@@ -1,0 +1,16 @@
+branch: fix/discovery-null-with-route-change
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-10-29T09:03:25Z'
+      title: Remove MCP discovery in a PUT that also moves the route
+      description: >-
+        A surface PUT that sent caller_authentication.protected_resource null, for the surface or a
+        variant, together with a route or listen address change was refused with 400 asking the
+        caller to send null. The stored setting was restored before the null applied and then
+        checked against the new route. The PUT now removes it, so the dashboard can switch
+        discovery off and change the route in one save.
+  removed: []
+  security: []
+  breaking: []

@@ -376,7 +376,7 @@ async fn outbound_extended_card_v1_shape_is_rewritten_for_both_methods() {
             .as_str()
             .unwrap();
         assert!(
-            gateway_url.ends_with("/outgoing/smoke/target"),
+            gateway_url.ends_with("/outbound/smoke/target"),
             "outbound card should point at the transit point, got {gateway_url}"
         );
     }

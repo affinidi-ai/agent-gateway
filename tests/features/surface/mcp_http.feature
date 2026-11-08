@@ -17,20 +17,20 @@ Feature: HTTP MCP surface forwarding
     And the MCP surface returns MCP server "bravo" tool catalog unchanged
 
   Scenario: MCP target authentication injects the configured header
-    Given the surface injects target authentication from secret "bdd-target-api-key" with value "bdd-target-secret" as header "x-target-api-key"
+    Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller asks the MCP surface for available tools
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" received header "x-target-api-key" with value "bdd-target-secret"
 
   Scenario: Missing MCP target authentication secret rejects the request when fallback is reject
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "reject"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller asks the MCP surface for available tools
     Then the response status is 502
     And MCP server "bravo" was not called
 
   Scenario: Missing MCP target authentication secret passes through when fallback is passthrough
-    Given the surface injects target authentication from missing secret "bdd-missing-target-secret" as header "x-target-api-key" with fallback "passthrough"
+    Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "passthrough"
     When the caller asks the MCP surface for available tools
     Then the response status is 200
     And MCP server "bravo" received the forwarded MCP request
@@ -85,11 +85,11 @@ Feature: HTTP MCP surface forwarding
 
   Scenario: Unsupported modern MCP requests do not enter legacy processing
     Given the VP Audit Log keeps every audit event
-    When the caller asks the MCP surface for available tools using protocol version "2025-11-25"
+    When the caller asks the MCP surface for available tools using protocol version "2099-01-01"
     Then the response status is 400
     And the MCP response is a JSON-RPC error with code -32022
     And the MCP response id matches the request id
-    And the MCP unsupported-version error requests "2025-11-25" and supports only "2024-11-05, 2026-07-28"
+    And the MCP unsupported-version error requests "2099-01-01" and supports only "2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28"
     And MCP server "bravo" was not called
     And the VP Audit Log records a request refusal for "an unsupported protocol version"
 

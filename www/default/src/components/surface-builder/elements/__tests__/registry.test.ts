@@ -81,8 +81,11 @@ describe('ElementRegistry', () => {
     it('treats missing gateway fields as incomplete for gateway endpoint type', () => {
       expect(registry.isConfigured('target', { endpoint_type: 'gateway' })).toBe(false);
       expect(registry.getIncompleteReason('target', { endpoint_type: 'gateway' })).toBe(
-        'Gateway connection is required'
+        'Select a gateway'
       );
+      expect(
+        registry.getIncompleteReason('target', { endpoint_type: 'gateway', gateway_id: 'gw1' })
+      ).toBe('Select an Agent Surface on the gateway');
       expect(
         registry.isConfigured('target', {
           endpoint_type: 'gateway',
@@ -102,21 +105,16 @@ describe('ElementRegistry', () => {
       ).toBe(true);
     });
 
-    it('payment requires enabled flag and x402 payment options', () => {
+    it('payment requires a gateway and a payment surface', () => {
       expect(registry.isConfigured('payment', {})).toBe(false);
-      expect(registry.isConfigured('payment', { enabled: false })).toBe(false);
+      expect(registry.isConfigured('payment', { payment_gateway_id: 'gw-1' })).toBe(false);
       expect(
-        registry.isConfigured('payment', {
-          enabled: true,
-          payment_kind: 'x402',
-          payment_requirements: [],
-        })
+        registry.isConfigured('payment', { unsupported_legacy: 'x402', original: { type: 'x402' } })
       ).toBe(false);
       expect(
         registry.isConfigured('payment', {
-          enabled: true,
-          payment_kind: 'x402',
-          payment_requirements: [{ amount: '1', recipient_id: 'recipient-1' }],
+          payment_gateway_id: 'gw-1',
+          payment_surface_id: 'pay-ch',
         })
       ).toBe(true);
     });
@@ -163,6 +161,18 @@ describe('ElementRegistry', () => {
       expect(a2a).not.toContain('target');
     });
 
+    it('leaves out the hidden types and keeps their definitions', () => {
+      expect(registry.paletteItems('mcp').map(d => d.type)).toContain('payment');
+      const hidden = new Set(['payment']);
+      expect(registry.paletteItems('mcp', hidden).map(d => d.type)).not.toContain('payment');
+      expect(
+        Object.values(registry.paletteByCategory('mcp', hidden))
+          .flat()
+          .map(d => d!.type)
+      ).not.toContain('payment');
+      expect(registry.get('payment')).toBeDefined();
+    });
+
     it('offers Metadata Extraction only on A2A / AP2 surfaces', () => {
       expect(registry.paletteItems('a2a').map(d => d.type)).toContain('metadata-extraction');
       expect(registry.paletteItems('ap2').map(d => d.type)).toContain('metadata-extraction');
@@ -193,18 +203,34 @@ describe('ElementRegistry', () => {
       allNodes: [],
     };
 
-    it('errors when MCP payment lacks a trigger mode', () => {
-      const warnings = registry.getDependencyWarnings('payment', { enabled: true }, baseCtx);
+    it('errors when an MCP Match trigger has no pattern', () => {
+      const warnings = registry.getDependencyWarnings(
+        'payment',
+        {
+          payment_gateway_id: 'gw',
+          payment_surface_id: 's',
+          mcp_payment_triggers: { mode: 'match', patterns: [' '] },
+        },
+        baseCtx
+      );
       expect(
         warnings.some(w => w.severity === 'error' && w.message.includes('MCP payment triggers'))
       ).toBe(true);
+    });
+
+    it('does not complain about missing MCP triggers, which default to every tool call', () => {
+      const warnings = registry.getDependencyWarnings(
+        'payment',
+        { payment_gateway_id: 'gw', payment_surface_id: 's' },
+        baseCtx
+      );
+      expect(warnings.some(w => w.message.includes('MCP payment triggers'))).toBe(false);
     });
 
     it('clears MCP payment trigger error when mcp_payment_triggers has patterns', () => {
       const warnings = registry.getDependencyWarnings(
         'payment',
         {
-          enabled: true,
           mcp_payment_triggers: { mode: 'match', patterns: ['^get_weather$'] },
         },
         baseCtx
@@ -212,12 +238,21 @@ describe('ElementRegistry', () => {
       expect(warnings.some(w => w.message.includes('MCP payment triggers'))).toBe(false);
     });
 
+    it('does not warn about A2A method filters when none are set, because the defaults apply', () => {
+      const a2aCtx: SurfaceContext = { ...baseCtx, protocol: 'a2a' };
+      const warnings = registry.getDependencyWarnings(
+        'payment',
+        { payment_gateway_id: 'gw', payment_surface_id: 's' },
+        a2aCtx
+      );
+      expect(warnings).toEqual([]);
+    });
+
     it('clears A2A payment triggers warning when a2a_method_filters is non-empty', () => {
       const a2aCtx: SurfaceContext = { ...baseCtx, protocol: 'a2a' };
       const warnings = registry.getDependencyWarnings(
         'payment',
         {
-          enabled: true,
           a2a_method_filters: [{ method: 'message/send', message_patterns: [] }],
         },
         a2aCtx
@@ -337,107 +372,31 @@ describe('ElementRegistry', () => {
       expect(out.target.response_policy).toEqual({ policy_definition_id: 'pol-3' });
     });
 
-    it('emits payment_policy with x402 fields when enabled', () => {
+    it('emits an agent_pay payment_policy', () => {
       const out = registry.buildPayload(
         makeCtx([
           {
             id: 'pay',
             type: 'payment',
             config: {
-              enabled: true,
-              verification_mode: 'mock',
-              settlement_mode: 'none',
-              supported_networks: ['base'],
-              facilitator_url: 'https://x',
+              payment_gateway_id: 'gw-1',
+              payment_surface_id: 'pay-ch',
               mcp_payment_triggers: { mode: 'match', patterns: ['^get_weather$'] },
             },
           },
         ])
       );
       expect(out.target.payment_policy).toEqual({
-        type: 'x402',
-        enabled: true,
-        verification_mode: 'mock',
-        settlement_mode: 'none',
-        supported_networks: ['base'],
-        facilitator_url: 'https://x',
+        type: 'agent_pay',
+        payment_gateway_id: 'gw-1',
+        payment_surface_id: 'pay-ch',
         mcp_payment_triggers: { mode: 'match', patterns: ['^get_weather$'] },
       });
     });
 
-    it('omits payment_policy when payment node is not enabled', () => {
+    it('omits payment_policy until a payment surface is chosen', () => {
       const out = registry.buildPayload(
-        makeCtx([{ id: 'pay', type: 'payment', config: { enabled: false } }])
-      );
-      expect(out.target.payment_policy).toBeUndefined();
-    });
-
-    it('emits payment_policy with mpp fields when enabled', () => {
-      const out = registry.buildPayload(
-        makeCtx([
-          {
-            id: 'pay',
-            type: 'payment',
-            config: {
-              enabled: true,
-              payment_kind: 'mpp',
-              mpp_realm: 'example.com',
-              mpp_secret_key: '$MPP_SECRET_KEY',
-              mpp_challenge_ttl: '600',
-              mpp_payment_methods: [
-                {
-                  method: 'tempo',
-                  intent: 'charge',
-                  currency: 'USDC',
-                  recipient: '0xabc',
-                  amount: '0.01',
-                },
-              ],
-              mpp_mcp_payment_triggers: { mode: 'match', patterns: ['^paid_.*$'] },
-              mpp_a2a_method_filters: [{ method: 'message/send', message_patterns: ['^premium'] }],
-              mpp_stripe_secret_key: '$STRIPE_SECRET_KEY',
-              mpp_crypto_verification_mode: 'onchain',
-              mpp_min_confirmations: '2',
-              mpp_verification_timeout_ms: '15000',
-              mpp_rpc_endpoints: { 'eip155:8453': 'https://mainnet.base.org' },
-            },
-          },
-        ])
-      );
-      expect(out.target.payment_policy).toEqual({
-        type: 'mpp',
-        enabled: true,
-        realm: 'example.com',
-        secret_key: '$MPP_SECRET_KEY',
-        challenge_ttl_seconds: 600,
-        payment_methods: [
-          {
-            method: 'tempo',
-            intent: 'charge',
-            currency: 'USDC',
-            recipient: '0xabc',
-            amount: '0.01',
-          },
-        ],
-        mcp_payment_triggers: { mode: 'match', patterns: ['^paid_.*$'] },
-        a2a_method_filters: [{ method: 'message/send', message_patterns: ['^premium'] }],
-        stripe_secret_key: '$STRIPE_SECRET_KEY',
-        crypto_verification_mode: 'onchain',
-        min_confirmations: 2,
-        verification_timeout_ms: 15000,
-        rpc_endpoints: { 'eip155:8453': 'https://mainnet.base.org' },
-      });
-    });
-
-    it('omits payment_policy for mpp when realm or secret key is missing', () => {
-      const out = registry.buildPayload(
-        makeCtx([
-          {
-            id: 'pay',
-            type: 'payment',
-            config: { enabled: true, payment_kind: 'mpp', mpp_realm: 'example.com' },
-          },
-        ])
+        makeCtx([{ id: 'pay', type: 'payment', config: { payment_gateway_id: 'gw-1' } }])
       );
       expect(out.target.payment_policy).toBeUndefined();
     });
@@ -484,6 +443,50 @@ describe('ElementRegistry', () => {
       expect(out.transit.points).toHaveLength(1);
       expect(out.transit.points[0].name).toBe('h1');
       expect(out.transit.points[0].rate_limit).toEqual({ requests: 50, window_secs: 30 });
+    });
+
+    it('writes a transit point per-caller rate limit beside its shared one, and either alone', () => {
+      const out = registry.buildPayload(
+        makeCtx([
+          {
+            id: 'rl-both',
+            type: 'rate-limit',
+            parentId: 'transit-point-a2a-1',
+            config: {
+              requests: '50',
+              window_secs: '30',
+              caller_requests: '5',
+              caller_window_secs: '10',
+              caller_burst: '8',
+            },
+          },
+          {
+            id: 'transit-point-a2a-1',
+            type: 'transit-point-a2a',
+            config: { name: 'h1', target_endpoint: 'http://a' },
+          },
+          {
+            id: 'rl-caller-only',
+            type: 'rate-limit',
+            parentId: 'transit-point-a2a-2',
+            config: { caller_requests: '7', caller_window_secs: '20' },
+          },
+          {
+            id: 'transit-point-a2a-2',
+            type: 'transit-point-a2a',
+            config: { name: 'h2', target_endpoint: 'http://b' },
+          },
+        ])
+      );
+      expect(out.transit.points[0].rate_limit).toEqual({ requests: 50, window_secs: 30 });
+      expect(out.transit.points[0].per_caller_rate_limit).toEqual({
+        requests: 5,
+        window_secs: 10,
+        burst: 8,
+      });
+      expect(out.transit.points[1].rate_limit).toBeUndefined();
+      expect(out.transit.points[1].per_caller_rate_limit).toEqual({ requests: 7, window_secs: 20 });
+      expect(out.access_point.rate_limit).toBeUndefined();
     });
 
     it('aggregates custom-metadata entries from multiple nodes', () => {
@@ -707,7 +710,11 @@ describe('ElementRegistry', () => {
         { id: 't', type: 'target', config: { endpoint: 'http://x' } },
       ]);
       probe(registry.get('payment'), [
-        { id: 'p', type: 'payment', config: { payment_type: 'mpp' } },
+        {
+          id: 'p',
+          type: 'payment',
+          config: { payment_gateway_id: 'gw-1', payment_surface_id: 'pay-ch' },
+        },
       ]);
       probe(registry.get('identity'), [
         { id: 'i', type: 'identity', config: { type: 'from_payload' } },

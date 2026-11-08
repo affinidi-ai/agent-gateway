@@ -177,6 +177,19 @@ pub fn free_port() -> (u16, ReservedPort) {
     panic!("no free gateway test ports in {GATEWAY_TEST_PORT_START}..{GATEWAY_TEST_PORT_END}");
 }
 
+/// An address that accepts every connection and closes it at once, so a request
+/// to it fails the same way each time and no other server can take its port.
+pub fn closing_endpoint() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            drop(connection);
+        }
+    });
+    address
+}
+
 // ── mock target server ───────────────────────────────────────────────────────
 
 /// The details of a request received by the mock server.
@@ -190,7 +203,17 @@ pub struct ReceivedRequest {
 
 enum MockBody {
     Json(String),
-    Streamed { content_type: &'static str, chunks: Vec<(Duration, String)>, hold_open: bool },
+    /// Every response has this status and content type.
+    Status {
+        status: u16,
+        content_type: &'static str,
+        body: String,
+    },
+    Streamed {
+        content_type: &'static str,
+        chunks: Vec<(Duration, String)>,
+        hold_open: bool,
+    },
 }
 
 /// A running axum server that simply echoes back a configurable response.
@@ -213,6 +236,23 @@ impl MockServer {
     /// Start the mock with a custom response body returned for every request.
     pub async fn start_with_response(response_body: impl Into<String>) -> Self {
         Self::start_with_response_gate(MockBody::Json(response_body.into()), None).await
+    }
+
+    /// Start the mock so every response has `status` and `content_type`.
+    pub async fn start_with_status(
+        status: u16,
+        content_type: &'static str,
+        response_body: impl Into<String>,
+    ) -> Self {
+        Self::start_with_response_gate(
+            MockBody::Status {
+                status,
+                content_type,
+                body: response_body.into(),
+            },
+            None,
+        )
+        .await
     }
 
     pub async fn start_paused(response_body: impl Into<String>) -> (Self, Arc<tokio::sync::Notify>) {
@@ -307,8 +347,11 @@ impl MockServer {
                     if let Some(gate) = gate {
                         gate.notified().await;
                     }
-                    let (content_type, body) = match response_body.as_ref() {
-                        MockBody::Json(body) => ("application/json", axum::body::Body::from(body.clone())),
+                    let (status, content_type, body) = match response_body.as_ref() {
+                        MockBody::Json(body) => (200, "application/json", axum::body::Body::from(body.clone())),
+                        MockBody::Status { status, content_type, body } => {
+                            (*status, *content_type, axum::body::Body::from(body.clone()))
+                        }
                         MockBody::Streamed {
                             content_type,
                             chunks,
@@ -324,11 +367,11 @@ impl MockServer {
                             } else {
                                 axum::body::Body::from_stream(chunks)
                             };
-                            (*content_type, body)
+                            (200, *content_type, body)
                         }
                     };
                     Response::builder()
-                        .status(200)
+                        .status(status)
                         .header("content-type", content_type)
                         .body(body)
                         .unwrap()
@@ -525,6 +568,63 @@ impl MockServer {
     /// URL that clients (or the gateway) should forward requests to.
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+/// A target that records the complete headers of every request it receives,
+/// repeated ones included, and answers each with a fixed status and headers and
+/// a JSON-RPC result.
+pub struct RecordingTarget {
+    pub url: String,
+    received: Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
+    _server: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingTarget {
+    pub async fn start(
+        status: axum::http::StatusCode,
+        headers: &[(&'static str, &'static str)],
+    ) -> Self {
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = received.clone();
+        let headers = headers.to_vec();
+        let app = Router::new().fallback(move |request_headers: axum::http::HeaderMap| {
+            let recorded = recorded.clone();
+            let headers = headers.clone();
+            async move {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(request_headers);
+                let mut response = Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json");
+                for (name, value) in headers {
+                    response = response.header(name, value);
+                }
+                response
+                    .body(axum::body::Body::from(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#))
+                    .unwrap()
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok();
+        });
+        Self { url, received, _server: server }
+    }
+
+    /// The headers of every request received so far, oldest first.
+    pub fn received(&self) -> Vec<axum::http::HeaderMap> {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
     }
 }
 
@@ -904,15 +1004,47 @@ fn build_bootstrap_config(
         metrics_cache_ttl_seconds_legacy: 1,
         auth_mode: AuthMode::default(),
         // Deterministic literal test key (64-char hex); the field is required at runtime.
-        backup_encryption_key: "00".repeat(32),
+        backup_encryption_key: "00".repeat(32).into(),
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
         vta: Default::default(),
+        credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
         cache_refresh_interval_secs: 0,
+        pinned_transit_token_max_lifetime_secs: None,
+        pinned_external_consent_resource_origins: None,
+        pinned_external_consent_issuers: None,
     }
+}
+
+/// Store an API key secret a source authentication method can name by
+/// `secret_id`. Call from the harness `setup` closure, before the gateway boots.
+pub fn write_api_key_secret(
+    storage_path: &str,
+    secret_id: &str,
+    value: &str,
+) {
+    use crate::secrets::SecretsStore;
+
+    let store = crate::secrets::FilesystemSecretsStore::new(storage_path).expect("create secrets store");
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Component test source API key".to_string(),
+                    secret_id: secret_id.to_string(),
+                    description: Some("component-test source auth secret".to_string()),
+                    value: value.to_string(),
+                    secret_type: "ApiKey".to_string(),
+                    tags: vec!["component-test".to_string()],
+                })
+                .await
+                .expect("create source auth secret");
+        })
+    });
 }
 
 /// Mount the identity API at `/api` on the gateway listener and seed an
@@ -930,8 +1062,9 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         "created_at": now, "updated_at": now
     }))
     .unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
     let session = crate::auth::session::Session {
-        token: uuid::Uuid::new_v4().to_string(),
+        token_hash: crate::storage::filesystem::token_storage_id(&token),
         username: user.username.clone(),
         user_id: user.user_id.clone(),
         created_at: now,
@@ -950,7 +1083,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
             &bootstrap
                 .storage_paths
                 .sessions,
-            &session.token,
+            &session.token_hash,
             serde_json::to_value(&session).unwrap(),
         ),
     ] {
@@ -961,7 +1094,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         )
         .unwrap();
     }
-    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", session.token)).unwrap();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
     authorization.set_sensitive(true);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::AUTHORIZATION, authorization);
@@ -1108,7 +1241,8 @@ pub fn build_minimal_outbound_channel() -> AgentSurface {
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         }
     }))
@@ -1138,6 +1272,7 @@ pub fn build_identity_channel() -> AgentSurface {
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "require_transit_token": false,
+                "allow_unauthenticated_callers": true,
                 "identity_injection": { "inject_vp": true }
             }]
         },
@@ -1194,7 +1329,8 @@ pub fn build_api_key_identity_channel(api_key_id: &str) -> AgentSurface {
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
-                "require_transit_token": false
+                "require_transit_token": false,
+                "allow_unauthenticated_callers": true
             }]
         },
         "identity_slots": {
@@ -1230,6 +1366,7 @@ pub fn build_per_tp_identity_channel() -> AgentSurface {
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "require_transit_token": false,
+                "allow_unauthenticated_callers": true,
                 "managed_identity": {
                     "type": "payload_extraction",
                     "meta_field": "agentIdentity",
@@ -1285,6 +1422,8 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
 /// tests abort with a stack overflow (SIGABRT).
 struct GatewayServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    startup_log: StartupLog,
+    provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -1302,18 +1441,85 @@ impl Drop for GatewayServer {
     }
 }
 
+/// The `WARN` and `ERROR` lines a harness gateway logs on its own thread, which
+/// runs `run_axum_proxy` and so its startup checks. Work the gateway spawns,
+/// such as serving requests, runs on the runtime's workers and is not kept.
+#[derive(Clone, Default)]
+struct StartupLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for StartupLog {
+    fn write(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap()
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StartupLog {
+    /// Makes this thread log to the test output as [`ensure_tracing`] does and
+    /// keep its `WARN` and `ERROR` lines, until the guard drops.
+    fn capture_on_this_thread(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = self.clone();
+        thread_subscriber::set_thread_default(
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_test_writer()
+                        .with_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        ),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(move || log.clone())
+                        .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+                ),
+        )
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
 fn spawn_gateway_server(
     gw_config: GatewayConfig,
     bootstrap: BootstrapConfig,
 ) -> GatewayServer {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let startup_log = StartupLog::default();
+    let thread_log = startup_log.clone();
+    let credential_policy = bootstrap
+        .credential_policy
+        .clone();
+    let provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate = Box::leak(Box::default());
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
+            let _log = thread_log.capture_on_this_thread();
+            crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+            crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024)
+                .on_thread_start(move || {
+                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+                    crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
+                })
                 .build()
                 .expect("build gateway harness runtime");
             rt.block_on(async move {
@@ -1333,6 +1539,8 @@ fn spawn_gateway_server(
         .expect("spawn gateway harness thread");
     GatewayServer {
         shutdown: Some(shutdown_tx),
+        startup_log,
+        provider_key_gate,
         _thread: thread,
     }
 }
@@ -1370,6 +1578,8 @@ async fn wait_for_gateway_http(
     loop {
         match client.get(&url).send().await {
             Ok(_) => break,
+            // The port accepts connections but does not speak plain HTTP: a TLS listener.
+            Err(error) if !error.is_connect() && !error.is_timeout() => break,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1619,10 +1829,54 @@ impl GatewayHarness {
     }
 }
 
+impl GatewayHarness {
+    /// The `WARN` and `ERROR` lines the gateway logged from `run_axum_proxy`
+    /// itself, such as its startup checks, but not from the work it spawns.
+    pub fn startup_warnings(&self) -> String {
+        self._gw_server
+            .startup_log
+            .text()
+    }
+
+    /// The provider key gate this gateway keeps its verdicts in.
+    pub fn provider_key_gate(&self) -> &'static crate::identity::provider_key_gate::ProviderKeyGate {
+        self._gw_server
+            .provider_key_gate
+    }
+}
+
 impl Drop for GatewayHarness {
     fn drop(&mut self) {
         self._gw_server.shutdown();
     }
+}
+
+/// Sets a top-level `gateway.json` key, such as `transit_token_max_lifetime_secs`.
+pub fn configure_gateway_setting(
+    bootstrap: &crate::config::BootstrapConfig,
+    key: &str,
+    value: serde_json::Value,
+) {
+    set_gateway_json_setting(&bootstrap.config_files.gateway, key, value);
+}
+
+/// Sets a top-level key in the `gateway.json` at `gateway_path`, also while the
+/// gateway that read it runs.
+pub fn set_gateway_json_setting(
+    gateway_path: &str,
+    key: &str,
+    value: serde_json::Value,
+) {
+    let gateway_path = std::path::Path::new(gateway_path);
+    let mut gateway_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(gateway_path).expect("read gateway network config"))
+            .expect("gateway network config JSON");
+    gateway_json[key] = value;
+    std::fs::write(
+        gateway_path,
+        serde_json::to_string_pretty(&gateway_json).expect("serialize gateway network config"),
+    )
+    .expect("write gateway network config");
 }
 
 /// Declare `(id, name, prefix)` route prefixes in the gateway network config,

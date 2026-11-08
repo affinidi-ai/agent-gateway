@@ -679,6 +679,40 @@ pub(crate) fn copy_response_headers(
         .insert("cache-control", axum::http::HeaderValue::from_static("no-store"));
 }
 
+/// Replaces an upstream's missing-session refusal with the session-only
+/// refusal it stands for, logging the upstream's error. Only a JSON answer can
+/// carry one: an upstream refuses before it opens an SSE stream.
+fn adopt_session_only_refusal(
+    request: &super::request_validation::ValidatedModernMessage,
+    status: axum::http::StatusCode,
+    message: &mut serde_json::Value,
+) {
+    let Some(refusal) = super::modern::session_only_refusal(request, status, message) else {
+        return;
+    };
+    let upstream_message: String = message
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(256)
+        .collect();
+    let upstream_code: String = message
+        .pointer("/error/code")
+        .map(serde_json::Value::to_string)
+        .unwrap_or_default()
+        .chars()
+        .take(32)
+        .collect();
+    tracing::warn!(
+        method = ?request.method,
+        upstream_code = ?upstream_code,
+        upstream_message = ?upstream_message,
+        "Upstream refused a modern MCP request without its id; answering -32022 with the session revisions"
+    );
+    *message = refusal;
+}
+
 pub struct ProcessedResponse {
     pub message: serde_json::Value,
     pub headers: Option<axum::http::HeaderMap>,
@@ -1008,6 +1042,7 @@ where
         body.extend_from_slice(&chunk);
     }
     let mut message: serde_json::Value = serde_json::from_slice(&body).map_err(|_| SseReadError::InvalidMessage)?;
+    adopt_session_only_refusal(&request, status, &mut message);
     if request.method == "subscriptions/listen"
         && validate_response(&request, &message, ResultSource::ModernServer)?.is_some()
     {
@@ -1452,12 +1487,12 @@ mod tests {
 
         let dual = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let advertised = |key: &UpstreamKey| {
-            restrict_unsupported(McpRequestValidationError::unsupported(None, "2025-11-25", dual), key)
+            restrict_unsupported(McpRequestValidationError::unsupported(None, "2099-01-01", dual), key)
                 .data
                 .unwrap()["supported"]
                 .clone()
         };
-        let path_set = json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION]);
+        let path_set = json!(dual.supported_versions());
         let result = |versions: serde_json::Value| {
             json!({"jsonrpc": "2.0", "id": 7, "result": {
                 "resultType": "complete", "supportedVersions": versions, "tools": [],
@@ -1465,15 +1500,56 @@ mod tests {
             }})
         };
         let error = |code: i32| json!({"jsonrpc": "2.0", "id": 7, "error": {"code": code, "message": "failed"}});
+        let refused = |id: serde_json::Value, code: i32| json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": "Bad Request: Missing session ID"}});
+        let ok = axum::http::StatusCode::OK;
+        let bad_request = axum::http::StatusCode::BAD_REQUEST;
+        let session_versions = json!(crate::mcp::request_validation::SESSION_VERSIONS);
         let cases = [
-            ("server/discover", result(json!([MCP_MODERN_VERSION, "2025-11-25"])), true, json!([MCP_MODERN_VERSION])),
-            ("server/discover", error(crate::mcp::error_codes::METHOD_NOT_FOUND), true, json!([MCP_LEGACY_VERSION])),
-            ("server/discover", error(crate::mcp::error_codes::INTERNAL_ERROR), true, path_set.clone()),
-            ("server/discover", result(json!([MCP_LEGACY_VERSION])), false, path_set.clone()),
-            ("tools/list", result(json!([MCP_MODERN_VERSION])), true, path_set.clone()),
+            ("server/discover", bad_request, refused(json!(null), -32000), true, session_versions.clone()),
+            ("server/discover", bad_request, refused(json!("server-error"), -32600), true, session_versions.clone()),
+            // Outages, rate limits and other errors without the request's id
+            // are not a session-only refusal and teach nothing.
+            ("server/discover", bad_request, refused(json!(null), -32700), false, path_set.clone()),
+            (
+                "server/discover",
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                refused(json!(null), crate::mcp::error_codes::INTERNAL_ERROR),
+                false,
+                path_set.clone(),
+            ),
+            (
+                "server/discover",
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                refused(json!(null), -32600),
+                false,
+                path_set.clone(),
+            ),
+            ("server/discover", ok, refused(json!(null), -32600), false, path_set.clone()),
+            (
+                "server/discover",
+                ok,
+                error(crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION),
+                true,
+                path_set.clone(),
+            ),
+            (
+                "server/discover",
+                ok,
+                result(json!([MCP_MODERN_VERSION, "2099-01-01"])),
+                true,
+                json!([MCP_MODERN_VERSION]),
+            ),
+            ("server/discover", ok, error(crate::mcp::error_codes::METHOD_NOT_FOUND), true, session_versions.clone()),
+            ("server/discover", ok, error(crate::mcp::error_codes::INTERNAL_ERROR), true, path_set.clone()),
+            ("server/discover", ok, result(json!([MCP_LEGACY_VERSION])), false, path_set.clone()),
+            ("tools/list", ok, result(json!([MCP_MODERN_VERSION])), true, path_set.clone()),
         ];
         for sse in [false, true] {
-            for (index, (method, upstream, delivered, expected)) in cases.iter().enumerate() {
+            for (index, (method, status, upstream, delivered, expected)) in cases.iter().enumerate() {
+                // An upstream refuses before it opens an SSE stream.
+                if sse && *status != ok {
+                    continue;
+                }
                 let key = UpstreamKey {
                     surface_id: format!("forwarded-discovery-{sse}-{index}"),
                     route: UpstreamRoute::AccessPoint(None),
@@ -1501,7 +1577,7 @@ mod tests {
                 .recording_versions(key.clone());
                 let response = forwarding_response(
                     futures::stream::iter([Ok::<_, io::Error>(Bytes::from(source))]),
-                    axum::http::StatusCode::OK,
+                    *status,
                     &headers,
                     request,
                     limits(4096),
@@ -1666,6 +1742,109 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body, refusal);
+    }
+
+    /// A JSON `400` missing-session refusal becomes `-32022`. The same error
+    /// with another status, without a Content-Type, or inside an SSE stream,
+    /// is not rewritten.
+    #[tokio::test]
+    async fn a_session_only_refusal_answers_minus_32022_only_for_a_json_400() {
+        let json_headers = axum::http::HeaderMap::from_iter([(
+            axum::http::header::CONTENT_TYPE,
+            "application/json"
+                .parse()
+                .unwrap(),
+        )]);
+        for (id, code) in [(serde_json::json!(null), -32000), (serde_json::json!("server-error"), -32600)] {
+            let upstream = serde_json::json!({"jsonrpc": "2.0", "id": id, "error": {
+                "code": code, "message": "Bad Request: Missing session ID"
+            }});
+            let response = request_response(
+                futures::stream::iter([Ok::<_, io::Error>(Bytes::from(upstream.to_string()))]),
+                axum::http::StatusCode::BAD_REQUEST,
+                &json_headers,
+                request(),
+                limits(4096),
+                |message| async { Ok(message) },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST, "{id}");
+            let message: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(message["id"], serde_json::json!(7), "{id}");
+            assert_eq!(message["error"]["code"], super::super::error_codes::UNSUPPORTED_PROTOCOL_VERSION, "{id}");
+            assert_eq!(
+                message["error"]["data"]["supported"],
+                serde_json::json!(super::super::request_validation::SESSION_VERSIONS),
+                "{id}"
+            );
+        }
+
+        let refused = |code: i32| serde_json::json!({"jsonrpc": "2.0", "id": null, "error": {"code": code, "message": "refused"}});
+        for (status, upstream) in [
+            (axum::http::StatusCode::BAD_REQUEST, refused(super::super::error_codes::PARSE_ERROR)),
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, refused(super::super::error_codes::INTERNAL_ERROR)),
+            (axum::http::StatusCode::UNAUTHORIZED, refused(super::super::error_codes::INVALID_REQUEST)),
+            (axum::http::StatusCode::TOO_MANY_REQUESTS, refused(super::super::error_codes::INVALID_REQUEST)),
+            (axum::http::StatusCode::SERVICE_UNAVAILABLE, refused(-32000)),
+        ] {
+            let response = request_response(
+                futures::stream::iter([Ok::<_, io::Error>(Bytes::from(upstream.to_string()))]),
+                status,
+                &json_headers,
+                request(),
+                limits(4096),
+                |message| async { Ok(message) },
+            )
+            .await;
+            assert!(
+                matches!(response, Err(SseReadError::Response(super::super::modern::ModernResponseError::IdMismatch))),
+                "{status} {upstream}"
+            );
+        }
+
+        // Both official SDKs send `application/json` with this refusal; without
+        // it the content-type gate answers first and the caller gets a 502.
+        let response = request_response(
+            futures::stream::iter([Ok::<_, io::Error>(Bytes::from(refused(-32000).to_string()))]),
+            axum::http::StatusCode::BAD_REQUEST,
+            &axum::http::HeaderMap::new(),
+            request(),
+            limits(4096),
+            |message| async { Ok(message) },
+        )
+        .await;
+        assert!(matches!(response, Err(SseReadError::UnsupportedContentType)));
+
+        let sse_headers = axum::http::HeaderMap::from_iter([(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream"
+                .parse()
+                .unwrap(),
+        )]);
+        let response = request_response(
+            futures::stream::iter([Ok::<_, io::Error>(Bytes::from(format!(
+                "data: {}\n\n",
+                refused(super::super::error_codes::INVALID_REQUEST)
+            )))]),
+            axum::http::StatusCode::OK,
+            &sse_headers,
+            request(),
+            limits(4096),
+            |message| async { Ok(message) },
+        )
+        .await
+        .unwrap();
+        assert!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

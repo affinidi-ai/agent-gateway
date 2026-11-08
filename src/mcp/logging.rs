@@ -7,36 +7,56 @@
 //! Do not extend it.
 
 use serde_json::Value as JsonValue;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
-/// Handle logging notification from server
+/// Record a `notifications/message` a client sent. Its level, logger and data are
+/// chosen by the client, so only the size of its data is logged, at debug.
 pub async fn handle_logging_message(
     body: &JsonValue,
     channel_name: &str,
 ) {
-    if let Some(params) = body.get("params") {
-        let level = params
-            .get("level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("info");
-        let logger = params
-            .get("logger")
-            .and_then(|v| v.as_str())
-            .unwrap_or("mcp");
-        let data = params.get("data");
+    let data_bytes = body
+        .get("params")
+        .and_then(|params| params.get("data"))
+        .map_or(0, |data| data.to_string().len());
+    debug!(channel = channel_name, data_bytes, "Received MCP logging notification");
+}
 
-        let log_message = if let Some(data_val) = data {
-            format!("[{}] {}: {}", channel_name, logger, serde_json::to_string(data_val).unwrap_or_default())
-        } else {
-            format!("[{}] {}: (no data)", channel_name, logger)
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
 
-        match level {
-            "debug" => debug!("{}", log_message),
-            "info" => info!("{}", log_message),
-            "warning" | "warn" => warn!("{}", log_message),
-            "error" => error!("{}", log_message),
-            _ => info!("{}", log_message),
-        }
+    #[tokio::test]
+    async fn a_logging_notification_is_logged_at_debug_without_its_data() {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": "error", "logger": "logger-marker", "data": {"text": "client-data-marker"}}
+        });
+        let data_bytes = notification["params"]["data"]
+            .to_string()
+            .len();
+        let logs = FormattedLogs::capture();
+
+        handle_logging_message(&notification, "test-channel").await;
+
+        let text = logs.text();
+        assert!(text.contains("DEBUG Received MCP logging notification"), "{text}");
+        assert!(text.contains(&format!("data_bytes={data_bytes}")), "{text}");
+        assert!(!text.contains("ERROR"), "the client chose the level: {text}");
+        assert!(!text.contains("client-data-marker"), "a log holds the client's data: {text}");
+        assert!(!text.contains("logger-marker"), "a log holds the client's logger name: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_logging_notification_without_data_logs_zero_bytes() {
+        let logs = FormattedLogs::capture();
+
+        handle_logging_message(&serde_json::json!({"method": "notifications/message"}), "test-channel").await;
+
+        let text = logs.text();
+        assert!(text.contains("Received MCP logging notification"), "{text}");
+        assert!(text.contains("data_bytes=0"), "{text}");
     }
 }

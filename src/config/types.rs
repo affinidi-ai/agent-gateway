@@ -155,7 +155,7 @@ fn default_pending_expiry_hours() -> u64 {
     1
 }
 
-/// Reconnect policy for connection-point DIDComm links (proposal section C).
+/// Reconnect policy for connection-point DIDComm links and trust registry connections.
 ///
 /// A failed connection is retried with exponential backoff up to
 /// `max_backoff_seconds`, after which it retries at that fixed interval
@@ -432,6 +432,9 @@ impl A2aConfig {
         if self.max_inflight_dispatches == 0 {
             return Err("a2a.max_inflight_dispatches must be > 0".to_string());
         }
+        if self.max_body_size == 0 {
+            return Err("a2a.max_body_size must be at least 1 byte".to_string());
+        }
         if !(1..=86_400).contains(&self.stream_max_lifetime_secs) {
             return Err("a2a.stream_max_lifetime_secs must be between 1 and 86400".to_string());
         }
@@ -513,7 +516,7 @@ impl Default for McpConfig {
 }
 
 /// A single log redaction rule: a regex pattern and its replacement string.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogRedactionRule {
     /// Human-readable label for this rule (e.g. "JWT tokens")
     #[serde(default)]
@@ -527,15 +530,32 @@ pub struct LogRedactionRule {
 }
 
 /// Log redaction configuration — loaded from gateway.json `logging.redaction`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Redaction is on unless `enabled` is `false`; without `rules`, the built-in rules apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRedactionConfig {
     /// Master switch — when false, no redaction is performed
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Ordered list of regex→replacement rules applied to every log line
-    #[serde(default)]
+    #[serde(default = "crate::observability::log_redact::built_in_rules")]
     pub rules: Vec<LogRedactionRule>,
+}
+
+impl Default for LogRedactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules: crate::observability::log_redact::built_in_rules(),
+        }
+    }
+}
+
+impl LogRedactionConfig {
+    /// Whether this is the default: enabled with the built-in rules.
+    pub fn is_built_in(&self) -> bool {
+        self.enabled && self.rules == crate::observability::log_redact::built_in_rules()
+    }
 }
 
 /// Logging configuration
@@ -552,8 +572,8 @@ pub struct LoggingConfig {
     /// Directory to write log files (optional, logs to stdout if not set)
     pub log_directory: Option<String>,
 
-    /// PII / secret redaction rules applied to all log output
-    #[serde(default)]
+    /// PII / secret redaction rules applied to all log output. Read from gateway.json only.
+    #[serde(default, skip_serializing_if = "LogRedactionConfig::is_built_in")]
     pub redaction: LogRedactionConfig,
 }
 
@@ -679,10 +699,45 @@ pub enum TargetAuthMethod {
         #[serde(default = "default_header_format")]
         header_format: String,
     },
+    /// Use the service token of a credential provider: an issued token (client
+    /// credentials, JWT Bearer, Client Credentials JWT), cached until shortly before it
+    /// expires, or an API key
+    CredentialProvider {
+        /// Credential provider ID (UUID)
+        provider_id: String,
+        #[serde(default = "default_provider_header_name")]
+        header_name: String,
+        /// The placeholder {value} will be replaced with the token
+        #[serde(default = "default_provider_header_format")]
+        header_format: String,
+        /// Scopes to request; the provider's default scopes when empty
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+    },
+}
+
+impl TargetAuthMethod {
+    /// The header this method injects; `None` for one that injects nothing.
+    pub fn header_name(&self) -> Option<&str> {
+        match self {
+            Self::StaticSecret { header_name, .. } | Self::CredentialProvider { header_name, .. } => {
+                Some(header_name.as_str())
+            }
+            Self::CredentialLookup => None,
+        }
+    }
 }
 
 fn default_header_format() -> String {
     "{value}".to_string()
+}
+
+fn default_provider_header_name() -> String {
+    "Authorization".to_string()
+}
+
+fn default_provider_header_format() -> String {
+    "Bearer {value}".to_string()
 }
 
 /// Fallback behavior when target credentials are not found
@@ -751,7 +806,8 @@ pub fn validate_outbound_listen_path(path: &str) -> Result<(), String> {
 ///
 /// VCs whose effective address can't be mapped to a port, or whose port is
 /// not in `configured_ports`, are skipped with a warning. Channels with no
-/// VCs that resolve to any listener are skipped entirely. Both startup
+/// VCs that resolve to any listener, and surfaces that are not active, are
+/// skipped entirely. Both startup
 /// (orchestrator) and hot-reload (channel_manager) call this so the
 /// bucketing logic stays in lockstep.
 pub fn group_outbound_vcs_by_port(
@@ -767,7 +823,7 @@ pub fn group_outbound_vcs_by_port(
         std::collections::HashMap::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -867,7 +923,7 @@ pub fn find_unresolved_outbound_transit_points(
     let mut problems = Vec::new();
 
     for surface in surfaces {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+        if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
             continue;
         }
         let Some(ref transit) = surface.transit else {
@@ -989,7 +1045,7 @@ pub enum CallerContextSource {
     /// Caller context derived from a DID-authenticated session on the current
     /// Access Point hop. The caller must be authenticated via
     /// [`SourceAuthConfig::DidAuth`](crate::source_auth::models::SourceAuthConfig::DidAuth);
-    /// the resolved DID becomes the caller identity and its SHA-256 hash the
+    /// the resolved DID becomes the caller identity and its identity hash the
     /// delegation-vault key.
     Did,
 }
@@ -1106,6 +1162,20 @@ pub struct OutboundCredentialBinding {
     /// did not advertise the `elicitation` capability during `initialize`.
     #[serde(default)]
     pub elicit_fallback: ElicitFallback,
+
+    /// Whose account the grant of a `consent_mode = external` binding is.
+    /// Required with `external`, refused with every other mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<crate::config::agent_surface::GrantSubject>,
+}
+
+impl OutboundCredentialBinding {
+    /// Whether the binding is the Access Point Target's external consent
+    /// binding, whose grants are kept by binding and which no agent-keyed
+    /// path serves.
+    pub fn is_external(&self) -> bool {
+        self.consent_mode == ConsentMode::External
+    }
 }
 
 fn default_elicit_timeout_secs() -> u64 {
@@ -1147,6 +1217,11 @@ pub enum ConsentMode {
     /// `decline`/`cancel`. Requires the MCP client to have advertised the
     /// `elicitation` capability during `initialize`; see `elicit_fallback`.
     Elicit,
+    /// Another system obtains the grant through the browser; the gateway keeps
+    /// it by binding, never builds an authorization URL, and refuses the call
+    /// while it has no grant. In `outbound_credentials` it binds the Access
+    /// Point's Target, as the only binding of a surface without Transit Points.
+    External,
 }
 
 /// What to do when `consent_mode = elicit` but the MCP client did not declare
@@ -1172,6 +1247,17 @@ pub enum CredentialInjection {
     CustomHeader { name: String, format: String },
     /// JSON-RPC _meta field injection
     Meta { field: String },
+}
+
+impl CredentialInjection {
+    /// The header this injection sets; `None` for one into `_meta`.
+    pub fn header_name(&self) -> Option<&str> {
+        match self {
+            Self::BearerHeader => Some("Authorization"),
+            Self::CustomHeader { name, .. } => Some(name.as_str()),
+            Self::Meta { .. } => None,
+        }
+    }
 }
 
 /// Rate limit configuration for a channel
@@ -1228,6 +1314,94 @@ impl Default for LoginThrottleConfig {
     }
 }
 
+/// The delegated payment gate's circuit breaker: after `breaker_failures`
+/// consecutive failed calls to one agent-pay gateway it refuses calls to it for
+/// `breaker_open_secs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentGateConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_failures: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaker_open_secs: Option<u64>,
+}
+
+impl PaymentGateConfig {
+    pub const DEFAULT_BREAKER_FAILURES: u32 = 5;
+    pub const DEFAULT_BREAKER_OPEN_SECS: u64 = 30;
+    const MAX_BREAKER_FAILURES: u32 = 1000;
+    const MAX_BREAKER_OPEN_SECS: u64 = 3600;
+
+    /// The configured failure count, kept within 1 to 1000.
+    pub fn breaker_failures(&self) -> u32 {
+        self.breaker_failures
+            .unwrap_or(Self::DEFAULT_BREAKER_FAILURES)
+            .clamp(1, Self::MAX_BREAKER_FAILURES)
+    }
+
+    /// The configured open time, kept within 1 to 3600 seconds.
+    pub fn breaker_open_for(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.breaker_open_secs
+                .unwrap_or(Self::DEFAULT_BREAKER_OPEN_SECS)
+                .clamp(1, Self::MAX_BREAKER_OPEN_SECS),
+        )
+    }
+}
+
+/// How long the delegated payments ledger keeps rows and how large it may grow
+/// on disk before its oldest hourly segments are deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLedgerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size_mb: Option<u64>,
+}
+
+impl PaymentLedgerConfig {
+    pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+    pub const MAX_RETENTION_DAYS: u32 = 400;
+    pub const DEFAULT_MAX_SIZE_MB: u64 = 2048;
+    const MIN_SIZE_MB: u64 = 16;
+    const MAX_SIZE_MB: u64 = 1024 * 1024;
+
+    /// The configured retention, kept within 1 to [`Self::MAX_RETENTION_DAYS`] days.
+    pub fn retention_days(&self) -> u32 {
+        self.retention_days
+            .unwrap_or(Self::DEFAULT_RETENTION_DAYS)
+            .clamp(1, Self::MAX_RETENTION_DAYS)
+    }
+
+    /// The configured size bound in bytes, kept within 16 MiB to 1 TiB.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_size_mb
+            .unwrap_or(Self::DEFAULT_MAX_SIZE_MB)
+            .clamp(Self::MIN_SIZE_MB, Self::MAX_SIZE_MB)
+            * 1024
+            * 1024
+    }
+
+    /// The configured values that fall outside their range and were clamped.
+    pub fn clamped_fields(&self) -> Vec<&'static str> {
+        let mut clamped = Vec::new();
+        if self
+            .retention_days
+            .is_some_and(|days| days != self.retention_days())
+        {
+            clamped.push("retention_days");
+        }
+        if self
+            .max_size_mb
+            .is_some_and(|mb| mb.saturating_mul(1024 * 1024) != self.max_bytes())
+        {
+            clamped.push("max_size_mb");
+        }
+        clamped
+    }
+}
+
 /// Which proxies may report the caller's address for per-client-IP limits (the SAML and CLI
 /// login throttles). Separate from `tls.client_auth.trusted_proxies`, which only gates forwarded
 /// client certificates.
@@ -1268,8 +1442,8 @@ fn default_replay_backend() -> String {
     "in_process".to_string()
 }
 
-/// Throttle for the token endpoint: bounds repeated attempts per client id and
-/// per source address so credential guessing is rate-limited.
+/// Throttle for the token endpoint: bounds repeated attempts per client id from
+/// each source, and per source, so credential guessing is rate-limited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEndpointThrottleConfig {
     /// Master switch for the throttle.
@@ -1278,10 +1452,11 @@ pub struct TokenEndpointThrottleConfig {
     /// Count only failed client authentications (recommended) rather than every request.
     #[serde(default = "sts_throttle_default_true")]
     pub failed_attempts_only: bool,
-    /// Per-`client_id` limit.
+    /// Per-`client_id` limit, counted separately for each source (an IPv4 address or an IPv6 /64).
     #[serde(default = "default_throttle_per_client")]
     pub per_client: RateLimitConfig,
-    /// Per-source-address limit (source read from `X-Forwarded-For` / `Forwarded`).
+    /// Per-source limit (an IPv4 address or an IPv6 /64; forwarded headers count only from
+    /// `client_ip.trusted_proxies`).
     #[serde(default = "default_throttle_per_ip")]
     pub per_ip: RateLimitConfig,
     /// Seconds a key stays blocked once over its limit (0 = until the window rolls off).
@@ -1575,18 +1750,12 @@ pub struct X402PaymentRequirement {
     pub asset: String,
 
     /// User-selected recipient identifier. Must match the `id` of an entry in
-    /// the global x402 config's `recipient_addresses` list. This is the only
-    /// recipient field the frontend / API caller is trusted to supply — the
-    /// actual wallet address is resolved server-side from `recipient_id` +
-    /// `network` and stored in `pay_to` during channel save and load.
+    /// the global x402 config's `recipient_addresses` list.
     #[serde(default, rename = "recipientId", alias = "recipient_id")]
     pub recipient_id: String,
 
-    /// Resolved on-chain recipient address. NEVER trusted from request input —
-    /// always overwritten by the server-side `recipient_id` → address lookup
-    /// in `validate_payment_policy`. Persisted on disk and read directly by
-    /// the verification, settlement, and proxy layers, so they don't need to
-    /// repeat the lookup on the hot path.
+    /// Resolved on-chain recipient address, as persisted with the policy and
+    /// read by the verification, settlement, and proxy layers.
     #[serde(default, rename = "payTo", alias = "recipient")]
     pub pay_to: String,
 
@@ -1625,14 +1794,9 @@ impl X402PaymentRequirement {
     }
 }
 
-/// x402 payment provider — who enforces the paywall.
-///
-/// `Local` (default) means this gateway runs the x402 challenge / verify /
-/// settle itself. `AgentPay` delegates the *entire* payment interaction to a
-/// remote payment gateway over the `fabric://` protocol: every
-/// request is relayed to the configured payment surface, whose `402`
-/// challenge is relayed back to the caller and whose `200` authorises the
-/// request to proceed to this surface's own upstream.
+/// x402 payment provider of a stored `x402` policy. An enabled `AgentPay`
+/// policy loads as [`crate::config::agent_surface::PaymentPolicy::AgentPay`];
+/// `Local` is the unsupported local paywall.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum X402Provider {
@@ -1650,12 +1814,8 @@ impl X402Provider {
     }
 }
 
-/// Which payment protocol the remote payment gateway enforces when
-/// `X402Provider::AgentPay` delegates the whole paywall over `fabric://`. This
-/// gateway's delegation transport is protocol-agnostic — the request/response
-/// are relayed verbatim regardless of this marker — so it exists purely to make
-/// the operator's choice explicit in config, the dashboard, and the delegation
-/// audit log, rather than to change any enforcement behavior.
+/// Which payment protocol a stored `x402` delegation policy named. Dropped
+/// when the policy loads as an `agent_pay` policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegatedPaymentRail {
@@ -1899,26 +2059,72 @@ impl McpPaymentTriggers {
     }
 }
 
+/// The compiled form of one pattern list: a single set, or the patterns that
+/// compile on their own when the set does not.
+enum CompiledPatterns {
+    Set(regex::RegexSet),
+    Each(Vec<regex::Regex>),
+}
+
+impl CompiledPatterns {
+    fn compile(patterns: &[String]) -> Self {
+        let used = || {
+            patterns
+                .iter()
+                .filter(|p| !p.trim().is_empty())
+        };
+        match regex::RegexSet::new(used()) {
+            Ok(set) => Self::Set(set),
+            Err(_) => Self::Each(
+                used()
+                    .filter_map(|p| regex::Regex::new(p).ok())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn is_match(
+        &self,
+        s: &str,
+    ) -> bool {
+        match self {
+            Self::Set(set) => set.is_match(s),
+            Self::Each(each) => each
+                .iter()
+                .any(|regex| regex.is_match(s)),
+        }
+    }
+}
+
+/// How many distinct pattern lists stay compiled; a full cache is emptied.
+const COMPILED_PATTERN_LISTS: usize = 512;
+
 fn any_pattern_matches(
     patterns: &[String],
     s: &str,
 ) -> bool {
-    if let Ok(set) = regex::RegexSet::new(
-        patterns
-            .iter()
-            .filter(|p| !p.trim().is_empty()),
-    ) {
-        set.is_match(s)
-    } else {
-        patterns
-            .iter()
-            .filter(|p| !p.trim().is_empty())
-            .any(|p| {
-                regex::Regex::new(p)
-                    .map(|r| r.is_match(s))
-                    .unwrap_or(false)
-            })
-    }
+    use std::collections::HashMap;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    static CACHE: LazyLock<Mutex<HashMap<Vec<String>, Arc<CompiledPatterns>>>> = LazyLock::new(Default::default);
+
+    let compiled = {
+        let mut cache = CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match cache.get(patterns) {
+            Some(compiled) => compiled.clone(),
+            None => {
+                if cache.len() >= COMPILED_PATTERN_LISTS {
+                    cache.clear();
+                }
+                let compiled = Arc::new(CompiledPatterns::compile(patterns));
+                cache.insert(patterns.to_vec(), compiled.clone());
+                compiled
+            }
+        }
+    };
+    compiled.is_match(s)
 }
 
 #[cfg(test)]
@@ -2006,6 +2212,18 @@ mod mcp_payment_triggers_tests {
     }
 
     #[test]
+    fn compiled_patterns_match_the_same_before_and_after_the_cache_is_emptied() {
+        for index in 0..(super::COMPILED_PATTERN_LISTS + 50) {
+            let t = McpPaymentTriggers::Match {
+                patterns: vec![format!("^tool{index}$")],
+            };
+            assert!(t.requires_payment(&format!("tool{index}")));
+            assert!(!t.requires_payment(&format!("tool{index}x")));
+            assert!(t.requires_payment(&format!("tool{index}")), "a cached list keeps matching");
+        }
+    }
+
+    #[test]
     fn serde_round_trip_match() {
         let t = McpPaymentTriggers::Match {
             patterns: vec!["^paid_".to_string()],
@@ -2025,28 +2243,40 @@ mod mcp_payment_triggers_tests {
 }
 
 /// A2A method filter for payment triggers
-/// Allows filtering by JSON-RPC method and optional message content regex
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Allows filtering by JSON-RPC method and optional message content text
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct A2AMethodFilter {
     /// JSON-RPC method name (e.g., "SendMessage", "GetTask", "ListTasks")
     pub method: String,
 
-    /// Optional regex patterns to match message content
+    /// Optional plain text a message must contain (not a regular expression).
     /// For methods with message payloads (SendMessage, SendStreamingMessage),
-    /// payment is only required if the message matches at least one pattern
+    /// payment is only required if the message contains at least one of them.
     /// Empty list means match all requests for this method
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_patterns: Vec<String>,
 }
 
 /// Facilitator key configuration with private key and derived address
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FacilitatorKeyConfig {
     /// Private key (hex-encoded, 0x-prefixed) or environment variable reference (e.g., "$FACILITATOR_KEY_BASE")
     pub private_key: String,
 
     /// Ethereum address derived from the private key (public information, doesn't need to be obfuscated)
     pub address: String,
+}
+
+impl std::fmt::Debug for FacilitatorKeyConfig {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("FacilitatorKeyConfig")
+            .field("private_key", &crate::observability::loggable::REDACTED)
+            .field("address", &self.address)
+            .finish()
+    }
 }
 
 /// x402 protocol configuration
@@ -2501,7 +2731,7 @@ pub struct ConfigFilePaths {
     #[serde(default = "default_payment_policy_path")]
     pub x402: String,
 
-    /// X402Proxy configuration file path - defines wallets and networks for MCP proxy payments
+    /// Path of `x402-proxy.json`, the removed MPP auto-pay's wallets; not read.
     #[serde(default = "default_x402_proxy_config_path", alias = "mcpx402")]
     pub x402_proxy: String,
 
@@ -2660,7 +2890,8 @@ pub struct StoragePaths {
     #[serde(default = "default_mpp_transactions_storage_path")]
     pub mpp_transactions: String,
 
-    /// Path to store session data (persistent sessions across restarts)
+    /// Path to store session data (persistent sessions across restarts). DID Auth
+    /// sessions are kept in its `didauth` subdirectory.
     #[serde(default = "default_sessions_storage_path")]
     pub sessions: String,
 
@@ -2763,6 +2994,40 @@ impl Default for StoragePaths {
     }
 }
 
+/// A configured key or key source that `Debug` prints as redacted.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(String);
+
+impl std::ops::Deref for SecretValue {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretValue {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretValue {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        std::fmt::Debug::fmt(crate::observability::loggable::REDACTED, f)
+    }
+}
+
 /// Bootstrap configuration - loaded from file to determine how to load full config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
@@ -2799,7 +3064,7 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub oob_connection: OobConnectionConfig,
 
-    /// Reconnect policy for connection-point DIDComm links
+    /// Reconnect policy for connection-point DIDComm links and trust registry connections
     #[serde(default)]
     pub reconnect_policy: ReconnectPolicyConfig,
 
@@ -2864,11 +3129,11 @@ pub struct BootstrapConfig {
     /// `file://path` reference. `aws_secrets://` / `aws_parameter_store://` are not
     /// supported. Absent from config = a parse error; empty or unresolvable = the
     /// service fails to start.
-    pub backup_encryption_key: String,
+    pub backup_encryption_key: SecretValue,
 
     /// Optional source resolving to up to four ordered, comma-separated previous backup keys.
     #[serde(default)]
-    pub legacy_backup_encryption_keys: Option<String>,
+    pub legacy_backup_encryption_keys: Option<SecretValue>,
 
     /// Trust Registry runtime tunables (Q3 resource name toggle etc.).
     #[serde(default)]
@@ -2885,6 +3150,11 @@ pub struct BootstrapConfig {
     /// its local issuer key. Startup-only. See `src/config/vta.rs`.
     #[serde(default)]
     pub vta: crate::config::vta::VtaConfig,
+    /// Credential provider rules (`[credential_policy]`): https token endpoints,
+    /// tenant credential isolation, and the exact http endpoints allowed.
+    /// Startup-only; every rule defaults to `warn`.
+    #[serde(default)]
+    pub credential_policy: super::credential_policy::CredentialPolicyConfig,
 
     /// Directory the bootstrap config.toml was loaded from. Populated
     /// by `BootstrapConfig::from_file` and used by services that need
@@ -2905,6 +3175,26 @@ pub struct BootstrapConfig {
     /// serves fresh state the moment it is promoted.
     #[serde(default)]
     pub cache_refresh_interval_secs: u64,
+
+    /// `gateway.json`'s `transit_token_max_lifetime_secs` as the gateway started
+    /// with it ([`Self::pin_transit_token_max_lifetime`]). Every later load of
+    /// `gateway.json` takes this value instead of the file's.
+    #[serde(skip)]
+    pub pinned_transit_token_max_lifetime_secs: Option<u64>,
+
+    /// `gateway.json`'s `external_consent_resource_origins` as the gateway
+    /// started with it ([`Self::pin_external_consent_resource_origins`]).
+    /// Every later load of `gateway.json` takes this value instead of the
+    /// file's.
+    #[serde(skip)]
+    pub pinned_external_consent_resource_origins: Option<std::collections::HashMap<String, Vec<String>>>,
+
+    /// `gateway.json`'s `external_consent_issuers` as the gateway started with
+    /// it, set or not ([`Self::pin_external_consent_issuers`]); `None` until
+    /// pinned. Every later load of `gateway.json` takes this value instead of
+    /// the file's.
+    #[serde(skip)]
+    pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// DID document cache configuration
@@ -3278,72 +3568,6 @@ fn default_agent_surface_templates_dir() -> String {
     "agent_surface_templates".to_string()
 }
 
-/// EVM test endpoint configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EvmTestEndpointConfig {
-    /// CAIP-2 network identifier (e.g., "eip155:84532" for Base Sepolia)
-    pub network: String,
-
-    /// RPC endpoint URL
-    pub rpc_endpoint: String,
-
-    /// Token contract address
-    pub token_address: String,
-
-    /// Recipient address for test payments
-    pub recipient: String,
-
-    /// Amount in token's smallest unit (e.g., "1000000" for 1 USDC with 6 decimals)
-    pub amount: String,
-
-    /// Payment method (e.g., "eip3009", "permit2")
-    pub payment_method: String,
-
-    /// Token EIP-712 domain name (e.g., "USDC"), issued as `extra.name`; required for EIP-3009
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_name: Option<String>,
-
-    /// Token EIP-712 domain version (e.g., "2"), issued as `extra.version`; required for EIP-3009
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_version: Option<String>,
-}
-
-/// Solana test endpoint configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SolanaTestEndpointConfig {
-    /// CAIP-2 network identifier (e.g., "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1" for devnet)
-    pub network: String,
-
-    /// RPC endpoint URL
-    pub rpc_endpoint: String,
-
-    /// Token mint address
-    pub token_address: String,
-
-    /// Recipient address for test payments
-    pub recipient: String,
-
-    /// Amount in token's smallest unit (e.g., "1000000" for 1 USDC with 6 decimals)
-    pub amount: String,
-}
-
-/// Test endpoints configuration
-/// Provides deployment-specific values for E2E payment testing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TestEndpointsConfig {
-    /// EVM test endpoint (Base Sepolia by default)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evm: Option<EvmTestEndpointConfig>,
-
-    /// Solana devnet test endpoint
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solana_devnet: Option<SolanaTestEndpointConfig>,
-
-    /// Solana mainnet test endpoint
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub solana_mainnet: Option<SolanaTestEndpointConfig>,
-}
-
 /// How to inject a DID identity into outgoing requests
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -3509,8 +3733,9 @@ mod outbound_config_tests {
                     "alias": *a,
                     "target_endpoint": "https://example.com",
                     "protocol": "a2a",
-                    "gateway_url": format!("https://gw.internal:9000/outgoing/test/{}", a),
+                    "gateway_url": format!("https://gw.internal:9000/outbound/test/{}", a),
                     "require_transit_token": false,
+                    "allow_unauthenticated_callers": true,
                 })
             })
             .collect();
@@ -3659,6 +3884,28 @@ mod outbound_config_tests {
                 .iter()
                 .any(|e: &String| e.contains("lowercase"))
         );
+    }
+
+    #[test]
+    fn validate_outbound_warns_that_transit_source_auth_refuses_every_request() {
+        let mut surface = surface_with_outbound(true, &["partner-a"]);
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .shared
+            .source_auth = Some(
+            serde_json::from_value(json!({
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "transit-caller-key"
+            }))
+            .unwrap(),
+        );
+
+        let errors = surface.validate_outbound();
+
+        assert_eq!(errors, vec![crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string()]);
     }
 
     // ── Listener backward-compat ─────────────────────────────────────────────
@@ -3831,6 +4078,24 @@ mod a2a_validate_tests {
     }
 
     #[test]
+    fn max_body_size_must_be_at_least_one_byte() {
+        for good in [1, A2aConfig::default().max_body_size] {
+            let c = A2aConfig {
+                max_body_size: good,
+                ..A2aConfig::default()
+            };
+            assert_eq!(c.validate(), Ok(()), "{good} should be accepted");
+        }
+        let err = A2aConfig {
+            max_body_size: 0,
+            ..A2aConfig::default()
+        }
+        .validate()
+        .expect_err("0 must be refused");
+        assert_eq!(err, "a2a.max_body_size must be at least 1 byte");
+    }
+
+    #[test]
     fn stream_max_lifetime_defaults_to_an_hour_and_is_bounded() {
         let from_empty_table: A2aConfig = toml::from_str("").expect("an empty [a2a] table must deserialize");
         assert_eq!(from_empty_table.stream_max_lifetime_secs, 3600);
@@ -3920,6 +4185,36 @@ mod unresolved_outbound_tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn only_active_surfaces_are_bucketed_onto_outbound_ports() {
+        let surface = |name: &str, status: &str| {
+            surface_with_transit(json!({
+                "name": name,
+                "status": status,
+                "access_point": { "listen_address": "https://in.example.com", "route": format!("/{name}"), "protocol": "a2a" },
+                "target": { "endpoint": "http://localhost:1/x" },
+                "transit": {
+                    "outbound_listen_address": "https://out.example.com",
+                    "points": [{ "alias": "tp1", "target_endpoint": "http://localhost:2" }]
+                }
+            }))
+        };
+        let surfaces = [surface("live", "active"), surface("gone", "deleted"), surface("off", "disabled")];
+
+        let by_port = group_outbound_vcs_by_port(&surfaces, &[8081], outbound_resolver);
+
+        let bucketed: Vec<&str> = by_port
+            .get(&8081)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(surface, _)| surface.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(bucketed, ["live"]);
     }
 
     #[test]
@@ -4309,6 +4604,231 @@ mod x402_storage_config_tests {
             err.to_string()
                 .contains("invalid type"),
             "unexpected error: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_redaction_config_tests {
+    use super::*;
+    use crate::observability::log_redact::built_in_rules;
+
+    fn rule_names(config: &LogRedactionConfig) -> Vec<String> {
+        config
+            .rules
+            .iter()
+            .map(|rule| rule.name.clone())
+            .collect()
+    }
+
+    fn built_in_rule_names() -> Vec<String> {
+        built_in_rules()
+            .into_iter()
+            .map(|rule| rule.name)
+            .collect()
+    }
+
+    #[test]
+    fn test_logging_without_redaction_section_enables_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str("{}").expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+        assert!(!built_in_rule_names().is_empty());
+    }
+
+    #[test]
+    fn test_redaction_section_without_enabled_or_rules_enables_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str(r#"{"redaction": {}}"#).expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_redaction_enabled_false_disables_redaction() {
+        let logging: LoggingConfig = serde_json::from_str(r#"{"redaction": {"enabled": false}}"#).expect("parses");
+
+        assert!(!logging.redaction.enabled);
+    }
+
+    #[test]
+    fn test_redaction_operator_rules_replace_built_in_rules() {
+        let logging: LoggingConfig = serde_json::from_str(
+            r#"{"redaction": {"rules": [{"name": "Ticket ids", "pattern": "TCK-\\d+", "replacement": "[TICKET]"}]}}"#,
+        )
+        .expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), vec!["Ticket ids".to_string()]);
+        assert_eq!(logging.redaction.rules[0].pattern, r"TCK-\d+");
+    }
+
+    #[test]
+    fn test_bootstrap_logging_table_without_redaction_enables_built_in_rules() {
+        let logging: LoggingConfig = toml::from_str("level = \"info\"\njson = false").expect("parses");
+
+        assert!(logging.redaction.enabled);
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_default_logging_config_enables_built_in_rules() {
+        let logging = LoggingConfig::default();
+
+        assert!(logging.redaction.enabled);
+        assert!(
+            logging
+                .redaction
+                .is_built_in()
+        );
+        assert_eq!(rule_names(&logging.redaction), built_in_rule_names());
+    }
+
+    #[test]
+    fn test_default_redaction_is_not_serialized_and_reads_back_as_default() {
+        let written = toml::to_string(&LoggingConfig::default()).expect("serializes");
+        assert!(!written.contains("redaction"), "{written}");
+        assert!(written.contains("level = \"info\""), "{written}");
+
+        let read_back: LoggingConfig = toml::from_str(&written).expect("parses");
+        assert!(
+            read_back
+                .redaction
+                .is_built_in()
+        );
+    }
+
+    #[test]
+    fn test_disabled_redaction_is_serialized() {
+        let logging = LoggingConfig {
+            redaction: LogRedactionConfig {
+                enabled: false,
+                ..LogRedactionConfig::default()
+            },
+            ..LoggingConfig::default()
+        };
+
+        let read_back: LoggingConfig =
+            serde_json::from_str(&serde_json::to_string(&logging).expect("serializes")).expect("parses");
+        assert!(!read_back.redaction.enabled);
+    }
+}
+
+#[cfg(test)]
+mod facilitator_key_config_tests {
+    use super::FacilitatorKeyConfig;
+
+    #[test]
+    fn test_facilitator_key_config_debug_redacts_private_key() {
+        let key = FacilitatorKeyConfig {
+            private_key: "test-private-key-marker".to_string(),
+            address: "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23".to_string(),
+        };
+
+        let rendered = format!("{key:?}");
+
+        assert!(!rendered.contains("test-private-key-marker"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod target_auth_method_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_credential_provider_method_defaults_to_a_bearer_authorization_header() {
+        let config: TargetAuthConfig =
+            serde_json::from_value(json!({"method": {"credential_provider": {"provider_id": "cp-1"}}})).unwrap();
+        assert_eq!(
+            config.method,
+            TargetAuthMethod::CredentialProvider {
+                provider_id: "cp-1".into(),
+                header_name: "Authorization".into(),
+                header_format: "Bearer {value}".into(),
+                scopes: vec![],
+            }
+        );
+        assert_eq!(config.fallback, TargetAuthFallback::Reject);
+        assert_eq!(config.method.header_name(), Some("Authorization"));
+        assert_eq!(
+            serde_json::to_value(&config.method).unwrap(),
+            json!({"credential_provider": {"provider_id": "cp-1", "header_name": "Authorization",
+                "header_format": "Bearer {value}"}})
+        );
+    }
+
+    #[test]
+    fn a_credential_provider_method_round_trips_its_header_and_scopes() {
+        let method = json!({"credential_provider": {"provider_id": "cp-1", "header_name": "x-api-key",
+            "header_format": "{value}", "scopes": ["https://www.googleapis.com/auth/cloud-platform"]}});
+        let parsed: TargetAuthMethod = serde_json::from_value(method.clone()).unwrap();
+        assert_eq!(parsed.header_name(), Some("x-api-key"));
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), method);
+    }
+
+    #[test]
+    fn stored_methods_still_load_and_name_their_header() {
+        let lookup: TargetAuthMethod = serde_json::from_value(json!("credential_lookup")).unwrap();
+        assert_eq!(lookup, TargetAuthMethod::CredentialLookup);
+        assert_eq!(lookup.header_name(), None);
+        let secret: TargetAuthMethod =
+            serde_json::from_value(json!({"static_secret": {"secret_id": "s", "header_name": "x-key"}})).unwrap();
+        assert_eq!(secret.header_name(), Some("x-key"));
+    }
+}
+
+#[cfg(test)]
+mod payment_ledger_config_tests {
+    use super::PaymentLedgerConfig;
+
+    #[test]
+    fn defaults_keep_seven_days_and_two_gibibytes() {
+        let config: PaymentLedgerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.retention_days(), 7);
+        assert_eq!(config.max_bytes(), 2048 * 1024 * 1024);
+        assert!(
+            config
+                .clamped_fields()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn configured_values_inside_their_range_are_used() {
+        let config: PaymentLedgerConfig =
+            serde_json::from_value(serde_json::json!({"retention_days": 90, "max_size_mb": 512})).unwrap();
+        assert_eq!(config.retention_days(), 90);
+        assert_eq!(config.max_bytes(), 512 * 1024 * 1024);
+        assert!(
+            config
+                .clamped_fields()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_and_reported() {
+        let config: PaymentLedgerConfig =
+            serde_json::from_value(serde_json::json!({"retention_days": 1000, "max_size_mb": 1})).unwrap();
+        assert_eq!(config.retention_days(), PaymentLedgerConfig::MAX_RETENTION_DAYS);
+        assert_eq!(config.max_bytes(), 16 * 1024 * 1024);
+        assert_eq!(config.clamped_fields(), vec!["retention_days", "max_size_mb"]);
+        let zero: PaymentLedgerConfig = serde_json::from_value(serde_json::json!({"retention_days": 0})).unwrap();
+        assert_eq!(zero.retention_days(), 1);
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused() {
+        let error = serde_json::from_value::<PaymentLedgerConfig>(serde_json::json!({"retention": 30})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field"),
+            "{error}"
         );
     }
 }

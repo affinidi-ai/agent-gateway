@@ -2,6 +2,16 @@ use std::collections::HashMap;
 
 use crate::bdd_support::config::config_tree::PolicyDefinitionFixture;
 
+/// The public https origin a surface's protected resource is published under.
+pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
+
+/// RFC 9728 discovery settings of the surface's caller authentication.
+#[derive(Debug, Clone)]
+pub struct ProtectedResourceFixture {
+    pub authorization_server: String,
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SurfaceConfigBuilder {
     pub protocol: String,
@@ -10,6 +20,8 @@ pub struct SurfaceConfigBuilder {
     pub registered_routes: Vec<String>,
     pub seed_surface: bool,
     pub source_auth: Option<SurfaceSourceAuthConfig>,
+    /// Source authentication methods after `source_auth`, in order.
+    pub additional_source_auth: Vec<SurfaceSourceAuthConfig>,
     pub alternate_variant_source_auth: Option<SurfaceSourceAuthConfig>,
     pub alternate_variant_target_timeout_secs: Option<u64>,
     pub alternate_variant_complete_mode: bool,
@@ -18,6 +30,7 @@ pub struct SurfaceConfigBuilder {
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
+    pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
     pub mcp_tool_gating: Option<serde_json::Value>,
     pub mcp_tool_gating_condition_policy: Option<RequestPolicyFixture>,
@@ -27,6 +40,8 @@ pub struct SurfaceConfigBuilder {
     pub alternate_variant_target_policy: Option<VariantTargetPolicyFixture>,
     pub custom_response_headers: HashMap<String, String>,
     pub override_target_url: Option<String>,
+    /// The path the Target endpoint, or the MCP proxy base URL, adds to the target's address.
+    pub target_base_path: Option<String>,
     pub mcp_proxy_target: Option<McpProxyTargetFixture>,
     pub a2a_proxy_target: Option<A2aProxyTargetFixture>,
     pub custom_metadata: Option<SurfaceCustomMetadataConfig>,
@@ -37,17 +52,40 @@ pub struct SurfaceConfigBuilder {
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
     pub agent_card_path: Option<String>,
-    pub transit_point: Option<SurfaceTransitPointConfig>,
+    pub transit_points: Vec<SurfaceTransitPointConfig>,
+    /// The surface sets `transit.source_auth`, as one stored before the admin
+    /// API refused it does.
+    pub transit_source_auth: bool,
+    /// How long the surface's transit tokens live, in seconds.
+    pub transit_token_lifetime_secs: Option<u64>,
+    /// The appliance's `transit_token_max_lifetime_secs` in `gateway.json`.
+    pub transit_token_max_lifetime_secs: Option<u64>,
     pub didwebvh_identity: Option<DidWebVhIdentityFixture>,
     pub caller_trust_check_list: Vec<serde_json::Value>,
-    pub target_trust_check_list: Vec<serde_json::Value>,
+    pub trust_recorder_entries: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
+    pub protected_resource: Option<ProtectedResourceFixture>,
+    /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
+    /// https origin a Transit Point's `mcp_http.authorization` resource must use.
+    pub outbound_public_origin: bool,
     pub a2a_settings: Option<serde_json::Value>,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// The gateway logs its `audit` target events at info level and keeps its log for the
+    /// scenario to read.
+    pub logs_audit_events: bool,
+    /// The tenant that owns the surface; appliance-wide when absent.
+    pub tenant_id: Option<String>,
+    /// The `[credential_policy]` rules the gateway starts with set to `enforce`.
+    pub enforced_credential_rules: Vec<String>,
+    pub token_request_timeout_secs: Option<u64>,
+    /// The gateway logs warnings and keeps its log for the scenario to read.
+    pub keeps_gateway_log: bool,
+    /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
+    pub writes_log_directory: bool,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -59,6 +97,7 @@ impl Default for SurfaceConfigBuilder {
             registered_routes: vec!["/smoke".to_string()],
             seed_surface: true,
             source_auth: None,
+            additional_source_auth: Vec::new(),
             alternate_variant_source_auth: None,
             alternate_variant_target_timeout_secs: None,
             alternate_variant_complete_mode: false,
@@ -67,6 +106,7 @@ impl Default for SurfaceConfigBuilder {
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
             target_auth: None,
+            target_auth_provider: None,
             mcp_tool_policy: None,
             mcp_tool_gating: None,
             mcp_tool_gating_condition_policy: None,
@@ -76,8 +116,11 @@ impl Default for SurfaceConfigBuilder {
             alternate_variant_target_policy: None,
             custom_response_headers: HashMap::new(),
             override_target_url: None,
+            target_base_path: None,
             mcp_proxy_target: None,
             a2a_proxy_target: None,
+            protected_resource: None,
+            outbound_public_origin: false,
             custom_metadata: None,
             credential_delegation: None,
             oauth_provider_base_url: None,
@@ -86,15 +129,24 @@ impl Default for SurfaceConfigBuilder {
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
             agent_card_path: None,
-            transit_point: None,
+            transit_points: Vec::new(),
+            transit_source_auth: false,
+            transit_token_lifetime_secs: None,
+            transit_token_max_lifetime_secs: None,
             didwebvh_identity: None,
             caller_trust_check_list: Vec::new(),
-            target_trust_check_list: Vec::new(),
+            trust_recorder_entries: Vec::new(),
             transit_shared_policy: None,
             mcp_http: None,
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            logs_audit_events: false,
+            tenant_id: None,
+            enforced_credential_rules: Vec::new(),
+            token_request_timeout_secs: None,
+            keeps_gateway_log: false,
+            writes_log_directory: false,
         }
     }
 }
@@ -169,6 +221,8 @@ pub struct McpProxyTargetFixture {
     pub proxy_id: String,
     pub openapi_spec: Option<String>,
     pub disabled: bool,
+    /// The proxy's `base_url` names the REST API with `https://` instead of `http://`.
+    pub https_base_url: bool,
 }
 
 impl McpProxyTargetFixture {
@@ -177,6 +231,7 @@ impl McpProxyTargetFixture {
             proxy_id: proxy_id.into(),
             openapi_spec: None,
             disabled: false,
+            https_base_url: false,
         }
     }
 
@@ -200,6 +255,55 @@ pub struct SurfaceTransitPointConfig {
     pub protocol: String,
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingConfig,
     pub managed_identity: Option<TransitPointManagedIdentityConfig>,
+    pub trust_check_list: Vec<serde_json::Value>,
+    pub policy: Option<RequestPolicyFixture>,
+    pub require_transit_token: bool,
+    /// The Transit Point's own `source_auth`.
+    pub source_auth: Option<serde_json::Value>,
+    /// Serves callers it does not authenticate when it requires no transit
+    /// token and has no `source_auth`.
+    pub allow_unauthenticated_callers: bool,
+    /// The surface's delegated credential is this Transit Point's own
+    /// `transit_credentials` rather than the surface's `outbound_credentials`.
+    pub delegated_credentials: bool,
+    /// The Transit Point authenticates its target with the surface's
+    /// `target_auth_provider`.
+    pub target_auth_provider: bool,
+    /// The `fallback` of the Transit Point's `target_auth`.
+    pub target_auth_fallback: String,
+    /// The Transit Point authenticates its target with a static secret that the gateway does
+    /// not hold instead.
+    pub target_auth_secret: Option<SurfaceTargetAuthConfig>,
+    /// The path the Transit Point's target endpoint adds to its destination's address.
+    pub target_base_path: Option<String>,
+    /// Requests per minute the Transit Point admits from each caller
+    /// (`per_caller_rate_limit`).
+    pub per_caller_rate_limit_per_minute: Option<u32>,
+}
+
+impl SurfaceTransitPointConfig {
+    pub fn new(
+        alias: impl Into<String>,
+        protocol: impl Into<String>,
+    ) -> Self {
+        Self {
+            alias: alias.into(),
+            protocol: protocol.into(),
+            header_metadata_mapping: Default::default(),
+            managed_identity: None,
+            trust_check_list: Vec::new(),
+            policy: None,
+            require_transit_token: false,
+            source_auth: None,
+            allow_unauthenticated_callers: true,
+            delegated_credentials: false,
+            target_auth_provider: false,
+            target_auth_fallback: "reject".to_string(),
+            target_auth_secret: None,
+            target_base_path: None,
+            per_caller_rate_limit_per_minute: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +344,7 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    pub forward_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +370,50 @@ pub struct SurfaceTargetAuthConfig {
     pub header_format: String,
     pub fallback: String,
     pub secret_value: Option<String>,
+}
+
+/// A Target authenticated with a credential provider's token. The harness serves the
+/// provider's token endpoint and sets `token_endpoint` before the gateway starts.
+#[derive(Debug, Clone)]
+pub struct SurfaceTargetAuthProviderConfig {
+    pub grant: TargetAuthProviderGrant,
+    pub fallback: String,
+    pub token_status: u16,
+    pub expires_in: u64,
+    pub token_endpoint: Option<String>,
+    /// The test allowlist admits the http token endpoint's origin for egress only, so the
+    /// gateway holds it to the https rule as it would any http token endpoint.
+    pub insecure_token_endpoint: bool,
+    /// The surface's own Target authenticates with this provider; `false` when only a
+    /// Transit Point or a delegated credential binding uses it.
+    pub authenticates_surface_target: bool,
+    /// A JWT Bearer provider's signing-key secret holds a whole service account JSON key
+    /// file whose `private_key_id` names the key, and the provider sets no key id itself.
+    pub signing_key_is_service_account_file: bool,
+    /// The `jwt_subject` a JWT Bearer provider stores; the grant's `sub` claim.
+    pub jwt_subject: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAuthProviderGrant {
+    ClientCredentials,
+    JwtBearer,
+}
+
+impl SurfaceTargetAuthProviderConfig {
+    pub fn new(grant: TargetAuthProviderGrant) -> Self {
+        Self {
+            grant,
+            fallback: "reject".to_string(),
+            token_status: 200,
+            expires_in: 3600,
+            token_endpoint: None,
+            insecure_token_endpoint: false,
+            authenticates_surface_target: true,
+            signing_key_is_service_account_file: false,
+            jwt_subject: Some("bdd-subject@example.com".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -361,7 +510,15 @@ pub struct SurfaceCredentialDelegationConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialProviderKind {
     OAuth2AuthorizationCode,
-    ApiKey { secret_id: String, secret_value: String },
+    ApiKey {
+        secret_id: String,
+        secret_value: String,
+    },
+    /// A provider the gateway has no record of, as after it was deleted.
+    Unknown,
+    /// The client credentials provider the harness serves as the surface's
+    /// `target_auth_provider`, whose fixture and secrets that config writes.
+    ClientCredentials,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +602,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),

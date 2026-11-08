@@ -12,6 +12,12 @@
 import type { SurfaceNodeType } from '../../nodeTypes';
 import type { DerivedEdge, EdgeArchetypeDef, SlotDef, SlotDirection, SlotId } from './types';
 import type { CanvasNode } from '../../SurfaceCanvas';
+import { A2A_PROXY_ENDPOINT_PREFIX } from '../_shared/a2aProxyEndpoint';
+
+export const TRUST_CHECK_CALLER_SLOT_ID = 'request:trust-check-access_point_trust_check_list';
+export const TRUST_CHECK_MANAGED_AGENT_SLOT_ID = 'request:trust-check-target_trust_check_list';
+export const TRUST_CHECK_TRANSIT_POINT_SLOT_ID =
+  'request:trust-check-transit_points_trust_check_list';
 
 /** Sentinel meaning "any element type that matches this slot's direction". */
 export const ANY_EDGE_MW = '*' as const;
@@ -56,10 +62,10 @@ function typedSlot(
   // node's persisted `slotId` back to the correct payload path.
   const id =
     type === 'trust-check' && payloadPathTemplate
-      ? // trust-check has a `_list` slot on both legs with identical
-        // path tails (`trust_check_list`). Encode the full path so
-        // ap-ma vs ma-tp slot ids stay distinct for `findSlotById`.
-        `${direction}:${type}-${payloadPathTemplate.replace(/\./g, '_')}`
+      ? // trust-check has a `trust_check_list` slot on every leg. Encode the
+        // full path so the caller, Managed Agent and Transit Point slot ids
+        // stay distinct for `findSlotById`.
+        `${direction}:${type}-${payloadPathTemplate.replace('[{owner}]', '').replace(/\./g, '_')}`
       : type === 'identity' && payloadPathTemplate
         ? `${direction}:${type}-${payloadPathTemplate.split('.').pop()}`
         : `${direction}:${type}`;
@@ -235,6 +241,17 @@ const maExternalArchetype: RuntimeEdgeArchetypeDef = {
       'Credential Delegation',
       { ownedBy: 'source' }
     ),
+    // The Managed Agent's own target-leg Trust Check list, which runs only
+    // for an `a2a-proxy://` or `fabric://` Managed Agent target (see
+    // `makeSurfaceSlotFilter`).
+    typedSlot(
+      'trust-check',
+      'request',
+      62,
+      'target.trust_check_list',
+      'Trust check (Managed Agent target leg)',
+      { ownedBy: 'source' }
+    ),
     // Primary-target (MA→EXT) workload binding. Writes to
     // `target.workload_binding`; the workload-binding element owns the slice
     // via its own buildPayload (unlike the per-TP path, which the Transit
@@ -259,16 +276,14 @@ const maTpArchetype: RuntimeEdgeArchetypeDef = {
     typedSlot('policy', 'request', 70, 'transit.points[{owner}].policy', 'Per-TP request policy', {
       ownedBy: 'target',
     }),
-    // Target-leg trust-check writes to `target.trust_check_list` — a
-    // target-wide (not per-TP) list — so the canvas node is owned by
-    // the MA (edge source), same as hydration parents it. `ownedBy:
-    // 'source'` keeps drop-parent and hydration-parent in agreement;
-    // `deriveEdges` binds the MA-child node to every ma-tp edge so
-    // snapping works on any MA→TP arrow.
-    typedSlot('trust-check', 'request', 60, 'target.trust_check_list', 'Trust check (target leg)', {
-      ownedBy: 'source',
-      cardinality: 'one',
-    }),
+    typedSlot(
+      'trust-check',
+      'request',
+      60,
+      'transit.points[{owner}].trust_check_list',
+      'Trust check (this Transit Point)',
+      { ownedBy: 'target' }
+    ),
     typedSlot(
       'policy',
       'response',
@@ -563,11 +578,16 @@ export function getSlot(archetypeId: string, slotId: SlotId): RuntimeSlotDef | u
  * A second class of hidden slot is protocol-scoped `ma-tp` request slots
  * whose target-leg pipeline stage is only implemented for A2A/AP2 Transit
  * Points: Header Metadata Mapping (`request:metadata-extraction`) and the
- * target-leg Trust Check (`request:trust-check-target_trust_check_list`).
+ * Transit Point's target-leg Trust Check (`TRUST_CHECK_TRANSIT_POINT_SLOT_ID`).
  * The MCP outbound pipeline has no target-leg counterpart for these yet,
  * so they are offered only on `transit-point-a2a` / `transit-point-ap2`
  * edges — an MCP Transit Point never exposes them, and the caller-leg
  * (AP→MA) Trust Check remains available for MCP.
+ *
+ * The Managed Agent's own target-leg Trust Check
+ * (`TRUST_CHECK_MANAGED_AGENT_SLOT_ID`) is offered only when the Managed
+ * Agent targets an A2A proxy (`a2a-proxy://`) or another gateway
+ * (`fabric://`); the gateway rejects that list on a URL target.
  */
 export function makeSurfaceSlotFilter(
   managedAgentEndpoint: string | undefined,
@@ -577,9 +597,11 @@ export function makeSurfaceSlotFilter(
   const endpoint = typeof managedAgentEndpoint === 'string' ? managedAgentEndpoint.trim() : '';
   const isFabric = endpoint.startsWith('fabric://');
   const shouldHideExternalIdentity = !isFabric && !hasTransitPoints;
+  const shouldHideManagedAgentTrustCheck = !managedAgentTargetLegTrustCheckAllowed(endpoint);
   const nodeById = new Map(allNodes.map(n => [n.id, n] as const));
   const hasProtocolScopedTpSlot = allNodes.some(n => isTransitPointType(n.type));
-  if (!shouldHideExternalIdentity && !hasProtocolScopedTpSlot) return undefined;
+  if (!shouldHideExternalIdentity && !shouldHideManagedAgentTrustCheck && !hasProtocolScopedTpSlot)
+    return undefined;
   const isA2aFamilyTp = (edge: DerivedEdge): boolean => {
     const tp = nodeById.get(edge.endpoints.target);
     return tp?.type === 'transit-point-a2a' || tp?.type === 'transit-point-ap2';
@@ -588,12 +610,14 @@ export function makeSurfaceSlotFilter(
     nodeById.get(edge.endpoints.target)?.type === 'transit-point-mcp';
   return (slot, edge) => {
     if (shouldHideExternalIdentity && slot.id === 'response:identity-external') return false;
+    if (shouldHideManagedAgentTrustCheck && slot.id === TRUST_CHECK_MANAGED_AGENT_SLOT_ID) {
+      return false;
+    }
     // Header Metadata Mapping and the target-leg Trust Check have no MCP
     // target-leg implementation, so only offer them on A2A/AP2 TPs.
     if (
       edge.archetype === 'ma-tp' &&
-      (slot.id === 'request:metadata-extraction' ||
-        slot.id === 'request:trust-check-target_trust_check_list')
+      (slot.id === 'request:metadata-extraction' || slot.id === TRUST_CHECK_TRANSIT_POINT_SLOT_ID)
     ) {
       return isA2aFamilyTp(edge);
     }
@@ -605,6 +629,16 @@ export function makeSurfaceSlotFilter(
     }
     return true;
   };
+}
+
+/**
+ * True when the Managed Agent endpoint routes through an A2A proxy or
+ * another gateway, the only targets whose own target leg runs
+ * `target.trust_check_list`.
+ */
+export function managedAgentTargetLegTrustCheckAllowed(endpoint: unknown): boolean {
+  const ep = typeof endpoint === 'string' ? endpoint.trim() : '';
+  return ep.startsWith(A2A_PROXY_ENDPOINT_PREFIX) || ep.startsWith('fabric://');
 }
 
 /**

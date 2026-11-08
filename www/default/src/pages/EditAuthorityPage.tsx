@@ -169,10 +169,11 @@ const EditAuthorityPage: React.FC<EditAuthorityPageProps> = ({ embeddedId, onDon
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-authority-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="authority-editor-back-button"
           onClick={() => (onDone ? onDone() : navigate(-1))}
         >
           <i className="fas fa-arrow-left"></i>
@@ -181,9 +182,12 @@ const EditAuthorityPage: React.FC<EditAuthorityPageProps> = ({ embeddedId, onDon
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div></div>
         <div className="d-flex gap-2">
-          {isEditMode && <DeleteButton onDelete={handleDelete} />}
+          {isEditMode && (
+            <DeleteButton data-testid="authority-editor-delete-button" onDelete={handleDelete} />
+          )}
           <button
             className="btn btn-sm btn-primary"
+            data-testid="authority-editor-save-button"
             onClick={handleSubmit}
             disabled={saving || contextInvalid}
           >

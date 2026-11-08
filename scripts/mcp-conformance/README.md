@@ -90,7 +90,7 @@ not be fetched, `130` interrupted (SIGINT), `143` terminated (SIGTERM).
    forwards to the shim. A step in the scenario runs the suite against gateway
    1, so the requests cross the Fabric as framed streams.
 5. **Legacy phase.** Starts the same binary on another fresh env and runs
-   `compat.mjs rejected` (every endpoint answers the unmodelled `2025-11-25`
+   `compat.mjs rejected` (every endpoint answers the unmodelled `2099-01-01`
    with `-32022` and a `supported` list offering `2024-11-05`) and
    `compat.mjs legacy`. `compat.mjs admitted`, in the modern phase, requires
    every endpoint, `legacy-surface` included, to admit `2026-07-28`.

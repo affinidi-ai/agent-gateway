@@ -581,6 +581,7 @@ const LogsViewer: React.FC<LogsViewerProps> = ({
               setPendingLogs([]);
               lastLogLinesRef.current = [];
             }}
+            data-testid="logs-clear-button"
             title="Clear displayed logs"
             iconStart={<i className="fas fa-trash-alt" aria-hidden="true"></i>}
           >
@@ -590,6 +591,7 @@ const LogsViewer: React.FC<LogsViewerProps> = ({
             variant="secondary"
             size={controlSize}
             disabled={disableControlsWhenEmpty && displayedLogs.length === 0}
+            data-testid="logs-pause-button"
             onClick={togglePause}
             title={
               isPaused && pendingLogs.length > displayedLogs.length
@@ -609,6 +611,7 @@ const LogsViewer: React.FC<LogsViewerProps> = ({
           <AppButton
             variant="primary"
             size={controlSize}
+            data-testid="logs-refresh-button"
             onClick={refreshLogs}
             iconStart={<i className="fas fa-sync-alt" aria-hidden="true"></i>}
           >

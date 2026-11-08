@@ -15,8 +15,11 @@
 //!   PEM bytes. Rotating the cert or the secret value keeps the DID stable.
 //!   Re-pointing the channel at a different stored credential produces a
 //!   different DID.
-//! - **Independent of source auth.** The DID is derived from the *stored*
-//!   credential material, not from what the caller presents.
+//! - **Independent of source auth on the Managed Agent slot.** The DID is
+//!   derived from the *stored* credential the slot names, not from what the
+//!   caller presents.
+//!   `FromApiKey` without an `api_key_id` names no stored credential and
+//!   fails with [`CredentialIdentityError::ApiKeyIdMissing`].
 //! - **`Static { did }`** bypasses issuance: the configured DID is used
 //!   verbatim. No identity record is persisted.
 //! - **`Certificate.identity_did = Some(_)`** is honoured as a pre-bound
@@ -59,7 +62,20 @@ use crate::source_auth::ManagedIdentityConfig;
 
 // ── Pepper ────────────────────────────────────────────────────────────────
 
-static IDENTITY_HASH_PEPPER: OnceLock<Vec<u8>> = OnceLock::new();
+struct Pepper {
+    bytes: Vec<u8>,
+    /// Read from `AG_IDENTITY_HASH_PEPPER`, so the same on every restart, rather
+    /// than generated for this process.
+    configured: bool,
+}
+
+static IDENTITY_HASH_PEPPER: OnceLock<Pepper> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PEPPER_CONFIGURED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_PEPPER_BYTES: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
 
 pub async fn initialize_pepper() {
     if IDENTITY_HASH_PEPPER
@@ -70,17 +86,20 @@ pub async fn initialize_pepper() {
     }
 
     let resolved = PepperCacheConfig::load().await;
-    let _ = IDENTITY_HASH_PEPPER.set(resolved.pepper_hash);
+    let _ = IDENTITY_HASH_PEPPER.set(Pepper {
+        bytes: resolved.pepper_hash,
+        configured: resolved.configured,
+    });
 }
 
-fn new_ephemeral_pepper() -> Vec<u8> {
+fn new_ephemeral_pepper() -> Pepper {
     let mut out = vec![0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut out);
     tracing::warn!(
         target: "credential_identity",
         "Credential identity pepper was not initialized at startup; using an ephemeral pepper for this process."
     );
-    out
+    Pepper { bytes: out, configured: false }
 }
 
 /// Process-wide HMAC pepper for credential identity hashes.
@@ -92,7 +111,34 @@ fn new_ephemeral_pepper() -> Vec<u8> {
 fn pepper() -> &'static [u8] {
     IDENTITY_HASH_PEPPER
         .get_or_init(new_ephemeral_pepper)
+        .bytes
         .as_slice()
+}
+
+/// Whether the pepper was read from `AG_IDENTITY_HASH_PEPPER`. While it was
+/// generated for this process instead, every value derived from it, such as a
+/// delegated grant's id, changes on the next restart.
+pub fn pepper_is_configured() -> bool {
+    #[cfg(test)]
+    if let Some(configured) = TEST_PEPPER_CONFIGURED.with(std::cell::Cell::get) {
+        return configured;
+    }
+    IDENTITY_HASH_PEPPER
+        .get()
+        .is_some_and(|pepper| pepper.configured)
+}
+
+/// Make [`pepper_is_configured`] answer `configured` on this test thread.
+#[cfg(test)]
+pub(crate) fn configure_pepper_for_tests(configured: bool) {
+    TEST_PEPPER_CONFIGURED.with(|cell| cell.set(Some(configured)));
+}
+
+/// Make [`derived_key`] derive from `pepper` on this test thread, as a gateway
+/// run with another `AG_IDENTITY_HASH_PEPPER` would.
+#[cfg(test)]
+pub(crate) fn configure_pepper_bytes_for_tests(pepper: &[u8]) {
+    TEST_PEPPER_BYTES.with(|cell| *cell.borrow_mut() = Some(pepper.to_vec()));
 }
 
 // ── Error type ────────────────────────────────────────────────────────────
@@ -119,6 +165,9 @@ pub enum CredentialIdentityError {
 
     #[error("secret '{0}' not found in secrets store")]
     SecretNotFound(String),
+
+    #[error("from_api_key identity has no api_key_id")]
+    ApiKeyIdMissing,
 
     #[error("invalid static DID: {0}")]
     InvalidStaticDid(String),
@@ -159,6 +208,7 @@ impl CredentialIdentityError {
             }
             Self::CertificateNotFound(_)
             | Self::SecretNotFound(_)
+            | Self::ApiKeyIdMissing
             | Self::CertificateDisabled(_)
             | Self::CertificateExpired { .. }
             | Self::CertificateWrongKind { .. }
@@ -180,6 +230,7 @@ impl CredentialIdentityError {
             Self::CertificateWrongKind { .. } => "cert_wrong_kind",
             Self::CertificateParse { .. } => "cert_parse_failed",
             Self::SecretNotFound(_) => "secret_not_found",
+            Self::ApiKeyIdMissing => "api_key_id_missing",
             Self::InvalidStaticDid(_) => "invalid_static_did",
             Self::StoreLookup(_) => "store_lookup_failed",
             Self::JwtClaimsUnavailable => "jwt_claims_unavailable",
@@ -258,10 +309,12 @@ impl CredentialIdentityResolver {
                 .await
                 .map(Some),
 
-            ManagedIdentityConfig::FromApiKey { api_key_id } => self
+            ManagedIdentityConfig::FromApiKey { api_key_id: Some(api_key_id) } => self
                 .resolve_api_key(api_key_id, secrets_store)
                 .await
                 .map(Some),
+
+            ManagedIdentityConfig::FromApiKey { api_key_id: None } => Err(CredentialIdentityError::ApiKeyIdMissing),
 
             ManagedIdentityConfig::Static { did } => {
                 validate_did(did).map_err(CredentialIdentityError::InvalidStaticDid)?;
@@ -363,10 +416,39 @@ impl CredentialIdentityResolver {
         // Those IDs live in a separate subsystem (ApiKeyStore), not in SecretsStore,
         // so a secrets-store lookup would always fail. The hash is keyed on
         // `api_key_id` alone, so we derive identity directly — no store lookup needed.
-        if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
-            return Ok(self.derive_api_key_id_direct(api_key_id));
-        }
+        let (identity_fields, identity_hash) = if api_key_id.starts_with(crate::api_keys::KEY_ID_PREFIX) {
+            self.derive_api_key_id_direct(api_key_id)
+        } else {
+            self.resolve_secret_api_key(api_key_id, store)
+                .await?
+        };
+        Ok(CredentialIdentity::Derived { identity_fields, identity_hash })
+    }
 
+    /// The caller identity of the API key a request presented: an API Key
+    /// Provider key by its key id, a plain API Key by its `secret_id` through
+    /// the secrets store. Both hash as `from_api_key` does, so a provider key's
+    /// DID matches the one `from_api_key` gives the same key id. A plain key
+    /// whose `secret_id` equals a provider key id therefore shares its DID.
+    pub async fn resolve_presented_api_key(
+        &self,
+        key_name: &str,
+        from_provider: bool,
+        store: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
+        if from_provider {
+            Ok(self.derive_api_key_id_direct(key_name))
+        } else {
+            self.resolve_secret_api_key(key_name, store)
+                .await
+        }
+    }
+
+    async fn resolve_secret_api_key(
+        &self,
+        api_key_id: &str,
+        store: Option<&Arc<dyn SecretsStore>>,
+    ) -> Result<(HashMap<String, JsonValue>, String), CredentialIdentityError> {
         let store = store.ok_or(CredentialIdentityError::SecretsStoreUnavailable)?;
         let secret = store
             .get_by_secret_id(api_key_id)
@@ -379,10 +461,7 @@ impl CredentialIdentityResolver {
             .get(api_key_id)
             && entry.updated_at == secret.updated_at
         {
-            return Ok(CredentialIdentity::Derived {
-                identity_fields: entry.fields.clone(),
-                identity_hash: entry.hash.clone(),
-            });
+            return Ok((entry.fields.clone(), entry.hash.clone()));
         }
 
         let fields = build_api_key_identity_fields(api_key_id, &secret);
@@ -397,20 +476,17 @@ impl CredentialIdentityResolver {
             },
         );
 
-        Ok(CredentialIdentity::Derived {
-            identity_fields: fields,
-            identity_hash: hash,
-        })
+        Ok((fields, hash))
     }
 
-    /// Derive `CredentialIdentity` from an `atgk_`-prefixed API key ID without
-    /// a secrets-store lookup. Used when the key lives in the API key store
-    /// (a separate subsystem). The hash is identical to the secrets-store path
-    /// because it is keyed on `api_key_id` only.
+    /// Derive the identity fields and hash of an `atgk_`-prefixed API key ID
+    /// without a secrets-store lookup. Used when the key lives in the API key
+    /// store (a separate subsystem). The hash is identical to the secrets-store
+    /// path because it is keyed on `api_key_id` only.
     fn derive_api_key_id_direct(
         &self,
         api_key_id: &str,
-    ) -> CredentialIdentity {
+    ) -> (HashMap<String, JsonValue>, String) {
         // Sentinel updated_at that never expires — entries are valid for the
         // lifetime of the process. The key_id is immutable so no invalidation
         // is needed beyond process restart.
@@ -420,10 +496,7 @@ impl CredentialIdentityResolver {
             .get(api_key_id)
             && entry.updated_at == sentinel
         {
-            return CredentialIdentity::Derived {
-                identity_fields: entry.fields.clone(),
-                identity_hash: entry.hash.clone(),
-            };
+            return (entry.fields.clone(), entry.hash.clone());
         }
         let mut fields = HashMap::new();
         fields.insert("credential_type".to_string(), json!("api_key"));
@@ -437,10 +510,7 @@ impl CredentialIdentityResolver {
                 hash: hash.clone(),
             },
         );
-        CredentialIdentity::Derived {
-            identity_fields: fields,
-            identity_hash: hash,
-        }
+        (fields, hash)
     }
 
     /// Forget any cached entry for `certificate_id`. Call after store mutations.
@@ -576,6 +646,15 @@ fn validate_did(did: &str) -> Result<(), String> {
 pub(crate) fn derived_key(label: &[u8]) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    #[cfg(test)]
+    if let Some(pepper) = TEST_PEPPER_BYTES.with(|cell| cell.borrow().clone()) {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&pepper).expect("HMAC key");
+        mac.update(label);
+        return mac
+            .finalize()
+            .into_bytes()
+            .into();
+    }
     let mut mac = Hmac::<Sha256>::new_from_slice(pepper()).expect("HMAC key");
     mac.update(label);
     mac.finalize()
@@ -883,12 +962,25 @@ mod tests {
 
     #[tokio::test]
     async fn from_api_key_requires_store() {
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "k-1".into() };
+        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: Some("k-1".into()) };
         let err = derive_credential_identity(&mi, None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, CredentialIdentityError::SecretsStoreUnavailable));
         assert_eq!(err.classify(), CredentialIdentityErrorClass::BackendUnavailable);
+    }
+
+    #[tokio::test]
+    async fn from_api_key_without_id_is_misconfigured() {
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(make_secret("v")));
+        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: None };
+        let err = CredentialIdentityResolver::new()
+            .resolve(&mi, None, Some(&store))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CredentialIdentityError::ApiKeyIdMissing));
+        assert_eq!(err.classify(), CredentialIdentityErrorClass::Misconfigured);
+        assert_eq!(err.reason_label(), "api_key_id_missing");
     }
 
     #[tokio::test]
@@ -1003,7 +1095,9 @@ mod tests {
         let secret = make_secret("super-secret-value");
         let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
         let resolver = CredentialIdentityResolver::new();
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "demo-key".into() };
+        let mi = ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("demo-key".into()),
+        };
         let r = resolver
             .resolve(&mi, None, Some(&store))
             .await
@@ -1030,7 +1124,9 @@ mod tests {
     async fn from_api_key_hash_stable_across_secret_value_rotation() {
         // Same api_key_id, different secret value, bumped updated_at → same hash.
         let resolver = CredentialIdentityResolver::new();
-        let mi = ManagedIdentityConfig::FromApiKey { api_key_id: "demo-key".into() };
+        let mi = ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("demo-key".into()),
+        };
 
         let s1 = make_secret("v1");
         let store_a: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(s1));
@@ -1078,7 +1174,7 @@ mod tests {
         let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(secret));
         let resolver = CredentialIdentityResolver::new();
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "user-facing-key".into(),
+            api_key_id: Some("user-facing-key".into()),
         };
 
         let result = resolver
@@ -1107,7 +1203,7 @@ mod tests {
 
         // Confirm that looking up by the internal UUID would NOT resolve:
         let mi_wrong = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "internal-uuid-111".into(),
+            api_key_id: Some("internal-uuid-111".into()),
         };
         let err = resolver
             .resolve(&mi_wrong, None, Some(&store))
@@ -1290,7 +1386,7 @@ mod tests {
     async fn atgk_prefix_bypasses_secrets_store() {
         // atgk_-prefixed IDs must succeed even with no secrets store supplied.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "atgk_abc123def456".into(),
+            api_key_id: Some("atgk_abc123def456".into()),
         };
         let r = derive_credential_identity(&mi, None, None)
             .await
@@ -1320,7 +1416,7 @@ mod tests {
     async fn atgk_hash_stable_across_calls() {
         // Same api_key_id must always produce the same hash within a process.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "atgk_stable_key".into(),
+            api_key_id: Some("atgk_stable_key".into()),
         };
         let resolver = CredentialIdentityResolver::new();
         let h1 = unwrap_derived(
@@ -1349,7 +1445,7 @@ mod tests {
             &resolver
                 .resolve(
                     &ManagedIdentityConfig::FromApiKey {
-                        api_key_id: "atgk_key_a".into(),
+                        api_key_id: Some("atgk_key_a".into()),
                     },
                     None,
                     None,
@@ -1363,7 +1459,7 @@ mod tests {
             &resolver
                 .resolve(
                     &ManagedIdentityConfig::FromApiKey {
-                        api_key_id: "atgk_key_b".into(),
+                        api_key_id: Some("atgk_key_b".into()),
                     },
                     None,
                     None,
@@ -1380,7 +1476,7 @@ mod tests {
     async fn non_atgk_prefix_still_requires_secrets_store() {
         // Non-atgk_ api_key_ids must still go through the secrets store path.
         let mi = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "sk_some-secret-ref".into(),
+            api_key_id: Some("sk_some-secret-ref".into()),
         };
         let err = derive_credential_identity(&mi, None, None)
             .await
@@ -1389,5 +1485,58 @@ mod tests {
             matches!(err, CredentialIdentityError::SecretsStoreUnavailable),
             "non-atgk_ IDs must require a secrets store; got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn presented_provider_key_hashes_like_from_api_key_with_its_id() {
+        let resolver = CredentialIdentityResolver::new();
+        let (fields, hash) = resolver
+            .resolve_presented_api_key("atgk_client_1", true, None)
+            .await
+            .unwrap();
+        let configured = unwrap_derived(
+            &resolver
+                .resolve(
+                    &ManagedIdentityConfig::FromApiKey {
+                        api_key_id: Some("atgk_client_1".into()),
+                    },
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .0;
+        let (_, other) = resolver
+            .resolve_presented_api_key("atgk_client_2", true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(hash, configured);
+        assert_ne!(hash, other);
+        assert_eq!(fields.get("api_key_id"), Some(&json!("atgk_client_1")));
+    }
+
+    #[tokio::test]
+    async fn presented_plain_key_resolves_its_secret_through_the_store() {
+        let store: Arc<dyn SecretsStore> = Arc::new(InMemorySecretsStore::new(make_secret("v")));
+        let (fields, hash) = CredentialIdentityResolver::new()
+            .resolve_presented_api_key("demo-key", false, Some(&store))
+            .await
+            .unwrap();
+
+        assert_eq!(hash, hash_credential(&[("credential_type", "api_key"), ("api_key_id", "demo-key")]));
+        assert_eq!(fields.get("api_key_id"), Some(&json!("demo-key")));
+    }
+
+    #[tokio::test]
+    async fn presented_plain_key_needs_the_secrets_store() {
+        let err = CredentialIdentityResolver::new()
+            .resolve_presented_api_key("demo-key", false, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CredentialIdentityError::SecretsStoreUnavailable));
     }
 }

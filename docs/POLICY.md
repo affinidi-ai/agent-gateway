@@ -34,6 +34,24 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+### Payment context (`input.payment`)
+
+On a surface with an `agent_pay` payment policy, every policy that runs for it gets
+`input.payment`: the appliance-wide and per-gateway gateway policies as well as the surface
+policies, on the direct Access Point and on Fabric receive alike. A surface without an
+`agent_pay` policy has no `input.payment`.
+
+```json
+{"required": true, "rail": "x402", "amount": "0.25", "currency": "USD"}
+```
+
+`required` says whether the request is chargeable under the policy's triggers. `rail` is the
+rail of the credential the caller presented, or the only rail the payment surface's manifest
+offers; `amount` and `currency` come from the manifest snapshot. Each is omitted when unknown.
+Payment is taken only after policy allows the request, so a denied request is never charged,
+and policy never sees whether a payment succeeded: the older `input.payment.verified` field is
+gone, and a rule that reads it no longer matches.
+
 ## Versioned policy definitions
 
 Policy definitions are immutable and versioned
@@ -125,11 +143,114 @@ template syntax.
 
 ![Trust Check flow: inbound request, extract metadata, TRQP query, trust registry, then OPA policy decides](assets/diagrams/trust-check-flow.png)
 
-Each leg carries a `trust_check_list`: `AccessPoint.trust_check_list` for the caller leg
-and `Target.trust_check_list` for the target leg. A list holds at most
-`TRUST_CHECK_LIST_MAX` (10) elements
+Each leg carries a `trust_check_list`:
+
+| List | Runs on |
+| --- | --- |
+| `access_point.trust_check_list` | The caller leg, for requests arriving at the Access Point. |
+| `transit.points[].trust_check_list` | Requests the managed agent sends through that Transit Point, and no other. The Surface Builder adds Trust Checks to A2A and AP2 Transit Points only; on an MCP or HTTP Transit Point it shows a migrated copy read-only, to keep or remove. |
+| `target.trust_check_list` | The managed agent's own target leg: `a2a-proxy://` Targets and Fabric send. |
+
+A Transit Point with an empty list runs no Trust Check on its traffic: no agent-card fetch
+for trust, no identity verification, no TRQP query. A request through a Transit Point sees
+only that Transit Point's results, at `input.trust_check_results.target`, in all three
+outbound OPA scopes (gateway, surface, Transit Point).
+
+A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
 ([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
-override replaces the whole list verbatim, never element by element.
+override replaces the whole list verbatim, never element by element; a variant gives its
+Transit Points their own lists through its `transit.points` override.
+
+A write to the management API declares the per-Transit-Point shape with
+`trust_check_split: true`; the Surface Builder always sends it. A declared write is rejected
+with `400` when its `target.trust_check_list` is non-empty and its Managed Agent target is not
+`a2a-proxy://` or `fabric://` (an `http(s)` URL, `proxy://`, or no endpoint), because no stage
+runs that list for such a target. For a variant, only a target list the variant sets in its own
+override counts; an inherited list that cannot run on the variant's endpoint is ignored.
+
+A write that does not declare the shape is converted only while the stored surface has no
+Trust Check lists at all (no `trust_check_split` and no Transit Point lists): an undeclared
+create or `PUT` that carries a `target.trust_check_list` and no Transit Point lists is then
+treated as the old shape, converted exactly as a stored surface is (below), logged as a
+warning, and saved. Once the surface has Trust Check lists, an undeclared write cannot change
+them. An undeclared `PUT` keeps every stored Transit Point list for each Transit Point it sends
+without one, keeps the stored target list when it sends none, and is rejected with `400` if it
+sets a target list or a Transit Point list that differs from the stored one, including an
+explicit empty list, or leaves out a variant's own Transit Points that hold lists. A new
+Transit Point it adds without a list has no Trust Checks. An undeclared `PATCH` or variant write is
+rejected with `400` when it sets or clears a target list or Transit Points, including through a
+parent object such as `transit` or a variant's `overrides`, or by replacing `variants`; a
+variant `PUT` that sends `overrides` for a variant whose Transit Points hold lists counts as
+doing so. Such a write must be resent with `trust_check_split: true`. A `PATCH` that only moves
+an `a2a-proxy://` or `fabric://` target to another endpoint while its target list remains is
+rejected by the first rule until the list is removed.
+
+### Lists stored before per-Transit-Point checks
+
+Surfaces stored before Transit Points had their own lists kept one `target.trust_check_list`
+that ran on every Transit Point. The first time such a surface loads, the gateway copies that
+list onto each of its Transit Points (and those of each variant), marks each copy
+with `trust_check_migrated: true`, removes `target.trust_check_list` unless the Managed Agent
+target is `a2a-proxy://` or `fabric://`, sets `trust_check_split: true`, and saves the file. It logs the surface and the Transit Points that received copies,
+and warns when a list is removed without any Transit Point receiving it. Every Transit Point
+keeps its behaviour until an operator edits the surface. The Surface Builder flags
+each copy for review; through the API, remove a copy by saving the Transit Point without
+`trust_check_list` in a write that declares the shape.
+
+User-saved Surface Templates are converted the same way when they load, and when they are
+created, updated or imported without the marker; an imported export from an earlier release is
+converted. A template's endpoint is usually the `$TARGET_ENDPOINT` placeholder, so a template
+with a placeholder or empty endpoint keeps its `target.trust_check_list`, and its Transit Points
+still receive copies. When the Surface Builder loads a surface, including one created from such
+a template, whose target cannot run its target list and whose Transit Points all carry the same
+checks, it drops the Managed Agent's copy; otherwise the `400` above applies when the surface is
+saved.
+
+MCP and HTTP Transit Points receive a copy too, because the old list ran on them. There it
+usually reports `AGENT_CARD_UNAVAILABLE`, but an HTTP Transit Point whose destination serves an
+A2A agent card runs real identity and TRQP checks. The Surface Builder does not add Trust Checks
+to MCP or HTTP Transit Points and shows such a copy read-only, to keep or remove; the
+management API accepts a list on any Transit Point. Removing a copy during review means that
+Transit Point's traffic is no longer checked, so a policy that denied on its results allows
+it.
+
+A variant that inherited the base Transit Points but resolves to a different list receives
+its own copy of them in `overrides.transit.points`, so later edits to the base Transit Points,
+such as a new Transit Point, a changed destination or rotated credentials, no longer reach it.
+Variants saved by the Surface Builder already carry their own Transit Points and are not
+affected.
+
+`trust_check_split` is stored whenever the surface keeps a `target.trust_check_list` or any of
+its Transit Points has a `trust_check_list`. A surface file written outside the API in the
+per-Transit-Point shape must set it, or a target list in it is converted on load. When the
+marker is set and a target list sits on a target that cannot run it, the gateway logs a warning
+on load and the list never runs.
+
+The conversion is forward-only. A gateway release from before per-Transit-Point lists refuses a
+surface carrying `trust_check_split`, which every surface with Trust Checks on its target or
+Transit Points carries after the upgrade. It still loads a converted template, because it
+stores the template's surface unparsed, so applying it there can fail or create a surface
+without its Transit Point checks. Back up `_storage/agent_surfaces/` and
+`_storage/agent_surface_templates/` before upgrading if a rollback may be needed, and restore
+both on rollback.
+
+### Requiring checks in policy
+
+A Transit Point without checks leaves `input.trust_check_results` absent. Rules that only look
+for failures, such as `every r in input.trust_check_results.target { r.ok }` or a count of
+results with `ok == false` equal to zero, therefore allow every request through a Transit
+Point that has no checks, or whose checks were removed. Such a Transit Point also has no
+verified target identity: `input.agent` is absent in the gateway and surface scopes, and with
+`require_agent_context` the Transit Point scope reads it from the agent card's unsigned DID.
+When a policy requires Trust Checks, also require that they ran, or check specific element
+ids:
+
+```rego
+allow if {
+    count(input.trust_check_results.target) > 0
+    every r in input.trust_check_results.target { r.ok }
+}
+```
 
 Element validation is in
 [`src/trust_registry_verification/trust_check_element.rs`](../src/trust_registry_verification/trust_check_element.rs).
@@ -146,24 +267,39 @@ addressable from policy while `name` is only a label. Counts are code points, no
 When an audit sink selects `trust_check`, each element's outcome is recorded with the
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
-triggered it.
+triggered it. On the outbound path the record also names the Transit Point.
 
 ## Failed caller authentication
 
-Source auth does not refuse a request whose credential is missing or invalid. The
-request continues with no caller identity, `input.source_auth` is
-`{"method": "failed", "attempted_method": ..., "reason": ...}`. On every forwarding
+A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
+it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
+refuse a missing or invalid credential with `401` before policy, see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). Otherwise source auth
+does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
+`{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
+the method selected for the request (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
-Fabric receive) the stored target credential, or the A2A proxy's Direct Line secret,
-is not attached, because it vouches that the gateway vetted the caller. A surface that
+Fabric receive, the last for surfaces without protected resource metadata) the stored
+target credential, or the A2A proxy's Direct Line secret, is not attached, because it
+vouches that the gateway vetted the caller. A legacy surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
-with `500`.
+with `500`. A request to an MCP Access Point that publishes protected resource
+metadata never reaches policy with a failed credential, direct or over Fabric: a failed JWT
+bearer credential is refused with a `401` challenge pointing at that metadata on a direct
+request, and with a `401` without it over Fabric, and a failed credential of another method
+on that Access Point with a plain `401`, see
+[`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
-Over Fabric, the sending Gateway strips the credential header its own surface consumed
-before forwarding. A receiving surface that requires source authentication on that same
-header therefore sees every Fabric caller as failed and forwards without its target
-credential. Require caller authentication on one side of the Fabric hop, or use a
+A Transit Point's own `source_auth` is different: it refuses a missing or invalid credential
+itself, with `401`, before any policy runs, so an outbound policy never sees
+`"method": "failed"` (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)).
+
+Over Fabric, the sending Gateway strips the credential headers of every method its own
+surface configures before forwarding. A receiving surface without protected resource metadata that requires
+source authentication on that same header therefore sees every Fabric caller as failed and
+forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input
@@ -177,9 +313,35 @@ Check flagged an identity mismatch). Both carry how the DID was established:
 | --- | --- | --- |
 | `input.extension_identity.verification`, `input.agent.did_verification` | `vp` | The caller proved control of the DID with an identity presentation that verified and whose issuer is one of the sending connection's issuers. Only the fabric receive path produces it. |
 | | `vp_unanchored` | The caller proved control of the DID with an identity presentation that verified, but no trust anchor vouches for its issuer: the direct A2A path has no authenticated sender, so a self-issued credential ends here too. Trust its identity fields only after checking `input.agent.identity_issuer_did` or a Trust Check. |
-| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request (`from_jwt_claim`). |
-| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms and surface-configured identities (`static`, `from_mtls`, `from_api_key`). |
+| | `source_auth` | The DID is bound to the source credential this gateway authenticated on this request: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
+| | `unverified` | Nothing in the request proves the DID: `x-identity` payload pseudonyms, surface-configured identities (`static`, `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an inbound `from_api_key` slot, whose DID every holder of the secret shares. |
 | `input.extension_identity.verified`, `input.agent.did_verified` | `true` / `false` | Boolean projection: everything but `unverified` is verified. |
+
+On a direct request to a surface whose inbound identity is `from_api_key`, the
+caller is the API key it presents (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#from_api_key-on-the-inbound-slot)). Fabric
+receive does not read this mode; the request body sets the caller there (see
+[`FABRIC.md`](FABRIC.md)). On a direct request:
+
+- `input.extension_identity` and `input.agent.did`, `did_verified` and
+  `did_verification` are the key's DID, replacing any DID or identity
+  presentation in the request body.
+- When the body does not assert the key's own DID, including when it names no DID,
+  the trust-registry claims it made are dropped: `provider_did`, `trust_registry_did`,
+  `authority_did`, `identity_issuer_did`, `agent_dna` and the trust verifications. A Trust Check
+  preset that reads `input.agent.provider_did` therefore denies unless the body
+  asserts the key's own DID.
+- With no caller identity, such as after a failed key, `input.agent.did` is absent and
+  those trust-registry claims are always dropped.
+- Gateway-plane policy, including its global policy, runs before the key resolves, so it
+  sees no `input.agent.did` and none of those claims on these surfaces.
+- On a `fabric://` target only `access_point.inbound_policy` sees the key's DID, in
+  `input.extension_identity` (and `input.agent` when the Access Point has a Trust Check).
+  `target.policy` keeps its existing input, the target agent's card and the request body, so
+  a per-caller rule there matches `input.source_auth.key_name`.
+- A key that also identifies a Managed Agent gives its callers the Managed Agent's DID; see
+  [One key in both roles](SOURCE_AUTH.md#one-key-in-both-roles) for the surface policy that
+  refuses it.
 
 A DID copied from the request body or an agent card into `input.agent.did` that
 differs from `extension_identity.did`, or when there is none, carries
@@ -194,6 +356,138 @@ identity (`unverified` or `source_auth`). A rule such as
 The same rule denies every request on the direct A2A path, which never produces
 `vp`; a rule for that path accepts `vp_unanchored` together with a check on
 `input.agent.identity_issuer_did`.
+
+## Caller in Transit Point policy input
+
+Every outbound evaluation (gateway, surface, per-Transit-Point and response policies, and
+MCP tool gating conditions on a Transit Point) gets `input.transit`. It is never on an
+inbound evaluation, where `input.source_auth` and `input.extension_identity` carry the
+caller. It names two principals, each in its own field, because one call can carry both:
+
+- `input.transit.caller` is the end user the transit token names, as the Access Point
+  authenticated them. Without a transit token it is `anonymous`.
+- `input.transit.client` is the principal the Transit Point authenticated itself on this
+  request, such as the managed agent's resource-server token. It is absent when the Transit
+  Point authenticated none.
+
+A rule about the end user reads `caller`, and a rule about the client reads `client`;
+neither stands in for the other. A policy that reads `caller` must test `verified` first: a
+caller named only by an unverified DID is reported, and never as verified.
+
+A Transit Point's response policy gets `input.transit`, and `input.source_auth` when the
+Transit Point authenticated a client, beside its `input.response`, `input.caller` and
+`input.surface`. Its `input.caller.did` is the managed agent's DID, not the Transit Point's
+caller, so a rule about who receives a response reads `input.transit.caller`.
+
+Only a Transit Point's response policy has `input.transit`. A gateway or surface response
+policy also runs on the inbound legs, where `input.transit` is undefined, and there
+`not input.transit.caller.verified` is true. A rule shared by both legs that denies on
+`not input.transit.caller.verified` therefore also denies every inbound response, and one that
+allows on it allows every inbound response. Do not negate `input.transit` in a response policy
+that can run inbound. Test that it is present instead (`input.transit.caller.verification`), or
+keep the rule in the Transit Point's own `response_policy`.
+
+| Field | Values | Meaning |
+| --- | --- | --- |
+| `input.transit.caller.verified` | `true` / `false` | `true` when `verification` is `transit_token`, or `fabric_peer` when the receiving surface verified the caller of the Fabric request itself. It covers the caller's `user_identity_hash` and `fields` only, never a DID. A `fabric_peer` caller's DID is the peer's word, so it is never `did` beside `verified`, only `fabric.caller_did`. Match a caller by `user_identity_hash`, never by a DID. |
+| `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
+| | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
+| | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
+| | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (for a JWT the value of its strategy's [`principal_claim`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller), `sub` by default, with the claim's name when it is not `sub`; the API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT without a non-empty string in its strategy's principal claim. |
+| `input.transit.caller.did` | DID | The caller DID an Access Point's transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Never present for a `fabric_peer` caller, whose DID is in `fabric.caller_did`. Absent when the token has none. |
+| `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point, or, for a `fabric_peer` caller, on the receiving surface. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
+| `input.transit.caller.fabric` | object | Present for a `fabric_peer` caller, whose transit token was issued for a request that arrived over Fabric: `peer_gateway_id` (the sending gateway's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops` (the Fabric crossings the request made) and `caller_did`. The Fabric handshake verified the peer. `caller_did` is present only when a presentation from one of the connection's issuers carried it (`fabric-presentation`), and is still the peer's word, never verified, even beside `verified: true`: any paired gateway can vouch for any DID. To admit a DID one partner vouches for, match it together with `identity_source == "fabric-presentation"` and `fabric.peer_issuer_did`. |
+| `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
+| | `source_auth` | The Transit Point's own `source_auth` verified the client's API key, JWT or client certificate on this request (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)). `input.source_auth` carries the same identity, with a JWT's claims. |
+| `input.transit.client.method` | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | The source-auth method that verified the client (`api_key` also for `api_key_provider`). |
+| `input.transit.client.user_identity_hash` | lowercase hex SHA-256 | The client's identity hash, computed as for the caller. It equals a caller's hash only when both were verified the same way. Absent for a JWT without a non-empty string in its strategy's principal claim. |
+| `input.transit.client.subject` | string | The verified principal itself. Absent with the hash. |
+
+On an MCP Transit Point that requires a resource token and also receives a transit token,
+`caller` is the end user, and `client` is the client the resource token names. A rule that
+admits one end user checks `caller`; one that admits only some clients checks `client` as well. `client` is set when the Transit Point
+verified a resource token or its own `source_auth`, whichever it requires.
+
+An anonymous call looks like this, and a policy that must refuse it denies on
+`not input.transit.caller.verified`:
+
+```json
+{ "verified": false, "verification": "anonymous" }
+```
+
+`input.transit.caller` has no `did_verified` and no Agent DNA UAI. Nothing on the Access Point
+verifies a DID presentation yet, so either would be a value the caller asserted. Match a caller
+by `user_identity_hash`, never by `did` or `fabric.caller_did`.
+
+Audit records of a Transit Point call carrying a Fabric-issued token name the Fabric caller
+(`auth_method: fabric_verified` or `fabric_asserted`, with `peer_gateway`), as they name the
+caller of any transit token. A client the Transit Point verified itself on the same call, with
+its `source_auth` or a resource token, is in `input.transit.client` for policy but not in those
+audit records, which have no field for a second principal; the same holds for an Access Point's
+token that names a caller. Without such a token, the audit records name that client.
+
+To allow only one caller, compare the hash. For the JWT subject `alice` from
+`https://login.example.com` on a surface with no tenant, it is
+`printf '%s' '["jwt_bearer","https://login.example.com",null,"alice"]' | shasum -a 256`. An API
+key named `alice`, or `alice` at another issuer, has another hash and is not admitted. The rule
+also admits a request a paired gateway sent over Fabric whose caller the receiving surface
+verified with the same credential; add `not input.transit.caller.fabric` to keep Fabric
+requests out:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if {
+    input.transit.caller.verified
+    input.transit.caller.user_identity_hash == "42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"
+}
+```
+
+### Fabric callers on a Transit Point
+
+A request a partner gateway sent over Fabric reaches the managed agent with a transit token
+that opens every Transit Point of the surface, so its agent can call them; which partners reach
+a surface is set by peer exposure ([`FABRIC.md`](FABRIC.md#which-transit-points-a-partner-can-drive)).
+Such a call is a `fabric_peer` caller. A rule on `verification == "transit_token"` never matches
+it, whichever DID it names, but a rule that refuses only anonymous callers admits it, and one
+that admits any `verified` caller admits it whenever the receiving surface verified the
+partner's caller. Review such rules on the Transit Points of surfaces a partner reaches, and match
+`verification` explicitly. To admit one partner's requests on a Transit Point:
+
+```rego
+package surface.policy
+
+default allow := false
+
+allow if {
+    input.transit.caller.verification == "fabric_peer"
+    input.transit.caller.fabric.peer_issuer_did == "did:web:partner.example"
+}
+```
+
+To keep every partner's requests off a Transit Point while the rest of the policy decides
+other calls:
+
+```rego
+package surface.policy
+
+default allow := true
+
+allow := false if input.transit.caller.fabric
+```
+
+`fabric` is present only when the call carries the transit token the gateway issued for the
+partner's request, so this rule, and `not input.transit.caller.fabric` in the hash rule above,
+hold only on a Transit Point that requires the transit token, for an agent that passes the
+token it was given with the request. A Transit Point that does not require the token reads one
+only when the agent sends it, so an agent can leave the rule unmatched by sending none, and an agent that still holds a live Access Point token from a direct request can
+present that instead (see [`FABRIC.md`](FABRIC.md#chains-across-gateways)). The rule keeps out
+partner requests an agent handles as intended, not those of an agent that sends another token.
 
 ## Egress and SSRF controls
 
@@ -212,11 +506,37 @@ disabled** — so a host cannot rebind to an internal/metadata IP between vettin
 and connect, and an upstream 3xx is returned to the caller rather than followed.
 A2A-proxy and legacy MCP `proxy://` targets are **not** DNS-resolved/pinned here
 (vetted at dial time / MCP-proxy create time). A modern (`2026-07-28`) owned MCP
-Proxy `tools/call` dials its REST backend through a pinned, redirect-free client
-too, under the stricter save-time policy (see _Other pinned egress sinks_). A
+Proxy `tools/call`, and a legacy one that carries the Target credential, dials its
+REST backend through a pinned, redirect-free client too, under the stricter
+save-time policy (see _Other pinned egress sinks_). A
 blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
+
+Every address check in [`src/url_validation.rs`](../src/url_validation.rs), on a URL literal or
+a resolved address, treats an IPv6 address that carries an IPv4 address like that IPv4
+address: the IPv4-mapped (`::ffff:0:0/96`), 6to4 (`2002::/16`) and NAT64 forms, on the
+well-known prefix (`64:ff9b::/96`) or a `/96` of the local-use prefix (`64:ff9b:1::/96`). So
+`[64:ff9b::a9fe:a9fe]` and `[2002:a9fe:a9fe::1]` are blocked as `169.254.169.254`, and the
+webhook checks block `[2002:a00:1::1]` as `10.0.0.1`. The webhook checks also block the whole
+local-use prefix `64:ff9b:1::/48`, which translates only non-global IPv4 addresses.
+
+A Transit Point request that carries a grant by binding (`consent_mode: external`) is held to
+more: the outbound forward sends it only to the origin of its provider's `resource`, through
+`egress::pinned_vendor_client` (the Strict policy, `https` only), and never over Fabric. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-a-transit-point). So
+is an Access Point request to a Target bound by external consent: the inbound forward uses that
+client in place of the operator-policy one, for every request but a public discovery read
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)).
+
+The vendor clients of external consent, which carry a client's credentials or a person's token,
+ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
+connect directly: the fetch of an external consent provider's authorization server metadata,
+the code exchange and refresh, RFC 7009 revocation, and the forward of a request that carries a
+grant by binding. A proxy would resolve the host again and connect to an address nobody vetted,
+voiding the pin. The gateway warns at startup when a proxy variable is set. Every other pinned client, the authorization
+server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
+before; the proxy then resolves the host itself, so the pin does not hold through it.
 
 ```mermaid
 flowchart LR
@@ -239,15 +559,37 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   **origin-locked** to the SSE host via
   `mcp::sse_transport::resolve_session_post_url`, so a cross-origin `endpoint`
   event can't redirect the POST to an internal address).
+- `egress::pinned_forward_client` (the forward step's policy) pins **MCP tool
+  discovery of a saved surface** (`surface_id`): the gateway reads the surface's
+  stored Target and `target.auth` itself, so it reaches exactly what the
+  surface already forwards to (loopback and RFC 1918 allowed, cloud metadata
+  blocked) and the caller cannot choose the host. The caller must be able to
+  read the surface (tenant and resource scope, else `404`), and a
+  `target_endpoint` sent with it that differs from the saved one is refused
+  with `409` before any dial.
 - `egress::pinned_configured_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, allows RFC 1918) pins the
   modern owned **MCP Proxy `tools/call`** to its REST backend
-  (`src/mcp_proxies/modern_rest.rs`). It applies at call time the same policy
-  `validate_resolved_url` applies to `base_url` when the proxy is saved, so a
-  backend host that rebinds to loopback afterwards is refused. Under
+  (`src/mcp_proxies/modern_rest.rs`), and a legacy MCP Proxy `tools/call` that
+  carries the Target credential, direct or over Fabric, the same way. It applies
+  at call time the same policy `validate_resolved_url` applies to `base_url`
+  when the proxy is saved, so a backend host that rebinds to loopback afterwards
+  is refused before any request, and the credential is never sent to it. A
+  legacy call without the credential still runs on `rmcp-openapi`'s client and
+  is not pinned. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_configured_client` also pins the **credential provider
+  token requests** of `src/delegation_vault/oauth.rs`: service-token grants,
+  refreshes, and the legacy and `2026-07-28` authorization-code exchanges (a
+  grant's connect code exchange and refresh go through `pinned_vendor_client`,
+  below). The
+  token endpoint is resolved once, off the async runtime, and the request goes
+  to that address with redirects off; a blocked address is refused before any
+  request. The pin holds when no HTTP proxy is configured: with `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` set, the proxy resolves the host itself. RFC 1918 token endpoints stay reachable. Under `AG_TEST_MODE=true`,
+  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints.
 - `egress::pinned_forward_client` (cloud-metadata-only) pins the **JWKS** fetch
   (`src/jwt_bearer/jwks.rs`, fresh client per fetch) and the **x402
   remote-facilitator** client (`src/x402/remote_facilitator.rs`, re-pinned per
@@ -259,13 +601,28 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   uses the same client and the same rules.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
-  (`src/proxy/handler.rs::fetch_agent_card_from_surface_target`), so the
+  (`src/proxy/handler/agent_card.rs`), so the
   credential cannot follow a 3xx to another host. A 3xx answers `502`
   "Upstream redirected"; a blocked target answers `403` "Request blocked by
   egress policy". It shares the `pinned_target_client` helper with the
   inbound forward step. Without `target.auth` the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
+- An Access Point with a `fabric://` Target gives its surface policy the card
+  it serves, built in process the way the preview builds it, never requested
+  through its own listener. Payment gating, rate limits, metrics and the Trust
+  Recorder do not see that read. The card is read from the remote gateway over
+  Fabric within `a2a.timeout_seconds`, or the surface's shorter request
+  timeout, and a card larger than `a2a.max_body_size` is refused, like a card
+  fetched over HTTP. The card the Access Point serves over Fabric is read the
+  same way.
+- The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
+  but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
+  or without `target.auth`, and records nothing; a blocked target reports
+  `blocked_by_egress` (`403`), and a host that does not resolve reports `unreachable`
+  (`502`). The served card route reports such a host as unreachable only when it fetches
+  without `target.auth`; a served fetch with `target.auth` (`pinned_target_client`) and the
+  proxy forward still answer `403` "Request blocked by egress policy" for it.
 - Fabric receive's **agent-card hop** to the local Target, made for the GW2
   policy context, uses the forward's `forward_client_for`
   (`egress::pinned_forward_client` for an `http(s)` Target), so it is pinned
@@ -274,7 +631,30 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
   policy, and reads the card within the Transit Point's response bounds. A
-  blocked URL, a redirect or an oversized card yields no card.
+  blocked URL, a redirect or an oversized card yields no card. For a
+  `fabric://` target the card is read over Fabric instead, never through the
+  Transit Point's own listener, at `/.well-known/agent-card.json` and then,
+  as a fallback, `/.well-known/agent.json`. Both are discovery paths, which the
+  remote gateway answers as public card reads with its surface's card and
+  identity credential. The remote reads `/.well-known/agent-card.json` from its
+  configured card location, with its Target credential when it has one. It
+  reads the `/.well-known/agent.json` fallback as a public discovery read,
+  without that credential, so a remote Target that serves its card only at the
+  legacy path and requires its credential there is reported as
+  `AGENT_CARD_UNAVAILABLE`. Any other path is an ordinary request through the
+  remote Access Point, so `agent_card_path` is not used, and the Surface Builder
+  does not offer it on a `fabric://` Transit Point. A `404` or `503` the
+  remote gateway answers itself (an unknown or inactive surface) and a Fabric
+  transport failure end the read with no card; any other answer without a
+  usable card moves on to the next path, which the remote reads with different
+  credentials. Trust Checks and a
+  Transit Point policy with `require_agent_context` share the agent card cache,
+  so a card is read once a minute and a missing one, for any target, is
+  remembered for 10 seconds. A read that failed on this gateway's side (no
+  Fabric connection yet, the mediator refusing the message, or the reply not
+  picked up) and a `503` from the briefly unavailable remote are not cached, so
+  the next request reads again. The policy does not read a card the request's Trust Checks already
+  found unavailable.
 - The **managed agent Agent Card fetch** for display names
   (`src/identity/target_card_names.rs`) reads the card of an A2A or AP2
   surface's operator-configured HTTP(S) target through the same
@@ -291,8 +671,27 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   redirects. The fetch has a 5-second timeout and a 64 KiB limit and runs in the
   background, off the request path. A blocked URL or a failed fetch yields no
   name; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#external-callers).
+- An **external consent provider's issuer metadata** is read when the provider
+  is created (`src/credential_providers/external.rs`), through
+  `authz_metadata::discover_client` under the Strict posture
+  (`egress::pinned_metadata_client`): `https` only, internal addresses blocked,
+  redirects refused, no proxy, a 64 KiB body and a 10-second timeout per step. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-providers).
+- A grant's **RFC 7009 revocation** (`src/delegation_vault/revocation.rs`) goes
+  through `egress::pinned_vendor_client`: the Strict policy, `https`
+  only, pinned, redirects refused, no proxy, a 10-second timeout, and the response body is
+  never read. Under `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an
+  exact `http` or loopback fixture, never cloud metadata. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#revoking-grants-at-the-vendor).
+- A grant's **code exchange and refresh** (`src/delegation_vault/token_endpoint.rs`)
+  go to its provider's token endpoint through `egress::pinned_vendor_client` as
+  revocation does, with a 30-second timeout and a 64 KiB cap on the answer, whose
+  body is never logged or echoed. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
 
-Both helpers share one `pin_and_build` body.
+`pinned_forward_client` and `pinned_strict_client` share one `pin_and_build` body; the
+metadata and vendor clients above build their client with `pinned_direct_client`, which ignores
+proxies.
 
 ### DID resolution host policy
 
@@ -384,20 +783,22 @@ documented here so operators can assess exposure.
   resolver that honours `HostPolicy` or pins the checked address, injected through
   the SDK. See [Agent name resolution](#agent-name-resolution).
 
-- **The legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
+- **The uncredentialed legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);
   discovery through it reads tool names from the loaded OpenAPI spec and does not
-  dial, but a `tools/call` dials `base_url` through rmcp-openapi's own internally
-  built HTTP client (re-resolves at connect; `base_url` is management-gated and
-  checked on create/update with `validate_resolved_url`, which blocks cloud
-  metadata, loopback and unspecified addresses but not RFC 1918). The gateway
-  cannot pin that client, so this path retains a DNS-rebinding window between
-  validation and connect. Modern `tools/call` uses the gateway's own pinned
-  client instead (`egress::pinned_configured_client`, see _Other pinned egress
-  sinks_), which applies the save-time policy at call time: a host that rebinds
-  to loopback, an unspecified address or cloud metadata after validation is
-  refused. It does not refuse a rebind to an RFC 1918 address, because that
-  policy allows RFC 1918.
+  dial, but a `tools/call` without the Target credential dials `base_url` through
+  rmcp-openapi's own internally built HTTP client, which re-resolves at connect
+  (`base_url` is management-gated and checked on create/update with
+  `validate_resolved_url`, which blocks cloud metadata, loopback and unspecified
+  addresses but not RFC 1918), so that call retains a DNS-rebinding window between
+  validation and connect. A legacy `tools/call` that carries the Target credential,
+  and every modern `tools/call`, uses the gateway's own REST client
+  (`modern_rest::call`) pinned with `egress::pinned_configured_client` (see _Other
+  pinned egress sinks_), which applies the save-time policy at call time: a host
+  that rebinds to loopback, an unspecified address or cloud metadata after
+  validation is refused before the request, so the credential never reaches it.
+  It does not refuse a rebind to an RFC 1918 address, because that policy allows
+  RFC 1918.
 - **The process-wide Legacy-SSE session cache** (keyed by `base_url`) can reuse a
   non-discovery session's client for a discovery GET. The POST origin-lock closes
   the metadata vector regardless, but the reused GET leg is not pinned.
@@ -407,6 +808,76 @@ documented here so operators can assess exposure.
   inbound request to a surface whose target is `fabric://` is dispatched to
   `handle_fabric_request` after the gateway-plane global gate but before the
   surface-plane global gate in `src/proxy/handler.rs`.
+
+## Policy change audit
+
+Every management change to a policy, or to where a policy applies, can be recorded as a
+governance audit event (group Policies; record fields in
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)):
+
+| Change | Where | Events |
+| --- | --- | --- |
+| Create, edit, delete a definition | `/v1/policy-definitions` | `policy_created`, `policy_updated`, `policy_deleted` |
+| Reassign a definition's tenant | `PUT /v1/tenant-ownership/policy-definitions/{id}` | `policy_updated` with `changed: ["owner"]` |
+| Add, remove or replace a policy on a surface or variant: target, inbound, response, shared transit, per transit point, MCP tool policy, MCP tool gate condition | any surface or variant write | `policy_attached`, `policy_detached` |
+| Change a gateway's policy or its deny-overrides members, or enable or disable it | any gateway write, e.g. `PUT /v1/gateways/{id}/policy` | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| Change the appliance-wide assignments, or switch one between enforced and monitor-only | `PUT /v1/policy-assignments`; deleting a definition prunes it | `policy_attached`, `policy_detached`, `policy_attachment_changed` |
+| A change above refused, by the route (role, validation, not found, conflict) or before it (an access token's resource scope, Terms and Conditions not yet accepted) | the definition, assignment, gateway policy and ownership routes | `policy_change_refused` |
+
+Surface and gateway changes are found by comparing the stored record before and after each
+write in a management request (`src/policies/slots.rs` lists a surface's policy slots), so
+every API path that writes one is covered. Each store holds a write lock from that read until the
+write's changes are recorded, so concurrent writes record a chain of changes, each relative to
+the record it replaced, in write order. The appliance-wide assignments (set through the API, or
+pruned when a definition is deleted) and definition updates and owner reassignments are locked
+the same way. A slot is told apart by its variant, its transit
+point and its tool name or gate id; every entry of a tool or gate list is enforced, so a name or
+id repeated in one list is a slot of its own. `transit.transit_policy` is not enforced, so it is
+not listed. A refused surface or variant write is not recorded, nor a refused
+`DELETE /v1/gateways/{id}`: a refusal is recorded from the route alone, and whether either one
+would have changed a policy depends on the body or the stored record. A successful one records
+each policy it attaches or detaches.
+
+Change records follow what a user wrote, not what the runtime works out from it. A surface's
+records name the policies set on the base surface and those set in each variant's overrides, as
+stored. They do not record which policy a request ends up under:
+- Promoting a variant to default, or enabling or disabling one, changes which policies serve a
+  route but writes no policy slot, so it records no policy change.
+- A variant saved with `complete: true` (the surface builder saves every variant this way)
+  replaces the base wholesale, so a policy it does not set is cleared for its traffic. Its
+  records show only the policies it sets.
+- A variant's shared transit overrides are recorded as written, but the runtime compiles
+  transit policies from the base surface only, so they are not enforced. A variant's Transit
+  Point cannot change the `policy` or `response_policy` of the surface's Transit Point of the
+  same alias: the admin API refuses such a write with `400`, also when the surface has no
+  Transit Point of that alias, and a stored variant whose Transit Point sets a different
+  one has the requests through that Transit Point refused with `403`. A variant Transit
+  Point that leaves them out is enforced with the surface Transit Point's policies. See
+  [`MCP_TOOL_GATING.md`](MCP_TOOL_GATING.md), which applies the same rule to
+  `mcp_tool_gating`.
+
+A surface change record names the slot it wrote in `surface_variant`: the variant's alias for a
+slot in a variant's overrides, or `_base_` for a slot on the base surface. A base change also
+applies to every variant that inherits that slot, so it can change what several variants enforce.
+Gateway and appliance targets have no variants and no `surface_variant`.
+
+What actually decided a request is in its `policy_decision` records, each naming the
+`surface_variant` that served the request.
+
+The policy write routes are listed once, in `PolicyWrite` (`src/audit/policy_refusals.rs`); the
+router registers each through it, so a route's own refusals and those made before it by
+authentication name the same attempted change.
+
+A gateway's legacy inline Rego (`opa_policy_config.policy`, enforced only when the gateway
+references no definition) is recorded too. It has no definition id, so its records carry
+`policy_name` `Gateway policy` and the `policy_content_hash` of the Rego, the same name and
+hash its decisions carry: `policy_attached` when it starts applying, `policy_detached` when it
+stops (including when a definition replaces it), `policy_updated` with `changed: ["rego"]` and
+`previous_policy_content_hash` when its text changes, and `policy_attachment_changed` when it is
+enabled or disabled. Inline Rego beside a definition reference is not enforced and not recorded.
+An enabled gateway policy with blank inline Rego and no definition denies every request (it
+fails closed), so it is recorded as attached too; a disabled blank one enforces nothing and is
+not, so enabling or disabling it records `policy_attached` or `policy_detached`.
 
 ## Policy decision audit logging
 
@@ -442,3 +913,14 @@ applies on the direct, Fabric and MCP-proxy paths.
 When the `policy_decision` audit event is selected, the decision is also written to the VP Audit
 Log, and from there forwarded to any Governance Audit integrations (any type). See
 [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding).
+
+Every decision record names its surface and its policy:
+
+- `surface_id` is the surface UUID and `channel_name` the surface name, on every scope and flow.
+- `policy_name` is never empty: the policy definition's name, else the definition id, else a
+  label for the layer that decided: `Gateway policy`, `Surface policy`, `MCP tool gating`,
+  `MCP tool policy`, `Response policy` or `MCP tool list filter`. A tool policy that matched no
+  definition keeps the tool name.
+- `request_id` identifies the gateway request the decision belongs to; one request yields a
+  decision per policy layer, all with the same `request_id` (see
+  [`OBSERVABILITY.md`](OBSERVABILITY.md)).

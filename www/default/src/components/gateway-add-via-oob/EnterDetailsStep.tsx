@@ -10,6 +10,23 @@ interface Mediator {
   status: 'active' | 'disabled';
 }
 
+export interface DetailsStepWording {
+  title: string;
+  intro: string;
+  nameLabel: string;
+  namePlaceholder: string;
+  nameRequired: string;
+}
+
+const DEFAULT_WORDING: DetailsStepWording = {
+  title: 'Enter Gateway Details',
+  intro:
+    "Provide a name and description for the gateway you're connecting to. This will help you identify it in your connections list.",
+  nameLabel: 'Gateway Name',
+  namePlaceholder: 'e.g., Partner Gateway, Production Server, etc.',
+  nameRequired: 'Gateway name is required',
+};
+
 interface EnterDetailsStepProps {
   onNext: (
     name: string,
@@ -22,6 +39,7 @@ interface EnterDetailsStepProps {
   initialDescription?: string;
   initialDidMethod?: string;
   initialAcceptorMediatorId?: string;
+  wording?: Partial<DetailsStepWording>;
 }
 
 const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
@@ -31,7 +49,9 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
   initialDescription = '',
   initialDidMethod = 'web',
   initialAcceptorMediatorId = '',
+  wording: wordingOverrides,
 }) => {
+  const wording = { ...DEFAULT_WORDING, ...wordingOverrides };
   const [name, setName] = useState(initialName);
   const [description, setDescription] = useState(initialDescription);
   const [didMethod, setDidMethod] = useState(initialDidMethod);
@@ -62,7 +82,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
     e.preventDefault();
 
     if (!name.trim()) {
-      setError('Gateway name is required');
+      setError(wording.nameRequired);
       return;
     }
 
@@ -70,20 +90,21 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
   };
 
   return (
-    <div className="card shadow">
+    <div className="card shadow" data-testid="wizard-step-details">
       <div className="card-header py-3">
         <h6 className="m-0 font-weight-bold text-primary">
-          <i className="fas fa-info-circle me-2"></i> Enter Gateway Details
+          <i className="fas fa-info-circle me-2"></i> {wording.title}
         </h6>
       </div>
       <div className="card-body">
-        <p className="text-muted">
-          Provide a name and description for the gateway you're connecting to. This will help you
-          identify it in your connections list.
-        </p>
+        <p className="text-muted">{wording.intro}</p>
 
         {error && (
-          <div className="alert alert-danger alert-dismissible fade show" role="alert">
+          <div
+            className="alert alert-danger alert-dismissible fade show"
+            role="alert"
+            data-testid="wizard-oob-details-error"
+          >
             {error}
             <button
               type="button"
@@ -97,16 +118,17 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
         <form onSubmit={handleSubmit}>
           <div className="mb-3">
             <label htmlFor="gatewayName">
-              Gateway Name <span className="text-danger">*</span>
+              {wording.nameLabel} <span className="text-danger">*</span>
             </label>
             <input
               type="text"
               className="form-control"
               id="gatewayName"
-              placeholder="e.g., Partner Gateway, Production Server, etc."
+              placeholder={wording.namePlaceholder}
               value={name}
               onChange={e => setName(e.target.value)}
               required
+              data-testid="wizard-oob-name-input"
             />
             <small className="form-text text-muted">
               Choose a descriptive name to easily identify this Agent Gateway Connection Point
@@ -121,6 +143,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               placeholder="e.g., Connection to partner organization's Agent Gateway"
               value={description}
               onChange={e => setDescription(e.target.value)}
+              data-testid="wizard-oob-description-input"
             />
             <small className="form-text text-muted">
               Add any additional details about this Agent Gateway Connection Point
@@ -134,6 +157,7 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               id="didMethod"
               value={didMethod}
               onChange={e => setDidMethod(e.target.value)}
+              data-testid="wizard-oob-did-method-select"
             >
               <option value="web">Web (did:web)</option>
               <option value="webvh">WebVH (did:webvh)</option>
@@ -191,16 +215,20 @@ const EnterDetailsStep: React.FC<EnterDetailsStepProps> = ({
               type="button"
               variant="secondary"
               size="md"
+              data-testid="wizard-cancel"
               onClick={onCancel}
               iconStart={<i className="fas fa-times"></i>}
+              data-testid="wizard-cancel"
             >
               Cancel
             </AppButton>
             <AppButton
+              data-testid="wizard-next"
               type="submit"
               variant="primary"
               size="md"
               iconEnd={<i className="fas fa-arrow-right"></i>}
+              data-testid="wizard-next"
             >
               Next
             </AppButton>

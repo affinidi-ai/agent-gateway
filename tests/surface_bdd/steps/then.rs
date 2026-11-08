@@ -107,6 +107,34 @@ fn assert_target_only_discovery(
     );
 }
 
+fn assert_target_no_discovery(
+    target: &ObservedTarget,
+    context: &str,
+) {
+    let discovery_requests: Vec<&crate::bdd_support::mock_server::ReceivedRequest> =
+        get_observed_target_requests(target, context)
+            .iter()
+            .filter(|request| is_agent_card_discovery(request))
+            .collect();
+    assert!(
+        discovery_requests.is_empty(),
+        "{context} should have received no Trust Check agent-card fetch, but received {} discovery request(s): {discovery_requests:?}",
+        discovery_requests.len()
+    );
+}
+
+fn assert_target_received_one_forwarded_request(
+    target: &ObservedTarget,
+    context: &str,
+) {
+    let forwarded_requests: Vec<_> = get_observed_target_requests(target, context)
+        .iter()
+        .filter(|request| !is_agent_card_discovery(request))
+        .cloned()
+        .collect();
+    assert_called_exactly_once(&forwarded_requests, context);
+}
+
 fn is_agent_card_discovery(request: &crate::bdd_support::mock_server::ReceivedRequest) -> bool {
     request
         .method
@@ -378,6 +406,24 @@ fn named_external_agent_received_only_discovery(
 ) {
     let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
     assert_target_only_discovery(target, &actor_name);
+}
+
+#[then(expr = "external agent {string} received no Trust Check agent-card fetch")]
+fn named_external_agent_received_no_discovery(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
+    assert_target_no_discovery(target, &actor_name);
+}
+
+#[then(expr = "external agent {string} received a forwarded request")]
+fn named_external_agent_received_a_forwarded_request(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let target = get_observed_target_for_actor(world, &actor_name, TargetActorKind::ExternalAgent);
+    assert_target_received_one_forwarded_request(target, &format!("external agent '{actor_name}'"));
 }
 
 #[then(expr = "REST API {string} was not called")]
@@ -656,7 +702,7 @@ async fn vp_audit_events_matching(
         .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"))
 }
 
-async fn expect_vp_audit_record(
+pub(crate) async fn expect_vp_audit_record(
     world: &mut SurfaceWorld,
     what: &str,
     matches: impl Fn(&serde_json::Value) -> bool,
@@ -699,6 +745,22 @@ async fn vp_audit_log_records_non_blocking_source_auth_failure(
     .await;
 }
 
+#[then(expr = "the VP Audit Log records a blocking {string} source authentication failure for {string}")]
+async fn vp_audit_log_records_blocking_source_auth_failure(
+    world: &mut SurfaceWorld,
+    auth_type: String,
+    failure: String,
+) {
+    let scheme = audited_auth_scheme(&auth_type);
+    let reason = audited_auth_failure_reason(&failure);
+    let what = format!("a blocking '{auth_type}' source authentication failure for {failure}");
+    expect_vp_audit_record(world, &what, |event| {
+        let recorded = &event["event"]["auth_failed"];
+        recorded["scheme"] == scheme && recorded["reason"] == reason && recorded["blocking"] == true
+    })
+    .await;
+}
+
 /// The audit reason code for a refused request, as the step names the refusal.
 fn audited_refusal_reason(refusal: &str) -> &'static str {
     match refusal {
@@ -725,6 +787,30 @@ async fn vp_audit_log_records_request_refusal(
 async fn vp_audit_log_records_surface_rate_limit_refusal(world: &mut SurfaceWorld) {
     expect_vp_audit_record(world, "a surface rate limit refusal", |event| {
         event["event"]["rate_limited"]["scope"] == "surface"
+    })
+    .await;
+}
+
+#[then(
+    expr = "the VP Audit Log records the per-caller rate limit refusal of caller {string} on Transit Point {string}"
+)]
+async fn vp_audit_log_records_per_caller_rate_limit_refusal(
+    world: &mut SurfaceWorld,
+    caller: String,
+    transit_point: String,
+) {
+    let identity_hash = crate::steps::given::caller_identity_hash(&caller);
+    let surface_id = world
+        .surface_under_test_id
+        .clone()
+        .expect("the surface under test has an id");
+    let what = format!("a per-caller rate limit refusal of caller '{caller}' on Transit Point '{transit_point}'");
+    expect_vp_audit_record(world, &what, |event| {
+        let refusal = &event["event"]["rate_limited"];
+        refusal["scope"] == "transit_point_caller"
+            && refusal["transit_point"] == transit_point.as_str()
+            && event["user_identity_hash"] == identity_hash.as_str()
+            && event["surface_id"] == surface_id.as_str()
     })
     .await;
 }
@@ -833,7 +919,8 @@ fn admin_api_response_status_is(
     world: &mut SurfaceWorld,
     expected: u16,
 ) {
-    assert_response_status(Some(get_admin_response(world).status), expected);
+    let response = get_admin_response(world);
+    assert_status_with_body(response.status, expected, &response.body, "admin API response");
 }
 
 #[then(expr = "the surface lookup response status is {int}")]
@@ -850,6 +937,28 @@ fn admin_api_error_response_mentions(
     expected: String,
 ) {
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
+}
+
+#[then("the response says only that the Access Point is not available")]
+fn response_says_only_access_point_not_available(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Service Unavailable",
+        "status": 503,
+        "detail": "This Access Point is not available."
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "not-ready Access Point refusal");
+}
+
+#[then("the response says only that the caller credential is missing or invalid")]
+fn response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "https://a2a-protocol.org/errors/proxy-error",
+        "title": "Unauthorized",
+        "status": 401,
+        "detail": "Caller credential missing or invalid"
+    });
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "caller credential refusal");
 }
 
 #[then("the operator can still read the stored surface through the admin API")]
@@ -939,6 +1048,25 @@ async fn caller_trust_check_reported_error_code(
     assert_trust_check_error_code(world, "caller", &expected_code).await;
 }
 
+#[then("no Trust Check audit event is recorded")]
+async fn no_trust_check_audit_event_is_recorded(world: &mut SurfaceWorld) {
+    let is_trust_check = |event: &serde_json::Value| {
+        event
+            .get("event")
+            .and_then(|action| action.get("trust_check"))
+            .is_some()
+    };
+    let (found, events) = vp_audit_events_matching(world, is_trust_check).await;
+    assert!(
+        !found,
+        "expected no Trust Check audit event; observed {:?}",
+        events
+            .iter()
+            .filter(|event| is_trust_check(event))
+            .collect::<Vec<_>>()
+    );
+}
+
 async fn assert_trust_check_error_code(
     world: &mut SurfaceWorld,
     leg: &str,
@@ -994,6 +1122,14 @@ async fn scrape_trust_check_counter(
     query_type: &str,
     result: &str,
 ) -> u64 {
+    sum_labeled_counter(
+        &scrape_prometheus(world).await,
+        "agent_gateway_trust_check_total",
+        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
+    )
+}
+
+pub(crate) async fn scrape_prometheus(world: &SurfaceWorld) -> String {
     let infra = world
         .infra
         .as_ref()
@@ -1010,14 +1146,10 @@ async fn scrape_trust_check_counter(
         .await
         .unwrap_or_else(|error| panic!("read prometheus body from {url}: {error}"));
     assert!(status.is_success(), "prometheus scrape at {url} returned {status}; body: {body}");
-    sum_labeled_counter(
-        &body,
-        "agent_gateway_trust_check_total",
-        &[("trust_registry_id", trust_registry_id), ("query_type", query_type), ("result", result)],
-    )
+    body
 }
 
-fn sum_labeled_counter(
+pub(crate) fn sum_labeled_counter(
     exposition: &str,
     metric_name: &str,
     required_labels: &[(&str, &str)],
@@ -1273,25 +1405,6 @@ fn oauth_callback_response_shows_authorization_failure_page(world: &mut SurfaceW
     assert!(
         body.contains("Authorization Failed"),
         "expected OAuth callback response to show an authorization failure page, got {body}"
-    );
-}
-
-#[then(expr = "the response reports that variant {string} is disabled")]
-fn response_reports_variant_disabled(
-    world: &mut SurfaceWorld,
-    alias: String,
-) {
-    let body = get_response_body_value(world);
-    let raw_body = body.to_string();
-
-    assert!(
-        raw_body.contains(&alias)
-            && raw_body
-                .to_lowercase()
-                .contains("disabled"),
-        "expected response body to report variant '{}' is disabled, got {}",
-        alias,
-        body
     );
 }
 
@@ -2054,6 +2167,19 @@ fn response_is_consent_required_error(
     );
 }
 
+#[then("the consent required error names neither the caller's identity hash nor the managed agent's DID")]
+fn consent_required_error_names_no_caller_or_agent(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .unwrap_or_else(|| panic!("expected a consent-required problem body, got {body}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["consent_required", "detail", "status", "title", "type"], "{body}");
+}
+
 #[then(expr = "the response includes an authorization URL for OAuth provider {string}")]
 fn response_includes_authorization_url(
     world: &mut SurfaceWorld,
@@ -2558,6 +2684,21 @@ fn named_managed_agent_received_header(
     assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &expected_value);
 }
 
+#[then(expr = "managed agent {string} received the caller's {string} header unchanged")]
+fn named_managed_agent_received_callers_header_unchanged(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    header_name: String,
+) {
+    let sent = world
+        .sent_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&header_name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("the caller sent no '{header_name}' header"));
+    assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &sent);
+}
+
 #[then(expr = "external agent {string} received header {string} with value {string}")]
 fn named_external_agent_received_header(
     world: &mut SurfaceWorld,
@@ -2575,6 +2716,61 @@ fn named_external_agent_did_not_receive_header(
     header_name: String,
 ) {
     assert_actor_did_not_receive_header(world, &agent_name, TargetActorKind::ExternalAgent, &header_name);
+}
+
+#[then("the protected resource metadata names the surface as the resource")]
+fn protected_resource_metadata_names_the_surface(world: &mut SurfaceWorld) {
+    let expected = format!(
+        "{}{}",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route
+    );
+    assert_eq!(get_response_body_value(world)["resource"], serde_json::json!(expected));
+    assert_eq!(get_response_body_value(world)["bearer_methods_supported"], serde_json::json!(["header"]));
+}
+
+#[then(expr = "the protected resource metadata names authorization server {string}")]
+fn protected_resource_metadata_names_authorization_server(
+    world: &mut SurfaceWorld,
+    authorization_server: String,
+) {
+    assert_eq!(get_response_body_value(world)["authorization_servers"], serde_json::json!([authorization_server]));
+}
+
+#[then(expr = "the protected resource metadata lists scope {string}")]
+fn protected_resource_metadata_lists_scope(
+    world: &mut SurfaceWorld,
+    scope: String,
+) {
+    assert_eq!(get_response_body_value(world)["scopes_supported"], serde_json::json!([scope]));
+}
+
+fn assert_discovery_challenge(
+    world: &SurfaceWorld,
+    error: &str,
+) {
+    let protected = world
+        .surface_config
+        .protected_resource
+        .as_ref()
+        .expect("the surface must publish protected resource metadata");
+    let expected = format!(
+        "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{}\"{error}, scope=\"{}\"",
+        crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+        world.surface_config.route,
+        protected.scopes.join(" ")
+    );
+    assert_collaborator_header_value(get_response_headers_value(world), "www-authenticate", &expected, "response");
+}
+
+#[then("the response challenges the caller to fetch a token from the surface's protected resource metadata")]
+fn response_challenges_for_a_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, "");
+}
+
+#[then("the response challenges the caller for a new token because the token is invalid")]
+fn response_challenges_for_a_new_token(world: &mut SurfaceWorld) {
+    assert_discovery_challenge(world, ", error=\"invalid_token\"");
 }
 
 #[then(expr = "the response includes header {string} with value {string}")]
@@ -2721,7 +2917,34 @@ fn mcp_tool_result_matches_rest_api_response(
     let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
         .configured_response
         .body;
-    let body = get_response_body_value(world);
+    assert_mcp_tool_result_carries_rest_api_body(get_response_body_value(world), expected, &actor_name);
+}
+
+#[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
+fn mcp_tool_result_without_target_credential_matches_rest_api_response(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let body = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result without the Target credential. Body: {body}"
+    );
+    assert_mcp_tool_result_carries_rest_api_body(body, expected, &actor_name);
+}
+
+fn assert_mcp_tool_result_carries_rest_api_body(
+    body: &serde_json::Value,
+    expected: &serde_json::Value,
+    actor_name: &str,
+) {
     let text = body
         .pointer("/result/content/0/text")
         .and_then(|value| value.as_str())
@@ -2735,6 +2958,64 @@ fn mcp_tool_result_matches_rest_api_response(
         actual, expected,
         "MCP tool result body differs from REST API '{}' response.\nExpected: {}\nActual: {}",
         actor_name, expected, actual
+    );
+}
+
+#[then(expr = "the MCP tool result is marked as an error")]
+fn mcp_tool_result_is_marked_as_an_error(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(true)),
+        "expected an MCP tool result with isError true. Body: {body}"
+    );
+}
+
+#[then(expr = "REST API {string} answered the same MCP tool result with and without the Target credential")]
+fn rest_api_answered_same_tool_result_with_and_without_target_credential(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let header_name = &world
+        .surface_config
+        .target_auth
+        .as_ref()
+        .expect("the scenario must configure a Target credential")
+        .header_name;
+    let context = format!("REST API '{}'", actor_name);
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi),
+        &context,
+    );
+    let [without, with] = requests else {
+        panic!("expected {context} to receive two requests, got {}: {requests:?}", requests.len());
+    };
+    assert_collaborator_header_absent(&without.headers, header_name, &format!("{context}, first request"));
+    assert!(
+        with.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(header_name)),
+        "expected the second request to {context} to carry the Target credential header '{header_name}'"
+    );
+    assert_eq!(
+        (&without.method, &without.path_and_query),
+        (&with.method, &with.path_and_query),
+        "both tool calls must reach the same {context} resource"
+    );
+    let without = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    let with = get_response_body_value(world);
+    assert!(
+        without
+            .get("result")
+            .is_some(),
+        "the call without the Target credential must answer a tool result. Body: {without}"
+    );
+    assert_eq!(
+        without, with,
+        "the MCP tool result differs with the Target credential.\nWithout: {without}\nWith: {with}"
     );
 }
 
@@ -2767,14 +3048,29 @@ fn named_managed_agent_received_exactly_n_requests(
     agent_name: String,
     expected: usize,
 ) {
-    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
-    let context = format!("managed agent '{}'", agent_name);
+    assert_received_exactly(world, "managed agent", &agent_name, TargetActorKind::ManagedAgent, expected);
+}
+
+#[then(expr = "MCP server {string} received exactly {int} request(s)")]
+fn named_mcp_server_received_exactly_n_requests(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    expected: usize,
+) {
+    assert_received_exactly(world, "MCP server", &server_name, TargetActorKind::McpServer, expected);
+}
+
+fn assert_received_exactly(
+    world: &mut SurfaceWorld,
+    role: &str,
+    name: &str,
+    kind: TargetActorKind,
+    expected: usize,
+) {
+    let target = get_observed_target_for_actor(world, name, kind);
+    let context = format!("{role} '{name}'");
     let actual = get_observed_target_requests(target, &context).len();
-    assert_eq!(
-        actual, expected,
-        "expected managed agent '{}' to receive exactly {} request(s), got {}",
-        agent_name, expected, actual
-    );
+    assert_eq!(actual, expected, "expected {context} to receive exactly {expected} request(s), got {actual}");
 }
 
 #[then(expr = "managed agent {string} received the request body {}")]
@@ -3860,4 +4156,226 @@ async fn mcp_server_stops_processing_cancelled_call(
 #[then("the MCP response stream is closed")]
 fn mcp_response_stream_is_closed(world: &mut SurfaceWorld) {
     assert!(world.mcp_stream.is_none(), "the caller's MCP response stream is closed");
+}
+
+async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, String>> {
+    world
+        .infra
+        .as_ref()
+        .and_then(|infra| {
+            infra
+                .target_token_endpoint
+                .as_ref()
+        })
+        .expect("the credential provider must serve a token endpoint")
+        .requests()
+        .await
+        .iter()
+        .map(|request| serde_urlencoded::from_str(&request.raw_body).expect("a token request is form encoded"))
+        .collect()
+}
+
+/// The gateway's log with terminal colour codes removed.
+fn gateway_log(world: &SurfaceWorld) -> String {
+    let path = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running")
+        ._temp_dir
+        .path()
+        .join("gateway.log");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("the scenario must keep the gateway log first: {}: {error}", path.display()));
+    let mut plain = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for skipped in chars.by_ref() {
+                if skipped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+fn warning_lines_containing(
+    world: &SurfaceWorld,
+    text: &str,
+) -> Vec<String> {
+    gateway_log(world)
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains(text))
+        .map(str::to_string)
+        .collect()
+}
+
+#[then(expr = "the gateway log has a warning containing {string}")]
+fn gateway_log_has_warning(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    assert!(
+        !warning_lines_containing(world, &text).is_empty(),
+        "the gateway log has no warning containing {text:?}:\n{}",
+        gateway_log(world)
+    );
+}
+
+#[then(expr = "the gateway log has no warning containing {string}")]
+fn gateway_log_has_no_warning(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let lines = warning_lines_containing(world, &text);
+    assert!(lines.is_empty(), "the gateway log has warnings containing {text:?}: {lines:?}");
+}
+
+#[then(expr = "the startup report names the {word} {string} as breaking the rule {string} in {word} mode")]
+fn startup_report_names_breach(
+    world: &mut SurfaceWorld,
+    subject: String,
+    id: String,
+    rule: String,
+    mode: String,
+) {
+    let enforced = match mode.as_str() {
+        "enforce" => true,
+        "warn" => false,
+        other => panic!("unknown credential rule mode {other:?}"),
+    };
+    let expected = format!("subject=\"{subject}\" id={id} ");
+    let rule_and_mode = format!("rule=\"{rule}\" enforced={enforced}");
+    let reports = warning_lines_containing(world, "Stored configuration breaks a credential policy rule");
+    assert!(
+        reports
+            .iter()
+            .any(|line| line.contains(&expected) && line.contains(&rule_and_mode)),
+        "the startup report does not name the {subject} {id} for rule {rule} in {mode} mode: {reports:?}"
+    );
+}
+
+#[then(expr = "the startup report does not name the {word} {string} as breaking the rule {string}")]
+fn startup_report_does_not_name_breach(
+    world: &mut SurfaceWorld,
+    subject: String,
+    id: String,
+    rule: String,
+) {
+    let expected = format!("subject=\"{subject}\" id={id} ");
+    let rule_field = format!("rule=\"{rule}\"");
+    let reports = warning_lines_containing(world, "Stored configuration breaks a credential policy rule");
+    assert!(
+        !reports
+            .iter()
+            .any(|line| line.contains(&expected) && line.contains(&rule_field)),
+        "the startup report names the {subject} {id} for rule {rule}: {reports:?}"
+    );
+}
+
+#[then("the gateway log shows no credential provider secret or token")]
+fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
+    let log = gateway_log(world);
+    for secret in [
+        crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
+        crate::bdd_support::config::target_auth::TARGET_AUTH_CLIENT_SECRET_VALUE,
+    ] {
+        assert!(!log.contains(secret), "the gateway log shows a credential provider secret or token");
+    }
+}
+
+#[then(expr = "the credential provider received {int} token request(s)")]
+async fn target_credential_provider_received_token_requests(
+    world: &mut SurfaceWorld,
+    expected: usize,
+) {
+    let observed = target_token_requests(world)
+        .await
+        .len();
+    assert_eq!(observed, expected, "the credential provider received {observed} token requests, expected {expected}");
+}
+
+#[then(expr = "the credential provider received a client credentials grant from client {string} for scope {string}")]
+async fn target_credential_provider_received_client_credentials_grant(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    scope: String,
+) {
+    let requests = target_token_requests(world).await;
+    let grant = requests
+        .first()
+        .expect("the token endpoint received a grant");
+    let field = |name: &str| {
+        grant
+            .get(name)
+            .map(String::as_str)
+    };
+    assert_eq!(
+        field("grant_type"),
+        Some("client_credentials"),
+        "the credential provider received grant_type {:?}, expected client_credentials",
+        field("grant_type")
+    );
+    assert_eq!(
+        field("client_id"),
+        Some(client_id.as_str()),
+        "the credential provider received client_id {:?}, expected {client_id}",
+        field("client_id")
+    );
+    assert_eq!(
+        field("scope"),
+        Some(scope.as_str()),
+        "the credential provider received scope {:?}, expected {scope}",
+        field("scope")
+    );
+    assert!(
+        !grant.contains_key("assertion"),
+        "a client credentials grant carries no assertion, but the credential provider received one"
+    );
+}
+
+#[then("the credential provider received a JWT Bearer grant signed with the provider key")]
+async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut SurfaceWorld) {
+    use crate::bdd_support::config::target_auth::{
+        TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_SCOPE, target_auth_signing_key,
+    };
+
+    let requests = target_token_requests(world).await;
+    let grant = requests
+        .first()
+        .expect("the token endpoint received a grant");
+    assert_eq!(grant["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
+    assert!(!grant.contains_key("client_secret"), "a JWT Bearer grant sends no client secret");
+    let token_endpoint = world
+        .surface_config
+        .target_auth_provider
+        .as_ref()
+        .and_then(|provider| {
+            provider
+                .token_endpoint
+                .clone()
+        })
+        .expect("the token endpoint was configured");
+    let header = jsonwebtoken::decode_header(&grant["assertion"]).expect("the assertion is a JWT");
+    assert_eq!(header.alg, jsonwebtoken::Algorithm::RS256);
+    assert_eq!(header.kid.as_deref(), Some("bdd-target-key-id"));
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&[token_endpoint]);
+    validation.set_issuer(&[TARGET_AUTH_JWT_ISSUER]);
+    let claims = jsonwebtoken::decode::<serde_json::Value>(
+        &grant["assertion"],
+        &jsonwebtoken::DecodingKey::from_rsa_pem(
+            target_auth_signing_key()
+                .public_pem
+                .as_bytes(),
+        )
+        .unwrap(),
+        &validation,
+    )
+    .expect("the grant is signed with the provider key")
+    .claims;
+    assert_eq!(claims["scope"], TARGET_AUTH_PROVIDER_SCOPE);
 }

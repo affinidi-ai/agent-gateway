@@ -1,16 +1,29 @@
 import type { SurfaceNodeType } from '../nodeTypes';
 import type {
+  DependencyNode,
   NodeDefinition,
   PayloadContext,
   PayloadSlice,
   Protocol,
+  SnapContext,
   SurfaceContext,
 } from './types';
-import { getArchetype, ANY_EDGE_MW } from './edges/archetypes';
+import {
+  getArchetype,
+  ANY_EDGE_MW,
+  TRUST_CHECK_CALLER_SLOT_ID,
+  TRUST_CHECK_MANAGED_AGENT_SLOT_ID,
+  TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+} from './edges/archetypes';
+import { isInboundIdentity } from './identity/placement';
+import { queriesFromWire, STORED_TRUST_CHECK_LIST_KEY } from './trust-check/definition';
 import { TRANSIT_POINT_FIELDS } from './agentSurfaceSchema';
 import { isSigningEmpty } from './types';
 import { transitConfigConfigFromPayload } from './transit-config/definition';
+import { RATE_LIMIT_FIELDS, carriesRateLimit, rateLimitConfigFromWire } from './rate-limit/wire';
 import { workloadBindingApiToForm } from './workload-binding/config';
+
+const TRANSIT_POINT_RATE_LIMIT_FIELDS: ReadonlySet<string> = new Set(RATE_LIMIT_FIELDS);
 
 export interface DependencyWarning {
   severity: 'error' | 'warning';
@@ -64,12 +77,12 @@ class ElementRegistry {
 
   /**
    * Elements available in the palette for a given protocol.
-   * Excludes core elements (auto-created) and protocol-locked items
-   * that don't match the current protocol.
+   * Excludes core elements (auto-created), protocol-locked items
+   * that don't match the current protocol, and the `hidden` types.
    */
-  paletteItems(protocol: Protocol): NodeDefinition[] {
+  paletteItems(protocol: Protocol, hidden: ReadonlySet<string> = new Set()): NodeDefinition[] {
     return this.all()
-      .filter(d => !d.hiddenFromPalette)
+      .filter(d => !d.hiddenFromPalette && !hidden.has(d.type))
       .filter(d => !d.protocols || d.protocols.includes(protocol))
       .sort((a, b) => {
         if (a.paletteCategory !== b.paletteCategory) {
@@ -81,10 +94,11 @@ class ElementRegistry {
 
   /** Group palette items by category. */
   paletteByCategory(
-    protocol: Protocol
+    protocol: Protocol,
+    hidden: ReadonlySet<string> = new Set()
   ): Partial<Record<import('./types').PaletteCategory, NodeDefinition[]>> {
     const out: Partial<Record<import('./types').PaletteCategory, NodeDefinition[]>> = {};
-    for (const def of this.paletteItems(protocol)) {
+    for (const def of this.paletteItems(protocol, hidden)) {
       const list = out[def.paletteCategory] ?? [];
       list.push(def);
       out[def.paletteCategory] = list;
@@ -117,6 +131,23 @@ class ElementRegistry {
   }
 
   /**
+   * Does the element's `edgeSnap` allow-list let it snap to the edge
+   * archetype? Elements without an allow-list snap to any archetype. With
+   * a surface context, the element's `edgeSnap.allows` can narrow the list.
+   */
+  snapsToArchetype(
+    elementType: SurfaceNodeType | string,
+    archetypeId: string | undefined,
+    ctx?: SnapContext
+  ): boolean {
+    const snap = this.get(elementType)?.edgeSnap;
+    const allowed = snap?.archetypes;
+    if (!allowed) return true;
+    if (!archetypeId || !allowed.includes(archetypeId)) return false;
+    return !ctx || !snap?.allows || snap.allows(archetypeId, ctx);
+  }
+
+  /**
    * Can this element be dropped directly on a specific node
    * (as a node-modifier rather than as an edge node)?
    */
@@ -140,8 +171,8 @@ class ElementRegistry {
    * node with an invalid URL is reported the same as a missing one so the
    * canvas mirrors the sidebar's fault state.
    */
-  isConfigured(type: SurfaceNodeType | string, config: any): boolean {
-    if (this.getIncompleteReason(type, config) !== null) return false;
+  isConfigured(type: SurfaceNodeType | string, config: any, node?: DependencyNode): boolean {
+    if (this.getIncompleteReason(type, config, node) !== null) return false;
     return this.getValidationErrors(type, config).length === 0;
   }
 
@@ -150,10 +181,14 @@ class ElementRegistry {
    * is fully configured. Delegates to the element's `incompleteReason` (a
    * mandatory contract member); returns null for unknown types.
    */
-  getIncompleteReason(type: SurfaceNodeType | string, config: any): string | null {
+  getIncompleteReason(
+    type: SurfaceNodeType | string,
+    config: any,
+    node?: DependencyNode
+  ): string | null {
     const def = this.get(type);
     if (!def) return null;
-    return def.incompleteReason(config ?? {});
+    return def.incompleteReason(config ?? {}, node);
   }
 
   /**
@@ -181,8 +216,12 @@ class ElementRegistry {
    * fields) and falls back to the first validation error so a malformed
    * URL surfaces on the canvas the same way the sidebar shows it.
    */
-  getFaultReason(type: SurfaceNodeType | string, config: any): string | null {
-    const incomplete = this.getIncompleteReason(type, config);
+  getFaultReason(
+    type: SurfaceNodeType | string,
+    config: any,
+    node?: DependencyNode
+  ): string | null {
+    const incomplete = this.getIncompleteReason(type, config, node);
     if (incomplete) return incomplete;
     const errs = this.getValidationErrors(type, config);
     return errs.length > 0 ? errs[0].message : null;
@@ -192,7 +231,8 @@ class ElementRegistry {
   getDependencyWarnings(
     type: SurfaceNodeType | string,
     config: any,
-    context: SurfaceContext
+    context: SurfaceContext,
+    node?: DependencyNode
   ): DependencyWarning[] {
     const def = this.get(type);
     if (!def?.featureDependencies) return [];
@@ -200,19 +240,22 @@ class ElementRegistry {
     return def.featureDependencies
       .filter(dep => {
         try {
-          return dep.condition(cfg, context);
+          return dep.condition(cfg, context, node);
         } catch {
           return false;
         }
       })
       .filter(dep => {
         try {
-          return !dep.check(cfg, context);
+          return !dep.check(cfg, context, node);
         } catch {
           return true;
         }
       })
-      .map(dep => ({ severity: dep.severity, message: dep.message }));
+      .map(dep => ({
+        severity: dep.severity,
+        message: typeof dep.message === 'function' ? dep.message(cfg, context, node) : dep.message,
+      }));
   }
 
   /**
@@ -408,7 +451,7 @@ class ElementRegistry {
         id,
         type: def.type as SurfaceNodeType,
         label: '',
-        configured: this.isConfigured(def.type, panelConfig),
+        configured: this.isConfigured(def.type, panelConfig, { id, parentId }),
         config: panelConfig,
         parentId,
         ...(direction === 'response' ? { direction: 'response' as const } : {}),
@@ -539,7 +582,7 @@ class ElementRegistry {
           id,
           type: elementType,
           label: '',
-          configured: this.isConfigured(elementType, panelConfig),
+          configured: this.isConfigured(elementType, panelConfig, { id, slotId: slot.id }),
           config: panelConfig,
           parentId,
           slotId: slot.id,
@@ -580,58 +623,55 @@ class ElementRegistry {
       }
     }
 
-    // Trust-check: per-leg Vec<TrustCheckElement>. Emit one canvas
-    // node per leg holding all of that leg's queries on
-    // `config.queries`; the panel's "+ Add Another Query" button
-    // appends entries and `buildPayload` fans each back out into the
-    // wire `trust_check_list` array.
-    {
-      const tcDef = this.get('trust-check');
-      if (tcDef) {
-        const hydrateLeg = (
-          path: string,
-          edge: 'ap-ma' | 'ma-tp',
-          parentId: string,
-          slotId: string
-        ) => {
-          const raw = readPath(payload, path);
-          if (!Array.isArray(raw) || raw.length === 0) return;
-          const queries = raw
-            .filter((e: any) => e && typeof e === 'object')
-            .map((e: any) => ({
-              id: typeof e.id === 'string' ? e.id : undefined,
-              trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
-              query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
-              name: typeof e.name === 'string' ? e.name : undefined,
-              query: e.query || {},
-            }));
-          if (queries.length === 0) return;
-          const id = `trust-check-${edge === 'ap-ma' ? 'caller' : 'target'}`;
-          const config = { _edge: edge, queries };
-          nodes.push({
-            id,
-            type: 'trust-check',
-            label: '',
-            configured: this.isConfigured('trust-check', config),
-            config,
-            parentId,
-            slotId,
-          });
-        };
-        hydrateLeg(
-          'access_point.trust_check_list',
-          'ap-ma',
-          'access-point',
-          'request:trust-check-access_point_trust_check_list'
-        );
-        hydrateLeg(
-          'target.trust_check_list',
-          'ma-tp',
-          'target',
-          'request:trust-check-target_trust_check_list'
-        );
-      }
-    }
+    // Trust-check: a Vec<TrustCheckElement> per leg. Emit one canvas
+    // node per list holding all of its queries on `config.queries`; the
+    // panel's "+ Add Another Query" button appends entries and
+    // `buildPayload` fans each back out into the wire `trust_check_list`
+    // array. Each Transit Point's own list is hydrated with the Transit
+    // Point below.
+    const hydrateTrustCheck = (
+      raw: unknown,
+      id: string,
+      edge: 'ap-ma' | 'ma-tp',
+      parentId: string,
+      slotId: string,
+      migrated = false,
+      keepStoredList = false
+    ) => {
+      const queries = queriesFromWire(raw);
+      if (queries.length === 0) return;
+      const config = {
+        _edge: edge,
+        queries,
+        ...(migrated ? { trust_check_migrated: true } : {}),
+        ...(keepStoredList
+          ? { [STORED_TRUST_CHECK_LIST_KEY]: JSON.parse(JSON.stringify(raw)) }
+          : {}),
+      };
+      nodes.push({
+        id,
+        type: 'trust-check',
+        label: '',
+        configured: this.isConfigured('trust-check', config),
+        config,
+        parentId,
+        slotId,
+      });
+    };
+    hydrateTrustCheck(
+      readPath(payload, 'access_point.trust_check_list'),
+      'trust-check-caller',
+      'ap-ma',
+      'access-point',
+      TRUST_CHECK_CALLER_SLOT_ID
+    );
+    hydrateTrustCheck(
+      readPath(payload, 'target.trust_check_list'),
+      'trust-check-target',
+      'ma-tp',
+      'target',
+      TRUST_CHECK_MANAGED_AGENT_SLOT_ID
+    );
 
     // Variants — always emit a surface-wide `target-variant` node,
     // even when the surface has no variants yet. The dedicated
@@ -652,11 +692,8 @@ class ElementRegistry {
       : payload?.target?.default_variant_id;
     const variantList = variants.map((v, idx) => {
       const id = v?.id || `target-variant-${idx + 1}`;
-      // Identity-only shape for the panel. Legacy override fields
-      // (endpoint, policy_definition_id, mpp_*, agent_card_*,
-      // extensions, …) are no longer surfaced here — they live on
-      // `surface.variants[].overrides` and are produced by the
-      // (forthcoming) per-element `VariantEditingContext`.
+      // Identity-only shape for the panel; override fields live on
+      // `surface.variants[].overrides`.
       return {
         id,
         alias: typeof v?.alias === 'string' ? v.alias : '',
@@ -682,10 +719,10 @@ class ElementRegistry {
     // Auto-hydrate transit-config (`transit.shared.*`) when meaningful
     // fields are present on the payload (e.g. surface authored via the
     // JSON tab, an import, or another tool). The transit-config
-    // helper deliberately ignores the harmless `sign_requests` /
-    // `transit_token_mode` defaults that the TP factory writes
-    // unconditionally — otherwise every surface with a TP would
-    // sprout a "Transit Settings" node on its canvas. The canvas blob
+    // helper deliberately ignores the `transit_token_mode` default
+    // that the TP factory writes unconditionally; otherwise every
+    // surface with a TP would sprout a "Transit Settings" node on its
+    // canvas. The canvas blob
     // layer below still wins for round-trips that previously saved a
     // transit-config node (preserving its layout and any UI-only
     // fields).
@@ -741,6 +778,8 @@ class ElementRegistry {
       const tpConfig = tp && typeof tp === 'object' ? { ...tp } : tp;
       if (tpConfig && typeof tpConfig === 'object') {
         delete tpConfig.header_metadata_mapping;
+        delete tpConfig.trust_check_list;
+        delete tpConfig.trust_check_migrated;
       }
       nodes.push({
         id: tpId,
@@ -810,15 +849,15 @@ class ElementRegistry {
       // uses string-typed numeric inputs so coerce wire numbers back to
       // strings on hydration.
       const tpRl = tp?.rate_limit;
-      if (tpRl && typeof tpRl === 'object' && tpRl.requests != null) {
+      const tpCallerRl = tp?.per_caller_rate_limit;
+      const hasTpRl = tpRl && typeof tpRl === 'object' && tpRl.requests != null;
+      const hasTpCallerRl =
+        tpCallerRl && typeof tpCallerRl === 'object' && tpCallerRl.requests != null;
+      if (hasTpRl || hasTpCallerRl) {
         const rlDef = this.get('rate-limit');
         const panelConfig = rlDef?.configFromPayload
           ? rlDef.configFromPayload(tpRl, payload)
-          : {
-              requests: String(tpRl.requests),
-              window_secs: String(tpRl.window_secs ?? 60),
-              ...(tpRl.burst != null ? { burst: String(tpRl.burst) } : {}),
-            };
+          : rateLimitConfigFromWire(hasTpRl ? tpRl : null, hasTpCallerRl ? tpCallerRl : null);
         nodes.push({
           id: `rate-limit-${tpId}`,
           type: 'rate-limit' as SurfaceNodeType,
@@ -846,6 +885,18 @@ class ElementRegistry {
           slotId: 'request:metadata-extraction',
         });
       }
+      // Per-TP target-leg Trust Check (`transit.points[i].trust_check_list`).
+      // New ones are offered only on A2A/AP2 Transit Points, but a stored
+      // list (a migrated copy on any protocol) is always shown.
+      hydrateTrustCheck(
+        tp?.trust_check_list,
+        `trust-check-${tpId}`,
+        'ma-tp',
+        tpId,
+        TRUST_CHECK_TRANSIT_POINT_SLOT_ID,
+        tp?.trust_check_migrated === true,
+        tpType !== 'transit-point-a2a' && tpType !== 'transit-point-ap2'
+      );
       // Per-TP managed identity (`transit.points[i].managed_identity`).
       // Mirrors the request-slot id produced by the identity element
       // when freshly dropped on the MA→TP edge so it round-trips
@@ -992,6 +1043,7 @@ class ElementRegistry {
         if (removedTps.has(bn.id) || removedTps.has(transitPointOf(bn.parentId))) continue;
         let target = byId.get(bn.id);
         if (target) claimedIds.add(target.id);
+        let restoredFromBlob = false;
         if (!target && bn.type) {
           // Adopt an unclaimed synthesized node of the same type when
           // the blob's id derives from a different archetype slot for
@@ -1004,15 +1056,21 @@ class ElementRegistry {
           // An element whose payload owns its config only adopts a node
           // on the same path (the Target, or the same Transit Point), so
           // a stale blob node never moves its settings to another path.
+          // A Transit Point's rate limit is read from that Transit Point only,
+          // so like those it adopts no node on another path.
           const ownsConfig = !!this.get(bn.type)?.payloadOwnsConfig;
-          const bnTransitPoint = ownsConfig ? transitPointOf(bn.parentId) : '';
+          const samePathOnly =
+            ownsConfig || (bn.type === 'rate-limit' && transitPointOf(bn.parentId) !== '');
+          const bnTransitPoint = samePathOnly ? transitPointOf(bn.parentId) : '';
           const candidates = nodes.filter(
             n =>
               n.type === bn.type &&
               !claimedIds.has(n.id) &&
               !byId.has(bn.id) &&
               !blob.nodes.some(b => b.id === n.id) &&
-              (!ownsConfig || transitPointOf(n.parentId) === bnTransitPoint)
+              (!samePathOnly ||
+                (transitPointOf(n.parentId) === bnTransitPoint &&
+                  (!bn.slotId || !n.slotId || n.slotId === bn.slotId)))
           );
           // Prefer slotId-based adoption when the blob carries one and
           // exactly one hydrated candidate owns the same slot. Keeps
@@ -1039,10 +1097,24 @@ class ElementRegistry {
         }
         if (!target) {
           if (!bn.type) continue;
-          if (this.get(bn.type)?.payloadOwnsConfig) {
+          const def = this.get(bn.type);
+          const parentType =
+            typeof bn.parentId === 'string'
+              ? (blobById.get(bn.parentId)?.type ?? byId.get(bn.parentId)?.type)
+              : undefined;
+          const removedTransitPointLimit =
+            bn.type === 'rate-limit' &&
+            this.isTransitPointType(parentType) &&
+            carriesRateLimit(bn.config);
+          if (
+            removedTransitPointLimit ||
+            (def?.payloadOwnsConfig &&
+              !def.isBlobPlaceholder?.(bn.config ?? {}, { ...bn, parentType }, payload))
+          ) {
             if (typeof bn.parentId === 'string') renameMap.set(bn.id, bn.parentId);
             continue;
           }
+          restoredFromBlob = true;
           // Compute `configured` from the blob's config rather than
           // hard-coding `true`. Otherwise an element that the user
           // dropped but never finished configuring (no payload slice
@@ -1057,7 +1129,10 @@ class ElementRegistry {
             id: bn.id,
             type: bn.type as SurfaceNodeType,
             label: bn.label || bn.id,
-            configured: this.isConfigured(bn.type as SurfaceNodeType, blobCfg),
+            configured: this.isConfigured(bn.type as SurfaceNodeType, blobCfg, {
+              id: bn.id,
+              slotId: bn.slotId,
+            }),
             config: blobCfg,
             parentId: bn.parentId ?? undefined,
             ...(bn.slotId ? { slotId: bn.slotId } : {}),
@@ -1084,11 +1159,18 @@ class ElementRegistry {
           // `gateway_id`, `auth_type`) so the panel doesn't "reset"
           // after save. Without this, every save round-trip strips
           // those fields and the panel re-derives them on next mount.
-          // A Transit Point's stored fields come only from the stored
-          // surface, so one removed through the API stays removed.
-          const fill = this.isTransitPointType(target.type)
+          // A Transit Point's stored fields, and the limits of a rate-limit
+          // node on one, come only from the stored surface, so one removed
+          // through the API stays removed.
+          const storedFields: ReadonlySet<string> | null = this.isTransitPointType(target.type)
+            ? TRANSIT_POINT_FIELDS
+            : target.type === 'rate-limit' &&
+                this.isTransitPointType(byId.get(target.parentId ?? '')?.type)
+              ? TRANSIT_POINT_RATE_LIMIT_FIELDS
+              : null;
+          const fill = storedFields
             ? Object.fromEntries(
-                Object.entries(blobConfig).filter(([key]) => !TRANSIT_POINT_FIELDS.has(key))
+                Object.entries(blobConfig).filter(([key]) => !storedFields.has(key))
               )
             : blobConfig;
           target.config = { ...fill, ...(target.config ?? {}) };
@@ -1096,7 +1178,7 @@ class ElementRegistry {
           // pulled from the blob can flip validity (e.g. an element
           // whose `incompleteReason` looks at a field that isn't part
           // of the persisted payload slice).
-          target.configured = this.isConfigured(target.type, target.config);
+          target.configured = this.isConfigured(target.type, target.config, target);
         }
         const overlay = readLayoutOverlay(bn);
         if (overlay.position) target.position = overlay.position;
@@ -1106,7 +1188,14 @@ class ElementRegistry {
         // the access-point onto the managed agent or onto a freshly
         // dropped middleware node). Always honour an explicit overlay
         // parentId so reloads don't snap edges back to defaults.
-        if (overlay.parentId !== undefined) {
+        // A node whose config the payload owns stays on the path it was
+        // hydrated for: a stale blob parent never moves it between the
+        // Target and a Transit Point, or between Transit Points.
+        const keepsHydratedPath =
+          !restoredFromBlob &&
+          !!this.get(target.type)?.payloadOwnsConfig &&
+          transitPointOf(overlay.parentId) !== transitPointOf(target.parentId);
+        if (overlay.parentId !== undefined && !keepsHydratedPath) {
           target.parentId = overlay.parentId || undefined;
         }
       }
@@ -1259,6 +1348,19 @@ export function buildCanvasBlob(
         Object.prototype.hasOwnProperty.call(configToPersist, 'trust_check_list')
       ) {
         const { trust_check_list: _stripped, ...rest } = configToPersist as Record<string, unknown>;
+        void _stripped;
+        configToPersist = rest;
+      }
+      // The inbound Identity names no stored key: each caller is identified
+      // by the key it presents, so an `api_key_id` loaded from an older save
+      // is not carried forward.
+      if (
+        configToPersist &&
+        n.type === 'identity' &&
+        isInboundIdentity(n) &&
+        Object.prototype.hasOwnProperty.call(configToPersist, 'api_key_id')
+      ) {
+        const { api_key_id: _stripped, ...rest } = configToPersist as Record<string, unknown>;
         void _stripped;
         configToPersist = rest;
       }

@@ -42,7 +42,7 @@ payment rules at the protocol level rather than as a generic HTTP proxy.
 | MCP | Agent-to-tool calls, including tool discovery and invocation |
 | AP2 | Agent payments over A2A. Experimental and off by default. |
 | DIDComm v2.1 | Encrypted transport between gateways |
-| x402, MPP | Payment settlement for metered services |
+| x402, MPP | Payment for metered services, taken by a connected agent-pay gateway |
 
 It can also expose a non-A2A agent, such as a Microsoft Copilot Studio agent reached over
 Direct Line, as an A2A endpoint, and expose a REST API as a set of MCP tools.
@@ -179,14 +179,19 @@ Several independent layers, evaluated before a request is forwarded.
 | Layer | What it controls |
 | --- | --- |
 | Source authentication | Who the caller is: JWT bearer, API key, API key provider, DID Auth, or mTLS. |
-| Rate limiting | A token bucket per surface, with a rate and a burst size. An empty bucket answers 429 with a `Retry-After` header. |
+| Rate limiting | A token bucket per surface, and per Transit Point, with a rate and a burst size, and optionally a bucket for each caller of a Transit Point. An empty bucket answers 429; the Access Point's and a Transit Point's per-caller buckets add a `Retry-After` header. |
 | Policy | Rego policies, evaluated by an embedded engine, over the request method, path, headers, body, and agent identity. |
 | MCP tool policies | An OPA policy attached to an individual MCP tool. |
 | MCP tool gating | An ordered allow/deny firewall over MCP tool names, matched by pattern and optionally activated by a policy condition. It hides tools from discovery and blocks their invocation. |
 
-A missing or invalid caller credential does not by itself refuse the request. The request
-continues with no caller identity and the failure is passed to policy, so a surface that
-must reject unauthenticated callers needs a policy that denies them. See
+A closed Access Point, which the admin API creates by default, refuses a missing or invalid
+caller credential with a `401` before policy and the Target; until it has caller
+authentication it is not ready and refuses every request with a `503`. On a public or legacy Access
+Point the request continues with no caller identity and the failure is passed to policy, so
+such a surface that must reject unauthenticated callers needs a policy that denies them. An
+MCP Access Point that publishes protected resource metadata always refuses the request with
+a `401`, direct or over Fabric; a direct request's challenge points at that metadata. See
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points) and
 [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
 A policy can express rules such as "only agents using a particular model may call these
@@ -290,27 +295,45 @@ written into the surface itself.
 
 ## Payments
 
-| Protocol | Behaviour |
-| --- | --- |
-| x402 | Blockchain-settled payment for HTTP requests. The gateway can also act as an x402 facilitator, over HTTP at `/api/x402/verify`, `/api/x402/settle`, and `/api/x402/supported`, and over the fabric for other gateways. |
-| MPP | Machine Payments Protocol authentication. |
+A surface charges for requests by delegating payment to a payment surface on a connected
+agent-pay gateway, which owns the price, the accepted x402 and MPP methods, verification and
+settlement. The gateway decides which requests are chargeable (selected MCP tools, A2A methods,
+or every request) and asks agent-pay to take the payment after policy, just before forwarding.
+The payment gateways on offer, `GET /v1/gateways/payment-providers`, are the active remote peers
+that expose at least one payment surface, whichever side opened the connection; their surfaces
+are cached for 5 minutes, and `?force_refresh=true` asks each peer again. When agent-pay only holds the funds (`payment-authorization`), the gateway captures them after the
+Target delivers and voids them otherwise, and a reconciler on the Active node finishes any capture
+or void left open; see [Capture on delivery](CONFIGURATION_REFERENCE.md#capture-on-delivery).
+A streamed response is returned without waiting for the capture and is captured once a result
+is passed on to the caller or the stream completes; an event stream ends with a `payment-receipt` event carrying the capture receipt. A
+caller whose payment was held for review polls its case at
+`<surface route>/.well-known/payment-cases/{case_id}`, answered only to the same authenticated
+caller ([Polling a held payment](CONFIGURATION_REFERENCE.md#polling-a-held-payment-caller)).
 
 ```mermaid
 sequenceDiagram
     participant A as Agent
     participant G as Agent Gateway
-    participant C as Chain
+    participant P as agent-pay
     A->>G: Request
-    G-->>A: 402 with PAYMENT-REQUIRED
+    G->>P: Payment request over the fabric
+    P-->>G: 402 challenge
+    G-->>A: 402 with the challenge
     Note over A: Signs a payment<br/>for the stated amount
-    A->>G: Retry with PAYMENT-SIGNATURE
-    G->>G: Verify, locally or through a facilitator
-    G->>C: Settle, immediately, deferred, or manually
-    G-->>A: 200 with PAYMENT-RESPONSE
+    A->>G: Retry with the payment credential
+    G->>P: Payment request with the credential
+    P-->>G: Receipt
+    G->>G: Forward to the target
+    G-->>A: Response with the receipt
 ```
 
-A surface can require payment before a request reaches its target, and an agent can pay an
-upstream service automatically under limits you set.
+agent-pay can also hold a payment for human review; the request is then answered `202`, or
+JSON-RPC error `1003` for MCP and A2A, and the client retries later. Payment receipts, metrics and
+a payments ledger are kept for every call, with the reason a payment was refused or failed. The
+Payments page is one list of payments. The payment audit events stay available from
+`GET /api/admin/payments/audit`. Local x402 and MPP
+verification is no longer supported.
+See [Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy).
 
 ## Observability
 
@@ -343,7 +366,7 @@ the gateway authorised, for whom, and under which policy.
 | VP injected | The managed agent's identity presentation is attached to a request or response |
 | Token injected | A delegated credential is used on a user's behalf |
 | Consent granted | A user completes consent and a token is stored |
-| Payments | An x402 or MPP payment is challenged, verified, or settled, locally or through another gateway |
+| Payments | A delegated agent-pay payment is taken, challenged, held for review, or refused |
 
 Entries are written as JSON Lines to a file that rotates daily. Each policy decision
 records the exact policy version and content hash that decided. On calls through a Transit
@@ -463,8 +486,8 @@ integration. See [`INTEGRATIONS.md`](INTEGRATIONS.md) for the events and publish
 ### Surface templates
 
 New surfaces start from templates: complete starters for A2A and MCP, and partial
-templates that add one capability, such as caller context, tool gating, credential
-delegation, or an x402 payment wall. Built-in templates ship with the gateway, and
+templates that add one capability, such as caller context, tool gating, or credential
+delegation. Built-in templates ship with the gateway, and
 operators can save, import, and export their own. See the
 [templates README](../config/examples/agent_surface_templates/README.md).
 
@@ -517,11 +540,18 @@ promotes it and `SIGUSR2` steps it down. Two instances sharing storage can keep 
 caches in step with a periodic refresh. See
 [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md#server-mode).
 
+Instances sharing storage also share the key that signs transit tokens, kept beside the
+gateway's own keys, so a managed agent's Transit Point calls are accepted by whichever
+instance serves them. Instances that do not share it refuse each other's transit tokens.
+See [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token).
+
 Set the same `AG_IDENTITY_HASH_PEPPER` on every node of a multi-node gateway. The pepper
 derives the DIDs of agents identified by mTLS, API key or a JWT claim, so nodes with
 different peppers give the same agent different DIDs. With encryption at rest off it also
 seals the OAuth delegation `state`, so a callback that lands on another node can open the
-state only when both nodes share the pepper.
+state only when both nodes share the pepper. It also derives the ids of delegated grants by
+binding, which the vault keeps only while the pepper is set, so a node with another pepper
+finds none of them.
 
 Used OAuth `state` nonces are checked per node, not across nodes. Each node remembers for
 15 minutes the nonces its own callbacks used, so a state already used on one node is not

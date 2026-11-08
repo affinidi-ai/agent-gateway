@@ -21,12 +21,15 @@ use crate::a2a::{
     validate_jsonrpc_envelope,
 };
 use crate::observability::broadcast_payload_capture_async;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::server::ConnectionGuard;
 use crate::state::{MultiSurfaceProxyState, ProxyState};
 use crate::{channel_debug, channel_error, channel_info, channel_warn};
 
 mod a2a_stream;
+pub(crate) mod agent_card;
+pub(crate) mod agent_pay_gate;
 pub(crate) mod surface_payment;
 
 /// Lazy-initialized SSE session manager for MCP proxy:// channels.
@@ -35,7 +38,8 @@ static CHANNEL_SSE_SESSION_MGR: std::sync::LazyLock<crate::mcp::sse_server::SseS
     std::sync::LazyLock::new(|| crate::mcp::sse_server::SseSessionManager::new(None));
 
 async fn resolve_legacy_mcp_session(
-    headers: &HeaderMap
+    surface_id: &str,
+    headers: &HeaderMap,
 ) -> (crate::mcp::request_validation::LegacySessionEvidence, Option<String>) {
     use crate::mcp::request_validation::LegacySessionEvidence;
 
@@ -52,8 +56,8 @@ async fn resolve_legacy_mcp_session(
 
     let (legacy_sse, streamable_sse, capabilities) = tokio::join!(
         CHANNEL_SSE_SESSION_MGR.session_exists(session_id),
-        crate::mcp::streamable_sse::global_streamable_session_registry().has_session(session_id),
-        crate::mcp::elicitation::global_capability_registry().get(session_id),
+        crate::mcp::streamable_sse::global_streamable_session_registry().has_session(surface_id, session_id),
+        crate::mcp::elicitation::global_capability_registry().get(surface_id, session_id),
     );
     if legacy_sse || streamable_sse || capabilities.is_some() {
         (LegacySessionEvidence::Known, Some(session_id.to_string()))
@@ -62,31 +66,63 @@ async fn resolve_legacy_mcp_session(
     }
 }
 
-/// Returns `true` if the header should be forwarded upstream, additionally
-/// stripping the source-auth credential header unless JWT bearer auth
-/// explicitly opts into forwarding it to the direct target.
-fn should_forward_header(
-    name: &str,
-    source_auth_header: Option<&str>,
-) -> bool {
-    should_forward_ap_request_header_with_mapping(name, source_auth_header, None, false)
+/// Longest upstream `Mcp-Session-Id` the gateway records client capabilities under.
+const MAX_UPSTREAM_SESSION_ID_LEN: usize = 1024;
+
+/// Largest DID Auth challenge or authenticate request body: a DID, an EdDSA or
+/// ES256 compact JWS whose `kid` repeats that DID, and an optional channel name
+/// take a few KiB even for a long `did:peer` or `did:webvh`.
+const DID_AUTH_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// The upstream's `Mcp-Session-Id` from an `initialize` response: `Ok(None)`
+/// when it sent none, `Err` when it sent one the gateway can't use as a key
+/// (several values, or not visible ASCII as the MCP spec requires).
+fn upstream_mcp_session_id(headers: &HeaderMap) -> Result<Option<String>, &'static str> {
+    let mut values = headers
+        .get_all("mcp-session-id")
+        .iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err("several values");
+    }
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_UPSTREAM_SESSION_ID_LEN {
+        return Err("empty or too long");
+    }
+    if !bytes
+        .iter()
+        .all(|byte| (0x21..=0x7e).contains(byte))
+    {
+        return Err("not visible ASCII");
+    }
+    Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
 }
 
+/// Returns `true` if the header should be forwarded upstream, additionally
+/// stripping every source-auth credential header, whatever its case and whether
+/// it spells `-` as `_`, except the verified header named exactly as
+/// `forwarded_source_auth_header`.
 fn should_forward_ap_request_header_with_mapping(
     name: &str,
-    source_auth_header: Option<&str>,
+    source_auth_headers: &[&str],
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
-    forward_source_auth_header: bool,
+    forwarded_source_auth_header: Option<&str>,
 ) -> bool {
-    if !should_forward_request_header(name) {
+    if !should_forward_request_header(name) || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
-    if let Some(auth_header_name) = source_auth_header
-        && name.eq_ignore_ascii_case(auth_header_name)
+    if forwarded_source_auth_header.is_some_and(|forwarded| name.eq_ignore_ascii_case(forwarded)) {
+        return true;
+    }
+    if name.eq_ignore_ascii_case("authorization")
+        || source_auth_headers
+            .iter()
+            .any(|header| crate::config::target_auth_rules::same_header_name(name, header))
     {
-        return forward_source_auth_header;
-    } else if name.eq_ignore_ascii_case("authorization") {
         return false;
     }
 
@@ -101,6 +137,94 @@ fn should_forward_ap_request_header_with_mapping(
     }
 
     true
+}
+
+/// The caller's headers an Access Point's Fabric send carries: those the
+/// Access Point forwards ([`should_forward_ap_request_header_with_mapping`]),
+/// except one named like one of `credential_headers` ([`target_credential_header_names`]),
+/// as a buffered forward's map of upper-cased names and as a framed stream's
+/// headers, with the first Fabric crossing in place of any count the caller
+/// sent.
+fn access_point_fabric_headers(
+    headers: &HeaderMap,
+    source_auth_headers: &[&str],
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    credential_headers: &[&str],
+) -> (std::collections::HashMap<String, String>, HeaderMap) {
+    use crate::proxy::fabric_hops::{FIRST_FABRIC_HOP, set_fabric_hops, set_stream_fabric_hops};
+    let mut stream_headers = HeaderMap::new();
+    let mut headers_map: std::collections::HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            if is_credential_header(k.as_str(), credential_headers)
+                || !should_forward_ap_request_header_with_mapping(
+                    k.as_str(),
+                    source_auth_headers,
+                    header_metadata_mapping,
+                    None,
+                )
+            {
+                return None;
+            }
+            stream_headers.append(k.clone(), v.clone());
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_uppercase(), v.to_string()))
+        })
+        .collect();
+    set_fabric_hops(&mut headers_map, FIRST_FABRIC_HOP);
+    set_stream_fabric_hops(&mut stream_headers, FIRST_FABRIC_HOP);
+    (headers_map, stream_headers)
+}
+
+/// Whether a caller header goes on to an Access Point's target: one
+/// [`should_forward_ap_request_header_with_mapping`] forwards, unless it is named
+/// like one of `credential_headers` ([`target_credential_header_names`]), which only
+/// the gateway sets.
+fn forwards_ap_caller_header(
+    name: &str,
+    source_auth_headers: &[&str],
+    header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
+    forwarded_source_auth_header: Option<&str>,
+    credential_headers: &[&str],
+) -> bool {
+    should_forward_ap_request_header_with_mapping(
+        name,
+        source_auth_headers,
+        header_metadata_mapping,
+        forwarded_source_auth_header,
+    ) && !is_credential_header(name, credential_headers)
+}
+
+/// Whether `name` is one of `credential_headers`, the headers the gateway fills with a
+/// credential, compared without regard to case or to `_` against `-`, since some servers read
+/// both spellings as one. A caller's header of that name is never forwarded, whether or not the
+/// gateway then adds its own value.
+pub(crate) fn is_credential_header(
+    name: &str,
+    credential_headers: &[impl AsRef<str>],
+) -> bool {
+    credential_headers
+        .iter()
+        .any(|credential| crate::config::target_auth_rules::same_header_name(name, credential.as_ref()))
+}
+
+/// The headers that carry an Access Point Target's credentials: its `target_auth` header and
+/// the header of each delegated credential binding that can apply to it, whether or not the
+/// request is given a value for them.
+pub(crate) fn target_credential_header_names(surface: &crate::config::agent_surface::AgentSurface) -> Vec<&str> {
+    target_auth_header_name(surface.target_auth())
+        .into_iter()
+        .chain(
+            surface
+                .agent_keyed_outbound_credentials()
+                .filter_map(|binding| {
+                    binding
+                        .inject_as
+                        .header_name()
+                }),
+        )
+        .collect()
 }
 
 /// Extract UCP operation type from request path and method
@@ -536,14 +660,417 @@ impl CallerAssertion {
             Self::for_request(method, path)
         }
     }
+
+    /// A request received over Fabric. Only a `GET` of exactly the default card location or the
+    /// surface's own one is the sending gateway's card fetch; any other request, a `HEAD` or
+    /// another discovery read included, is a caller's, as [`Self::for_forwarded_request`] decides.
+    pub(crate) fn for_fabric_received_request(
+        surface: &crate::config::agent_surface::AgentSurface,
+        method: &str,
+        path: &str,
+        source_auth_failed: bool,
+    ) -> Self {
+        if method.eq_ignore_ascii_case("GET")
+            && (path == DEFAULT_AGENT_CARD_PATH || path == agent_card_fabric_forward_path(surface))
+        {
+            Self::GatewayOriginated
+        } else {
+            Self::for_forwarded_request(method, path, source_auth_failed)
+        }
+    }
 }
 
+/// The stores target authentication resolves a credential from, the surface it is resolved
+/// for, and the leg it goes out on. A provider token is cached in the vault for this surface.
+pub(crate) struct TargetAuthContext<'a> {
+    pub secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+    pub providers: Option<&'a dyn crate::credential_providers::storage::CredentialProviderStorage>,
+    pub vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+    /// How token requests reach the provider; the environment's egress when `None`.
+    pub egress: Option<&'a crate::delegation_vault::oauth::TokenEgress>,
+    pub surface: &'a crate::config::agent_surface::AgentSurface,
+    pub isolation: crate::config::credential_policy::RuleMode,
+    /// Where the credential goes: the surface's Target, or a Transit Point's endpoint.
+    pub endpoint: &'a str,
+    /// Whether the leg checks its callers: the surface's Access Point is configured to, or on a
+    /// Transit Point, the Transit Point is. A caller whose check failed is
+    /// [`CallerAssertion::Unauthenticated`] instead.
+    pub checks_callers: bool,
+    /// The alias of the Transit Point whose leg this is; `None` for the surface's Target.
+    pub transit_point: Option<&'a str>,
+    pub target_https: crate::config::credential_policy::RuleMode,
+    pub target_source_auth: crate::config::credential_policy::RuleMode,
+}
+
+impl<'a> TargetAuthContext<'a> {
+    pub(crate) fn of_surface(
+        surface: &'a crate::config::agent_surface::AgentSurface,
+        secrets: Option<&'a Arc<dyn crate::secrets::SecretsStore>>,
+        providers: Option<&'a Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
+        vault: Option<&'a Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
+    ) -> Self {
+        let policy = crate::config::credential_policy::credential_policy();
+        Self {
+            secrets,
+            providers: providers.map(|providers| providers.as_ref()),
+            vault: vault.map(|vault| vault.as_ref()),
+            egress: None,
+            surface,
+            isolation: policy.tenant_credential_isolation,
+            endpoint: &surface.target.endpoint,
+            checks_callers: surface.authenticates_callers(),
+            transit_point: None,
+            target_https: policy.target_https,
+            target_source_auth: policy.target_source_auth,
+        }
+    }
+
+    /// The same stores and surface for a Transit Point's leg: its endpoint, and whether it
+    /// checks its own callers.
+    pub(crate) fn for_transit_point(
+        self,
+        point: &'a crate::config::agent_surface::TransitPoint,
+    ) -> Self {
+        Self {
+            endpoint: &point.target_endpoint,
+            checks_callers: point.authenticates_callers(),
+            transit_point: Some(&point.alias),
+            ..self
+        }
+    }
+
+    /// The same leg to an MCP proxy Target: the credential goes to the proxy's `base_url`, so
+    /// `target_https` judges that URL. Without one the `proxy://` endpoint stays, which is
+    /// not https.
+    pub(crate) fn for_mcp_proxy(
+        self,
+        base_url: Option<&'a str>,
+    ) -> Self {
+        Self {
+            endpoint: base_url.unwrap_or(self.endpoint),
+            ..self
+        }
+    }
+
+    fn rule_mode(
+        &self,
+        rule: crate::config::target_auth_rules::TargetCredentialRule,
+    ) -> crate::config::credential_policy::RuleMode {
+        match rule {
+            crate::config::target_auth_rules::TargetCredentialRule::Https => self.target_https,
+            crate::config::target_auth_rules::TargetCredentialRule::SourceAuth => self.target_source_auth,
+        }
+    }
+
+    /// The enforced rule that withholds the credential on this leg for `caller`, if any.
+    fn withholding_rule(
+        &self,
+        caller: CallerAssertion,
+    ) -> Option<crate::config::target_auth_rules::TargetCredentialRule> {
+        let broken = crate::config::target_auth_rules::broken_target_credential_rules(
+            crate::config::target_auth_rules::is_https_target(self.endpoint),
+            self.checks_callers,
+            caller == CallerAssertion::GatewayOriginated,
+        );
+        withholding_rule(&self.surface.surface_id, self.transit_point, broken, |rule| self.rule_mode(rule))
+    }
+
+    pub(crate) fn of_proxy(state: &'a ProxyState) -> Self {
+        Self::of_surface(
+            &state.surface,
+            state.secrets_store.as_ref(),
+            state
+                .credential_provider_store
+                .as_ref(),
+            state
+                .delegation_vault_store
+                .as_ref(),
+        )
+    }
+}
+
+/// The first of the `broken` rules that is enforced, which withholds the Target credential.
+/// When none is, the credential is sent and each broken rule is logged, once per leg: the
+/// surface's Target, or the Transit Point named `transit_point`, under the surface variant the
+/// request resolved to.
+fn withholding_rule(
+    surface_id: &str,
+    transit_point: Option<&str>,
+    broken: Vec<crate::config::target_auth_rules::TargetCredentialRule>,
+    mode: impl Fn(crate::config::target_auth_rules::TargetCredentialRule) -> crate::config::credential_policy::RuleMode,
+) -> Option<crate::config::target_auth_rules::TargetCredentialRule> {
+    let withheld = broken
+        .iter()
+        .copied()
+        .find(|rule| mode(*rule).is_enforced());
+    if withheld.is_none() {
+        for rule in broken {
+            warn_target_rule_once(surface_id, transit_point, rule);
+        }
+    }
+    withheld
+}
+
+/// Logs that a leg sends its Target credential against `rule` in `warn`: the surface's Target,
+/// or the Transit Point named `transit_point`, under the surface variant the request resolved
+/// to. The decision is made per request, so each leg and rule is logged once. Returns whether
+/// it logged.
+fn warn_target_rule_once(
+    surface_id: &str,
+    transit_point: Option<&str>,
+    rule: crate::config::target_auth_rules::TargetCredentialRule,
+) -> bool {
+    use crate::config::target_auth_rules::TargetCredentialRule;
+    static WARNED: std::sync::LazyLock<dashmap::DashMap<String, u8>> = std::sync::LazyLock::new(Default::default);
+    let bit = match rule {
+        TargetCredentialRule::Https => 1,
+        TargetCredentialRule::SourceAuth => 2,
+    };
+    let variant = crate::observability::policy_audit::current_request_variant();
+    let leg = format!(
+        "{surface_id}\n{}\n{}",
+        variant
+            .as_deref()
+            .unwrap_or_default(),
+        transit_point.unwrap_or_default()
+    );
+    if WARNED
+        .get(&leg)
+        .is_some_and(|warned| *warned & bit != 0)
+    {
+        return false;
+    }
+    let first = {
+        let mut warned = WARNED.entry(leg).or_default();
+        let first = *warned & bit == 0;
+        *warned |= bit;
+        first
+    };
+    if first {
+        let what = match (rule, transit_point) {
+            (TargetCredentialRule::Https, _) => "to an endpoint that is not https".to_string(),
+            (TargetCredentialRule::SourceAuth, None) => "for callers the surface does not authenticate".to_string(),
+            (TargetCredentialRule::SourceAuth, Some(alias)) => {
+                format!("for callers Transit Point '{alias}' does not authenticate")
+            }
+        };
+        warn!(
+            surface_id = %surface_id,
+            surface_variant = variant.as_deref(),
+            transit_point = transit_point.unwrap_or_default(),
+            rule = rule.key(),
+            "Target credential sent {what}; it will be withheld once credential_policy.{rule} is enforce"
+        );
+    }
+    first
+}
+
+/// The caller an A2A proxy Target hands its backend credential for. That credential follows
+/// `target_source_auth` as a Target credential does: in `enforce`, a surface that checks no
+/// caller sends it for nobody. It goes to the proxy's own backend endpoint, not over the
+/// surface's `a2a-proxy://` Target, so `target_https` does not apply.
+pub(crate) fn a2a_proxy_target_caller(
+    surface: &crate::config::agent_surface::AgentSurface,
+    caller: CallerAssertion,
+) -> CallerAssertion {
+    if !caller.permits_target_credential() {
+        return caller;
+    }
+    let broken = crate::config::target_auth_rules::broken_target_credential_rules(
+        true,
+        surface.authenticates_callers(),
+        caller == CallerAssertion::GatewayOriginated,
+    );
+    let mode = crate::config::credential_policy::credential_policy().target_source_auth;
+    match withholding_rule(&surface.surface_id, None, broken, |_| mode) {
+        Some(rule) => {
+            warn!(surface_id = %surface.surface_id, rule = rule.key(), "Withholding the A2A proxy backend credential");
+            CallerAssertion::Unauthenticated
+        }
+        None => caller,
+    }
+}
+
+pub(crate) const TARGET_AUTH_FAILED: &str = "Target authentication failed";
+
+/// Why a target credential could not be resolved. Rendered to the caller only as a
+/// generic failure; the variant is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TargetAuthError {
+    #[error("target authentication store unavailable")]
+    StoreUnavailable,
+    #[error("target authentication secret not found")]
+    SecretNotFound,
+    #[error("target authentication credential provider not found")]
+    ProviderNotFound,
+    #[error("credential provider needs a user's consent and cannot authenticate a target")]
+    ProviderNeedsConsent,
+    #[error("target credential withheld: credential_policy.{0} is enforce")]
+    Withheld(crate::config::target_auth_rules::TargetCredentialRule),
+    #[error("target authentication header breaks a header rule and is never sent")]
+    InvalidHeader,
+    #[error(transparent)]
+    ServiceToken(#[from] crate::delegation_vault::service_token::ServiceTokenError),
+}
+
+impl TargetAuthError {
+    /// The token endpoint's OAuth `error` code behind this failure, when it answered with one.
+    pub(crate) fn oauth_error(&self) -> Option<crate::delegation_vault::oauth::OAuthErrorCode> {
+        match self {
+            Self::ServiceToken(error) => error.oauth_error(),
+            _ => None,
+        }
+    }
+}
+
+/// Records in the VP Audit Log that the Target credential of `target_auth` was not sent
+/// because of `error`; its `fallback` says whether the request was refused or went on without
+/// it.
+pub(crate) fn record_target_auth_failure(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+    error: &TargetAuthError,
+) {
+    use crate::audit::request_events::TargetAuthOutcome;
+    let outcome = match target_auth.fallback {
+        crate::config::TargetAuthFallback::Reject => TargetAuthOutcome::Rejected,
+        crate::config::TargetAuthFallback::Passthrough => TargetAuthOutcome::Passthrough,
+    };
+    record_target_auth_outcome(facts, transit_point, target_auth, outcome, error.oauth_error());
+}
+
+/// Records in the VP Audit Log that a request was refused over the Target credential of
+/// `target_auth` whatever its `fallback`: it would have carried the credential outside the
+/// Target's base path, or the credential cannot be sent as a header. Nothing is forwarded.
+pub(crate) fn record_target_auth_refusal(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+) {
+    record_target_auth_outcome(
+        facts,
+        transit_point,
+        target_auth,
+        crate::audit::request_events::TargetAuthOutcome::Rejected,
+        None,
+    );
+}
+
+fn record_target_auth_outcome(
+    facts: &crate::audit::request_events::RequestFacts<'_>,
+    transit_point: Option<&str>,
+    target_auth: &crate::config::TargetAuthConfig,
+    outcome: crate::audit::request_events::TargetAuthOutcome,
+    oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
+) {
+    let provider_id = match &target_auth.method {
+        crate::config::TargetAuthMethod::CredentialProvider { provider_id, .. } => Some(provider_id.as_str()),
+        _ => None,
+    };
+    crate::audit::request_events::target_auth_failed(facts, transit_point, provider_id, outcome, oauth_error);
+}
+
+/// A Target credential header the gateway attaches, and the issued service token behind it,
+/// which [`forget_refused_target_token`] drops when the Target refuses it as invalid.
+pub(crate) struct TargetCredential {
+    pub header: (String, String),
+    pub issued: Option<crate::delegation_vault::service_token::IssuedToken>,
+}
+
+/// The Target credential header for `target_auth`, without the token behind it.
 pub(crate) async fn inject_target_auth_header(
     target_auth: &crate::config::TargetAuthConfig,
-    secrets_store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
+    context: &TargetAuthContext<'_>,
     channel_name: &str,
     caller: CallerAssertion,
-) -> anyhow::Result<Option<(String, String)>> {
+) -> Result<Option<(String, String)>, TargetAuthError> {
+    Ok(resolve_target_credential(target_auth, context, channel_name, caller)
+        .await?
+        .map(|credential| credential.header))
+}
+
+/// Drops the issued service token behind a Target credential when the Target's answer refuses
+/// it as invalid: a 401 with a Bearer challenge whose `error` is `invalid_token`, under the
+/// limits of [`service_token::invalidate`](crate::delegation_vault::service_token::invalidate).
+/// The request is not retried; the next one asks the provider for a new token. Any other
+/// answer, and a credential with no issued token (a static secret, an API key, or a provider
+/// token sent other than as `Authorization: Bearer`), changes nothing.
+pub(crate) async fn forget_refused_target_token(
+    vault: Option<&dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+    issued: Option<&crate::delegation_vault::service_token::IssuedToken>,
+    surface_id: &str,
+    status: u16,
+    headers: &axum::http::HeaderMap,
+) {
+    use crate::delegation_vault::service_token;
+    let (Some(vault), Some(issued)) = (vault, issued) else {
+        return;
+    };
+    let challenges = headers
+        .get_all(axum::http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|value| value.to_str().ok());
+    if !service_token::refuses_token_as_invalid(status, challenges) {
+        return;
+    }
+    match service_token::invalidate(vault, issued, chrono::Utc::now()).await {
+        Ok(service_token::Invalidation::Dropped) => info!(
+            surface_id = %surface_id,
+            token_id = %issued.id,
+            "The Target refused its service token as invalid_token; the next request gets a new one"
+        ),
+        Ok(outcome) => debug!(
+            surface_id = %surface_id,
+            token_id = %issued.id,
+            ?outcome,
+            "The Target refused its service token as invalid_token; the token is kept"
+        ),
+        Err(error) => warn!(
+            surface_id = %surface_id,
+            token_id = %issued.id,
+            %error,
+            "Could not drop a service token the Target refused as invalid_token"
+        ),
+    }
+}
+
+/// An issued service token sent as a Target credential by a call that reads the Target's
+/// answer itself, such as an MCP proxy tool call, with what [`forget_refused_target_token`]
+/// needs to drop it.
+pub(crate) struct SentServiceToken<'a> {
+    pub vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+    pub issued: &'a crate::delegation_vault::service_token::IssuedToken,
+    pub surface_id: &'a str,
+}
+
+impl<'a> SentServiceToken<'a> {
+    /// The token sent to the Target of `surface_id`, if `issued` is one.
+    pub(crate) fn of(
+        vault: Option<&'a dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+        issued: Option<&'a crate::delegation_vault::service_token::IssuedToken>,
+        surface_id: &'a str,
+    ) -> Option<Self> {
+        issued.map(|issued| Self { vault, issued, surface_id })
+    }
+
+    /// [`forget_refused_target_token`] for the Target's answer `status` and `headers`.
+    pub(crate) async fn forget_if_refused(
+        &self,
+        status: u16,
+        headers: &axum::http::HeaderMap,
+    ) {
+        forget_refused_target_token(self.vault, Some(self.issued), self.surface_id, status, headers).await;
+    }
+}
+
+/// The Target credential for `target_auth`, with the issued service token behind it.
+pub(crate) async fn resolve_target_credential(
+    target_auth: &crate::config::TargetAuthConfig,
+    context: &TargetAuthContext<'_>,
+    channel_name: &str,
+    caller: CallerAssertion,
+) -> Result<Option<TargetCredential>, TargetAuthError> {
     use crate::config::TargetAuthMethod;
 
     if !caller.permits_target_credential() {
@@ -553,6 +1080,22 @@ pub(crate) async fn inject_target_auth_header(
         );
         return Ok(None);
     }
+    if let TargetAuthMethod::StaticSecret { header_name, header_format, .. }
+    | TargetAuthMethod::CredentialProvider { header_name, header_format, .. } = &target_auth.method
+        && crate::config::target_auth_rules::breaks_header_rules(header_name, header_format)
+    {
+        warn!(
+            channel = %channel_name,
+            header = ?header_name,
+            "Refusing to send a target credential whose header breaks a header rule"
+        );
+        return Err(TargetAuthError::InvalidHeader);
+    }
+    if !matches!(target_auth.method, TargetAuthMethod::CredentialLookup)
+        && let Some(rule) = context.withholding_rule(caller)
+    {
+        return Err(TargetAuthError::Withheld(rule));
+    }
 
     match &target_auth.method {
         TargetAuthMethod::StaticSecret {
@@ -560,28 +1103,168 @@ pub(crate) async fn inject_target_auth_header(
             header_name,
             header_format,
         } => {
-            let store = secrets_store
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Secrets store not available"))?;
+            let store = context
+                .secrets
+                .ok_or(TargetAuthError::StoreUnavailable)?;
 
             let secret = store
                 .get_by_secret_id(secret_id)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to load secret '{}': {}", secret_id, e))?
-                .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id))?;
+                .map_err(|e| {
+                    warn!(channel = channel_name, secret_id = %secret_id, error = %e, "Failed to load target auth secret");
+                    TargetAuthError::StoreUnavailable
+                })?
+                .ok_or(TargetAuthError::SecretNotFound)?;
+
+            let surface_tenant = context
+                .surface
+                .tenant_id
+                .as_deref();
+            if !crate::tenancy::can_reference_with_rule(surface_tenant, secret.tenant_id.as_deref(), context.isolation)
+            {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    "Refusing target auth secret outside the surface's tenant"
+                );
+                return Err(TargetAuthError::SecretNotFound);
+            }
+            if crate::tenancy::breaks_tenant_isolation(surface_tenant, secret.tenant_id.as_deref()) {
+                warn!(
+                    channel = channel_name,
+                    secret_id = %secret_id,
+                    tenant_id = ?surface_tenant,
+                    "Target auth secret is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                );
+            }
 
             // Format the header value
             let header_value = header_format.replace("{value}", &secret.value);
 
             debug!(channel = channel_name, secret_id = %secret_id, header = %header_name, "Resolved target auth secret");
 
-            Ok(Some((header_name.clone(), header_value)))
+            Ok(Some(TargetCredential {
+                header: (header_name.clone(), header_value),
+                issued: None,
+            }))
+        }
+        TargetAuthMethod::CredentialProvider {
+            provider_id,
+            header_name,
+            header_format,
+            scopes,
+        } => {
+            let mut token = target_provider_token(context, provider_id, scopes).await?;
+            debug!(channel = channel_name, provider_id = %provider_id, header = %header_name, "Resolved target auth provider token");
+            let bearer = header_name.eq_ignore_ascii_case("authorization")
+                && header_format
+                    .get(..7)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "));
+            Ok(Some(TargetCredential {
+                header: (header_name.clone(), header_format.replace("{value}", token.value())),
+                issued: token
+                    .issued
+                    .take()
+                    .filter(|_| bearer),
+            }))
         }
         TargetAuthMethod::CredentialLookup => {
             // CredentialLookup method not yet implemented - using Secrets approach instead
             warn!(channel = channel_name, "CredentialLookup method not implemented, skipping target auth injection");
             Ok(None)
         }
+    }
+}
+
+/// The service token of `provider_id` for target authentication, cached in the vault
+/// under the surface (`surface:<id>`) and the purpose `__target_auth__`, so two sets of
+/// scopes on one surface keep a token each.
+async fn target_provider_token(
+    context: &TargetAuthContext<'_>,
+    provider_id: &str,
+    scopes: &[String],
+) -> Result<crate::delegation_vault::service_token::ServiceToken, TargetAuthError> {
+    use crate::credential_providers::CredentialProviderType;
+    use crate::delegation_vault::service_token::{self, ServiceTokenContext, ServiceTokenKey};
+
+    let (Some(secrets), Some(providers), Some(vault)) = (context.secrets, context.providers, context.vault) else {
+        return Err(TargetAuthError::StoreUnavailable);
+    };
+    let provider = providers
+        .get(provider_id)
+        .await
+        .map_err(|_| TargetAuthError::StoreUnavailable)?
+        .filter(|provider| {
+            provider.usable_by(crate::tenancy::SurfaceTenancy {
+                tenant_id: context
+                    .surface
+                    .tenant_id
+                    .as_deref(),
+                mode: context.isolation,
+            })
+        })
+        .ok_or(TargetAuthError::ProviderNotFound)?;
+    if provider.breaks_tenant_isolation_for(
+        context
+            .surface
+            .tenant_id
+            .as_deref(),
+    ) {
+        warn!(
+            surface_id = %context.surface.surface_id,
+            provider_id = %provider_id,
+            tenant_id = ?context.surface.tenant_id,
+            "Target auth provider is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+        );
+    }
+    if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
+        return Err(TargetAuthError::ProviderNeedsConsent);
+    }
+    let mut scopes = if scopes.is_empty() {
+        provider
+            .default_scopes
+            .clone()
+    } else {
+        scopes.to_vec()
+    };
+    scopes.sort_unstable();
+    scopes.dedup();
+    let agent_did = format!("surface:{}", context.surface.surface_id);
+    let service = ServiceTokenContext {
+        secrets,
+        providers,
+        vault,
+        egress: context.egress,
+    };
+    let key = ServiceTokenKey {
+        agent_did: &agent_did,
+        purpose: "__target_auth__",
+    };
+    Ok(service_token::acquire(&provider, &scopes, &service, key, chrono::Utc::now()).await?)
+}
+
+/// The header a Target authentication sets, when it sets one. A caller header of
+/// that name never reaches the target, whether or not the gateway adds its own.
+pub(crate) fn target_auth_header_name(target_auth: Option<&crate::config::TargetAuthConfig>) -> Option<&str> {
+    target_auth.and_then(|target_auth| {
+        target_auth
+            .method
+            .header_name()
+    })
+}
+
+/// Set a gateway credential header on an upstream request, replacing every
+/// value of that header already on it, so the target receives exactly one. An
+/// invalid name or value fails the request when it is sent, as
+/// [`reqwest::RequestBuilder::header`] does.
+pub(crate) fn replace_request_header(
+    request: reqwest::RequestBuilder,
+    name: &str,
+    value: &str,
+) -> reqwest::RequestBuilder {
+    match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(value)) {
+        (Ok(name), Ok(value)) => request.headers(HeaderMap::from_iter([(name, value)])),
+        _ => request.header(name, value),
     }
 }
 
@@ -641,17 +1324,16 @@ fn inject_did_headers(
     headers: &mut Vec<(&str, String)>,
 ) {
     use crate::config::DidInjectionMode;
+    use crate::proxy::caller_identity::CallerHeaders;
 
     match context.injection_mode() {
         DidInjectionMode::Header => {
-            // Simple DID in X-DID-Identity header
-            headers.push(("X-DID-Identity", context.did().to_string()));
+            headers.push((CallerHeaders::DID_IDENTITY, context.did().to_string()));
             debug!(did = %context.did(), "Injected DID identity in header");
         }
         DidInjectionMode::SignedHeader => {
-            // DID document in X-DID-Signed-Identity header
             headers.push((
-                "X-DID-Signed-Identity",
+                CallerHeaders::DID_SIGNED_IDENTITY,
                 context
                     .did_document()
                     .to_string(),
@@ -666,12 +1348,15 @@ fn inject_did_headers(
 }
 
 /// Handle agent card requests - intercept and potentially modify
-#[allow(dead_code)]
 pub async fn handle_agent_card(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<ProxyState>,
     headers: HeaderMap,
+    trace_id: &str,
 ) -> Result<Response, Response> {
+    if let Some(response) = surface_payment::legacy_payment_unavailable(&state.surface, false) {
+        return Ok(response);
+    }
     let channel_name = state.surface.name.clone();
 
     // Extract source address (client IP) - prefer x-forwarded-for if present, otherwise use socket address
@@ -694,407 +1379,17 @@ pub async fn handle_agent_card(
         "Intercepting /.well-known/agent-card.json request"
     );
 
-    // Handle payment verification (x402, MPP, or both)
-    // When both protocols are enabled, the client can satisfy either one.
-    // If no credential is provided, a combined 402 is returned with both
-    // x402 JSON body and MPP WWW-Authenticate headers.
-    {
-        let config_id = state
-            .surface
-            .surface_id
-            .as_str();
-        let resource_url = "/.well-known/agent-card.json";
-        let empty_body: &[u8] = b""; // Agent card is a GET request
-
-        // A delegated (Model B) x402 policy has no local price/verify config to
-        // check here and is never routed through the delegation relay on this
-        // endpoint — skip it so an agent-card fetch isn't paywalled against an
-        // empty local challenge.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| p.enabled && p.provider != crate::config::types::X402Provider::AgentPay);
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    empty_body,
-                    None,
-                )
-            });
-
-        if x402_required || mpp_required {
-            let payment_signature = crate::x402::extract_payment_signature(
-                &headers,
-                &state
-                    .config
-                    .x402_headers
-                    .payment_signature,
-            );
-            let mpp_credential = crate::mpp::extract_mpp_credential(&headers);
-
-            if x402_required && payment_signature.is_some() {
-                // Client sent x402 credential → verify via x402
-                match crate::x402::process_payment(
-                    payment_signature,
-                    state
-                        .surface
-                        .x402_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    resource_url,
-                    state
-                        .listener_manager
-                        .read()
-                        .await
-                        .clone(),
-                    state
-                        .transaction_store
-                        .clone(),
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(error) => return Err(error.render(&state.config.x402_headers)),
-                }
-            } else if mpp_required && mpp_credential.is_some() {
-                // Client sent MPP credential → verify via MPP
-                match crate::mpp::process_payment(
-                    mpp_credential,
-                    state
-                        .surface
-                        .mpp_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    resource_url,
-                    state
-                        .mpp_transaction_store
-                        .clone(),
-                    &state.secrets_store,
-                )
-                .await
-                {
-                    Ok(_) => {}
-                    Err(error) => return Err(error.into_response()),
-                }
-            } else if let Some(error) = surface_payment::payment_required(
-                // No credential → return 402 (combined if both protocols enabled)
-                state
-                    .surface
-                    .x402_config()
-                    .filter(|_| x402_required),
-                state
-                    .surface
-                    .mpp_config()
-                    .filter(|_| mpp_required),
-                &channel_name,
-                config_id,
-                resource_url,
-                &surface_payment::LocalPaymentServices::of(&state).await,
-            )
+    let card =
+        agent_card::build_public_card(&state, &headers, &source_addr, agent_card::CardMode::Serve, Some(trace_id))
             .await
-            {
-                return Err(error.render(&state.config.x402_headers));
-            }
-        }
-    }
-
-    let prepared_a2a_proxy_agent_card = prepare_a2a_proxy_agent_card(&state, &channel_name).await?;
-    let agent_card_was_synthesized = prepared_a2a_proxy_agent_card.is_some();
-
-    // Build target URL, respecting override_agent_card_location if configured
-    let target_url = if prepared_a2a_proxy_agent_card.is_none()
-        && state
-            .surface
-            .override_agent_card_location()
-        && state
-            .surface
-            .agent_card_location_path()
-            .is_some()
-    {
-        let custom_path = state
-            .surface
-            .agent_card_location_path()
-            .unwrap();
-        let endpoint = &state.surface.target.endpoint;
-        let origin = if let Some(scheme_end) = endpoint.find("://") {
-            let after_scheme = &endpoint[scheme_end + 3..];
-            let authority_end = after_scheme
-                .find('/')
-                .unwrap_or(after_scheme.len());
-            &endpoint[..scheme_end + 3 + authority_end]
-        } else {
-            endpoint.as_str()
-        };
-        if custom_path.starts_with('/') {
-            format!("{}{}", origin, custom_path)
-        } else {
-            format!("{}/{}", origin, custom_path)
-        }
-    } else {
-        crate::proxy::protocol_router::join_endpoint_path(
-            &state.surface.target.endpoint,
-            "/.well-known/agent-card.json",
-        )
-    };
-
-    let (mut agent_card, prepared_identity) = if let Some(prepared) = prepared_a2a_proxy_agent_card {
-        (prepared.card, prepared.identity)
-    } else {
-        (fetch_agent_card_from_surface_target(&state, &headers, &source_addr, &channel_name, &target_url).await?, None)
-    };
-
-    let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-    let resolved_identity = if let Some(identity) = prepared_identity {
-        identity
-    } else {
-        let card_identity_selector = state
-            .protected_selector
-            .as_ref()
-            .or(state
-                .identity_selector
-                .as_ref());
-        let card_identity_rules = state
-            .protected_rules_engine
-            .as_ref()
-            .or(state
-                .identity_rules_engine
-                .as_ref());
-        match crate::proxy::backend_identity::resolve_protected_agent_identity(
-            &card_bytes,
-            &state.surface,
-            card_identity_selector,
-            card_identity_rules,
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None,
-        )
-        .await
-        {
-            Ok(identity) => identity,
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    error = %e,
-                    code = %e.code(),
-                    "Protected agent identity resolution failed for agent card intercept"
-                );
-                return Err(crate::a2a::create_identity_error_response(
-                    e.http_status(),
-                    e.code(),
-                    "protected_identity",
-                    &channel_name,
-                    &e.to_string(),
-                ));
-            }
-        }
-    };
-
-    // External slot resolution (Surface Builder external identity node).
-    // Side-effect: issues DID for the external counterparty via vc_issuer.
-    if state
-        .external_selector
-        .is_some()
-        && let Err(e) = crate::proxy::backend_identity::resolve_external_agent_identity(
-            &card_bytes,
-            &state.surface,
-            state
-                .external_selector
-                .as_ref(),
-            state
-                .external_rules_engine
-                .as_ref(),
-            &channel_name,
-            crate::proxy::backend_identity::IdentityResponseKind::PublicAgentCard,
-            None, // agent-card fetch has no inbound caller token
-        )
-        .await
-    {
-        warn!(
-            channel = channel_name,
-            error = %e,
-            code = %e.code(),
-            "External agent identity resolution failed for agent card intercept"
-        );
-        return Err(crate::a2a::create_identity_error_response(
-            e.http_status(),
-            e.code(),
-            "external_identity",
-            &channel_name,
-            &e.to_string(),
-        ));
-    }
-
-    // Rewrite upstream cards to point back to the proxy; synthesized A2A Proxy
-    // cards already derive their URL from the exposing Access Point.
-    if !agent_card_was_synthesized {
-        let card_bytes = serde_json::to_vec(&agent_card).unwrap_or_default();
-        let rewritten = rewrite_agent_card_urls(
-            &card_bytes,
-            &state.surface,
-            &state.config,
-            &state.network_config,
-            &resolved_identity,
-            crate::a2a::AgentCardKind::Public,
-        )
-        .await
-        .map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to rewrite agent card URLs");
-            create_error_response(StatusCode::BAD_GATEWAY, "Failed to rewrite agent card URLs")
-        })?;
-        agent_card = serde_json::from_slice(rewritten.as_ref()).map_err(|e| {
-            warn!(channel = channel_name, error = %e, "Failed to parse rewritten agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid rewritten agent card JSON")
-        })?;
-    }
-
-    // Replace agent-identity/v1 with agent-identity-credential/v1 (signed VP)
-    if let Some(selector) = state
-        .identity_selector
-        .as_ref()
-    {
-        let vc_issuer = selector.get_vc_issuer();
-        if let Err(e) = crate::a2a::inject_credential_into_agent_card(
-            &mut agent_card,
-            &resolved_identity,
-            &vc_issuer,
-            &channel_name,
-        )
-        .await
-        {
-            error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
-            return Err(create_error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Agent card identity credential injection failed: {}", e),
-            ));
-        }
-    }
-
-    // Inject Agent DNA + DID from the channel's did:webvh identity into the agent card.
-    // Per the February demo design: DNA is randomly generated at identity creation time
-    // and surfaced here so callers (other agents, UI clients) can observe the UAI / DNA
-    // without needing to resolve the did.jsonl separately.
-    #[cfg(feature = "didwebvh")]
-    if let (Some(did_config), Some(identity_store)) = (
-        state
-            .surface
-            .didwebvh_identity_legacy(),
-        state
-            .didwebvh_identity_store
-            .as_ref(),
-    ) {
-        match identity_store
-            .get(&did_config.identity_id)
-            .await
-        {
-            Ok(Some(identity)) => {
-                if let Some(obj) = agent_card.as_object_mut() {
-                    obj.insert("agentDid".to_string(), JsonValue::String(identity.did.clone()));
-                    if let Some(dna_value) = identity
-                        .metadata
-                        .get("agentDNA")
-                    {
-                        obj.insert("agentDNA".to_string(), dna_value.clone());
-                        info!(
-                            channel = channel_name,
-                            did = %identity.did,
-                            "Injected agentDNA into agent card"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    "Configured did:webvh identity not found — skipping DNA injection"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    channel = channel_name,
-                    identity_id = %did_config.identity_id,
-                    error = %e,
-                    "Failed to load did:webvh identity for agent card — skipping DNA injection"
-                );
-            }
-        }
-    }
-
-    info!(channel = channel_name, "Successfully fetched and parsed agent card");
-
-    // Trust Recorder — writes TrAdmin records to configured TRs on the
-    // discovery (agent-card) fetch, so a fresh surface populates its trust
-    // registry on the first `.well-known/agent-card.json` request instead of
-    // waiting for the first real message. Fire-and-forget; idempotent —
-    // duplicate records log at DEBUG (`apply_trust_recorder`), so firing on
-    // every discovery is safe.
-    if let ProtectedAgentIdentity::Managed { did, .. } = &resolved_identity {
-        crate::trust_registry_verification::spawn_trust_recorder(
-            &state.surface,
-            did,
-            state
-                .trust_registry_listener_manager
-                .clone(),
-        );
-    }
-
-    // Record successful connection in metrics
-    // Only tag as UCP "discovery" when the channel is actually a UCP channel
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.clone();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let ucp_operation = if state.surface.is_ucp() {
-            Some("discovery".to_string())
-        } else {
-            None
-        };
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
-            metrics
-                .record_connection_with_ucp(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::Success,
-                    None,
-                    None,
-                    crate::metrics::ConnectionDirection::Request,
-                    uuid::Uuid::new_v4().to_string(),
-                    ucp_operation,
-                    None,
-                    None,
-                    0,
-                    variant_alias,
-                )
-                .await;
-        });
-    }
+            .map_err(|failure| failure.response)?;
 
     // Negotiate the agent-card media type: A2A 1.0.1 prefers
     // `application/a2a+json`, but it is only served to callers that signalled 1.0
     // (via `A2A-Version` or `Accept`) so 0.3 clients and tools that strict-check
     // `application/json` are unaffected.
     Ok(agent_card_response(
-        agent_card,
+        card.served,
         &headers,
         state
             .surface
@@ -1220,107 +1515,135 @@ fn evaluate_ap2_inbound_decision(
 
 async fn resolve_direct_surface_auth_config(
     auth_config: &crate::source_auth::SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> crate::source_auth::errors::SourceAuthResult<crate::source_auth::SourceAuthConfig> {
-    crate::source_auth::middleware::resolve_surface_audience(auth_config, vc_issuer, surface_id).await
+    crate::source_auth::middleware::resolve_surface_audience(auth_config, protected_resource, vc_issuer, surface_id)
+        .await
 }
 
-/// Maps the config-level delegated-rail marker onto the audit `PaymentRail`.
-fn map_delegated_rail(
-    rail: &crate::config::types::DelegatedPaymentRail
-) -> crate::delegation_vault::audit::PaymentRail {
-    if rail.is_x402() {
-        crate::delegation_vault::audit::PaymentRail::X402
-    } else {
-        crate::delegation_vault::audit::PaymentRail::Mpp
-    }
-}
-
-/// Records one payment-lifecycle audit event for the Model B fabric relay, using
-/// the same protocol-independent `PaymentEvent` action the local x402/MPP stores
-/// emit. The delegate leg owns no local transaction, so the request `trace_id`
-/// doubles as the correlation id and `delegated` / remote-id / remote-status
-/// fields carry the relay context. `extra_detail` is folded into the failure
-/// `error` for a denied/misconfigured outcome. On `proceed` this also issues a
-/// `PaymentAccessGrantCredential` ( agent-gateway attests to granting access on
-/// a payment it relayed, not to settlement — that is the remote payment
-/// gateway's own responsibility to attest to); on a denial it issues a
-/// `PaymentRejectionCredential` instead.
-async fn audit_payment_delegation(
-    config_id: &str,
-    channel_name: &str,
+/// Records a request refused by payment with its real status.
+fn record_payment_refusal(
+    state: &ProxyState,
+    source_addr: &str,
+    start_time: std::time::Instant,
     trace_id: &str,
-    rail: crate::delegation_vault::audit::PaymentRail,
-    payment_gateway_id: &str,
-    payment_surface_id: &str,
-    outcome: &str,
-    status_code: u16,
-    extra_detail: Option<&str>,
+    status: StatusCode,
 ) {
-    use crate::delegation_vault::audit::{PaymentEventDetails, PaymentStage, record_payment_event};
-    let stage = match outcome {
-        "proceed" => PaymentStage::Verified,
-        "challenge" => PaymentStage::ChallengeIssued,
-        _ => PaymentStage::Failed,
-    };
-    let error = (stage == PaymentStage::Failed).then(|| match extra_detail {
-        Some(msg) => format!("{outcome}: {msg}"),
-        None => outcome.to_string(),
-    });
-    let rail_tag = if rail == crate::delegation_vault::audit::PaymentRail::X402 {
-        "x402"
-    } else {
-        "mpp"
-    };
-    let vc = match stage {
-        PaymentStage::Verified => {
-            crate::payment_credentials::issue_access_grant(crate::payment_credentials::AccessGrantInput {
-                rail: rail_tag,
-                trace_id: Some(trace_id.to_string()),
-                payment_gateway_id: (!payment_gateway_id.is_empty()).then(|| payment_gateway_id.to_string()),
-                payment_surface_id: (!payment_surface_id.is_empty()).then(|| payment_surface_id.to_string()),
-                remote_status: status_code,
-            })
-            .await
-        }
-        PaymentStage::Failed => {
-            crate::payment_credentials::issue_payment_rejection(crate::payment_credentials::PaymentRejectionInput {
-                rail: rail_tag,
-                payment_id: trace_id.to_string(),
-                trace_id: Some(trace_id.to_string()),
-                method: None,
-                payer: None,
-                reason: error
-                    .clone()
-                    .unwrap_or_else(|| outcome.to_string()),
-            })
-            .await
-        }
-        _ => None,
-    };
-    record_payment_event(
-        PaymentEventDetails {
-            rail,
-            stage,
-            transaction_id: trace_id.to_string(),
-            amount: None,
-            currency: None,
-            method: None,
-            payer: None,
-            error,
-            delegated: true,
-            payment_gateway_id: (!payment_gateway_id.is_empty()).then(|| payment_gateway_id.to_string()),
-            payment_surface_id: (!payment_surface_id.is_empty()).then(|| payment_surface_id.to_string()),
-            remote_status: Some(status_code),
-        },
-        Some(config_id),
-        Some(channel_name),
-        Some(trace_id),
-        true,
-        vc.as_ref()
-            .map(|c| c.jwt.as_str()),
+    record_payment_refusal_metric(
+        state.metrics_store.clone(),
+        &state.surface,
+        source_addr,
+        start_time,
+        trace_id,
+        status,
     );
+}
+
+/// Records, in the connection metrics, a request that payment refused, with
+/// its real status.
+pub(crate) fn record_payment_refusal_metric(
+    metrics: Option<Arc<crate::metrics::MetricsStore>>,
+    surface: &crate::config::agent_surface::AgentSurface,
+    source_addr: &str,
+    start_time: std::time::Instant,
+    trace_id: &str,
+    status: StatusCode,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let latency_ms = start_time
+        .elapsed()
+        .as_millis() as u64;
+    let surface_id = surface.surface_id.clone();
+    let destination = surface
+        .target
+        .endpoint
+        .clone();
+    let source = source_addr.to_string();
+    let trace_id = trace_id.to_string();
+    let status = if status.is_server_error() {
+        crate::metrics::ConnectionStatus::GatewayFault
+    } else {
+        crate::metrics::ConnectionStatus::Failed
+    };
+    crate::observability::policy_audit::spawn_in_request(async move {
+        metrics
+            .record_connection(
+                surface_id,
+                source,
+                destination,
+                status,
+                Some(latency_ms),
+                None,
+                crate::metrics::ConnectionDirection::Request,
+                trace_id,
+                None,
+                None,
+                latency_ms,
+            )
+            .await;
+    });
+}
+
+/// What a request needs to be put through the agent-pay payment gate: who is
+/// calling, how the request is traced and where it came from.
+#[derive(Clone, Copy)]
+struct InboundPayment<'a> {
+    intake: Option<&'a agent_pay_gate::Intake>,
+    identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
+    identity_binding: Option<&'a crate::surface_context::IdentityBindingContext>,
+    trace_id: &'a str,
+    egress_trace_id: &'a str,
+    source_addr: &'a str,
+    start_time: std::time::Instant,
+}
+
+impl InboundPayment<'_> {
+    /// Puts the request through the gate, just before it is forwarded.
+    /// `Ok(None)` when it is free and `Ok(Some(receipt))` when it was paid for;
+    /// the receipt holds the payment's claim until [`agent_pay_gate::Receipt::commit`].
+    /// `Err(response)` is the gate's answer when it was not, already recorded in
+    /// the connection metrics.
+    async fn charge(
+        &self,
+        state: &ProxyState,
+        evidence: Option<&crate::mcp::continuations::protected::ContinuationPayment>,
+    ) -> Result<Option<agent_pay_gate::Receipt>, Response> {
+        let Some(intake) = self.intake else {
+            return Ok(None);
+        };
+        match agent_pay_gate::charge(
+            intake,
+            agent_pay_gate::GateCall {
+                surface: &state.surface,
+                caller: agent_pay_gate::Caller {
+                    identity: self.identity,
+                    verified_agent_did: self
+                        .identity_binding
+                        .filter(|binding| binding.verified)
+                        .map(|binding| binding.agent_did.as_str()),
+                },
+                trace_id: self.trace_id,
+                egress_trace_id: self.egress_trace_id,
+                deadline_ms: None,
+                evidence,
+                fabric: &state.listener_manager,
+                via_fabric: false,
+            },
+        )
+        .await
+        {
+            agent_pay_gate::GateOutcome::Free => Ok(None),
+            agent_pay_gate::GateOutcome::Paid(paid) => Ok(Some(paid.receipt)),
+            agent_pay_gate::GateOutcome::Refused(response) => {
+                record_payment_refusal(state, self.source_addr, self.start_time, self.trace_id, response.status());
+                Err(response)
+            }
+        }
+    }
 }
 
 fn access_point_upstream_key(state: &ProxyState) -> crate::mcp::upstream_versions::UpstreamKey {
@@ -1407,14 +1730,11 @@ fn streamed_response_completion(
         .target
         .endpoint
         .clone();
-    let variant = state
-        .active_variant_alias
-        .clone();
     move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
         let latency = start_time
             .elapsed()
             .as_millis() as u64;
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             guard.decrement().await;
             if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                 monitor
@@ -1446,7 +1766,6 @@ fn streamed_response_completion(
                         None,
                         None,
                         latency,
-                        variant,
                     )
                     .await;
             }
@@ -1546,6 +1865,20 @@ fn record_legacy_mcp_refusal(
 
 /// Refuses a new SSE session because the session cap is reached, releasing the
 /// request's connection.
+/// Whether `body` is a JSON-RPC message. A legacy SSE session carries one to its
+/// client whatever the HTTP status of the answer, which is how a payment
+/// challenge or refusal reaches the client.
+fn is_jsonrpc_message(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|message| {
+            message
+                .get("jsonrpc")
+                .and_then(serde_json::Value::as_str)
+                == Some("2.0")
+        })
+}
+
 fn sse_session_limit_response(
     connection_guard: ConnectionGuard,
     facts: &crate::audit::request_events::RequestFacts<'_>,
@@ -1555,6 +1888,8 @@ fn sse_session_limit_response(
     (StatusCode::TOO_MANY_REQUESTS, "Too many active SSE sessions").into_response()
 }
 
+/// Serves one request on an Access Point, adding the receipt of the payment
+/// taken for it to whatever response it ends in, an error included.
 async fn proxy_handler_with_mcp_runtime(
     addr: SocketAddr,
     state: ProxyState,
@@ -1562,6 +1897,32 @@ async fn proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Result<Response, Response> {
+    let protocol = state
+        .surface
+        .channel_protocol();
+    let mut receipt = None;
+    let result = proxy_charged_request(addr, state, req, mcp_versions, mcp_continuations, &mut receipt).await;
+    match receipt {
+        Some(receipt) => {
+            receipt
+                .attach_to_result(&protocol, result)
+                .await
+        }
+        None => result,
+    }
+}
+
+async fn proxy_charged_request(
+    addr: SocketAddr,
+    state: ProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+    receipt_out: &mut Option<agent_pay_gate::Receipt>,
+) -> Result<Response, Response> {
+    if let Some(response) = surface_payment::legacy_payment_unavailable(&state.surface, false) {
+        return Err(response);
+    }
     let mut subscription_access = crate::mcp::subscriptions::SubscriptionLifetime::new(
         std::time::Duration::from_secs(
             state
@@ -1582,6 +1943,24 @@ async fn proxy_handler_with_mcp_runtime(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
+
+    // A closed Access Point without source authentication, or one deriving a
+    // DID from an API key it may not use, is not ready: it refuses every
+    // request, discovery reads included, before source authentication, policy
+    // and the Target.
+    if let Some(reason) = crate::source_auth::errors::NotReadyReason::of(&state.surface).await {
+        return Ok(refuse_not_ready_access_point(
+            &state.surface,
+            &state.network_config,
+            mcp_versions,
+            state
+                .active_variant_alias
+                .as_deref(),
+            req,
+            reason,
+        )
+        .await);
+    }
 
     // Start timing the request
     let start_time = std::time::Instant::now();
@@ -1658,17 +2037,24 @@ async fn proxy_handler_with_mcp_runtime(
     // Extract UCP operation type from request path and method (if this is a UCP channel).
     let mut ucp_operation = extract_ucp_operation(uri.path(), &method);
 
+    let logged_path = loggable::untrusted(&loggable::path(uri.path()));
     if let Some(ref op) = ucp_operation {
         channel_info!(
             config_id,
             "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={} ucp_op={}",
             trace_id,
             method,
-            uri.path(),
+            logged_path,
             op
         );
     } else {
-        channel_info!(config_id, "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={}", trace_id, method, uri.path());
+        channel_info!(
+            config_id,
+            "🟢 INNER HANDLER ENTRY: trace_id={} method={} path={}",
+            trace_id,
+            method,
+            logged_path
+        );
     }
 
     // Track active connection for this task and create guard for cleanup
@@ -1694,12 +2080,11 @@ async fn proxy_handler_with_mcp_runtime(
         .unwrap_or(&addr_string)
         .to_string();
 
-    channel_info!(config_id, "Proxying request: method={} path={}", method, uri.path());
-
     if crate::proxy::paths::is_well_known_agent_card_path(uri.path()) {
-        let response = match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone()).await {
-            Ok(response) | Err(response) => response,
-        };
+        let response =
+            match handle_agent_card(ConnectInfo(addr), State(state.clone()), headers.clone(), &trace_id).await {
+                Ok(response) | Err(response) => response,
+            };
         connection_guard
             .decrement()
             .await;
@@ -1711,19 +2096,22 @@ async fn proxy_handler_with_mcp_runtime(
     let path = uri.path();
     if path.ends_with("/authenticate/challenge") || path.ends_with("/authenticate") {
         // Check if this is a DID Auth request to /authenticate/challenge or /authenticate
-        let didauth_cfg = match state.surface.source_auth() {
-            Some(crate::source_auth::SourceAuthConfig::DidAuth(cfg)) => Some(cfg.clone()),
-            _ => None,
-        };
+        let didauth_cfg = state
+            .surface
+            .did_auth_config()
+            .cloned();
 
         if let Some(cfg) = didauth_cfg {
-            channel_info!(config_id, "DID Auth request detected: {}", path);
+            channel_info!(config_id, "DID Auth request detected: {}", logged_path);
 
             // Read the request body
             let (_parts, body) = req.into_parts();
-            let body_bytes = axum::body::to_bytes(body, usize::MAX)
+            let body_bytes = axum::body::to_bytes(body, DID_AUTH_MAX_BODY_BYTES)
                 .await
                 .map_err(|e| {
+                    if crate::proxy::exceeds_length_limit(&e) {
+                        return crate::proxy::body_too_large_response(DID_AUTH_MAX_BODY_BYTES);
+                    }
                     create_error_response(StatusCode::BAD_REQUEST, &format!("Failed to read request body: {}", e))
                 })?;
 
@@ -1735,6 +2123,9 @@ async fn proxy_handler_with_mcp_runtime(
                 surface_id: state
                     .surface
                     .surface_id
+                    .clone(),
+                variant_id: state
+                    .active_variant_id
                     .clone(),
             };
 
@@ -1779,10 +2170,11 @@ async fn proxy_handler_with_mcp_runtime(
     // Must run before rate limiting so unauthenticated requests are rejected
     // before consuming any rate-limit budget.
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable source-auth failures are non-blocking: the outcome is
-    // handed to the policy layer via `source_auth_context` below, which decides
-    // whether to allow or deny. Only server-side failures (setup/config
-    // resolution, internal errors) still block here (now with a 500).
+    // Caller-attributable source-auth failures are refused with 401 on an Access
+    // Point that publishes protected resource metadata or rejects failed callers;
+    // otherwise the outcome is handed to the policy layer via `source_auth_context`
+    // below, which decides whether to allow or deny. Server-side failures
+    // (setup/config resolution, internal errors) block with a 500.
     let resource_authorization = state
         .surface
         .mcp_http
@@ -1810,195 +2202,281 @@ async fn proxy_handler_with_mcp_runtime(
             .get::<crate::source_auth::client_ip::ClientIp>()
             .map_or(addr.ip(), |client| client.0),
     );
-    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> = if let Some(authorization) =
-        &resource_authorization
-    {
-        let Some((profile, issuer, middleware)) = state
-            .network_config
-            .sts
-            .mcp_issuer
-            .as_ref()
-            .zip(state.vc_issuer.as_deref())
-            .zip(
-                state
-                    .source_auth_middleware
-                    .as_ref(),
-            )
-            .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
-        else {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
-            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-            return Ok(authorization.challenge(error));
-        };
-        let public_origins = state
-            .network_config
-            .map_url_to_port(
-                &state
-                    .surface
-                    .access_point
-                    .listen_address,
-            )
-            .and_then(|port| {
-                state
-                    .network_config
-                    .get_listener_by_port(port)
-            })
-            .map(|listener| listener.external_urls.clone())
-            .unwrap_or_default();
-        let expected_path = match state
+    let protected_resource = match crate::protocols::protected_resource::access_point_protected_resource(
+        &state.surface,
+        state
             .active_variant_alias
-            .as_deref()
-        {
-            Some(alias) => format!(
-                "{}${alias}",
-                state
+            .as_deref(),
+        &state.network_config,
+    )
+    .transpose()
+    {
+        Ok(protected_resource) => protected_resource,
+        Err(e) => {
+            channel_warn!(config_id, "Invalid MCP protected resource (reason={}) — blocking", e);
+            crate::audit::request_events::auth_failed(
+                &audit_facts,
+                crate::audit::events::AuthScheme::Jwt,
+                "setup_failed",
+                true,
+                client_ip,
+            );
+            connection_guard
+                .decrement()
+                .await;
+            return Err(create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Invalid MCP protected resource"));
+        }
+    };
+    let selected_source_auth = state
+        .surface
+        .source_auth_for_request(
+            &headers,
+            req.extensions()
+                .get::<crate::source_auth::models::PeerCertInfo>(),
+        );
+    let authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity> =
+        if let Some(authorization) = &resource_authorization {
+            let Some((profile, issuer, middleware)) = state
+                .network_config
+                .sts
+                .mcp_issuer
+                .as_ref()
+                .zip(state.vc_issuer.as_deref())
+                .zip(
+                    state
+                        .source_auth_middleware
+                        .as_ref(),
+                )
+                .map(|((profile, issuer), middleware)| (profile, issuer, middleware))
+            else {
+                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
+                crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+                return Ok(authorization.challenge(error));
+            };
+            let public_origins = state
+                .network_config
+                .map_url_to_port(
+                    &state
+                        .surface
+                        .access_point
+                        .listen_address,
+                )
+                .and_then(|port| {
+                    state
+                        .network_config
+                        .get_listener_by_port(port)
+                })
+                .map(|listener| listener.external_urls.clone())
+                .unwrap_or_default();
+            let expected_path = match state
+                .active_variant_alias
+                .as_deref()
+            {
+                Some(alias) => format!(
+                    "{}${alias}",
+                    state
+                        .surface
+                        .access_point
+                        .route
+                ),
+                None => state
                     .surface
                     .access_point
                     .route
-            ),
-            None => state
+                    .clone(),
+            };
+            if state
                 .surface
                 .access_point
-                .route
-                .clone(),
-        };
-        if state
-            .surface
-            .access_point
-            .protocol
-            != crate::config::agent_surface::SurfaceProtocol::Mcp
-            || state
-                .surface
-                .source_auth()
-                .is_some()
-            || authorization
-                .validate_endpoint(&public_origins, &expected_path)
-                .is_err()
-            || profile
-                .validate_network(&state.network_config)
-                .is_err()
-        {
-            let error = crate::mcp::resource_server::ResourceTokenError::Unavailable;
-            crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
-            return Ok(authorization.challenge(error));
-        }
-        match authorization
-            .authenticate(&headers, profile, issuer, middleware.jwks_client())
-            .await
-        {
-            Ok(identity) => Some(identity),
-            Err(error) => {
+                .protocol
+                != crate::config::agent_surface::SurfaceProtocol::Mcp
+                || state
+                    .surface
+                    .has_source_auth()
+                || authorization
+                    .validate_endpoint(&public_origins, &expected_path)
+                    .is_err()
+                || profile
+                    .validate_network(&state.network_config)
+                    .is_err()
+            {
+                let error = crate::protocols::protected_resource::ResourceTokenError::Unavailable;
                 crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
                 return Ok(authorization.challenge(error));
             }
-        }
-    } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
-        && let (Some(auth_config), installed_middleware) = (state.surface.source_auth(), &state.source_auth_middleware)
-    {
-        let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
-            Ok(middleware) => middleware,
-            Err(e) => {
-                channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    auth_config,
-                    &e,
-                ));
+            match authorization
+                .authenticate(&headers, profile, issuer, middleware.jwks_client())
+                .await
+            {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    crate::audit::request_events::resource_token_failed(&audit_facts, error, client_ip);
+                    return Ok(authorization.challenge(error));
+                }
             }
-        };
-        let resolved_auth_config = match resolve_direct_surface_auth_config(
-            auth_config,
-            state.vc_issuer.as_deref(),
-            &state.surface.surface_id,
-        )
-        .await
+        } else if !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+            && let (Some(selection), installed_middleware) = (selected_source_auth, &state.source_auth_middleware)
         {
-            Ok(config) => config,
-            Err(e) => {
-                // Setup/config-resolution failure is a server-side problem,
-                // not a caller decision — keep blocking.
-                channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(auth_config),
-                    "setup_failed",
-                    true,
-                    client_ip,
-                );
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    auth_config,
-                    &e,
-                ));
-            }
-        };
-        let peer_cert = req
-            .extensions()
-            .get::<crate::source_auth::models::PeerCertInfo>();
-        match sa_middleware
-            .authenticate(&resolved_auth_config, &headers, &channel_name, &state.surface.surface_id, peer_cert)
+            let auth_config = selection.method;
+            let sa_middleware = match crate::source_auth::middleware::require_installed(installed_middleware.clone()) {
+                Ok(middleware) => middleware,
+                Err(e) => {
+                    channel_warn!(config_id, "Source authentication unavailable (reason={}) — blocking", e);
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
+                            .surface
+                            .access_point
+                            .protocol,
+                        auth_config,
+                        &e,
+                    ));
+                }
+            };
+            let resolved_auth_config = match resolve_direct_surface_auth_config(
+                auth_config,
+                protected_resource.as_ref(),
+                state.vc_issuer.as_deref(),
+                &state.surface.surface_id,
+            )
             .await
-        {
-            Ok(identity) => Some(identity),
-            // Caller-attributable failure (missing/invalid credential):
-            // record the outcome for the policy layer and continue with no
-            // asserted caller identity — do not block here.
-            Err(e) if e.is_caller_attributable() => {
-                channel_warn!(config_id, "Source authentication failed (reason={}) — deferring to policy", e);
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                    crate::audit::request_events::source_auth_reason(&e),
-                    false,
-                    client_ip,
-                );
-                source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
-                    attempted_method: resolved_auth_config
-                        .method_tag()
-                        .to_string(),
-                    reason: e.to_string(),
-                });
-                None
+            {
+                Ok(config) => config,
+                Err(e) => {
+                    // Setup/config-resolution failure is a server-side problem,
+                    // not a caller decision — keep blocking.
+                    channel_warn!(config_id, "Source authentication setup failed (reason={}) — blocking", e);
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(auth_config),
+                        "setup_failed",
+                        true,
+                        client_ip,
+                    );
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
+                            .surface
+                            .access_point
+                            .protocol,
+                        auth_config,
+                        &e,
+                    ));
+                }
+            };
+            let peer_cert = req
+                .extensions()
+                .get::<crate::source_auth::models::PeerCertInfo>();
+            let view = crate::didauth::sessions::SessionView {
+                surface_id: &state.surface.surface_id,
+                variant_id: state
+                    .active_variant_id
+                    .as_deref(),
+            };
+            let verified = if selection.ambiguous {
+                Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
+            } else {
+                sa_middleware
+                    .authenticate(&resolved_auth_config, &headers, &channel_name, view, peer_cert)
+                    .await
+            };
+            match verified {
+                Ok(identity) => Some(identity),
+                // Caller-attributable failure (missing/invalid credential). An
+                // Access Point that publishes protected resource metadata answers
+                // it with its challenge, so the caller can fetch a token and
+                // retry, and one whose caller authentication rejects failures
+                // refuses it. Otherwise record the outcome for the policy layer and
+                // continue with no asserted caller identity — do not block here.
+                Err(e) if e.is_caller_attributable() => {
+                    // On an Access Point that publishes protected resource
+                    // metadata a failed JWT gets the discovery challenge, and a
+                    // failure of any other method a plain refusal, so a bad
+                    // credential never gets further than none.
+                    let challenged = protected_resource.is_some()
+                        && matches!(auth_config, crate::source_auth::SourceAuthConfig::JwtBearer(_));
+                    let refused = !challenged
+                        && (protected_resource.is_some()
+                            || state
+                                .surface
+                                .rejects_failed_caller_authentication());
+                    channel_warn!(
+                        config_id,
+                        "Source authentication failed (reason={}) — {}",
+                        e,
+                        if challenged {
+                            "sending the discovery challenge"
+                        } else if refused {
+                            "refusing the caller"
+                        } else {
+                            "deferring to policy"
+                        }
+                    );
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        crate::audit::request_events::source_auth_reason(&e),
+                        challenged || refused,
+                        client_ip,
+                    );
+                    if challenged && let Some(protected_resource) = &protected_resource {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(protected_resource.caller_challenge(&e));
+                    }
+                    if refused {
+                        connection_guard
+                            .decrement()
+                            .await;
+                        return Ok(refuse_failed_caller(
+                            &state.surface,
+                            &state.network_config,
+                            mcp_versions,
+                            &resolved_auth_config,
+                            req,
+                        )
+                        .await);
+                    }
+                    source_auth_failure = Some(crate::surface_context::SourceAuthContext::Failed {
+                        attempted_method: resolved_auth_config
+                            .method_tag()
+                            .to_string(),
+                        reason: e.to_string(),
+                    });
+                    None
+                }
+                // Server-side failure (config not found, internal) — keep
+                // blocking (500).
+                Err(e) => {
+                    channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
+                    crate::audit::request_events::auth_failed(
+                        &audit_facts,
+                        crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
+                        crate::audit::request_events::source_auth_reason(&e),
+                        true,
+                        client_ip,
+                    );
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Err(crate::source_auth::errors::deny_response(
+                        &state
+                            .surface
+                            .access_point
+                            .protocol,
+                        &resolved_auth_config,
+                        &e,
+                    ));
+                }
             }
-            // Server-side failure (config not found, internal) — keep
-            // blocking (500).
-            Err(e) => {
-                channel_warn!(config_id, "Source authentication error (reason={}) — blocking", e);
-                crate::audit::request_events::auth_failed(
-                    &audit_facts,
-                    crate::audit::request_events::source_auth_scheme(&resolved_auth_config),
-                    crate::audit::request_events::source_auth_reason(&e),
-                    true,
-                    client_ip,
-                );
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(crate::source_auth::errors::deny_response(
-                    &state
-                        .surface
-                        .access_point
-                        .protocol,
-                    &resolved_auth_config,
-                    &e,
-                ));
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Merged source-auth context for policy inputs: the verified identity on
     // success, or a `Failed` marker on a non-blocking caller-attributable
@@ -2151,16 +2629,40 @@ async fn proxy_handler_with_mcp_runtime(
 
     // Extract body early for payment verification and fabric forwarding
     // Body is needed to check payment requirements based on request content
-    let mut body_bytes = axum::body::to_bytes(
+    let body_read = axum::body::to_bytes(
         req.into_body(),
         mcp_http
             .as_ref()
-            .map_or(usize::MAX, |policy| policy.body_limit()),
+            .map_or(state.config.a2a.max_body_size, |policy| policy.body_limit()),
     )
-    .await
-    .map_err(|e| {
+    .await;
+    if let Err(e) = &body_read
+        && mcp_http.is_none()
+        && crate::proxy::exceeds_length_limit(e)
+    {
+        warn!(channel = channel_name, max = state.config.a2a.max_body_size, "Request body too large");
+        crate::audit::request_events::request_rejected(
+            &audit_facts,
+            crate::audit::request_events::RejectionStage::Admission,
+            crate::audit::request_events::RejectionReason::BodyTooLarge,
+            413,
+            None,
+        );
+        connection_guard
+            .decrement()
+            .await;
+        return Err(crate::proxy::body_too_large_response(state.config.a2a.max_body_size));
+    }
+    let mut body_bytes = body_read.map_err(|e| {
+        // An oversized body is an admission refusal, not a task error; any other read failure is the connection.
+        if let Some(policy) = &mcp_http
+            && crate::proxy::exceeds_length_limit(&e)
+        {
+            let error = policy.body_read_error(e);
+            crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+            return (*error).into_response();
+        }
         error!(channel = channel_name, error = %e, "Failed to read request body");
-        // Track error (connection guard will be dropped automatically)
         if let (Some(task_monitor), Some(task_id)) = (&state.task_monitor, &state.task_id) {
             let task_id = task_id.clone();
             let monitor = task_monitor.clone();
@@ -2171,14 +2673,8 @@ async fn proxy_handler_with_mcp_runtime(
                     .await;
             });
         }
-        // Connection guard will automatically decrement when dropped
         if let Some(policy) = &mcp_http {
-            let error = policy.body_read_error(e);
-            // Only an oversized body is a refusal; any other read failure is the connection.
-            if error.status == StatusCode::PAYLOAD_TOO_LARGE {
-                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
-            }
-            return (*error).into_response();
+            return (*policy.body_read_error(e)).into_response();
         }
         create_error_response(StatusCode::BAD_REQUEST, "Failed to read request body")
     })?;
@@ -2192,153 +2688,125 @@ async fn proxy_handler_with_mcp_runtime(
         return Ok(response);
     }
 
-    let (mcp_metadata_context, validated_mcp_session_id, mcp_verified_binding, mcp_classification) = if let Some(policy) =
-        &mcp_http
-        && method == Method::POST
-    {
-        let (session_evidence, known_session_id) = resolve_legacy_mcp_session(&headers).await;
-        let classification = match policy.admit_post(&headers, &body_bytes, session_evidence) {
-            Ok(classification) => classification,
-            Err(validation_error) => {
-                channel_warn!(
-                    config_id,
-                    "Rejecting MCP request at protocol boundary: code={} message={}",
-                    validation_error.code,
-                    validation_error.message
-                );
-                let error = crate::mcp::upstream_versions::restrict_unsupported(
-                    validation_error,
-                    &access_point_upstream_key(&state),
-                );
-                crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok((*error).into_response());
-            }
-        };
-        if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
-            channel_warn!(config_id, "Rejecting MCP request body at admission: {}", refusal.reason());
-            crate::audit::request_events::mcp_body_refused(
-                &audit_facts,
-                &refusal,
-                matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)),
-            );
-            connection_guard
-                .decrement()
-                .await;
-            return Ok(refusal.into_response_for(&classification, &body_bytes));
-        }
-        let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
-            &classification,
-            state
-                .surface
-                .mcp_legacy_metadata_output,
-        );
-        if let Err(error) = state
-            .surface
-            .validate_mcp_metadata_base()
+    let (mcp_metadata_context, validated_mcp_session_id, mcp_verified_binding, mut mcp_classification) =
+        if let Some(policy) = &mcp_http
+            && method == Method::POST
         {
-            channel_warn!(config_id, "Invalid MCP metadata configuration: {}", error);
-            connection_guard
-                .decrement()
-                .await;
-            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid MCP metadata configuration"));
-        }
-        body_bytes = match crate::mcp::meta::normalize_bytes(&body_bytes, mcp_metadata_context) {
-            Ok(body) => body,
-            Err(error) => {
-                crate::audit::request_events::request_rejected(
+            let (session_evidence, known_session_id) = resolve_legacy_mcp_session(config_id, &headers).await;
+            let classification = match policy.admit_post(&headers, &body_bytes, session_evidence) {
+                Ok(classification) => classification,
+                Err(validation_error) => {
+                    channel_warn!(
+                        config_id,
+                        "Rejecting MCP request at protocol boundary: code={} message={}",
+                        validation_error.code,
+                        validation_error.message
+                    );
+                    let error = crate::mcp::upstream_versions::restrict_unsupported(
+                        validation_error,
+                        &access_point_upstream_key(&state),
+                    );
+                    crate::audit::request_events::mcp_request_rejected(&audit_facts, &error);
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok((*error).into_response());
+                }
+            };
+            if let Some(refusal) = crate::mcp::tool_analyzer::single_object_refusal(&body_bytes) {
+                channel_warn!(config_id, "Rejecting MCP request body at admission: {}", refusal.reason());
+                crate::audit::request_events::mcp_body_refused(
                     &audit_facts,
-                    crate::audit::request_events::RejectionStage::Admission,
-                    crate::audit::request_events::RejectionReason::McpAdmission,
-                    400,
-                    Some(i64::from(crate::mcp::error_codes::INVALID_PARAMS)),
+                    &refusal,
+                    matches!(classification, crate::mcp::request_validation::McpRequestClassification::Modern(_)),
                 );
                 connection_guard
                     .decrement()
                     .await;
-                return Ok(error.into_response(&body_bytes, StatusCode::BAD_REQUEST));
+                return Ok(refusal.into_response_for(&classification, &body_bytes));
             }
-        };
-        body_bytes = policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
-        let binding = crate::protocols::extensions::verify_mcp_metadata_identity(
-            &body_bytes,
-            state.vc_issuer.as_ref(),
-            &audit_facts,
-            None,
-        )
-        .await
-        .map_err(|error| {
-            warn!(channel = channel_name, error = %error, "Invalid MCP identity presentation");
-            crate::audit::request_events::request_rejected(
-                &audit_facts,
-                crate::audit::request_events::RejectionStage::Admission,
-                crate::audit::request_events::RejectionReason::ExtensionRejected,
-                422,
-                None,
-            );
-            create_error_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")
-        })?;
-        let session_id = if matches!(
-            classification,
-            crate::mcp::request_validation::McpRequestClassification::Legacy(
-                crate::mcp::request_validation::LegacyRequestKind::Session
-            )
-        ) {
-            known_session_id
-        } else {
-            None
-        };
-        (mcp_metadata_context, session_id, binding, Some(classification))
-    } else {
-        (
-            crate::mcp::meta::McpMetadataContext::legacy(
+            let mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
+                &classification,
                 state
                     .surface
                     .mcp_legacy_metadata_output,
-            ),
-            None,
-            None,
-            None,
-        )
-    };
+            );
+            if let Err(error) = state
+                .surface
+                .validate_mcp_metadata_base()
+            {
+                channel_warn!(config_id, "Invalid MCP metadata configuration: {}", error);
+                connection_guard
+                    .decrement()
+                    .await;
+                return Err(create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid MCP metadata configuration",
+                ));
+            }
+            body_bytes = match crate::mcp::meta::normalize_bytes(&body_bytes, mcp_metadata_context) {
+                Ok(body) => body,
+                Err(error) => {
+                    crate::audit::request_events::request_rejected(
+                        &audit_facts,
+                        crate::audit::request_events::RejectionStage::Admission,
+                        crate::audit::request_events::RejectionReason::McpAdmission,
+                        400,
+                        Some(i64::from(crate::mcp::error_codes::INVALID_PARAMS)),
+                    );
+                    connection_guard
+                        .decrement()
+                        .await;
+                    return Ok(error.into_response(&body_bytes, StatusCode::BAD_REQUEST));
+                }
+            };
+            body_bytes = policy.cap_legacy_initialize(body_bytes, &classification, config_id, None);
+            let binding = crate::protocols::extensions::verify_mcp_metadata_identity(
+                &body_bytes,
+                state.vc_issuer.as_ref(),
+                &audit_facts,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                warn!(channel = channel_name, error = %error, "Invalid MCP identity presentation");
+                crate::audit::request_events::request_rejected(
+                    &audit_facts,
+                    crate::audit::request_events::RejectionStage::Admission,
+                    crate::audit::request_events::RejectionReason::ExtensionRejected,
+                    422,
+                    None,
+                );
+                create_error_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid MCP identity presentation")
+            })?;
+            let session_id = if matches!(
+                classification,
+                crate::mcp::request_validation::McpRequestClassification::Legacy(
+                    crate::mcp::request_validation::LegacyRequestKind::Session
+                )
+            ) {
+                known_session_id
+            } else {
+                None
+            };
+            (mcp_metadata_context, session_id, binding, Some(classification))
+        } else {
+            (
+                crate::mcp::meta::McpMetadataContext::legacy(
+                    state
+                        .surface
+                        .mcp_legacy_metadata_output,
+                ),
+                None,
+                None,
+                None,
+            )
+        };
 
     let mut modern_request = match mcp_classification.as_ref() {
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => Some((**request).clone()),
         _ => None,
     };
-    if let Some(request) = modern_request.as_ref()
-        && let Some(error) = state
-            .variant_resolution_error
-            .as_ref()
-    {
-        connection_guard
-            .decrement()
-            .await;
-        let status = match error {
-            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => {
-                crate::audit::request_events::request_rejected(
-                    &audit_facts,
-                    crate::audit::request_events::RejectionStage::Routing,
-                    crate::audit::request_events::RejectionReason::UnknownVariant,
-                    404,
-                    Some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
-                );
-                StatusCode::NOT_FOUND
-            }
-            // A misconfigured default variant is a gateway fault, not a refusal.
-            _ => StatusCode::SERVICE_UNAVAILABLE,
-        };
-        return Ok(crate::mcp::request_validation::McpRequestValidationError {
-            status,
-            id: request.id.clone(),
-            code: crate::mcp::error_codes::INTERNAL_ERROR,
-            message: "MCP surface variant is unavailable".into(),
-            data: None,
-        }
-        .into_response());
-    }
     let subscription_lifetime = if let Some(request) = modern_request
         .as_ref()
         .filter(|request| request.method == "subscriptions/listen")
@@ -2571,12 +3039,12 @@ async fn proxy_handler_with_mcp_runtime(
             && let Some((elicit_id, result)) = crate::mcp::elicitation::try_parse_elicitation_response(&envelope)
         {
             let resolved = crate::mcp::elicitation::global_pending_elicitation_registry()
-                .resolve(session_id, &elicit_id, result)
+                .resolve(config_id, session_id, &elicit_id, result)
                 .await;
             channel_info!(
                 config_id,
                 "📩 MCP elicitation response routed session={} elicit_id={} resolved={}",
-                session_id,
+                loggable::secret(session_id),
                 elicit_id,
                 resolved
             );
@@ -2588,7 +3056,7 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     // ── Capture MCP context for OPA input (early, before gateway OPA) ──────
-    let mcp_context: Option<crate::surface_context::McpContext> = if state
+    let mut mcp_context: Option<crate::surface_context::McpContext> = if state
         .surface
         .channel_protocol()
         == crate::config::ChannelProtocol::Mcp
@@ -2601,11 +3069,83 @@ async fn proxy_handler_with_mcp_runtime(
         None
     };
 
+    // For MCP `tools/call`, qualify the operation with the actual tool
+    // name so the monitoring "Tool/Operation Distribution" table shows a
+    // row per tool instead of collapsing every tool invocation into a
+    // single `tools/call` bucket. Reuses the already-parsed `mcp_context`
+    // — no extra body parse.
+    if let Some(ref ctx) = mcp_context
+        && ctx.method == "tools/call"
+        && let Some(ref tool) = ctx.tool_name
+    {
+        ucp_operation = Some(format!("tools/call:{}", tool));
+    }
+
+    if state
+        .surface
+        .agent_pay_policy()
+        .is_some()
+        && let Some(case_id) = agent_pay_gate::polled_case(method.as_str(), uri.path())
+    {
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(agent_pay_gate::case_poll_response(&state.surface, case_id, authenticated_identity.as_ref()).await);
+    }
+
+    // ── Payment intake ──────────────────────────────────────────────────────
+    // On an `agent_pay` surface the request is read once here: whether it is
+    // chargeable (`input.payment`, seen by gateway and surface policy alike), and
+    // its payment credential, which is removed from the request whether or not it
+    // is charged. Agent-pay is asked to take the payment only just before the
+    // request is forwarded, after every refusal that does not depend on payment.
+    let payment = agent_pay_gate::Intake::read(
+        &state.surface,
+        agent_pay_gate::Inbound {
+            method: method.as_str(),
+            path_and_query: uri
+                .path_and_query()
+                .map_or(uri.path(), |path_and_query| path_and_query.as_str()),
+            variant: state
+                .active_variant_alias
+                .as_deref(),
+            headers: &headers,
+            body: &body_bytes,
+            mcp_context: mcp_context.as_ref(),
+            signature_header: &state
+                .config
+                .x402_headers
+                .payment_signature,
+        },
+    );
+    let payment_context = payment
+        .as_ref()
+        .map(agent_pay_gate::Intake::policy_input);
+    if let Some(payment) = &payment {
+        payment.strip_headers(&mut headers);
+        body_bytes = payment.body().clone();
+        if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(message)) =
+            mcp_classification.as_mut()
+        {
+            payment.strip_modern(message);
+        }
+        if let Some(message) = modern_request.as_mut() {
+            payment.strip_modern(message);
+        }
+        if mcp_context.is_some() {
+            mcp_context = match mcp_classification.as_ref() {
+                Some(classification) => crate::mcp::build_validated_mcp_context(&body_bytes, classification),
+                None => crate::mcp::build_mcp_context(&body_bytes),
+            };
+        }
+    }
+
     // Parse the A2A/AP2 message payload so policies can inspect the actual
-    // agent content (`input.a2a`). Built after boundary Header Metadata
-    // Mapping but before gateway-side trust registry, DID, and custom metadata
-    // injection, so policies see normalized caller transport context as
-    // protocol metadata without seeing later gateway assertions.
+    // agent content (`input.a2a`). Built from the request without its payment
+    // credential, after boundary Header Metadata Mapping but before
+    // gateway-side trust registry, DID, and custom metadata injection, so
+    // policies see normalized caller transport context as protocol metadata
+    // without seeing later gateway assertions.
     let a2a_context: Option<crate::surface_context::A2aContext> = if matches!(
         state
             .surface
@@ -2632,18 +3172,6 @@ async fn proxy_handler_with_mcp_runtime(
     } else {
         None
     };
-
-    // For MCP `tools/call`, qualify the operation with the actual tool
-    // name so the monitoring "Tool/Operation Distribution" table shows a
-    // row per tool instead of collapsing every tool invocation into a
-    // single `tools/call` bucket. Reuses the already-parsed `mcp_context`
-    // — no extra body parse.
-    if let Some(ref ctx) = mcp_context
-        && ctx.method == "tools/call"
-        && let Some(ref tool) = ctx.tool_name
-    {
-        ucp_operation = Some(format!("tools/call:{}", tool));
-    }
 
     // ── Trust Registry Fetch (early, before gateway OPA) ────────────────────
     // Fetches agent trust context (DID, trust verification, agent DNA) from the
@@ -2695,6 +3223,8 @@ async fn proxy_handler_with_mcp_runtime(
         } else {
             None
         };
+    let mut pre_identity_agent_context = agent_context.clone();
+    bind_api_key_caller_did(&state.surface, method.as_str(), uri.path(), pre_identity_agent_context.as_mut(), None);
 
     // ── Trust Check stage placeholder ───────────────────────────────────────
     // The caller-leg Trust Check stage runs at the single post-identity seam
@@ -2727,9 +3257,10 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         g_input.source_auth = source_auth_context.clone();
-        g_input.agent = agent_context.clone();
+        g_input.agent = pre_identity_agent_context.clone();
         g_input.mcp = mcp_context.clone();
         g_input.a2a = a2a_context.clone();
+        g_input.payment = payment_context.clone();
         g_input.trust_check_results = trust_check_results.clone();
         let g_input_value = serde_json::to_value(&g_input).unwrap_or_default();
         let gd = global_pm.evaluate_global(crate::policies::global_policy::PLANE_GATEWAY, &g_input_value);
@@ -2742,6 +3273,7 @@ async fn proxy_handler_with_mcp_runtime(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: state.surface.config_id(),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -2780,25 +3312,19 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         gw_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Gateway policy input BEFORE agent/TR data
-        info!(
-            channel = state.surface.name,
-            "[OPA-INPUT] Gateway policy input before TR: {}",
-            serde_json::to_string(&gw_input).unwrap_or_default()
-        );
-        gw_input.agent = agent_context.clone();
+        gw_input.agent = pre_identity_agent_context;
         gw_input.mcp = mcp_context.clone();
         gw_input.a2a = a2a_context.clone();
+        gw_input.payment = payment_context.clone();
         gw_input.trust_check_results = trust_check_results.clone();
         let gw_input_value = serde_json::to_value(&gw_input).unwrap_or_default();
-        info!(channel = state.surface.name, "[OPA-INPUT] Gateway policy input before eval: {}", gw_input_value);
         let (gw_policy_def_id, gw_policy_version, gw_policy_hash) =
             match gw_policy_manager.policy_evidence(&self_gateway_id) {
                 Some((id, v, h)) => (id, v, Some(h)),
                 None => (None, None, None),
             };
         let gw_policy_name = gw_policy_manager
-            .resolve_policy_name_or_default(gw_policy_def_id.as_deref())
+            .resolve_policy_name(gw_policy_def_id.as_deref())
             .await;
 
         match gw_policy_manager.evaluate_policy_decision(&self_gateway_id, gw_input_value) {
@@ -2808,8 +3334,9 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2827,8 +3354,9 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2850,8 +3378,9 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
                     policy_definition_id: gw_policy_def_id.as_deref(),
-                    policy_name: Some(gw_policy_name.as_str()),
+                    policy_name: gw_policy_name.as_deref(),
                     surface_id: state.surface.config_id(),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -2960,10 +3489,9 @@ async fn proxy_handler_with_mcp_runtime(
     {
         headers.insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
-    let is_a2a_proxy_target = is_a2a_surface
-        && state
-            .surface
-            .is_a2a_proxy_target();
+    let is_a2a_proxy_target = state
+        .surface
+        .dispatches_to_a2a_proxy();
     // The accepted versions and the validation level are set per A2A Access
     // Point; an A2A-proxy target takes the versions and checks the envelope only.
     let a2a_settings = state.surface.a2a_settings();
@@ -3130,287 +3658,35 @@ async fn proxy_handler_with_mcp_runtime(
         return Err(crate::a2a::errors::create_invalid_params_response(&field_errors));
     }
 
-    // ── Track payment context for OPA input ────────────────────────────────
-    let mut payment_context: Option<crate::surface_context::PaymentContext> = None;
-
-    // Handle payment verification for fabric:// protocol BEFORE forwarding
-    // When both x402 and MPP are enabled, the client can satisfy either one.
-    // If no credential is provided, a combined 402 is returned.
-    let mut mpp_receipt_header: Option<String> = None;
-
-    // Settlement receipt headers relayed from a delegate payment gateway
-    // (Model B) on a `Proceed` decision, injected onto the caller's response.
-    let mut delegation_receipt_headers: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-
-    let defer_surface_payment = modern_request.is_some();
-    if !defer_surface_payment {
-        match surface_payment::delegate(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            &method,
-            &uri,
-            &trace_id,
-            &channel_name,
-            None,
-        )
-        .await
-        {
-            surface_payment::DelegatedPayment::Proceed(receipts) => delegation_receipt_headers.extend(receipts),
-            surface_payment::DelegatedPayment::Challenge(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok(response);
-            }
-            surface_payment::DelegatedPayment::Denied(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
-    }
-
-    if !defer_surface_payment
-        && state
-            .surface
-            .target
-            .endpoint
-            .starts_with("fabric://")
+    // ── The route of a request to a Target bound by external consent ───────
+    // Before any payment, so a surface that would charge for such a request
+    // is refused before anyone pays. Its grant is sent only at the Target's
+    // endpoint path, at the origin of the provider's resource, through Strict
+    // egress.
+    let target_grant = match crate::proxy::target_grant::route(
+        &state,
+        crate::proxy::target_grant::TargetRequest {
+            method: method.as_str(),
+            path: uri.path(),
+            query: uri.query(),
+            headers: &headers,
+            modern: modern_request.is_some(),
+            facts: &audit_facts,
+        },
+    )
+    .await
     {
-        // A delegated (Model B) x402 policy was already fully adjudicated by
-        // the delegation block above (Proceed/Challenge/Deny) — never run the
-        // local paywall a second time against its (empty) local price config.
-        let x402_required = state
-            .surface
-            .x402_config()
-            .is_some_and(|p| {
-                p.provider != crate::config::types::X402Provider::AgentPay
-                    && crate::x402::should_require_payment(
-                        p,
-                        &state
-                            .surface
-                            .channel_protocol(),
-                        &body_bytes,
-                        mcp_context.as_ref(),
-                    )
-            });
-        let mpp_required = state
-            .surface
-            .mpp_config()
-            .is_some_and(|p| {
-                crate::mpp::should_require_payment(
-                    p,
-                    &state
-                        .surface
-                        .channel_protocol(),
-                    &body_bytes,
-                    mcp_context.as_ref(),
-                )
-            });
-
-        if x402_required || mpp_required {
-            let resource_url = uri.to_string();
-
-            // Extract credentials for both protocols (with MCP body extraction)
-            let (payment_signature, mpp_credential, modified_body) = if state
-                .surface
-                .channel_protocol()
-                == crate::config::ChannelProtocol::Mcp
-            {
-                let (sig, body1) = crate::x402::extract_payment_signature_with_mcp(
-                    &headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                    &body_bytes,
-                );
-                let (cred, body2) = crate::mpp::extract_mpp_credential_with_mcp(&headers, &body1);
-                (sig, cred, body2)
-            } else {
-                let sig = crate::x402::extract_payment_signature(
-                    &headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                let cred = crate::mpp::extract_mpp_credential(&headers);
-                (sig, cred, body_bytes.to_vec())
-            };
-
-            if x402_required && payment_signature.is_some() {
-                // Client sent x402 credential → verify via x402
-                match crate::x402::process_payment(
-                    payment_signature,
-                    state
-                        .surface
-                        .x402_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    &resource_url,
-                    state
-                        .listener_manager
-                        .read()
-                        .await
-                        .clone(),
-                    state
-                        .transaction_store
-                        .clone(),
-                )
-                .await
-                .map_err(|error| error.render(&state.config.x402_headers))
-                {
-                    Ok(response_header) => {
-                        body_bytes = modified_body.into();
-                        if let Some(hdr) = response_header {
-                            payment_context = Some(crate::surface_context::PaymentContext {
-                                verified: true,
-                                response_header: Some(hdr),
-                            });
-                        }
-                    }
-                    Err(err_response) => {
-                        channel_warn!(config_id, "❌ Payment verification failed for fabric request");
-
-                        if let Some(ref metrics) = state.metrics_store {
-                            let latency_ms = start_time
-                                .elapsed()
-                                .as_millis() as u64;
-                            let channel_config_id = state
-                                .surface
-                                .surface_id
-                                .clone();
-                            let source = source_addr.clone();
-                            let dest = state
-                                .surface
-                                .target
-                                .endpoint
-                                .clone();
-                            let metrics_clone = Arc::clone(metrics);
-                            let trace_id_clone = trace_id.clone();
-                            tokio::spawn(async move {
-                                metrics_clone
-                                    .record_connection(
-                                        channel_config_id,
-                                        source,
-                                        dest,
-                                        crate::metrics::ConnectionStatus::Success,
-                                        Some(latency_ms),
-                                        None,
-                                        crate::metrics::ConnectionDirection::Request,
-                                        trace_id_clone,
-                                        None,
-                                        None,
-                                        latency_ms,
-                                        None,
-                                    )
-                                    .await;
-                            });
-                        }
-
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(err_response);
-                    }
-                }
-            } else if mpp_required && mpp_credential.is_some() {
-                // Client sent MPP credential → verify via MPP
-                match crate::mpp::process_payment(
-                    mpp_credential,
-                    state
-                        .surface
-                        .mpp_config()
-                        .unwrap(),
-                    &channel_name,
-                    config_id,
-                    &resource_url,
-                    state
-                        .mpp_transaction_store
-                        .clone(),
-                    &state.secrets_store,
-                )
-                .await
-                {
-                    Ok(receipt_header) => {
-                        mpp_receipt_header = receipt_header;
-                        body_bytes = modified_body.into();
-                    }
-                    Err(error) => {
-                        channel_warn!(config_id, "❌ MPP payment verification failed for fabric request");
-                        connection_guard
-                            .decrement()
-                            .await;
-                        return Err(error.into_response());
-                    }
-                }
-            } else if let Some(error) = surface_payment::payment_required(
-                // No credential → return 402 (combined if both protocols enabled)
-                state
-                    .surface
-                    .x402_config()
-                    .filter(|_| x402_required),
-                state
-                    .surface
-                    .mpp_config()
-                    .filter(|_| mpp_required),
-                &channel_name,
-                config_id,
-                &resource_url,
-                &surface_payment::LocalPaymentServices::of(&state).await,
-            )
-            .await
-            {
-                channel_warn!(config_id, "❌ Payment required for fabric request");
-
-                if let Some(ref metrics) = state.metrics_store {
-                    let latency_ms = start_time
-                        .elapsed()
-                        .as_millis() as u64;
-                    let channel_config_id = state
-                        .surface
-                        .surface_id
-                        .clone();
-                    let source = source_addr.clone();
-                    let dest = state
-                        .surface
-                        .target
-                        .endpoint
-                        .clone();
-                    let metrics_clone = Arc::clone(metrics);
-                    let trace_id_clone = trace_id.clone();
-                    tokio::spawn(async move {
-                        metrics_clone
-                            .record_connection(
-                                channel_config_id,
-                                source,
-                                dest,
-                                crate::metrics::ConnectionStatus::Success,
-                                Some(latency_ms),
-                                None,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace_id_clone,
-                                None,
-                                None,
-                                latency_ms,
-                                None,
-                            )
-                            .await;
-                    });
-                }
-
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(error.render(&state.config.x402_headers));
-            }
+        Ok(route) => route,
+        Err(refused) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refused.response(&state.surface, &body_bytes));
         }
-    }
+    };
+
+    // ── Payment ─────────────────────────────────────────────────────────────
+    let mut gate_receipt: Option<agent_pay_gate::Receipt> = None;
 
     // ── MCP fabric:// SSE transport (GET /sse and POST /mcp/messages/) ─────
     // For MCP channels with fabric:// targets, SSE transport must be handled
@@ -3470,7 +3746,11 @@ async fn proxy_handler_with_mcp_runtime(
                 return Err(create_error_response(StatusCode::NOT_FOUND, "SSE session not found or expired"));
             }
 
-            channel_info!(config_id, "📨 SSE session POST for fabric:// MCP channel session={}", session_id);
+            channel_info!(
+                config_id,
+                "📨 SSE session POST for fabric:// MCP channel session={}",
+                loggable::secret(&session_id)
+            );
 
             // Parse the JSON-RPC request
             let json_request: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -3492,30 +3772,33 @@ async fn proxy_handler_with_mcp_runtime(
                 "📨 Fabric SSE: forwarding through Fabric — rewritten_uri={}, body_len={}, method=POST, target={}",
                 rewritten_uri,
                 body_bytes.len(),
-                state.surface.target.endpoint
+                loggable::url(&state.surface.target.endpoint)
             );
 
             // Forward through Fabric
             let fabric_result = Box::pin(handle_fabric_request(
                 state.clone(),
-                &channel_name,
-                Method::POST,
-                rewritten_uri,
-                headers.clone(),
-                source_addr.clone(),
-                start_time,
-                ConnectionGuard::new(None, None),
-                body_bytes.clone(),
-                trace_id.clone(),
-                ucp_operation.clone(),
-                authenticated_identity.clone(),
-                source_auth_context.clone(),
-                payment_context.clone(),
-                mcp_metadata_context,
-                mcp_verified_binding.clone(),
-                mcp_classification.as_ref(),
-                None,
-                mcp_continuations.clone(),
+                FabricSend {
+                    channel_name: &channel_name,
+                    method: Method::POST,
+                    uri: rewritten_uri,
+                    headers: headers.clone(),
+                    source_addr: source_addr.clone(),
+                    start_time,
+                    connection_guard: ConnectionGuard::new(None, None),
+                    body_bytes: body_bytes.clone(),
+                    trace_id: trace_id.clone(),
+                    ucp_operation: ucp_operation.clone(),
+                    authenticated_identity: authenticated_identity.clone(),
+                    source_auth_context: source_auth_context.clone(),
+                    payment_context: payment_context.clone(),
+                    mcp_metadata_context,
+                    mcp_verified_binding: mcp_verified_binding.clone(),
+                    mcp_classification: mcp_classification.as_ref(),
+                    subscription_lifetime: None,
+                    mcp_continuations: mcp_continuations.clone(),
+                    payment: payment.as_ref(),
+                },
             ))
             .await;
 
@@ -3547,13 +3830,12 @@ async fn proxy_handler_with_mcp_runtime(
 
                     channel_info!(
                         config_id,
-                        "📨 Fabric SSE: response status={}, body_len={}, body_preview={}",
+                        "📨 Fabric SSE: response status={}, body_len={}",
                         parts.status,
-                        json_str.len(),
-                        &json_str[..json_str.len().min(500)]
+                        json_str.len()
                     );
 
-                    if parts.status.is_success() && !json_str.is_empty() {
+                    if (parts.status.is_success() && !json_str.is_empty()) || is_jsonrpc_message(&json_str) {
                         CHANNEL_SSE_SESSION_MGR
                             .send_response(&session_id, &json_str)
                             .await;
@@ -3574,7 +3856,6 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                 }
                 Err(err_resp) => {
-                    // Extract error details for debugging
                     let err_status = err_resp.status();
                     let (err_parts, err_body) = err_resp.into_parts();
                     let err_body_bytes = axum::body::to_bytes(err_body, 1024 * 1024)
@@ -3583,10 +3864,12 @@ async fn proxy_handler_with_mcp_runtime(
                     let err_body_str = String::from_utf8_lossy(&err_body_bytes);
                     channel_error!(
                         config_id,
-                        "📨 Fabric SSE: forwarding FAILED — status={}, headers={:?}, body={}",
+                        "📨 Fabric SSE: forwarding FAILED — status={}, content_type={:?}, body_len={}",
                         err_status,
-                        err_parts.headers,
-                        &err_body_str[..err_body_str.len().min(1000)]
+                        err_parts
+                            .headers
+                            .get(axum::http::header::CONTENT_TYPE),
+                        err_body_bytes.len()
                     );
 
                     let error_json = serde_json::json!({
@@ -3673,6 +3956,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -3707,6 +3991,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -3760,24 +4045,27 @@ async fn proxy_handler_with_mcp_runtime(
     {
         return Box::pin(handle_fabric_request(
             state,
-            &channel_name,
-            method,
-            uri,
-            headers,
-            source_addr,
-            start_time,
-            connection_guard,
-            body_bytes, // Pass body_bytes instead of req
-            trace_id,
-            ucp_operation,
-            authenticated_identity,
-            source_auth_context.clone(),
-            payment_context,
-            mcp_metadata_context,
-            mcp_verified_binding,
-            mcp_classification.as_ref(),
-            subscription_lifetime,
-            mcp_continuations,
+            FabricSend {
+                channel_name: &channel_name,
+                method,
+                uri,
+                headers,
+                source_addr,
+                start_time,
+                connection_guard,
+                body_bytes,
+                trace_id,
+                ucp_operation,
+                authenticated_identity,
+                source_auth_context: source_auth_context.clone(),
+                payment_context,
+                mcp_metadata_context,
+                mcp_verified_binding,
+                mcp_classification: mcp_classification.as_ref(),
+                subscription_lifetime,
+                mcp_continuations,
+                payment: payment.as_ref(),
+            },
         ))
         .await;
     }
@@ -3785,12 +4073,30 @@ async fn proxy_handler_with_mcp_runtime(
     // Build target URL (or get direct response for special protocols like DID).
     // A2A Proxy targets are internal adapter references, not network URLs; keep
     // them in the normal policy/trust pipeline, then dispatch after OPA.
+    // A discovery read is the only request a Target bound by external consent
+    // is sent without the grant, and it is sent without the caller's query.
+    let uri_without_query;
+    let forwarded_uri = match uri.path_and_query() {
+        Some(path_and_query)
+            if path_and_query
+                .query()
+                .is_some()
+                && crate::proxy::target_grant::binds_the_target(&state.surface) =>
+        {
+            uri_without_query = path_and_query
+                .path()
+                .parse()
+                .unwrap_or_else(|_| uri.clone());
+            &uri_without_query
+        }
+        _ => &uri,
+    };
     let target_url = if is_a2a_proxy_target {
         String::new()
     } else {
         match build_target_url(
             &state.surface.target.endpoint,
-            &uri,
+            forwarded_uri,
             &method,
             &headers,
             state
@@ -3822,7 +4128,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -3836,7 +4142,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -3873,8 +4178,16 @@ async fn proxy_handler_with_mcp_runtime(
     // is created/updated, so it is also skipped at this sink rather than
     // DNS-resolving the placeholder host and failing closed on every request.
     let is_mcp_proxy_target = target_url.starts_with("proxy://");
-    let mut forward_client: Option<reqwest::Client> = None;
-    if !is_a2a_proxy_target && !is_mcp_proxy_target {
+    // A request carrying the grant of a Target bound by external consent goes
+    // to the URL its route decided.
+    let target_url = match target_grant.as_ref() {
+        Some(route) => route.target_url().to_string(),
+        None => target_url,
+    };
+    let mut forward_client: Option<reqwest::Client> = target_grant
+        .as_ref()
+        .map(|route| route.client().clone());
+    if forward_client.is_none() && !is_a2a_proxy_target && !is_mcp_proxy_target {
         match pinned_target_client(&state, &channel_name, &target_url, &audit_facts).await {
             Ok(client) => forward_client = Some(client),
             Err(blocked) => return Ok(blocked),
@@ -3882,7 +4195,7 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     if !is_a2a_proxy_target {
-        debug!(channel = channel_name, target = %target_url, "Forwarding to upstream");
+        debug!(channel = channel_name, target = %loggable::url(&target_url), "Forwarding to upstream");
     }
 
     let _prep_span = tracing::info_span!(
@@ -3918,71 +4231,6 @@ async fn proxy_handler_with_mcp_runtime(
         ));
     }
 
-    if !defer_surface_payment {
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            mcp_context.as_ref(),
-            &uri.to_string(),
-            None,
-        )
-        .await
-        {
-            Ok(payment) => {
-                body_bytes = payment.body;
-                if payment.context.is_some() {
-                    payment_context = payment.context;
-                }
-                if payment.mpp_receipt.is_some() {
-                    mpp_receipt_header = payment.mpp_receipt;
-                }
-            }
-            Err(response) => {
-                channel_warn!(config_id, "Payment did not authorize the request");
-                if let Some(metrics) = state.metrics_store.as_ref() {
-                    let latency_ms = start_time
-                        .elapsed()
-                        .as_millis() as u64;
-                    let channel_config_id = state
-                        .surface
-                        .surface_id
-                        .clone();
-                    let source = source_addr.clone();
-                    let dest = state
-                        .surface
-                        .target
-                        .endpoint
-                        .clone();
-                    let metrics = Arc::clone(metrics);
-                    let trace = trace_id.clone();
-                    tokio::spawn(async move {
-                        metrics
-                            .record_connection(
-                                channel_config_id,
-                                source,
-                                dest,
-                                crate::metrics::ConnectionStatus::Success,
-                                Some(latency_ms),
-                                None,
-                                crate::metrics::ConnectionDirection::Request,
-                                trace,
-                                None,
-                                None,
-                                latency_ms,
-                                None,
-                            )
-                            .await;
-                    });
-                }
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
-    }
-
     // ── MCP Streamable HTTP transport: GET (notification stream) + DELETE ────
     // Per MCP spec rev 2025-03-26, a Streamable HTTP server must accept:
     //   - POST /<route> with Accept: text/event-stream  (request → SSE response)
@@ -4014,6 +4262,8 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP GET: opening notification stream session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
 
             let stream: std::pin::Pin<
@@ -4021,7 +4271,7 @@ async fn proxy_handler_with_mcp_runtime(
             > = match session_id_opt {
                 Some(sid) => {
                     let rx = match crate::mcp::streamable_sse::global_streamable_session_registry()
-                        .register(&sid)
+                        .register(config_id, &sid)
                         .await
                     {
                         Some(rx) => rx,
@@ -4047,16 +4297,18 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "🔌 MCP Streamable HTTP DELETE: terminating session session_id={:?}",
                 session_id_opt
+                    .as_deref()
+                    .map(loggable::secret)
             );
             if let Some(sid) = session_id_opt {
                 crate::mcp::streamable_sse::global_streamable_session_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
                 crate::mcp::elicitation::global_capability_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
                 crate::mcp::elicitation::global_pending_elicitation_registry()
-                    .drop_session(&sid)
+                    .drop_session(config_id, &sid)
                     .await;
             }
             connection_guard
@@ -4172,7 +4424,7 @@ async fn proxy_handler_with_mcp_runtime(
                 config_id,
                 "📨 SSE session POST for proxy:// channel proxy_id={} session={}",
                 proxy_id,
-                session_id
+                loggable::secret(&session_id)
             );
 
             // Parse JSON-RPC request
@@ -4188,19 +4440,23 @@ async fn proxy_handler_with_mcp_runtime(
             // Process through the proxy handler (reuses existing handle_mcp_proxy_request flow)
             let response = handle_mcp_proxy_request(
                 &state,
-                proxy_id,
-                &body_bytes,
-                &headers,
-                &method,
-                &uri,
-                &channel_name,
-                &source_addr,
-                start_time,
-                trace_id.clone(),
-                authenticated_identity.as_ref(),
-                source_auth_failed,
-                &policy_input,
-                mcp_context.as_ref(),
+                McpProxyRequest {
+                    proxy_id,
+                    body_bytes: &body_bytes,
+                    headers: &headers,
+                    method: &method,
+                    uri: &uri,
+                    channel_name: &channel_name,
+                    source_addr: &source_addr,
+                    start_time,
+                    trace_id: trace_id.clone(),
+                    egress_trace_id: &egress_trace_id,
+                    authenticated_identity: authenticated_identity.as_ref(),
+                    source_auth_failed,
+                    policy_input: &policy_input,
+                    mcp_context: mcp_context.as_ref(),
+                    payment: payment.as_ref(),
+                },
             )
             .await;
 
@@ -4212,7 +4468,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .unwrap_or_default();
                     let json_str = String::from_utf8_lossy(&body_bytes_resp);
 
-                    if parts.status.is_success() && !json_str.is_empty() {
+                    if (parts.status.is_success() && !json_str.is_empty()) || is_jsonrpc_message(&json_str) {
                         CHANNEL_SSE_SESSION_MGR
                             .send_response(&session_id, &json_str)
                             .await;
@@ -4290,19 +4546,23 @@ async fn proxy_handler_with_mcp_runtime(
 
             let response = handle_mcp_proxy_request(
                 &state,
-                proxy_id,
-                &body_bytes,
-                &headers,
-                &method,
-                &uri,
-                &channel_name,
-                &source_addr,
-                start_time,
-                trace_id.clone(),
-                authenticated_identity.as_ref(),
-                source_auth_failed,
-                &policy_input,
-                mcp_context.as_ref(),
+                McpProxyRequest {
+                    proxy_id,
+                    body_bytes: &body_bytes,
+                    headers: &headers,
+                    method: &method,
+                    uri: &uri,
+                    channel_name: &channel_name,
+                    source_addr: &source_addr,
+                    start_time,
+                    trace_id: trace_id.clone(),
+                    egress_trace_id: &egress_trace_id,
+                    authenticated_identity: authenticated_identity.as_ref(),
+                    source_auth_failed,
+                    policy_input: &policy_input,
+                    mcp_context: mcp_context.as_ref(),
+                    payment: payment.as_ref(),
+                },
             )
             .await;
 
@@ -4321,7 +4581,15 @@ async fn proxy_handler_with_mcp_runtime(
                     return Err(r);
                 }
             };
-            let (_, body) = resp.into_parts();
+            // A payment challenge or refusal is relayed with its own status and
+            // headers; only a success is framed as an event.
+            if !resp.status().is_success() {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(resp);
+            }
+            let (parts, body) = resp.into_parts();
             let body_bytes_resp = axum::body::to_bytes(body, 10 * 1024 * 1024)
                 .await
                 .unwrap_or_default();
@@ -4330,7 +4598,15 @@ async fn proxy_handler_with_mcp_runtime(
             connection_guard
                 .decrement()
                 .await;
-            return Ok(crate::mcp::sse_server::build_streamable_http_response(&json_str));
+            let mut framed = crate::mcp::sse_server::build_streamable_http_response(&json_str);
+            for (name, value) in &parts.headers {
+                if !matches!(name.as_str(), "content-type" | "content-length" | "transfer-encoding") {
+                    framed
+                        .headers_mut()
+                        .insert(name.clone(), value.clone());
+                }
+            }
+            return Ok(framed);
         }
     }
 
@@ -4399,19 +4675,23 @@ async fn proxy_handler_with_mcp_runtime(
 
             match handle_mcp_proxy_request(
                 &state,
-                proxy_id,
-                &body_bytes,
-                &headers,
-                &method,
-                &uri,
-                &channel_name,
-                &source_addr,
-                start_time,
-                trace_id.clone(),
-                authenticated_identity.as_ref(),
-                source_auth_failed,
-                &policy_input,
-                mcp_context.as_ref(),
+                McpProxyRequest {
+                    proxy_id,
+                    body_bytes: &body_bytes,
+                    headers: &headers,
+                    method: &method,
+                    uri: &uri,
+                    channel_name: &channel_name,
+                    source_addr: &source_addr,
+                    start_time,
+                    trace_id: trace_id.clone(),
+                    egress_trace_id: &egress_trace_id,
+                    authenticated_identity: authenticated_identity.as_ref(),
+                    source_auth_failed,
+                    policy_input: &policy_input,
+                    mcp_context: mcp_context.as_ref(),
+                    payment: payment.as_ref(),
+                },
             )
             .await
             {
@@ -4458,6 +4738,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         allow: true,
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4482,6 +4763,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .as_deref(),
                         policy_definition_id: outcome.policy_id.as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4505,7 +4787,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4519,7 +4801,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4548,6 +4829,7 @@ async fn proxy_handler_with_mcp_runtime(
                         scope: crate::observability::PolicyScope::McpTool,
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -4596,7 +4878,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .target
                             .endpoint
                             .clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -4610,7 +4892,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -4644,11 +4925,6 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
     }
-
-    // x402 payment has already been verified earlier in the handler (line ~395)
-    // Use MPP receipt if available, otherwise None
-    let payment_response_header: Option<String> = mpp_receipt_header;
-    let mut modern_local_receipt = None;
 
     // Inspect extensions if enabled and this is a POST with JSON body (A2A or MCP protocol)
     // Also capture if client supports credential extension for response VP injection
@@ -4686,9 +4962,6 @@ async fn proxy_handler_with_mcp_runtime(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
 
         let identity_result = match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
@@ -4715,7 +4988,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .endpoint
                         .clone();
                     let trace_id = uuid::Uuid::new_v4().to_string();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection(
                                 channel_config_id,
@@ -4729,7 +5002,6 @@ async fn proxy_handler_with_mcp_runtime(
                                 None,
                                 None,
                                 latency_ms,
-                                None,
                             )
                             .await;
                     });
@@ -4770,8 +5042,18 @@ async fn proxy_handler_with_mcp_runtime(
     };
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if identity_result.is_none() {
-        match resolve_configured_caller_identity(&state, method.as_str(), uri.path(), &channel_name, "direct").await {
+    if configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path()) {
+        match resolve_configured_caller_identity(
+            &state,
+            method.as_str(),
+            uri.path(),
+            &channel_name,
+            "direct",
+            authenticated_identity.as_ref(),
+            source_auth_failed,
+        )
+        .await
+        {
             Ok(resolved) => identity_result = resolved,
             Err(response) => {
                 connection_guard
@@ -4946,7 +5228,7 @@ async fn proxy_handler_with_mcp_runtime(
         .as_ref()
         .map(|r| r.did.clone());
     let request_user_id = source_auth_user_id(authenticated_identity.as_ref());
-    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref());
+    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
     // Stamp the derived agent DID onto the root HTTP span as `caller.did`.
     // For credential-derived managed identity (e.g. `from_jwt_claim`) the DID
@@ -4964,6 +5246,13 @@ async fn proxy_handler_with_mcp_runtime(
             did: Some(result.did.clone()),
             identity_hash: Some(result.hash.clone()),
         });
+    bind_api_key_caller_did(
+        &state.surface,
+        method.as_str(),
+        uri.path(),
+        agent_context.as_mut(),
+        extension_identity.as_ref(),
+    );
 
     // Surface the cryptographically-verified issuer DID of the caller's
     // `agent-identity-credential/v1` VP as `input.agent.identity_issuer_did`,
@@ -5102,10 +5391,10 @@ async fn proxy_handler_with_mcp_runtime(
                     custom_metadata,
                     &channel_name,
                     &state.secrets_store,
-                    crate::protocols::MetadataRuntimeContext {
-                        request_id: Some(egress_trace_id.as_str()),
-                        surface_id: Some(config_id),
-                    },
+                    crate::protocols::MetadataRuntimeContext::for_surface(
+                        &state.surface,
+                        Some(egress_trace_id.as_str()),
+                    ),
                 )
                 .await
                 {
@@ -5406,6 +5695,7 @@ async fn proxy_handler_with_mcp_runtime(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5440,10 +5730,11 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5459,10 +5750,11 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5498,10 +5790,11 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5571,6 +5864,7 @@ async fn proxy_handler_with_mcp_runtime(
             policy_definition_id: gd.policy_id.as_deref(),
             policy_name: global_policy_name,
             surface_id: state.surface.config_id(),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -5610,12 +5904,6 @@ async fn proxy_handler_with_mcp_runtime(
             &state.surface.name,
         );
         policy_input.source_auth = source_auth_context.clone();
-        // [OPA-INPUT] Surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_context.clone();
         policy_input.mcp = mcp_context.clone();
         policy_input.a2a = a2a_context.clone();
@@ -5625,8 +5913,6 @@ async fn proxy_handler_with_mcp_runtime(
         policy_input.trust_check_results = trust_check_results.clone();
         policy_input.normalize_caller_did();
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Surface policy input before eval: {}", input_value);
 
         let Some(policy_manager) = state
             .policy_manager
@@ -5653,6 +5939,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .surface
                     .opa_policy_definition_id(),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5696,8 +5983,9 @@ async fn proxy_handler_with_mcp_runtime(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5715,8 +6003,9 @@ async fn proxy_handler_with_mcp_runtime(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5750,8 +6039,9 @@ async fn proxy_handler_with_mcp_runtime(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -5818,6 +6108,7 @@ async fn proxy_handler_with_mcp_runtime(
                 reason: Some("tools/call without a readable tool name under MCP tool gating"),
                 policy_id: Some("mcp_tool_gating"),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -5873,6 +6164,7 @@ async fn proxy_handler_with_mcp_runtime(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id_str),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -5893,10 +6185,21 @@ async fn proxy_handler_with_mcp_runtime(
         }
     }
 
+    let inbound_payment = InboundPayment {
+        intake: payment.as_ref(),
+        identity: authenticated_identity.as_ref(),
+        identity_binding: identity_binding.as_ref(),
+        trace_id: &trace_id,
+        egress_trace_id: &egress_trace_id,
+        source_addr: &source_addr,
+        start_time,
+    };
+
     // A2A Proxy target adapter: the surface remains the public A2A/AP2 endpoint,
     // while the target endpoint dispatches to an internal configured adapter.
     // Dispatch happens after the normal gateway/source-auth/body/trust/OPA
-    // controls above, but before any network upstream request is built.
+    // controls above, but before any network upstream request is built. The
+    // payment is taken once the proxy is known to be there to serve it.
     if is_a2a_proxy_target {
         let Some(proxy_id) =
             crate::a2a_proxies::A2aProxyTargetAdapter::proxy_id_from_endpoint(&state.surface.target.endpoint)
@@ -5911,18 +6214,81 @@ async fn proxy_handler_with_mcp_runtime(
             return Ok(response);
         };
         channel_info!(config_id, "🔌 Routing A2A request through A2A proxy backend proxy_id={}", proxy_id);
-        let caller = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
-        let response = handle_a2a_proxy_target_request(&state, proxy_id, &body_bytes, &channel_name, caller).await;
-        let response = record_a2a_proxy_connection_metric(
-            &state,
-            proxy_id,
-            response,
-            &source_addr,
-            start_time,
-            &trace_id,
-            body_bytes.len() as u64,
-        )
-        .await;
+        let caller = a2a_proxy_target_caller(
+            &state.surface,
+            CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
+        );
+        let dispatched: Result<Response, Response> = 'dispatch: {
+            let adapter =
+                match crate::a2a_proxies::A2aProxyTargetAdapter::from_optional_store(state.a2a_proxy_store.clone()) {
+                    Ok(adapter) => adapter,
+                    Err(err) => {
+                        break 'dispatch Ok(crate::a2a_proxies::target_adapter::json_rpc_target_error(
+                            &body_bytes,
+                            err,
+                        ));
+                    }
+                };
+            let proxy = match adapter
+                .load_active_proxy(proxy_id, &channel_name)
+                .await
+            {
+                Ok(proxy) => proxy,
+                Err(err) => {
+                    break 'dispatch Ok(crate::a2a_proxies::target_adapter::json_rpc_target_error(&body_bytes, err));
+                }
+            };
+            let prepared = match crate::a2a_proxies::A2aProxyTargetAdapter::prepare_message_send(
+                &proxy,
+                &body_bytes,
+                &channel_name,
+            ) {
+                Ok(prepared) => prepared,
+                Err(refusal) => break 'dispatch Ok(*refusal),
+            };
+            match inbound_payment
+                .charge(&state, None)
+                .await
+            {
+                Ok(receipt) => {
+                    gate_receipt = receipt;
+                    *receipt_out = gate_receipt.clone();
+                }
+                Err(refusal) => break 'dispatch Err(refusal),
+            }
+            if let Some(receipt) = &gate_receipt {
+                receipt.commit().await;
+            }
+            Ok(crate::a2a_proxies::A2aProxyTargetAdapter::dispatch_message_send(
+                &proxy,
+                prepared,
+                state.secrets_store.as_ref(),
+                &channel_name,
+                caller,
+                crate::tenancy::SurfaceTenancy::configured(
+                    state
+                        .surface
+                        .tenant_id
+                        .as_deref(),
+                ),
+            )
+            .await)
+        };
+        let response = match dispatched {
+            Ok(response) => {
+                record_a2a_proxy_connection_metric(
+                    &state,
+                    proxy_id,
+                    response,
+                    &source_addr,
+                    start_time,
+                    &trace_id,
+                    body_bytes.len() as u64,
+                )
+                .await
+            }
+            Err(refusal) => refusal,
+        };
         connection_guard
             .decrement()
             .await;
@@ -5931,10 +6297,9 @@ async fn proxy_handler_with_mcp_runtime(
 
     let mut modern_delegation = None;
     if let Some(request) = modern_request.as_ref()
-        && !state
+        && state
             .surface
-            .outbound_credentials
-            .is_empty()
+            .has_agent_keyed_outbound_credentials()
     {
         use crate::proxy::credential_delegation::modern::{
             ModernDelegationError, ModernDelegationResult, prepare_direct,
@@ -5954,7 +6319,9 @@ async fn proxy_handler_with_mcp_runtime(
             authenticated_identity.as_ref(),
             request_agent_did.as_deref(),
             crate::mcp::continuations::protected::ContinuationRoute::AccessPoint,
-            surface_payment::is_unpaid(&state, &headers, &body_bytes),
+            payment
+                .as_ref()
+                .is_some_and(agent_pay_gate::Intake::is_unpaid),
         )
         .await
         {
@@ -5975,19 +6342,14 @@ async fn proxy_handler_with_mcp_runtime(
                 connection_guard
                     .decrement()
                     .await;
-                return match surface_payment::process(
-                    &state,
-                    &headers,
-                    body_bytes,
-                    mcp_context.as_ref(),
-                    &uri.to_string(),
-                    None,
-                )
-                .await
+                match inbound_payment
+                    .charge(&state, None)
+                    .await
                 {
-                    Err(response) => Ok(response),
-                    Ok(_) => Err(ModernDelegationError::Unpaid.response(request)),
-                };
+                    Err(response) => return Ok(response),
+                    Ok(receipt) => *receipt_out = receipt,
+                }
+                return Err(ModernDelegationError::Unpaid.response(request));
             }
             Err(error) => {
                 connection_guard
@@ -5997,110 +6359,59 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
     }
-    if defer_surface_payment {
-        match surface_payment::delegate(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            &method,
-            &uri,
-            &trace_id,
-            &channel_name,
-            modern_request.as_ref(),
-        )
-        .await
-        {
-            surface_payment::DelegatedPayment::Proceed(receipts) => delegation_receipt_headers.extend(receipts),
-            surface_payment::DelegatedPayment::Challenge(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok(response);
-            }
-            surface_payment::DelegatedPayment::Denied(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            mcp_context.as_ref(),
-            &uri.to_string(),
-            modern_delegation
-                .as_ref()
-                .and_then(|prepared| prepared.payment()),
-        )
-        .await
-        {
-            Ok(mut payment) => {
-                if let Some(prepared) = modern_delegation.as_mut() {
-                    let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                    })?;
-                    prepared
-                        .record_local_payment(
-                            &payment,
-                            mcp_continuations
-                                .as_ref()
-                                .map_or(300, |runtime| runtime.config.ttl_secs),
-                            now,
-                        )
-                        .map_err(|_| {
-                            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                        })?;
-                }
-                payment
-                    .strip_consumed_mcp_argument()
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid paid MCP request")
-                    })?;
-                payment.strip_consumed_headers(
-                    &mut headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                modern_local_receipt = payment
-                    .receipt_header(&state.config.x402_headers)
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid payment receipt header")
-                    })?;
-                body_bytes = payment.body;
-                payment_context = payment.context;
-            }
-            Err(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
+    if let Some(response) = surface_payment::continuation_payment_refusal(
+        &state.surface,
+        modern_delegation
+            .as_ref()
+            .and_then(|prepared| prepared.payment()),
+    ) {
+        connection_guard
+            .decrement()
+            .await;
+        return Err(response);
     }
 
-    // Determine source-auth credential header to strip from upstream requests.
-    let source_cred_header = state
+    // Source-auth credential headers to strip from upstream requests. Only
+    // the selected JWT method's header may be forwarded, and only on opt-in.
+    let mut source_cred_headers = state
         .surface
-        .source_auth()
-        .and_then(|sa| sa.credential_header_name())
-        .or(resource_authorization
-            .as_ref()
-            .map(|_| "authorization"));
+        .source_credential_headers();
+    if resource_authorization.is_some() {
+        source_cred_headers.push("authorization");
+    }
     let header_metadata_mapping = state
         .surface
         .access_point
         .header_metadata_mapping_if_supported();
-    let forward_source_auth_header = state
-        .surface
-        .source_auth()
-        .is_some_and(
-            |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
-        )
-        && resource_authorization.is_none();
+    let forwarded_source_auth_header = match selected_source_auth
+        .filter(|selection| !selection.ambiguous)
+        .map(|selection| selection.method)
+    {
+        Some(crate::source_auth::SourceAuthConfig::JwtBearer(config))
+            if config.forward_header && resource_authorization.is_none() && authenticated_identity.is_some() =>
+        {
+            Some(config.token_header.as_str())
+        }
+        _ => None,
+    };
+    // A Target bound by external consent is a third party: it is sent only
+    // what a Transit Point sends its vendor, no caller-info or DID header, and
+    // is asked for an answer the gateway can read as it is sent.
+    let bound_target = crate::proxy::target_grant::binds_the_target(&state.surface);
+    let credential_headers = target_credential_header_names(&state.surface);
+    let forwards_header = |name: &str| {
+        if bound_target {
+            crate::proxy::target_grant::forwards_caller_header(name, &source_cred_headers, header_metadata_mapping)
+        } else {
+            forwards_ap_caller_header(
+                name,
+                &source_cred_headers,
+                header_metadata_mapping,
+                forwarded_source_auth_header,
+                &credential_headers,
+            )
+        }
+    };
 
     // Build upstream request. The forward send uses the per-request pinned,
     // redirect-disabled client built at the SSRF vetting sink above; only the
@@ -6116,14 +6427,12 @@ async fn proxy_handler_with_mcp_runtime(
     // Copy headers (excluding hop-by-hop headers, content-length, host,
     // and the source-auth credential header which must not leak upstream)
     for (key, value) in headers.iter() {
-        if should_forward_ap_request_header_with_mapping(
-            key.as_str(),
-            source_cred_header,
-            header_metadata_mapping,
-            forward_source_auth_header,
-        ) {
+        if forwards_header(key.as_str()) {
             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
         }
+    }
+    if bound_target {
+        upstream_req = upstream_req.header(reqwest::header::ACCEPT_ENCODING, "identity");
     }
 
     // For MCP channels, advertise SSE support upstream ONLY if the client
@@ -6146,7 +6455,9 @@ async fn proxy_handler_with_mcp_runtime(
 
     // Inject DID:webvh identity into HTTP headers (Header and SignedHeader modes)
     #[cfg(feature = "didwebvh")]
-    if let Some(ref context) = did_context {
+    if let Some(ref context) = did_context
+        && !bound_target
+    {
         use crate::config::DidInjectionMode;
         if *context.injection_mode() != DidInjectionMode::ProtocolNative {
             let mut did_headers = Vec::new();
@@ -6210,8 +6521,10 @@ async fn proxy_handler_with_mcp_runtime(
         #[cfg(not(feature = "didwebvh"))]
         let gateway_did: Option<String> = None;
 
-        for (key, value) in CallerHeaders::build(&caller, gateway_did.as_deref()) {
-            upstream_req = upstream_req.header(&key, &value);
+        if !bound_target {
+            for (key, value) in CallerHeaders::build(&caller, gateway_did.as_deref()) {
+                upstream_req = upstream_req.header(&key, &value);
+            }
         }
     }
 
@@ -6245,18 +6558,7 @@ async fn proxy_handler_with_mcp_runtime(
 
         // Compute user identity hash from authenticated identity for credential
         // vault lookups on the transit side.
-        let transit_user_hash = authenticated_identity
-            .as_ref()
-            .map(|id| {
-                use sha2::{Digest, Sha256};
-                let raw = match id {
-                    crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-                    crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-                    crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-                    crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-                };
-                format!("{:x}", Sha256::digest(raw.as_bytes()))
-            });
+        let transit_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
         let allowed_points: Vec<String> = state
             .surface
@@ -6277,6 +6579,13 @@ async fn proxy_handler_with_mcp_runtime(
             Some(egress_trace_id.as_str()),
             allowed_points,
             caller_context_fields,
+            state
+                .surface
+                .issued_transit_token_lifetime_secs(
+                    state
+                        .network_config
+                        .transit_token_max_lifetime_secs,
+                ),
         ) {
             Ok(token) => {
                 upstream_req = upstream_req.header("X-Transit-Token", &token);
@@ -6305,10 +6614,7 @@ async fn proxy_handler_with_mcp_runtime(
             custom_metadata,
             &channel_name,
             &state.secrets_store,
-            crate::protocols::MetadataRuntimeContext {
-                request_id: Some(egress_trace_id.as_str()),
-                surface_id: Some(config_id),
-            },
+            crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             mcp_metadata_context,
             crate::mcp::meta::McpMetaTarget::Params,
         )
@@ -6344,12 +6650,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .request(method.clone(), &target_url)
                         .body(body_bytes.clone());
                     for (key, value) in headers.iter() {
-                        if should_forward_ap_request_header_with_mapping(
-                            key.as_str(),
-                            source_cred_header,
-                            header_metadata_mapping,
-                            forward_source_auth_header,
-                        ) {
+                        if forwards_header(key.as_str()) {
                             upstream_req = upstream_req.header(key.as_str(), value.as_bytes());
                         }
                     }
@@ -6363,25 +6664,58 @@ async fn proxy_handler_with_mcp_runtime(
     }
 
     // Inject target authentication credentials (if configured)
+    let mut target_token = None;
     if let Some(target_auth) = state.surface.target_auth() {
+        if !crate::proxy::paths::is_target_credential_destination(
+            &state.surface.target.endpoint,
+            method.as_str(),
+            &target_url,
+            state
+                .surface
+                .agent_card_location_path(),
+        ) {
+            warn!(
+                channel = channel_name,
+                "Refusing a request outside the Target base path: it would carry the Target credential"
+            );
+            record_target_auth_refusal(&audit_facts, None, target_auth);
+            return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+        }
         let caller_assertion = CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed);
-        match inject_target_auth_header(target_auth, &state.secrets_store, &channel_name, caller_assertion).await {
-            Ok(Some((header_name, header_value))) => {
-                upstream_req = upstream_req.header(&header_name, &header_value);
+        let mcp_proxy_base_url = match state.mcp_proxy_store.as_ref() {
+            Some(store) => {
+                store
+                    .target_base_url(&state.surface.target.endpoint)
+                    .await
+            }
+            None => None,
+        };
+        match resolve_target_credential(
+            target_auth,
+            &TargetAuthContext::of_proxy(&state).for_mcp_proxy(mcp_proxy_base_url.as_deref()),
+            &channel_name,
+            caller_assertion,
+        )
+        .await
+        {
+            Ok(Some(TargetCredential {
+                header: (header_name, header_value),
+                issued,
+            })) => {
+                upstream_req = replace_request_header(upstream_req, &header_name, &header_value);
                 debug!(channel = channel_name, header = %header_name, "Injected target authentication header");
+                target_token = issued;
             }
             Ok(None) => {
                 // CredentialLookup method not implemented, skip
             }
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target authentication");
+                record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 // Check fallback behavior
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Ok(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
+                        return Ok(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -6393,6 +6727,35 @@ async fn proxy_handler_with_mcp_runtime(
             }
         }
     }
+
+    // ── The Target's grant by binding, in place of the caller's credentials ──
+    let released_target_grant = match target_grant.as_ref() {
+        Some(route) => match route
+            .release(
+                &state,
+                crate::proxy::target_grant::Caller {
+                    identity: authenticated_identity.as_ref(),
+                    source_auth_failed,
+                    facts: &audit_facts,
+                },
+            )
+            .await
+        {
+            Ok(released) => {
+                upstream_req = released
+                    .apply(upstream_req)
+                    .map_err(|refused| refused.response(&state.surface, &body_bytes))?;
+                Some(released)
+            }
+            Err(refused) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(refused.response(&state.surface, &body_bytes));
+            }
+        },
+        None => None,
+    };
 
     // ── Credential delegation: inject delegated OAuth tokens or signal consent ──
     let mut delegation_actions_for_vp: Option<serde_json::Value> = None;
@@ -6407,6 +6770,7 @@ async fn proxy_handler_with_mcp_runtime(
         });
     }
     if !outbound_credentials.is_empty() {
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
         // Credential delegation requires a verified identity — both source_auth
         // (to know *who* the caller is) and managed_identity / extension inspection
         // (to know *which agent* is acting). Anonymous callers must be rejected.
@@ -6414,24 +6778,16 @@ async fn proxy_handler_with_mcp_runtime(
         // Derive the user hash from source authentication only.
         // This identifies the HUMAN user who is delegating — separate from the
         // agent identity (which comes from extension extraction via request_agent_did).
-        let delegation_user_hash = authenticated_identity
-            .as_ref()
-            .map(|id| {
-                use sha2::{Digest, Sha256};
-                let raw = match id {
-                    crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-                    crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-                    crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-                    crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-                };
-                format!("{:x}", Sha256::digest(raw.as_bytes()))
-            });
+        // A credential that names no subject identifies nobody, so it is refused
+        // as anonymous rather than given a grant every such caller would share.
+        let delegation_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
         // Reject anonymous callers: credential delegation requires a verified identity
         if delegation_user_hash.is_none() {
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 "Credential delegation requires source authentication — rejecting anonymous request"
             );
             crate::audit::request_events::request_rejected(
@@ -6466,12 +6822,9 @@ async fn proxy_handler_with_mcp_runtime(
                 .as_ref()
                 .and_then(crate::surface_context::McpContext::called_tool_name);
 
-            // Use the agent DID from request-path identity extraction.
-            // Fall back to channel_id as the workload identity when no
-            // managed identity is configured.
-            let agent_did_for_vault = request_agent_did
-                .as_deref()
-                .unwrap_or(config_id);
+            let agent_did_for_vault = state
+                .surface
+                .target_grant_agent_did(request_agent_did.as_deref());
 
             // Only a verified JWT establishes who consented; every other source
             // auth mode leaves this None and so cannot unlock a consent record.
@@ -6483,10 +6836,18 @@ async fn proxy_handler_with_mcp_runtime(
                 .zip(
                     authenticated_identity
                         .as_ref()
-                        .and_then(crate::source_auth::AuthenticatedIdentity::jwt_claims),
+                        .and_then(|identity| {
+                            identity
+                                .jwt_claims()
+                                .zip(identity.jwt_principal_claim())
+                        }),
                 )
-                .and_then(|(profile, claims)| {
-                    crate::delegation_vault::modern_consent::identity::principal_for_claims(profile, claims)
+                .and_then(|(profile, (claims, principal_claim))| {
+                    crate::delegation_vault::modern_consent::identity::principal_for_claims(
+                        profile,
+                        claims,
+                        principal_claim,
+                    )
                 });
 
             let delegation_audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
@@ -6518,6 +6879,12 @@ async fn proxy_handler_with_mcp_runtime(
                     user_hash,
                     agent_did_for_vault,
                     config_id,
+                    crate::tenancy::SurfaceTenancy::configured(
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
                     mcp_tool,
                     vault_store,
                     provider_store,
@@ -6542,11 +6909,19 @@ async fn proxy_handler_with_mcp_runtime(
                     )
                 })
             {
+                let (content_type, body) = crate::proxy::credential_delegation::delegation_unavailable_body(
+                    state
+                        .surface
+                        .access_point
+                        .protocol
+                        == crate::config::agent_surface::SurfaceProtocol::Mcp,
+                    &body_bytes,
+                );
                 return Ok(Response::builder()
                     .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("content-type", "text/plain")
+                    .header("content-type", content_type)
                     .header("cache-control", "no-store")
-                    .body(Body::from("Delegated credentials unavailable"))
+                    .body(Body::from(body))
                     .unwrap());
             }
 
@@ -6571,6 +6946,7 @@ async fn proxy_handler_with_mcp_runtime(
                 info!(
                     target: "credential_delegation",
                     surface = %channel_name,
+                    surface_variant = surface_variant.as_deref(),
                     providers = %consent_entries.len(),
                     user_hash = %user_hash,
                     agent_did = %agent_did_for_vault,
@@ -6664,6 +7040,7 @@ async fn proxy_handler_with_mcp_runtime(
                             warn!(
                                 target: "credential_delegation",
                                 surface = %channel_name,
+                                surface_variant = surface_variant.as_deref(),
                                 error = %e,
                                 "Failed to mint consent_required identity VP for audit log"
                             );
@@ -6673,6 +7050,7 @@ async fn proxy_handler_with_mcp_runtime(
                     debug!(
                         target: "credential_delegation",
                         surface = %channel_name,
+                        surface_variant = surface_variant.as_deref(),
                         has_identity_selector = %state.identity_selector.is_some(),
                         has_identity_result = %identity_result.is_some(),
                         "Skipping consent_required VP audit — missing identity selector or resolved agent identity"
@@ -6690,8 +7068,6 @@ async fn proxy_handler_with_mcp_runtime(
                     "status": 401,
                     "detail": "This channel requires delegated credentials. The user must authorize access via the provided URLs.",
                     "consent_required": consent_entries,
-                    "_debug_user_hash": user_hash,
-                    "_debug_agent_did": agent_did_for_vault,
                 });
                 return Ok(Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
@@ -6721,6 +7097,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         debug!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             "Injected delegated credential into MCP metadata"
                                         );
@@ -6729,6 +7106,7 @@ async fn proxy_handler_with_mcp_runtime(
                                         warn!(
                                             target: "credential_delegation",
                                             surface = %channel_name,
+                                            surface_variant = surface_variant.as_deref(),
                                             meta_field = %field,
                                             error = %error,
                                             "Failed to inject delegated credential into MCP metadata"
@@ -6744,10 +7122,11 @@ async fn proxy_handler_with_mcp_runtime(
                                 name,
                                 value,
                             } => {
-                                upstream_req = upstream_req.header(name, value);
+                                upstream_req = replace_request_header(upstream_req, name, value);
                                 debug!(
                                     target: "credential_delegation",
                                     surface = %channel_name,
+                                    surface_variant = surface_variant.as_deref(),
                                     header = %name,
                                     "Injected delegated credential header"
                                 );
@@ -6760,6 +7139,7 @@ async fn proxy_handler_with_mcp_runtime(
             warn!(
                 target: "credential_delegation",
                 surface = %channel_name,
+                surface_variant = surface_variant.as_deref(),
                 has_user_hash = %delegation_user_hash.is_some(),
                 "Credential delegation configured but stores not available — skipping"
             );
@@ -6971,7 +7351,92 @@ async fn proxy_handler_with_mcp_runtime(
         deferred_audit.flush();
     }
 
-    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, target_url);
+    debug!("🟢 OUTBOUND REQUEST: trace_id={} target={}", trace_id, loggable::url(&target_url));
+
+    // An MCP proxy Target that cannot be loaded refuses a modern request here.
+    let modern_proxy = match (
+        modern_request.as_ref(),
+        state
+            .surface
+            .target
+            .endpoint
+            .strip_prefix("proxy://"),
+    ) {
+        (Some(_), Some(proxy_id)) => Some(load_owned_proxy(&state, proxy_id).await?),
+        _ => None,
+    };
+
+    // Get circuit breaker if configured
+    let circuit_breaker = target_circuit_breaker(&state).await;
+
+    // The request the MCP proxy is given is built when it is sent, after the
+    // payment: a request that cannot be built is refused here instead.
+    if modern_proxy.is_some()
+        && upstream_req
+            .try_clone()
+            .is_none_or(|request| request.build().is_err())
+    {
+        connection_guard
+            .decrement()
+            .await;
+        return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare MCP proxy request"));
+    }
+
+    // ── Payment ─────────────────────────────────────────────────────────────
+    // The last step before the request leaves: every refusal that does not
+    // depend on payment (policy, tool gating, delegated credentials, target
+    // authentication, an open circuit breaker) has been made, so a request is
+    // never charged and then refused for one of them. A request that fails from
+    // here on still carries its receipt.
+    if let Some(breaker) = &circuit_breaker
+        && let Some(retry_after) = breaker.refusing_for().await
+    {
+        error!(channel = channel_name, retry_after = ?retry_after, "Circuit breaker is open");
+        connection_guard
+            .decrement()
+            .await;
+        return Err(circuit_open_response(retry_after));
+    }
+    match inbound_payment
+        .charge(
+            &state,
+            modern_delegation
+                .as_ref()
+                .and_then(|prepared| prepared.payment()),
+        )
+        .await
+    {
+        Ok(Some(receipt)) => {
+            *receipt_out = Some(receipt.clone());
+            if let Some(prepared) = modern_delegation.as_mut() {
+                let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
+                    create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
+                })?;
+                prepared
+                    .record_payment(
+                        receipt.continuation_evidence(),
+                        mcp_continuations
+                            .as_ref()
+                            .map_or(300, |runtime| runtime.config.ttl_secs),
+                        now,
+                    )
+                    .map_err(|_| {
+                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
+                    })?;
+            }
+            gate_receipt = Some(receipt);
+        }
+        Ok(None) => {}
+        Err(response) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(response);
+        }
+    }
+    if let Some(receipt) = &gate_receipt {
+        receipt.commit().await;
+    }
 
     // Traffic mirroring - send duplicate request to mirror endpoint (if configured)
     if let Some(mirror_config) = state.surface.mirror() {
@@ -6988,7 +7453,7 @@ async fn proxy_handler_with_mcp_runtime(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
-            let mirror_endpoint_for_log = mirror_endpoint.clone(); // Clone for later use
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let channel_name_clone = channel_name.to_string();
@@ -7009,9 +7474,9 @@ async fn proxy_handler_with_mcp_runtime(
                 for (key, value) in headers.iter() {
                     if should_forward_ap_request_header_with_mapping(
                         key.as_str(),
-                        source_cred_header,
+                        &source_cred_headers,
                         header_metadata_mapping,
-                        false,
+                        None,
                     ) {
                         mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
                     }
@@ -7029,7 +7494,7 @@ async fn proxy_handler_with_mcp_runtime(
                         Ok(resp) => {
                             info!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
+                                mirror_endpoint = mirror_endpoint_for_log,
                                 status = resp.status().as_u16(),
                                 trace_id = trace_id_clone,
                                 "Mirror request completed"
@@ -7038,8 +7503,8 @@ async fn proxy_handler_with_mcp_runtime(
                         Err(e) => {
                             warn!(
                                 channel = channel_name_clone,
-                                mirror_endpoint = mirror_endpoint,
-                                error = %e,
+                                mirror_endpoint = mirror_endpoint_for_log,
+                                error = %e.without_url(),
                                 trace_id = trace_id_clone,
                                 "Mirror request failed"
                             );
@@ -7048,6 +7513,7 @@ async fn proxy_handler_with_mcp_runtime(
                 } else {
                     // Fire-and-forget mirror request
                     let config_id_clone = config_id.to_string();
+                    let mirror_endpoint_for_task = mirror_endpoint_for_log.clone();
                     tokio::spawn(async move {
                         match mirror_req_with_headers
                             .send()
@@ -7057,7 +7523,7 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_info!(
                                     config_id_clone,
                                     "Mirror request completed (async): endpoint={}, status={}",
-                                    mirror_endpoint,
+                                    mirror_endpoint_for_task,
                                     resp.status().as_u16()
                                 );
                             }
@@ -7065,8 +7531,8 @@ async fn proxy_handler_with_mcp_runtime(
                                 channel_warn!(
                                     config_id_clone,
                                     "Mirror request failed (async): endpoint={}, error={}",
-                                    mirror_endpoint,
-                                    e
+                                    mirror_endpoint_for_task,
+                                    e.without_url()
                                 );
                             }
                         }
@@ -7153,24 +7619,6 @@ async fn proxy_handler_with_mcp_runtime(
         None
     };
 
-    // Get circuit breaker if configured
-    let circuit_breaker = if state
-        .surface
-        .circuit_breaker()
-        .is_some()
-    {
-        if let Some(ref pm) = state.policy_manager {
-            // Use config_id for circuit breaker lookup, not channel name
-            let channel_id = &state.surface.surface_id;
-            pm.get_circuit_breaker(channel_id.as_str())
-                .await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // Send request and measure request latency (time to get response from upstream)
     let request_latency_start = std::time::Instant::now();
 
@@ -7178,29 +7626,13 @@ async fn proxy_handler_with_mcp_runtime(
         "http.client.send",
         otel.name = "Send Request & Await Response",
         http.method = %method,
-        http.url = %target_url,
+        http.url = %loggable::url(&target_url),
         surface = %channel_name
     );
 
     let owned_modern_response = if let Some(request) = modern_request.as_ref()
-        && let Some(proxy_id) = state
-            .surface
-            .target
-            .endpoint
-            .strip_prefix("proxy://")
+        && let Some(proxy) = modern_proxy.as_ref()
     {
-        use crate::mcp_proxies::McpProxyStore;
-        let store = state
-            .mcp_proxy_store
-            .as_ref()
-            .ok_or_else(|| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "MCP proxy storage is unavailable")
-            })?;
-        let proxy = store
-            .get(proxy_id)
-            .await
-            .map_err(|_| create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load MCP proxy"))?
-            .ok_or_else(|| create_error_response(StatusCode::NOT_FOUND, "MCP proxy was not found"))?;
         let prepared = upstream_req
             .try_clone()
             .ok_or_else(|| {
@@ -7210,13 +7642,21 @@ async fn proxy_handler_with_mcp_runtime(
             .map_err(|_| {
                 create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare MCP proxy request")
             })?;
+        let sent_token = SentServiceToken::of(
+            state
+                .delegation_vault_store
+                .as_deref(),
+            target_token.as_ref(),
+            &state.surface.surface_id,
+        );
         let execute = crate::mcp_proxies::handlers::handle_modern_surface_http_request(
-            &proxy,
+            proxy,
             &state.surface,
             request,
             prepared,
             &state.client,
             mcp_versions,
+            sent_token.as_ref(),
         );
         let execute = async {
             let deadline = std::time::Duration::from_secs(
@@ -7236,6 +7676,9 @@ async fn proxy_handler_with_mcp_runtime(
                 .await
                 .map_err(|error| match error {
                     crate::policies::CircuitBreakerError::Open { .. } => {
+                        gate_receipt
+                            .iter()
+                            .for_each(|receipt| receipt.revoke());
                         create_error_response(StatusCode::SERVICE_UNAVAILABLE, "MCP proxy circuit breaker is open")
                     }
                     crate::policies::CircuitBreakerError::Inner(response) => response,
@@ -7249,6 +7692,31 @@ async fn proxy_handler_with_mcp_runtime(
     } else {
         None
     };
+
+    // A Target bound by external consent is sent a request only with its
+    // grant, or as a public discovery read.
+    if bound_target
+        && released_target_grant.is_none()
+        && !crate::proxy::paths::is_public_request(method.as_str(), uri.path())
+    {
+        connection_guard
+            .decrement()
+            .await;
+        return Ok(crate::proxy::target_grant::refuse_without_the_grant(&state.surface, &body_bytes));
+    }
+
+    // The request as sent, for the one retry a vendor's refusal of the
+    // Target's grant gets; a body too large to send twice has none.
+    let target_grant_retry = released_target_grant
+        .as_ref()
+        .filter(|_| body_bytes.len() <= crate::delegation_vault::release::RETRY_BODY_LIMIT)
+        .and_then(|_| upstream_req.try_clone());
+
+    // Whether any attempt may have reached the Target; a paid request's claim
+    // is handed back only when none did.
+    let reached_target = std::sync::atomic::AtomicBool::new(false);
+    let sent_nothing =
+        |error: &reqwest::Error| error.is_connect() && !reached_target.load(std::sync::atomic::Ordering::Relaxed);
 
     // Implement retry logic if configured
     let send_with_retry = || async {
@@ -7279,7 +7747,14 @@ async fn proxy_handler_with_mcp_runtime(
                     break result;
                 };
 
-                match req_to_send.send().await {
+                let sent = req_to_send.send().await;
+                if !sent
+                    .as_ref()
+                    .is_err_and(reqwest::Error::is_connect)
+                {
+                    reached_target.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                match sent {
                     Ok(resp) => {
                         let status = resp.status();
 
@@ -7316,6 +7791,7 @@ async fn proxy_handler_with_mcp_runtime(
                     }
                     Err(e) => {
                         if attempt <= retry_config.max_attempts {
+                            let e = e.without_url();
                             warn!(channel = channel_name, attempt = attempt, error = %e, "Request failed, will retry");
 
                             // Calculate backoff delay
@@ -7360,12 +7836,18 @@ async fn proxy_handler_with_mcp_runtime(
                         retry_after = ?retry_after,
                         "Circuit breaker is open"
                     );
-                    return Err(create_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("Service temporarily unavailable. Retry after {:?}", retry_after),
-                    ));
+                    // The breaker opened after the charge: nothing was sent.
+                    gate_receipt
+                        .iter()
+                        .for_each(|receipt| receipt.revoke());
+                    return Err(circuit_open_response(retry_after));
                 }
                 Err(crate::policies::CircuitBreakerError::Inner(e)) => {
+                    if sent_nothing(&e) {
+                        gate_receipt
+                            .iter()
+                            .for_each(|receipt| receipt.revoke());
+                    }
                     return Err(handle_upstream_error(
                         e,
                         &state,
@@ -7381,6 +7863,11 @@ async fn proxy_handler_with_mcp_runtime(
                 .instrument(_send_span.clone())
                 .await
                 .map_err(|e| {
+                    if sent_nothing(&e) {
+                        gate_receipt
+                            .iter()
+                            .for_each(|receipt| receipt.revoke());
+                    }
                     handle_upstream_error(e, &state, &source_addr, &identity_hash, &channel_name, &ucp_operation)
                 })?
         };
@@ -7410,6 +7897,49 @@ async fn proxy_handler_with_mcp_runtime(
     } else {
         send_response.await?
     };
+    // The vendor's answer to the Target's grant: a refusal of the token gets
+    // one refresh and one retry, and its cookies and authentication challenges
+    // never reach the caller.
+    let mut upstream_response = match (target_grant.as_ref(), released_target_grant) {
+        (Some(route), Some(released)) => match route
+            .answer(&state, released, upstream_response, target_grant_retry)
+            .await
+        {
+            Ok(response) => response,
+            Err(refused) => {
+                connection_guard
+                    .decrement()
+                    .await;
+                return Ok(refused.response(&state.surface, &body_bytes));
+            }
+        },
+        _ => upstream_response,
+    };
+    if bound_target {
+        crate::proxy::target_grant::withhold_vendor_headers(&mut upstream_response);
+        if let Some(refused) = crate::proxy::target_grant::refuse_a_compressed_answer(
+            &state.surface,
+            upstream_response.headers(),
+            &body_bytes,
+        ) {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(refused);
+        }
+    }
+    forget_refused_target_token(
+        state
+            .delegation_vault_store
+            .as_deref(),
+        target_token.as_ref(),
+        &state.surface.surface_id,
+        upstream_response
+            .status()
+            .as_u16(),
+        upstream_response.headers(),
+    )
+    .await;
 
     // Process response
     let _process_span = tracing::info_span!(
@@ -7447,6 +7977,7 @@ async fn proxy_handler_with_mcp_runtime(
             .target
             .endpoint
             .starts_with("proxy://")
+        && !bound_target
         && matches!(
             upstream_response
                 .status()
@@ -7458,7 +7989,7 @@ async fn proxy_handler_with_mcp_runtime(
         info!(
             surface = %channel_name,
             status = %sse_status,
-            body = %String::from_utf8_lossy(&body_bytes),
+            body_bytes = body_bytes.len(),
             "Upstream rejected direct POST ({}), falling back to Legacy SSE transport",
             sse_status
         );
@@ -7473,7 +8004,11 @@ async fn proxy_handler_with_mcp_runtime(
         .await
         {
             Ok(json_response) => {
-                info!(channel = %channel_name, response = %json_response, "SSE fallback succeeded, returning JSON response");
+                info!(
+                    channel = %channel_name,
+                    response_bytes = json_response.len(),
+                    "SSE fallback succeeded, returning JSON response"
+                );
                 connection_guard
                     .decrement()
                     .await;
@@ -7602,7 +8137,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace = trace_id.clone();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -7616,7 +8151,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -7653,40 +8187,9 @@ async fn proxy_handler_with_mcp_runtime(
                 "Upstream A2A agent responded with an event stream — forwarding it event by event"
             );
             let status = upstream_response.status();
-            let mut stream_headers = upstream_response
+            let stream_headers = upstream_response
                 .headers()
                 .clone();
-            if let Some(payment_header) = &payment_response_header {
-                let name = axum::http::HeaderName::from_bytes(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_response
-                        .as_bytes(),
-                );
-                let value = axum::http::HeaderValue::from_str(payment_header);
-                let (Ok(name), Ok(value)) = (name, value) else {
-                    return Err(create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Invalid payment response header",
-                    ));
-                };
-                stream_headers.insert(name, value);
-            }
-            for (name, values) in &delegation_receipt_headers {
-                let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header name")
-                })?;
-                for value in values {
-                    let value = axum::http::HeaderValue::from_str(value).map_err(|_| {
-                        create_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Invalid delegated receipt header value",
-                        )
-                    })?;
-                    stream_headers.append(name.clone(), value);
-                }
-            }
             let request = a2a_stream::StreamRequest {
                 channel_name: channel_name.to_string(),
                 trace_id: trace_id.clone(),
@@ -7764,21 +8267,10 @@ async fn proxy_handler_with_mcp_runtime(
     };
 
     let mut modern_receipt_headers = HeaderMap::new();
-    if modern_request.is_some() {
-        if let Some((name, value)) = modern_local_receipt {
-            modern_receipt_headers.append(name, value);
-        }
-        for (name, values) in &delegation_receipt_headers {
-            let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header name")
-            })?;
-            for value in values {
-                let value = axum::http::HeaderValue::from_str(value).map_err(|_| {
-                    create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header value")
-                })?;
-                modern_receipt_headers.append(name.clone(), value);
-            }
-        }
+    if modern_request.is_some()
+        && let Some(receipt) = gate_receipt.as_ref()
+    {
+        receipt.apply(&mut modern_receipt_headers);
     }
     let modern_completion = modern_upstream
         .as_ref()
@@ -8247,6 +8739,7 @@ async fn proxy_handler_with_mcp_runtime(
                             &kept_names,
                             crate::observability::PolicyDecisionEvent {
                                 surface_id: Some(config_id),
+                                surface_name: Some(state.surface.name.as_str()),
                                 trace_id: Some(&trace_id),
                                 http_method: Some(method.as_ref()),
                                 path: Some(uri.path()),
@@ -8310,10 +8803,10 @@ async fn proxy_handler_with_mcp_runtime(
                                 response_custom_metadata,
                                 &channel_name,
                                 &state.secrets_store,
-                                crate::protocols::MetadataRuntimeContext {
-                                    request_id: Some(trace_id.as_str()),
-                                    surface_id: Some(config_id),
-                                },
+                                crate::protocols::MetadataRuntimeContext::for_surface(
+                                    &state.surface,
+                                    Some(trace_id.as_str()),
+                                ),
                             )
                             .await
                             {
@@ -8333,10 +8826,10 @@ async fn proxy_handler_with_mcp_runtime(
                                 response_custom_metadata,
                                 &channel_name,
                                 &state.secrets_store,
-                                crate::protocols::MetadataRuntimeContext {
-                                    request_id: Some(trace_id.as_str()),
-                                    surface_id: Some(config_id),
-                                },
+                                crate::protocols::MetadataRuntimeContext::for_surface(
+                                    &state.surface,
+                                    Some(trace_id.as_str()),
+                                ),
                                 mcp_metadata_context,
                                 crate::mcp::meta::McpMetaTarget::Result,
                             )
@@ -8523,7 +9016,7 @@ async fn proxy_handler_with_mcp_runtime(
                             .endpoint
                             .clone();
                         let trace_id = uuid::Uuid::new_v4().to_string();
-                        tokio::spawn(async move {
+                        crate::observability::policy_audit::spawn_in_request(async move {
                             metrics
                                 .record_connection(
                                     channel_config_id,
@@ -8537,7 +9030,6 @@ async fn proxy_handler_with_mcp_runtime(
                                     None,
                                     None,
                                     latency_ms,
-                                    None,
                                 )
                                 .await;
                         });
@@ -8583,15 +9075,15 @@ async fn proxy_handler_with_mcp_runtime(
                 .map(|s| s.to_string());
 
             let policy_key = format!("response:{}", response_policy_id);
-            let input = ResponsePolicyInput {
-                response: ResponseContext {
+            let input = ResponsePolicyInput::new(
+                ResponseContext {
                     status_code: status.as_u16(),
                     body: response_json,
                     content_type: content_type_str,
                     is_error: status.is_server_error() || status.is_client_error(),
                     method: None,
                 },
-                caller: RpCallerContext {
+                RpCallerContext {
                     did: agent_context
                         .as_ref()
                         .and_then(|ctx| ctx.did.clone()),
@@ -8601,7 +9093,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .and_then(|ctx| ctx.agent_dna.as_ref())
                         .map(|dna| dna.uai.clone()),
                 },
-                surface: SurfaceContext {
+                SurfaceContext {
                     id: state
                         .surface
                         .surface_id
@@ -8615,8 +9107,7 @@ async fn proxy_handler_with_mcp_runtime(
                     )
                     .to_lowercase(),
                 },
-                metadata: None,
-            };
+            );
 
             let response_policy = pm
                 .resolve_policy_attestation(Some(response_policy_id))
@@ -8638,6 +9129,7 @@ async fn proxy_handler_with_mcp_runtime(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -8667,6 +9159,7 @@ async fn proxy_handler_with_mcp_runtime(
                     .content_hash
                     .as_deref(),
                 surface_id: Some(config_id),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -8791,9 +9284,6 @@ async fn proxy_handler_with_mcp_runtime(
                 "success",
                 None,
                 identity_hash.clone(),
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
         }
@@ -8908,10 +9398,7 @@ async fn proxy_handler_with_mcp_runtime(
             }
 
             // Record single metric with all latency breakdowns
-            let variant_alias = state
-                .active_variant_alias
-                .clone();
-            tokio::spawn(async move {
+            crate::observability::policy_audit::spawn_in_request(async move {
                 metrics
                     .record_connection_with_ucp(
                         channel_config_id,
@@ -8926,7 +9413,6 @@ async fn proxy_handler_with_mcp_runtime(
                         Some(request_latency_ms),
                         Some(channel_response_latency_ms),
                         total_latency_ms,
-                        variant_alias,
                     )
                     .await;
             });
@@ -9010,60 +9496,117 @@ async fn proxy_handler_with_mcp_runtime(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.contains("application/json"));
 
-        let (response_body, sse_override_content_type, mcp_session_id) =
-            if client_wants_streamable_sse && status.is_success() && upstream_is_json && !response_body.is_empty() {
-                // Detect MCP `initialize` response so we can mint a session id.
-                let parsed = serde_json::from_slice::<serde_json::Value>(&response_body).ok();
+        // A modern response is streamed, so each of its messages carries the
+        // receipt here; any other response is given it whole, with its header, by
+        // the caller of this function.
+        let response_body = match gate_receipt
+            .as_ref()
+            .filter(|_| is_modern_response)
+            .and_then(|receipt| {
+                receipt.inject_into_json(
+                    &state
+                        .surface
+                        .channel_protocol(),
+                    &response_body,
+                )
+            }) {
+            Some(with_receipt) => bytes::Bytes::from(with_receipt),
+            None => response_body,
+        };
+        let (response_body, sse_override_content_type, mcp_session_id) = if client_wants_streamable_sse
+            && status.is_success()
+            && upstream_is_json
+            && !response_body.is_empty()
+        {
+            // Detect MCP `initialize` response so we can mint a session id.
+            let parsed = serde_json::from_slice::<serde_json::Value>(&response_body).ok();
 
-                let compact_body = match &parsed {
-                    Some(v) => serde_json::to_string(v)
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&response_body).into_owned()),
-                    None => String::from_utf8_lossy(&response_body).into_owned(),
-                };
-
-                let is_initialize = parsed
-                    .as_ref()
-                    .and_then(|v| {
-                        v.get("result").map(|r| {
-                            r.get("protocolVersion")
-                                .is_some()
-                                || r.get("serverInfo").is_some()
-                                || r.get("capabilities")
-                                    .is_some()
-                        })
-                    })
-                    .unwrap_or(false);
-
-                let session_id = if is_initialize {
-                    let sid = uuid::Uuid::new_v4()
-                        .to_string()
-                        .replace('-', "");
-                    // Associate the client capabilities captured from the
-                    // inbound `initialize` request with the freshly-minted
-                    // session id, so downstream code (credential delegation,
-                    // Elicit mode) can check `capabilities.elicitation`.
-                    if let Some(caps) = mcp_initialize_caps.clone() {
-                        let registry = crate::mcp::elicitation::global_capability_registry().clone();
-                        registry
-                            .record(&sid, caps)
-                            .await;
-                    }
-                    Some(sid)
-                } else {
-                    None
-                };
-
-                let sse_body = crate::mcp::sse_server::wrap_json_as_sse_event(&compact_body);
-                channel_info!(
-                    config_id,
-                    "📦 MCP Streamable HTTP: wrapping JSON-RPC response as SSE (initialize={}, body_len={})",
-                    is_initialize,
-                    sse_body.len()
-                );
-                (bytes::Bytes::from(sse_body), Some("text/event-stream"), session_id)
-            } else {
-                (response_body, None, None)
+            let compact_body = match &parsed {
+                Some(v) => {
+                    serde_json::to_string(v).unwrap_or_else(|_| String::from_utf8_lossy(&response_body).into_owned())
+                }
+                None => String::from_utf8_lossy(&response_body).into_owned(),
             };
+
+            let is_initialize = parsed
+                .as_ref()
+                .and_then(|v| {
+                    v.get("result").map(|r| {
+                        r.get("protocolVersion")
+                            .is_some()
+                            || r.get("serverInfo").is_some()
+                            || r.get("capabilities")
+                                .is_some()
+                    })
+                })
+                .unwrap_or(false);
+
+            // The id to add as `Mcp-Session-Id`. When the upstream sent its
+            // own id, that header is copied below and the client must get
+            // only that one, or it may send back an id the upstream doesn't know.
+            let session_id = if is_initialize {
+                let (registry_sid, minted) = match upstream_mcp_session_id(&response_headers) {
+                    Ok(Some(sid)) => (Some(sid), None),
+                    Ok(None) => {
+                        let sid = uuid::Uuid::new_v4()
+                            .to_string()
+                            .replace('-', "");
+                        (Some(sid.clone()), Some(sid))
+                    }
+                    // The upstream keys the session by what it sent, so
+                    // dropping or picking one of the values would also break
+                    // the session; the client gets them as sent.
+                    Err(reason) => {
+                        channel_warn!(
+                            config_id,
+                            "Upstream initialize returned an unusable Mcp-Session-Id ({}); passing it through without recording client capabilities",
+                            reason
+                        );
+                        (None, None)
+                    }
+                };
+                // Associate the client capabilities captured from the
+                // inbound `initialize` request with the session id the
+                // client will send, so downstream code (credential
+                // delegation, Elicit mode) can check `capabilities.elicitation`.
+                if let (Some(sid), Some(caps)) = (&registry_sid, mcp_initialize_caps.clone()) {
+                    let registry = crate::mcp::elicitation::global_capability_registry().clone();
+                    // A client re-initializing its own session sends that id;
+                    // any other `initialize` must get an id nobody else holds.
+                    let reinitialized = headers
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        == Some(sid.as_str());
+                    if reinitialized {
+                        registry
+                            .record(config_id, sid, caps)
+                            .await;
+                    } else if !registry
+                        .record_opened(config_id, sid, caps)
+                        .await
+                    {
+                        channel_warn!(
+                            config_id,
+                            "Upstream initialize returned an Mcp-Session-Id already used by another session; Elicit consent is off for that id"
+                        );
+                    }
+                }
+                minted
+            } else {
+                None
+            };
+
+            let sse_body = crate::mcp::sse_server::wrap_json_as_sse_event(&compact_body);
+            channel_info!(
+                config_id,
+                "📦 MCP Streamable HTTP: wrapping JSON-RPC response as SSE (initialize={}, body_len={})",
+                is_initialize,
+                sse_body.len()
+            );
+            (bytes::Bytes::from(sse_body), Some("text/event-stream"), session_id)
+        } else {
+            (response_body, None, None)
+        };
 
         // Build response
         let mut response = Response::builder().status(status);
@@ -9090,29 +9633,6 @@ async fn proxy_handler_with_mcp_runtime(
 
         if let Some(sid) = mcp_session_id {
             response = response.header("Mcp-Session-Id", sid);
-        }
-
-        // Add x402 payment response header if present
-        if let Some(payment_header) = payment_response_header
-            && !is_modern_response
-        {
-            response = response.header(
-                &state
-                    .config
-                    .x402_headers
-                    .payment_response,
-                payment_header,
-            );
-        }
-
-        // Relay allow-listed settlement receipt headers from a delegate payment
-        // gateway (Model B `Proceed`) onto the caller-facing response.
-        if !is_modern_response {
-            for (name, values) in &delegation_receipt_headers {
-                for value in values {
-                    response = response.header(name.as_str(), value.as_str());
-                }
-            }
         }
 
         // Apply Custom Metadata HTTP headers (when injection_target is Headers or Both).
@@ -9212,6 +9732,91 @@ async fn proxy_handler_with_mcp_runtime(
     process_response(status, response_headers, response_body).await
 }
 
+/// Refuses an Access Point request whose surface variant can't be resolved,
+/// recording the refusal once. A modern MCP request, told by its headers, is
+/// answered with a JSON-RPC error whatever its method: its body is read,
+/// within the surface's MCP body limit, only to echo its `id`. Every other
+/// request gets a plain error.
+async fn refuse_access_point_variant(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+) -> Response {
+    let modern_mcp = surface.access_point.protocol == crate::config::agent_surface::SurfaceProtocol::Mcp
+        && crate::mcp::request_validation::has_modern_header(req.headers(), versions);
+    let refusal = crate::audit::request_events::refuse_routing(
+        &routing_facts(surface),
+        error,
+        modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR)),
+    );
+    refusal.warn(surface);
+    if !modern_mcp {
+        return create_error_response(refusal.status(), refusal.message());
+    }
+    crate::mcp::request_validation::answer_routing_refusal(
+        &refusal,
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        Some(req.into_body()),
+    )
+    .await
+}
+
+/// Refuses an Access Point caller whose credential is missing or invalid.
+async fn refuse_failed_caller(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    auth_config: &crate::source_auth::SourceAuthConfig,
+    req: Request,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::caller_refusal(&surface.access_point.protocol, auth_config, mcp_request_id)
+}
+
+/// Refuses a request to an Access Point that is not ready, recording the
+/// refusal once.
+async fn refuse_not_ready_access_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    variant_alias: Option<&str>,
+    req: Request,
+    reason: crate::source_auth::errors::NotReadyReason,
+) -> Response {
+    let mcp_request_id = refused_mcp_request_id(surface, network_config, versions, req).await;
+    crate::source_auth::errors::refuse_unavailable_access_point(
+        surface,
+        &routing_facts(surface),
+        variant_alias,
+        mcp_request_id,
+        reason,
+    )
+}
+
+/// The `id` a refusal of an MCP request answers. The body is read, within the
+/// surface's MCP body limit, only to echo it.
+async fn refused_mcp_request_id(
+    surface: &crate::config::agent_surface::AgentSurface,
+    network_config: &crate::config::NetworkConfig,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    req: Request,
+) -> Option<serde_json::Value> {
+    if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::Mcp {
+        return None;
+    }
+    crate::mcp::request_validation::refused_request_id(
+        surface.mcp_http.as_ref(),
+        &network_config.get_inbound_external_urls(),
+        versions,
+        Some(req.into_body()),
+    )
+    .await
+}
+
 fn normalize_route_for_match(route: &str) -> String {
     let with_leading_slash = if route.starts_with('/') {
         route.to_string()
@@ -9260,24 +9865,54 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
     mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
 ) -> Response {
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
+
+    let scope = RequestScope::fresh();
+    let response = in_request(
+        scope.clone(),
+        Box::pin(multi_channel_proxy_handler_in_request_scope(addr, state, req, mcp_versions, mcp_continuations)),
+    )
+    .await;
+    response_in_request(scope, response)
+}
+
+/// The single-channel request future, moved to the heap where it is built.
+/// It is large, so building it in the router would hold a copy in the
+/// router's own frame and in the task-local future that wraps it.
+fn boxed_proxy_handler(
+    addr: SocketAddr,
+    state: ProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Response, Response>>>> {
+    Box::pin(proxy_handler_with_mcp_runtime(addr, state, req, mcp_versions, mcp_continuations))
+}
+
+async fn multi_channel_proxy_handler_in_request_scope(
+    addr: SocketAddr,
+    state: MultiSurfaceProxyState,
+    req: Request,
+    mcp_versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+) -> Response {
     // Generate unique ID for this handler invocation to track duplicates
     let handler_invocation_id = uuid::Uuid::new_v4();
+    let path = req.uri().path().to_string();
+    let logged_path = loggable::untrusted(&loggable::path(&path));
     info!(
         "🔵 HANDLER ENTRY: invocation_id={} source={} method={} path={}",
         handler_invocation_id,
         addr,
         req.method(),
-        req.uri().path()
+        logged_path
     );
 
-    // Extract path and query before consuming req
-    let path = req.uri().path().to_string();
+    // Extract the query before consuming req
     let query = req
         .uri()
         .query()
         .map(|q| q.to_string());
-
-    debug!("Multi-channel handler received request: method={} path={}", req.method(), path);
 
     // Find the matching channel and parse any `$alias` suffix attached to its route.
     // URL grammar: `/route[$alias][/rest]`.
@@ -9308,8 +9943,11 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
 
             crate::proxy::route_variant::parse_route_with_variant(&path, prefix).map(|m| {
                 debug!(
-                    "Route matched: surface='{}' route='{}' alias={:?} tail='{}'",
-                    ch.surface.name, normalized_route, m.alias, m.tail
+                    "Route matched: surface='{}' route='{}' alias={} tail={}",
+                    ch.surface.name,
+                    normalized_route,
+                    loggable::untrusted(m.alias.unwrap_or_default()),
+                    loggable::untrusted(&loggable::path(m.tail))
                 );
                 (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string())
             })
@@ -9323,318 +9961,80 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
         None => (None, None, String::new()),
     };
 
-    if let Some(ref alias) = virtual_channel_alias {
-        debug!("Variant alias detected: alias='{}' tail='{}'", alias, stripped_tail);
-    }
-
     match channel_info {
         Some(ch) => {
-            info!("Matched channel '{}' with route '{}' for path '{}'", ch.surface.name, ch.surface.route(), path);
+            info!("Matched channel '{}' with route '{}' for path {}", ch.surface.name, ch.surface.route(), logged_path);
 
-            // Base-mode (no variants): resolve to base surface, use channel-level
-            // engines, and forward through the normal pipeline below.
-            // Variant-mode (one or more variants): pick by alias or
-            // default_variant_id, use per-variant engines.
-            // `variant_id` is None in base-mode.
-            let mut variant_resolution_error = None;
-            let variant_id: Option<String> = if ch.surface.variants.is_empty() {
-                if let Some(alias) = virtual_channel_alias.as_deref() {
-                    warn!(
-                        surface = %ch.surface.name,
-                        requested_alias = %alias,
-                        "Channel has no variants — alias in path is ignored, routing to base surface"
-                    );
-                    variant_resolution_error = Some(
-                        crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string()),
-                    );
-                } else if let Some(id) = ch
-                    .surface
-                    .default_variant_id
-                    .as_deref()
-                {
-                    variant_resolution_error =
-                        Some(crate::config::agent_surface_variants::VariantResolveError::MisconfiguredDefault(
-                            id.to_string(),
-                        ));
-                }
-                None
-            } else {
-                let candidate = if let Some(alias) = virtual_channel_alias.as_deref() {
-                    ch.surface
-                        .variants
-                        .iter()
-                        .find(|v| v.alias == alias)
-                        .map(|v| v.id.clone())
-                } else {
-                    ch.surface
-                        .default_variant_id
-                        .clone()
-                };
-
-                match candidate {
-                    Some(id) => Some(id),
-                    None => {
-                        if let Some(alias) = virtual_channel_alias.as_deref() {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = %alias,
-                                available_variants = ?ch.surface.variants.iter().map(|v| &v.alias).collect::<Vec<_>>(),
-                                "❌ ROUTING FAILED: Virtual channel alias not found"
-                            );
-                            crate::audit::request_events::request_rejected(
-                                &routing_facts(&ch.surface),
-                                crate::audit::request_events::RejectionStage::Routing,
-                                crate::audit::request_events::RejectionReason::UnknownVariant,
-                                400,
-                                None,
-                            );
-                            return create_error_response(
-                                StatusCode::BAD_REQUEST,
-                                &format!("Virtual channel alias '{}' not found for this channel", alias),
-                            );
-                        } else {
-                            // No alias in path and no default_variant_id
-                            // configured → route to the bare base surface
-                            // (base is the implicit default). variant_id =
-                            // None drops into channel-level engine handling
-                            // below.
-                            debug!(
-                                surface = %ch.surface.name,
-                                "Alias-less request, no default_variant_id — routing to base surface"
-                            );
-                            None
-                        }
-                    }
+            // The URL's alias, else the default variant, else the base surface
+            // (`variant_id` None) serves the request. A variant that can't be
+            // resolved is refused, never served by the base or another variant.
+            let selected = match ch
+                .surface
+                .select_variant(virtual_channel_alias.as_deref())
+            {
+                Ok(variant) => variant,
+                Err(error) => {
+                    // The refusal may wait on the caller's body, so it must not
+                    // hold the surface list a surface update writes to.
+                    let surface = Arc::clone(&ch.surface);
+                    drop(sorted_channels);
+                    drop(channels);
+                    return refuse_access_point_variant(&surface, &state.network_config, mcp_versions, req, &error)
+                        .await;
                 }
             };
+            let variant_id = selected.map(|variant| variant.id.clone());
 
-            // Check if variant exists and is enabled (only in variant-mode)
-            if let Some(ref vid) = variant_id {
-                let variant = match ch
-                    .surface
-                    .variants
-                    .iter()
-                    .find(|v| &v.id == vid)
-                {
-                    Some(v) => v,
-                    None => {
-                        error!(
-                            surface = %ch.surface.name,
-                            config_id = ?ch.surface.config_id(),
-                            variant_id = %vid,
-                            "❌ ROUTING FAILED: Variant ID not found in channel's variants list"
-                        );
-                        return create_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Selected variant not found in channel configuration",
-                        );
-                    }
-                };
-
-                if !variant.enabled {
-                    warn!(
-                        surface = %ch.surface.name,
-                        variant_id = %vid,
-                        variant_alias = %variant.alias,
-                        "❌ Virtual channel variant is DISABLED"
-                    );
-                    crate::audit::request_events::request_rejected(
-                        &routing_facts(&ch.surface),
-                        crate::audit::request_events::RejectionStage::Routing,
-                        crate::audit::request_events::RejectionReason::VariantDisabled,
-                        503,
-                        None,
-                    );
-                    return create_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &format!("Virtual channel variant '{}' is disabled", variant.alias),
-                    );
-                }
-
-                info!(
-                    "✓ Using virtual channel variant '{}' (alias: '{}') for channel '{}'",
-                    vid, variant.alias, ch.surface.name
+            // A surface the cache retired, because it was disabled or deleted,
+            // is refused: the channel may be a stale copy held by a connection
+            // kept alive across a full reload.
+            let Some((resolved_surface, recorded_variant)) =
+                state.served_surface(ch, virtual_channel_alias.as_deref(), selected)
+            else {
+                warn!(
+                    surface = %ch.surface.name,
+                    config_id = %ch.surface.surface_id,
+                    "Refusing a request routed to a disabled or deleted surface"
                 );
-            }
-
-            // Phase D — prefer the pre-resolved snapshot from
-            // `MultiSurfaceProxyState.resolved_surface_cache`, which is
-            // populated by `apply_surface_change` whenever a surface is
-            // saved. Falls back to resolving the variant from the
-            // channel's mirror surface when the cache has no entry
-            // (e.g. a legacy JSON-config channel that never came from a
-            // surface, or a startup race before seeding). The mirror
-            // surface is built by `AgentSurface::from_channel_mapping`,
-            // whose `variants[]` projection (see
-            // `virtual_channel_to_surface_variant`) carries every
-            // per-variant field that `apply_variant_overrides` would
-            // write, so `resolve_variant` returns an equivalent
-            // surface.
-            let resolved_surface = {
-                let cache_lookup = ch
-                    .surface
-                    .config_id()
-                    .and_then(|sid| {
-                        state
-                            .resolved_surface_cache
-                            .resolve(sid, virtual_channel_alias.as_deref())
-                            .ok()
-                    });
-                if let Some(snap) = cache_lookup {
-                    snap
-                } else {
-                    match ch
-                        .surface
-                        .resolve_variant(virtual_channel_alias.as_deref())
-                    {
-                        Ok(s) => Arc::new(s),
-                        Err(e) => {
-                            error!(
-                                surface = %ch.surface.name,
-                                config_id = ?ch.surface.config_id(),
-                                requested_alias = ?virtual_channel_alias,
-                                error = %e,
-                                "❌ VARIANT RESOLVE FAILED on surface mirror"
-                            );
-                            return create_error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "Failed to resolve virtual channel variant",
-                            );
-                        }
-                    }
-                }
+                crate::audit::request_events::request_rejected(
+                    &crate::audit::request_events::RequestFacts::unroutable(),
+                    crate::audit::request_events::RejectionStage::Routing,
+                    crate::audit::request_events::RejectionReason::NoRoute,
+                    404,
+                    None,
+                );
+                return create_error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("No route configured for path: {}", path),
+                );
             };
+            crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
             // Select the correct engines. In base-mode (variant_id == None) we
             // use channel-level engines and resolve to the base surface.
             // Otherwise we use the pre-compiled per-variant engines.
-            let (
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-            ) = if let Some(ref vid) = variant_id {
-                if let Some(variant_engines) = ch.variant_engines.get(vid) {
-                    info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name);
-                    (
-                        variant_engines
-                            .identity_rules_engine
-                            .clone(),
-                        variant_engines
-                            .identity_selector
-                            .clone(),
-                        variant_engines
-                            .protected_rules_engine
-                            .clone(),
-                        variant_engines
-                            .protected_selector
-                            .clone(),
-                        variant_engines
-                            .external_rules_engine
-                            .clone(),
-                        variant_engines
-                            .external_selector
-                            .clone(),
-                    )
-                } else {
-                    error!(
-                        surface = %ch.surface.name,
-                        config_id = ?ch.surface.config_id(),
-                        variant_id = %vid,
-                        compiled_variants = ?ch.variant_engines.keys().collect::<Vec<_>>(),
-                        "❌ ENGINE LOOKUP FAILED: Variant selected but not found in pre-compiled variant engines. This should never happen if channel validation passed."
-                    );
-                    return create_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Selected virtual channel variant has no compiled engines. This is a configuration error.",
-                    );
+            let Some(engines) = ch.engines_for(variant_id.as_deref()) else {
+                error!(
+                    surface = %ch.surface.name,
+                    config_id = ?ch.surface.config_id(),
+                    variant_id = %variant_id.as_deref().unwrap_or_default(),
+                    compiled_variants = ?ch.variant_engines.keys().collect::<Vec<_>>(),
+                    "❌ ENGINE LOOKUP FAILED: Variant selected but not found in pre-compiled variant engines. This should never happen if channel validation passed."
+                );
+                return create_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Selected virtual channel variant has no compiled engines. This is a configuration error.",
+                );
+            };
+            match &variant_id {
+                Some(vid) => {
+                    info!("✓ Using pre-compiled engines for variant '{}' on channel '{}'", vid, ch.surface.name)
                 }
-            } else {
-                info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name);
-                (
-                    ch.identity_rules_engine
-                        .clone(),
-                    ch.identity_selector.clone(),
-                    ch.protected_rules_engine
-                        .clone(),
-                    ch.protected_selector.clone(),
-                    ch.external_rules_engine
-                        .clone(),
-                    ch.external_selector.clone(),
-                )
-            };
+                None => info!("✓ Using channel-level engines (base-mode) for channel '{}'", ch.surface.name),
+            }
 
-            // Create single-channel ProxyState for this request with effective channel and variant engines
-            let proxy_state = ProxyState {
-                config: state.config.clone(),
-                network_config: state.network_config.clone(),
-                client: state.client.clone(),
-                metrics_store: state.metrics_store.clone(),
-                identity_rules_engine,
-                identity_selector,
-                protected_rules_engine,
-                protected_selector,
-                external_rules_engine,
-                external_selector,
-                task_monitor: state.task_monitor.clone(),
-                task_id: Some(ch.task_id.clone()),
-                ws_state: state.ws_state.clone(),
-                listener_manager: state.listener_manager.clone(),
-                secrets_store: state.secrets_store.clone(),
-                certificates_store: state
-                    .certificates_store
-                    .clone(),
-                policy_manager: state.policy_manager.clone(),
-                gateway_policy_manager: state
-                    .gateway_policy_manager
-                    .clone(),
-                didauth_session_store: state
-                    .didauth_session_store
-                    .clone(),
-                transaction_store: state
-                    .transaction_store
-                    .clone(),
-                mpp_transaction_store: state
-                    .mpp_transaction_store
-                    .clone(),
-                trust_registry_listener_manager: state
-                    .trust_registry_listener_manager
-                    .clone(),
-                source_auth_middleware: state
-                    .source_auth_middleware
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_identity_store: state
-                    .didwebvh_identity_store
-                    .clone(),
-
-                #[cfg(feature = "didwebvh")]
-                didwebvh_log_manager: state
-                    .didwebvh_log_manager
-                    .clone(),
-
-                credential_provider_store: state
-                    .credential_provider_store
-                    .clone(),
-                delegation_vault_store: state
-                    .delegation_vault_store
-                    .clone(),
-                gateway_base_url: state.gateway_base_url.clone(),
-                transit_token_issuer: state
-                    .transit_token_issuer
-                    .clone(),
-                mcp_proxy_store: state.mcp_proxy_store.clone(),
-                a2a_proxy_store: state.a2a_proxy_store.clone(),
-                vc_issuer: state.vc_issuer.clone(),
-                active_variant_alias: virtual_channel_alias.clone(),
-                active_variant_id: variant_id,
-                variant_resolution_error,
-                surface: resolved_surface,
-            };
+            let proxy_state =
+                state.proxy_state_for(ch, engines, virtual_channel_alias.clone(), variant_id, resolved_surface);
 
             // The route + optional `$alias` suffix have already been stripped
             // by `parse_route_with_variant` above; `stripped_tail` is the
@@ -9650,14 +10050,6 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
                 stripped_path.clone()
             };
 
-            debug!(
-                "Rewriting URI: original='{}' new='{}' (stripped route '{}' alias={:?})",
-                path,
-                new_uri,
-                ch.surface.route(),
-                virtual_channel_alias
-            );
-
             let parsed_uri = match new_uri.parse() {
                 Ok(uri) => uri,
                 Err(e) => {
@@ -9665,6 +10057,17 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
                     return create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to process request path");
                 }
             };
+            debug!(
+                "Rewriting URI: original={} new={} (stripped route '{}' alias={})",
+                logged_path,
+                loggable::untrusted(&loggable::uri(&parsed_uri)),
+                ch.surface.route(),
+                loggable::untrusted(
+                    virtual_channel_alias
+                        .as_deref()
+                        .unwrap_or_default()
+                )
+            );
             parts.uri = parsed_uri;
 
             let new_req = Request::from_parts(parts, body);
@@ -9680,11 +10083,12 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
             let policy_collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::<
                 crate::observability::policy_audit::PolicyDecisionSummary,
             >::new()));
-            let result = Box::pin(crate::observability::policy_audit::POLICY_DECISION_COLLECTOR.scope(
-                policy_collector,
-                proxy_handler_with_mcp_runtime(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
-            ))
-            .await;
+            let result = crate::observability::policy_audit::POLICY_DECISION_COLLECTOR
+                .scope(
+                    policy_collector,
+                    boxed_proxy_handler(addr, proxy_state, new_req, mcp_versions, mcp_continuations),
+                )
+                .await;
             match result {
                 Ok(response) => {
                     channel_info!(
@@ -9726,11 +10130,7 @@ async fn multi_channel_proxy_handler_with_mcp_runtime(
             }
         }
         None => {
-            // No matching channel found for this route
-            warn!("No channel found for path: {} (checked {} channels)", path, channels.len());
-            for ch in channels.iter() {
-                warn!("  Available: surface='{}' route='{}'", ch.surface.name, ch.surface.route());
-            }
+            warn!("No surface route matches path {}", logged_path);
             crate::audit::request_events::request_rejected(
                 &crate::audit::request_events::RequestFacts::unroutable(),
                 crate::audit::request_events::RejectionStage::Routing,
@@ -9853,44 +10253,14 @@ fn handle_upstream_error(
             .endpoint
             .contains("your-domain.com");
 
-    // Provide more specific error messages based on the error type
-    let error_message = if e.is_connect() {
-        if e.to_string().contains("dns")
-            || e.to_string()
-                .contains("resolve")
-        {
-            if is_example_domain {
-                format!(
-                    "Target endpoint '{}' uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings.",
-                    state.surface.target.endpoint
-                )
-            } else {
-                format!(
-                    "DNS resolution failed for target endpoint '{}'. Please check that the hostname is valid and resolvable.",
-                    state.surface.target.endpoint
-                )
-            }
-        } else if e
-            .to_string()
-            .contains("timeout")
-        {
-            format!(
-                "Connection timeout to target endpoint '{}'. The server may be unavailable or slow to respond.",
-                state.surface.target.endpoint
-            )
-        } else {
-            format!("Connection failed to target endpoint '{}': {}", state.surface.target.endpoint, e)
-        }
-    } else if e.is_timeout() {
-        format!(
-            "Request timeout to target endpoint '{}'. The server did not respond within the configured timeout period.",
-            state.surface.target.endpoint
-        )
-    } else {
-        format!("Failed to forward request to target endpoint '{}': {}", state.surface.target.endpoint, e)
-    };
-
-    error!(channel = channel_name, error = %e, target = %state.surface.target.endpoint, "Failed to forward request to upstream - bad gateway");
+    let error_message = upstream_error_message(&e, is_example_domain);
+    let e = e.without_url();
+    error!(
+        channel = channel_name,
+        error = %e,
+        target = %loggable::url(&state.surface.target.endpoint),
+        "Failed to forward request to upstream - bad gateway"
+    );
 
     // Record gateway fault in metrics
     if let Some(ref metrics) = state.metrics_store {
@@ -9907,10 +10277,7 @@ fn handle_upstream_error(
             .clone();
         let hash = identity_hash.clone();
         let ucp_op = ucp_operation.clone();
-        let variant_alias = state
-            .active_variant_alias
-            .clone();
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_ucp(
                     channel_config_id,
@@ -9925,7 +10292,6 @@ fn handle_upstream_error(
                     None,
                     None,
                     0,
-                    variant_alias,
                 )
                 .await;
         });
@@ -9957,7 +10323,36 @@ fn handle_upstream_error(
     } else {
         StatusCode::BAD_GATEWAY
     };
-    create_error_response(status_code, &error_message)
+    create_error_response(status_code, error_message)
+}
+
+/// Message returned to the caller when forwarding to the target fails. It names the
+/// kind of failure only: the target URL and the transport error stay in the server log.
+fn upstream_error_message(
+    error: &reqwest::Error,
+    is_example_domain: bool,
+) -> &'static str {
+    let causes = std::iter::successors(std::error::Error::source(error), |cause| cause.source())
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ");
+    if error.is_connect() {
+        if causes.contains("dns") || causes.contains("resolve") {
+            if is_example_domain {
+                "Target endpoint uses a placeholder domain that doesn't resolve. Please configure a valid endpoint in your channel settings."
+            } else {
+                "DNS resolution failed for target endpoint. Please check that the hostname is valid and resolvable."
+            }
+        } else if causes.contains("timeout") {
+            "Connection timeout to target endpoint. The server may be unavailable or slow to respond."
+        } else {
+            "Connection failed to target endpoint"
+        }
+    } else if error.is_timeout() {
+        "Request timeout to target endpoint. The server did not respond within the configured timeout period."
+    } else {
+        "Failed to forward request to target endpoint"
+    }
 }
 
 async fn handle_onboarding_request(
@@ -9971,7 +10366,12 @@ async fn handle_onboarding_request(
     mut connection_guard: ConnectionGuard,
     _req: Request,
 ) -> Result<Response, Response> {
-    info!(channel = channel_name, method = %method, path = %uri.path(), "Onboarding channel detected");
+    info!(
+        channel = channel_name,
+        method = %method,
+        path = %loggable::untrusted(&loggable::path(uri.path())),
+        "Onboarding channel detected"
+    );
 
     // Onboarding handler implementation would go here - this is a simplified version
     // The full implementation is quite long (lines 1438-1695 in original file)
@@ -9988,82 +10388,6 @@ async fn handle_onboarding_request(
     Ok(response)
 }
 
-/// Fetch an agent card from `<base_url>/.well-known/agent-card.json` (then
-/// `/.well-known/agent.json` as fallback).
-///
-/// `base_url` must include the scheme (e.g. `https://gw.example.com/route`).
-/// A non-2xx status or a JSON parse error is treated as final — only
-/// **transport-level** failures (connection error, TLS handshake) on the
-/// first well-known path trigger the fallback to the second path.
-///
-/// Returns `Some(card)` on success or `None` on failure.
-async fn fetch_agent_card(
-    client: &reqwest::Client,
-    base_url: &str,
-    channel_id: &str,
-    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
-) -> Option<serde_json::Value> {
-    let base = base_url.trim_end_matches('/');
-    let urls = [format!("{}/.well-known/agent-card.json", base), format!("{}/.well-known/agent.json", base)];
-
-    for url in &urls {
-        info!(channel = channel_id, "GW1 fabric: [Target mode] Fetching agent card from: {}", url);
-        match client.get(url).send().await {
-            Ok(resp) => {
-                info!(channel = channel_id, "GW1 fabric: Agent card fetch HTTP status: {}", resp.status());
-                if resp.status().is_success() {
-                    let body = match crate::proxy::upstream_body::read_bounded(resp, limits).await {
-                        Ok(body) => body,
-                        Err(e) => {
-                            warn!(
-                                channel = channel_id,
-                                "GW1 fabric: Agent card exceeded its bounds (url={}): {}", url, e
-                            );
-                            return None;
-                        }
-                    };
-                    match serde_json::from_slice::<serde_json::Value>(&body) {
-                        Ok(card) => {
-                            info!(
-                                channel = channel_id,
-                                "GW1 fabric: Agent card fetched successfully (url={}): name={:?} endpoint={:?}",
-                                url,
-                                card.get("name"),
-                                // Reads either era: a pure-1.0 card has no top-level
-                                // `url`, only `supportedInterfaces[]`.
-                                crate::a2a::url_rewriter::primary_endpoint_url(&card)
-                            );
-                            return Some(card);
-                        }
-                        Err(e) => {
-                            // JSON parse failure — no value in retrying with http
-                            warn!(
-                                channel = channel_id,
-                                "GW1 fabric: Failed to parse agent card JSON (url={}): {}", url, e
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    // HTTP-level error — no value in retrying with http
-                    warn!(
-                        channel = channel_id,
-                        "GW1 fabric: Agent card fetch non-success status (url={}): {}",
-                        url,
-                        resp.status()
-                    );
-                    return None;
-                }
-            }
-            Err(e) => {
-                warn!(channel = channel_id, "GW1 fabric: Agent card fetch request failed (url={}): {}", url, e);
-                // Transport-level failure — try the next well-known path
-            }
-        }
-    }
-    None
-}
-
 /// Resolves the caller identity configured on the surface's inbound (or
 /// managed) identity slot for the modes whose DID comes from a stored
 /// credential (cert / API key) or a configured static DID rather than the
@@ -10072,22 +10396,42 @@ async fn fetch_agent_card(
 /// certs, and `Derived` for `FromMtls` / `FromApiKey`. A DID derived from the
 /// managed slot fallback is the surface's managed agent, so it is issued as managed.
 ///
+/// An inbound `from_api_key` slot names no stored key: each caller is
+/// identified by the API key it presented (see
+/// [`resolve_presented_api_key_identity`]).
+///
 /// Returns `Ok(None)` for other modes and on public/discovery paths, where
 /// source auth, Trust Check and surface OPA are bypassed (mirroring the
 /// `from_jwt_claim` resolution). A credential that cannot be derived is a
-/// `502` error response.
+/// `502` error response, except a `from_api_key` slot with no `api_key_id`,
+/// which is a fixed `500` counted as `api_key_id_missing`.
 async fn resolve_configured_caller_identity(
     state: &ProxyState,
     method: &str,
     path: &str,
     channel_name: &str,
     leg: &'static str,
+    authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    source_auth_failed: bool,
 ) -> Result<Option<crate::identity::IdentityResult>, Response> {
     use crate::identity::credential_identity::CredentialIdentity;
     use crate::source_auth::ManagedIdentityConfig;
 
     if crate::proxy::paths::is_public_request(method, path) {
         return Ok(None);
+    }
+    if state
+        .surface
+        .inbound_identity_from_api_key()
+    {
+        return resolve_presented_api_key_identity(
+            state,
+            channel_name,
+            leg,
+            authenticated_identity,
+            source_auth_failed,
+        )
+        .await;
     }
     let (mi, from_managed_slot) = match state
         .surface
@@ -10193,6 +10537,16 @@ async fn resolve_configured_caller_identity(
             }
         }
         Ok(None) => return Ok(None),
+        Err(e @ crate::identity::credential_identity::CredentialIdentityError::ApiKeyIdMissing) => {
+            warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
+            crate::metrics::backends::prometheus::track_managed_identity_resolve(
+                channel_name,
+                "from_api_key",
+                e.reason_label(),
+                0.0,
+            );
+            return Err(create_error_response(StatusCode::INTERNAL_SERVER_ERROR, CALLER_IDENTITY_UNRESOLVED));
+        }
         Err(e) => {
             warn!(channel = channel_name, leg, error = %e, "Failed to derive inbound credential-based identity");
             return Err(create_error_response(
@@ -10204,13 +10558,159 @@ async fn resolve_configured_caller_identity(
     Ok(Some(identity))
 }
 
+const CALLER_IDENTITY_UNRESOLVED: &str = "Caller identity could not be resolved";
+
+/// Whether the configured caller identity runs on this request. It fills in
+/// when the body carried no identity; on an inbound `from_api_key` slot it
+/// replaces any body identity, so a presented key cannot be traded for a VP's
+/// DID.
+fn configured_caller_identity_applies(
+    surface: &crate::config::agent_surface::AgentSurface,
+    body_identity_resolved: bool,
+    method: &str,
+    path: &str,
+) -> bool {
+    !body_identity_resolved
+        || (surface.inbound_identity_from_api_key() && !crate::proxy::paths::is_public_request(method, path))
+}
+
+/// On an inbound `from_api_key` surface the caller is the presented key, so
+/// `input.agent.did` is the key's DID (or absent when none was resolved), never
+/// a DID the request body asserts. Other surfaces keep the body DID.
+fn bind_api_key_caller_did(
+    surface: &crate::config::agent_surface::AgentSurface,
+    method: &str,
+    path: &str,
+    agent: Option<&mut crate::surface_context::AgentContext>,
+    extension_identity: Option<&crate::surface_context::ExtensionIdentityContext>,
+) {
+    if surface.inbound_identity_from_api_key()
+        && !crate::proxy::paths::is_public_request(method, path)
+        && let Some(agent) = agent
+    {
+        agent.bind_caller_did(extension_identity);
+    }
+}
+
+/// The caller identity of an inbound `from_api_key` slot: the DID of the API
+/// key source auth verified on this request. An API Key Provider key is
+/// identified by its key id and reports `source_auth`; a plain API Key by its
+/// `secret_id`, shared by every value in the secret, and reports `unverified`.
+/// A caller-attributable auth failure resolves no identity, leaving the
+/// decision to policy, as does a VC issuer that is missing or fails. Any other
+/// source auth or an unusable key refuses the request with a fixed body.
+async fn resolve_presented_api_key_identity(
+    state: &ProxyState,
+    channel_name: &str,
+    leg: &'static str,
+    authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    source_auth_failed: bool,
+) -> Result<Option<crate::identity::IdentityResult>, Response> {
+    use crate::identity::credential_identity::CredentialIdentityErrorClass;
+
+    if source_auth_failed {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let track = |outcome: &str| {
+        crate::metrics::backends::prometheus::track_managed_identity_resolve(
+            channel_name,
+            "from_api_key",
+            outcome,
+            started
+                .elapsed()
+                .as_secs_f64(),
+        );
+    };
+    let Some(crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, provider_agent_id }) =
+        authenticated_identity
+    else {
+        warn!(channel = channel_name, leg, "Inbound from_api_key identity without API key source auth — refused");
+        track("api_key_unavailable");
+        return Err(create_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Caller identity requires API key authentication",
+        ));
+    };
+    let from_provider = provider_agent_id.is_some();
+
+    let (identity_fields, identity_hash) = match crate::identity::credential_identity::global_resolver()
+        .resolve_presented_api_key(key_name, from_provider, state.secrets_store.as_ref())
+        .await
+    {
+        Ok(derived) => derived,
+        Err(e) => {
+            warn!(channel = channel_name, leg, error = %e, "Failed to derive caller identity from the presented API key");
+            track(e.reason_label());
+            let status = match e.classify() {
+                CredentialIdentityErrorClass::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+                CredentialIdentityErrorClass::BackendUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            return Err(create_error_response(status, CALLER_IDENTITY_UNRESOLVED));
+        }
+    };
+
+    let Some(issuer) = state
+        .identity_selector
+        .as_ref()
+        .map(|s| s.get_vc_issuer())
+        .or_else(|| state.vc_issuer.clone())
+    else {
+        warn!(channel = channel_name, leg, "Inbound from_api_key identity without a VC issuer — DID issuance skipped");
+        track("vc_issuer_missing");
+        return Ok(None);
+    };
+    let response = match issuer
+        .issue_or_get_caller_credential(
+            identity_fields.clone(),
+            Some(identity_hash.clone()),
+            state
+                .surface
+                .config_id()
+                .map(String::from),
+            state
+                .surface
+                .issuer_id
+                .clone(),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            warn!(channel = channel_name, leg, error = %e, "Failed to issue DID for the presented API key");
+            track("vc_issuer_error");
+            return Ok(None);
+        }
+    };
+    track(if response.is_new {
+        "ok_new"
+    } else {
+        "ok_cached"
+    });
+    if response.is_new {
+        info!(channel = channel_name, leg, did = %response.did, "Created new caller DID for the presented API key");
+    } else {
+        debug!(channel = channel_name, leg, did = %response.did, "Resolved caller DID from the presented API key");
+    }
+    Ok(Some(crate::identity::IdentityResult {
+        verification: if from_provider {
+            crate::surface_context::IdentityVerification::SourceAuth
+        } else {
+            crate::surface_context::IdentityVerification::Unverified
+        },
+        hash: identity_hash,
+        did: response.did,
+        is_new: response.is_new,
+        identity_fields,
+        issuer_did: None,
+    }))
+}
+
 fn delegates_credentials_over_fabric(surface: &crate::config::agent_surface::AgentSurface) -> bool {
     surface
         .target
         .fabric_delegated_credentials
-        && !surface
-            .outbound_credentials
-            .is_empty()
+        && surface.has_agent_keyed_outbound_credentials()
 }
 
 /// The Access Point's answer to a modern MCP request the Fabric transport
@@ -10232,7 +10732,8 @@ fn modern_fabric_failure_response(
             );
             return crate::proxy::fabric_forward::capacity_response(id);
         }
-        crate::proxy::fabric_forward::FabricForwardError::NoResponse(_) => StatusCode::GATEWAY_TIMEOUT,
+        crate::proxy::fabric_forward::FabricForwardError::NoResponse(_)
+        | crate::proxy::fabric_forward::FabricForwardError::ReplyNotReceived(_) => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
     create_error_response(status, "Modern Fabric transport is unavailable")
@@ -10274,16 +10775,47 @@ fn fabric_mcp_gate_input(
     serde_json::to_value(&policy_input).unwrap_or_default()
 }
 
-/// Handle requests through the fabric:// protocol by forwarding via gateway
-async fn handle_fabric_request(
-    state: ProxyState,
-    channel_name: &str,
+/// Where a request to a `fabric://{gateway_id}/{channel_id}[$alias]` Target
+/// goes: the peer gateway and surface, the variant alias sent with a
+/// `ForwardRequest`, and the target a framed stream opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricSendRoute {
+    gateway_id: String,
+    channel_id: String,
+    /// The alias the Target pins, never the caller's own `$alias`, which names
+    /// a variant of this surface. With none, the peer serves its own default
+    /// variant or base surface.
+    variant_alias: Option<String>,
+    stream_target: String,
+}
+
+/// The [`FabricSendRoute`] of the served `surface`, whose Target is the
+/// variant's own when the variant overrides it, or `None` when the Target is
+/// not a valid `fabric://` URL.
+fn fabric_send_route(surface: &crate::config::agent_surface::AgentSurface) -> Option<FabricSendRoute> {
+    let endpoint = &surface.target.endpoint;
+    let mut parts = endpoint
+        .strip_prefix("fabric://")?
+        .split('/');
+    let gateway_id = parts.next()?;
+    let (channel_id, variant_alias) = crate::proxy::fabric_forward::pinned_alias(parts.next()?);
+    Some(FabricSendRoute {
+        gateway_id: gateway_id.to_string(),
+        channel_id: channel_id.to_string(),
+        variant_alias: variant_alias.map(str::to_string),
+        stream_target: endpoint.clone(),
+    })
+}
+
+/// A request for a `fabric://` Target.
+struct FabricSend<'a> {
+    channel_name: &'a str,
     method: Method,
     uri: axum::http::Uri,
-    mut headers: HeaderMap,
+    headers: HeaderMap,
     source_addr: String,
     start_time: std::time::Instant,
-    mut connection_guard: ConnectionGuard,
+    connection_guard: ConnectionGuard,
     body_bytes: axum::body::Bytes,
     trace_id: String,
     ucp_operation: Option<String>,
@@ -10292,10 +10824,60 @@ async fn handle_fabric_request(
     payment_context: Option<crate::surface_context::PaymentContext>,
     mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
     mcp_verified_binding: Option<crate::surface_context::IdentityBindingContext>,
-    mcp_classification: Option<&crate::mcp::request_validation::McpRequestClassification>,
+    mcp_classification: Option<&'a crate::mcp::request_validation::McpRequestClassification>,
     subscription_lifetime: Option<crate::mcp::subscriptions::SubscriptionLifetime>,
     mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
+    payment: Option<&'a agent_pay_gate::Intake>,
+}
+
+/// Handle requests through the fabric:// protocol by forwarding via gateway
+/// Forwards a request to a `fabric://` Target, adding the receipt of the
+/// payment taken for it to the response.
+async fn handle_fabric_request(
+    state: ProxyState,
+    request: FabricSend<'_>,
 ) -> Result<Response, Response> {
+    let protocol = state
+        .surface
+        .channel_protocol();
+    let mut gate_receipt = None;
+    let result = Box::pin(handle_fabric_request_inner(state, request, &mut gate_receipt)).await;
+    match gate_receipt {
+        Some(receipt) => {
+            receipt
+                .attach_to_result(&protocol, result)
+                .await
+        }
+        None => result,
+    }
+}
+
+async fn handle_fabric_request_inner(
+    state: ProxyState,
+    request: FabricSend<'_>,
+    gate_receipt: &mut Option<agent_pay_gate::Receipt>,
+) -> Result<Response, Response> {
+    let FabricSend {
+        channel_name,
+        method,
+        uri,
+        headers,
+        source_addr,
+        start_time,
+        mut connection_guard,
+        body_bytes,
+        trace_id,
+        ucp_operation,
+        authenticated_identity,
+        source_auth_context,
+        payment_context,
+        mcp_metadata_context,
+        mcp_verified_binding,
+        mcp_classification,
+        subscription_lifetime,
+        mcp_continuations,
+        payment,
+    } = request;
     let source_auth_failed =
         matches!(source_auth_context, Some(crate::surface_context::SourceAuthContext::Failed { .. }));
     let modern_mcp_context = mcp_classification.and_then(crate::mcp::modern_mcp_context);
@@ -10345,20 +10927,8 @@ async fn handle_fabric_request(
         );
     }
 
-    // Log the incoming URI details
-    channel_debug!(config_id, "📍 Incoming URI: {}", uri);
-    channel_debug!(config_id, "  ↳ Path: {:?}", uri.path());
-    channel_debug!(config_id, "  ↳ Query: {:?}", uri.query());
-    channel_debug!(config_id, "  ↳ Path and Query: {:?}", uri.path_and_query());
-
-    // Parse fabric://{gateway_id}/{channel_id}
-    let fabric_path = &state.surface.target.endpoint[9..]; // Remove "fabric://"
-    let parts: Vec<&str> = fabric_path
-        .split('/')
-        .collect();
-
-    if parts.len() < 2 {
-        channel_error!(config_id, "Invalid fabric URL format: {}", state.surface.target.endpoint);
+    let Some(fabric_route) = fabric_send_route(&state.surface) else {
+        channel_error!(config_id, "Invalid fabric URL format: {}", loggable::url(&state.surface.target.endpoint));
         connection_guard
             .decrement()
             .await;
@@ -10366,10 +10936,13 @@ async fn handle_fabric_request(
             StatusCode::BAD_REQUEST,
             "Invalid fabric URL format. Expected: fabric://{gateway_id}/{channel_id}",
         ));
-    }
-
-    let gateway_id = parts[0];
-    let channel_id = parts[1];
+    };
+    let gateway_id = fabric_route
+        .gateway_id
+        .as_str();
+    let channel_id = fabric_route
+        .channel_id
+        .as_str();
 
     channel_info!(config_id, "Fabric - forwarding to gateway {} channel {}", gateway_id, channel_id);
 
@@ -10495,9 +11068,6 @@ async fn handle_fabric_request(
             source_authenticated: authenticated_identity.is_some(),
             metrics_store: &state.metrics_store,
             ws_state: &state.ws_state,
-            variant_alias: state
-                .active_variant_alias
-                .as_deref(),
         };
         match async { inspect_message_extensions(&body_bytes, &inspection_ctx).await }
             .instrument(inspection_span)
@@ -10527,8 +11097,18 @@ async fn handle_fabric_request(
     }
 
     // ── Configured caller identity (FromMtls / FromApiKey / Static) ─────────
-    if identity_result.is_none() {
-        match resolve_configured_caller_identity(&state, method.as_str(), uri.path(), channel_name, "fabric").await {
+    if configured_caller_identity_applies(&state.surface, identity_result.is_some(), method.as_str(), uri.path()) {
+        match resolve_configured_caller_identity(
+            &state,
+            method.as_str(),
+            uri.path(),
+            channel_name,
+            "fabric",
+            authenticated_identity.as_ref(),
+            source_auth_failed,
+        )
+        .await
+        {
             Ok(resolved) => identity_result = resolved,
             Err(response) => {
                 connection_guard
@@ -10758,7 +11338,7 @@ async fn handle_fabric_request(
             None
         };
 
-        let agent_ctx = if !state
+        let mut agent_ctx = if !state
             .surface
             .access_point
             .trust_check_list
@@ -10779,6 +11359,13 @@ async fn handle_fabric_request(
         } else {
             None
         };
+        bind_api_key_caller_did(
+            &state.surface,
+            method.as_str(),
+            uri.path(),
+            agent_ctx.as_mut(),
+            extension_identity.as_ref(),
+        );
 
         let mut policy_input = crate::surface_context::PolicyInput::new(
             method.as_ref(),
@@ -10820,6 +11407,7 @@ async fn handle_fabric_request(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -10854,10 +11442,11 @@ async fn handle_fabric_request(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -10873,10 +11462,11 @@ async fn handle_fabric_request(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -10912,10 +11502,11 @@ async fn handle_fabric_request(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some(method.as_ref()),
                     path: Some(uri.path()),
@@ -10965,43 +11556,13 @@ async fn handle_fabric_request(
         let body_json: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
         let body_ref = body_json.as_ref();
         info!("GW1 fabric: Surface-level OPA policy, body JSON parse success: {}", body_json.is_some());
-        // For fabric:// targets, fetch the agent card via the surface's
-        // own access point URL (public path, bypasses auth) instead of
-        // the unresolvable fabric:// target endpoint.
-        let fabric_card_json = {
-            let card_url = format!(
-                "{}{}",
-                state
-                    .surface
-                    .access_point
-                    .listen_address
-                    .trim_end_matches('/'),
-                state
-                    .surface
-                    .access_point
-                    .route,
-            );
-            info!(
-                channel = config_id_str,
-                fabric_target = %state.surface.target.endpoint,
-                resolved_url = %card_url,
-                "GW1 fabric: resolving agent card via access point listen address"
-            );
-            fetch_agent_card(
-                &state.client,
-                &card_url,
-                config_id_str,
-                crate::proxy::upstream_body::UpstreamBodyLimits::new(
-                    state.config.a2a.max_body_size,
-                    state.surface.timeout(),
-                    state
-                        .config
-                        .a2a
-                        .timeout_seconds,
-                ),
-            )
-            .await
-        };
+        // The card this Access Point serves, built in process without the
+        // effects of serving it.
+        let fabric_card_json =
+            agent_card::build_public_card(&state, &HeaderMap::new(), &source_addr, agent_card::CardMode::Preview, None)
+                .await
+                .map(|card| card.served)
+                .ok();
 
         let agent_ctx = if fabric_card_json.is_some() {
             let agent_ctx = crate::policies::build_agent_context(
@@ -11033,12 +11594,6 @@ async fn handle_fabric_request(
         );
         policy_input.source_auth = source_auth_context.clone();
         policy_input.mcp = modern_mcp_context.clone();
-        // [OPA-INPUT] Fabric surface policy input BEFORE agent/TR data
-        info!(
-            channel = config_id_str,
-            "[OPA-INPUT] Fabric surface policy input before TR: {}",
-            serde_json::to_string(&policy_input).unwrap_or_default()
-        );
         policy_input.agent = agent_ctx;
         if matches!(
             state
@@ -11090,8 +11645,6 @@ async fn handle_fabric_request(
             }
         }
         let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-        // [OPA-INPUT] Fabric surface policy input fully populated
-        info!(channel = config_id_str, "[OPA-INPUT] Fabric surface policy input before eval: {}", input_value);
 
         if let Some(ref policy_manager) = state.policy_manager {
             let channel_opa_def_id = state
@@ -11113,8 +11666,9 @@ async fn handle_fabric_request(
                         allow: true,
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11131,8 +11685,9 @@ async fn handle_fabric_request(
                         reason: decision.reason.as_deref(),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11159,8 +11714,9 @@ async fn handle_fabric_request(
                         error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                         policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                         policy_definition_id: channel_opa_def_id,
-                        policy_name: Some(channel_opa_name.as_str()),
+                        policy_name: channel_opa_name.as_deref(),
                         surface_id: Some(config_id_str),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_ref()),
                         path: Some(uri.path()),
@@ -11223,6 +11779,7 @@ async fn handle_fabric_request(
                 reason: Some("tools/call without a readable tool name under MCP tool gating"),
                 policy_id: Some("mcp_tool_gating"),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(&trace_id),
                 http_method: Some(method.as_ref()),
                 path: Some(uri.path()),
@@ -11279,6 +11836,7 @@ async fn handle_fabric_request(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id_str),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some(method.as_ref()),
             path: Some(uri.path()),
@@ -11301,6 +11859,15 @@ async fn handle_fabric_request(
         }
     }
 
+    let inbound_payment = InboundPayment {
+        intake: payment,
+        identity: authenticated_identity.as_ref(),
+        identity_binding: identity_binding.as_ref(),
+        trace_id: &trace_id,
+        egress_trace_id: &egress_trace_id,
+        source_addr: &source_addr,
+        start_time,
+    };
     let mut modern_delegation = None;
     let mut modern_payment_headers = HeaderMap::new();
     if let Some(request) = modern_request.as_ref() {
@@ -11323,7 +11890,8 @@ async fn handle_fabric_request(
             debug!(
                 target: "credential_delegation",
                 surface_id = %state.surface.surface_id,
-                route = %state.surface.target.endpoint,
+                surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+                route = %loggable::url(&state.surface.target.endpoint),
                 reason = "fabric_delegated_credentials=false",
                 "Delegated credentials withheld from Fabric peer"
             );
@@ -11361,7 +11929,7 @@ async fn handle_fabric_request(
                 ContinuationRoute::FabricSend {
                     peer_did: remote_gateway_did.clone(),
                 },
-                surface_payment::is_unpaid(&state, &headers, &body_bytes),
+                payment.is_some_and(agent_pay_gate::Intake::is_unpaid),
             )
             .await
             {
@@ -11382,19 +11950,14 @@ async fn handle_fabric_request(
                     connection_guard
                         .decrement()
                         .await;
-                    return match surface_payment::process(
-                        &state,
-                        &headers,
-                        body_bytes,
-                        modern_mcp_context.as_ref(),
-                        &uri.to_string(),
-                        None,
-                    )
-                    .await
+                    match inbound_payment
+                        .charge(&state, None)
+                        .await
                     {
-                        Err(response) => Ok(response),
-                        Ok(_) => Err(ModernDelegationError::Unpaid.response(request)),
-                    };
+                        Err(response) => return Ok(response),
+                        Ok(receipt) => *gate_receipt = receipt,
+                    }
+                    return Err(ModernDelegationError::Unpaid.response(request));
                 }
                 Err(error) => {
                     connection_guard
@@ -11404,101 +11967,16 @@ async fn handle_fabric_request(
                 }
             }
         }
-        match surface_payment::delegate(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            &method,
-            &uri,
-            &trace_id,
-            channel_name,
-            modern_request.as_ref(),
-        )
-        .await
-        {
-            surface_payment::DelegatedPayment::Proceed(receipts) => {
-                for (name, values) in receipts {
-                    let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt header")
-                    })?;
-                    for value in values {
-                        let value = axum::http::HeaderValue::from_str(&value).map_err(|_| {
-                            create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid delegated receipt value")
-                        })?;
-                        modern_payment_headers.append(name.clone(), value);
-                    }
-                }
-            }
-            surface_payment::DelegatedPayment::Challenge(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Ok(response);
-            }
-            surface_payment::DelegatedPayment::Denied(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
-        }
-        match surface_payment::process(
-            &state,
-            &headers,
-            body_bytes.clone(),
-            modern_mcp_context.as_ref(),
-            &uri.to_string(),
+        if let Some(response) = surface_payment::continuation_payment_refusal(
+            &state.surface,
             modern_delegation
                 .as_ref()
                 .and_then(|prepared| prepared.payment()),
-        )
-        .await
-        {
-            Ok(mut payment) => {
-                if let Some(prepared) = modern_delegation.as_mut() {
-                    let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
-                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                    })?;
-                    prepared
-                        .record_local_payment(
-                            &payment,
-                            mcp_continuations
-                                .as_ref()
-                                .map_or(300, |runtime| runtime.config.ttl_secs),
-                            now,
-                        )
-                        .map_err(|_| {
-                            create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
-                        })?;
-                }
-                payment
-                    .strip_consumed_mcp_argument()
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid paid MCP request")
-                    })?;
-                payment.strip_consumed_headers(
-                    &mut headers,
-                    &state
-                        .config
-                        .x402_headers
-                        .payment_signature,
-                );
-                if let Some((name, value)) = payment
-                    .receipt_header(&state.config.x402_headers)
-                    .map_err(|_| {
-                        create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Invalid payment receipt header")
-                    })?
-                {
-                    modern_payment_headers.insert(name, value);
-                }
-                body_bytes = payment.body;
-            }
-            Err(response) => {
-                connection_guard
-                    .decrement()
-                    .await;
-                return Err(response);
-            }
+        ) {
+            connection_guard
+                .decrement()
+                .await;
+            return Err(response);
         }
     }
 
@@ -11520,6 +11998,7 @@ async fn handle_fabric_request(
 
         if should_mirror {
             let mirror_endpoint = mirror_config.endpoint.clone();
+            let mirror_endpoint_for_log = loggable::url(&mirror_endpoint);
             let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
             let wait_for_response = mirror_config.wait_for_response;
             let client = crate::http_client::with_timeout(mirror_timeout).unwrap_or_else(|_| reqwest::Client::new());
@@ -11532,10 +12011,9 @@ async fn handle_fabric_request(
                 .timeout(mirror_timeout);
 
             // Copy headers
-            let source_cred_header = state
+            let source_cred_headers = state
                 .surface
-                .source_auth()
-                .and_then(|sa| sa.credential_header_name());
+                .source_credential_headers();
             let header_metadata_mapping = state
                 .surface
                 .access_point
@@ -11544,9 +12022,9 @@ async fn handle_fabric_request(
             for (key, value) in headers.iter() {
                 if should_forward_ap_request_header_with_mapping(
                     key.as_str(),
-                    source_cred_header,
+                    &source_cred_headers,
                     header_metadata_mapping,
-                    false,
+                    None,
                 ) {
                     mirror_req_with_headers = mirror_req_with_headers.header(key.as_str(), value.as_bytes());
                 }
@@ -11567,7 +12045,7 @@ async fn handle_fabric_request(
                         channel_info!(
                             config_id,
                             "Fabric mirror request completed: endpoint={}, status={}",
-                            mirror_endpoint,
+                            mirror_endpoint_for_log,
                             resp.status().as_u16()
                         );
                     }
@@ -11586,8 +12064,8 @@ async fn handle_fabric_request(
                             config_id,
                             "Fabric mirror request failed ({}): endpoint={}, error={}",
                             error_type,
-                            mirror_endpoint,
-                            e
+                            mirror_endpoint_for_log,
+                            e.without_url()
                         );
 
                         // For synchronous mirroring, return error if mirror fails
@@ -11596,16 +12074,13 @@ async fn handle_fabric_request(
                             .await;
                         return Err(create_error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            &format!(
-                                "Traffic mirroring failed ({}): Mirror endpoint '{}' is unreachable. Error: {}",
-                                error_type, mirror_endpoint, e
-                            ),
+                            &format!("Traffic mirroring failed ({error_type}): the mirror endpoint is unreachable"),
                         ));
                     }
                 }
             } else {
                 // Fire-and-forget mirror request
-                let mirror_endpoint_clone = mirror_endpoint.clone();
+                let mirror_endpoint_clone = mirror_endpoint_for_log.clone();
                 let config_id_clone = config_id.to_string();
                 tokio::spawn(async move {
                     match mirror_req_with_headers
@@ -11625,7 +12100,7 @@ async fn handle_fabric_request(
                                 config_id_clone,
                                 "Fabric mirror request failed (async): endpoint={}, error={}",
                                 mirror_endpoint_clone,
-                                e
+                                e.without_url()
                             );
                         }
                     }
@@ -11643,7 +12118,7 @@ async fn handle_fabric_request(
     let _request_agent_did = identity_result
         .as_ref()
         .map(|r| r.did.clone());
-    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref());
+    let request_user_hash = source_auth_user_hash(authenticated_identity.as_ref(), &state.surface);
 
     // Mirror the direct path: stamp the derived agent DID onto the root span
     // as `caller.did` so credential-derived identity (e.g. `from_jwt_claim`)
@@ -11674,10 +12149,7 @@ async fn handle_fabric_request(
                 custom_metadata,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(egress_trace_id.as_str()),
-                    surface_id: Some(config_id),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             )
             .await
             {
@@ -11709,10 +12181,7 @@ async fn handle_fabric_request(
                     .unwrap_or(&serde_json::json!({})),
                 &state.secrets_store,
                 channel_name,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(egress_trace_id.as_str()),
-                    surface_id: Some(config_id),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(egress_trace_id.as_str())),
             )
             .await
             {
@@ -12023,40 +12492,44 @@ async fn handle_fabric_request(
     // Convert headers to JSON-serializable format
     // Normalize header names to uppercase for consistency (HTTP headers are case-insensitive)
     // This ensures PAYMENT-SIGNATURE and other x402 headers work correctly through fabric protocol
-    // Also strip the source-auth credential header — it was consumed by GW1 and must not leak to GW2/upstream.
-    let fabric_source_cred = state
+    // Also strip the source-auth credential headers — GW1 consumed them and they must not leak to GW2/upstream.
+    let fabric_source_creds = state
         .surface
-        .source_auth()
-        .and_then(|sa| sa.credential_header_name());
+        .source_credential_headers();
     let header_metadata_mapping = state
         .surface
         .access_point
         .header_metadata_mapping_if_supported();
-    let mut stream_headers = HeaderMap::new();
-    let mut headers_map: std::collections::HashMap<String, String> = headers
-        .iter()
-        .filter_map(|(k, v)| {
-            if !should_forward_ap_request_header_with_mapping(
-                k.as_str(),
-                fabric_source_cred,
-                header_metadata_mapping,
-                false,
-            ) {
-                return None;
-            }
-            stream_headers.append(k.clone(), v.clone());
-            v.to_str()
-                .ok()
-                .map(|v| (k.as_str().to_uppercase(), v.to_string()))
-        })
-        .collect();
+    let (mut headers_map, mut stream_headers) = access_point_fabric_headers(
+        &headers,
+        &fabric_source_creds,
+        header_metadata_mapping,
+        &target_credential_header_names(&state.surface),
+    );
 
+    let fabric_send_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
     // Inject target authentication credentials into the forwarded headers so
     // GW2 delivers them to the upstream service.
     if let Some(target_auth) = state.surface.target_auth() {
+        if !crate::proxy::paths::appended_path_stays_below_base(uri.path()) {
+            warn!(
+                channel = channel_name,
+                "Refusing a Fabric request that climbs out of its path: it would carry the Target credential"
+            );
+            record_target_auth_refusal(&fabric_send_facts, None, target_auth);
+            connection_guard
+                .decrement()
+                .await;
+            return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
+        }
         match inject_target_auth_header(
             target_auth,
-            &state.secrets_store,
+            &TargetAuthContext::of_proxy(&state),
             channel_name,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
@@ -12078,15 +12551,13 @@ async fn handle_fabric_request(
             Ok(None) => {}
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target auth for fabric forwarding");
+                record_target_auth_failure(&fabric_send_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
                         connection_guard
                             .decrement()
                             .await;
-                        return Err(create_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("Target authentication failed: {}", e),
-                        ));
+                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(
@@ -12115,17 +12586,49 @@ async fn handle_fabric_request(
         }
     }
 
+    // The payment is taken last: every refusal that does not depend on it has
+    // been made, and what follows is the dispatch itself.
+    match inbound_payment
+        .charge(
+            &state,
+            modern_delegation
+                .as_ref()
+                .and_then(|prepared| prepared.payment()),
+        )
+        .await
+    {
+        Ok(Some(receipt)) => {
+            receipt.apply(&mut modern_payment_headers);
+            *gate_receipt = Some(receipt.clone());
+            if let Some(prepared) = modern_delegation.as_mut() {
+                let now = crate::proxy::credential_delegation::modern::now_secs().map_err(|_| {
+                    create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
+                })?;
+                prepared
+                    .record_payment(
+                        receipt.continuation_evidence(),
+                        mcp_continuations
+                            .as_ref()
+                            .map_or(300, |runtime| runtime.config.ttl_secs),
+                        now,
+                    )
+                    .map_err(|_| {
+                        create_error_response(StatusCode::SERVICE_UNAVAILABLE, "Payment continuation unavailable")
+                    })?;
+            }
+        }
+        Ok(None) => {}
+        Err(response) => {
+            connection_guard
+                .decrement()
+                .await;
+            return Ok(response);
+        }
+    }
+
     // Debug: Log payment-related headers to diagnose propagation
     if let Some(payment_sig) = headers_map.get("PAYMENT-SIGNATURE") {
-        channel_info!(
-            config_id,
-            "Forwarding PAYMENT-SIGNATURE header (first 50 chars): {}",
-            if payment_sig.len() > 50 {
-                &payment_sig[..50]
-            } else {
-                payment_sig
-            }
-        );
+        channel_info!(config_id, "Forwarding PAYMENT-SIGNATURE header ({} bytes)", payment_sig.len());
     } else {
         channel_info!(config_id, "No PAYMENT-SIGNATURE header to forward");
     }
@@ -12160,15 +12663,16 @@ async fn handle_fabric_request(
         serde_json::Value::Null
     };
 
+    let logged_path = loggable::uri(&uri);
     info!(
         "📦 Building ForwardRequest: {} {} ({} headers, {} bytes body)",
         method.as_str(),
-        path_and_query,
+        logged_path,
         headers_map.len(),
         body_bytes.len()
     );
 
-    debug!("  ↳ Full path being sent: '{}'", path_and_query);
+    debug!("  ↳ Full path being sent: '{}'", logged_path);
     debug!("  ↳ Body bytes length: {}", body_bytes.len());
 
     // Calculate message expiration time (use channel timeout if configured, otherwise global)
@@ -12223,37 +12727,9 @@ async fn handle_fabric_request(
         }
     };
 
-    // Extract variant alias from the request path (for fabric routing).
-    // This allows GW2 to resolve the same surface variant on its side.
-    // URL grammar: `/route$alias/...` (suffix on the route, see plan §2.3).
-    let virtual_channel_alias = crate::proxy::route_variant::extract_variant_alias_for_route(
-        uri.path(),
-        state
-            .surface
-            .access_point
-            .route
-            .as_str(),
-    )
-    .and_then(|a| a);
-
     let (modern_upstream, forward_result) = if modern_request.is_some() {
         crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
-        let stream_target = match virtual_channel_alias.as_deref() {
-            Some(alias)
-                if !state
-                    .surface
-                    .target
-                    .endpoint
-                    .contains('$') =>
-            {
-                format!("{}${alias}", state.surface.target.endpoint)
-            }
-            _ => state
-                .surface
-                .target
-                .endpoint
-                .clone(),
-        };
+        let stream_target = &fabric_route.stream_target;
         let header_timeout = state
             .surface
             .timeout()
@@ -12266,10 +12742,13 @@ async fn handle_fabric_request(
                         .fabric_gateway_timeout_ms,
                 )
             });
+        if let Some(receipt) = gate_receipt.as_ref() {
+            receipt.commit().await;
+        }
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
             crate::proxy::fabric_forward::FabricStreamForwardRequest {
-                fabric_target: &stream_target,
+                fabric_target: stream_target,
                 path: path_and_query,
                 headers: stream_headers,
                 body: body_bytes.clone(),
@@ -12300,13 +12779,6 @@ async fn handle_fabric_request(
         })?;
         (Some(response), Ok(None))
     } else {
-        // Save data for potential MPP auto-pay retry (before it's consumed by json! macro)
-        let mpp_retry_context = if state.surface.mpp_auto_pay() {
-            Some((headers_map.clone(), body_value.clone()))
-        } else {
-            None
-        };
-
         // Compute a wall-clock deadline (epoch milliseconds) for this proxied
         // request. GW2 short-circuits the upstream call with 504 once this
         // passes so we never spend time on work the caller has already given
@@ -12319,21 +12791,21 @@ async fn handle_fabric_request(
             MessageType::ForwardRequest
                 .as_str()
                 .to_string(),
-            serde_json::json!({
-                "channel_id": channel_id,
-                "method": method.as_str(),
-                "path": path_and_query,
-                "headers": headers_map,
-                "body": body_value,
-                "trace_id": egress_trace_id.clone(),
-                "otel_context": otel_context,
-                "deadline_ms": deadline_ms,
-                // `virtual_channel_alias` retained for backward compatibility with
-                // older GW2s. `active_variant_alias` is the spec-aligned name
-                // (plan §4.4); GW2 prefers it when present.
-                "virtual_channel_alias": virtual_channel_alias,
-                "active_variant_alias": virtual_channel_alias,
-            }),
+            crate::proxy::fabric_forward::with_pinned_alias(
+                serde_json::json!({
+                    "channel_id": channel_id,
+                    "method": method.as_str(),
+                    "path": path_and_query,
+                    "headers": headers_map,
+                    "body": body_value,
+                    "trace_id": egress_trace_id.clone(),
+                    "otel_context": otel_context,
+                    "deadline_ms": deadline_ms,
+                }),
+                fabric_route
+                    .variant_alias
+                    .as_deref(),
+            ),
         )
         .from(
             gateway_listener
@@ -12396,6 +12868,10 @@ async fn handle_fabric_request(
             create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to prepare fabric response waiter")
         })?;
 
+        if let Some(receipt) = gate_receipt.as_ref() {
+            receipt.commit().await;
+        }
+
         // Pack and send the message
         let _send_span = tracing::info_span!(
             "fabric.client.send",
@@ -12414,6 +12890,7 @@ async fn handle_fabric_request(
     ).await
     .map_err(|e| {
         crate::proxy::fabric_response_waiter::remove_forward_response_waiter(&forward_request_msg.id);
+        gate_receipt.iter().for_each(|receipt| receipt.revoke());
         channel_error!(config_id, "Failed to send ForwardRequest to gateway {} (DID: {}): {:?}", gateway_id, remote_gateway_did, e);
         channel_warn!(config_id, "If the error mentions DID resolution, the remote gateway may be offline or its DID document unreachable");
         channel_warn!(config_id, "Consider checking if a cached DID document exists but is expired");
@@ -12473,187 +12950,6 @@ async fn handle_fabric_request(
         }
         .instrument(_wait_span)
         .await;
-
-        // ─── MPP Auto-Pay: intercept 402 from downstream gateway ───
-        let forward_result = if state.surface.mpp_auto_pay() {
-            if let Some((saved_headers, saved_body)) = mpp_retry_context {
-                // Check if the response is a 402 ForwardResponse
-                let should_retry = match &forward_result {
-                    Ok(Some(response_msg)) => {
-                        let status = response_msg
-                            .message_body
-                            .get("status")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u16;
-                        if status == 402 {
-                            response_msg
-                                .message_body
-                                .get("headers")
-                                .and_then(|v| v.as_object())
-                                .map(|m| {
-                                    m.iter()
-                                        .map(|(k, v)| (k.clone(), v.clone()))
-                                        .collect::<std::collections::HashMap<String, serde_json::Value>>()
-                                })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-
-                if let Some(response_headers_map) = should_retry {
-                    channel_info!(
-                        config_id,
-                        "🔄 MPP auto-pay: downstream gateway returned 402, attempting auto-payment"
-                    );
-
-                    let secrets_store_ref = state
-                        .secrets_store
-                        .as_ref()
-                        .map(|s| s.as_ref());
-
-                    let auto_pay_result = if let Some(store) = secrets_store_ref {
-                        crate::mpp::auto_pay::auto_pay_402(
-                            &response_headers_map,
-                            state
-                                .surface
-                                .mpp_auto_pay_max_amount(),
-                            store,
-                        )
-                        .await
-                    } else {
-                        Err(anyhow::anyhow!("Secrets store not available for MPP auto-pay"))
-                    };
-
-                    match auto_pay_result {
-                        Ok(result) => {
-                            channel_info!(
-                                config_id,
-                                "🔄 MPP auto-pay succeeded (method='{}'), retrying fabric request",
-                                result.method
-                            );
-
-                            // Rebuild headers with Authorization
-                            let mut retry_headers = saved_headers;
-                            retry_headers.insert("AUTHORIZATION".to_string(), result.authorization_header);
-
-                            // Recalculate expiration
-                            let retry_expires_secs = if let Some(timeout_config) = state.surface.timeout() {
-                                timeout_config.request_secs
-                            } else {
-                                state
-                                    .config
-                                    .a2a
-                                    .message_expires_seconds
-                            };
-                            let now_epoch = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap();
-                            let retry_expires = now_epoch.as_secs()
-                                + crate::gateways::connection_points::envelope_replay::sent_envelope_lifetime_secs(
-                                    retry_expires_secs,
-                                );
-                            let retry_deadline_ms =
-                                (now_epoch.as_millis() as u64).saturating_add(retry_expires_secs.saturating_mul(1000));
-
-                            // Build new ForwardRequest with auth header
-                            let retry_msg = DIDCommMessage::build(
-                                uuid::Uuid::new_v4().to_string(),
-                                MessageType::ForwardRequest
-                                    .as_str()
-                                    .to_string(),
-                                serde_json::json!({
-                                    "channel_id": channel_id,
-                                    "method": method.as_str(),
-                                    "path": path_and_query,
-                                    "headers": retry_headers,
-                                    "body": saved_body,
-                                    "trace_id": egress_trace_id.clone(),
-                                    "deadline_ms": retry_deadline_ms,
-                                }),
-                            )
-                            .from(
-                                gateway_listener
-                                    .gateway_did
-                                    .clone(),
-                            )
-                            .to(remote_gateway_did.clone())
-                            .thid(uuid::Uuid::new_v4().to_string())
-                            .expires_time(retry_expires)
-                            .finalize();
-
-                            match crate::proxy::fabric_response_waiter::register_forward_response_waiter(
-                                &retry_msg.id,
-                                &remote_gateway_did,
-                            ) {
-                                Ok(retry_response_rx) => {
-                                    // Pack + send retry
-                                    match gateway_listener
-                                        .client
-                                        .pack_and_send_message(
-                                            &retry_msg,
-                                            &remote_gateway_did,
-                                            &gateway_listener.gateway_did,
-                                        )
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            // Wait for retry response
-                                            let timeout_duration = if let Some(timeout_config) = state.surface.timeout()
-                                            {
-                                                std::time::Duration::from_secs(timeout_config.request_secs)
-                                            } else {
-                                                std::time::Duration::from_millis(
-                                                    state
-                                                        .config
-                                                        .a2a
-                                                        .fabric_gateway_timeout_ms,
-                                                )
-                                            };
-                                            let retry_result = Ok::<
-                                                Option<crate::gateways::connection_points::messages::ReceivedMessage>,
-                                                String,
-                                            >(
-                                                crate::proxy::fabric_response_waiter::wait_for_forward_response(
-                                                    &retry_msg.id,
-                                                    retry_response_rx,
-                                                    timeout_duration,
-                                                )
-                                                .await,
-                                            );
-                                            channel_info!(config_id, "🔄 MPP auto-pay: retry response received");
-                                            retry_result
-                                        }
-                                        Err(e) => {
-                                            crate::proxy::fabric_response_waiter::remove_forward_response_waiter(
-                                                &retry_msg.id,
-                                            );
-                                            channel_warn!(config_id, "MPP auto-pay: failed to send retry: {}", e);
-                                            forward_result
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    channel_warn!(config_id, "MPP auto-pay: failed to register retry waiter: {}", e);
-                                    forward_result
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            channel_warn!(config_id, "MPP auto-pay failed: {}, propagating 402", e);
-                            forward_result
-                        }
-                    }
-                } else {
-                    forward_result
-                }
-            } else {
-                forward_result
-            }
-        } else {
-            forward_result
-        };
         (None, forward_result)
     };
 
@@ -12710,15 +13006,12 @@ async fn handle_fabric_request(
             let source = source_addr.clone();
             let identity = identity_hash.clone();
             let trace = trace_id.clone();
-            let variant = state
-                .active_variant_alias
-                .clone();
             let request_bytes = body_bytes.len() as u64;
             move |outcome: crate::mcp::modern_sse::ResponseOutcome| {
                 let latency = start_time
                     .elapsed()
                     .as_millis() as u64;
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     guard.decrement().await;
                     if let (Some(monitor), Some(task_id)) = (monitor, task_id) {
                         monitor
@@ -12750,7 +13043,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency,
-                                variant,
                             )
                             .await;
                     }
@@ -13432,7 +13724,7 @@ async fn handle_fabric_request(
                                                                 if let Some(extension_obj) = extension_data.as_object_mut() {
                                                                     if let Some(payload_obj) = payload.as_object() {
                                                                         for (key, value) in payload_obj {
-                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' = {:?} under {}", key, value, extension_uri);
+                                                                            channel_info!(config_id, "Injecting A2A response metadata key '{}' under {}", key, extension_uri);
                                                                             extension_obj.insert(key.clone(), value.clone());
                                                                         }
                                                                         modified = true;
@@ -13471,7 +13763,7 @@ async fn handle_fabric_request(
                             crate::config::ChannelProtocol::Mcp => {
                                 let injected = crate::mcp::metadata::inject_custom_metadata_with_context(
                                     &bytes::Bytes::from(response_body.clone()), response_custom_metadata, channel_name, &state.secrets_store,
-                                    crate::protocols::MetadataRuntimeContext { request_id: Some(trace_id.as_str()), surface_id: Some(config_id) },
+                                    crate::protocols::MetadataRuntimeContext::for_surface(&state.surface, Some(trace_id.as_str())),
                                     mcp_metadata_context, crate::mcp::meta::McpMetaTarget::Result,
                                 ).await.map_err(|error| {
                                     channel_warn!(config_id, "MCP response metadata injection failed: {}", error);
@@ -13571,6 +13863,7 @@ async fn handle_fabric_request(
                                         &filtered.kept,
                                         crate::observability::PolicyDecisionEvent {
                                             surface_id: Some(config_id),
+                                            surface_name: Some(state.surface.name.as_str()),
                                             trace_id: Some(&trace_id),
                                             http_method: Some(method.as_ref()),
                                             path: Some(uri.path()),
@@ -13695,9 +13988,6 @@ async fn handle_fabric_request(
                         validation_status,
                         None, // validation_error
                         identity_hash.clone(),
-                        state
-                            .active_variant_alias
-                            .as_deref(),
                     )
                     .await;
 
@@ -13948,12 +14238,9 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
 
                     // Record single metric with total latency
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -13968,7 +14255,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14023,10 +14309,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14041,7 +14324,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14087,10 +14369,7 @@ async fn handle_fabric_request(
                     let identity = identity_hash.clone();
                     let trace = trace_id.clone();
                     let ucp_op = ucp_operation.clone();
-                    let variant_alias = state
-                        .active_variant_alias
-                        .clone();
-                    tokio::spawn(async move {
+                    crate::observability::policy_audit::spawn_in_request(async move {
                         metrics
                             .record_connection_with_ucp(
                                 channel_config_id,
@@ -14105,7 +14384,6 @@ async fn handle_fabric_request(
                                 None,
                                 None,
                                 latency_ms,
-                                variant_alias,
                             )
                             .await;
                     });
@@ -14148,6 +14426,7 @@ async fn handle_fabric_request(
         let status = parts.status;
         let mut processing_headers = parts.headers.clone();
         processing_headers.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+        let stream_receipt = gate_receipt.clone();
         let result = crate::mcp::modern_sse::forwarding_response_with_completion(
             body.into_data_stream(),
             status,
@@ -14155,8 +14434,11 @@ async fn handle_fabric_request(
             request,
             modern_limits,
             discovery_support,
-            move |message| async move {
+            move |mut message| async move {
                 use crate::mcp::modern_sse::SseReadError;
+                if let Some(receipt) = &stream_receipt {
+                    receipt.inject_into_message(&crate::config::ChannelProtocol::Mcp, &mut message);
+                }
                 let headers = crate::proxy::fabric_stream::wire::encode_headers(&processing_headers)
                     .map_err(|_| SseReadError::ResponseRejected)?;
                 let response_body = serde_json::to_string(&message).map_err(|_| SseReadError::InvalidMessage)?;
@@ -14448,6 +14730,8 @@ async fn evaluate_mcp_tool_policies(
     })
 }
 
+const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+
 fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentSurface) -> String {
     if surface.override_agent_card_location()
         && let Some(custom_path) = surface.agent_card_location_path()
@@ -14458,45 +14742,7 @@ fn agent_card_fabric_forward_path(surface: &crate::config::agent_surface::AgentS
             format!("/{custom_path}")
         }
     } else {
-        "/.well-known/agent-card.json".to_string()
-    }
-}
-
-fn record_agent_card_gateway_fault(
-    state: &ProxyState,
-    source_addr: &str,
-) {
-    if let Some(ref metrics) = state.metrics_store {
-        let metrics = Arc::clone(metrics);
-        let channel_config_id = state
-            .surface
-            .surface_id
-            .clone();
-        let source = source_addr.to_string();
-        let dest = state
-            .surface
-            .target
-            .endpoint
-            .clone();
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        tokio::spawn(async move {
-            metrics
-                .record_connection(
-                    channel_config_id,
-                    source,
-                    dest,
-                    crate::metrics::ConnectionStatus::GatewayFault,
-                    None,
-                    Some("Anonymous".to_string()),
-                    crate::metrics::ConnectionDirection::Request,
-                    trace_id,
-                    None,
-                    None,
-                    0,
-                    None,
-                )
-                .await;
-        });
+        DEFAULT_AGENT_CARD_PATH.to_string()
     }
 }
 
@@ -14529,184 +14775,6 @@ fn extended_agent_card_refusal(rpc_request_id: Option<&serde_json::Value>) -> Re
     crate::a2a::url_rewriter::extended_agent_card_refusal(rpc_request_id)
 }
 
-async fn fetch_agent_card_from_surface_target(
-    state: &ProxyState,
-    headers: &HeaderMap,
-    source_addr: &str,
-    channel_name: &str,
-    target_url: &str,
-) -> Result<JsonValue, Response> {
-    debug!(channel = channel_name, target = %target_url, "Fetching agent card from upstream");
-
-    let source_cred_header = state
-        .surface
-        .source_auth()
-        .and_then(|sa| sa.credential_header_name());
-
-    if state
-        .surface
-        .target
-        .endpoint
-        .starts_with("fabric://")
-    {
-        let forwarded_headers = headers
-            .iter()
-            .filter(|(key, _)| should_forward_header(key.as_str(), source_cred_header))
-            .filter_map(|(key, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (key.as_str().to_string(), value.to_string()))
-            })
-            .collect::<HashMap<_, _>>();
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        let path = agent_card_fabric_forward_path(&state.surface);
-        let response = crate::proxy::fabric_forward::forward_via_fabric(
-            &state.listener_manager,
-            crate::proxy::fabric_forward::FabricForwardRequest {
-                fabric_target: &state.surface.target.endpoint,
-                method: &Method::GET,
-                path: &path,
-                headers: forwarded_headers,
-                body: bytes::Bytes::new(),
-                timeout: std::time::Duration::from_secs(30),
-                trace_id: &trace_id,
-                log_label: channel_name,
-            },
-        )
-        .await
-        .map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to fetch agent card from fabric upstream - bad gateway");
-            record_agent_card_gateway_fault(state, source_addr);
-            create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
-        })?;
-
-        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        if !status.is_success() {
-            error!(channel = channel_name, status = %status, "Fabric upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(status, &format!("Upstream error: {status}")));
-        }
-
-        serde_json::from_slice(&response.body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse fabric agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    } else {
-        let credential = agent_card_target_credential(state, source_addr, channel_name).await?;
-        let mut req = match credential {
-            Some(_) => pinned_target_client(
-                state,
-                channel_name,
-                target_url,
-                &crate::audit::request_events::RequestFacts {
-                    surface_id: &state.surface.surface_id,
-                    channel_name,
-                    trace_id: None,
-                    via_fabric: false,
-                },
-            )
-            .await
-            .inspect_err(|_| record_agent_card_gateway_fault(state, source_addr))?
-            .get(target_url),
-            None => state.client.get(target_url),
-        };
-
-        for (key, value) in headers.iter() {
-            let forward = match credential {
-                Some(_) => is_forwarded_on_credentialed_card_fetch(key.as_str()),
-                None => should_forward_header(key.as_str(), source_cred_header),
-            };
-            if forward {
-                req = req.header(key.as_str(), value.as_bytes());
-            }
-        }
-        if let Some((header_name, header_value)) = &credential {
-            req = req.header(header_name.as_str(), header_value.as_str());
-            debug!(channel = channel_name, header = %header_name, "Injected target authentication header on agent card fetch");
-        }
-
-        let response = req
-            .send()
-            .await
-            .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to fetch agent card from upstream - bad gateway");
-                record_agent_card_gateway_fault(state, source_addr);
-                create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e))
-            })?;
-
-        if response
-            .status()
-            .is_redirection()
-        {
-            error!(channel = channel_name, status = %response.status(), "Upstream redirected the agent card fetch - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(StatusCode::BAD_GATEWAY, "Upstream redirected"));
-        }
-        if !response.status().is_success() {
-            error!(channel = channel_name, status = %response.status(), "Upstream returned error for agent card - gateway fault");
-            record_agent_card_gateway_fault(state, source_addr);
-            return Err(create_error_response(response.status(), &format!("Upstream error: {}", response.status())));
-        }
-
-        let limits = crate::proxy::upstream_body::UpstreamBodyLimits::new(
-            state.config.a2a.max_body_size,
-            state.surface.timeout(),
-            state
-                .config
-                .a2a
-                .timeout_seconds,
-        );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
-            .await
-            .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
-                record_agent_card_gateway_fault(state, source_addr);
-                let (status, message) = e.status_and_message();
-                create_error_response(status, message)
-            })?;
-        serde_json::from_slice(&body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse agent card JSON");
-            create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream")
-        })
-    }
-}
-
-/// The surface's target credential for the gateway's own agent-card fetch, or
-/// `None` when the surface has none. Honours `target.auth.fallback` exactly as
-/// the forwarded path does: `reject` fails the card with 502 rather than asking
-/// the target without the credential it requires.
-async fn agent_card_target_credential(
-    state: &ProxyState,
-    source_addr: &str,
-    channel_name: &str,
-) -> Result<Option<(String, String)>, Response> {
-    let Some(target_auth) = state.surface.target_auth() else {
-        return Ok(None);
-    };
-    match inject_target_auth_header(target_auth, &state.secrets_store, channel_name, CallerAssertion::GatewayOriginated)
-        .await
-    {
-        Ok(credential) => Ok(credential),
-        Err(e) => {
-            error!(channel = channel_name, error = %e, "Failed to resolve target authentication for agent card fetch");
-            match target_auth.fallback {
-                crate::config::TargetAuthFallback::Reject => {
-                    record_agent_card_gateway_fault(state, source_addr);
-                    Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"))
-                }
-                crate::config::TargetAuthFallback::Passthrough => {
-                    warn!(
-                        channel = channel_name,
-                        "Target auth failed but passthrough enabled, fetching agent card without credentials"
-                    );
-                    Ok(None)
-                }
-            }
-        }
-    }
-}
-
 /// A redirect-disabled client pinned to the vetted address of `target_url`, or
 /// the 403 to answer when egress policy blocks it. Pinning stops DNS rebinding
 /// between vetting and connect; disabling redirects stops a 3xx from sending
@@ -14728,7 +14796,7 @@ async fn pinned_target_client(
     match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, timeout)).await {
         Ok(Ok((client, _target))) => Ok(client),
         Ok(Err(e)) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF blocked by egress policy: {}", e);
+            warn!(channel = channel_name, target = %loggable::url(target_url), "SSRF blocked by egress policy: {}", e);
             crate::audit::request_events::request_rejected(
                 facts,
                 crate::audit::request_events::RejectionStage::Forward,
@@ -14739,7 +14807,12 @@ async fn pinned_target_client(
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
         Err(e) => {
-            warn!(channel = channel_name, target = %target_url, "SSRF egress validation task failed: {}", e);
+            warn!(
+                channel = channel_name,
+                target = %loggable::url(target_url),
+                "SSRF egress validation task failed: {}",
+                e
+            );
             Err(create_error_response(StatusCode::FORBIDDEN, "Request blocked by egress policy"))
         }
     }
@@ -14798,23 +14871,6 @@ async fn prepare_a2a_proxy_agent_card_for_target_context(
     .map(|prepared| prepared.card)
 }
 
-async fn handle_a2a_proxy_target_request(
-    state: &ProxyState,
-    proxy_id: &str,
-    body_bytes: &[u8],
-    channel_name: &str,
-    caller: CallerAssertion,
-) -> Response {
-    let adapter = match crate::a2a_proxies::A2aProxyTargetAdapter::from_optional_store(state.a2a_proxy_store.clone()) {
-        Ok(adapter) => adapter,
-        Err(err) => return crate::a2a_proxies::target_adapter::json_rpc_target_error(body_bytes, err),
-    };
-
-    adapter
-        .dispatch_message_send(proxy_id, body_bytes, state.secrets_store.as_ref(), channel_name, caller)
-        .await
-}
-
 async fn record_a2a_proxy_connection_metric(
     state: &ProxyState,
     proxy_id: &str,
@@ -14860,9 +14916,6 @@ async fn record_a2a_proxy_connection_metric(
             None,
             None,
             latency_ms,
-            state
-                .active_variant_alias
-                .clone(),
         )
         .await;
 
@@ -14956,6 +15009,7 @@ async fn evaluate_mcp_proxy_opa_policies(
             .await,
         );
     }
+    bind_api_key_caller_did(&state.surface, method, uri.path(), policy_input.agent.as_mut(), None);
     policy_input.normalize_caller_did();
 
     // ── Trust Check stage (caller leg) ─────────────────────────────────────
@@ -15012,6 +15066,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                 policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                 policy_definition_id: inbound_policy_def_id,
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(trace_id),
                 http_method: Some(method),
                 path: Some(uri.path()),
@@ -15036,10 +15091,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15054,10 +15110,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15081,10 +15138,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: inbound_policy_def_id,
-                    policy_name: Some(inbound_policy_name.as_str()),
+                    policy_name: inbound_policy_name.as_deref(),
                     policy_version: inbound_policy_version,
                     policy_content_hash: inbound_policy_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15129,6 +15187,7 @@ async fn evaluate_mcp_proxy_opa_policies(
                     .surface
                     .opa_policy_definition_id(),
                 surface_id: Some(config_id_str),
+                surface_name: Some(state.surface.name.as_str()),
                 trace_id: Some(trace_id),
                 http_method: Some(method),
                 path: Some(uri.path()),
@@ -15160,8 +15219,9 @@ async fn evaluate_mcp_proxy_opa_policies(
                     allow: true,
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15178,10 +15238,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     reason: decision.reason.as_deref(),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15201,10 +15262,11 @@ async fn evaluate_mcp_proxy_opa_policies(
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     policy_id: Some(crate::policies::SURFACE_POLICY_PACKAGE),
                     policy_definition_id: channel_opa_def_id,
-                    policy_name: Some(channel_opa_name.as_str()),
+                    policy_name: channel_opa_name.as_deref(),
                     policy_version: channel_opa_version,
                     policy_content_hash: channel_opa_hash.as_deref(),
                     surface_id: Some(config_id_str),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(trace_id),
                     http_method: Some(method),
                     path: Some(uri.path()),
@@ -15223,24 +15285,71 @@ async fn evaluate_mcp_proxy_opa_policies(
     Ok(policy_input)
 }
 
-/// Handle MCP request through an MCP proxy backend
-/// This routes the request through rmcp-openapi Server instead of directly forwarding
-async fn handle_mcp_proxy_request(
-    state: &ProxyState,
-    proxy_id: &str,
-    body_bytes: &[u8],
-    headers: &HeaderMap,
-    method: &Method,
-    uri: &axum::http::Uri,
-    channel_name: &str,
-    source_addr: &str,
+/// A request to an MCP proxy Target.
+struct McpProxyRequest<'a> {
+    proxy_id: &'a str,
+    body_bytes: &'a [u8],
+    headers: &'a HeaderMap,
+    method: &'a Method,
+    uri: &'a axum::http::Uri,
+    channel_name: &'a str,
+    source_addr: &'a str,
     start_time: std::time::Instant,
     trace_id: String,
-    authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    egress_trace_id: &'a str,
+    authenticated_identity: Option<&'a crate::source_auth::AuthenticatedIdentity>,
     source_auth_failed: bool,
-    policy_input: &crate::surface_context::PolicyInput,
-    mcp_context: Option<&crate::surface_context::McpContext>,
+    policy_input: &'a crate::surface_context::PolicyInput,
+    mcp_context: Option<&'a crate::surface_context::McpContext>,
+    payment: Option<&'a agent_pay_gate::Intake>,
+}
+
+/// Handle MCP request through an MCP proxy backend
+/// This routes the request through rmcp-openapi Server instead of directly forwarding.
+/// The receipt of the payment taken for it is added to whatever response it ends in.
+async fn handle_mcp_proxy_request(
+    state: &ProxyState,
+    request: McpProxyRequest<'_>,
 ) -> Result<Response, Response> {
+    let mut receipt = None;
+    let result = Box::pin(handle_mcp_proxy_request_inner(state, request, &mut receipt)).await;
+    match receipt {
+        Some(receipt) => {
+            receipt
+                .attach_to_result(
+                    &state
+                        .surface
+                        .channel_protocol(),
+                    result,
+                )
+                .await
+        }
+        None => result,
+    }
+}
+
+async fn handle_mcp_proxy_request_inner(
+    state: &ProxyState,
+    request: McpProxyRequest<'_>,
+    receipt_out: &mut Option<agent_pay_gate::Receipt>,
+) -> Result<Response, Response> {
+    let McpProxyRequest {
+        proxy_id,
+        body_bytes,
+        headers,
+        method,
+        uri,
+        channel_name,
+        source_addr,
+        start_time,
+        trace_id,
+        egress_trace_id,
+        authenticated_identity,
+        source_auth_failed,
+        policy_input,
+        mcp_context,
+        payment,
+    } = request;
     use crate::mcp_proxies::filesystem::McpProxyStore;
 
     let config_id = state
@@ -15332,6 +15441,7 @@ async fn handle_mcp_proxy_request(
                     scope: crate::observability::PolicyScope::McpTool,
                     allow: true,
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15355,6 +15465,7 @@ async fn handle_mcp_proxy_request(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15382,6 +15493,7 @@ async fn handle_mcp_proxy_request(
                     scope: crate::observability::PolicyScope::McpTool,
                     error: Some(crate::observability::PolicyEvaluationError::EvaluationError),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     path: Some(uri.path()),
                     identity: authenticated_identity,
@@ -15428,6 +15540,7 @@ async fn handle_mcp_proxy_request(
             },
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(state.surface.name.as_str()),
             trace_id: Some(&trace_id),
             http_method: Some("POST"),
             path: Some(uri.path()),
@@ -15440,19 +15553,26 @@ async fn handle_mcp_proxy_request(
         }
     }
 
+    let audit_facts = crate::audit::request_events::RequestFacts {
+        surface_id: config_id,
+        channel_name,
+        trace_id: Some(&trace_id),
+        via_fabric: false,
+    };
     // Resolve target auth header if configured on the channel
-    let target_auth_header = if let Some(target_auth) = state.surface.target_auth() {
-        match inject_target_auth_header(
+    let target_credential = if let Some(target_auth) = state.surface.target_auth() {
+        match resolve_target_credential(
             target_auth,
-            &state.secrets_store,
+            &TargetAuthContext::of_proxy(state).for_mcp_proxy(Some(&proxy.base_url)),
             channel_name,
             CallerAssertion::for_forwarded_request(method.as_str(), uri.path(), source_auth_failed),
         )
         .await
         {
-            Ok(header) => header,
+            Ok(credential) => credential,
             Err(e) => {
                 error!(channel = channel_name, error = %e, "Failed to resolve target auth for MCP proxy");
+                record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
                         return Err(create_error_response(
@@ -15474,18 +15594,83 @@ async fn handle_mcp_proxy_request(
         None
     };
 
-    // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)
-    match crate::mcp_proxies::handlers::handle_mcp_request_with_policies(
-        &proxy,
-        json_request.clone(),
-        &state.surface,
-        state.policy_manager.as_ref(),
-        &state.client,
-        channel_name,
-        target_auth_header,
-    )
-    .await
+    let (target_auth_header, issued) =
+        target_credential.map_or((None, None), |credential| (Some(credential.header), credential.issued));
+    let sent_token = SentServiceToken::of(
+        state
+            .delegation_vault_store
+            .as_deref(),
+        issued.as_ref(),
+        &state.surface.surface_id,
+    );
+    // The proxy has to be able to serve the request before it is charged: its
+    // spec and base URL, the method and the tool must be known.
+    let prepared =
+        crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, json_request.clone(), target_auth_header, config_id);
+
+    // Every refusal that does not depend on payment has been made: tool
+    // policies, tool gating, the proxy itself, its target authentication and
+    // an open circuit breaker.
+    if prepared.is_ok()
+        && let Some(breaker) = target_circuit_breaker(state).await
+        && let Some(retry_after) = breaker.refusing_for().await
     {
+        error!(channel = channel_name, proxy_id = proxy_id, retry_after = ?retry_after, "Circuit breaker is open");
+        return Err(crate::mcp::errors::create_mcp_error_response(
+            json_request
+                .get("id")
+                .cloned(),
+            crate::mcp::errors::error_codes::INTERNAL_ERROR,
+            &format!("MCP proxy error: Circuit breaker open, retry after {:?}", retry_after),
+            None,
+        ));
+    }
+    let executed = match prepared {
+        Ok(prepared) => {
+            let inbound_payment = InboundPayment {
+                intake: payment,
+                identity: authenticated_identity,
+                identity_binding: policy_input
+                    .identity_binding
+                    .as_ref(),
+                trace_id: &trace_id,
+                egress_trace_id,
+                source_addr,
+                start_time,
+            };
+            match inbound_payment
+                .charge(state, None)
+                .await
+            {
+                Ok(receipt) => *receipt_out = receipt,
+                Err(response) => return Ok(response),
+            }
+            if let Some(receipt) = receipt_out.as_ref() {
+                receipt.commit().await;
+            }
+            // Use the MCP proxy request handler with full policy support (timeout, retry, circuit breaker, mirroring)
+            let executed = crate::mcp_proxies::handlers::execute_mcp_request(
+                &proxy,
+                prepared,
+                &state.surface,
+                state.policy_manager.as_ref(),
+                &state.client,
+                channel_name,
+                sent_token.as_ref(),
+            )
+            .await;
+            if let Err(error) = &executed
+                && crate::mcp_proxies::handlers::is_circuit_open_error(error)
+            {
+                receipt_out
+                    .iter()
+                    .for_each(|receipt| receipt.revoke());
+            }
+            executed
+        }
+        Err(error) => Err(error),
+    };
+    match executed {
         Ok(mut response_json) => {
             info!(channel = channel_name, proxy_id = proxy_id, "✅ MCP proxy request successful");
 
@@ -15505,6 +15690,7 @@ async fn handle_mcp_proxy_request(
                     &filtered.kept,
                     crate::observability::PolicyDecisionEvent {
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some(method.as_str()),
                         path: Some(uri.path()),
@@ -15526,20 +15712,20 @@ async fn handle_mcp_proxy_request(
                 };
 
                 let policy_key = format!("response:{}", response_policy_id);
-                let input = ResponsePolicyInput {
-                    response: ResponseContext {
+                let input = ResponsePolicyInput::new(
+                    ResponseContext {
                         status_code: 200,
                         body: Some(response_json.clone()),
                         content_type: Some("application/json".to_string()),
                         is_error: false,
                         method: None,
                     },
-                    caller: RpCallerContext {
+                    RpCallerContext {
                         did: None,
                         identity_source: authenticated_identity.map(|id| format!("{:?}", id)),
                         dna_uai: None,
                     },
-                    surface: SurfaceContext {
+                    SurfaceContext {
                         id: state
                             .surface
                             .surface_id
@@ -15553,8 +15739,7 @@ async fn handle_mcp_proxy_request(
                         )
                         .to_lowercase(),
                     },
-                    metadata: None,
-                };
+                );
 
                 let response_policy = pm
                     .resolve_policy_attestation(Some(response_policy_id))
@@ -15576,6 +15761,7 @@ async fn handle_mcp_proxy_request(
                             .content_hash
                             .as_deref(),
                         surface_id: Some(config_id),
+                        surface_name: Some(state.surface.name.as_str()),
                         trace_id: Some(&trace_id),
                         http_method: Some("POST"),
                         path: Some(uri.path()),
@@ -15605,6 +15791,7 @@ async fn handle_mcp_proxy_request(
                         .content_hash
                         .as_deref(),
                     surface_id: Some(config_id),
+                    surface_name: Some(state.surface.name.as_str()),
                     trace_id: Some(&trace_id),
                     http_method: Some("POST"),
                     path: Some(uri.path()),
@@ -15674,9 +15861,6 @@ async fn handle_mcp_proxy_request(
                 "success", // MCP protocol doesn't have A2A extension validation
                 None,
                 None, // identity_hash - MCP channels might not have identity tracking
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15695,7 +15879,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15709,7 +15893,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
@@ -15735,7 +15918,13 @@ async fn handle_mcp_proxy_request(
 
             Ok(axum::response::Json(response_json).into_response())
         }
-        Err(e) => {
+        Err(crate::mcp_proxies::handlers::McpProxyCallError::OutsideTargetBase) => {
+            if let Some(target_auth) = state.surface.target_auth() {
+                record_target_auth_refusal(&audit_facts, None, target_auth);
+            }
+            Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED))
+        }
+        Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(e)) => {
             error!(
                 channel = channel_name,
                 proxy_id = proxy_id,
@@ -15755,9 +15944,6 @@ async fn handle_mcp_proxy_request(
                 "mcp_error", // Custom status to differentiate MCP errors from A2A validation failures
                 Some(format!("MCP Proxy Error: {}", e)),
                 None,
-                state
-                    .active_variant_alias
-                    .as_deref(),
             )
             .await;
 
@@ -15776,7 +15962,7 @@ async fn handle_mcp_proxy_request(
                 let trace = trace_id.clone();
 
                 // Record single metric with total latency
-                tokio::spawn(async move {
+                crate::observability::policy_audit::spawn_in_request(async move {
                     metrics
                         .record_connection(
                             channel_config_id,
@@ -15790,7 +15976,6 @@ async fn handle_mcp_proxy_request(
                             None,
                             None,
                             latency_ms,
-                            None,
                         )
                         .await;
                 });
@@ -15854,6 +16039,49 @@ fn forward_response_log_summary(message_body: &serde_json::Value) -> String {
             .unwrap_or(&serde_json::Value::Null),
         header_names,
         body_bytes
+    )
+}
+
+/// The circuit breaker of the surface's Target, when the surface configures one
+/// and this gateway tracks it.
+async fn target_circuit_breaker(state: &ProxyState) -> Option<Arc<crate::policies::CircuitBreaker>> {
+    state
+        .surface
+        .circuit_breaker()?;
+    state
+        .policy_manager
+        .as_ref()?
+        .get_circuit_breaker(
+            state
+                .surface
+                .surface_id
+                .as_str(),
+        )
+        .await
+}
+
+/// The MCP proxy a `proxy://` Target names.
+async fn load_owned_proxy(
+    state: &ProxyState,
+    proxy_id: &str,
+) -> Result<crate::mcp_proxies::types::McpProxy, Response> {
+    use crate::mcp_proxies::McpProxyStore;
+
+    state
+        .mcp_proxy_store
+        .as_ref()
+        .ok_or_else(|| create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "MCP proxy storage is unavailable"))?
+        .get(proxy_id)
+        .await
+        .map_err(|_| create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load MCP proxy"))?
+        .ok_or_else(|| create_error_response(StatusCode::NOT_FOUND, "MCP proxy was not found"))
+}
+
+/// What a request gets when the Target's circuit breaker is open.
+fn circuit_open_response(retry_after: std::time::Duration) -> Response {
+    create_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!("Service temporarily unavailable. Retry after {:?}", retry_after),
     )
 }
 
@@ -16221,8 +16449,14 @@ fn build_target_request_workload_binding(
             .and_then(|auth| {
                 crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
             }),
-        crate::config::types::CallerContextSource::Did => authenticated_identity
-            .and_then(|id| crate::proxy::workload_binding::capture_from_did(id, &cfg.caller_context_fields).ok()),
+        crate::config::types::CallerContextSource::Did => authenticated_identity.and_then(|id| {
+            crate::proxy::workload_binding::capture_from_did(
+                id,
+                &cfg.caller_context_fields,
+                surface.tenant_id.as_deref(),
+            )
+            .ok()
+        }),
     };
     crate::proxy::workload_binding::maybe_build_workload_binding_subject(
         Some(cfg),
@@ -16267,19 +16501,18 @@ fn build_response_workload_binding(
 }
 
 fn source_auth_user_id(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Option<String> {
-    identity.map(|id| match id {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, .. } => subject.clone(),
-        crate::source_auth::AuthenticatedIdentity::ApiKey { key_name } => key_name.clone(),
-        crate::source_auth::AuthenticatedIdentity::DidAuth { did } => did.clone(),
-        crate::source_auth::AuthenticatedIdentity::Mtls { principal, .. } => principal.clone(),
-    })
+    identity.map(|id| id.principal().to_string())
 }
 
-fn source_auth_user_hash(identity: Option<&crate::source_auth::AuthenticatedIdentity>) -> Option<String> {
-    source_auth_user_id(identity).map(|raw| {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(raw.as_bytes()))
-    })
+/// The caller's identity hash on `surface`: namespaced by how it was
+/// identified and by the surface's tenant, and `None` for a credential that
+/// names no subject. The Fabric receive path uses it for the caller its
+/// surface verified, so both put the same value in a transit token.
+pub(crate) fn source_auth_user_hash(
+    identity: Option<&crate::source_auth::AuthenticatedIdentity>,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Option<String> {
+    identity.and_then(|id| id.principal_hash(surface.tenant_id.as_deref()))
 }
 
 /// Compute caller context fields for the transit token.
@@ -16288,8 +16521,9 @@ fn source_auth_user_hash(identity: Option<&crate::source_auth::AuthenticatedIden
 /// allowlists (only those with `caller_source = transit_token` and `enabled = true`),
 /// then populates from the authenticated identity's JWT claims (only `JwtBearer`
 /// carries claims today). The TP side re-filters per its own allowlist via
-/// `select_allowlisted`, so a superset in the token is safe.
-fn compute_transit_token_caller_context(
+/// `select_allowlisted`, so a superset in the token is safe. The Fabric receive
+/// path calls it with the caller its own surface verified.
+pub(crate) fn compute_transit_token_caller_context(
     surface: &crate::config::agent_surface::AgentSurface,
     authenticated_identity: Option<&crate::source_auth::AuthenticatedIdentity>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -16325,6 +16559,14 @@ fn compute_transit_token_caller_context(
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod target_auth_audit_tests;
+#[cfg(test)]
+pub(crate) mod variant_routing_tests;
+
+#[cfg(test)]
+mod target_grant_tests;
 
 #[cfg(test)]
 mod forward_response_log_tests {
@@ -16418,14 +16660,1176 @@ mod caller_assertion_tests {
 }
 
 #[cfg(test)]
+pub(crate) mod target_auth_tests {
+    use super::{CallerAssertion, TargetAuthContext, TargetAuthError, inject_target_auth_header};
+    use crate::config::TargetAuthConfig;
+    use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+    use crate::delegation_vault::service_token::ServiceTokenError;
+    use crate::delegation_vault::storage::{DelegationVaultStorage, FileSystemDelegationVaultStore};
+    use crate::secrets::SecretsStore;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+
+    pub(crate) struct Fixture {
+        surface: crate::config::agent_surface::AgentSurface,
+        pub(crate) secrets: Arc<dyn SecretsStore>,
+        pub(crate) providers: Arc<FileSystemCredentialProviderStore>,
+        pub(crate) vault: Arc<FileSystemDelegationVaultStore>,
+        pub(crate) egress: crate::delegation_vault::oauth::TokenEgress,
+        token_requests: Arc<AtomicUsize>,
+        token_status: Arc<AtomicU16>,
+        _server: tokio::task::JoinSet<()>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        pub(crate) async fn new(token_status: u16) -> Self {
+            let token_requests = Arc::new(AtomicUsize::new(0));
+            let counter = token_requests.clone();
+            let token_status = Arc::new(AtomicU16::new(token_status));
+            let status = token_status.clone();
+            let app = axum::Router::new().fallback(axum::routing::post(move || {
+                let counter = counter.clone();
+                let status = status.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::from_u16(status.load(Ordering::SeqCst)).unwrap(),
+                        axum::Json(
+                            json!({"access_token": "provider-token", "token_type": "Bearer", "expires_in": 3600}),
+                        ),
+                    )
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let mut server = tokio::task::JoinSet::new();
+            server.spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let secrets: Arc<dyn SecretsStore> = Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            for (secret_id, value, tenant) in [
+                ("CLIENT_ID", "client", None),
+                ("CLIENT_SECRET", "secret", None),
+                ("WIDE_KEY", "wide-value", None),
+                ("OWN_KEY", "own-value", Some("tenant-a")),
+                ("OTHER_KEY", "other-value", Some("tenant-b")),
+            ] {
+                secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: tenant.map(String::from),
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let providers = Arc::new(
+                FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            );
+            for (id, provider_type, tenant) in [
+                ("machine", "oauth2_client_credentials", Value::Null),
+                ("consent", "oauth2_authorization_code", Value::Null),
+                ("other-tenant", "oauth2_client_credentials", json!("tenant-b")),
+                ("own", "oauth2_client_credentials", json!("tenant-a")),
+            ] {
+                providers
+                    .create(
+                        serde_json::from_value(json!({
+                            "id": id, "name": id, "provider_id": id, "provider_type": provider_type, "tenant_id": tenant,
+                            "token_endpoint": token_endpoint, "client_id_secret_ref": "CLIENT_ID",
+                            "client_secret_secret_ref": "CLIENT_SECRET", "default_scopes": ["read"],
+                            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Self {
+                surface: serde_json::from_value(json!({
+                    "surface_id": "surface-1", "name": "Surface", "tenant_id": "tenant-a",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                    "target": {"endpoint": "https://agent.example/a2a"}
+                }))
+                .unwrap(),
+                secrets,
+                providers,
+                vault: Arc::new(
+                    FileSystemDelegationVaultStore::new(directory.path().join("vault"))
+                        .await
+                        .unwrap(),
+                ),
+                egress: crate::delegation_vault::oauth::TokenEgress {
+                    timeout: std::time::Duration::from_secs(5),
+                    exact_allowlist: Some(token_endpoint),
+                    policy: Default::default(),
+                },
+                token_requests,
+                token_status,
+                _server: server,
+                _directory: directory,
+            }
+        }
+
+        fn context(&self) -> TargetAuthContext<'_> {
+            TargetAuthContext {
+                secrets: Some(&self.secrets),
+                providers: Some(&*self.providers),
+                vault: Some(&*self.vault),
+                egress: Some(&self.egress),
+                surface: &self.surface,
+                isolation: crate::config::credential_policy::RuleMode::Warn,
+                endpoint: &self.surface.target.endpoint,
+                checks_callers: true,
+                transit_point: None,
+                target_https: crate::config::credential_policy::RuleMode::Warn,
+                target_source_auth: crate::config::credential_policy::RuleMode::Warn,
+            }
+        }
+
+        pub(crate) fn secrets_path(&self) -> std::path::PathBuf {
+            self._directory
+                .path()
+                .join("secrets")
+        }
+
+        pub(crate) fn requests(&self) -> usize {
+            self.token_requests
+                .load(Ordering::SeqCst)
+        }
+
+        /// Dates the one cached token back past the minimum age for dropping a refused token.
+        pub(crate) async fn age_the_cached_token(&self) {
+            let mut row = self
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .remove(0);
+            row.consent_granted_at -=
+                chrono::Duration::seconds(crate::delegation_vault::service_token::MIN_INVALIDATION_AGE_SECS);
+            assert!(
+                self.vault
+                    .delete(&row.id)
+                    .await
+                    .unwrap()
+            );
+            self.vault
+                .store(row)
+                .await
+                .unwrap();
+        }
+    }
+
+    pub(crate) fn provider_auth(provider_id: &str) -> TargetAuthConfig {
+        serde_json::from_value(json!({"method": {"credential_provider": {"provider_id": provider_id}}})).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_token_is_injected_and_cached_for_the_surface() {
+        let fixture = Fixture::new(200).await;
+        for _ in 0..2 {
+            let header = inject_target_auth_header(
+                &provider_auth("machine"),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        }
+        assert_eq!(fixture.requests(), 1);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].agent_did, "surface:surface-1");
+        assert!(
+            stored[0]
+                .user_identity_hash
+                .starts_with("__target_auth__:")
+        );
+        assert_eq!(stored[0].credential_provider_id, "machine");
+        assert_eq!(stored[0].scopes, vec!["read"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cached_provider_token_is_still_injected_when_its_renewal_fails() {
+        let fixture = Fixture::new(200).await;
+        let auth = provider_auth("machine");
+        let context = fixture.context();
+        let inject = || inject_target_auth_header(&auth, &context, "surface", CallerAssertion::GatewayOriginated);
+        inject().await.unwrap();
+        let mut stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .remove(0);
+        let now = chrono::Utc::now();
+        stored.created_at = now - chrono::Duration::seconds(3400);
+        stored.expires_at = Some(now + chrono::Duration::seconds(200));
+        fixture
+            .vault
+            .delete(&stored.id)
+            .await
+            .unwrap();
+        fixture
+            .vault
+            .store(stored)
+            .await
+            .unwrap();
+        fixture
+            .token_status
+            .store(500, Ordering::SeqCst);
+        let header = inject().await.unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 2, "the renewal was attempted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_custom_header_and_scopes_shape_the_injected_credential() {
+        let fixture = Fixture::new(200).await;
+        let auth: TargetAuthConfig = serde_json::from_value(json!({"method": {"credential_provider": {
+            "provider_id": "machine", "header_name": "x-agent-token", "header_format": "Token {value}", "scopes": ["write", "read", "write"]
+        }}}))
+        .unwrap();
+        let header = inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+            .await
+            .unwrap();
+        assert_eq!(header, Some(("x-agent-token".to_string(), "Token provider-token".to_string())));
+        assert_eq!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()[0]
+                .scopes,
+            vec!["read", "write"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokens_for_different_scopes_of_one_provider_are_cached_side_by_side() {
+        let fixture = Fixture::new(200).await;
+        let scoped = |scope: &str| -> TargetAuthConfig {
+            serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "scopes": [scope]
+            }}}))
+            .unwrap()
+        };
+        for _ in 0..2 {
+            for scope in ["read", "write"] {
+                inject_target_auth_header(
+                    &scoped(scope),
+                    &fixture.context(),
+                    "surface",
+                    CallerAssertion::Authenticated,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert_eq!(fixture.requests(), 2, "the token endpoint received one request per scope set");
+        let mut stored: Vec<Vec<String>> = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.scopes)
+            .collect();
+        stored.sort();
+        assert_eq!(stored, vec![vec!["read".to_string()], vec!["write".to_string()]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unauthenticated_caller_never_spends_a_provider_token() {
+        let fixture = Fixture::new(200).await;
+        let header = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::Unauthenticated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, None);
+        assert_eq!(fixture.requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_provider_is_a_typed_error() {
+        let fixture = Fixture::new(200).await;
+        for (provider_id, expected) in [
+            ("consent", TargetAuthError::ProviderNeedsConsent),
+            ("other-tenant", TargetAuthError::ProviderNotFound),
+            ("missing", TargetAuthError::ProviderNotFound),
+        ] {
+            let error = inject_target_auth_header(
+                &provider_auth(provider_id),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, expected, "{provider_id}");
+        }
+        let mut without_vault = fixture.context();
+        without_vault.vault = None;
+        assert_eq!(
+            inject_target_auth_header(
+                &provider_auth("machine"),
+                &without_vault,
+                "surface",
+                CallerAssertion::GatewayOriginated
+            )
+            .await
+            .unwrap_err(),
+            TargetAuthError::StoreUnavailable
+        );
+        assert_eq!(fixture.requests(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_token_request_fails_without_detail_and_holds_back_the_next() {
+        let fixture = Fixture::new(401).await;
+        for _ in 0..2 {
+            let error = inject_target_auth_header(
+                &provider_auth("machine"),
+                &fixture.context(),
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed));
+            assert_eq!(error.to_string(), "credential provider token request failed");
+        }
+        assert_eq!(fixture.requests(), 1);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_provider_token_sent_as_an_authorization_bearer_can_be_dropped() {
+        let fixture = Fixture::new(200).await;
+        for (header_name, header_format, droppable) in [
+            ("Authorization", "Bearer {value}", true),
+            ("authorization", "bearer {value}", true),
+            ("X-Api-Key", "Bearer {value}", false),
+            ("Authorization", "Token {value}", false),
+            ("Authorization", "{value}", false),
+        ] {
+            let auth: TargetAuthConfig = serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "header_name": header_name, "header_format": header_format
+            }}}))
+            .unwrap();
+            let credential =
+                super::resolve_target_credential(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(credential.issued.is_some(), droppable, "{header_name}: {header_format}");
+        }
+    }
+
+    fn secret_auth(secret_id: &str) -> TargetAuthConfig {
+        serde_json::from_value(json!({"method": {"static_secret": {"secret_id": secret_id, "header_name": "x-key"}}}))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_the_target_refuses_as_invalid_is_dropped_and_the_next_request_gets_a_new_one() {
+        use super::{forget_refused_target_token, resolve_target_credential};
+        let fixture = Fixture::new(200).await;
+        let vault: Option<&dyn DelegationVaultStorage> = Some(&*fixture.vault);
+        let answer = |challenge: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(axum::http::header::WWW_AUTHENTICATE, challenge.parse().unwrap());
+            headers
+        };
+        let resolve = |auth: TargetAuthConfig| {
+            let context = fixture.context();
+            async move {
+                resolve_target_credential(&auth, &context, "surface", CallerAssertion::Authenticated)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+
+        let credential = resolve(provider_auth("machine")).await;
+        forget_refused_target_token(
+            vault,
+            credential.issued.as_ref(),
+            "surface-1",
+            401,
+            &answer(r#"Bearer error="invalid_token""#),
+        )
+        .await;
+        assert_eq!(
+            resolve(provider_auth("machine"))
+                .await
+                .header
+                .1,
+            "Bearer provider-token"
+        );
+        assert_eq!(fixture.requests(), 1, "a token issued less than 30 seconds ago is kept");
+
+        fixture
+            .age_the_cached_token()
+            .await;
+        for (status, challenge) in [
+            (401, r#"Bearer realm="api""#),
+            (401, r#"Basic realm="api", error="invalid_token""#),
+            (403, r#"Bearer error="invalid_token""#),
+            (200, r#"Bearer error="invalid_token""#),
+        ] {
+            let credential = resolve(provider_auth("machine")).await;
+            forget_refused_target_token(vault, credential.issued.as_ref(), "surface-1", status, &answer(challenge))
+                .await;
+            resolve(provider_auth("machine")).await;
+            assert_eq!(fixture.requests(), 1, "{status} {challenge}: only a 401 invalid_token drops the token");
+        }
+
+        let credential = resolve(provider_auth("machine")).await;
+        forget_refused_target_token(
+            vault,
+            credential.issued.as_ref(),
+            "surface-1",
+            401,
+            &answer(r#"Bearer error="invalid_token""#),
+        )
+        .await;
+        assert_eq!(fixture.requests(), 1, "the refused request is not retried");
+        let renewed = resolve(provider_auth("machine")).await;
+        assert_eq!(fixture.requests(), 2, "the next request asks for a new token");
+        assert_eq!(renewed.header, ("Authorization".to_string(), "Bearer provider-token".to_string()));
+
+        fixture
+            .age_the_cached_token()
+            .await;
+        let secret = resolve(secret_auth("WIDE_KEY")).await;
+        assert!(secret.issued.is_none(), "a static secret has no issued token to drop");
+        forget_refused_target_token(
+            vault,
+            secret.issued.as_ref(),
+            "surface-1",
+            401,
+            &answer("Bearer error=invalid_token"),
+        )
+        .await;
+        assert_eq!(
+            resolve(provider_auth("machine"))
+                .await
+                .header
+                .1,
+            "Bearer provider-token"
+        );
+        assert_eq!(fixture.requests(), 2, "the cached provider token is untouched");
+    }
+
+    pub(crate) type BackendAnswer = Arc<std::sync::Mutex<(u16, Option<&'static str>)>>;
+
+    /// A backend whose base URL is returned, answering every request with `body` and the status
+    /// and `WWW-Authenticate` challenge `answer` holds at the time.
+    pub(crate) async fn backend_answering(
+        answer: BackendAnswer,
+        body: Value,
+    ) -> (String, tokio::task::JoinSet<()>) {
+        let backend = axum::Router::new().fallback(move || {
+            let (status, challenge) = *answer.lock().unwrap();
+            let body = body.clone();
+            async move {
+                let mut response = axum::response::IntoResponse::into_response((
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(body),
+                ));
+                if let Some(challenge) = challenge {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::WWW_AUTHENTICATE, challenge.parse().unwrap());
+                }
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let mut server = tokio::task::JoinSet::new();
+        server.spawn(async move {
+            axum::serve(listener, backend)
+                .await
+                .unwrap();
+        });
+        (base_url, server)
+    }
+
+    /// An MCP proxy with one `echo` tool, whose backend answers every call with the status and
+    /// `WWW-Authenticate` challenge `answer` holds at the time.
+    pub(crate) async fn mcp_proxy_answering(
+        answer: BackendAnswer
+    ) -> (crate::mcp_proxies::types::McpProxy, crate::config::agent_surface::AgentSurface, tokio::task::JoinSet<()>)
+    {
+        let (base_url, server) = backend_answering(answer, json!({"error": "refused"})).await;
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Refusing".into(),
+            String::new(),
+            base_url,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/echo": {"get": {"operationId": "echo", "responses": {"200": {"description": "OK"}}}}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/refusing".into(),
+        );
+        let surface = serde_json::from_value(json!({
+            "surface_id": "surface-1", "name": "Surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        (proxy, surface, server)
+    }
+
+    /// An MCP `tools/call` of the `echo` tool as a legacy or a `2026-07-28` client sends it:
+    /// its headers and its body.
+    pub(crate) fn echo_tool_call(modern: bool) -> (Vec<(&'static str, &'static str)>, Value) {
+        if !modern {
+            return (
+                vec![("content-type", "application/json")],
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "arguments": {}}}),
+            );
+        }
+        (
+            vec![
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION),
+                ("mcp-method", "tools/call"),
+                ("mcp-name", "echo"),
+            ],
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "arguments": {}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}}),
+        )
+    }
+
+    /// Calls the `echo` tool with `call` while `answer` sets the backend's answer, and checks
+    /// that only a 401 `invalid_token` refusal of a token at least 30 seconds old drops the
+    /// token, that the caller gets the backend's answer, and that the next call asks the
+    /// provider for a new token. `call` returns the tool result the caller is answered with.
+    pub(crate) async fn assert_a_refused_token_is_dropped<F, Fut>(
+        fixture: &Fixture,
+        answer: &BackendAnswer,
+        leg: &str,
+        call: F,
+    ) where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Value>,
+    {
+        const INVALID_TOKEN: &str = r#"Bearer error="invalid_token""#;
+        let answered = |status: u16, challenge: Option<&'static str>| {
+            *answer.lock().unwrap() = (status, challenge);
+            call()
+        };
+
+        let result = answered(401, Some(INVALID_TOKEN)).await;
+        assert_eq!(result["isError"], true, "{leg}: {result}");
+        assert_eq!(fixture.requests(), 1, "{leg}");
+        answered(200, None).await;
+        assert_eq!(fixture.requests(), 1, "{leg}: a token issued less than 30 seconds ago is kept");
+
+        fixture
+            .age_the_cached_token()
+            .await;
+        for (status, challenge) in [(403, Some(INVALID_TOKEN)), (401, Some(r#"Bearer realm="api""#)), (401, None)] {
+            let result = answered(status, challenge).await;
+            assert_eq!(result["isError"], true, "{leg}: {status} {challenge:?}: {result}");
+        }
+        answered(200, None).await;
+        assert_eq!(fixture.requests(), 1, "{leg}: only a 401 invalid_token drops the token");
+
+        let result = answered(401, Some(INVALID_TOKEN)).await;
+        assert_eq!(result["isError"], true, "{leg}: the caller gets the backend's answer: {result}");
+        assert_eq!(fixture.requests(), 1, "{leg}: the refused call is not retried");
+        let result = answered(200, None).await;
+        assert_eq!(result["isError"], false, "{leg}: {result}");
+        assert_eq!(fixture.requests(), 2, "{leg}: the next call asks the provider for a new token");
+    }
+
+    /// The Access Point of `surface`, serving `proxy` from an MCP proxy store of its own and
+    /// sending the Target credential from `fixture`'s client credentials provider. Returns the
+    /// directory holding the store, which the caller keeps alive.
+    async fn mcp_proxy_access_point(
+        fixture: &Fixture,
+        proxy: &crate::mcp_proxies::types::McpProxy,
+        mut surface: crate::config::agent_surface::AgentSurface,
+    ) -> (crate::state::MultiSurfaceProxyState, tempfile::TempDir) {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        surface.target.auth = Some(provider_auth("machine"));
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        store
+            .create(proxy)
+            .await
+            .unwrap();
+        let mut router = super::variant_routing_tests::router(surface);
+        router.mcp_proxy_store = Some(store);
+        router.secrets_store = Some(fixture.secrets.clone());
+        router.credential_provider_store = Some(fixture.providers.clone());
+        router.delegation_vault_store = Some(fixture.vault.clone());
+        (router, directory)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_proxy_tool_call_drops_a_token_its_backend_refuses_as_invalid() {
+        for modern in [false, true] {
+            let fixture = Fixture::new(200).await;
+            let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+            let (proxy, surface, _backend) = mcp_proxy_answering(answer.clone()).await;
+            let (router, _store) = mcp_proxy_access_point(&fixture, &proxy, surface).await;
+            let call = || {
+                let (headers, body) = echo_tool_call(modern);
+                let mut request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp");
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                let request = request
+                    .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap();
+                let handled = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    router.clone(),
+                    request,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    None,
+                ));
+                let egress = fixture.egress.clone();
+                async move {
+                    let response = egress.scope(handled).await;
+                    assert_eq!(response.status(), axum::http::StatusCode::OK, "modern: {modern}");
+                    let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                        .await
+                        .unwrap();
+                    let answered: Value = serde_json::from_slice(&bytes)
+                        .unwrap_or_else(|_| panic!("modern: {modern}: {}", String::from_utf8_lossy(&bytes)));
+                    answered["result"].clone()
+                }
+            };
+            assert_a_refused_token_is_dropped(&fixture, &answer, &format!("direct, modern: {modern}"), call).await;
+        }
+    }
+
+    mod target_credential_rules {
+        use super::*;
+        use crate::config::credential_policy::RuleMode;
+        use crate::config::target_auth_rules::TargetCredentialRule;
+
+        const HTTP_TARGET: &str = "http://agent.example/a2a";
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_credential_to_a_target_that_is_not_https_is_attached_in_warn_and_withheld_in_enforce() {
+            let fixture = Fixture::new(200).await;
+            for endpoint in [HTTP_TARGET, "fabric://gateway-2/surface", "proxy://mcp-1"] {
+                let mut context = fixture.context();
+                context.endpoint = endpoint;
+                for auth in [secret_auth("WIDE_KEY"), provider_auth("machine")] {
+                    let header = inject_target_auth_header(&auth, &context, "surface", CallerAssertion::Authenticated)
+                        .await
+                        .unwrap();
+                    assert!(header.is_some(), "{endpoint}: warn attaches the credential");
+                }
+                context.target_https = RuleMode::Enforce;
+                let requests = fixture.requests();
+                for auth in [secret_auth("WIDE_KEY"), provider_auth("machine")] {
+                    for caller in [CallerAssertion::Authenticated, CallerAssertion::GatewayOriginated] {
+                        let error = inject_target_auth_header(&auth, &context, "surface", caller)
+                            .await
+                            .unwrap_err();
+                        assert_eq!(error, TargetAuthError::Withheld(TargetCredentialRule::Https), "{endpoint}");
+                    }
+                }
+                assert_eq!(fixture.requests(), requests, "{endpoint}: a withheld credential requests no token");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_credential_to_an_https_target_is_attached_when_target_https_is_enforced() {
+            let fixture = Fixture::new(200).await;
+            let mut context = fixture.context();
+            context.target_https = RuleMode::Enforce;
+            context.target_source_auth = RuleMode::Enforce;
+            let header = inject_target_auth_header(
+                &secret_auth("WIDE_KEY"),
+                &context,
+                "surface",
+                CallerAssertion::Authenticated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, Some(("x-key".to_string(), "wide-value".to_string())));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_caller_credential_for_a_leg_that_checks_no_caller_is_attached_in_warn_and_withheld_in_enforce() {
+            let fixture = Fixture::new(200).await;
+            let mut context = fixture.context();
+            context.checks_callers = false;
+            let header = inject_target_auth_header(
+                &secret_auth("WIDE_KEY"),
+                &context,
+                "surface",
+                CallerAssertion::Authenticated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, Some(("x-key".to_string(), "wide-value".to_string())));
+
+            context.target_source_auth = RuleMode::Enforce;
+            for auth in [secret_auth("WIDE_KEY"), provider_auth("machine")] {
+                let error = inject_target_auth_header(&auth, &context, "surface", CallerAssertion::Authenticated)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error, TargetAuthError::Withheld(TargetCredentialRule::SourceAuth));
+            }
+            assert_eq!(fixture.requests(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_gateways_own_card_fetch_keeps_the_credential_when_no_caller_is_checked() {
+            let fixture = Fixture::new(200).await;
+            let mut context = fixture.context();
+            context.checks_callers = false;
+            context.target_source_auth = RuleMode::Enforce;
+            let header = inject_target_auth_header(
+                &provider_auth("machine"),
+                &context,
+                "surface",
+                CallerAssertion::GatewayOriginated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unauthenticated_caller_gets_no_credential_whatever_the_rules() {
+            let fixture = Fixture::new(200).await;
+            let mut context = fixture.context();
+            context.endpoint = HTTP_TARGET;
+            context.checks_callers = false;
+            context.target_https = RuleMode::Enforce;
+            context.target_source_auth = RuleMode::Enforce;
+            let header = inject_target_auth_header(
+                &secret_auth("WIDE_KEY"),
+                &context,
+                "surface",
+                CallerAssertion::Unauthenticated,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, None);
+        }
+
+        #[test]
+        fn a_transit_point_leg_uses_its_own_endpoint_and_caller_check() {
+            let api_key = json!({"type": "api_key", "secret_id": "caller-key",
+                "extraction": {"source": "http_header", "field": "X-Caller"}});
+            let jwt = json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []});
+            for methods in [json!([api_key]), json!([api_key, jwt])] {
+                let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                    "surface_id": "s", "name": "s",
+                    "access_point": {"listen_address": "127.0.0.1:8080", "route": "/s", "protocol": "a2a",
+                        "caller_authentication": {"methods": methods}},
+                    "target": {"endpoint": "https://agent.example/a2a"}
+                }))
+                .unwrap();
+                let context = TargetAuthContext::of_surface(&surface, None, None, None);
+                assert_eq!(context.endpoint, "https://agent.example/a2a");
+                assert!(context.checks_callers, "{methods}");
+
+                let open: crate::config::agent_surface::TransitPoint = serde_json::from_value(json!({
+                    "alias": "tp", "target_endpoint": "http://tp.example/",
+                    "require_transit_token": false, "allow_unauthenticated_callers": true
+                }))
+                .unwrap();
+                let leg = TargetAuthContext::of_surface(&surface, None, None, None).for_transit_point(&open);
+                assert_eq!(leg.endpoint, "http://tp.example/");
+                assert!(
+                    !leg.checks_callers,
+                    "the Access Point's caller check does not cover a Transit Point: {methods}"
+                );
+
+                let guarded: crate::config::agent_surface::TransitPoint =
+                    serde_json::from_value(json!({"alias": "tp", "target_endpoint": "https://tp.example/"})).unwrap();
+                assert!(
+                    TargetAuthContext::of_surface(&surface, None, None, None)
+                        .for_transit_point(&guarded)
+                        .checks_callers,
+                    "{methods}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_mcp_proxy_target_is_held_to_target_https_by_its_proxy_base_url() {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "s", "name": "s",
+                "access_point": {"listen_address": "127.0.0.1:8080", "route": "/s", "protocol": "mcp",
+                    "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "caller-key",
+                        "extraction": {"source": "http_header", "field": "X-Caller"}}]}},
+                "target": {"endpoint": "proxy://weather"}
+            }))
+            .unwrap();
+            let withheld = |base_url: Option<&str>| {
+                let mut context = TargetAuthContext::of_surface(&surface, None, None, None).for_mcp_proxy(base_url);
+                context.target_https = crate::config::credential_policy::RuleMode::Enforce;
+                context.withholding_rule(CallerAssertion::Authenticated)
+            };
+            assert_eq!(withheld(Some("https://rest.example.com/api")), None);
+            assert_eq!(withheld(Some("http://rest.example.com/api")), Some(TargetCredentialRule::Https));
+            assert_eq!(withheld(None), Some(TargetCredentialRule::Https), "an MCP proxy that could not be loaded");
+        }
+
+        #[test]
+        fn a_rule_in_warn_is_logged_once_per_leg() {
+            let surface_id = format!("warn-once-{}", uuid::Uuid::new_v4());
+            let once = super::super::warn_target_rule_once;
+            assert!(once(&surface_id, None, TargetCredentialRule::Https));
+            assert!(!once(&surface_id, None, TargetCredentialRule::Https));
+            assert!(once(&surface_id, None, TargetCredentialRule::SourceAuth));
+            assert!(once(&format!("{surface_id}-2"), None, TargetCredentialRule::Https));
+            assert!(once(&surface_id, Some("partner"), TargetCredentialRule::Https), "a Transit Point is its own leg");
+            assert!(!once(&surface_id, Some("partner"), TargetCredentialRule::Https));
+            assert!(once(&surface_id, Some("supplier"), TargetCredentialRule::Https));
+        }
+
+        #[test]
+        fn a_rule_in_warn_is_logged_once_per_surface_variant() {
+            let surface_id = format!("warn-variant-{}", uuid::Uuid::new_v4());
+            let once = super::super::warn_target_rule_once;
+            let rule = TargetCredentialRule::Https;
+            let under = |variant: &str, transit_point: Option<&str>| {
+                crate::observability::policy_audit::with_request_variant(variant, || {
+                    once(&surface_id, transit_point, rule)
+                })
+            };
+            assert!(under("blue", None));
+            assert!(!under("blue", None));
+            assert!(under("green", None), "a variant is its own leg");
+            assert!(once(&surface_id, None, rule), "the base surface is its own leg");
+            assert!(!once(&surface_id, None, rule));
+            assert!(under("blue", Some("partner")));
+            assert!(!under("blue", Some("partner")));
+            assert!(under("green", Some("partner")));
+        }
+
+        #[test]
+        fn a_rule_in_warn_is_not_logged_when_another_rule_withholds_the_credential() {
+            let mode = |rule: TargetCredentialRule| match rule {
+                TargetCredentialRule::Https => RuleMode::Enforce,
+                TargetCredentialRule::SourceAuth => RuleMode::Warn,
+            };
+            let reversed = |rule: TargetCredentialRule| match rule {
+                TargetCredentialRule::Https => RuleMode::Warn,
+                TargetCredentialRule::SourceAuth => RuleMode::Enforce,
+            };
+            let once = super::super::warn_target_rule_once;
+            for transit_point in [None, Some("partner")] {
+                let surface_id = format!("withheld-{}", uuid::Uuid::new_v4());
+                let broken = || vec![TargetCredentialRule::Https, TargetCredentialRule::SourceAuth];
+                assert_eq!(
+                    super::super::withholding_rule(&surface_id, transit_point, broken(), mode),
+                    Some(TargetCredentialRule::Https)
+                );
+                assert!(
+                    once(&surface_id, transit_point, TargetCredentialRule::SourceAuth),
+                    "the warned rule was not logged, so its once-per-leg bit is unspent"
+                );
+
+                let surface_id = format!("withheld-{}", uuid::Uuid::new_v4());
+                assert_eq!(
+                    super::super::withholding_rule(&surface_id, transit_point, broken(), reversed),
+                    Some(TargetCredentialRule::SourceAuth)
+                );
+                assert!(once(&surface_id, transit_point, TargetCredentialRule::Https));
+            }
+        }
+
+        #[test]
+        fn every_rule_in_warn_is_logged_when_the_credential_is_sent() {
+            let surface_id = format!("sent-{}", uuid::Uuid::new_v4());
+            let withheld = super::super::withholding_rule(
+                &surface_id,
+                None,
+                vec![TargetCredentialRule::Https, TargetCredentialRule::SourceAuth],
+                |_| RuleMode::Warn,
+            );
+            assert_eq!(withheld, None);
+            let once = super::super::warn_target_rule_once;
+            assert!(!once(&surface_id, None, TargetCredentialRule::Https));
+            assert!(!once(&surface_id, None, TargetCredentialRule::SourceAuth));
+        }
+
+        #[tokio::test]
+        async fn an_a2a_proxy_backend_credential_follows_target_source_auth() {
+            use crate::config::credential_policy::{CredentialPolicyConfig, TEST_CREDENTIAL_POLICY};
+            let unchecked: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "proxy-surface", "name": "proxy-surface",
+                "access_point": {"listen_address": "127.0.0.1:8080", "route": "/p", "protocol": "a2a"},
+                "target": {"endpoint": "a2a-proxy://proxy-1"}
+            }))
+            .unwrap();
+            let mut checked = unchecked.clone();
+            checked
+                .access_point
+                .caller_authentication = Some(
+                serde_json::from_value(json!({"methods": [{"type": "api_key", "secret_id": "caller-key",
+                    "extraction": {"source": "http_header", "field": "X-Caller"}}]}))
+                .unwrap(),
+            );
+            let caller_under = |mode: RuleMode, surface: crate::config::agent_surface::AgentSurface| {
+                let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+                    target_https: RuleMode::Enforce,
+                    target_source_auth: mode,
+                    ..CredentialPolicyConfig::default()
+                }));
+                TEST_CREDENTIAL_POLICY.scope(policy, async move {
+                    [CallerAssertion::Authenticated, CallerAssertion::Unauthenticated]
+                        .map(|caller| super::super::a2a_proxy_target_caller(&surface, caller))
+                })
+            };
+            let with_methods = |methods: serde_json::Value| {
+                let mut surface = unchecked.clone();
+                surface
+                    .access_point
+                    .caller_authentication = Some(serde_json::from_value(json!({"methods": methods})).unwrap());
+                surface
+            };
+            let two_methods = with_methods(json!([
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+                {"type": "api_key", "secret_id": "caller-key",
+                 "extraction": {"source": "http_header", "field": "X-Caller"}}
+            ]));
+            let no_methods = with_methods(json!([]));
+            use CallerAssertion::{Authenticated, Unauthenticated};
+            assert_eq!(caller_under(RuleMode::Warn, unchecked.clone()).await, [Authenticated, Unauthenticated]);
+            assert_eq!(caller_under(RuleMode::Enforce, unchecked).await, [Unauthenticated, Unauthenticated]);
+            assert_eq!(caller_under(RuleMode::Enforce, checked).await, [Authenticated, Unauthenticated]);
+            assert_eq!(caller_under(RuleMode::Enforce, two_methods).await, [Authenticated, Unauthenticated]);
+            assert_eq!(caller_under(RuleMode::Warn, no_methods.clone()).await, [Authenticated, Unauthenticated]);
+            assert_eq!(caller_under(RuleMode::Enforce, no_methods).await, [Unauthenticated, Unauthenticated]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_provider_is_refused_on_a_tenant_surface_only_when_enforced() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &enforced,
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ProviderNotFound);
+        assert_eq!(fixture.requests(), 0);
+
+        let header =
+            inject_target_auth_header(&provider_auth("own"), &enforced, "surface", CallerAssertion::GatewayOriginated)
+                .await
+                .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+        assert_eq!(fixture.requests(), 1);
+
+        let header = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, Some(("Authorization".to_string(), "Bearer provider-token".to_string())));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_static_secret_must_belong_to_the_surface_tenant() {
+        let fixture = Fixture::new(200).await;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        for (case, (context, secret_id, expected)) in [
+            (&enforced, "OWN_KEY", Ok(Some(("x-key".to_string(), "own-value".to_string())))),
+            (&enforced, "WIDE_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&enforced, "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+            (&fixture.context(), "WIDE_KEY", Ok(Some(("x-key".to_string(), "wide-value".to_string())))),
+            (&fixture.context(), "OTHER_KEY", Err(TargetAuthError::SecretNotFound)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result =
+                inject_target_auth_header(&secret_auth(secret_id), context, "surface", CallerAssertion::Authenticated)
+                    .await;
+            assert_eq!(result, expected, "case {case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_appliance_wide_surface_may_use_an_appliance_wide_secret() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.surface.tenant_id = None;
+        let mut enforced = fixture.context();
+        enforced.isolation = crate::config::credential_policy::RuleMode::Enforce;
+        let result =
+            inject_target_auth_header(&secret_auth("WIDE_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Ok(Some(("x-key".to_string(), "wide-value".to_string()))));
+        let result =
+            inject_target_auth_header(&secret_auth("OWN_KEY"), &enforced, "surface", CallerAssertion::Authenticated)
+                .await;
+        assert_eq!(result, Err(TargetAuthError::SecretNotFound));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_endpoint_the_egress_policy_blocks_is_refused_without_a_request() {
+        let mut fixture = Fixture::new(200).await;
+        fixture.egress.exact_allowlist = None;
+        let error = inject_target_auth_header(
+            &provider_auth("machine"),
+            &fixture.context(),
+            "surface",
+            CallerAssertion::GatewayOriginated,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused));
+        assert_eq!(fixture.requests(), 0);
+        assert!(
+            fixture
+                .vault
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_whose_header_breaks_a_header_rule_is_never_resolved() {
+        let fixture = Fixture::new(200).await;
+        for (header_name, header_format) in [
+            ("X-Transit-Token", "{value}"),
+            ("x_transit_token", "{value}"),
+            ("Host", "{value}"),
+            ("X Api", "{value}"),
+            ("", "{value}"),
+            ("x-key", "Bearer {value}\r\nX-Other: 1"),
+            ("x-key", "{value}\0"),
+            ("x-key", "Bearer"),
+            ("x-key", "{value}{value}"),
+        ] {
+            let secret: TargetAuthConfig = serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": "OWN_KEY", "header_name": header_name, "header_format": header_format
+            }}}))
+            .unwrap();
+            let provider: TargetAuthConfig = serde_json::from_value(json!({"method": {"credential_provider": {
+                "provider_id": "machine", "header_name": header_name, "header_format": header_format
+            }}}))
+            .unwrap();
+            for auth in [secret, provider] {
+                let result =
+                    inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+                        .await;
+                assert_eq!(result, Err(TargetAuthError::InvalidHeader), "{header_name:?} {header_format:?}");
+            }
+        }
+        assert_eq!(fixture.requests(), 0, "no token is requested for a header the gateway will not send");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_static_secret_is_a_typed_error_that_does_not_name_it() {
+        let fixture = Fixture::new(200).await;
+        let auth: TargetAuthConfig = serde_json::from_value(json!({"method": {"static_secret": {
+            "secret_id": "secret-name-marker", "header_name": "x-key"
+        }}}))
+        .unwrap();
+        let error = inject_target_auth_header(&auth, &fixture.context(), "surface", CallerAssertion::Authenticated)
+            .await
+            .unwrap_err();
+        assert_eq!(error, TargetAuthError::SecretNotFound);
+        assert!(
+            !error
+                .to_string()
+                .contains("secret-name-marker")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, agent_card_fabric_forward_path,
-        agent_card_response, ap2_experimental_enabled_from_flags, decode_bearer_jwt_claims,
-        delegates_credentials_over_fabric, evaluate_ap2_inbound_decision, fabric_mcp_gate_input,
-        is_forwarded_on_credentialed_card_fetch, modern_fabric_failure_response, normalize_route_for_match,
+        Ap2InboundDecision, CHANNEL_SSE_SESSION_MGR, a2a_proxy_connection_status, access_point_fabric_headers,
+        agent_card_fabric_forward_path, agent_card_response, ap2_experimental_enabled_from_flags,
+        decode_bearer_jwt_claims, delegates_credentials_over_fabric, evaluate_ap2_inbound_decision,
+        fabric_mcp_gate_input, forwards_ap_caller_header, is_forwarded_on_credentialed_card_fetch,
+        modern_fabric_failure_response, normalize_route_for_match, replace_request_header,
         resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping,
+        should_forward_ap_request_header_with_mapping, target_credential_header_names,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -16650,8 +18054,8 @@ allow if {
         let reader = caller("reader");
         let known = caller_did("did:example:caller");
         let payment = crate::surface_context::PaymentContext {
-            verified: true,
-            response_header: None,
+            required: true,
+            ..Default::default()
         };
 
         let input = fabric_mcp_gate_input(
@@ -16677,7 +18081,7 @@ allow if {
         assert_eq!(input["extension_identity"]["verification"], "vp");
         assert_eq!(input["agent"]["did"], "did:example:caller");
         assert_eq!(input["agent"]["did_verified"], true);
-        assert_eq!(input["payment"]["verified"], true);
+        assert_eq!(input["payment"], serde_json::json!({"required": true}));
         assert_eq!(input["identity_binding"]["agent"]["did"], "did:example:agent");
         assert_eq!(input["identity_binding"]["verified"], true);
         assert_eq!(input["mcp"]["method"], "tools/list");
@@ -16783,12 +18187,6 @@ allow if {
             didauth_session_store: state
                 .didauth_session_store
                 .clone(),
-            transaction_store: state
-                .transaction_store
-                .clone(),
-            mpp_transaction_store: state
-                .mpp_transaction_store
-                .clone(),
             trust_registry_listener_manager: state
                 .trust_registry_listener_manager
                 .clone(),
@@ -16809,6 +18207,7 @@ allow if {
             delegation_vault_store: state
                 .delegation_vault_store
                 .clone(),
+            egress_allowlist: state.egress_allowlist.clone(),
             gateway_base_url: state.gateway_base_url.clone(),
             transit_token_issuer: state
                 .transit_token_issuer
@@ -16819,7 +18218,7 @@ allow if {
         }
     }
 
-    async fn modern_access_point_router_keeps_legacy_variant_fallback(state: &crate::state::ProxyState) {
+    async fn access_point_router_refuses_a_variant_it_cannot_resolve(state: &crate::state::ProxyState) {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -16852,10 +18251,10 @@ allow if {
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         for (router, path, modern, expected) in [
             (&router, "/mcp", true, axum::http::StatusCode::OK),
-            (&router, "/mcp$missing", false, axum::http::StatusCode::OK),
+            (&router, "/mcp$missing", false, axum::http::StatusCode::NOT_FOUND),
             (&router, "/mcp$missing", true, axum::http::StatusCode::NOT_FOUND),
-            (&broken, "/broken", false, axum::http::StatusCode::OK),
-            (&broken, "/broken", true, axum::http::StatusCode::SERVICE_UNAVAILABLE),
+            (&broken, "/broken", false, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+            (&broken, "/broken", true, axum::http::StatusCode::INTERNAL_SERVER_ERROR),
         ] {
             let before = target
                 .request_count
@@ -16905,7 +18304,9 @@ allow if {
             let response: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|error| {
                 panic!("{path} modern={modern} body {text:?}: {error}");
             });
-            assert_eq!(response["id"], "router-request");
+            if expected.is_success() {
+                assert_eq!(response["id"], "router-request");
+            }
             assert_eq!(
                 target
                     .request_count
@@ -16990,7 +18391,7 @@ allow if {
             "target": {"endpoint": target.url()}
         });
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+            "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
         }});
         let request = axum::http::Request::builder()
             .method("POST")
@@ -17019,6 +18420,260 @@ allow if {
         assert_eq!(forwarded["method"], "initialize");
         assert_eq!(forwarded["params"]["protocolVersion"], crate::mcp::MCP_LEGACY_VERSION);
         assert_eq!(forwarded["params"]["clientInfo"], body["params"]["clientInfo"]);
+    }
+
+    #[test]
+    fn upstream_session_id_must_be_one_visible_ascii_value_of_bounded_length() {
+        let with = |values: &[HeaderValue]| {
+            let mut headers = axum::http::HeaderMap::new();
+            for value in values {
+                headers.append("mcp-session-id", value.clone());
+            }
+            super::upstream_mcp_session_id(&headers)
+        };
+        let longest = "a".repeat(super::MAX_UPSTREAM_SESSION_ID_LEN);
+        let too_long = "a".repeat(super::MAX_UPSTREAM_SESSION_ID_LEN + 1);
+        assert_eq!(with(&[]), Ok(None));
+        assert_eq!(with(&[HeaderValue::from_static("abc-123")]), Ok(Some("abc-123".to_string())));
+        assert_eq!(with(&[HeaderValue::from_str(&longest).unwrap()]), Ok(Some(longest.clone())));
+        assert_eq!(
+            with(&[HeaderValue::from_static("first"), HeaderValue::from_static("second")]),
+            Err("several values")
+        );
+        assert_eq!(with(&[HeaderValue::from_static("")]), Err("empty or too long"));
+        assert_eq!(with(&[HeaderValue::from_str(&too_long).unwrap()]), Err("empty or too long"));
+        assert_eq!(with(&[HeaderValue::from_static("has space")]), Err("not visible ASCII"));
+        assert_eq!(with(&[HeaderValue::from_bytes("café".as_bytes()).unwrap()]), Err("not visible ASCII"));
+    }
+
+    /// When a JSON `initialize` result is wrapped as SSE, the client gets
+    /// exactly one `Mcp-Session-Id`: the upstream's when it sent one, else a
+    /// gateway id. Client capabilities are recorded under that id, per surface.
+    async fn initialize_wrapped_as_sse_returns_one_session_id(state: &crate::state::ProxyState) {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        async fn upstream(session_ids: &'static [&'static str]) -> std::net::SocketAddr {
+            let app = axum::Router::new().fallback(move || async move {
+                let mut response = axum::Json(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "serverInfo": {"name": "target", "version": "1"}
+                }}))
+                .into_response();
+                for id in session_ids {
+                    response
+                        .headers_mut()
+                        .append("mcp-session-id", HeaderValue::from_static(id));
+                }
+                response
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .ok()
+            });
+            addr
+        }
+
+        let registry = crate::mcp::elicitation::global_capability_registry();
+        for (surface_id, upstream_ids) in [
+            ("session-id-upstream", &["upstream-session-1"][..]),
+            ("session-id-minted", &[][..]),
+            ("session-id-unusable", &["first", "second"][..]),
+        ] {
+            let addr = upstream(upstream_ids).await;
+            let surface = json!({
+                "surface_id": surface_id, "name": surface_id,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+                "target": {"endpoint": format!("http://{addr}/mcp")}
+            });
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "client", "version": "1"}
+            }});
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/initialize")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-method", "initialize")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let response = super::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                ),
+                axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                request,
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{surface_id}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream"),
+                "{surface_id}"
+            );
+            let ids: Vec<String> = response
+                .headers()
+                .get_all("mcp-session-id")
+                .iter()
+                .map(|value| {
+                    value
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            match upstream_ids {
+                [one] => {
+                    assert_eq!(ids, vec![one.to_string()], "{surface_id}");
+                    let caps = registry
+                        .get(surface_id, one)
+                        .await
+                        .expect("capabilities recorded under the upstream id");
+                    assert!(caps.elicitation);
+                    assert!(
+                        registry
+                            .get("another-surface", one)
+                            .await
+                            .is_none()
+                    );
+                    registry
+                        .drop_session(surface_id, one)
+                        .await;
+                }
+                [] => {
+                    assert_eq!(ids.len(), 1, "{surface_id}: {ids:?}");
+                    assert!(
+                        registry
+                            .get(surface_id, &ids[0])
+                            .await
+                            .is_some()
+                    );
+                    registry
+                        .drop_session(surface_id, &ids[0])
+                        .await;
+                }
+                several => {
+                    assert_eq!(ids, several.to_vec(), "{surface_id}");
+                    for id in several {
+                        assert!(
+                            registry
+                                .get(surface_id, id)
+                                .await
+                                .is_none()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An upstream that gives one `Mcp-Session-Id` to two `initialize`s must
+    /// not route one client's consent prompts to the other: the id keeps no
+    /// elicitation capability, so Elicit falls back. A client re-initializing
+    /// the session it holds keeps its capabilities.
+    async fn reused_upstream_session_id_turns_elicitation_off(state: &crate::state::ProxyState) {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        let app = axum::Router::new().fallback(|| async {
+            let mut response = axum::Json(json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "protocolVersion": "2025-11-25", "capabilities": {},
+                "serverInfo": {"name": "target", "version": "1"}
+            }}))
+            .into_response();
+            response
+                .headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static("fixed-upstream-session"));
+            response
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .ok()
+        });
+
+        let initialize = |surface_id: &'static str, session_id: Option<&'static str>| {
+            let surface = json!({
+                "surface_id": surface_id, "name": surface_id,
+                "access_point": {"listen_address": "https://gateway.example", "route": "/initialize", "protocol": "mcp"},
+                "target": {"endpoint": format!("http://{addr}/mcp")}
+            });
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {"elicitation": {}},
+                "clientInfo": {"name": "client", "version": "1"}
+            }});
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/initialize")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(session_id) = session_id {
+                request = request.header("mcp-session-id", session_id);
+            }
+            let request = request
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            async move {
+                let response = super::multi_channel_proxy_handler(
+                    axum::extract::ConnectInfo(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                    ),
+                    axum::extract::State(direct_router_state(state, serde_json::from_value(surface).unwrap())),
+                    request,
+                )
+                .await;
+                assert_eq!(response.status(), axum::http::StatusCode::OK, "{surface_id}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("mcp-session-id")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("fixed-upstream-session"),
+                    "{surface_id}"
+                );
+            }
+        };
+        let registry = crate::mcp::elicitation::global_capability_registry();
+        let elicitation = |surface_id: &'static str| async move {
+            registry
+                .get(surface_id, "fixed-upstream-session")
+                .await
+                .map(|caps| caps.elicitation)
+        };
+
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(true));
+        initialize("session-id-reused", None).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+        initialize("session-id-reused", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reused").await, Some(false));
+
+        initialize("session-id-reinitialized", None).await;
+        initialize("session-id-reinitialized", Some("fixed-upstream-session")).await;
+        assert_eq!(elicitation("session-id-reinitialized").await, Some(true));
+
+        for surface_id in ["session-id-reused", "session-id-reinitialized"] {
+            registry
+                .drop_session(surface_id, "fixed-upstream-session")
+                .await;
+        }
     }
 
     /// The direct Access Point is a transparent proxy for the modern routing
@@ -17116,6 +18771,35 @@ allow if {
         path: &str,
         body: serde_json::Value,
     ) -> (axum::http::StatusCode, Vec<RecordedRefusal>) {
+        let (status, events) = access_point_records(router, path, body).await;
+        let refusals = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    rpc_error_code,
+                    ..
+                } => Some((
+                    stage,
+                    reason,
+                    http_status.expect("an Access Point refusal records its HTTP status"),
+                    rpc_error_code,
+                )),
+                _ => None,
+            })
+            .collect();
+        (status, refusals)
+    }
+
+    /// Sends one request through the Access Point and returns its status with
+    /// every audit record it produced.
+    async fn access_point_records(
+        router: crate::state::MultiSurfaceProxyState,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, Vec<crate::delegation_vault::audit::DelegationAuditEvent>) {
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(path)
@@ -17136,19 +18820,362 @@ allow if {
                 None,
             )))
             .await;
-        let refusals = events
-            .into_iter()
-            .filter_map(|event| match event.event {
-                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
-                    stage,
-                    reason,
-                    http_status,
-                    rpc_error_code,
-                } => Some((stage, reason, http_status, rpc_error_code)),
-                _ => None,
+        (response.status(), events)
+    }
+
+    /// Every record an Access Point request produces carries the request's own
+    /// id: 16 lowercase hex characters, fresh for each request.
+    async fn access_point_requests_each_carry_their_own_request_id(state: &crate::state::ProxyState) {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "request-ids", "name": "Request ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (_, events) = access_point_records(
+                direct_router_state(state, surface.clone()),
+                "/elsewhere/rpc",
+                serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}),
+            )
+            .await;
+            assert!(!events.is_empty(), "the unroutable request is recorded");
+            let ids: std::collections::HashSet<_> = events
+                .iter()
+                .map(|event| {
+                    event
+                        .request_id
+                        .clone()
+                        .expect("every record carries the request id")
+                })
+                .collect();
+            assert_eq!(ids.len(), 1, "one request, one id");
+            seen.extend(ids);
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
+    }
+
+    /// A streamed response is read after the handler returned. The records its
+    /// events write (here, the response-policy allow recorded on the first
+    /// event) still carry the request's id, the one its other records carry.
+    async fn streamed_response_records_carry_the_request_id(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let event = |result: serde_json::Value| {
+            (std::time::Duration::ZERO, format!("data: {}\n\n", json!({"jsonrpc": "2.0", "id": 1, "result": result})))
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_finished_stream(
+            "text/event-stream",
+            vec![
+                event(json!({"task": {"id": "t-1", "contextId": "c-1", "status": {"state": "TASK_STATE_SUBMITTED"}}})),
+                event(json!({"statusUpdate": {"taskId": "t-1", "contextId": "c-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"}}})),
+            ],
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                directory
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        policies
+            .save(
+                serde_json::from_value(json!({
+                    "id": "allow-responses", "name": "Allow responses", "policy_type": "agent_surface",
+                    "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-10-28T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "streamed-ids", "name": "Streamed ids",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": target.url(), "response_policy": {"policy_definition_id": "allow-responses"}}
+        }))
+        .unwrap();
+        let manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        manager.set_policy_definition_store(policies);
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let state = crate::state::ProxyState {
+            policy_manager: Some(manager),
+            ..state.clone()
+        };
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/a2a")
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("A2A-Version", "1.0")
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "SendStreamingMessage", "params": {
+                    "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "hi"}]}
+                }})
+                .to_string(),
+            ))
+            .unwrap();
+
+        let (body, events) = crate::audit::producer::capture(async {
+            let response = Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                direct_router_state(&state, surface),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            ))
+            .await;
+            axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap()
+        })
+        .await;
+
+        let streamed_decisions = events
+            .iter()
+            .filter(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision {
+                    scope, ..
+                } if scope == crate::observability::PolicyScope::Response.as_str())
             })
+            .count();
+        assert_eq!(streamed_decisions, 1, "the allow is recorded once per stream: {events:?}\n{body:?}");
+        let decision = events
+            .iter()
+            .find(|event| {
+                matches!(&event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+            })
+            .unwrap();
+        assert_eq!(
+            decision
+                .channel_name
+                .as_deref(),
+            Some("Streamed ids"),
+            "the decision names the surface"
+        );
+        let ids: std::collections::HashSet<_> = events
+            .iter()
+            .map(|event| event.request_id.clone())
             .collect();
-        (response.status(), refusals)
+        assert_eq!(ids.len(), 1, "one request, one id: {ids:?}");
+        assert!(
+            ids.iter()
+                .all(Option::is_some),
+            "every record carries the id: {ids:?}"
+        );
+    }
+
+    /// An Access Point stops reading an endless body from a caller without a
+    /// credential once it passes `a2a.max_body_size`, answers 413 and records
+    /// one `request_rejected`; it reads a body of exactly the cap.
+    async fn access_point_caps_an_endless_body_as_it_reads_it(state: &crate::state::ProxyState) {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CAP: usize = 64 * 1024;
+        const CHUNK: usize = 1024;
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"kind": "message"}}).to_string(),
+        )
+        .await;
+        let surface = || -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "endless-body", "name": "Endless body",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": target.url()}
+            }))
+            .unwrap()
+        };
+        let mut capped_config = (*state.config).clone();
+        capped_config
+            .a2a
+            .max_body_size = CAP;
+        let capped_state = crate::state::ProxyState {
+            config: std::sync::Arc::new(capped_config),
+            ..state.clone()
+        };
+        let call = |body: axum::body::Body| {
+            let router = direct_router_state(&capped_state, surface());
+            async move {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/a2a/rpc")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap();
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        None,
+                    )))
+                    .await;
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let rejections = events
+                    .into_iter()
+                    .filter_map(|event| match event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason,
+                            http_status,
+                            ..
+                        } => Some((stage, reason, http_status)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+            }
+        };
+        let pulled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = pulled.clone();
+        let endless = axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            counted.fetch_add(CHUNK, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![b' '; CHUNK]))
+        }));
+
+        let (status, body, rejections) = tokio::time::timeout(std::time::Duration::from_secs(10), call(endless))
+            .await
+            .expect("the Access Point must answer instead of reading an endless body");
+
+        assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains(&format!("Request body too large (max: {CAP})")), "{body}");
+        assert!(pulled.load(Ordering::SeqCst) <= CAP + CHUNK, "pulled {} bytes", pulled.load(Ordering::SeqCst));
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))]);
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+
+        let envelope = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+            "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": ""}]
+        }}})
+        .to_string();
+        let exact = envelope.replacen(r#""text":"""#, &format!(r#""text":"{}""#, "x".repeat(CAP - envelope.len())), 1);
+        assert_eq!(exact.len(), CAP);
+        let (status, body, rejections) = call(axum::body::Body::from(exact)).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(rejections.is_empty(), "{rejections:?}");
+    }
+
+    /// A body refused for its size is an admission refusal and leaves the task's
+    /// error count alone, on an A2A and an MCP Access Point alike; a body the
+    /// caller fails to send counts as a task error.
+    async fn access_point_counts_only_failed_body_reads_as_task_errors(state: &crate::state::ProxyState) {
+        use serde_json::json;
+        use std::sync::Arc;
+
+        const TASK: &str = "router-fixture";
+        const CAP: usize = 1024;
+        let monitor = Arc::new(crate::observability::TaskMonitor::new(None));
+        monitor
+            .register_task(crate::observability::TaskInfo::running(TASK))
+            .await;
+        let mut capped_config = (*state.config).clone();
+        capped_config
+            .a2a
+            .max_body_size = CAP;
+        let state = crate::state::ProxyState {
+            config: Arc::new(capped_config),
+            task_monitor: Some(monitor.clone()),
+            ..state.clone()
+        };
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+        )
+        .await;
+        let surface = |protocol: &str| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "task-errors", "name": "Task errors",
+                "mcp_http": if protocol == "mcp" { json!({"max_request_bytes": CAP}) } else { json!(null) },
+                "access_point": {"listen_address": "https://gateway.example", "route": "/errors", "protocol": protocol},
+                "target": {"endpoint": target.url()}
+            }))
+            .unwrap()
+        };
+        let send = |protocol: &'static str, body: axum::body::Body| {
+            let router = direct_router_state(&state, surface(protocol));
+            async move {
+                let mut request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/errors")
+                    .header("content-type", "application/json");
+                if protocol == "mcp" {
+                    request = request
+                        .header("accept", "application/json, text/event-stream")
+                        .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
+                        .header("mcp-method", "tools/list");
+                }
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    Box::pin(super::multi_channel_proxy_handler_with_mcp_runtime(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        router,
+                        request.body(body).unwrap(),
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                        None,
+                    )),
+                )
+                .await
+                .expect("the Access Point must answer")
+                .status()
+            }
+        };
+        let error_count = || async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            monitor
+                .get_task(TASK)
+                .await
+                .unwrap()
+                .error_count
+        };
+        let broken = || {
+            axum::body::Body::from_stream(futures::stream::iter([
+                Ok(bytes::Bytes::from_static(b"{")),
+                Err(std::io::Error::other("caller went away")),
+            ]))
+        };
+
+        for protocol in ["a2a", "mcp"] {
+            let status = send(protocol, axum::body::Body::from(vec![b' '; CAP + 1])).await;
+            assert_eq!(status, axum::http::StatusCode::PAYLOAD_TOO_LARGE, "{protocol}");
+            assert_eq!(error_count().await, 0, "{protocol}: a 413 is not a task error");
+        }
+        let status = send("mcp", broken()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error_count().await, 1, "a failed body read is a task error");
+        let status = send("a2a", broken()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(error_count().await, 2, "a failed body read is a task error");
     }
 
     /// Each refusal the Access Point answers itself is recorded as
@@ -17193,6 +19220,24 @@ allow if {
         });
         let metadata_target = json!({"target": {"endpoint": "http://169.254.169.254/rpc"}});
         let delegated = json!({"outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}]});
+        let gate = super::agent_pay_gate::tests::MockGate::answering(
+            200,
+            &[("Payment-Receipt", "refusal-receipt")],
+            json!({}),
+        )
+        .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+        super::agent_pay_gate::install_test_transport("refusal-gate", gate.clone());
+        let paid_target = |endpoint: String| {
+            json!({"endpoint": endpoint, "payment_policy": {
+                "type": "agent_pay", "payment_gateway_id": "refusal-gate", "payment_surface_id": "pay-1",
+                "require_all": true
+            }})
+        };
+        let paid_metadata_target = json!({"target": paid_target("http://169.254.169.254/rpc".into())});
+        let paid_delegated = json!({
+            "outbound_credentials": [{"credential_provider_id": "provider", "scopes": ["read"]}],
+            "target": paid_target(target.url())
+        });
 
         let cases: Vec<(&str, crate::state::MultiSurfaceProxyState, &str, serde_json::Value, u16, RecordedRefusal)> = vec![
             (
@@ -17208,8 +19253,8 @@ allow if {
                 direct_router_state(state, a2a_surface(variants)),
                 "/a2a$missing/rpc",
                 message.clone(),
-                400,
-                (RejectionStage::Routing, RejectionReason::UnknownVariant, 400, None),
+                404,
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, 404, None),
             ),
             (
                 "MCP body on an A2A Access Point",
@@ -17253,9 +19298,39 @@ allow if {
                 "credential delegation for an anonymous caller",
                 direct_router_state(state, a2a_surface(delegated)),
                 "/a2a/rpc",
-                message,
+                message.clone(),
                 403,
                 (RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, 403, None),
+            ),
+            (
+                "charged target blocked by egress policy",
+                direct_router_state(state, a2a_surface(paid_metadata_target)),
+                "/a2a/rpc",
+                message.clone(),
+                403,
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+            ),
+            (
+                "charged credential delegation for an anonymous caller",
+                direct_router_state(state, a2a_surface(paid_delegated)),
+                "/a2a/rpc",
+                message.clone(),
+                403,
+                (RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, 403, None),
+            ),
+            (
+                "closed Access Point without source authentication",
+                direct_router_state(
+                    state,
+                    a2a_surface(json!({"access_point": {
+                        "listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a",
+                        "public": false
+                    }})),
+                ),
+                "/a2a/rpc",
+                message,
+                503,
+                (RejectionStage::Admission, RejectionReason::AccessPointNotReady, 503, None),
             ),
         ];
         for (case, router, path, body, status, expected) in cases {
@@ -17263,6 +19338,7 @@ allow if {
             assert_eq!(observed_status.as_u16(), status, "{case}: status");
             assert_eq!(refusals, vec![expected], "{case}: recorded refusals");
         }
+        assert_eq!(gate.calls(), 0, "a request refused for a reason that does not depend on payment is not charged");
     }
 
     /// An Access Point targeting `proxy://` is backed by a gateway-owned server,
@@ -18014,6 +20090,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::SseSessions,
                         retry_after_ms: None,
+                        ..
                     }
                 )),
             "the refused SSE session is audited: {audit:?}"
@@ -18327,7 +20404,7 @@ allow if {
     }
 
     async fn forwarded_discovery_narrows_unsupported_version_errors(state: &crate::state::ProxyState) {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
@@ -18363,7 +20440,7 @@ allow if {
         }});
         for (name, discovery, expected) in [
             ("discovered", Some(&discovered), json!([MCP_MODERN_VERSION])),
-            ("legacy-only", Some(&legacy_only), json!([MCP_LEGACY_VERSION])),
+            ("legacy-only", Some(&legacy_only), json!(crate::mcp::request_validation::SESSION_VERSIONS)),
             ("fresh", None, json!(versions.supported_versions())),
         ] {
             let target = crate::component_tests::helpers::MockServer::start_with_response(
@@ -18405,7 +20482,7 @@ allow if {
             let forwarded = target
                 .request_count
                 .load(Ordering::SeqCst);
-            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2025-11-25")).await).await;
+            let (status, rejected) = read(send(request(&route, "unmodelled", "tools/list", "2099-01-01")).await).await;
             assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{name}: {rejected}");
             assert_eq!(rejected["id"], "unmodelled");
             assert_eq!(rejected["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
@@ -18638,8 +20715,8 @@ allow if {
             "surface_id": "consent-surface", "name": "Consent Surface",
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
             "target": {"endpoint": "http://127.0.0.1:9/api", "payment_policy": {
-                "type": "x402", "enabled": true, "provider": "agent_pay",
-                "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface"
+                "type": "agent_pay", "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface",
+                "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
             }},
             "identity_slots": {"inbound": {"type": "static", "did": "did:web:agent.example"}},
             "mcp_http": {"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}},
@@ -18692,8 +20769,6 @@ allow if {
             policy_manager: None,
             gateway_policy_manager: None,
             didauth_session_store: sessions,
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: Some(middleware),
             #[cfg(feature = "didwebvh")]
@@ -18702,18 +20777,21 @@ allow if {
             didwebvh_log_manager: None,
             credential_provider_store: Some(providers),
             delegation_vault_store: Some(vault.clone()),
+            egress_allowlist: None,
             gateway_base_url: Some("https://gateway.example".into()),
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
+            served_surface: Arc::new(surface.clone()),
             surface: Arc::new(surface),
         };
-        modern_access_point_router_keeps_legacy_variant_fallback(&state).await;
+        access_point_router_refuses_a_variant_it_cannot_resolve(&state).await;
         mounted_access_point_uses_the_direct_access_point_policy(&state).await;
         direct_access_point_caps_legacy_initialize(&state).await;
+        initialize_wrapped_as_sse_returns_one_session_id(&state).await;
+        reused_upstream_session_id_turns_elicitation_off(&state).await;
         access_point_admission_rejects_every_negative_case(&state).await;
         access_point_refuses_methods_and_bodies_outside_post(&state).await;
         access_point_rejects_a_spoofed_identity_credential(&state).await;
@@ -18729,6 +20807,10 @@ allow if {
         modern_extensions_survive_forwarding(&state).await;
         proxy_access_point_answers_modern_discovery(&state).await;
         access_point_records_request_refusals(&state).await;
+        access_point_caps_an_endless_body_as_it_reads_it(&state).await;
+        access_point_counts_only_failed_body_reads_as_task_errors(&state).await;
+        access_point_requests_each_carry_their_own_request_id(&state).await;
+        streamed_response_records_carry_the_request_id(&state).await;
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         let runtime = negative_cases::continuation_runtime(now, 300);
         let bearer = issuer.sign_jwt_with_gateway_key_typ(&json!({
@@ -18778,7 +20860,7 @@ allow if {
         assert_eq!(response["result"]["resultType"], "input_required");
         // Two surfaces route to the same peer gateway. Only the opted-in one reaches the delegation
         // gate, which stops it without a runtime; the other skips consent, even with a runtime, and
-        // goes on to payment.
+        // goes on to Fabric dispatch (its free tool makes no payment call).
         let fabric_root = tempfile::tempdir().unwrap();
         let peer = crate::gateways::types::Gateway::new(
             "Peer".into(),
@@ -18845,7 +20927,7 @@ allow if {
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
             assert_eq!(
-                body.contains("payment delegation"),
+                body.contains("Modern Fabric transport is unavailable"),
                 !opted_in,
                 "{surface_id} runtime={with_runtime}: {status} {body}"
             );
@@ -19019,7 +21101,9 @@ allow if {
             .unwrap();
         let token = serde_json::from_value(json!({
             "id": "verified-token", "agent_did": "did:web:agent.example",
-            "user_identity_hash": hex::encode(Sha256::digest(b"user")), "credential_provider_id": "provider",
+            "user_identity_hash": crate::source_auth::models::caller_identity_hash(
+                "jwt_bearer", "https://gateway.example/api/oauth2/mcp", state.surface.tenant_id.as_deref(), "user"),
+            "credential_provider_id": "provider",
             "provider_id": "provider", "access_token": "verified-credential", "scopes": ["read"],
             "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
             "consent_identity": {
@@ -19241,103 +21325,12 @@ allow if {
         }
         let surface = Arc::make_mut(&mut state.surface);
         surface.target.endpoint = format!("http://{target_address}/json");
-        surface.target.payment_policy = Some(
-            serde_json::from_value(json!({
-                "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
-                "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
-                "mcp_payment_triggers": {"mode": "all"}
-            }))
-            .unwrap(),
-        );
+        surface.target.payment_policy =
+            Some(serde_json::from_value(json!({"type": "x402", "mcp_payment_triggers": {"mode": "all"}})).unwrap());
         message["id"] = json!(20);
-        message["params"]["requestState"] = json!("opaque upstream state");
-        let original = crate::mcp::request_validation::ValidatedModernMessage {
-            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
-            client_capabilities: Some(json!({"elicitation": {"url": {}}})),
-            client_info: None,
-            method: "tools/call".into(),
-            params: Some(message["params"].clone()),
-            id: Some(message["id"].clone()),
-            kind: crate::mcp::request_validation::McpMessageKind::Request,
-        };
-        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
-            subject: "user".into(),
-            claims: json!({"iss": "https://gateway.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
-        };
-        let binding = crate::mcp::continuations::delegation::make_binding(
-            "deployment",
-            &state.surface,
-            None,
-            crate::mcp::continuations::protected::ContinuationRoute::AccessPoint,
-            state
-                .surface
-                .mcp_http
-                .as_ref()
-                .unwrap()
-                .authorization
-                .as_ref()
-                .unwrap(),
-            &provider,
-            vec!["read".into()],
-            "did:web:agent.example",
-            &identity,
-            &original,
-        )
-        .unwrap();
-        let (issued, connect) = runtime
-            .service
-            .issue_consent(
-                &original,
-                binding,
-                crate::mcp::continuations::delegation::provider_digest(&provider).unwrap(),
-                crate::mcp::continuations::delegation::surface_digest(&state.surface).unwrap(),
-                crate::mcp::continuations::delegation::identity_strategy_digest(&strategy).unwrap(),
-                "https://gateway.example/mcp-consent/callback/provider".into(),
-                300,
-                now,
-            )
-            .await
-            .unwrap();
-        let ticket = runtime
-            .service
-            .read_consent_ticket(&connect, false, now)
-            .await
-            .unwrap();
-        let callback = runtime
-            .service
-            .begin_consent_callback(ticket, "v".repeat(43), vault.as_ref(), now)
-            .await
-            .unwrap();
-        let ticket = runtime
-            .service
-            .read_consent_ticket(&callback, true, now)
-            .await
-            .unwrap();
-        let callback = runtime
-            .service
-            .claim_consent_callback(ticket, now)
-            .await
-            .unwrap();
-        let credential = vault
-            .get("verified-token")
-            .await
-            .unwrap()
-            .unwrap();
-        runtime
-            .service
-            .complete_consent_callback(callback, vault.as_ref(), credential, now)
-            .await
-            .unwrap();
-        message["id"] = json!(21);
-        message["params"]["requestState"] = json!(issued.state);
-        message["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("inputResponses");
         let before = calls.lock().await.len();
-        for _attempt in 0..2 {
-            let response = Box::pin(super::proxy_handler_with_mcp_runtime(
+        let (status, refused) = decode_response(
+            Box::pin(super::proxy_handler_with_mcp_runtime(
                 address,
                 state.clone(),
                 build_request(&message),
@@ -19345,194 +21338,149 @@ allow if {
                 Some(runtime.clone()),
             ))
             .await
-            .unwrap_or_else(|response| response);
-            assert_eq!(response.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
-            assert_eq!(calls.lock().await.len(), before);
-        }
-        message["id"] = json!(22);
-        let signature = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&json!({
-            "x402Version": 2, "resource": {"url": "https://gateway.example/mcp", "description": "test", "mimeType": "application/json"},
-            "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-            "payload": {"signature": "fixture-payment"}
-        })).unwrap());
-        let paid_request = || {
-            let mut request = build_request(&message);
-            request.headers_mut().insert(
-                axum::http::HeaderName::from_bytes(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_signature
-                        .as_bytes(),
-                )
-                .unwrap(),
-                HeaderValue::from_str(&signature).unwrap(),
-            );
-            request
-        };
-        let (first, second) = tokio::join!(
-            Box::pin(super::proxy_handler_with_mcp_runtime(
-                address,
-                state.clone(),
-                paid_request(),
-                versions,
-                Some(runtime.clone())
-            )),
-            Box::pin(super::proxy_handler_with_mcp_runtime(
-                address,
-                state.clone(),
-                paid_request(),
-                versions,
-                Some(runtime.clone())
-            )),
-        );
-        let first = decode_response(first.unwrap_or_else(|response| response)).await;
-        let second = decode_response(second.unwrap_or_else(|response| response)).await;
-        assert!(matches!((first.0.as_u16(), second.0.as_u16()), (200, 409) | (409, 200)), "{first:?}; {second:?}");
-        assert_eq!(calls.lock().await.len(), before + 1);
-        assert!(
-            !calls.lock().await[before]
-                .0
-                .contains_key(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_signature
-                        .as_str()
-                )
-        );
-        let transactions = Arc::new(
-            crate::x402::TransactionStore::new(
-                directory
-                    .path()
-                    .join("payments"),
-            )
-            .await
-            .unwrap(),
-        );
-        state.transaction_store = Some(transactions.clone());
-        for format in ["json", "sse"] {
+            .unwrap_or_else(|response| response),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused, json!({"error": "payment_unavailable"}));
+        assert_eq!(calls.lock().await.len(), before, "a local payment surface never reaches the Target");
+        {
+            use super::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+            let gate = MockGate::answering(200, &[("Payment-Receipt", "direct-receipt")], json!({}))
+                .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+            install_test_transport("direct-consent-gate", gate.clone());
             Arc::make_mut(&mut state.surface)
                 .target
-                .endpoint = format!("http://{target_address}/{format}");
-            message["id"] = json!(30);
-            message["params"]
-                .as_object_mut()
-                .unwrap()
-                .remove("requestState");
-            message["params"]
-                .as_object_mut()
-                .unwrap()
-                .remove("inputResponses");
-            let signature = base64::engine::general_purpose::STANDARD.encode(
-                serde_json::to_vec(&json!({
-                    "x402Version": 2,
-                    "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                        "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-                    "payload": {"signature": format!("paid-round-{format}")}
+                .payment_policy = Some(
+                serde_json::from_value(json!({
+                    "type": "agent_pay", "payment_gateway_id": "direct-consent-gate", "payment_surface_id": "pay-1",
+                    "mcp_payment_triggers": {"mode": "all"}
                 }))
                 .unwrap(),
             );
-            let mut paid = build_request(&message);
-            paid.headers_mut().insert(
-                axum::http::HeaderName::from_bytes(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_signature
-                        .as_bytes(),
-                )
-                .unwrap(),
-                HeaderValue::from_str(&signature).unwrap(),
-            );
-            let calls_before = calls.lock().await.len();
-            let payments_before = transactions
-                .list_all()
-                .await
-                .len();
-            let response = Box::pin(super::proxy_handler_with_mcp_runtime(
-                address,
-                state.clone(),
-                paid,
-                versions,
-                Some(runtime.clone()),
-            ))
-            .await
-            .unwrap_or_else(|response| response);
-            let receipt = response
-                .headers()
-                .get(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_response
-                        .as_str(),
-                )
-                .unwrap()
-                .clone();
-            let (status, response) = decode_response(response).await;
-            assert_eq!(status, axum::http::StatusCode::OK, "{response}");
-            assert_eq!(response["result"]["resultType"], "input_required");
-            assert_eq!(
-                transactions
-                    .list_all()
+            let paid_request = |message: &serde_json::Value, credential: Option<&str>| {
+                let mut request = build_request(message);
+                if let Some(credential) = credential {
+                    request
+                        .headers_mut()
+                        .insert("payment-signature", credential.parse().unwrap());
+                }
+                request
+            };
+            let send = |state: crate::state::ProxyState, request: axum::http::Request<axum::body::Body>| {
+                let runtime = runtime.clone();
+                async move {
+                    let response = Box::pin(super::proxy_handler_with_mcp_runtime(
+                        address,
+                        state,
+                        request,
+                        versions,
+                        Some(runtime),
+                    ))
                     .await
-                    .len(),
-                payments_before + 1
+                    .unwrap_or_else(|response| response);
+                    let receipt = response
+                        .headers()
+                        .get("payment-response")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let (status, body) = decode_response(response).await;
+                    (status, receipt, body)
+                }
+            };
+            for format in ["json", "sse"] {
+                Arc::make_mut(&mut state.surface)
+                    .target
+                    .endpoint = format!("http://{target_address}/{format}");
+                message["id"] = json!(50);
+                for field in ["requestState", "inputResponses"] {
+                    message["params"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove(field);
+                }
+                let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+                let (status, receipt, paid) =
+                    send(state.clone(), paid_request(&message, Some(&format!("direct-consent-{format}")))).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{format}: {paid}");
+                assert_eq!(receipt.as_deref(), Some("direct-receipt"), "{format}");
+                assert_eq!(paid["result"]["resultType"], "input_required", "{format}");
+                assert_ne!(paid["result"]["requestState"], "opaque upstream state", "{format}");
+                assert_eq!(gate.calls(), hops + 1, "{format}: the first round is charged once");
+
+                message["id"] = json!(51);
+                message["params"]["requestState"] = paid["result"]["requestState"].clone();
+                message["params"]["inputResponses"] = json!({"upstream-input": {"action": "accept"}});
+                let (status, receipt, continued) = send(state.clone(), paid_request(&message, None)).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{format}: {continued}");
+                assert_eq!(
+                    receipt.as_deref(),
+                    Some("direct-receipt"),
+                    "{format}: the continuation carries the receipt"
+                );
+                assert_eq!(continued["result"]["resultType"], "complete", "{format}");
+                assert_eq!(continued["result"]["_meta"]["org.paymentauth/receipt"], "direct-receipt", "{format}");
+                assert_eq!(gate.calls(), hops + 1, "{format}: a continuation round is not charged again");
+                {
+                    let observed = calls.lock().await;
+                    assert_eq!(observed.len(), forwarded + 2, "{format}");
+                    for (headers, upstream) in &observed[forwarded..] {
+                        assert!(!headers.contains_key("payment-signature"), "{format}: {headers:?}");
+                        assert!(
+                            upstream["params"]["arguments"]
+                                .get("payment_signature")
+                                .is_none()
+                        );
+                    }
+                }
+
+                message["id"] = json!(52);
+                let (status, receipt, replayed) = send(state.clone(), paid_request(&message, None)).await;
+                assert_eq!(status, axum::http::StatusCode::CONFLICT, "{format}: {replayed}");
+                assert!(receipt.is_none(), "{format}");
+                assert_eq!(gate.calls(), hops + 1, "{format}: a replayed continuation is not charged");
+                assert_eq!(calls.lock().await.len(), forwarded + 2, "{format}: nor forwarded");
+            }
+
+            Arc::make_mut(&mut state.surface)
+                .target
+                .endpoint = format!("http://{target_address}/json");
+            message["id"] = json!(60);
+            for field in ["requestState", "inputResponses"] {
+                message["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            }
+            let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+            let (first, second) = tokio::join!(
+                send(state.clone(), paid_request(&message, Some("racing-direct-consent"))),
+                send(state.clone(), paid_request(&message, Some("racing-direct-consent"))),
             );
-            message["id"] = json!(31);
-            message["params"]["requestState"] = response["result"]["requestState"].clone();
+            let (paid, refused) = match (first.0.as_u16(), second.0.as_u16()) {
+                (200, 402) => (first, second),
+                (402, 200) => (second, first),
+                other => panic!("one payment pays for one call: {other:?}; {first:?}; {second:?}"),
+            };
+            assert_eq!(paid.2["result"]["resultType"], "input_required");
+            assert_eq!(refused.2["error"]["data"]["failure"]["reason"], "payment_already_used", "{:?}", refused.2);
+            assert!(refused.1.is_none());
+            assert_eq!(calls.lock().await.len(), forwarded + 1, "the credential reaches the Target once");
+            assert_eq!(gate.calls(), hops + 3, "two payments, and the fresh challenge for the replayed one");
+
+            message["id"] = json!(61);
+            message["params"]["requestState"] = paid.2["result"]["requestState"].clone();
             message["params"]["inputResponses"] = json!({"upstream-input": {"action": "accept"}});
-            let response = Box::pin(super::proxy_handler_with_mcp_runtime(
-                address,
-                state.clone(),
-                build_request(&message),
-                versions,
-                Some(runtime.clone()),
-            ))
-            .await
-            .unwrap_or_else(|response| response);
-            assert_eq!(
-                response.headers().get(
-                    state
-                        .config
-                        .x402_headers
-                        .payment_response
-                        .as_str()
-                ),
-                Some(&receipt)
+            let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+            let (first, second) = tokio::join!(
+                send(state.clone(), paid_request(&message, None)),
+                send(state.clone(), paid_request(&message, None))
             );
-            let (status, response) = decode_response(response).await;
-            assert_eq!(status, axum::http::StatusCode::OK, "{response}");
-            assert_eq!(response["result"]["resultType"], "complete");
-            assert_eq!(
-                transactions
-                    .list_all()
-                    .await
-                    .len(),
-                payments_before + 1
-            );
-            assert_eq!(calls.lock().await.len(), calls_before + 2);
-            message["id"] = json!(32);
-            let response = Box::pin(super::proxy_handler_with_mcp_runtime(
-                address,
-                state.clone(),
-                build_request(&message),
-                versions,
-                Some(runtime.clone()),
-            ))
-            .await
-            .unwrap_or_else(|response| response);
-            assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
-            assert_eq!(
-                transactions
-                    .list_all()
-                    .await
-                    .len(),
-                payments_before + 1
-            );
-            assert_eq!(calls.lock().await.len(), calls_before + 2);
+            let statuses = [first.0.as_u16(), second.0.as_u16()];
+            assert!(statuses == [200, 409] || statuses == [409, 200], "{first:?}; {second:?}");
+            assert_eq!(gate.calls(), hops, "neither continuation round reaches agent-pay");
+            assert_eq!(calls.lock().await.len(), forwarded + 1, "the continuation is forwarded once");
         }
         Arc::make_mut(&mut state.surface)
             .target
@@ -20065,7 +22013,7 @@ allow if {
             ..Default::default()
         });
 
-        let resolved = resolve_direct_surface_auth_config(&config, Some(&vc_issuer), "direct-surface")
+        let resolved = resolve_direct_surface_auth_config(&config, None, Some(&vc_issuer), "direct-surface")
             .await
             .expect("resolve direct surface audience");
 
@@ -20081,7 +22029,7 @@ allow if {
 
         let mut headers = HeaderMap::new();
         headers.insert("mcp-session-id", HeaderValue::from_static("unknown-session"));
-        let unknown = resolve_legacy_mcp_session(&headers).await;
+        let unknown = resolve_legacy_mcp_session("surface-a", &headers).await;
         assert_eq!(unknown, (LegacySessionEvidence::Unknown, None));
 
         let (session_id, _receiver) = CHANNEL_SSE_SESSION_MGR
@@ -20089,10 +22037,30 @@ allow if {
             .await
             .unwrap();
         headers.insert("mcp-session-id", HeaderValue::from_str(&session_id).unwrap());
-        let known = resolve_legacy_mcp_session(&headers).await;
+        let known = resolve_legacy_mcp_session("surface-a", &headers).await;
         assert_eq!(known, (LegacySessionEvidence::Known, Some(session_id.clone())));
         CHANNEL_SSE_SESSION_MGR
             .remove_session(&session_id)
+            .await;
+
+        // A session the gateway knows only from the capability registry is
+        // known on the surface that recorded it, not on another surface.
+        let caps = crate::mcp::elicitation::McpClientCapabilities {
+            elicitation: false,
+            sampling: false,
+            roots: false,
+        };
+        crate::mcp::elicitation::global_capability_registry()
+            .record("surface-a", "registry-only-session", caps)
+            .await;
+        headers.insert("mcp-session-id", HeaderValue::from_static("registry-only-session"));
+        assert_eq!(
+            resolve_legacy_mcp_session("surface-a", &headers).await,
+            (LegacySessionEvidence::Known, Some("registry-only-session".to_string()))
+        );
+        assert_eq!(resolve_legacy_mcp_session("surface-b", &headers).await, (LegacySessionEvidence::Unknown, None));
+        crate::mcp::elicitation::global_capability_registry()
+            .drop_session("surface-a", "registry-only-session")
             .await;
     }
 
@@ -20129,31 +22097,246 @@ allow if {
     }
 
     #[test]
+    fn a_caller_header_named_like_the_credential_header_is_not_forwarded() {
+        use super::is_credential_header;
+        assert!(is_credential_header("X-Api-Key", &["X-Api-Key"]));
+        assert!(is_credential_header("x-api-key", &["X-API-KEY"]));
+        assert!(is_credential_header("x-api-key", &["X-Other".to_string(), "X-Api-Key".to_string()]));
+        assert!(!is_credential_header("x-other", &["X-Api-Key"]));
+        assert!(!is_credential_header("x-api-key", None::<&str>.as_slice()));
+    }
+
+    #[test]
     fn authorization_forwarding_requires_explicit_jwt_opt_in() {
-        assert!(!should_forward_ap_request_header_with_mapping("authorization", None, None, false));
-        assert!(!should_forward_ap_request_header_with_mapping("authorization", None, None, true));
+        assert!(!should_forward_ap_request_header_with_mapping("authorization", &[], None, None));
+        assert!(!should_forward_ap_request_header_with_mapping("authorization", &[], None, Some("x-other")));
     }
 
     #[test]
     fn source_auth_authorization_requires_explicit_jwt_opt_in() {
-        assert!(!should_forward_ap_request_header_with_mapping("authorization", Some("authorization"), None, false,));
-        assert!(should_forward_ap_request_header_with_mapping("authorization", Some("authorization"), None, true,));
+        assert!(!should_forward_ap_request_header_with_mapping("authorization", &["authorization"], None, None));
+        assert!(should_forward_ap_request_header_with_mapping(
+            "authorization",
+            &["authorization"],
+            None,
+            Some("authorization"),
+        ));
     }
 
     #[test]
     fn custom_source_auth_header_can_be_forwarded_with_jwt_opt_in() {
         assert!(should_forward_ap_request_header_with_mapping(
             "x-gateway-authorization",
-            Some("x-gateway-authorization"),
+            &["x-gateway-authorization"],
             None,
-            true,
+            Some("x-gateway-authorization"),
         ));
         assert!(!should_forward_ap_request_header_with_mapping(
             "authorization",
-            Some("x-gateway-authorization"),
+            &["x-gateway-authorization"],
             None,
-            true,
+            Some("x-gateway-authorization"),
         ));
+    }
+
+    /// An Access Point's Fabric send carries the first Fabric crossing, in the
+    /// buffered and the streamed form, never a count the caller sent; a direct
+    /// forward carries none.
+    #[test]
+    fn an_access_point_fabric_send_carries_the_first_crossing_and_never_the_callers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-gateway-fabric-hops", HeaderValue::from_static("6"));
+        headers.insert("x-partner-context", HeaderValue::from_static("kept"));
+
+        let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &[]);
+
+        let hops: Vec<_> = buffered
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-fabric-hops"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(hops, ["1"]);
+        assert_eq!(
+            streamed
+                .get_all("x-gateway-fabric-hops")
+                .iter()
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(
+            buffered
+                .get("X-PARTNER-CONTEXT")
+                .map(String::as_str),
+            Some("kept")
+        );
+        assert!(!should_forward_ap_request_header_with_mapping("X-Gateway-Fabric-Hops", &[], None, None));
+    }
+
+    #[test]
+    fn every_configured_source_auth_header_is_stripped() {
+        let headers = ["authorization", "X-API-Key"];
+        assert!(!should_forward_ap_request_header_with_mapping("x-api-key", &headers, None, None));
+        assert!(!should_forward_ap_request_header_with_mapping("authorization", &headers, None, None));
+        assert!(should_forward_ap_request_header_with_mapping("x-trace", &headers, None, None));
+    }
+
+    #[test]
+    fn forwarding_the_selected_jwt_header_still_strips_the_other_methods_headers() {
+        let headers = ["authorization", "x-api-key"];
+        assert!(should_forward_ap_request_header_with_mapping("authorization", &headers, None, Some("authorization")));
+        assert!(!should_forward_ap_request_header_with_mapping("x-api-key", &headers, None, Some("authorization")));
+    }
+
+    #[test]
+    fn every_other_spelling_of_the_forwarded_token_header_is_stripped() {
+        let headers = ["X-User-Token"];
+        assert!(forwards_ap_caller_header("x-user-token", &headers, None, Some("X-User-Token"), &[]));
+        for name in ["X_User_Token", "x_user-token"] {
+            assert!(!forwards_ap_caller_header(name, &headers, None, Some("X-User-Token"), &[]), "{name}");
+            assert!(!should_forward_ap_request_header_with_mapping(name, &headers, None, None), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_access_point_never_forwards_the_callers_cookies() {
+        assert!(!forwards_ap_caller_header("Cookie", &[], None, None, &[]));
+        assert!(!should_forward_ap_request_header_with_mapping("cookie", &[], None, Some("cookie")));
+        let mut caller = HeaderMap::new();
+        caller.insert("cookie", HeaderValue::from_static("__Host-session_token=dashboard; lb=sticky"));
+        caller.insert("x-trace", HeaderValue::from_static("t-1"));
+        let (buffered, stream) = access_point_fabric_headers(&caller, &[], None, &[]);
+        assert!(!buffered.contains_key("COOKIE"));
+        assert!(!stream.contains_key("cookie"));
+        assert_eq!(buffered["X-TRACE"], "t-1");
+    }
+
+    #[test]
+    fn a_caller_header_named_like_the_target_auth_header_is_never_forwarded() {
+        assert!(!forwards_ap_caller_header("X-Vendor-Key", &[], None, None, &["x-vendor-key"]));
+        assert!(forwards_ap_caller_header("X-Vendor-Key", &[], None, None, &[]));
+        assert!(!forwards_ap_caller_header("X_Vendor_Key", &[], None, None, &["x-vendor-key"]));
+        assert!(forwards_ap_caller_header("X-Other", &[], None, None, &["x-vendor-key"]));
+        assert!(!forwards_ap_caller_header(
+            "authorization",
+            &["authorization"],
+            None,
+            Some("authorization"),
+            &["Authorization"]
+        ));
+        assert!(forwards_ap_caller_header("authorization", &["authorization"], None, Some("authorization"), &[]));
+    }
+
+    #[test]
+    fn a_caller_header_named_like_a_delegated_credential_header_is_never_forwarded() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "mcp"},
+            "target": {"endpoint": "https://api.example.com", "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}},
+            "outbound_credentials": [
+                {"credential_provider_id": "vendor",
+                 "inject_as": {"type": "custom_header", "name": "X-Vendor-Token", "format": "{value}"}},
+                {"credential_provider_id": "bearer"},
+                {"credential_provider_id": "meta", "inject_as": {"type": "meta", "field": "token"}}
+            ]
+        }))
+        .unwrap();
+        let credential_headers = target_credential_header_names(&surface);
+        assert_eq!(credential_headers, ["X-Target-Key", "X-Vendor-Token", "Authorization"]);
+        let forwards = |name: &str| forwards_ap_caller_header(name, &[], None, None, &credential_headers);
+        for name in ["X-Vendor-Token", "x_vendor_token", "X_Vendor_Token", "x-target-key", "authorization"] {
+            assert!(!forwards(name), "{name}");
+        }
+        for name in ["X-Vendor-Tokens", "X-Other", "token"] {
+            assert!(forwards(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_replaced_request_header_carries_only_the_gateway_value() {
+        let request = reqwest::Client::new()
+            .get("http://target.example/")
+            .header("x-vendor-key", "caller-one")
+            .header("X-Vendor-Key", "caller-two")
+            .header("x-other", "kept");
+
+        let request = replace_request_header(request, "X-Vendor-Key", "gateway-key")
+            .build()
+            .unwrap();
+
+        let values: Vec<_> = request
+            .headers()
+            .get_all("x-vendor-key")
+            .iter()
+            .collect();
+        assert_eq!(values, ["gateway-key"]);
+        assert_eq!(request.headers()["x-other"], "kept");
+    }
+
+    #[test]
+    fn a_target_auth_header_matches_its_name_in_any_case_and_with_underscores() {
+        for name in ["X-Api-Key", "x-api-key", "X_API_KEY", "x_api-key"] {
+            assert!(crate::proxy::handler::is_credential_header(name, &["X-Api-Key"]), "{name}");
+        }
+        for name in ["X-Api-Keys", "X-Api", "XApiKey", "X.Api.Key"] {
+            assert!(!crate::proxy::handler::is_credential_header(name, &["X-Api-Key"]), "{name}");
+        }
+        assert!(!crate::proxy::handler::is_credential_header("X-Api-Key", None::<&str>.as_slice()));
+    }
+
+    #[test]
+    fn an_access_point_fabric_send_drops_a_caller_header_named_like_the_target_credential_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-target-key", HeaderValue::from_static("caller-chosen"));
+        headers.insert("x-partner-context", HeaderValue::from_static("kept"));
+
+        let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &["X-Target-Key"]);
+
+        assert_eq!(buffered.get("X-TARGET-KEY"), None);
+        assert_eq!(streamed.get("x-target-key"), None);
+        assert_eq!(
+            buffered
+                .get("X-PARTNER-CONTEXT")
+                .map(String::as_str),
+            Some("kept")
+        );
+        let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &[]);
+        assert_eq!(
+            buffered
+                .get("X-TARGET-KEY")
+                .map(String::as_str),
+            Some("caller-chosen")
+        );
+        assert!(streamed.contains_key("x-target-key"));
+    }
+
+    #[test]
+    fn an_access_point_fabric_send_drops_a_caller_header_named_like_a_delegated_credential_header() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/s", "protocol": "mcp"},
+            "target": {"endpoint": "fabric://gateway-b/surface-b", "fabric_delegated_credentials": true},
+            "outbound_credentials": [{"credential_provider_id": "vendor",
+                "inject_as": {"type": "custom_header", "name": "X-Vendor-Token", "format": "{value}"}}]
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x_vendor_token", HeaderValue::from_static("caller-chosen"));
+        headers.insert("x-vendor-tokens", HeaderValue::from_static("kept"));
+
+        let (buffered, streamed) =
+            access_point_fabric_headers(&headers, &[], None, &target_credential_header_names(&surface));
+
+        assert_eq!(buffered.get("X_VENDOR_TOKEN"), None);
+        assert_eq!(streamed.get("x_vendor_token"), None);
+        assert_eq!(
+            buffered
+                .get("X-VENDOR-TOKENS")
+                .map(String::as_str),
+            Some("kept")
+        );
+        assert!(streamed.contains_key("x-vendor-tokens"));
     }
 
     #[test]
@@ -20317,6 +22500,7 @@ allow if {
                     crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
                         scope: crate::audit::events::RateLimitScope::FabricCapacity,
                         retry_after_ms: Some(5000),
+                        ..
                     }
                 )),
             "the full Fabric stream cap is audited: {audit:?}"
@@ -20340,6 +22524,7 @@ allow if {
         for (error, status) in [
             (FabricForwardError::StreamingUnavailable, axum::http::StatusCode::BAD_GATEWAY),
             (FabricForwardError::NoResponse("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
+            (FabricForwardError::ReplyNotReceived("gw".into()), axum::http::StatusCode::GATEWAY_TIMEOUT),
         ] {
             let (response, audit) = crate::audit::producer::capture(async {
                 modern_fabric_failure_response(error, Some(serde_json::json!("call-1")), &facts)
@@ -20355,14 +22540,1082 @@ allow if {
             );
         }
     }
+
+    // ── Log and span redaction ─────────────────────────────────────────────────
+
+    /// A `ProxyState` for `surface` with no stores and no source authentication.
+    fn bare_proxy_state(
+        surface: crate::config::agent_surface::AgentSurface,
+        policy_manager: Option<std::sync::Arc<crate::policies::SurfacePolicyManager>>,
+    ) -> crate::state::ProxyState {
+        let network = serde_json::from_value(serde_json::json!({
+            "did": {"domain": "gateway.example"},
+            "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
+            "integration": {"types": [], "categories": []},
+            "listeners": [], "routes": {}
+        }))
+        .unwrap();
+        let config = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [], "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        crate::state::ProxyState {
+            config: std::sync::Arc::new(config),
+            network_config: std::sync::Arc::new(network),
+            client: reqwest::Client::new(),
+            metrics_store: None,
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_monitor: None,
+            task_id: None,
+            ws_state: None,
+            listener_manager: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            secrets_store: None,
+            certificates_store: None,
+            vc_issuer: None,
+            policy_manager,
+            gateway_policy_manager: None,
+            didauth_session_store: std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            trust_registry_listener_manager: None,
+            source_auth_middleware: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_identity_store: None,
+            #[cfg(feature = "didwebvh")]
+            didwebvh_log_manager: None,
+            credential_provider_store: None,
+            delegation_vault_store: None,
+            egress_allowlist: None,
+            gateway_base_url: None,
+            transit_token_issuer: None,
+            mcp_proxy_store: None,
+            a2a_proxy_store: None,
+            active_variant_alias: None,
+            active_variant_id: None,
+            served_surface: std::sync::Arc::new(surface.clone()),
+            surface: std::sync::Arc::new(surface),
+        }
+    }
+
+    fn mcp_surface(
+        surface_id: &str,
+        endpoint: &str,
+        policy_definition_id: Option<&str>,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut target = serde_json::json!({"endpoint": endpoint});
+        if let Some(policy_definition_id) = policy_definition_id {
+            target["policy"] = serde_json::json!({"policy_definition_id": policy_definition_id});
+        }
+        serde_json::from_value(serde_json::json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{surface_id}"), "protocol": "mcp"},
+            "target": target
+        }))
+        .unwrap()
+    }
+
+    mod presented_api_key_identity {
+        use super::{bare_proxy_state, mcp_surface};
+        use crate::identity::IdentityOrigin;
+        use crate::identity::test_helpers::{FailingIdentityStore, test_vc_issuer, test_vc_issuer_with};
+        use crate::source_auth::{AuthenticatedIdentity, ManagedIdentityConfig};
+        use crate::surface_context::IdentityVerification;
+        use axum::http::StatusCode;
+        use std::sync::Arc;
+
+        fn provider_key(key_id: &str) -> AuthenticatedIdentity {
+            AuthenticatedIdentity::ApiKey {
+                key_name: key_id.to_string(),
+                provider_agent_id: Some("provider-agent".to_string()),
+            }
+        }
+
+        fn plain_key(secret_id: &str) -> AuthenticatedIdentity {
+            AuthenticatedIdentity::ApiKey {
+                key_name: secret_id.to_string(),
+                provider_agent_id: None,
+            }
+        }
+
+        fn surface_with(
+            surface_id: &str,
+            inbound: Option<ManagedIdentityConfig>,
+            protected: Option<ManagedIdentityConfig>,
+        ) -> crate::config::agent_surface::AgentSurface {
+            let mut surface = mcp_surface(surface_id, "https://upstream.example/mcp", None);
+            surface.identity_slots.inbound = inbound;
+            surface
+                .identity_slots
+                .protected = protected;
+            surface
+        }
+
+        fn inbound_from_api_key(surface_id: &str) -> crate::config::agent_surface::AgentSurface {
+            surface_with(surface_id, Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }), None)
+        }
+
+        fn state_with(
+            surface: crate::config::agent_surface::AgentSurface,
+            issuer: Option<crate::identity::VCIssuer>,
+        ) -> crate::state::ProxyState {
+            let mut state = bare_proxy_state(surface, None);
+            state.vc_issuer = issuer.map(Arc::new);
+            state
+        }
+
+        async fn resolve(
+            state: &crate::state::ProxyState,
+            identity: Option<&AuthenticatedIdentity>,
+            source_auth_failed: bool,
+        ) -> Result<Option<crate::identity::IdentityResult>, axum::response::Response> {
+            let channel = state
+                .surface
+                .surface_id
+                .clone();
+            super::super::resolve_configured_caller_identity(
+                state,
+                "POST",
+                "/mcp",
+                &channel,
+                "direct",
+                identity,
+                source_auth_failed,
+            )
+            .await
+        }
+
+        fn resolve_count(
+            channel: &str,
+            outcome: &str,
+        ) -> u64 {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&[channel, "from_api_key", outcome])
+                .get()
+        }
+
+        async fn body_text(response: axum::response::Response) -> String {
+            String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        }
+
+        fn api_key_hash(key_id: &str) -> String {
+            crate::identity::credential_identity::hash_credential(&[
+                ("credential_type", "api_key"),
+                ("api_key_id", key_id),
+            ])
+        }
+
+        #[tokio::test]
+        async fn each_provider_key_gets_its_own_did_keyed_on_its_id() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(inbound_from_api_key("pak-two-keys"), Some(issuer));
+
+            let first = resolve(&state, Some(&provider_key("atgk_pak_client_1")), false)
+                .await
+                .unwrap()
+                .unwrap();
+            let second = resolve(&state, Some(&provider_key("atgk_pak_client_2")), false)
+                .await
+                .unwrap()
+                .unwrap();
+            let again = resolve(&state, Some(&provider_key("atgk_pak_client_1")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_ne!(first.did, second.did);
+            assert_eq!(again.did, first.did);
+            assert_eq!(first.hash, api_key_hash("atgk_pak_client_1"));
+            assert_eq!(second.hash, api_key_hash("atgk_pak_client_2"));
+            let store = state
+                .vc_issuer
+                .as_ref()
+                .unwrap()
+                .get_identity_store();
+            for result in [&first, &second] {
+                let record = store
+                    .find_by_hash(&result.hash)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.did, result.did);
+                assert_eq!(record.origin, Some(IdentityOrigin::ExternalCaller));
+            }
+            assert_eq!(first.verification, IdentityVerification::SourceAuth);
+            assert_eq!(resolve_count("pak-two-keys", "ok_new"), 2);
+            assert_eq!(resolve_count("pak-two-keys", "ok_cached"), 1);
+        }
+
+        #[tokio::test]
+        async fn provider_key_did_matches_the_configured_key_did() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let configured = crate::identity::credential_identity::derive_credential_identity(
+                &ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("atgk_pak_stable".into()),
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
+                configured
+            else {
+                panic!("API key identity is derived");
+            };
+            let before = issuer
+                .issue_or_get_caller_credential(identity_fields, Some(identity_hash), Some("pak-stable".into()), None)
+                .await
+                .unwrap();
+            let state = state_with(inbound_from_api_key("pak-stable"), Some(issuer));
+
+            let after = resolve(&state, Some(&provider_key("atgk_pak_stable")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(after.did, before.did);
+            assert!(!after.is_new);
+        }
+
+        #[tokio::test]
+        async fn stored_inbound_key_id_is_ignored() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let surface = surface_with(
+                "pak-stored-id",
+                Some(ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("atgk_pak_stored".into()),
+                }),
+                None,
+            );
+            let state = state_with(surface, Some(issuer));
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_presented")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.hash, api_key_hash("atgk_pak_presented"));
+        }
+
+        #[tokio::test]
+        async fn plain_key_is_identified_by_its_secret_and_unverified() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let mut state = state_with(inbound_from_api_key("pak-plain"), Some(issuer));
+            state.secrets_store = Some(Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
+                "pak-plain-secret",
+                None,
+                "v1",
+            )])));
+
+            let result = resolve(&state, Some(&plain_key("pak-plain-secret")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.hash, api_key_hash("pak-plain-secret"));
+            assert_eq!(result.verification, IdentityVerification::Unverified);
+            assert!(result.did.starts_with("did:"));
+        }
+
+        #[tokio::test]
+        async fn caller_attributable_failure_resolves_no_identity() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(inbound_from_api_key("pak-failed"), Some(issuer));
+
+            let result = resolve(&state, None, true)
+                .await
+                .unwrap();
+
+            assert!(result.is_none());
+        }
+
+        #[tokio::test]
+        async fn other_or_no_source_auth_is_refused() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(inbound_from_api_key("pak-wrong-auth"), Some(issuer));
+            let jwt = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
+                subject: "user-1".into(),
+                claims: serde_json::json!({"sub": "user-1"}),
+            };
+
+            for identity in [Some(&jwt), None] {
+                let response = resolve(&state, identity, false)
+                    .await
+                    .unwrap_err();
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(
+                    body_text(response)
+                        .await
+                        .contains("Caller identity requires API key authentication")
+                );
+            }
+            assert_eq!(resolve_count("pak-wrong-auth", "api_key_unavailable"), 2);
+        }
+
+        #[tokio::test]
+        async fn public_paths_resolve_no_identity() {
+            let state = state_with(inbound_from_api_key("pak-public"), None);
+            let channel = state
+                .surface
+                .surface_id
+                .clone();
+
+            let result = super::super::resolve_configured_caller_identity(
+                &state,
+                "GET",
+                "/.well-known/agent-card.json",
+                &channel,
+                "direct",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+            assert!(result.is_none());
+        }
+
+        #[tokio::test]
+        async fn protected_api_key_without_key_id_is_a_fixed_500() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let state = state_with(
+                surface_with("pak-protected-no-id", None, Some(ManagedIdentityConfig::FromApiKey { api_key_id: None })),
+                Some(issuer),
+            );
+
+            let response = resolve(&state, Some(&provider_key("atgk_pak_caller")), false)
+                .await
+                .unwrap_err();
+
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_text(response).await;
+            assert!(body.contains(super::super::CALLER_IDENTITY_UNRESOLVED), "{body}");
+            assert!(!body.contains("api_key_id"), "{body}");
+            assert_eq!(resolve_count("pak-protected-no-id", "api_key_id_missing"), 1);
+        }
+
+        #[tokio::test]
+        async fn missing_vc_issuer_resolves_no_identity() {
+            let state = state_with(inbound_from_api_key("pak-no-issuer"), None);
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_no_issuer")), false).await;
+
+            assert!(matches!(result, Ok(None)));
+            assert_eq!(resolve_count("pak-no-issuer", "vc_issuer_missing"), 1);
+        }
+
+        #[tokio::test]
+        async fn issuance_error_resolves_no_identity() {
+            let (issuer, _dir) = test_vc_issuer_with(Arc::new(FailingIdentityStore)).await;
+            let state = state_with(inbound_from_api_key("pak-issuer-error"), Some(issuer));
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_issuer_error")), false).await;
+
+            assert!(matches!(result, Ok(None)));
+            assert_eq!(resolve_count("pak-issuer-error", "vc_issuer_error"), 1);
+        }
+
+        async fn origin_of(
+            state: &crate::state::ProxyState,
+            hash: &str,
+        ) -> Option<IdentityOrigin> {
+            state
+                .vc_issuer
+                .as_ref()
+                .unwrap()
+                .get_identity_store()
+                .find_by_hash(hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .origin
+        }
+
+        #[tokio::test]
+        async fn caller_key_of_a_managed_agent_shares_its_did_and_role() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let (fields, hash) = crate::identity::credential_identity::global_resolver()
+                .resolve_presented_api_key("atgk_pak_managed", true, None)
+                .await
+                .unwrap();
+            let managed = issuer
+                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-shared".into()), None)
+                .await
+                .unwrap();
+            let state = state_with(inbound_from_api_key("pak-shared"), Some(issuer));
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_managed")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.did, managed.did);
+            assert!(!result.is_new);
+            assert_eq!(origin_of(&state, &hash).await, Some(IdentityOrigin::Managed));
+            assert_eq!(resolve_count("pak-shared", "ok_cached"), 1);
+        }
+
+        #[tokio::test]
+        async fn plain_key_of_a_managed_agent_shares_its_did() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let secrets: Arc<dyn crate::secrets::SecretsStore> = Arc::new(
+                crate::integrations::definitions::test_secrets::Secrets(vec![("pak-shared-secret", None, "v1")]),
+            );
+            let managed = crate::identity::credential_identity::derive_credential_identity(
+                &ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("pak-shared-secret".into()),
+                },
+                None,
+                Some(&secrets),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
+                managed
+            else {
+                panic!("API key identity is derived");
+            };
+            let managed = issuer
+                .issue_or_get_managed_credential(
+                    identity_fields,
+                    Some(identity_hash.clone()),
+                    Some("pak-plain-shared".into()),
+                    None,
+                )
+                .await
+                .unwrap();
+            let mut state = state_with(inbound_from_api_key("pak-plain-shared"), Some(issuer));
+            state.secrets_store = Some(secrets);
+
+            let result = resolve(&state, Some(&plain_key("pak-shared-secret")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.did, managed.did);
+            assert_eq!(origin_of(&state, &identity_hash).await, Some(IdentityOrigin::Managed));
+        }
+
+        async fn issuer_that_cannot_record_origins() -> (crate::identity::VCIssuer, tempfile::TempDir) {
+            crate::identity::test_helpers::test_vc_issuer_with(Arc::new(
+                crate::identity::test_helpers::OriginFailingIdentityStore(
+                    crate::identity::test_helpers::MockIdentityStore::new(),
+                ),
+            ))
+            .await
+        }
+
+        #[tokio::test]
+        async fn caller_key_whose_role_cannot_be_recorded_resolves() {
+            let (issuer, _dir) = issuer_that_cannot_record_origins().await;
+            let (fields, hash) = crate::identity::credential_identity::global_resolver()
+                .resolve_presented_api_key("atgk_pak_origin_caller", true, None)
+                .await
+                .unwrap();
+            let legacy = issuer
+                .issue_or_get_credential(fields, Some(hash), Some("pak-origin-caller".into()), None)
+                .await
+                .unwrap();
+            let state = state_with(inbound_from_api_key("pak-origin-caller"), Some(issuer));
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_origin_caller")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.did, legacy.did);
+            assert_eq!(resolve_count("pak-origin-caller", "ok_cached"), 1);
+            assert_eq!(resolve_count("pak-origin-caller", "vc_issuer_error"), 0);
+        }
+
+        #[tokio::test]
+        async fn managed_key_of_a_caller_shares_its_did_and_role() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let (fields, hash) = crate::identity::credential_identity::global_resolver()
+                .resolve_presented_api_key("atgk_pak_caller", true, None)
+                .await
+                .unwrap();
+            let caller = issuer
+                .issue_or_get_caller_credential(fields, Some(hash.clone()), Some("pak-shared-managed".into()), None)
+                .await
+                .unwrap();
+            let surface = surface_with(
+                "pak-shared-managed",
+                None,
+                Some(ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("atgk_pak_caller".into()),
+                }),
+            );
+            let state = state_with(surface, Some(issuer));
+
+            let result = resolve(&state, None, false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.did, caller.did);
+            assert_eq!(origin_of(&state, &hash).await, Some(IdentityOrigin::ExternalCaller));
+        }
+
+        #[tokio::test]
+        async fn managed_slot_fallback_keeps_the_stored_key() {
+            let (issuer, _dir) = test_vc_issuer().await;
+            let surface = surface_with(
+                "pak-managed-fallback",
+                None,
+                Some(ManagedIdentityConfig::FromApiKey {
+                    api_key_id: Some("atgk_pak_managed_slot".into()),
+                }),
+            );
+            let state = state_with(surface, Some(issuer));
+
+            let result = resolve(&state, Some(&provider_key("atgk_pak_other")), false)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(result.hash, api_key_hash("atgk_pak_managed_slot"));
+            assert_eq!(result.verification, IdentityVerification::Unverified);
+        }
+
+        #[test]
+        fn presented_key_replaces_a_body_identity_off_public_paths() {
+            let api_key = inbound_from_api_key("pak-precedence");
+            let mtls = surface_with(
+                "pak-precedence-mtls",
+                Some(ManagedIdentityConfig::FromMtls {
+                    certificate_id: "cert-1".into(),
+                }),
+                None,
+            );
+
+            assert!(super::super::configured_caller_identity_applies(&api_key, true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(&api_key, false, "POST", "/mcp"));
+            assert!(!super::super::configured_caller_identity_applies(
+                &api_key,
+                true,
+                "GET",
+                "/.well-known/agent-card.json"
+            ));
+            assert!(!super::super::configured_caller_identity_applies(&mtls, true, "POST", "/mcp"));
+            assert!(super::super::configured_caller_identity_applies(&mtls, false, "POST", "/mcp"));
+        }
+
+        fn asserted_agent() -> crate::surface_context::AgentContext {
+            crate::surface_context::AgentContext {
+                trust_verification: None,
+                source_trust_verification: None,
+                target_trust_verification: None,
+                did: Some("did:web:asserted.example".into()),
+                did_verified: false,
+                did_verification: None,
+                agent_dna: None,
+                trust_registry_did: None,
+                provider_did: None,
+                authority_did: None,
+                identity_issuer_did: None,
+                tr_identity_mismatch: false,
+            }
+        }
+
+        #[test]
+        fn presented_key_did_replaces_a_body_asserted_agent_did_off_public_paths() {
+            let api_key = inbound_from_api_key("pak-agent-did");
+            let key = crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:webvh:key".into()),
+                identity_hash: Some("hash-key".into()),
+                verification: IdentityVerification::SourceAuth,
+            };
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), Some(&key));
+            assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
+            assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            assert_eq!(agent.did, None);
+
+            let mut agent = asserted_agent();
+            agent.did = None;
+            agent.provider_did = Some("did:web:provider.example".into());
+            super::super::bind_api_key_caller_did(&api_key, "POST", "/mcp", Some(&mut agent), None);
+            assert_eq!(agent.did, None);
+            assert_eq!(agent.provider_did, None);
+
+            let mut agent = asserted_agent();
+            super::super::bind_api_key_caller_did(
+                &api_key,
+                "GET",
+                "/.well-known/agent-card.json",
+                Some(&mut agent),
+                Some(&key),
+            );
+            assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+        }
+
+        async fn mcp_proxy_policy_agent(
+            inbound: Option<ManagedIdentityConfig>
+        ) -> Option<crate::surface_context::AgentContext> {
+            let mut surface = mcp_surface("pak-mcp-proxy", "proxy://pak-mcp-proxy", None);
+            surface.identity_slots.inbound = inbound;
+            let state = bare_proxy_state(surface, None);
+            let body = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": { "_meta": { crate::config::MCP_TRUST_REGISTRY_KEY: {
+                    "agent_did": "did:web:asserted.example",
+                    "trust_registry_did": "did:web:registry.example",
+                    "provider_did": "did:web:provider.example"
+                } } }
+            }))
+            .unwrap();
+            let uri: axum::http::Uri = "/mcp".parse().unwrap();
+            super::super::evaluate_mcp_proxy_opa_policies(
+                &state,
+                "POST",
+                &uri,
+                &axum::http::HeaderMap::new(),
+                &body,
+                None,
+                None,
+                None,
+                None,
+                "trace-mcp-proxy",
+            )
+            .await
+            .unwrap()
+            .agent
+        }
+
+        #[tokio::test]
+        async fn mcp_proxy_policy_input_has_no_body_asserted_did_on_an_api_key_surface() {
+            let agent = mcp_proxy_policy_agent(Some(ManagedIdentityConfig::FromApiKey { api_key_id: None }))
+                .await
+                .unwrap();
+
+            assert_eq!(agent.did, None);
+            assert_eq!(agent.provider_did, None);
+        }
+
+        #[tokio::test]
+        async fn mcp_proxy_policy_input_keeps_the_body_asserted_did_on_other_surfaces() {
+            let agent = mcp_proxy_policy_agent(None)
+                .await
+                .unwrap();
+
+            assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+            assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
+        }
+
+        #[test]
+        fn other_caller_identities_keep_a_body_asserted_agent_did() {
+            let key = crate::surface_context::ExtensionIdentityContext {
+                did: Some("did:webvh:other".into()),
+                identity_hash: None,
+                verification: IdentityVerification::Unverified,
+            };
+            let surfaces = [
+                surface_with(
+                    "pak-agent-did-mtls",
+                    Some(ManagedIdentityConfig::FromMtls {
+                        certificate_id: "cert-1".into(),
+                    }),
+                    None,
+                ),
+                surface_with("pak-agent-did-none", None, None),
+            ];
+            for surface in &surfaces {
+                let mut agent = asserted_agent();
+                super::super::bind_api_key_caller_did(surface, "POST", "/mcp", Some(&mut agent), Some(&key));
+                assert_eq!(agent.did.as_deref(), Some("did:web:asserted.example"));
+                assert_eq!(agent.did_verification, None);
+            }
+        }
+    }
+
+    fn legacy_mcp_request(
+        uri: &str,
+        body: &serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION)
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    async fn send_to_surface(
+        state: &crate::state::ProxyState,
+        surface: crate::config::agent_surface::AgentSurface,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        super::multi_channel_proxy_handler(
+            axum::extract::ConnectInfo(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+            ),
+            axum::extract::State(direct_router_state(state, surface)),
+            request,
+        )
+        .await
+    }
+
+    fn tool_call_with_argument(argument: &str) -> serde_json::Value {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "send", "arguments": {"text": argument}
+        }})
+    }
+
+    /// Fields of every `http.client.send` span opened on the current thread.
+    #[derive(Clone, Default)]
+    struct ClientSendSpans(std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ClientSendSpans {
+        fn on_new_span(
+            &self,
+            attributes: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attributes.metadata().name() != "http.client.send" {
+                return;
+            }
+            let mut fields = SpanFields::default();
+            attributes.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap()
+                .push(fields.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct SpanFields(HashMap<String, String>);
+
+    impl tracing::field::Visit for SpanFields {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_client_send_span_records_the_target_url_without_query_values() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let target = crate::component_tests::helpers::MockServer::start_with_response(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}).to_string(),
+        )
+        .await;
+        let surface = mcp_surface("client-span-url", &target.url(), None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let spans = ClientSendSpans::default();
+        let _guard = crate::component_tests::helpers::thread_subscriber::set_thread_default(
+            tracing_subscriber::registry().with(spans.clone()),
+        );
+
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(
+                "/client-span-url?code=oauth-code-value&bare-token-value",
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let spans = spans.0.lock().unwrap();
+        let url = spans
+            .iter()
+            .find_map(|fields| fields.get("http.url"))
+            .expect("the request opened an http.client.send span");
+        assert!(url.starts_with(&target.url()), "{url}");
+        assert!(url.ends_with("?code=<redacted>&<redacted>"), "{url}");
+        assert!(!url.contains("oauth-code-value"), "{url}");
+        assert!(!url.contains("bare-token-value"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn a_path_no_surface_serves_logs_one_bounded_line_naming_no_surface() {
+        let surface = mcp_surface("tenant-only-surface", "http://127.0.0.1:9", None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let capability_id = uuid::Uuid::new_v4().to_string();
+        let tail = "a".repeat(1000);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response = send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request(&format!("/onboard/{capability_id}/{tail}"), &serde_json::json!({})),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = logs.text();
+        let misses: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("No surface route matches path"))
+            .collect();
+        assert_eq!(misses.len(), 1, "{text}");
+        let shortened = crate::observability::loggable::secret(&capability_id);
+        assert!(
+            misses[0].contains(&crate::observability::loggable::untrusted(&format!("/onboard/{shortened}/{tail}"))),
+            "{}",
+            misses[0]
+        );
+        assert!(!text.contains(&tail), "a log holds the whole path: {text}");
+        assert!(!text.contains(&capability_id), "a log holds the capability id: {text}");
+        assert!(!text.contains("tenant-only-surface"), "a log names a surface: {text}");
+    }
+
+    #[tokio::test]
+    async fn a_matched_routes_caller_path_is_logged_bounded_with_capability_ids_shortened() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "guarded", "name": "guarded",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/guarded", "protocol": "mcp",
+                "caller_authentication": {"methods": [{
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": []
+                }]}},
+            "target": {"endpoint": "http://127.0.0.1:9"}
+        }))
+        .unwrap();
+        let state = bare_proxy_state(surface.clone(), None);
+        let capability_id = uuid::Uuid::new_v4().to_string();
+        let shortened = crate::observability::loggable::secret(&capability_id);
+        let padding = "a".repeat(1000);
+
+        // Without source authentication the surface's handler refuses the
+        // request after logging its entry; an unknown alias is refused at routing.
+        for (route, status, reaches_surface_handler) in [
+            ("/guarded", axum::http::StatusCode::INTERNAL_SERVER_ERROR, true),
+            ("/guarded$canary", axum::http::StatusCode::NOT_FOUND, false),
+        ] {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let path = format!("{route}/onboard/{capability_id}/{padding}");
+
+            let response =
+                send_to_surface(&state, surface.clone(), legacy_mcp_request(&path, &serde_json::json!({}))).await;
+
+            assert_eq!(response.status(), status, "{route}");
+            let text = logs.text();
+            let matched = text
+                .lines()
+                .find(|line| line.contains("Matched channel 'guarded'"))
+                .unwrap_or_else(|| panic!("{route}: no match line: {text}"));
+            assert!(matched.contains(&format!("{route}/onboard/{shortened}/aaa")), "{matched}");
+            assert!(matched.contains("aaa\"..."), "{route}: the path is not cut: {matched}");
+            assert_eq!(text.contains("INNER HANDLER ENTRY"), reaches_surface_handler, "{route}: {text}");
+            assert!(!text.contains(&padding), "{route}: a log holds the whole path: {text}");
+            assert!(!text.contains(&capability_id), "{route}: a log holds the capability id: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_target_receives_only_the_gateway_target_auth_header() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let mut surface = mcp_surface("target-auth-header", &target.url, None);
+        surface.target.auth = Some(
+            serde_json::from_value(serde_json::json!({"method": {"static_secret": {
+                "secret_id": "vendor-key", "header_name": "X-Vendor-Key", "header_format": "{value}"
+            }}}))
+            .unwrap(),
+        );
+        let mut state = bare_proxy_state(surface.clone(), None);
+        state.secrets_store =
+            Some(std::sync::Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
+                "vendor-key",
+                None,
+                "gateway-key",
+            )])));
+        let mut request = legacy_mcp_request("/target-auth-header", &tool_call_with_argument("value"));
+        request
+            .headers_mut()
+            .append("x-vendor-key", HeaderValue::from_static("caller-one"));
+        request
+            .headers_mut()
+            .append("X-Vendor-Key", HeaderValue::from_static("caller-two"));
+
+        let response = send_to_surface(&state, surface, request).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        let values: Vec<_> = received[0]
+            .get_all("x-vendor-key")
+            .iter()
+            .collect();
+        assert_eq!(values, ["gateway-key"]);
+    }
+
+    #[tokio::test]
+    async fn a_connection_routed_with_a_disabled_surface_is_refused() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let surface = mcp_surface("retired-surface", &target.url, None);
+        let mut router = direct_router_state(&bare_proxy_state(surface.clone(), None), surface.clone());
+        let cache = std::sync::Arc::new(crate::surfaces::ResolvedSurfaceCache::new());
+        cache
+            .upsert(&surface)
+            .unwrap();
+        router.resolved_surface_cache = cache.clone();
+        let send = || {
+            super::multi_channel_proxy_handler(
+                axum::extract::ConnectInfo(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                ),
+                axum::extract::State(router.clone()),
+                legacy_mcp_request(
+                    "/retired-surface",
+                    &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                ),
+            )
+        };
+        assert_eq!(send().await.status(), axum::http::StatusCode::OK);
+        assert_eq!(target.received().len(), 1);
+
+        cache.remove(&surface.surface_id);
+
+        assert_eq!(send().await.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(target.received().len(), 1, "a retired surface must not reach its target");
+    }
+
+    #[tokio::test]
+    async fn an_opa_enforced_request_logs_neither_tool_arguments_nor_header_values() {
+        use std::sync::atomic::Ordering;
+
+        let target = crate::component_tests::helpers::MockServer::start().await;
+        let surface = mcp_surface("opa-input-logs", &target.url(), Some("deny-all"));
+        let policies = crate::policies::SurfacePolicyManager::new();
+        policies
+            .load_policy_text("opa-input-logs", "package surface.policy\n\ndefault allow := false\n")
+            .unwrap();
+        let state = bare_proxy_state(surface.clone(), Some(std::sync::Arc::new(policies)));
+        let mut request = legacy_mcp_request("/opa-input-logs", &tool_call_with_argument("tool-argument-marker"));
+        request
+            .headers_mut()
+            .insert("x-request-note", HeaderValue::from_static("header-value-marker"));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(&state, surface, request).await;
+
+        let text = logs.text();
+        assert!(text.contains("policy decision: deny"), "{text}");
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert!(!text.contains("tool-argument-marker"), "a log holds a tool argument: {text}");
+        assert!(!text.contains("header-value-marker"), "a log holds a header value: {text}");
+    }
+
+    /// An upstream that answers every request with `404`, as a Legacy SSE server
+    /// does for a direct POST to its root.
+    async fn upstream_answering_not_found() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().fallback(|| async { axum::http::StatusCode::NOT_FOUND });
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_legacy_sse_fallback_logs_the_status_and_size_but_not_the_body() {
+        let target = upstream_answering_not_found().await;
+        let surface = mcp_surface("sse-fallback-logs", &target, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        send_to_surface(
+            &state,
+            surface,
+            legacy_mcp_request("/sse-fallback-logs", &tool_call_with_argument("tool-argument-marker")),
+        )
+        .await;
+
+        let text = logs.text();
+        let fallback = text
+            .lines()
+            .find(|line| line.contains("falling back to Legacy SSE transport"))
+            .unwrap_or_else(|| panic!("no fallback log line: {text}"));
+        assert!(fallback.contains("status=404 Not Found"), "{fallback}");
+        assert!(fallback.contains("body_bytes="), "{fallback}");
+        assert!(text.contains("SSE fallback also failed"), "{text}");
+        assert!(!text.contains("tool-argument-marker"), "a log holds the request body: {text}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_target_answers_a_generic_error_and_logs_no_target_url() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let endpoint = format!("http://127.0.0.1:{port}/agent?api_key=endpoint-key-value");
+        let state = bare_proxy_state(mcp_surface("unreachable-target", &endpoint, None), None);
+        let error = reqwest::Client::new()
+            .get(&endpoint)
+            .send()
+            .await
+            .expect_err("nothing listens on the port");
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response =
+            super::handle_upstream_error(error, &state, "127.0.0.1:12345", &None, "unreachable-target", &None);
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], "Connection failed to target endpoint");
+        let text = logs.text();
+        assert!(text.contains("Failed to forward request to upstream - bad gateway"), "{text}");
+        assert!(text.contains(&format!("target=http://127.0.0.1:{port}/agent?api_key=<redacted>")), "{text}");
+        assert!(text.contains("error=error sending request "), "{text}");
+        assert!(!text.contains("endpoint-key-value"), "a log holds the target's query value: {text}");
+        assert!(!text.contains("for url"), "a log holds the reqwest error URL: {text}");
+    }
 }
 
 #[cfg(test)]
-mod fabric_extended_card_tests {
+mod fabric_send_tests {
     use std::future::Future;
     use std::sync::Arc;
 
     use serde_json::json;
+
+    use super::agent_pay_gate::install_test_transport;
+    use super::agent_pay_gate::tests::MockGate;
 
     const TARGET_URL: &str = "https://backend.internal/a2a";
 
@@ -20387,6 +23640,8 @@ mod fabric_extended_card_tests {
     struct FabricPeer {
         state: crate::state::ProxyState,
         peer_did: String,
+        /// The body of every ForwardRequest the peer was sent.
+        forwards: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         _root: tempfile::TempDir,
         _issuer_dir: tempfile::TempDir,
     }
@@ -20397,11 +23652,57 @@ mod fabric_extended_card_tests {
         }
     }
 
+    /// The peer's `ForwardResponse` to `request`, with `status` and `body`.
+    fn forward_response(
+        request: &affinidi_messaging_didcomm::Message,
+        responder_did: &str,
+        status: u16,
+        body: &str,
+    ) -> crate::gateways::connection_points::messages::ReceivedMessage {
+        crate::gateways::connection_points::messages::ReceivedMessage::new(
+            "cp-1".into(),
+            "peer".into(),
+            crate::messages::MessageType::ForwardResponse
+                .as_str()
+                .into(),
+            uuid::Uuid::new_v4().to_string(),
+            Some(request.id.clone()),
+            Some(responder_did.to_string()),
+            vec!["did:example:connection-point".into()],
+            None,
+            None,
+            json!({"status": status, "headers": {"content-type": "application/json"}, "body": body}),
+            crate::gateways::connection_points::messages::MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: json!({}),
+            },
+        )
+    }
+
     /// A gateway whose A2A surface targets a Fabric peer that answers every
     /// ForwardRequest with `status` and `body`.
     async fn fabric_peer_answering(
         status: u16,
         body: serde_json::Value,
+    ) -> FabricPeer {
+        fabric_peer_fronted_by(status, body, |peer_id| {
+            json!({
+                "surface_id": "fabric-a2a", "name": "Fabric A2A",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                "target": {"endpoint": format!("fabric://{peer_id}/remote-surface")}
+            })
+        })
+        .await
+    }
+
+    /// A gateway whose surface, built from the Fabric peer's id, targets a peer
+    /// that answers every ForwardRequest with `status` and `body`.
+    async fn fabric_peer_fronted_by(
+        status: u16,
+        body: serde_json::Value,
+        surface: impl FnOnce(&str) -> serde_json::Value,
     ) -> FabricPeer {
         let root = tempfile::tempdir().unwrap();
         let peer_did = format!("did:example:peer-{}", uuid::Uuid::new_v4());
@@ -20432,36 +23733,24 @@ mod fabric_extended_card_tests {
 
         let responder_did = peer_did.clone();
         let reply_body = body.to_string();
+        let forwards = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = forwards.clone();
+        // A card read over Fabric waits on the mediator's live stream, which this
+        // peer cannot answer; every other forward has registered a waiter.
         crate::comm::didcomm::client::test_send_hook::install(&peer_did, move |request| {
-            let reply = crate::gateways::connection_points::messages::ReceivedMessage::new(
-                "cp-1".into(),
-                "peer".into(),
-                crate::messages::MessageType::ForwardResponse
-                    .as_str()
-                    .into(),
-                uuid::Uuid::new_v4().to_string(),
-                Some(request.id.clone()),
-                Some(responder_did.clone()),
-                vec!["did:example:connection-point".into()],
-                None,
-                None,
-                json!({"status": status, "headers": {"content-type": "application/json"}, "body": reply_body}),
-                crate::gateways::connection_points::messages::MessageMetadata {
-                    encrypted: true,
-                    authenticated: true,
-                    from_key: None,
-                    extra: json!({}),
-                },
-            );
-            assert!(crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply));
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.body.clone());
+            let reply = forward_response(request, &responder_did, status, &reply_body);
+            let answered = crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply);
+            let card_read = request.body["path"]
+                .as_str()
+                .is_some_and(crate::proxy::paths::is_well_known_agent_card_path);
+            assert!(answered || card_read, "an unanswered forward: {}", request.body);
         });
 
-        let surface = serde_json::from_value(json!({
-            "surface_id": "fabric-a2a", "name": "Fabric A2A",
-            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
-            "target": {"endpoint": format!("fabric://{}/remote-surface", peer.id)}
-        }))
-        .unwrap();
+        let surface = serde_json::from_value(surface(&peer.id)).unwrap();
         let network = serde_json::from_value(json!({
             "did": {"domain": "gateway.example"},
             "webauthn": {"rp_id": "gateway.example", "external_origin": "https://gateway.example"},
@@ -20497,8 +23786,6 @@ mod fabric_extended_card_tests {
             policy_manager: None,
             gateway_policy_manager: None,
             didauth_session_store: Arc::new(crate::didauth::DidAuthSessionStore::new()),
-            transaction_store: None,
-            mpp_transaction_store: None,
             trust_registry_listener_manager: None,
             source_auth_middleware: None,
             #[cfg(feature = "didwebvh")]
@@ -20507,18 +23794,20 @@ mod fabric_extended_card_tests {
             didwebvh_log_manager: None,
             credential_provider_store: None,
             delegation_vault_store: None,
+            egress_allowlist: None,
             gateway_base_url: Some("https://gateway.example".into()),
             transit_token_issuer: None,
             mcp_proxy_store: None,
             a2a_proxy_store: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
+            served_surface: Arc::new(crate::config::agent_surface::AgentSurface::clone(&surface)),
             surface: Arc::new(surface),
         };
         FabricPeer {
             state,
             peer_did,
+            forwards,
             _root: root,
             _issuer_dir: issuer_dir,
         }
@@ -20657,32 +23946,36 @@ mod fabric_extended_card_tests {
                 "metadata": {"https://fabric.affinidi.io/extensions/agent-identity/v1": {"cloudProvider": "local", "model": "gpt-4"}}}}
         });
         let caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
         };
 
         let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
             peer.state.clone(),
-            "Fabric A2A",
-            axum::http::Method::POST,
-            "https://gateway.example/a2a"
-                .parse()
-                .unwrap(),
-            axum::http::HeaderMap::new(),
-            "127.0.0.1:12345".to_string(),
-            std::time::Instant::now(),
-            super::ConnectionGuard::new(None, None),
-            axum::body::Bytes::from(body.to_string()),
-            "trace-1".to_string(),
-            None,
-            Some(caller),
-            None,
-            None,
-            crate::mcp::meta::McpMetadataContext::default(),
-            None,
-            None,
-            None,
-            None,
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: Some(caller),
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
         )))
         .await;
 
@@ -20710,5 +24003,1121 @@ mod fabric_extended_card_tests {
                 .and_then(|caller| caller.email.as_deref()),
             Some("ada@example.com")
         );
+    }
+    /// The status a Fabric send answers for `path` on a surface whose Target authentication
+    /// uses a secret that does not exist, with fallback `passthrough`.
+    async fn fabric_send_status_with_passthrough_target_auth(path: &str) -> axum::http::StatusCode {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let mut surface = (*peer.state.surface).clone();
+        surface.target.auth = Some(
+            serde_json::from_value(json!({
+                "method": {"static_secret": {"secret_id": "missing", "header_name": "X-Target-Key"}},
+                "fallback": "passthrough"
+            }))
+            .unwrap(),
+        );
+        peer.state.surface = Arc::new(surface);
+        let result = Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: format!("https://gateway.example{path}")
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(
+                    json!({"jsonrpc": "2.0", "id": "m-1", "method": "message/send"}).to_string(),
+                ),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        ))
+        .await;
+        match result {
+            Ok(response) | Err(response) => response.status(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fabric_send_below_its_path_goes_out_and_one_climbing_out_is_refused() {
+        for path in ["/x", "/x/./y", "/x/../y"] {
+            assert_eq!(
+                fabric_send_status_with_passthrough_target_auth(path).await,
+                axum::http::StatusCode::OK,
+                "{path}"
+            );
+        }
+        for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/%2E%2E/%2e%2e/admin"] {
+            assert_eq!(
+                fabric_send_status_with_passthrough_target_auth(path).await,
+                axum::http::StatusCode::BAD_GATEWAY,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fabric_send_target_trust_check_runs_the_surface_target_list_only() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let registry_dir = tempfile::tempdir().unwrap();
+        peer.state
+            .trust_registry_listener_manager =
+            Some(crate::trust_registries::TrustRegistryListenerManager::with_retry_policy(
+                "gateway.example".to_string(),
+                registry_dir
+                    .path()
+                    .to_path_buf(),
+                None,
+                crate::comm::connection_health::ReconnectPolicy::default(),
+            ));
+        let element = |id: &str, authority: &str| {
+            json!({
+                "id": id,
+                "trust_registry_id": "tr-none",
+                "query_type": "recognition",
+                "query": {"authority_id": authority, "entity_id": "did:x:entity"}
+            })
+        };
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .target
+            .trust_check_list = vec![serde_json::from_value(element("fabric-target", "did:x:target")).unwrap()];
+        surface.transit = Some(
+            serde_json::from_value(json!({"points": [{
+                "alias": "partner-a",
+                "target_endpoint": "https://partner.example/a2a",
+                "protocol": "a2a",
+                "trust_check_list": [element("tp-a", "did:x:transit"), element("tp-b", "did:x:transit")]
+            }]}))
+            .unwrap(),
+        );
+        surface
+            .access_point
+            .listen_address = "http://127.0.0.1:1".to_string();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                registry_dir
+                    .path()
+                    .join("policies")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+            "id": "allow-all", "name": "Allow all", "policy_type": "agent_surface",
+            "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        policies
+            .save(policy.clone())
+            .await
+            .unwrap();
+        surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: policy.id,
+            require_agent_context: false,
+        });
+        let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        policy_manager.set_policy_definition_store(policies);
+        policy_manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        peer.state.policy_manager = Some(policy_manager);
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let (_, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        )))
+        .await;
+
+        let trust_checks: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck {
+                    leg,
+                    authority_id,
+                    transit_point,
+                    ..
+                } => Some((leg.clone(), authority_id.clone(), transit_point.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trust_checks, vec![("target".to_string(), Some("did:x:target".to_string()), None)]);
+    }
+
+    const RECEIPT: &str = "fabric-send-receipt";
+
+    /// An MCP surface in front of the Fabric peer that charges `^paid_` tools
+    /// through the agent-pay gateway `gate_id`.
+    fn paid_mcp_surface(
+        peer_id: &str,
+        gate_id: &str,
+    ) -> serde_json::Value {
+        json!({
+            "surface_id": "fabric-paid-mcp", "name": "Fabric paid MCP",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": format!("fabric://{peer_id}/remote-surface"), "payment_policy": {
+                "type": "agent_pay", "payment_gateway_id": gate_id, "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+            }}
+        })
+    }
+
+    /// A payment gate that takes any credential and answers a request without
+    /// one with a challenge.
+    fn taking_gate(gate_id: &str) -> Arc<MockGate> {
+        let gate = MockGate::answering(200, &[("Payment-Receipt", RECEIPT), ("Cache-Control", "no-store")], json!({}))
+            .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+        install_test_transport(gate_id, gate.clone());
+        gate
+    }
+
+    fn tool_call(tool: &str) -> serde_json::Value {
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": tool, "arguments": {}}})
+    }
+
+    async fn post(
+        state: &crate::state::ProxyState,
+        uri: &str,
+        body: &serde_json::Value,
+        credential: Option<&str>,
+    ) -> axum::response::Response {
+        let credential = credential.map(|credential| ("payment-signature", credential));
+        post_with(state, uri, body, credential.as_slice()).await
+    }
+
+    async fn post_with(
+        state: &crate::state::ProxyState,
+        uri: &str,
+        body: &serde_json::Value,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::pin(super::proxy_handler_with_mcp_runtime(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state.clone(),
+                request
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                None,
+            )),
+        )
+        .await
+        .expect("the request is answered")
+        .unwrap_or_else(|response| response)
+    }
+
+    async fn answer(
+        response: axum::response::Response
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, 65536)
+            .await
+            .unwrap();
+        (parts.status, parts.headers, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn forwarded_a_credential(request: &serde_json::Value) -> bool {
+        request["headers"]
+            .as_object()
+            .is_some_and(|headers| {
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("payment-signature"))
+            })
+    }
+
+    #[test]
+    fn a_paid_call_over_the_fabric_is_charged_just_before_it_is_sent() {
+        run_on_large_stack(a_paid_call_over_the_fabric_is_charged_just_before_it_is_sent_flow());
+    }
+
+    async fn a_paid_call_over_the_fabric_is_charged_just_before_it_is_sent_flow() {
+        let gate = taking_gate("fabric-send-gate");
+        let peer = fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
+            paid_mcp_surface(id, "fabric-send-gate")
+        })
+        .await;
+        let url = "https://gateway.example/mcp";
+
+        let (status, headers, body) =
+            answer(post(&peer.state, url, &tool_call("free_tool"), Some("unused-proof")).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(!headers.contains_key("payment-response"), "a free call has no receipt");
+        assert_eq!(gate.calls(), 0);
+        let sent = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(sent.len(), 1);
+        assert!(!forwarded_a_credential(&sent[0]), "the credential of a free call is not relayed: {}", sent[0]);
+
+        let (status, headers, body) = answer(post(&peer.state, url, &tool_call("paid_tool"), None).await).await;
+        assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(body["error"]["code"], -32042);
+        assert_eq!(body["error"]["data"]["x402"], json!({"accepts": []}));
+        assert_eq!(headers["payment-required"], "eyJ4IjoxfQ==");
+        assert_eq!(gate.calls(), 1);
+        assert_eq!(
+            peer.forwards
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "an unpaid call never reaches the peer"
+        );
+
+        let (status, headers, body) =
+            answer(post(&peer.state, url, &tool_call("paid_tool"), Some("send-proof")).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(headers["payment-response"], RECEIPT);
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(body["result"]["_meta"]["org.paymentauth/receipt"], RECEIPT);
+        assert_eq!(gate.calls(), 2);
+        let sent = peer
+            .forwards
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(sent.len(), 2);
+        assert!(!forwarded_a_credential(&sent[1]), "the consumed credential is not relayed: {}", sent[1]);
+
+        let (status, headers, body) =
+            answer(post(&peer.state, url, &tool_call("paid_tool"), Some("send-proof")).await).await;
+        assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert_eq!(body["error"]["code"], -32043);
+        assert_eq!(body["error"]["data"]["failure"]["reason"], "payment_already_used");
+        assert_eq!(headers["payment-required"], "eyJ4IjoxfQ==", "a fresh challenge comes with it");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 4, "the replayed payment, then a request for a fresh challenge");
+        assert_eq!(
+            peer.forwards
+                .lock()
+                .unwrap()
+                .len(),
+            2,
+            "a used payment is not sent again"
+        );
+    }
+
+    #[test]
+    fn a_paid_call_that_fails_over_the_fabric_still_carries_its_receipt() {
+        run_on_large_stack(a_paid_call_that_fails_over_the_fabric_still_carries_its_receipt_flow());
+    }
+
+    async fn a_paid_call_that_fails_over_the_fabric_still_carries_its_receipt_flow() {
+        let gate = taking_gate("fabric-failing-gate");
+        let peer =
+            fabric_peer_fronted_by(500, json!({"error": "boom"}), |id| paid_mcp_surface(id, "fabric-failing-gate"))
+                .await;
+
+        let (status, headers, _) = answer(
+            post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), Some("failing-proof")).await,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(headers["payment-response"], RECEIPT, "the caller can see it was charged");
+        assert_eq!(gate.calls(), 1);
+
+        crate::comm::didcomm::client::test_send_hook::uninstall(&peer.peer_did);
+        let (status, headers, _) = answer(
+            post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), Some("unreachable-proof")).await,
+        )
+        .await;
+        assert!(status.is_server_error(), "{status}");
+        assert_eq!(headers["payment-response"], RECEIPT, "an error answer carries it too");
+        assert_eq!(gate.calls(), 2);
+    }
+
+    /// The next event of a legacy SSE stream: its name and data.
+    async fn next_event(body: &mut axum::body::Body) -> (String, String) {
+        use http_body_util::BodyExt;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+            .await
+            .expect("an event arrives")
+            .expect("the stream is open")
+            .unwrap();
+        let text = String::from_utf8(
+            frame
+                .into_data()
+                .expect("a data frame")
+                .to_vec(),
+        )
+        .unwrap();
+        let field = |name: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .map(|value| value.trim_start().to_string())
+                .unwrap_or_default()
+        };
+        (field("event:"), field("data:"))
+    }
+
+    #[test]
+    fn a_legacy_sse_session_post_over_the_fabric_delivers_what_the_payment_gate_answered() {
+        run_on_large_stack(a_legacy_sse_session_post_over_the_fabric_delivers_what_the_payment_gate_answered_flow());
+    }
+
+    async fn a_legacy_sse_session_post_over_the_fabric_delivers_what_the_payment_gate_answered_flow() {
+        let gate = taking_gate("fabric-sse-gate");
+        let peer = fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
+            paid_mcp_surface(id, "fabric-sse-gate")
+        })
+        .await;
+        let (session_id, stream) = super::CHANNEL_SSE_SESSION_MGR
+            .create_session()
+            .await
+            .unwrap();
+        let mut events =
+            crate::mcp::sse_server::build_legacy_sse_response(session_id.clone(), stream, "/mcp").into_body();
+        let (name, endpoint) = next_event(&mut events).await;
+        assert_eq!((name.as_str(), endpoint.contains(&session_id)), ("endpoint", true));
+        let url = format!("https://gateway.example/mcp/messages/?session_id={session_id}");
+
+        for (credential, code, reason) in [
+            (None, Some(-32042), None),
+            (Some("sse-proof"), None, None),
+            (Some("sse-proof"), Some(-32043), Some("payment_already_used")),
+        ] {
+            let (status, _, _) = answer(post(&peer.state, &url, &tool_call("paid_tool"), credential).await).await;
+            assert_eq!(status, axum::http::StatusCode::ACCEPTED, "{credential:?}");
+            let (name, data) = next_event(&mut events).await;
+            assert_eq!(name, "message", "{credential:?}");
+            let message: serde_json::Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(message["id"], 7, "{message}");
+            match code {
+                Some(code) => {
+                    assert_eq!(message["error"]["code"], code, "{credential:?}: {message}");
+                    assert_eq!(message["error"]["data"]["failure"]["reason"].as_str(), reason, "{message}");
+                    assert_eq!(message["error"]["data"]["x402"], json!({"accepts": []}), "{message}");
+                }
+                None => {
+                    assert_eq!(message["result"]["_meta"]["org.paymentauth/receipt"], RECEIPT, "{message}");
+                }
+            }
+        }
+        assert_eq!(gate.calls(), 4, "unpaid; paid; replayed and its fresh challenge");
+        assert_eq!(
+            peer.forwards
+                .lock()
+                .unwrap()
+                .len(),
+            1,
+            "only the paid call reached the peer"
+        );
+        super::CHANNEL_SSE_SESSION_MGR
+            .remove_session(&session_id)
+            .await;
+    }
+
+    #[test]
+    fn the_gateway_policy_sees_whether_a_direct_request_is_chargeable() {
+        run_on_large_stack(the_gateway_policy_sees_whether_a_direct_request_is_chargeable_flow());
+    }
+
+    async fn the_gateway_policy_sees_whether_a_direct_request_is_chargeable_flow() {
+        use crate::gateways::types::{Gateway, GatewayOpaPolicyConfig, GatewayType};
+
+        let gate = taking_gate("fabric-policy-gate");
+        let mut peer =
+            fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
+                paid_mcp_surface(id, "fabric-policy-gate")
+            })
+            .await;
+        let manager = crate::policies::GatewayPolicyManager::new();
+        let mut gateway =
+            Gateway::new("Self".into(), String::new(), "did:web:gateway.example".into(), GatewayType::SelfGateway);
+        gateway.opa_policy_config = Some(GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: "package gateway.policy\ndefault allow = false\nallow if {\n  input.payment.required == true\n}"
+                .into(),
+            ..Default::default()
+        });
+        manager
+            .update_gateway_policy(&gateway)
+            .await
+            .unwrap();
+        peer.state
+            .gateway_policy_manager = Some(Arc::new(manager));
+
+        let (status, _, body) =
+            answer(post(&peer.state, "https://gateway.example/mcp", &tool_call("free_tool"), None).await).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "a request that is not chargeable is denied: {body}");
+        assert_eq!(gate.calls(), 0);
+
+        let (status, _, body) =
+            answer(post(&peer.state, "https://gateway.example/mcp", &tool_call("paid_tool"), None).await).await;
+        assert_eq!(status, axum::http::StatusCode::PAYMENT_REQUIRED, "a chargeable one is allowed through: {body}");
+        assert_eq!(gate.calls(), 1);
+    }
+
+    #[test]
+    fn a_proxy_target_is_charged_only_after_every_refusal_that_does_not_depend_on_payment() {
+        run_on_large_stack(a_proxy_target_is_charged_only_after_every_refusal_that_does_not_depend_on_payment_flow());
+    }
+
+    async fn a_proxy_target_is_charged_only_after_every_refusal_that_does_not_depend_on_payment_flow() {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        let gate = taking_gate("fabric-proxy-gate");
+        let backend = crate::component_tests::helpers::MockServer::start_with_response(r#"{"ok": true}"#).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let spec = json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+            "/alpha": {"get": {"operationId": "paid_alpha", "summary": "Alpha", "responses": {"200": {"description": "OK"}}}},
+            "/admin": {"get": {"operationId": "paid_admin", "summary": "Admin", "responses": {"200": {"description": "OK"}}}}
+        }});
+        let mut active = crate::mcp_proxies::types::McpProxy::new(
+            "Active tools".into(),
+            String::new(),
+            backend.url(),
+            spec.to_string(),
+            "/mcp".into(),
+            "/active".into(),
+        );
+        let mut disabled = active.clone();
+        disabled.id = uuid::Uuid::new_v4().to_string();
+        disabled.status = crate::mcp_proxies::types::McpProxyStatus::Disabled;
+        disabled.endpoint_path = "/disabled".into();
+        active.endpoint_path = "/active".into();
+        for proxy in [&active, &disabled] {
+            store
+                .create(proxy)
+                .await
+                .unwrap();
+        }
+        let mut peer = fabric_peer_fronted_by(200, json!({}), |id| paid_mcp_surface(id, "fabric-proxy-gate")).await;
+        let policies = Arc::new(crate::policies::SurfacePolicyManager::new());
+        peer.state.mcp_proxy_store = Some(store);
+        peer.state.policy_manager = Some(policies.clone());
+        let surface = |proxy: &crate::mcp_proxies::types::McpProxy| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": "proxy-paid", "name": "Proxy paid",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {
+                    "endpoint": format!("proxy://{}", proxy.id),
+                    "mcp_tool_gating": {"gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^paid_admin"]}}]},
+                    "payment_policy": {
+                        "type": "agent_pay", "payment_gateway_id": "fabric-proxy-gate", "payment_surface_id": "pay-1",
+                        "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+                    }
+                }
+            }))
+            .unwrap()
+        };
+        let url = "https://gateway.example/mcp";
+
+        let disabled_surface = surface(&disabled);
+        policies
+            .update_channel_policy(&disabled_surface)
+            .await
+            .unwrap();
+        peer.state.surface = Arc::new(disabled_surface);
+        let (status, headers, body) =
+            answer(post(&peer.state, url, &tool_call("paid_alpha"), Some("proxy-proof-1")).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["error"]["message"], "MCP proxy is disabled");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 0, "a disabled proxy is refused before any payment");
+
+        let active_surface = surface(&active);
+        policies
+            .update_channel_policy(&active_surface)
+            .await
+            .unwrap();
+        peer.state.surface = Arc::new(active_surface.clone());
+        let (_, headers, body) =
+            answer(post(&peer.state, url, &tool_call("paid_admin"), Some("proxy-proof-2")).await).await;
+        assert!(body.get("error").is_some(), "{body}");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 0, "a denied tool is refused before any payment");
+        assert_eq!(
+            backend
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let mut missing = active.clone();
+        missing.id = "no-such-proxy".into();
+        peer.state.surface = Arc::new(surface(&missing));
+        let modern = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "paid_alpha", "arguments": {}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }});
+        let modern_headers = [
+            ("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "paid_alpha"),
+            ("accept", "application/json, text/event-stream"),
+            ("payment-signature", "proxy-proof-4"),
+        ];
+        let (status, headers, _) = answer(post_with(&peer.state, url, &modern, &modern_headers).await).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "a proxy that is not there is refused");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 0, "a modern request for a missing proxy is refused before any payment");
+
+        peer.state.surface = Arc::new(active_surface);
+        let (status, headers, body) =
+            answer(post(&peer.state, url, &tool_call("paid_alpha"), Some("proxy-proof-3")).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(headers["payment-response"], RECEIPT);
+        assert_eq!(body["result"]["_meta"]["org.paymentauth/receipt"], RECEIPT, "{body}");
+        assert_eq!(gate.calls(), 1, "an allowed call is charged once");
+        assert_eq!(
+            backend
+                .request_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn a_credential_in_a_tool_argument_or_meta_never_reaches_policy_or_a_proxy_backend() {
+        run_on_large_stack(a_credential_in_a_tool_argument_or_meta_never_reaches_policy_or_a_proxy_backend_flow());
+    }
+
+    async fn a_credential_in_a_tool_argument_or_meta_never_reaches_policy_or_a_proxy_backend_flow() {
+        use crate::gateways::types::{Gateway, GatewayOpaPolicyConfig, GatewayType};
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        const SECRET: &str = "S1-S2-SECRET";
+        let gate = taking_gate("credential-gate");
+        let backend = crate::component_tests::helpers::MockServer::start_with_response(r#"{"ok": true}"#).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let spec = json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+            "/echo": {"post": {"operationId": "paid_echo", "summary": "Echo",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "properties": {"payment_signature": {"type": "string"}, "q": {"type": "string"}}
+                }}}},
+                "responses": {"200": {"description": "OK"}}}}
+        }});
+        let mut proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Echo".into(),
+            String::new(),
+            backend.url(),
+            spec.to_string(),
+            "/mcp".into(),
+            "/echo-proxy".into(),
+        );
+        proxy.flatten_post_params = true;
+        store
+            .create(&proxy)
+            .await
+            .unwrap();
+        let mut peer = fabric_peer_fronted_by(200, json!({}), |id| paid_mcp_surface(id, "credential-gate")).await;
+        peer.state.mcp_proxy_store = Some(store);
+        peer.state.surface = Arc::new(
+            serde_json::from_value(json!({
+                "surface_id": "credential-proxy", "name": "Credential proxy",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {
+                    "endpoint": format!("proxy://{}", proxy.id),
+                    "payment_policy": {
+                        "type": "agent_pay", "payment_gateway_id": "credential-gate", "payment_surface_id": "pay-1",
+                        "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        let manager = crate::policies::GatewayPolicyManager::new();
+        let mut gateway =
+            Gateway::new("Self".into(), String::new(), "did:web:gateway.example".into(), GatewayType::SelfGateway);
+        gateway.opa_policy_config = Some(GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: format!(
+                "package gateway.policy\ndefault allow = false\nallow if {{\n  contains(json.marshal(input), \"paid_echo\")\n  not contains(json.marshal(input), \"{SECRET}\")\n}}"
+            ),
+            ..Default::default()
+        });
+        manager
+            .update_gateway_policy(&gateway)
+            .await
+            .unwrap();
+        peer.state
+            .gateway_policy_manager = Some(Arc::new(manager));
+
+        let url = "https://gateway.example/mcp";
+        let modern = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "paid_echo", "arguments": {"q": "1", "payment_signature": SECRET}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "org.paymentauth/credential": SECRET
+            }
+        }});
+        let headers = [
+            ("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "paid_echo"),
+            ("accept", "application/json, text/event-stream"),
+        ];
+        let (status, response_headers, body) = answer(post_with(&peer.state, url, &modern, &headers).await).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "the policy saw the call without its credential: {body}");
+        assert_eq!(response_headers["payment-response"], RECEIPT);
+        assert_eq!(gate.calls(), 1, "the credential was still the one paid with");
+        assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], SECRET);
+        let received = backend
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the backend was called");
+        assert!(
+            received
+                .body
+                .contains("\"q\""),
+            "the tool's own argument still arrives: {received:?}"
+        );
+        assert!(
+            !received.path.contains(SECRET) && !received.body.contains(SECRET),
+            "the backend received a credential: {received:?}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_request_reaches_gateway_and_surface_policy_without_its_credential() {
+        run_on_large_stack(a_legacy_request_reaches_gateway_and_surface_policy_without_its_credential_flow());
+    }
+
+    async fn a_legacy_request_reaches_gateway_and_surface_policy_without_its_credential_flow() {
+        use crate::gateways::types::{Gateway, GatewayOpaPolicyConfig, GatewayType};
+
+        const SECRET: &str = "LEGACY-SECRET";
+        let gate = taking_gate("legacy-credential-gate");
+        let mut peer =
+            fabric_peer_fronted_by(200, json!({"jsonrpc": "2.0", "id": 7, "result": {"content": []}}), |id| {
+                paid_mcp_surface(id, "legacy-credential-gate")
+            })
+            .await;
+        let manager = crate::policies::GatewayPolicyManager::new();
+        let mut gateway =
+            Gateway::new("Self".into(), String::new(), "did:web:gateway.example".into(), GatewayType::SelfGateway);
+        let rego = |needle: &str| {
+            format!(
+                "package gateway.policy\ndefault allow = false\nallow if {{\n  contains(json.marshal(input), \"paid_tool\")\n  {needle}\n}}"
+            )
+        };
+        gateway.opa_policy_config = Some(GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: rego(&format!("not contains(json.marshal(input), \"{SECRET}\")")),
+            ..Default::default()
+        });
+        manager
+            .update_gateway_policy(&gateway)
+            .await
+            .unwrap();
+        peer.state
+            .gateway_policy_manager = Some(Arc::new(manager));
+
+        let call = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "paid_tool", "arguments": {"q": 1, "payment_signature": SECRET},
+            "_meta": {"org.paymentauth/credential": SECRET}
+        }});
+        #[derive(Clone, Default)]
+        struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(
+                &mut self,
+                bytes: &[u8],
+            ) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+            type Writer = Logs;
+
+            fn make_writer(&'a self) -> Logs {
+                self.clone()
+            }
+        }
+        let logs = Logs::default();
+        let logging = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let (status, _, body) = answer(post_with(&peer.state, "https://gateway.example/mcp", &call, &[]).await).await;
+        drop(logging);
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(gate.calls(), 1);
+        let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        assert!(!logged.contains(SECRET), "a credential was logged");
+        let forwards = peer.forwards.lock().unwrap();
+        assert!(
+            !forwards
+                .iter()
+                .any(|forward| forward
+                    .to_string()
+                    .contains(SECRET)),
+            "the peer was sent the credential: {forwards:?}"
+        );
+    }
+
+    /// A surface policy on the Fabric path gets the agent card this Access Point
+    /// serves by building it in process, which reads it from the peer over Fabric.
+    /// The Access Point's own address is never asked for it.
+    #[tokio::test]
+    async fn a_fabric_surface_policy_never_reads_the_card_through_its_own_access_point() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = sent.clone();
+        let responder_did = peer.peer_did.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push((request.body["method"].to_string(), request.body["path"].to_string()));
+            let reply = forward_response(request, &responder_did, 200, "{}");
+            let _ = crate::proxy::fabric_response_waiter::complete_forward_response_waiter(&reply);
+        });
+        let own_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = own_reads.clone();
+        let own_access_point = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let own_address = own_access_point
+            .local_addr()
+            .unwrap();
+        let own_app = axum::Router::new().fallback(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { axum::Json(json!({"name": "own"})) }
+        });
+        tokio::spawn(async move { axum::serve(own_access_point, own_app).await });
+        let mut surface = (*peer.state.surface).clone();
+        surface
+            .access_point
+            .listen_address = format!("http://{own_address}");
+        let policy_dir = tempfile::tempdir().unwrap();
+        let policies = Arc::new(
+            crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                policy_dir
+                    .path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+            "id": "allow-all", "name": "Allow all", "policy_type": "agent_surface",
+            "policy": "package surface.policy\ndefault allow = true", "created_at": "2026-09-01T00:00:00Z"
+        }))
+        .unwrap();
+        policies
+            .save(policy.clone())
+            .await
+            .unwrap();
+        surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: policy.id,
+            require_agent_context: false,
+        });
+        let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+        policy_manager.set_policy_definition_store(policies);
+        policy_manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        peer.state.policy_manager = Some(policy_manager);
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        let _ = Box::pin(super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        ))
+        .await;
+
+        assert_eq!(
+            own_reads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Access Point asked itself for its card"
+        );
+        assert!(
+            sent.lock()
+                .unwrap()
+                .contains(&(r#""GET""#.to_string(), r#""/.well-known/agent-card.json""#.to_string())),
+            "the card is read from the peer over Fabric: {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    struct FabricPolicyCase {
+        name: &'static str,
+        inbound: String,
+        target: String,
+        key_failed: bool,
+        expected: axum::http::StatusCode,
+    }
+
+    #[tokio::test]
+    async fn fabric_send_gives_the_presented_key_did_to_the_inbound_policy_only() {
+        const KEY_ID: &str = "atgk_pak_fabric_caller";
+        let key = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: KEY_ID.to_string(),
+            provider_agent_id: Some("provider-agent".to_string()),
+        };
+        let (vc_issuer, _issuer_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let vc_issuer = Arc::new(vc_issuer);
+        let key_surface = |peer: &mut FabricPeer| {
+            peer.state.vc_issuer = Some(vc_issuer.clone());
+            let mut surface = (*peer.state.surface).clone();
+            surface.identity_slots.inbound =
+                Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { api_key_id: None });
+            surface
+        };
+        let mut setup = fabric_peer_answering(200, json!({})).await;
+        setup.state.surface = Arc::new(key_surface(&mut setup));
+        let key_did = super::resolve_configured_caller_identity(
+            &setup.state,
+            "POST",
+            "/a2a",
+            "Fabric A2A",
+            "fabric",
+            Some(&key),
+            false,
+        )
+        .await
+        .unwrap()
+        .expect("an API Key Provider key resolves a caller DID")
+        .did;
+        let inbound_rule = |did: &str| {
+            format!(
+                "package surface.policy\ndefault allow = false\nallow if {{\n    input.extension_identity.did == \"{did}\"\n    input.extension_identity.verification == \"source_auth\"\n}}"
+            )
+        };
+        let no_caller_identity_target_rule = format!(
+            "package surface.policy\ndefault allow = false\nallow if {{\n    not input.agent\n    not input.extension_identity\n    input.source_auth.key_name == \"{KEY_ID}\"\n}}"
+        );
+        let failed_key_rule = "package surface.policy\ndefault allow = false\nallow if {\n    input.source_auth.method == \"failed\"\n    not input.extension_identity\n}";
+        let cases = [
+            FabricPolicyCase {
+                name: "inbound sees the key DID, target sees no caller identity",
+                inbound: inbound_rule(&key_did),
+                target: no_caller_identity_target_rule.clone(),
+                key_failed: false,
+                expected: axum::http::StatusCode::OK,
+            },
+            FabricPolicyCase {
+                name: "inbound rule naming another DID denies",
+                inbound: inbound_rule("did:example:other"),
+                target: no_caller_identity_target_rule,
+                key_failed: false,
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+            FabricPolicyCase {
+                name: "target rule needing the caller identity denies",
+                inbound: inbound_rule(&key_did),
+                target: "package surface.policy\ndefault allow = false\nallow if input.extension_identity.did"
+                    .to_string(),
+                key_failed: false,
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+            FabricPolicyCase {
+                name: "a failed key gives the inbound policy no caller identity",
+                inbound: failed_key_rule.to_string(),
+                target: failed_key_rule.to_string(),
+                key_failed: true,
+                expected: axum::http::StatusCode::OK,
+            },
+            FabricPolicyCase {
+                name: "a failed key does not carry the key DID",
+                inbound: inbound_rule(&key_did),
+                target: failed_key_rule.to_string(),
+                key_failed: true,
+                expected: axum::http::StatusCode::FORBIDDEN,
+            },
+        ];
+
+        for case in cases {
+            let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+            let mut surface = key_surface(&mut peer);
+            let (inbound_rego, target_rego) = (case.inbound, case.target);
+            let policy_dir = tempfile::tempdir().unwrap();
+            let policies = Arc::new(
+                crate::policies::policy_definitions::FileSystemPolicyDefinitionStore::new(
+                    policy_dir
+                        .path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+                .await
+                .unwrap(),
+            );
+            for (id, rego) in [("inbound", inbound_rego), ("target", target_rego)] {
+                let policy: crate::policies::policy_definitions::PolicyDefinition = serde_json::from_value(json!({
+                    "id": id, "name": id, "policy_type": "agent_surface",
+                    "policy": rego, "created_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap();
+                policies
+                    .save(policy)
+                    .await
+                    .unwrap();
+            }
+            surface
+                .access_point
+                .inbound_policy = Some(crate::config::agent_surface::PolicyRef {
+                policy_definition_id: "inbound".to_string(),
+                require_agent_context: false,
+            });
+            surface.target.policy = Some(crate::config::agent_surface::PolicyRef {
+                policy_definition_id: "target".to_string(),
+                require_agent_context: false,
+            });
+            let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
+            policy_manager.set_policy_definition_store(policies);
+            policy_manager
+                .update_channel_policy(&surface)
+                .await
+                .unwrap();
+            peer.state.policy_manager = Some(policy_manager);
+            peer.state.surface = Arc::new(surface);
+            let body = json!({
+                "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+                "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+            });
+
+            let result = Box::pin(super::handle_fabric_request(
+                peer.state.clone(),
+                super::FabricSend {
+                    channel_name: "Fabric A2A",
+                    method: axum::http::Method::POST,
+                    uri: "https://gateway.example/a2a"
+                        .parse()
+                        .unwrap(),
+                    headers: axum::http::HeaderMap::new(),
+                    source_addr: "127.0.0.1:12345".to_string(),
+                    start_time: std::time::Instant::now(),
+                    connection_guard: super::ConnectionGuard::new(None, None),
+                    body_bytes: axum::body::Bytes::from(body.to_string()),
+                    trace_id: "trace-1".to_string(),
+                    ucp_operation: None,
+                    authenticated_identity: (!case.key_failed).then(|| key.clone()),
+                    source_auth_context: Some(if case.key_failed {
+                        crate::surface_context::SourceAuthContext::Failed {
+                            attempted_method: "api_key_provider".to_string(),
+                            reason: "Invalid API key".to_string(),
+                        }
+                    } else {
+                        crate::surface_context::SourceAuthContext::ApiKey { key_name: KEY_ID.to_string() }
+                    }),
+                    payment_context: None,
+                    mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                    mcp_verified_binding: None,
+                    mcp_classification: None,
+                    subscription_lifetime: None,
+                    mcp_continuations: None,
+                    payment: None,
+                },
+            ))
+            .await;
+
+            let status = match result {
+                Ok(response) | Err(response) => response.status(),
+            };
+            assert_eq!(status, case.expected, "{}", case.name);
+        }
     }
 }

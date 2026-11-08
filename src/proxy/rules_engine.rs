@@ -47,11 +47,9 @@ impl RulesEngine {
         // Then validate against JSON Schema if provided (for structural validation)
         if let Some(ref validator) = self.schema_validator {
             if !validator.is_valid(payload) {
-                // Try to provide more specific error information
-                let payload_str = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "invalid JSON".to_string());
                 anyhow::bail!(
-                    "JSON Schema structural validation failed. This usually indicates missing required fields, incorrect data types, or constraint violations. Payload: {}",
-                    payload_str
+                    "JSON Schema structural validation failed: {}",
+                    crate::identity::identity_selector::format_schema_errors(validator, payload)
                 );
             }
             debug!(channel = channel_name, "JSON Schema validation passed");
@@ -72,10 +70,9 @@ impl RulesEngine {
                 Ok(field_value) => {
                     if field_value != value {
                         anyhow::bail!(
-                            "Property '{}' with validation 'equals {}' was provided value '{}' which does not match the required value",
+                            "Property '{}' with validation 'equals {}' was provided a value which does not match the required value",
                             path,
-                            serde_json::to_string(value).unwrap_or_else(|_| format!("{:?}", value)),
-                            serde_json::to_string(field_value).unwrap_or_else(|_| format!("{:?}", field_value))
+                            serde_json::to_string(value).unwrap_or_else(|_| format!("{:?}", value))
                         );
                     }
                     debug!(channel = channel_name, path = path, "Equals rule passed");
@@ -94,10 +91,9 @@ impl RulesEngine {
                 Ok(field_value) => {
                     if field_value == value {
                         anyhow::bail!(
-                            "Property '{}' with validation 'not-equals {}' was provided value '{}' which matches the forbidden value",
+                            "Property '{}' with validation 'not-equals {}' was provided the forbidden value",
                             path,
-                            serde_json::to_string(value).unwrap_or_else(|_| format!("{:?}", value)),
-                            serde_json::to_string(field_value).unwrap_or_else(|_| format!("{:?}", field_value))
+                            serde_json::to_string(value).unwrap_or_else(|_| format!("{:?}", value))
                         );
                     }
                     debug!(channel = channel_name, path = path, "NotEquals rule passed");
@@ -118,10 +114,10 @@ impl RulesEngine {
                         .as_str()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "Property '{}' with validation 'regex {}' expected a string but got: {:?}",
+                                "Property '{}' with validation 'regex {}' expected a string but got {}",
                                 path,
                                 pattern,
-                                field_value
+                                json_type(field_value)
                             )
                         })?;
 
@@ -129,10 +125,9 @@ impl RulesEngine {
 
                     if !regex.is_match(string_value) {
                         anyhow::bail!(
-                            "Property '{}' with validation 'regex {}' was provided value '{}' which does not match the required pattern",
+                            "Property '{}' with validation 'regex {}' was provided a value which does not match the required pattern",
                             path,
-                            pattern,
-                            string_value
+                            pattern
                         );
                     }
                     debug!(channel = channel_name, path = path, "Regex rule passed");
@@ -172,10 +167,10 @@ impl RulesEngine {
                                 (None, None) => "numeric".to_string(),
                             };
                             anyhow::anyhow!(
-                                "Property '{}' with validation 'range {}' expected a number but got: {:?}",
+                                "Property '{}' with validation 'range {}' expected a number but got {}",
                                 path,
                                 range_desc,
-                                field_value
+                                json_type(field_value)
                             )
                         })?;
 
@@ -189,10 +184,9 @@ impl RulesEngine {
                             None => format!(">= {}", min_val),
                         };
                         anyhow::bail!(
-                            "Property '{}' with validation 'range {}' was provided value '{}' which is less than the minimum allowed value",
+                            "Property '{}' with validation 'range {}' was provided a value which is less than the minimum allowed value",
                             path,
-                            range_desc,
-                            number_value
+                            range_desc
                         );
                     }
 
@@ -206,10 +200,9 @@ impl RulesEngine {
                             None => format!("<= {}", max_val),
                         };
                         anyhow::bail!(
-                            "Property '{}' with validation 'range {}' was provided value '{}' which is greater than the maximum allowed value",
+                            "Property '{}' with validation 'range {}' was provided a value which is greater than the maximum allowed value",
                             path,
-                            range_desc,
-                            number_value
+                            range_desc
                         );
                     }
 
@@ -241,10 +234,9 @@ impl RulesEngine {
                             .collect::<Vec<_>>()
                             .join(", ");
                         anyhow::bail!(
-                            "Property '{}' with validation 'one-of [{}]' was provided value '{}' which is not in the allowed values",
+                            "Property '{}' with validation 'one-of [{}]' was provided a value which is not in the allowed values",
                             path,
-                            allowed_values,
-                            serde_json::to_string(field_value).unwrap_or_else(|_| format!("{:?}", field_value))
+                            allowed_values
                         );
                     }
                     debug!(channel = channel_name, path = path, "OneOf rule passed");
@@ -271,10 +263,10 @@ impl RulesEngine {
                             .as_array()
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "Property '{}' with validation 'array-all {}' expected an array but got: {:?}",
+                                    "Property '{}' with validation 'array-all {}' expected an array but got {}",
                                     path,
                                     element_type,
-                                    field_value
+                                    json_type(field_value)
                                 )
                             })?;
 
@@ -290,16 +282,13 @@ impl RulesEngine {
                             };
 
                             if !type_matches {
-                                let actual_array_str =
-                                    serde_json::to_string(array).unwrap_or_else(|_| format!("{:?}", array));
                                 anyhow::bail!(
-                                    "Property '{}' with validation 'array-all {}' has element at index {} with wrong type: expected {}, got {:?}. Actual array received: {}",
+                                    "Property '{}' with validation 'array-all {}' has element at index {} with wrong type: expected {}, got {}",
                                     path,
                                     element_type,
                                     idx,
                                     element_type,
-                                    element,
-                                    actual_array_str
+                                    json_type(element)
                                 );
                             }
 
@@ -307,21 +296,17 @@ impl RulesEngine {
                             if let Some(required_values) = values
                                 && !required_values.contains(element)
                             {
-                                let actual_array_str =
-                                    serde_json::to_string(array).unwrap_or_else(|_| format!("{:?}", array));
                                 let allowed_values = required_values
                                     .iter()
                                     .map(|v| serde_json::to_string(v).unwrap_or_else(|_| format!("{:?}", v)))
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 anyhow::bail!(
-                                    "Property '{}' with validation 'array-all {} [{}]' has element at index {} with value '{}' which is not in the allowed values. Actual array received: {}",
+                                    "Property '{}' with validation 'array-all {} [{}]' has element at index {} which is not in the allowed values",
                                     path,
                                     element_type,
                                     allowed_values,
-                                    idx,
-                                    serde_json::to_string(element).unwrap_or_else(|_| format!("{:?}", element)),
-                                    actual_array_str
+                                    idx
                                 );
                             }
                         }
@@ -346,10 +331,10 @@ impl RulesEngine {
                             .as_array()
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "Property '{}' with validation 'array-any {}' expected an array but got: {:?}",
+                                    "Property '{}' with validation 'array-any {}' expected an array but got {}",
                                     path,
                                     element_type,
-                                    field_value
+                                    json_type(field_value)
                                 )
                             })?;
 
@@ -380,9 +365,6 @@ impl RulesEngine {
                         }
 
                         if !found_match {
-                            let actual_array_str =
-                                serde_json::to_string(array).unwrap_or_else(|_| format!("{:?}", array));
-
                             if let Some(required_values) = values {
                                 let allowed_values = required_values
                                     .iter()
@@ -390,18 +372,16 @@ impl RulesEngine {
                                     .collect::<Vec<_>>()
                                     .join(", ");
                                 anyhow::bail!(
-                                    "Property '{}' with validation 'array-any {} [{}]' has no elements matching the required type and values. Actual array received: {}",
+                                    "Property '{}' with validation 'array-any {} [{}]' has no elements matching the required type and values",
                                     path,
                                     element_type,
-                                    allowed_values,
-                                    actual_array_str
+                                    allowed_values
                                 );
                             } else {
                                 anyhow::bail!(
-                                    "Property '{}' with validation 'array-any {}' has no elements matching the required type. Actual array received: {}",
+                                    "Property '{}' with validation 'array-any {}' has no elements matching the required type",
                                     path,
-                                    element_type,
-                                    actual_array_str
+                                    element_type
                                 );
                             }
                         }
@@ -425,9 +405,9 @@ impl RulesEngine {
                         .as_array()
                         .ok_or_else(|| {
                             anyhow::anyhow!(
-                                "Property '{}' with validation 'array-length' expected an array but got: {:?}",
+                                "Property '{}' with validation 'array-length' expected an array but got {}",
                                 path,
-                                field_value
+                                json_type(field_value)
                             )
                         })?;
 
@@ -436,7 +416,6 @@ impl RulesEngine {
                     if let Some(min_val) = min
                         && array_length < *min_val
                     {
-                        let actual_array_str = serde_json::to_string(array).unwrap_or_else(|_| format!("{:?}", array));
                         let range_desc = match max {
                             Some(max_val) => {
                                 format!("{}-{}", min_val, max_val)
@@ -444,18 +423,16 @@ impl RulesEngine {
                             None => format!(">= {}", min_val),
                         };
                         anyhow::bail!(
-                            "Property '{}' with validation 'array-length {}' has {} elements which is less than the minimum allowed length. Actual array received: {}",
+                            "Property '{}' with validation 'array-length {}' has {} elements which is less than the minimum allowed length",
                             path,
                             range_desc,
-                            array_length,
-                            actual_array_str
+                            array_length
                         );
                     }
 
                     if let Some(max_val) = max
                         && array_length > *max_val
                     {
-                        let actual_array_str = serde_json::to_string(array).unwrap_or_else(|_| format!("{:?}", array));
                         let range_desc = match min {
                             Some(min_val) => {
                                 format!("{}-{}", min_val, max_val)
@@ -463,11 +440,10 @@ impl RulesEngine {
                             None => format!("<= {}", max_val),
                         };
                         anyhow::bail!(
-                            "Property '{}' with validation 'array-length {}' has {} elements which is greater than the maximum allowed length. Actual array received: {}",
+                            "Property '{}' with validation 'array-length {}' has {} elements which is greater than the maximum allowed length",
                             path,
                             range_desc,
-                            array_length,
-                            actual_array_str
+                            array_length
                         );
                     }
 
@@ -492,6 +468,18 @@ impl RulesEngine {
                 }
             },
         }
+    }
+}
+
+/// The JSON type of `value`, named in validation errors instead of the value itself.
+fn json_type(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "a boolean",
+        JsonValue::Number(_) => "a number",
+        JsonValue::String(_) => "a string",
+        JsonValue::Array(_) => "an array",
+        JsonValue::Object(_) => "an object",
     }
 }
 
@@ -560,6 +548,115 @@ mod tests {
         let result = get_field_by_path(&payload, "agentIdentity.provisioningInfo.cloudProvider");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), &json!("local"));
+    }
+
+    const VALUE_MARKER: &str = "caller-value-marker-2d9f";
+
+    fn engine(
+        json_schema: Option<JsonValue>,
+        rules: Vec<ValidationRule>,
+    ) -> RulesEngine {
+        RulesEngine::new(&ExtensionRules {
+            json_schema,
+            rules,
+            filter_rules: vec![],
+            default_action: None,
+        })
+        .unwrap()
+    }
+
+    fn violation(
+        engine: &RulesEngine,
+        payload: &JsonValue,
+    ) -> String {
+        engine
+            .validate(payload, "test")
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn rule_violations_name_path_and_rule_without_the_provided_value() {
+        let cases = [
+            (
+                ValidationRule::Equals {
+                    path: "provider".to_string(),
+                    value: json!("local"),
+                },
+                json!({ "provider": VALUE_MARKER }),
+                "Property 'provider' with validation 'equals \"local\"' was provided a value which does not match the required value",
+            ),
+            (
+                ValidationRule::NotEquals {
+                    path: "provider".to_string(),
+                    value: json!(VALUE_MARKER),
+                },
+                json!({ "provider": VALUE_MARKER }),
+                "Property 'provider' with validation 'not-equals \"caller-value-marker-2d9f\"' was provided the forbidden value",
+            ),
+            (
+                ValidationRule::Regex {
+                    path: "provider".to_string(),
+                    pattern: "^aws$".to_string(),
+                },
+                json!({ "provider": VALUE_MARKER }),
+                "Property 'provider' with validation 'regex ^aws$' was provided a value which does not match the required pattern",
+            ),
+            (
+                ValidationRule::Regex {
+                    path: "provider".to_string(),
+                    pattern: "^aws$".to_string(),
+                },
+                json!({ "provider": [VALUE_MARKER] }),
+                "Property 'provider' with validation 'regex ^aws$' expected a string but got an array",
+            ),
+            (
+                ValidationRule::OneOf {
+                    path: "provider".to_string(),
+                    values: vec![json!("aws")],
+                },
+                json!({ "provider": VALUE_MARKER }),
+                "Property 'provider' with validation 'one-of [\"aws\"]' was provided a value which is not in the allowed values",
+            ),
+            (
+                ValidationRule::ArrayAll {
+                    path: "tags".to_string(),
+                    element_type: "string".to_string(),
+                    values: Some(vec![json!("aws")]),
+                },
+                json!({ "tags": ["aws", VALUE_MARKER] }),
+                "Property 'tags' with validation 'array-all string [\"aws\"]' has element at index 1 which is not in the allowed values",
+            ),
+            (
+                ValidationRule::ArrayLength {
+                    path: "tags".to_string(),
+                    min: None,
+                    max: Some(1),
+                },
+                json!({ "tags": ["aws", VALUE_MARKER] }),
+                "Property 'tags' with validation 'array-length <= 1' has 2 elements which is greater than the maximum allowed length",
+            ),
+        ];
+
+        for (rule, payload, expected) in cases {
+            assert_eq!(violation(&engine(None, vec![rule]), &payload), expected);
+        }
+    }
+
+    #[test]
+    fn schema_violation_names_location_and_rule_without_the_payload() {
+        let schema = json!({
+            "type": "object",
+            "required": ["model"],
+            "properties": { "provider": { "type": "integer" }, "model": { "type": "string" } }
+        });
+
+        let error = violation(&engine(Some(schema), vec![]), &json!({ "provider": VALUE_MARKER }));
+
+        assert_eq!(
+            error,
+            "JSON Schema structural validation failed: <root>: \"model\" is a required property; provider: fails 'type'"
+        );
     }
 
     #[test]

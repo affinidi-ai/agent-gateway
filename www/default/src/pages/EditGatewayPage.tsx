@@ -14,6 +14,7 @@ import IssuerDidsCard, {
   issuerDidsFromGateway,
 } from './EditGatewayPage/IssuerDidsCard';
 import GlobalPolicyTab from './EditGatewayPage/GlobalPolicyTab';
+import UseAsPaymentGatewayButton from '../components/gateways/UseAsPaymentGatewayButton';
 
 interface GatewayForm {
   name: string;
@@ -28,6 +29,8 @@ interface GatewayForm {
 interface GatewayMetadata {
   created_at: string;
   updated_at: string;
+  /** The stored status, which the Enabled checkbox does not change until saved. */
+  status: string;
 }
 
 interface RemoteChannel {
@@ -134,6 +137,7 @@ const EditGatewayPage: React.FC = () => {
       setGatewayMetadata({
         created_at: response.data.created_at,
         updated_at: response.data.updated_at,
+        status: response.data.status,
       });
       setRuntimeStatus(response.data.runtime_status ?? null);
       setIssuerDids(issuerDidsFromGateway(response.data));
@@ -284,10 +288,11 @@ const EditGatewayPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-gateway-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="gateway-editor-back-button"
           onClick={() => navigate('/connections?tab=gateways')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -363,9 +368,23 @@ const EditGatewayPage: React.FC = () => {
             </h6>
           </div>
           <div>
+            {isEditMode && id && gatewayMetadata && (
+              <UseAsPaymentGatewayButton
+                gateway={{
+                  id,
+                  name: form.name,
+                  gateway_type: form.gateway_type,
+                  status: gatewayMetadata.status,
+                }}
+                onError={setError}
+                testId="gateway-use-as-payment-button"
+                className="me-2"
+              />
+            )}
             {isEditMode && (
               <button
                 className={`btn btn-sm btn-primary me-2 ${saving ? 'disabled' : ''}`}
+                data-testid="gateway-editor-save-button"
                 onClick={handleSubmit}
                 disabled={saving}
               >
@@ -376,6 +395,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && !isSelfGateway && (
               <button
                 className={`btn btn-sm btn-outline-danger me-2 ${saving ? 'disabled' : ''}`}
+                data-testid="gateway-editor-delete-button"
                 onClick={handleDelete}
                 disabled={saving}
                 title="Delete this gateway"
@@ -395,6 +415,7 @@ const EditGatewayPage: React.FC = () => {
             {/* Overview Tab */}
             <Tab
               eventKey="overview"
+              tabAttrs={{ 'data-testid': 'gateway-editor-overview-tab-trigger' }}
               title={
                 <>
                   <i className="fas fa-info-circle"></i> Overview
@@ -421,6 +442,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && form.gateway_type === 'remote' && (
               <Tab
                 eventKey="publishing"
+                tabAttrs={{ 'data-testid': 'gateway-editor-publishing-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-filter"></i> Publishing
@@ -444,6 +466,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && form.gateway_type === 'remote' && (
               <Tab
                 eventKey="remote"
+                tabAttrs={{ 'data-testid': 'gateway-editor-remote-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-network-wired"></i> Remote
@@ -464,6 +487,7 @@ const EditGatewayPage: React.FC = () => {
             {isEditMode && (
               <Tab
                 eventKey="global-policy"
+                tabAttrs={{ 'data-testid': 'gateway-editor-global-policy-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-shield-alt"></i> Global Policy

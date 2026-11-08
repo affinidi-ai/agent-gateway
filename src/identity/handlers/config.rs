@@ -92,9 +92,17 @@ pub async fn reload_configuration(
 /// running proxy without a manual reload.
 ///
 /// Returns `(channels_count, surfaces_count, is_fallback, warning)`.
+///
+/// A reload is the gateway's own work, not a user change, so the writes it
+/// makes record no policy changes (`without_actor`), even though it runs
+/// inside the management request that asked for it.
 pub(crate) async fn perform_config_reload(
     state: &IdentityApiState
 ) -> anyhow::Result<(usize, usize, bool, Option<String>)> {
+    crate::audit::context::without_actor(reload(state)).await
+}
+
+async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool, Option<String>)> {
     info!("Configuration reload requested");
 
     // Drop cached outbound target agent cards so a redeployed surface
@@ -122,6 +130,8 @@ pub(crate) async fn perform_config_reload(
 
     let new_config_result = load_base_gateway_config(state).await;
     let (new_config_result, surfaces_count) = inject_surfaces_into_config(state, new_config_result).await;
+
+    super::report_credential_policy(state).await;
 
     let (channels_count, is_fallback, warning) = state
         .channel_manager
@@ -180,6 +190,7 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                 .await?;
 
                 let mut config = store.load_config().await?;
+                crate::config::fall_back_to_first_source_auth_methods_in_memory(&mut config.surfaces);
 
                 info!("Using TLS, A2A, logging, and extension inspection configurations from bootstrap config");
                 config.tls = state
@@ -244,6 +255,12 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                     .list_all()
                     .await?;
                 crate::surfaces::strip_unsupported_header_metadata_mappings(agent_surface_store, &mut channels).await?;
+                crate::surfaces::fall_back_to_first_source_auth_methods(
+                    agent_surface_store,
+                    &mut channels,
+                    !crate::server::mode::is_standby(),
+                )
+                .await?;
                 let given = crate::surfaces::carry_over_a2a_settings(
                     agent_surface_store,
                     &mut channels,
@@ -336,6 +353,9 @@ async fn inject_surfaces_into_config(
                             if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
                                 continue;
                             }
+                            crate::identity::provider_key_gate::gate()
+                                .admit(surface)
+                                .await;
                             if existing_surface_ids.contains(&surface.surface_id) {
                                 continue;
                             }
@@ -410,9 +430,11 @@ pub async fn reload_single_channel(
                 )
                 .await?;
 
-                store
+                let mut surface = store
                     .load_single_channel_by_config_id(&config_id)
-                    .await
+                    .await?;
+                crate::config::fall_back_to_first_source_auth_methods_in_memory(std::slice::from_mut(&mut surface));
+                Ok(surface)
             }
             .await
         }
@@ -429,10 +451,19 @@ pub async fn reload_single_channel(
                 ))
                 .await?;
 
-                agent_surface_store
+                let mut surface = agent_surface_store
                     .get(&config_id)
                     .await?
-                    .ok_or_else(|| anyhow::anyhow!("Surface with config_id '{}' not found in local storage", config_id))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Surface with config_id '{}' not found in local storage", config_id)
+                    })?;
+                crate::surfaces::fall_back_to_first_source_auth_methods(
+                    &agent_surface_store,
+                    std::slice::from_mut(&mut surface),
+                    !crate::server::mode::is_standby(),
+                )
+                .await?;
+                Ok(surface)
             }
             .await
         }

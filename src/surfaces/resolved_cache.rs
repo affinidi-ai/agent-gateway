@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::config::agent_surface_variants::{VariantResolveError, VariantValidationError};
@@ -26,9 +26,11 @@ use crate::config::agent_surface_variants::{VariantResolveError, VariantValidati
 /// when a request selects this surface (default or a named variant).
 #[derive(Debug, Clone)]
 pub struct SurfaceSnapshots {
-    /// Snapshot used when no `$alias` is present in the request URL.
-    /// Equal to the base surface when no variants are configured.
-    pub default: Arc<AgentSurface>,
+    /// What serves a request with no `$alias` in its URL: the default
+    /// variant's snapshot, or the base surface when there is no default
+    /// variant, with the `surface_variant` it records. A disabled default
+    /// variant refuses such requests instead.
+    pub default: Result<CachedVariant, ResolveError>,
     /// Pre-resolved snapshots for each enabled variant alias.
     pub by_alias: HashMap<String, Arc<AgentSurface>>,
     /// Aliases of variants that exist on the surface but are
@@ -36,6 +38,14 @@ pub struct SurfaceSnapshots {
     /// alias — the pipeline must distinguish so it can return HTTP 503
     /// (intentionally switched off) rather than 404 (no such variant).
     pub disabled_aliases: HashSet<String>,
+}
+
+/// A snapshot [`ResolvedSurfaceCache::resolve`] found, with the
+/// `surface_variant` a request it serves records, both from the same entry.
+#[derive(Debug, Clone)]
+pub struct CachedVariant {
+    pub surface: Arc<AgentSurface>,
+    pub surface_variant: String,
 }
 
 /// Why a [`ResolvedSurfaceCache::resolve`] call failed.
@@ -46,8 +56,8 @@ pub enum ResolveError {
     UnknownSurface(String),
     /// The surface exists but has no variant with the requested alias.
     UnknownAlias(String),
-    /// The surface has a variant with the requested alias but it is
-    /// `enabled: false`.
+    /// The variant with the requested alias, or the default variant of a
+    /// request with no alias, is `enabled: false`. Holds that variant's alias.
     DisabledAlias(String),
 }
 
@@ -111,11 +121,14 @@ impl From<VariantResolveError> for CacheUpsertError {
 #[derive(Debug, Default)]
 pub struct ResolvedSurfaceCache {
     inner: DashMap<String, Arc<SurfaceSnapshots>>,
+    /// Surfaces removed because they were disabled or deleted, until they are
+    /// upserted again.
+    retired: DashSet<String>,
 }
 
 impl ResolvedSurfaceCache {
     pub fn new() -> Self {
-        Self { inner: DashMap::new() }
+        Self::default()
     }
 
     /// Validate `surface.variants`, pre-resolve every snapshot, then
@@ -130,15 +143,32 @@ impl ResolvedSurfaceCache {
         let snapshots = build_snapshots(surface)?;
         self.inner
             .insert(surface.surface_id.clone(), Arc::new(snapshots));
+        self.retired
+            .remove(&surface.surface_id);
         Ok(())
     }
 
-    /// Drop the cache entry for `surface_id`. No-op if absent.
+    /// Drop the cache entry for a surface that was disabled or deleted, and
+    /// remember it as retired until it is upserted again.
     pub fn remove(
         &self,
         surface_id: &str,
     ) {
+        self.retired
+            .insert(surface_id.to_string());
         self.inner.remove(surface_id);
+    }
+
+    /// Whether `surface_id` was disabled or deleted and has not been upserted
+    /// since. A request still routed to such a surface, as over a connection kept
+    /// alive across a full reload, must be refused rather than served from the
+    /// surface it was routed with.
+    pub fn is_retired(
+        &self,
+        surface_id: &str,
+    ) -> bool {
+        self.retired
+            .contains(surface_id)
     }
 
     /// Look up a pre-resolved snapshot by surface and optional alias.
@@ -147,7 +177,7 @@ impl ResolvedSurfaceCache {
         &self,
         surface_id: &str,
         alias: Option<&str>,
-    ) -> Result<Arc<AgentSurface>, ResolveError> {
+    ) -> Result<CachedVariant, ResolveError> {
         let entry = self
             .inner
             .get(surface_id)
@@ -155,10 +185,13 @@ impl ResolvedSurfaceCache {
         let snaps = entry.value().clone();
         drop(entry);
         match alias {
-            None => Ok(snaps.default.clone()),
+            None => snaps.default.clone(),
             Some(a) => {
                 if let Some(s) = snaps.by_alias.get(a) {
-                    Ok(s.clone())
+                    Ok(CachedVariant {
+                        surface: s.clone(),
+                        surface_variant: a.to_string(),
+                    })
                 } else if snaps
                     .disabled_aliases
                     .contains(a)
@@ -196,7 +229,14 @@ impl ResolvedSurfaceCache {
 }
 
 fn build_snapshots(surface: &AgentSurface) -> Result<SurfaceSnapshots, CacheUpsertError> {
-    let default = Arc::new(surface.resolve_variant(None)?);
+    let default = match surface.serve_variant(None) {
+        Ok(served) => Ok(CachedVariant {
+            surface: Arc::new(served.surface),
+            surface_variant: served.recorded,
+        }),
+        Err(VariantResolveError::DisabledVariant(alias)) => Err(ResolveError::DisabledAlias(alias)),
+        Err(error) => return Err(error.into()),
+    };
     let mut by_alias = HashMap::with_capacity(surface.variants.len());
     let mut disabled_aliases = HashSet::new();
     for v in &surface.variants {
@@ -254,6 +294,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "http://upstream.example/".to_string(),
@@ -277,6 +318,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -288,6 +330,8 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             signing: None,
+            trust_check_split: false,
+            transit_point_source_auth: false,
         }
     }
 
@@ -329,8 +373,9 @@ mod tests {
         let snap = cache
             .resolve("s1", None)
             .unwrap();
-        assert_eq!(snap.surface_id, "s1");
-        assert_eq!(snap.target.endpoint, "http://upstream.example/");
+        assert_eq!(snap.surface.surface_id, "s1");
+        assert_eq!(snap.surface.target.endpoint, "http://upstream.example/");
+        assert_eq!(snap.surface_variant, "_base_");
     }
 
     #[test]
@@ -346,7 +391,8 @@ mod tests {
         let snap = cache
             .resolve("s2", None)
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://beta/");
+        assert_eq!(snap.surface.target.endpoint, "http://beta/");
+        assert_eq!(snap.surface_variant, "beta");
     }
 
     #[test]
@@ -360,7 +406,8 @@ mod tests {
         let snap = cache
             .resolve("s3", Some("alpha"))
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface_variant, "alpha");
     }
 
     #[test]
@@ -376,8 +423,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("s4", Some("alpha"))
-                .unwrap_err(),
-            ResolveError::DisabledAlias("alpha".to_string())
+                .err(),
+            Some(ResolveError::DisabledAlias("alpha".to_string()))
         );
     }
 
@@ -392,8 +439,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("s5", Some("gamma"))
-                .unwrap_err(),
-            ResolveError::UnknownAlias("gamma".to_string())
+                .err(),
+            Some(ResolveError::UnknownAlias("gamma".to_string()))
         );
     }
 
@@ -403,8 +450,8 @@ mod tests {
         assert_eq!(
             cache
                 .resolve("missing", None)
-                .unwrap_err(),
-            ResolveError::UnknownSurface("missing".to_string())
+                .err(),
+            Some(ResolveError::UnknownSurface("missing".to_string()))
         );
     }
 
@@ -444,7 +491,57 @@ mod tests {
         let snap = cache
             .resolve("s7", Some("alpha"))
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://alpha/");
+        assert_eq!(snap.surface.target.endpoint, "http://alpha/");
+    }
+
+    #[test]
+    fn a_save_with_a_disabled_default_refreshes_the_enabled_variants() {
+        let mut s = base_surface("s11");
+        s.variants
+            .push(variant("v1", "alpha", true, Some("http://alpha/")));
+        s.variants
+            .push(variant("v2", "beta", true, Some("http://beta/")));
+        s.default_variant_id = Some("v2".to_string());
+        let cache = ResolvedSurfaceCache::new();
+        cache.upsert(&s).unwrap();
+
+        s.variants[0] = variant("v1", "alpha", true, Some("http://alpha-2/"));
+        s.variants[1].enabled = false;
+        cache.upsert(&s).unwrap();
+
+        let snap = cache
+            .resolve("s11", Some("alpha"))
+            .unwrap();
+        assert_eq!(snap.surface.target.endpoint, "http://alpha-2/");
+        assert_eq!(snap.surface_variant, "alpha");
+    }
+
+    #[test]
+    fn resolve_default_refuses_a_disabled_default_variant() {
+        let mut s = base_surface("s12");
+        s.variants
+            .push(variant("v1", "alpha", true, Some("http://alpha/")));
+        s.variants
+            .push(variant("v2", "beta", false, Some("http://beta/")));
+        s.default_variant_id = Some("v2".to_string());
+        let cache = ResolvedSurfaceCache::new();
+        cache.upsert(&s).unwrap();
+
+        assert_eq!(
+            cache
+                .resolve("s12", None)
+                .err(),
+            Some(ResolveError::DisabledAlias("beta".to_string()))
+        );
+        assert_eq!(
+            cache
+                .resolve("s12", Some("alpha"))
+                .unwrap()
+                .surface
+                .target
+                .endpoint,
+            "http://alpha/"
+        );
     }
 
     #[test]
@@ -460,6 +557,29 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_surface_is_retired_until_it_is_upserted_again() {
+        let cache = ResolvedSurfaceCache::new();
+        assert!(!cache.is_retired("s10"), "a surface never cached is not retired");
+        cache
+            .upsert(&base_surface("s10"))
+            .unwrap();
+        assert!(!cache.is_retired("s10"));
+
+        cache.remove("s10");
+        assert!(cache.is_retired("s10"));
+
+        cache
+            .upsert(&base_surface("s10"))
+            .unwrap();
+        assert!(!cache.is_retired("s10"));
+        assert!(
+            cache
+                .resolve("s10", None)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn upsert_replaces_existing_entry_atomically() {
         let cache = ResolvedSurfaceCache::new();
         let mut s = base_surface("s9");
@@ -470,7 +590,7 @@ mod tests {
         let snap = cache
             .resolve("s9", None)
             .unwrap();
-        assert_eq!(snap.target.endpoint, "http://v2/");
+        assert_eq!(snap.surface.target.endpoint, "http://v2/");
         assert_eq!(cache.len(), 1);
     }
 

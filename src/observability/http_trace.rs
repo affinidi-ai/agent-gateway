@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{Instrument, Level, debug, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use super::loggable;
+
 /// Opt-in toggle for recording the authenticated caller's identity on the
 /// root HTTP span. Off by default; set from `traces.record_caller_identity`
 /// at startup. When off, [`record_caller_identity_on_current_span`] is a
@@ -25,6 +27,62 @@ fn record_caller_identity_enabled() -> bool {
     RECORD_CALLER_IDENTITY.load(Ordering::Relaxed)
 }
 
+/// What the payment gate decided for the request in flight: its ledger outcome
+/// and, when a ledger row was recorded, that row's id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaymentNote {
+    pub outcome: String,
+    pub ledger_id: Option<String>,
+}
+
+tokio::task_local! {
+    static PAYMENT_NOTE: std::sync::Arc<std::sync::Mutex<Option<PaymentNote>>>;
+}
+
+/// Notes the payment gate's outcome for the request being served, so its
+/// access log line and root span name it. A no-op outside a request that
+/// [`access_log`] serves (the fabric path, background tasks).
+pub fn note_payment_outcome(
+    outcome: &str,
+    ledger_id: Option<&str>,
+) {
+    let _ = PAYMENT_NOTE.try_with(|note| {
+        *note
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PaymentNote {
+            outcome: outcome.to_string(),
+            ledger_id: ledger_id.map(str::to_string),
+        });
+    });
+}
+
+/// The payment outcome noted for the request being served, if any.
+fn noted_payment() -> Option<PaymentNote> {
+    PAYMENT_NOTE
+        .try_with(|note| {
+            note.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+        .ok()
+        .flatten()
+}
+
+/// ` payment_outcome="…" payment_ledger_id="…"` for an access log line, or
+/// nothing when the request made no payment decision.
+fn payment_log_suffix(note: Option<&PaymentNote>) -> String {
+    match note {
+        Some(note) => format!(
+            " payment_outcome=\"{}\" payment_ledger_id=\"{}\"",
+            note.outcome,
+            note.ledger_id
+                .as_deref()
+                .unwrap_or("")
+        ),
+        None => String::new(),
+    }
+}
+
 /// Map an [`AuthenticatedIdentity`](crate::source_auth::AuthenticatedIdentity)
 /// to the `caller.*` span attributes that describe it. Returns
 /// `caller.auth_method` and `caller.principal` for every variant, plus
@@ -38,7 +96,7 @@ pub fn caller_span_fields(identity: &crate::source_auth::AuthenticatedIdentity) 
         AuthenticatedIdentity::JwtBearer { subject, .. } => {
             vec![("caller.auth_method", "jwt_bearer".to_string()), ("caller.principal", subject.clone())]
         }
-        AuthenticatedIdentity::ApiKey { key_name } => {
+        AuthenticatedIdentity::ApiKey { key_name, .. } => {
             vec![("caller.auth_method", "api_key".to_string()), ("caller.principal", key_name.clone())]
         }
         AuthenticatedIdentity::DidAuth { did } => vec![
@@ -141,8 +199,9 @@ fn is_spa_html_navigation(
 }
 
 /// Unconditional access log: logs every inbound HTTP request with method, path,
-/// query, peer, and a small set of headers useful for debugging external
-/// integrations (Accept, Host, User-Agent, Origin, MCP session id).
+/// query parameter names (values redacted), peer, and a small set of headers useful
+/// for debugging external integrations (Accept, Host, User-Agent, Origin, and the
+/// MCP session id as a prefix).
 ///
 /// Logged at INFO so it surfaces in normal logs without enabling debug. Useful
 /// for diagnosing situations where a client (e.g. Microsoft Copilot Studio)
@@ -159,10 +218,7 @@ pub async fn access_log(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().to_string();
-    let query = uri
-        .query()
-        .unwrap_or("")
-        .to_string();
+    let logged_uri = loggable::uri(&uri);
     let headers = request.headers();
     let host = headers
         .get(axum::http::header::HOST)
@@ -187,8 +243,8 @@ pub async fn access_log(
     let mcp_session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .map(loggable::secret)
+        .unwrap_or_default();
     let xfwd_for = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -205,11 +261,9 @@ pub async fn access_log(
     if is_asset {
         debug!(
             target: "agent_gateway::access",
-            "➡️  HTTP {} {}{}{} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
+            "➡️  HTTP {} {} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
             method,
-            path,
-            if query.is_empty() { "" } else { "?" },
-            query,
+            logged_uri,
             host,
             accept,
             user_agent,
@@ -221,11 +275,9 @@ pub async fn access_log(
     } else {
         info!(
             target: "agent_gateway::access",
-            "➡️  HTTP {} {}{}{} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
+            "➡️  HTTP {} {} host=\"{}\" accept=\"{}\" ua=\"{}\" origin=\"{}\" mcp_sid=\"{}\" xff=\"{}\" xfp=\"{}\"",
             method,
-            path,
-            if query.is_empty() { "" } else { "?" },
-            query,
+            logged_uri,
             host,
             accept,
             user_agent,
@@ -237,7 +289,15 @@ pub async fn access_log(
     }
 
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let response = PAYMENT_NOTE
+        .scope(slot.clone(), next.run(request))
+        .await;
+    let payment = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let payment = payment_log_suffix(payment.as_ref());
     let status = response.status();
     let elapsed_ms = started.elapsed().as_millis();
     let resp_ct = response
@@ -249,37 +309,17 @@ pub async fn access_log(
     if is_asset {
         debug!(
             target: "agent_gateway::access",
-            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"{}",
+            method, loggable::path(&path), status.as_u16(), elapsed_ms, resp_ct, payment
         );
     } else {
         info!(
             target: "agent_gateway::access",
-            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"",
-            method, path, status.as_u16(), elapsed_ms, resp_ct
+            "⬅️  HTTP {} {} → {} ({}ms) content-type=\"{}\"{}",
+            method, loggable::path(&path), status.as_u16(), elapsed_ms, resp_ct, payment
         );
     }
     response
-}
-
-/// Check if a request path should be traced
-/// Returns true ONLY for agent-to-agent communication, NOT dashboard/API calls
-///
-/// This dynamically checks against registered channel and MCP proxy prefixes.
-/// Prefixes are registered when channels/MCP proxies are created.
-///
-/// This traces ONLY:
-/// - A2A/MCP protocol traffic (agents using channels) - based on registered channel prefixes
-/// - Background tasks are traced separately via spawn_traced_task
-///
-/// This does NOT trace:
-/// - Identity API endpoints (dashboard/UX)
-/// - Metrics, logs, monitoring endpoints
-/// - Static files
-#[allow(dead_code)]
-fn should_trace_request(path: &str) -> bool {
-    // Use the dynamic trace registry to check if this path should be traced
-    super::should_trace_path(path)
 }
 
 /// Middleware that creates a root span for each HTTP request
@@ -351,12 +391,15 @@ pub async fn trace_http_request(
             "http.request",
             otel.name = %span_name,
             http.method = %method,
-            http.uri = %uri,
-            http.path = %path,
+            http.uri = %loggable::uri(&uri),
+            http.path = %loggable::path(&path),
             http.status_code = tracing::field::Empty,
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty,
+            payment.outcome = tracing::field::Empty,
+            payment.ledger_id = tracing::field::Empty,
         )
     } else {
         tracing::span!(
@@ -366,12 +409,15 @@ pub async fn trace_http_request(
             "http.request",
             otel.name = %span_name,
             http.method = %method,
-            http.uri = %uri,
-            http.path = %path,
+            http.uri = %loggable::uri(&uri),
+            http.path = %loggable::path(&path),
             http.status_code = tracing::field::Empty,
             caller.auth_method = tracing::field::Empty,
             caller.principal = tracing::field::Empty,
             caller.did = tracing::field::Empty,
+            surface.variant = tracing::field::Empty,
+            payment.outcome = tracing::field::Empty,
+            payment.ledger_id = tracing::field::Empty,
         )
     };
 
@@ -386,7 +432,14 @@ pub async fn trace_http_request(
         let status = response.status();
 
         // Record status while span is active
-        tracing::Span::current().record("http.status_code", status.as_u16());
+        let span = tracing::Span::current();
+        span.record("http.status_code", status.as_u16());
+        if let Some(note) = noted_payment() {
+            span.record("payment.outcome", note.outcome.as_str());
+            if let Some(ledger_id) = note.ledger_id.as_deref() {
+                span.record("payment.ledger_id", ledger_id);
+            }
+        }
 
         response
     }
@@ -394,85 +447,23 @@ pub async fn trace_http_request(
     .await
 }
 
+/// Captures the spans a future exports, for tests asserting span attributes.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::source_auth::AuthenticatedIdentity;
-    use crate::source_auth::models::{MtlsSans, PeerCertSource};
-
-    fn field(
-        fields: &[(&'static str, String)],
-        key: &str,
-    ) -> Option<String> {
-        fields
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.clone())
-    }
-
-    #[test]
-    fn caller_span_fields_jwt_bearer() {
-        let id = AuthenticatedIdentity::JwtBearer {
-            subject: "alice@example.com".to_string(),
-            claims: serde_json::json!({"sub": "alice@example.com"}),
-        };
-        let f = caller_span_fields(&id);
-        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("jwt_bearer"));
-        assert_eq!(field(&f, "caller.principal").as_deref(), Some("alice@example.com"));
-        assert_eq!(field(&f, "caller.did"), None);
-    }
-
-    #[test]
-    fn caller_span_fields_api_key() {
-        let id = AuthenticatedIdentity::ApiKey {
-            key_name: "key-prod-01".to_string(),
-        };
-        let f = caller_span_fields(&id);
-        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("api_key"));
-        assert_eq!(field(&f, "caller.principal").as_deref(), Some("key-prod-01"));
-        assert_eq!(field(&f, "caller.did"), None);
-    }
-
-    #[test]
-    fn caller_span_fields_did_auth() {
-        let id = AuthenticatedIdentity::DidAuth {
-            did: "did:web:agent.example.com".to_string(),
-        };
-        let f = caller_span_fields(&id);
-        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("did_auth"));
-        assert_eq!(field(&f, "caller.principal").as_deref(), Some("did:web:agent.example.com"));
-        assert_eq!(field(&f, "caller.did").as_deref(), Some("did:web:agent.example.com"));
-    }
-
-    #[test]
-    fn caller_span_fields_mtls() {
-        let id = AuthenticatedIdentity::Mtls {
-            principal: "CN=client".to_string(),
-            fingerprint: "abc123".to_string(),
-            subject_dn: "CN=client,O=Acme".to_string(),
-            issuer_dn: "CN=Acme CA".to_string(),
-            sans: MtlsSans::default(),
-            source: PeerCertSource::DirectTls,
-        };
-        let f = caller_span_fields(&id);
-        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("mtls"));
-        assert_eq!(field(&f, "caller.principal").as_deref(), Some("CN=client"));
-        assert_eq!(field(&f, "caller.did"), None);
-    }
-
-    // ── Component test: proxied request produces a span with caller.* ──────────
-
+pub(crate) mod span_capture {
+    use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::error::OTelSdkError;
     use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
     use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Minimal in-memory span exporter that captures exported spans for
     /// assertions. Spans are stored after any wrapping exporter (e.g. the
     /// redacting exporter) has run.
     #[derive(Debug, Clone)]
-    struct CapturingExporter {
-        spans: Arc<Mutex<Vec<SpanData>>>,
+    pub(crate) struct CapturingExporter {
+        pub(crate) spans: Arc<Mutex<Vec<SpanData>>>,
     }
 
     impl SpanExporter for CapturingExporter {
@@ -498,7 +489,8 @@ mod tests {
         }
     }
 
-    fn span_attr(
+    /// The string value of attribute `key` on `span`.
+    pub(crate) fn span_attr(
         span: &SpanData,
         key: &str,
     ) -> Option<String> {
@@ -506,6 +498,265 @@ mod tests {
             .iter()
             .find(|kv| kv.key.as_str() == key)
             .map(|kv| kv.value.as_str().to_string())
+    }
+
+    /// Runs `future` with an OpenTelemetry layer and returns the spans it
+    /// exported. Only spans created while polling `future` itself are
+    /// captured, not those of tasks it spawns.
+    pub(crate) async fn capture_spans<F: std::future::Future>(future: F) -> (F::Output, Vec<SpanData>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(CapturingExporter { spans: captured.clone() })
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("test")));
+        let output = future
+            .with_subscriber(subscriber)
+            .await;
+        provider
+            .force_flush()
+            .unwrap();
+        let spans = std::mem::take(&mut *captured.lock().unwrap());
+        (output, spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_payment_outcome_noted_while_serving_reaches_the_access_log_line() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        PAYMENT_NOTE
+            .scope(slot.clone(), async {
+                note_payment_outcome("rejected", Some("0199-row"));
+                assert_eq!(
+                    noted_payment(),
+                    Some(PaymentNote {
+                        outcome: "rejected".to_string(),
+                        ledger_id: Some("0199-row".to_string())
+                    })
+                );
+            })
+            .await;
+        let noted = slot.lock().unwrap().take();
+        assert_eq!(payment_log_suffix(noted.as_ref()), " payment_outcome=\"rejected\" payment_ledger_id=\"0199-row\"");
+        assert_eq!(
+            payment_log_suffix(Some(&PaymentNote {
+                outcome: "unavailable".to_string(),
+                ledger_id: None
+            })),
+            " payment_outcome=\"unavailable\" payment_ledger_id=\"\""
+        );
+    }
+
+    #[tokio::test]
+    async fn outside_a_served_request_a_payment_outcome_is_ignored() {
+        note_payment_outcome("paid", Some("row"));
+        assert_eq!(noted_payment(), None);
+        assert_eq!(payment_log_suffix(None), "");
+    }
+    use crate::source_auth::AuthenticatedIdentity;
+    use crate::source_auth::models::{MtlsSans, PeerCertSource};
+
+    fn field(
+        fields: &[(&'static str, String)],
+        key: &str,
+    ) -> Option<String> {
+        fields
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn caller_span_fields_jwt_bearer() {
+        let id = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "alice@example.com".to_string(),
+            claims: serde_json::json!({"sub": "alice@example.com"}),
+        };
+        let f = caller_span_fields(&id);
+        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("jwt_bearer"));
+        assert_eq!(field(&f, "caller.principal").as_deref(), Some("alice@example.com"));
+        assert_eq!(field(&f, "caller.did"), None);
+    }
+
+    #[test]
+    fn caller_span_fields_api_key() {
+        let id = AuthenticatedIdentity::ApiKey {
+            key_name: "key-prod-01".to_string(),
+            provider_agent_id: None,
+        };
+        let f = caller_span_fields(&id);
+        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("api_key"));
+        assert_eq!(field(&f, "caller.principal").as_deref(), Some("key-prod-01"));
+        assert_eq!(field(&f, "caller.did"), None);
+    }
+
+    #[test]
+    fn caller_span_fields_did_auth() {
+        let id = AuthenticatedIdentity::DidAuth {
+            did: "did:web:agent.example.com".to_string(),
+        };
+        let f = caller_span_fields(&id);
+        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("did_auth"));
+        assert_eq!(field(&f, "caller.principal").as_deref(), Some("did:web:agent.example.com"));
+        assert_eq!(field(&f, "caller.did").as_deref(), Some("did:web:agent.example.com"));
+    }
+
+    #[test]
+    fn caller_span_fields_mtls() {
+        let id = AuthenticatedIdentity::Mtls {
+            principal: "CN=client".to_string(),
+            fingerprint: "abc123".to_string(),
+            subject_dn: "CN=client,O=Acme".to_string(),
+            issuer_dn: "CN=Acme CA".to_string(),
+            trust_anchor_fingerprint: "def456".to_string(),
+            sans: MtlsSans::default(),
+            source: PeerCertSource::DirectTls,
+        };
+        let f = caller_span_fields(&id);
+        assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("mtls"));
+        assert_eq!(field(&f, "caller.principal").as_deref(), Some("CN=client"));
+        assert_eq!(field(&f, "caller.did"), None);
+    }
+
+    #[tokio::test]
+    async fn access_log_keeps_query_parameter_names_and_redacts_values() {
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/v1/oauth/callback", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        for uri in
+            ["/v1/oauth/callback?code=oauth-code-value&state=oauth-state-value", "/v1/oauth/callback?bare-token-value"]
+        {
+            let request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
+
+        let text = logs.text();
+        assert!(text.contains("HTTP GET /v1/oauth/callback?code=<redacted>&state=<redacted> host="), "{text}");
+        assert!(text.contains("HTTP GET /v1/oauth/callback?<redacted> host="), "{text}");
+        assert!(text.contains("HTTP GET /v1/oauth/callback → 200"), "{text}");
+        for (parameter, value) in
+            [("code", "oauth-code-value"), ("state", "oauth-state-value"), ("bare", "bare-token-value")]
+        {
+            assert!(!text.contains(value), "the access log holds the {parameter} value: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn access_log_records_only_a_prefix_of_an_onboarding_session_id() {
+        use tower::ServiceExt;
+
+        let session_id = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let app = axum::Router::new()
+            .route("/onboard/{uuid}/rpc", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/onboard/{session_id}/rpc"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let text = logs.text();
+        assert!(text.contains("HTTP POST /onboard/0f2c9d7e.../rpc host="), "{text}");
+        assert!(text.contains("HTTP POST /onboard/0f2c9d7e.../rpc → 200"), "{text}");
+        assert!(!text.contains(session_id), "{text}");
+    }
+
+    #[tokio::test]
+    async fn access_log_records_only_a_prefix_of_the_mcp_session_id() {
+        use tower::ServiceExt;
+
+        let session_id = "0f2c9d7e1b3a4c5d8e9fa0b1c2d3e4f5";
+        let app = axum::Router::new()
+            .route("/mcp", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(access_log));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("mcp-session-id", session_id)
+                    .header("x-forwarded-for", "203.0.113.7")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let text = logs.text();
+        assert!(text.contains(r#"mcp_sid="0f2c9d7e...""#), "{text}");
+        assert!(text.contains(r#"xff="203.0.113.7""#), "{text}");
+        assert!(!text.contains(session_id), "the access log holds the full session id: {text}");
+    }
+
+    // ── Component test: proxied request produces a span with caller.* ──────────
+
+    use super::span_capture::{CapturingExporter, capture_spans, span_attr};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn the_request_span_records_the_variant_routing_set() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        use axum::{Router, body::Body, http::Request, routing::post};
+        use tower::ServiceExt;
+
+        super::super::register_channel_prefix("/test-variant-span".to_string(), "Test Variant Span".to_string());
+        let ((), spans) = capture_spans(async {
+            async fn handler() -> &'static str {
+                in_request(RequestScope::fresh(), async {
+                    set_request_variant("beta");
+                    set_request_variant("_base_");
+                })
+                .await;
+                "ok"
+            }
+            let app = Router::new()
+                .route("/test-variant-span", post(handler))
+                .layer(axum::middleware::from_fn(trace_http_request));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/test-variant-span")
+                .body(Body::empty())
+                .unwrap();
+            let _ = app
+                .oneshot(request)
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let http_span = spans
+            .iter()
+            .find(|span| span.name == "http.request" || span_attr(span, "http.path").is_some())
+            .expect("the request span was exported");
+        assert_eq!(span_attr(http_span, "surface.variant").as_deref(), Some("beta"));
     }
 
     #[test]
@@ -548,6 +799,7 @@ mod tests {
             rt.block_on(async {
                 async fn handler() -> &'static str {
                     let identity = AuthenticatedIdentity::JwtBearer {
+                        principal_claim: "sub".to_string(),
                         subject: "alice@example.com".to_string(),
                         claims: serde_json::json!({"sub": "alice@example.com"}),
                     };
@@ -587,6 +839,67 @@ mod tests {
     }
 
     #[test]
+    fn http_request_span_redacts_query_values_in_http_uri() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use opentelemetry::trace::TracerProvider as _;
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        super::super::register_channel_prefix("/test-uri-span".to_string(), "Test Uri Span".to_string());
+
+        let captured = Arc::new(Mutex::new(Vec::<SpanData>::new()));
+        let exporter = CapturingExporter { spans: captured.clone() };
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::OpenTelemetryLayer::new(provider.tracer("test")));
+
+        {
+            let _guard = crate::component_tests::helpers::thread_subscriber::set_thread_default(subscriber);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let app = Router::new()
+                    .route("/test-uri-span/callback", get(|| async { "ok" }))
+                    .layer(axum::middleware::from_fn(trace_http_request));
+                let request = Request::builder()
+                    .uri("/test-uri-span/callback?code=oauth-code-value&bare-token-value")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app
+                    .oneshot(request)
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+            });
+        }
+
+        provider
+            .force_flush()
+            .unwrap();
+
+        let spans = captured.lock().unwrap();
+        let http_span = spans
+            .iter()
+            .find(|span| span_attr(span, "http.path").as_deref() == Some("/test-uri-span/callback"))
+            .expect("the request exported an http.request span");
+        assert_eq!(
+            span_attr(http_span, "http.uri").as_deref(),
+            Some("/test-uri-span/callback?code=<redacted>&<redacted>")
+        );
+        for span in spans.iter() {
+            for attribute in &span.attributes {
+                let value = attribute.value.as_str();
+                assert!(!value.contains("oauth-code-value"), "{} holds a query value", attribute.key);
+                assert!(!value.contains("bare-token-value"), "{} holds a query value", attribute.key);
+            }
+        }
+    }
+
+    #[test]
     fn proxied_request_records_derived_caller_did() {
         use axum::{Router, body::Body, http::Request, routing::post};
         use opentelemetry::trace::TracerProvider as _;
@@ -614,6 +927,7 @@ mod tests {
                 async fn handler() -> &'static str {
                     // Caller authenticated with a JWT bearer (no DID known here)…
                     let identity = AuthenticatedIdentity::JwtBearer {
+                        principal_claim: "sub".to_string(),
                         subject: "agent-oid-123".to_string(),
                         claims: serde_json::json!({"oid": "agent-oid-123"}),
                     };

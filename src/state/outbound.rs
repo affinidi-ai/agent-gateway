@@ -58,6 +58,8 @@ pub struct OutboundProxyState {
     /// Credential provider store — resolves provider metadata for OAuth flows.
     pub credential_provider_store: Option<Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
     pub consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+    /// Authenticates a Transit Point's callers with its `source_auth`.
+    pub source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
     pub mcp_continuations: Option<Arc<crate::mcp::continuations::config::ContinuationRuntime>>,
     /// Gateway base URL — for building OAuth authorization URLs.
     pub gateway_base_url: Option<String>,
@@ -65,13 +67,19 @@ pub struct OutboundProxyState {
     /// connections, and errors so the dashboard can render TP rows under
     /// their parent surface group.
     pub task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    /// Byte cap for a buffered MCP upstream response (`a2a.max_body_size`).
+    /// Byte cap for a buffered upstream response (`a2a.max_body_size`).
     pub max_response_bytes: usize,
+    /// Byte cap for a request body on a Transit Point without `mcp_http`
+    /// (`a2a.max_body_size`).
+    pub max_request_bytes: usize,
+    /// The test allow-list of fixtures a request carrying a grant by binding
+    /// may reach over `http` or loopback; `None` in production.
+    pub egress_allowlist: Option<String>,
 
     /// When set, skip path-based virtual-channel resolution and use this
     /// alias directly. Populated at route-registration time when the VC
     /// is mounted at a custom `listen_path` (and therefore the request
-    /// path no longer follows the `/outgoing/<route>/<alias>` convention
+    /// path no longer follows the `/outbound/<route>/<alias>` convention
     /// that [`crate::proxy::outbound_handler::resolve_virtual_channel`]
     /// relies on).
     pub vc_alias_override: Option<String>,

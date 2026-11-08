@@ -35,7 +35,6 @@
         }
       }
     ],
-    "transit_token_mode": "embedded",
-    "sign_requests": true
+    "transit_token_mode": "embedded"
   }
 }

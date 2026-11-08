@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import {
   DirectAccessSwitch,
   ExposureBadge,
+  ManagedByBadge,
   ManagedByBanner,
   SurfaceOnlyNotice,
   surfacesFronting,
@@ -85,6 +86,15 @@ describe('labels', () => {
   it('names the managing product', () => {
     render(<ManagedByBanner managedBy="Boris" />);
     expect(screen.getByTestId('mcp-proxy-managed-by')).toHaveTextContent('Managed by Boris.');
+  });
+
+  it('lets a long owner name wrap inside its table cell', () => {
+    render(<ManagedByBadge managedBy="procurement-automation-platform-terraform-pipeline" />);
+    const badge = screen.getByTitle(
+      'Created and maintained by procurement-automation-platform-terraform-pipeline'
+    );
+    expect(badge).toHaveClass('badge', 'text-wrap', 'text-break');
+    expect(badge).toHaveTextContent('procurement-automation-platform-terraform-pipeline');
   });
 
   it('shows how a proxy can be reached', () => {

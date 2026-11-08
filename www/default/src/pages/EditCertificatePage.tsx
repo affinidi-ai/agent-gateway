@@ -178,13 +178,11 @@ const EditCertificatePage: React.FC = () => {
 
   const generateIdentity = async () => {
     try {
-      console.log('[EditCertificatePage] Generating new identity...');
       const response = await apiClient.post('/vault/identity/generate', {
         purpose: `Certificate: ${formData.name || 'Unnamed'}`,
         item_type: 'cert',
       });
       const { did } = response.data;
-      console.log('[EditCertificatePage] Generated DID:', did);
       setFormData({ ...formData, identity_did: did, useIdentity: true });
       setIsModified(true);
       showToast('success', 'Identity generated successfully');
@@ -362,10 +360,11 @@ const EditCertificatePage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-certificate-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="certificate-editor-back-button"
           onClick={() => navigate('/secrets')}
           disabled={isSaving}
         >
@@ -387,6 +386,7 @@ const EditCertificatePage: React.FC = () => {
         <div>
           <button
             className="btn btn-sm btn-primary me-2"
+            data-testid="certificate-editor-header-save-button"
             onClick={handleSubmit}
             disabled={isSaving || (isEditMode && !isModified)}
           >
@@ -516,6 +516,7 @@ const EditCertificatePage: React.FC = () => {
                     <button
                       type="button"
                       className="btn btn-sm btn-outline-primary"
+                      data-testid="certificate-editor-upload-button"
                       onClick={() => fileInputRef.current?.click()}
                     >
                       <i className="fas fa-upload me-1"></i>
@@ -685,6 +686,7 @@ const EditCertificatePage: React.FC = () => {
                       <button
                         type="button"
                         className="btn btn-outline-secondary"
+                        data-testid="certificate-editor-add-tag-button"
                         onClick={handleAddTag}
                       >
                         <i className="fas fa-plus"></i> Add
@@ -746,6 +748,7 @@ const EditCertificatePage: React.FC = () => {
                   {isEditMode && (
                     <DeleteButton
                       onDelete={handleDelete}
+                      data-testid="certificate-editor-delete-button"
                       title="Delete this certificate"
                       disabled={isSaving}
                       variant="danger"
@@ -755,6 +758,7 @@ const EditCertificatePage: React.FC = () => {
                   )}
                   <div className={!isEditMode ? 'ms-auto' : ''}>
                     <button
+                      data-testid="certificate-editor-save-button"
                       type="submit"
                       className="btn btn-sm btn-primary"
                       disabled={isSaving || (isEditMode && !isModified)}

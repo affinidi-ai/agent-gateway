@@ -1,0 +1,129 @@
+branch: surface-variant-in-audit-logs
+changes:
+  added:
+    - timestamp: '2026-10-28T17:00:00Z'
+      title: ⭐ Name the surface variant on every audit record and log line of a request
+      description: >-
+        Every audit record written while serving a surface request carries surface_variant: the
+        variant's alias, _base_ when the base surface served it, or _unknown_ when the URL named a
+        variant the surface doesn't have. Policy decisions, refusals, delegation, VP, identity
+        binding, trust check and payment records of a request all carry it, so audits and
+        integrations can tell which variant a request ran on. The policy_audit,
+        identity_binding_audit, trust_check_audit and credential_delegation log lines carry the
+        same field, and the request spans carry surface.variant. Records outside surface requests,
+        and records written before the upgrade, have none.
+    - timestamp: '2026-10-28T17:01:00Z'
+      title: Offer AUDIT_SURFACE_VARIANT to audit integration templates
+      description: >-
+        Audit integration templates can use AUDIT_SURFACE_VARIANT, the record's surface variant,
+        empty outside surface requests and when the surface's default variant is misconfigured.
+    - timestamp: '2026-10-28T17:02:00Z'
+      title: Show the surface variant and refusal details on the Audit Log
+      description: >-
+        The Audit Log shows which variant a request record ran on and says it in the record's
+        description, reads a gateway-wide policy decision as applying to every surface, and
+        describes request refusals with their stage, reason, status and the variant asked for.
+        Policy change records show the slot's variant, or the base surface.
+  changed: []
+  fixed:
+    - timestamp: '2026-10-28T18:00:00Z'
+      title: Keep the surface variant on metrics of a stream the client aborts
+      description: >-
+        A streamed response whose client disconnects before its end now records its connection
+        metric with the request's surface variant and id, as a stream that completes does. The
+        stream was dropped outside its request, so the metric carried no variant.
+    - timestamp: '2026-10-28T22:30:00Z'
+      title: Reject a default_variant_id that names no variant on a surface without variants
+      description: >-
+        Saving a surface whose default_variant_id names no variant is refused with 400 whether or
+        not the surface has variants; a surface with no variants used to save with one, and its
+        base surface served its requests. The gateway drops such a stored default at startup,
+        with a warning naming the surface and the dropped id, so the base surface keeps serving
+        them instead of every path refusing them with 500 as misconfigured_default.
+    - timestamp: '2026-10-29T15:20:00Z'
+      title: Refresh the enabled variants of a surface whose default variant is disabled
+      description: >-
+        Saving a surface whose default variant is disabled now refreshes the Targets and overrides
+        the Access Point serves its enabled variants with. They used to keep the ones from before
+        the save, as the whole cache entry was left as it was; requests with no alias are still
+        refused as the disabled default.
+    - timestamp: '2026-10-29T15:25:00Z'
+      title: Ask a Fabric peer for the pinned variant on the MPP auto-pay retry too
+      description: >-
+        When a peer gateway answers a ForwardRequest with 402 and the Access Point's MPP auto-pay
+        pays it, the paid retry now carries the alias the fabric:// Target pins, as the first
+        request does. It carried none, so the peer could serve the paid request with its default
+        variant or base surface instead of the pinned one.
+  removed:
+    - timestamp: '2026-10-29T13:30:00Z'
+      title: Drop variant_alias from request_completed audit records
+      description: >-
+        The request_completed audit record no longer declares a variant_alias field. No release
+        ever wrote it; the record's variant is surface_variant, as on every other request record.
+  security:
+    - timestamp: '2026-10-28T18:10:00Z'
+      title: Log a refused variant alias cut to 32 characters, never as the caller sent it
+      description: >-
+        The warning written when a request's surface variant can't be resolved names the reason,
+        the requested alias cut to 32 characters as the audit record holds it, on a disabled
+        variant its configured alias in disabled_variant, and on a misconfigured default the
+        configured default_variant_id. It no longer embeds the alias
+        from the URL verbatim, so caller-chosen text in the log is bounded on the Access Point,
+        the Transit Point and Fabric receive.
+  breaking:
+    - timestamp: '2026-10-28T15:30:00Z'
+      title: ⭐ Refuse requests whose surface variant can't be resolved on every path
+      description: >-
+        A request that names a variant the surface doesn't have (including on a surface with no
+        variants), names a disabled variant, has a disabled default variant, or reaches a surface
+        whose default_variant_id names no variant is now refused on the Access Point, the Transit
+        Point and Fabric receive. It is no longer served by the base surface or the default
+        variant. An unknown or disabled variant gets 404, a misconfigured default 500, for legacy
+        and modern requests alike, in place of the earlier 400, 503 and base-surface fallback. Each
+        refusal is recorded as request_rejected at stage routing with reason unknown_variant,
+        variant_disabled or the new misconfigured_default; an unknown_variant record carries the
+        alias the URL named, cut to 32 characters, in requested_variant. On the Access Point and
+        the Transit Point, a modern MCP request of any method (told by its MCP headers) is refused
+        with a JSON-RPC error with code -32603 that echoes the request's id, recorded with that
+        rpc_error_code; the body is read only to recover the id, within 16 KiB (or the endpoint's
+        smaller max_request_bytes) and 2 seconds since the read runs before authentication, and
+        one that can't be read within those, or carries no id, gets the error without one. Legacy
+        MCP and other requests get a plain error.
+    - timestamp: '2026-10-28T16:10:00Z'
+      title: Rename variant_alias to surface_variant on metrics and PayloadCaptured
+      description: >-
+        Connection metrics and the PayloadCaptured WebSocket update name the variant
+        surface_variant instead of variant_alias, and take it from the request, so it matches the
+        request's audit records. The default variant now shows its alias and a surface with no
+        variants shows _base_, where both were empty, so a per-variant series steps at the upgrade
+        for one metrics retention window (6 hours by default). Stored metrics written with
+        variant_alias still load.
+    - timestamp: '2026-10-28T17:03:00Z'
+      title: Name the variant of a policy change surface_variant, _base_ for base slots
+      description: >-
+        Policy change records name the variant whose slot was written surface_variant, the name
+        every other record uses, instead of variant, and record _base_ for a slot on the base
+        surface, which also applies to the variants that inherit it. Readers of policy change
+        records, such as audit integrations and log consumers, must switch from variant to
+        surface_variant. Records stored with variant still read, as surface_variant, and the
+        Audit Log shows their variant.
+    - timestamp: '2026-10-29T13:00:00Z'
+      title: ⭐ Send a peer gateway only the variant alias its fabric:// Target pins
+      description: >-
+        A request over Fabric no longer carries the sending gateway's URL alias: a request to
+        /route$beta on the sending gateway used to ask the peer for its own beta variant, and is now
+        served by the peer's default variant or base surface, as an alias-less request is. Each
+        gateway picks its own variant. To select a peer variant, pin it in the sending route's
+        Target, fabric://<gateway>/<surface>$<alias>, or in a variant's Target override; this works
+        for Access Point Targets and Transit Points, over a buffered ForwardRequest and a framed
+        stream alike (a pinned alias on a ForwardRequest used to reach the peer as part of the
+        surface id, which it couldn't find). The peer refuses a pinned alias it doesn't have, or has
+        disabled, with 404. Setups that relied on matching aliases on both gateways must pin the
+        alias in the Target.
+    - timestamp: '2026-10-28T16:15:00Z'
+      title: Leave http_status off request_rejected records written on Fabric receive
+      description: >-
+        request_rejected records http_status only on HTTP refusals, at the Access Point and the
+        Transit Point. A refusal on Fabric receive (via_fabric true, a stream or a ForwardRequest)
+        involves no HTTP response and no longer records one. Readers that expected the field on
+        every request_rejected record must treat it as optional; stored records keep theirs.

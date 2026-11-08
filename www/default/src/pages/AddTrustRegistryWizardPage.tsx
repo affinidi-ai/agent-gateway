@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import './OnboardWizard.css';
+import WizardProgress from '../components/shared/WizardProgress';
 
 // Import step components
 import EnterOobUrlStep from '../components/trust-registry/EnterOobUrlStep';
@@ -120,7 +121,7 @@ const AddTrustRegistryWizardPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-trust-registry-wizard">
       {/* Page Header */}
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <h1 className="h3 mb-0 text-gray-800">
@@ -146,37 +147,7 @@ const AddTrustRegistryWizardPage: React.FC = () => {
         </div>
       )}
 
-      {/* Progress Bar */}
-      <div className="card shadow mb-4">
-        <div className="card-body">
-          <div className="wizard-progress">
-            <div className="wizard-steps">
-              {steps.map((step, index) => (
-                <div
-                  key={step.key}
-                  className={`wizard-step ${
-                    index === currentStepIndex
-                      ? 'active'
-                      : index < currentStepIndex
-                        ? 'completed'
-                        : ''
-                  }`}
-                >
-                  <div className="wizard-step-circle">
-                    {index < currentStepIndex ? (
-                      <i className="fas fa-check"></i>
-                    ) : (
-                      <span>{index + 1}</span>
-                    )}
-                  </div>
-                  <div className="wizard-step-label">{step.label}</div>
-                  {index < steps.length - 1 && <div className="wizard-step-line"></div>}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
+      <WizardProgress steps={steps} currentIndex={currentStepIndex} />
 
       {/* Step Content */}
       <div className="wizard-content">{renderStep()}</div>

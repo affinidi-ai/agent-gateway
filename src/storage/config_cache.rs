@@ -99,3 +99,68 @@ impl ConfigCache {
         &self.cache_path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_cache_never_carries_surfaces() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = ConfigCache::new(dir.path());
+        let config = GatewayConfig::default_config();
+        assert!(!config.surfaces.is_empty());
+
+        cache
+            .save(&config, "dynamodb")
+            .await
+            .expect("save");
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(cache.cache_path()).expect("read cache")).expect("parse");
+        assert!(
+            raw["config"]
+                .get("surfaces")
+                .is_none(),
+            "surfaces must not be cached"
+        );
+        let loaded = cache
+            .load()
+            .await
+            .expect("load");
+        assert!(
+            loaded
+                .config
+                .surfaces
+                .is_empty()
+        );
+        assert_eq!(loaded.source, "dynamodb");
+
+        raw["config"]["surfaces"] = serde_json::json!([{
+            "surface_id": "legacy",
+            "name": "legacy",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/legacy", "protocol": "a2a"},
+            "target": {
+                "endpoint": "https://managed.example/a2a",
+                "trust_check_list": [{
+                    "id": "legacy-target",
+                    "trust_registry_id": "tr-1",
+                    "query_type": "recognition",
+                    "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
+                }]
+            },
+            "transit": {"points": [{"alias": "partner-a", "target_endpoint": "https://partner.example/a2a"}]}
+        }]);
+        std::fs::write(cache.cache_path(), raw.to_string()).expect("write cache");
+        let loaded = cache
+            .load()
+            .await
+            .expect("a cache file carrying surfaces still loads");
+        assert!(
+            loaded
+                .config
+                .surfaces
+                .is_empty(),
+            "surfaces come only from the surface store"
+        );
+    }
+}

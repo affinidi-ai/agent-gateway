@@ -34,6 +34,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'mcp_legacy_metadata_output',
   'mcp_http',
   'tags',
+  'trust_check_split',
   'access_point',
   'target',
   'transit',
@@ -60,6 +61,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'access_point.publish_to_did_document',
   'access_point.terminate_trace_id',
   'access_point.a2a',
+  'access_point.public',
   'access_point.supported_extensions',
   'access_point.agent_card_path',
   'access_point.response_custom_metadata',
@@ -86,9 +88,8 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'target.a2a_proxy_id',
   'target.mcp_identity_config',
   'target.fabric_target_name',
-  'target.mpp_auto_pay',
-  'target.mpp_auto_pay_max_amount',
   'target.fabric_delegated_credentials',
+  'target.delegated_credentials_for_fabric_callers',
 
   // ── Transit (SharedTransitConfig is flattened into transit.*) ────
   'transit.points',
@@ -102,7 +103,6 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.custom_metadata',
   'transit.response_extension_rules',
   'transit.opa_policy_definition_id',
-  'transit.source_auth',
 
   // ── TransitPoint (each entry in transit.points[]) ────────────────
   'transit.points[*].id',
@@ -116,9 +116,9 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].policy',
   'transit.points[*].response_policy',
   'transit.points[*].mcp_tool_gating',
-  'transit.points[*].payment_policy',
   'transit.points[*].networking',
   'transit.points[*].rate_limit',
+  'transit.points[*].per_caller_rate_limit',
   'transit.points[*].identity_injection',
   'transit.points[*].managed_identity',
   'transit.points[*].workload_binding',
@@ -129,7 +129,11 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].agent_card_path',
   'transit.points[*].extension_inspection',
   'transit.points[*].require_transit_token',
+  'transit.points[*].source_auth',
+  'transit.points[*].allow_unauthenticated_callers',
   'transit.points[*].fabric_delegated_credentials',
+  'transit.points[*].trust_check_list',
+  'transit.points[*].trust_check_migrated',
 ]);
 
 /** Fields of a stored Transit Point: the `X` of every `transit.points[*].X` path. */

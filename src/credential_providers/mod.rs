@@ -8,9 +8,16 @@
 //!
 //! Client secrets are never stored directly; they reference the secrets store
 //! via secret_id (e.g. "GOOGLE_CLIENT_SECRET").
+//!
+//! A provider with an `issuer` is an external consent provider: checked against
+//! its issuer's metadata when it is created, its endpoints and client fields
+//! fixed for life, and bound only by `consent_mode: external` (see [`external`]).
 
+pub mod external;
 pub mod handlers;
+pub mod references;
 pub mod router;
+pub mod scope_comparison;
 pub mod storage;
 
 use chrono::{DateTime, Utc};
@@ -32,6 +39,195 @@ pub enum CredentialProviderType {
     /// Static API key — resolved directly from the secrets store, no OAuth
     #[serde(rename = "api_key")]
     ApiKey,
+    /// JWT Bearer grant (RFC 7523 section 2.1): a signed JWT is the grant, no client
+    /// credentials. Google service accounts use it.
+    #[serde(rename = "oauth2_jwt_bearer")]
+    OAuth2JwtBearer,
+    /// Client Credentials grant with `private_key_jwt` client authentication (RFC 7523
+    /// section 2.2). Entra certificate credentials use it.
+    #[serde(rename = "oauth2_client_credentials_jwt_auth")]
+    OAuth2ClientCredentialsJwtAuth,
+}
+
+impl CredentialProviderType {
+    /// The signing algorithm used when the provider names none; `None` for types
+    /// that sign nothing.
+    pub fn default_jwt_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        match self {
+            Self::OAuth2JwtBearer => Some(JwtSigningAlgorithm::RS256),
+            Self::OAuth2ClientCredentialsJwtAuth => Some(JwtSigningAlgorithm::PS256),
+            Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => None,
+        }
+    }
+
+    /// Does a request authenticated by a provider of this type carry the gateway's own
+    /// credential (an API key, or a token granted to the gateway's own client)? An
+    /// authorization code provider sends the end user's token instead.
+    pub fn sends_gateway_credential(&self) -> bool {
+        match self {
+            Self::OAuth2ClientCredentials
+            | Self::ApiKey
+            | Self::OAuth2JwtBearer
+            | Self::OAuth2ClientCredentialsJwtAuth => true,
+            Self::OAuth2AuthorizationCode => false,
+        }
+    }
+
+    /// The algorithm a provider of this type signs with: `configured`, else the default.
+    pub fn jwt_signing_algorithm(
+        &self,
+        configured: Option<JwtSigningAlgorithm>,
+    ) -> Option<JwtSigningAlgorithm> {
+        self.default_jwt_algorithm()
+            .map(|default| configured.unwrap_or(default))
+    }
+
+    pub fn allows_jwt_algorithm(
+        &self,
+        algorithm: JwtSigningAlgorithm,
+    ) -> bool {
+        match self {
+            Self::OAuth2JwtBearer => matches!(algorithm, JwtSigningAlgorithm::RS256 | JwtSigningAlgorithm::ES256),
+            Self::OAuth2ClientCredentialsJwtAuth => {
+                matches!(algorithm, JwtSigningAlgorithm::PS256 | JwtSigningAlgorithm::RS256)
+            }
+            Self::OAuth2AuthorizationCode | Self::OAuth2ClientCredentials | Self::ApiKey => false,
+        }
+    }
+}
+
+/// Algorithm of the JWT a provider signs with its private key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum JwtSigningAlgorithm {
+    RS256,
+    PS256,
+    ES256,
+}
+
+/// The signed-JWT settings of the `oauth2_jwt_bearer` and
+/// `oauth2_client_credentials_jwt_auth` types. Key and certificate are secret
+/// references; the PEM values never leave the secrets store except to sign.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JwtAssertionSettings {
+    /// Secret holding the PEM private key (PKCS#1 or PKCS#8 for RSA, PKCS#8 for EC) or a
+    /// Google service account JSON key file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_key_secret_ref: Option<String>,
+    /// Secret holding the PEM certificate whose SHA-256 thumbprint goes in `x5t#S256`;
+    /// optional, for issuers such as Entra that identify the key by certificate
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_certificate_secret_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_algorithm: Option<JwtSigningAlgorithm>,
+    /// `aud` claim; the token endpoint when unset
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_audience: Option<String>,
+    /// `kid` header
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_key_id: Option<String>,
+    /// `iss` claim of a JWT Bearer grant (a Google service account's `client_email`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_issuer: Option<String>,
+    /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_subject: Option<String>,
+}
+
+impl JwtAssertionSettings {
+    /// These settings with every field that `self` leaves unset taken from `existing`.
+    pub fn or(
+        self,
+        existing: Self,
+    ) -> Self {
+        Self {
+            jwt_signing_key_secret_ref: self
+                .jwt_signing_key_secret_ref
+                .or(existing.jwt_signing_key_secret_ref),
+            jwt_certificate_secret_ref: self
+                .jwt_certificate_secret_ref
+                .or(existing.jwt_certificate_secret_ref),
+            jwt_signing_algorithm: self
+                .jwt_signing_algorithm
+                .or(existing.jwt_signing_algorithm),
+            jwt_audience: self
+                .jwt_audience
+                .or(existing.jwt_audience),
+            jwt_key_id: self
+                .jwt_key_id
+                .or(existing.jwt_key_id),
+            jwt_issuer: self
+                .jwt_issuer
+                .or(existing.jwt_issuer),
+            jwt_subject: self
+                .jwt_subject
+                .or(existing.jwt_subject),
+        }
+    }
+
+    /// Does a provider of `provider_type` need a `jwt_subject` these settings leave blank?
+    /// Only a JWT Bearer grant does: its assertion names the subject the token is for.
+    pub fn lacks_subject_for(
+        &self,
+        provider_type: &CredentialProviderType,
+    ) -> bool {
+        *provider_type == CredentialProviderType::OAuth2JwtBearer
+            && self
+                .jwt_subject
+                .as_deref()
+                .is_none_or(|subject| subject.trim().is_empty())
+    }
+
+    /// The same settings with blank values removed and the rest trimmed, so a field
+    /// sent empty clears it.
+    pub fn normalized(self) -> Self {
+        fn clean(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+        Self {
+            jwt_signing_key_secret_ref: clean(self.jwt_signing_key_secret_ref),
+            jwt_certificate_secret_ref: clean(self.jwt_certificate_secret_ref),
+            jwt_signing_algorithm: self.jwt_signing_algorithm,
+            jwt_audience: clean(self.jwt_audience),
+            jwt_key_id: clean(self.jwt_key_id),
+            jwt_issuer: clean(self.jwt_issuer),
+            jwt_subject: clean(self.jwt_subject),
+        }
+    }
+}
+
+/// How an external consent provider's client authenticates at the token and
+/// revocation endpoints (RFC 6749 section 2.3, RFC 8414).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// A public client: `client_id` in the body, no secret.
+    None,
+    /// HTTP Basic with the client id and secret.
+    ClientSecretBasic,
+    /// The client id and secret in the form body.
+    ClientSecretPost,
+    /// A JWT the client signs with its private key (RFC 7523 section 2.2), as
+    /// an `oauth2_client_credentials_jwt_auth` provider authenticates.
+    PrivateKeyJwt,
+}
+
+impl TokenEndpointAuthMethod {
+    /// The method's name in RFC 8414 `token_endpoint_auth_methods_supported`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+            Self::PrivateKeyJwt => "private_key_jwt",
+        }
+    }
+
+    /// Whether the client authenticates with a secret.
+    pub fn uses_secret(self) -> bool {
+        matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
+    }
 }
 
 /// A configured OAuth 2.0 credential provider
@@ -107,9 +303,63 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_secret_ref: Option<String>,
 
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
+
     /// Optional description
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// The authorization server's issuer. Makes this an external consent
+    /// provider, checked against the issuer's metadata at create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+
+    /// RFC 7009 revocation endpoint of an external consent provider: the one
+    /// its issuer's metadata names, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+
+    /// How an external consent provider's client authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+
+    /// An external consent provider's client id, a plain value: a client id is
+    /// not a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+
+    /// Admit an issuer whose metadata does not list
+    /// `code_challenge_methods_supported`, which MCP clients refuse. Set only for
+    /// an authorization server known to enforce S256 PKCE without saying so,
+    /// such as Microsoft Entra ID. An external consent provider only, fixed for
+    /// its life.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
+
+    /// Whether the issuer's metadata says its authorization responses carry
+    /// `iss` (RFC 9207), recorded from the metadata when an external consent
+    /// provider is created and never set by a request: a connect completed
+    /// without `iss` is then refused. `None` for a provider created before it
+    /// was recorded, whose connects need `iss` as well, since nothing says its
+    /// issuer omits it: recreate such a provider for an issuer that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_response_iss_parameter_supported: Option<bool>,
+
+    /// How the scopes an external consent provider's token endpoint grants are
+    /// compared with those asked for: exactly by default. An external consent
+    /// provider only, fixed for its life.
+    #[serde(default, skip_serializing_if = "scope_comparison::ScopeComparison::is_exact")]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+
+    /// Whether revoking any one token at the provider's revocation endpoint
+    /// ends the whole authorization of the person and the client, every
+    /// other grant of theirs included, as Google's does. The gateway then
+    /// revokes no grant while the same person holds another grant of the
+    /// provider: it would end that one too. Unset, every grant removed is
+    /// revoked. An external consent provider only, fixed for its life.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revocation_ends_authorization: bool,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -122,6 +372,183 @@ fn default_true() -> bool {
 impl StorableEntity for CredentialProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+}
+
+impl CredentialProvider {
+    /// The secret ids this provider reads: client, API key, signing key and certificate.
+    pub fn secret_refs(&self) -> Vec<&str> {
+        self.secret_ref_fields()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The secret ids a service token of this provider's type reads: the API key; the client
+    /// ID and secret; a JWT Bearer grant's signing key and certificate; or the client ID,
+    /// signing key and certificate of a client authenticating with a JWT. A reference left
+    /// from another type is not among them, and an authorization code provider issues no
+    /// service token.
+    pub fn service_token_secret_refs(&self) -> Vec<&str> {
+        let [client_id, client_secret, api_key, signing_key, certificate] = self.secret_ref_fields();
+        match self.provider_type {
+            CredentialProviderType::ApiKey => vec![api_key],
+            CredentialProviderType::OAuth2ClientCredentials => vec![client_id, client_secret],
+            CredentialProviderType::OAuth2JwtBearer => vec![signing_key, certificate],
+            CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![client_id, signing_key, certificate],
+            CredentialProviderType::OAuth2AuthorizationCode => Vec::new(),
+        }
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The secret reference of each field, in the order of [`Self::secret_refs`].
+    fn secret_ref_fields(&self) -> [Option<&str>; 5] {
+        [
+            self.client_id_secret_ref
+                .as_deref(),
+            self.client_secret_secret_ref
+                .as_deref(),
+            self.api_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            self.jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+        ]
+    }
+
+    /// Each secret reference, paired with whether `previous` held it in the same field while
+    /// this provider keeps the type and sends it to the same place: the token and
+    /// authorization endpoints, resource, additional parameters, default scopes and JWT issuer,
+    /// subject and audience.
+    fn secret_refs_kept_from(
+        &self,
+        previous: Option<&Self>,
+    ) -> Vec<(&str, bool)> {
+        let stored = previous
+            .filter(|previous| {
+                self.provider_type == previous.provider_type
+                    && self.token_endpoint == previous.token_endpoint
+                    && self.authorization_endpoint == previous.authorization_endpoint
+                    && self.resource == previous.resource
+                    && self.additional_params == previous.additional_params
+                    && self.default_scopes == previous.default_scopes
+                    && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
+                    && self.jwt.jwt_subject == previous.jwt.jwt_subject
+                    && self.jwt.jwt_audience == previous.jwt.jwt_audience
+            })
+            .map(Self::secret_ref_fields)
+            .unwrap_or_default();
+        self.secret_ref_fields()
+            .into_iter()
+            .zip(stored)
+            .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
+            .collect()
+    }
+
+    /// Is a secret of `secret_tenant` outside this provider's own tenant? A tenant provider
+    /// may use only its own tenant's secrets and an appliance-wide provider only appliance-wide
+    /// ones.
+    pub fn secret_is_outside_tenant(
+        &self,
+        secret_tenant: Option<&str>,
+    ) -> bool {
+        self.tenant_id.as_deref() != secret_tenant
+    }
+
+    /// Does the provider name a secret outside its own tenant? `secret_tenants` maps a secret id
+    /// to its tenant; a secret missing from it no longer exists and does not count.
+    pub fn uses_secret_outside_tenant(
+        &self,
+        secret_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    ) -> bool {
+        self.secret_refs()
+            .into_iter()
+            .any(|secret_ref| {
+                secret_tenants
+                    .get(secret_ref)
+                    .is_some_and(|tenant| self.secret_is_outside_tenant(*tenant))
+            })
+    }
+
+    /// Does the provider send the gateway's own credential on a tenant surface from an
+    /// appliance-wide provider? Only that credential is held to tenant isolation.
+    pub fn breaks_tenant_isolation_for(
+        &self,
+        surface_tenant_id: Option<&str>,
+    ) -> bool {
+        self.provider_type
+            .sends_gateway_credential()
+            && crate::tenancy::breaks_tenant_isolation(surface_tenant_id, self.tenant_id.as_deref())
+    }
+
+    /// May a surface use this provider? A provider of another tenant never; an
+    /// appliance-wide one that sends the gateway's own credential only while the surface's
+    /// mode is `Warn`.
+    pub fn usable_by(
+        &self,
+        surface_tenancy: crate::tenancy::SurfaceTenancy<'_>,
+    ) -> bool {
+        if self
+            .provider_type
+            .sends_gateway_credential()
+        {
+            crate::tenancy::can_reference_with_rule(
+                surface_tenancy.tenant_id,
+                self.tenant_id.as_deref(),
+                surface_tenancy.mode,
+            )
+        } else {
+            crate::tenancy::can_reference(surface_tenancy.tenant_id, self.tenant_id.as_deref())
+        }
+    }
+
+    /// Is this a JWT Bearer provider without a `jwt_subject`? A save refuses one; a stored
+    /// one still signs its grant without `sub`.
+    pub fn lacks_jwt_subject(&self) -> bool {
+        self.jwt
+            .lacks_subject_for(&self.provider_type)
+    }
+
+    /// The algorithm this provider signs its JWT with: the configured one, or its
+    /// type's default, or for an external consent provider whose client
+    /// authenticates with `private_key_jwt` the default of
+    /// `oauth2_client_credentials_jwt_auth`. `None` for providers that sign nothing.
+    pub fn jwt_signing_algorithm(&self) -> Option<JwtSigningAlgorithm> {
+        if self.token_endpoint_auth_method == Some(TokenEndpointAuthMethod::PrivateKeyJwt) {
+            return CredentialProviderType::OAuth2ClientCredentialsJwtAuth
+                .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm);
+        }
+        self.provider_type
+            .jwt_signing_algorithm(self.jwt.jwt_signing_algorithm)
+    }
+
+    /// Whether this is an external consent provider: one with an `issuer`,
+    /// whose grants are made through external consent and kept in the
+    /// delegation vault by binding.
+    pub fn is_external_consent(&self) -> bool {
+        self.issuer.is_some()
+    }
+
+    /// Whether this provider may use a secret of `secret_tenant_id`. An
+    /// external consent provider uses its own tenant's secrets only, an
+    /// untenanted one untenanted secrets only, since its client authenticates
+    /// at endpoints its tenant chose; any other provider its own tenant's or
+    /// an untenanted one. This is the runtime and kept-reference check: a save
+    /// also needs an exact tenant match unless the reference is kept in warn
+    /// mode.
+    pub fn may_use_secret(
+        &self,
+        secret_tenant_id: Option<&str>,
+    ) -> bool {
+        if self.is_external_consent() {
+            return self.tenant_id.as_deref() == secret_tenant_id;
+        }
+        crate::tenancy::can_reference(self.tenant_id.as_deref(), secret_tenant_id)
     }
 }
 
@@ -150,6 +577,8 @@ pub struct CreateCredentialProviderRequest {
     pub additional_params: HashMap<String, String>,
     #[serde(default)]
     pub api_key_secret_ref: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
@@ -159,6 +588,20 @@ pub struct CreateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub allow_unadvertised_pkce: bool,
+    #[serde(default)]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+    #[serde(default)]
+    pub revocation_ends_authorization: bool,
 }
 
 /// Request to update an existing credential provider
@@ -184,6 +627,8 @@ pub struct UpdateCredentialProviderRequest {
     pub additional_params: Option<HashMap<String, String>>,
     #[serde(default)]
     pub api_key_secret_ref: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
     #[serde(default)]
     pub description: Option<String>,
     /// Full callback URL (host + path) — overrides auto-generated callback URL
@@ -193,6 +638,41 @@ pub struct UpdateCredentialProviderRequest {
     pub resource: Option<String>,
     #[serde(default)]
     pub consent_identity_strategy_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub revocation_endpoint: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub allow_unadvertised_pkce: Option<bool>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub scope_comparison: Option<scope_comparison::ScopeComparison>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub revocation_ends_authorization: Option<bool>,
+}
+
+/// Request to check a provider before it is saved: the token endpoint's reachability and,
+/// for a type that signs a JWT, the key material its secret references hold
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateCredentialProviderRequest {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub provider_type: Option<CredentialProviderType>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(flatten)]
+    pub jwt: JwtAssertionSettings,
 }
 
 /// List response item (no sensitive data)
@@ -215,8 +695,36 @@ pub struct CredentialProviderListItem {
     pub callback_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// The origin of `resource`, for a provider with an issuer: the only origin
+    /// its grants are sent to, so a connect page can show the person where.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent_identity_strategy_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_signing_algorithm: Option<JwtSigningAlgorithm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_audience: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<TokenEndpointAuthMethod>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_unadvertised_pkce: bool,
+    #[serde(default, skip_serializing_if = "scope_comparison::ScopeComparison::is_exact")]
+    pub scope_comparison: scope_comparison::ScopeComparison,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub revocation_ends_authorization: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -238,9 +746,25 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             description: p.description.clone(),
             callback_url: p.callback_url.clone(),
             resource: p.resource.clone(),
+            resource_origin: p
+                .is_external_consent()
+                .then(|| external::resource_origin(p))
+                .flatten(),
             consent_identity_strategy_id: p
                 .consent_identity_strategy_id
                 .clone(),
+            jwt_signing_algorithm: p.jwt.jwt_signing_algorithm,
+            jwt_audience: p.jwt.jwt_audience.clone(),
+            jwt_key_id: p.jwt.jwt_key_id.clone(),
+            jwt_issuer: p.jwt.jwt_issuer.clone(),
+            jwt_subject: p.jwt.jwt_subject.clone(),
+            issuer: p.issuer.clone(),
+            revocation_endpoint: p.revocation_endpoint.clone(),
+            token_endpoint_auth_method: p.token_endpoint_auth_method,
+            client_id: p.client_id.clone(),
+            allow_unadvertised_pkce: p.allow_unadvertised_pkce,
+            scope_comparison: p.scope_comparison,
+            revocation_ends_authorization: p.revocation_ends_authorization,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -250,6 +774,185 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_token_reads_only_the_secrets_its_provider_type_uses() {
+        let provider = |provider_type: &str, certificate: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET", "api_key_secret_ref": "KEY",
+                "jwt_signing_key_secret_ref": "SIGNING", "jwt_certificate_secret_ref": certificate,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for (provider_type, certificate, expected) in [
+            ("api_key", Some("CERT"), vec!["KEY"]),
+            ("oauth2_client_credentials", Some("CERT"), vec!["ID", "SECRET"]),
+            ("oauth2_jwt_bearer", Some("CERT"), vec!["SIGNING", "CERT"]),
+            ("oauth2_jwt_bearer", None, vec!["SIGNING"]),
+            ("oauth2_client_credentials_jwt_auth", Some("CERT"), vec!["ID", "SIGNING", "CERT"]),
+            ("oauth2_authorization_code", Some("CERT"), vec![]),
+        ] {
+            let provider = provider(provider_type, certificate);
+            assert_eq!(provider.service_token_secret_refs(), expected, "{provider_type}");
+            assert_eq!(provider.secret_refs().len(), 4 + usize::from(certificate.is_some()), "{provider_type}");
+        }
+    }
+
+    #[test]
+    fn an_external_provider_uses_its_own_tenants_secrets_only_and_any_other_may_also_use_untenanted_ones() {
+        let provider = |tenant: Option<&str>, issuer: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": "api_key",
+                "api_key_secret_ref": "KEY", "tenant_id": tenant, "issuer": issuer,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let issuer = Some("https://issuer.example");
+
+        let external = provider(Some("tenant-a"), issuer);
+        assert!(external.may_use_secret(Some("tenant-a")));
+        assert!(!external.may_use_secret(None));
+        assert!(!external.may_use_secret(Some("tenant-b")));
+
+        let untenanted_external = provider(None, issuer);
+        assert!(untenanted_external.may_use_secret(None));
+        assert!(!untenanted_external.may_use_secret(Some("tenant-a")));
+
+        let tenant = provider(Some("tenant-a"), None);
+        assert!(tenant.may_use_secret(Some("tenant-a")));
+        assert!(tenant.may_use_secret(None));
+        assert!(!tenant.may_use_secret(Some("tenant-b")));
+
+        let untenanted = provider(None, None);
+        assert!(untenanted.may_use_secret(None));
+        assert!(!untenanted.may_use_secret(Some("tenant-a")));
+    }
+
+    #[test]
+    fn a_reference_is_kept_only_in_its_own_field_while_the_destination_is_unchanged() {
+        let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://idp.example/token", "jwt_signing_key_secret_ref": "KEY",
+            "jwt_certificate_secret_ref": "CERT", "jwt_issuer": "iss", "jwt_subject": "sub",
+            "jwt_audience": "https://idp.example/token",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(stored.secret_refs_kept_from(None), vec![("KEY", false), ("CERT", false)]);
+        let mut renamed = stored.clone();
+        renamed.name = "renamed".into();
+        renamed.jwt.jwt_key_id = Some("kid".into());
+        assert_eq!(renamed.secret_refs_kept_from(Some(&stored)), vec![("KEY", true), ("CERT", true)]);
+
+        let mut swapped = stored.clone();
+        swapped
+            .jwt
+            .jwt_signing_key_secret_ref = Some("CERT".into());
+        swapped
+            .jwt
+            .jwt_certificate_secret_ref = Some("KEY".into());
+        assert_eq!(swapped.secret_refs_kept_from(Some(&stored)), vec![("CERT", false), ("KEY", false)]);
+
+        let redirected: [fn(&mut CredentialProvider); 9] = [
+            |p| p.provider_type = CredentialProviderType::OAuth2ClientCredentialsJwtAuth,
+            |p| p.token_endpoint = Some("https://tenant.example/token".into()),
+            |p| p.authorization_endpoint = Some("https://tenant.example/authorize".into()),
+            |p| p.resource = Some("https://tenant.example/".into()),
+            |p| {
+                p.additional_params
+                    .insert("audience".into(), "tenant".into());
+            },
+            |p| p.jwt.jwt_issuer = Some("tenant".into()),
+            |p| p.jwt.jwt_subject = None,
+            |p| p.jwt.jwt_audience = Some("https://tenant.example/token".into()),
+            |p| p.default_scopes = vec!["admin".into()],
+        ];
+        for change in redirected {
+            let mut changed = stored.clone();
+            change(&mut changed);
+            assert_eq!(changed.secret_refs_kept_from(Some(&stored)), vec![("KEY", false), ("CERT", false)]);
+        }
+    }
+
+    #[test]
+    fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+        use crate::tenancy::SurfaceTenancy;
+
+        let types = [
+            (CredentialProviderType::OAuth2AuthorizationCode, false),
+            (CredentialProviderType::OAuth2ClientCredentials, true),
+            (CredentialProviderType::OAuth2ClientCredentialsJwtAuth, true),
+            (CredentialProviderType::OAuth2JwtBearer, true),
+            (CredentialProviderType::ApiKey, true),
+        ];
+        for (provider_type, sends_gateway_credential) in types {
+            assert_eq!(provider_type.sends_gateway_credential(), sends_gateway_credential, "{provider_type:?}");
+            let provider = |tenant: Option<&str>| {
+                let mut provider = make_provider("p", "p");
+                provider.provider_type = provider_type.clone();
+                provider.tenant_id = tenant.map(String::from);
+                provider
+            };
+            for mode in [Warn, Enforce] {
+                let surface = |tenant: Option<&'static str>| SurfaceTenancy { tenant_id: tenant, mode };
+                assert!(provider(Some("a")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("b")).usable_by(surface(Some("a"))));
+                assert!(!provider(Some("a")).usable_by(surface(None)));
+                assert!(provider(None).usable_by(surface(None)));
+            }
+            let wide = provider(None);
+            assert!(wide.usable_by(SurfaceTenancy {
+                tenant_id: Some("a"),
+                mode: Warn
+            }));
+            assert_eq!(
+                wide.usable_by(SurfaceTenancy {
+                    tenant_id: Some("a"),
+                    mode: Enforce
+                }),
+                !sends_gateway_credential,
+                "{provider_type:?}"
+            );
+            assert_eq!(wide.breaks_tenant_isolation_for(Some("a")), sends_gateway_credential);
+            assert!(!wide.breaks_tenant_isolation_for(None));
+        }
+    }
+
+    #[test]
+    fn a_provider_uses_a_secret_outside_its_tenant_only_when_a_secret_it_names_lies_elsewhere() {
+        let secret_tenants: std::collections::HashMap<&str, Option<&str>> =
+            [("WIDE", None), ("OWN", Some("a")), ("OTHER", Some("b"))]
+                .into_iter()
+                .collect();
+        let provider = |tenant: Option<&str>, client_secret: &str| {
+            let mut provider = make_provider("p", "p");
+            provider.tenant_id = tenant.map(String::from);
+            provider.client_secret_secret_ref = Some(client_secret.into());
+            provider
+        };
+        assert!(provider(Some("a"), "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(Some("a"), "OTHER").uses_secret_outside_tenant(&secret_tenants));
+        assert!(provider(None, "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "OWN").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(None, "WIDE").uses_secret_outside_tenant(&secret_tenants));
+        assert!(!provider(Some("a"), "GONE").uses_secret_outside_tenant(&secret_tenants));
+    }
+
+    #[test]
+    fn a_secret_is_outside_a_provider_tenant_unless_both_name_the_same_one() {
+        let mut provider = make_provider("p", "p");
+        assert!(!provider.secret_is_outside_tenant(None));
+        assert!(provider.secret_is_outside_tenant(Some("a")));
+        provider.tenant_id = Some("a".into());
+        assert!(!provider.secret_is_outside_tenant(Some("a")));
+        assert!(provider.secret_is_outside_tenant(Some("b")));
+        assert!(provider.secret_is_outside_tenant(None));
+    }
 
     fn make_provider(
         name: &str,
@@ -271,12 +974,21 @@ mod tests {
             token_refresh_enabled: true,
             additional_params: HashMap::new(),
             api_key_secret_ref: None,
+            jwt: Default::default(),
             description: Some("Test provider".to_string()),
             created_at: now,
             updated_at: now,
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         }
     }
 
@@ -398,12 +1110,21 @@ mod tests {
             token_refresh_enabled: false,
             additional_params: HashMap::new(),
             api_key_secret_ref: Some("MY_API_KEY".to_string()),
+            jwt: Default::default(),
             description: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
             resource: None,
             consent_identity_strategy_id: None,
+            issuer: None,
+            revocation_endpoint: None,
+            token_endpoint_auth_method: None,
+            client_id: None,
+            allow_unadvertised_pkce: false,
+            authorization_response_iss_parameter_supported: None,
+            scope_comparison: Default::default(),
+            revocation_ends_authorization: false,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));
@@ -413,6 +1134,162 @@ mod tests {
     #[test]
     fn test_provider_type_default_is_authorization_code() {
         assert_eq!(CredentialProviderType::default(), CredentialProviderType::OAuth2AuthorizationCode);
+    }
+
+    #[test]
+    fn jwt_bearer_provider_round_trips_its_signed_jwt_settings() {
+        let json = r#"{
+            "id": "cp-vertex", "name": "Vertex", "provider_id": "vertex",
+            "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_signing_key_secret_ref": "VERTEX_SA_KEY",
+            "jwt_signing_algorithm": "ES256",
+            "jwt_audience": "https://oauth2.googleapis.com/token",
+            "jwt_key_id": "key-1",
+            "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+            "jwt_subject": "user@example.com",
+            "default_scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }"#;
+        let provider: CredentialProvider = serde_json::from_str(json).unwrap();
+        assert_eq!(provider.provider_type, CredentialProviderType::OAuth2JwtBearer);
+        assert_eq!(
+            provider.jwt,
+            JwtAssertionSettings {
+                jwt_signing_key_secret_ref: Some("VERTEX_SA_KEY".into()),
+                jwt_certificate_secret_ref: None,
+                jwt_signing_algorithm: Some(JwtSigningAlgorithm::ES256),
+                jwt_audience: Some("https://oauth2.googleapis.com/token".into()),
+                jwt_key_id: Some("key-1".into()),
+                jwt_issuer: Some("agent@project.iam.gserviceaccount.com".into()),
+                jwt_subject: Some("user@example.com".into()),
+            }
+        );
+        let value = serde_json::to_value(&provider).unwrap();
+        assert_eq!(value["provider_type"], "oauth2_jwt_bearer");
+        assert_eq!(value["jwt_signing_key_secret_ref"], "VERTEX_SA_KEY");
+        assert_eq!(value["jwt_signing_algorithm"], "ES256");
+        assert!(value.get("jwt").is_none());
+        assert!(
+            value
+                .get("jwt_certificate_secret_ref")
+                .is_none()
+        );
+        let again: CredentialProvider = serde_json::from_value(value).unwrap();
+        assert_eq!(again.jwt, provider.jwt);
+    }
+
+    #[test]
+    fn client_credentials_jwt_auth_request_reads_its_certificate_reference() {
+        let json = r#"{
+            "name": "Foundry", "provider_id": "foundry",
+            "provider_type": "oauth2_client_credentials_jwt_auth",
+            "token_endpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "client_id_secret_ref": "FOUNDRY_CLIENT_ID",
+            "jwt_signing_key_secret_ref": "FOUNDRY_KEY",
+            "jwt_certificate_secret_ref": "FOUNDRY_CERT",
+            "jwt_signing_algorithm": "PS256"
+        }"#;
+        let request: CreateCredentialProviderRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.provider_type, CredentialProviderType::OAuth2ClientCredentialsJwtAuth);
+        assert_eq!(
+            request
+                .jwt
+                .jwt_certificate_secret_ref
+                .as_deref(),
+            Some("FOUNDRY_CERT")
+        );
+        assert_eq!(
+            request
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::PS256)
+        );
+        let update: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"jwt_key_id": "thumb", "jwt_signing_algorithm": "RS256"}"#).unwrap();
+        assert_eq!(
+            update
+                .jwt
+                .jwt_key_id
+                .as_deref(),
+            Some("thumb")
+        );
+        assert_eq!(
+            update
+                .jwt
+                .jwt_signing_algorithm,
+            Some(JwtSigningAlgorithm::RS256)
+        );
+        assert!(
+            serde_json::from_str::<UpdateCredentialProviderRequest>(r#"{"jwt_signing_algorithm": "HS256"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn list_item_shows_jwt_settings_but_never_the_key_or_certificate_reference() {
+        let mut provider = make_provider("Vertex", "vertex");
+        provider.provider_type = CredentialProviderType::OAuth2JwtBearer;
+        provider.jwt = JwtAssertionSettings {
+            jwt_signing_key_secret_ref: Some("KEY_REF_MARKER".into()),
+            jwt_certificate_secret_ref: Some("CERT_REF_MARKER".into()),
+            jwt_signing_algorithm: Some(JwtSigningAlgorithm::RS256),
+            jwt_audience: Some("https://aud.example".into()),
+            jwt_key_id: Some("kid-1".into()),
+            jwt_issuer: Some("sa@example.iam".into()),
+            jwt_subject: Some("user@example.com".into()),
+        };
+        let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert_eq!(item["provider_type"], "oauth2_jwt_bearer");
+        assert_eq!(item["jwt_signing_algorithm"], "RS256");
+        assert_eq!(item["jwt_audience"], "https://aud.example");
+        assert_eq!(item["jwt_key_id"], "kid-1");
+        assert_eq!(item["jwt_issuer"], "sa@example.iam");
+        assert_eq!(item["jwt_subject"], "user@example.com");
+        let text = item.to_string();
+        assert!(!text.contains("KEY_REF_MARKER"));
+        assert!(!text.contains("CERT_REF_MARKER"));
+    }
+
+    #[test]
+    fn jwt_settings_merge_onto_existing_and_blank_values_clear_them() {
+        let existing = JwtAssertionSettings {
+            jwt_signing_key_secret_ref: Some("OLD_KEY".into()),
+            jwt_issuer: Some("old@example".into()),
+            jwt_key_id: Some("old-kid".into()),
+            ..Default::default()
+        };
+        let update = JwtAssertionSettings {
+            jwt_issuer: Some(" new@example ".into()),
+            jwt_key_id: Some("  ".into()),
+            ..Default::default()
+        };
+        let merged = update
+            .or(existing)
+            .normalized();
+        assert_eq!(
+            merged
+                .jwt_signing_key_secret_ref
+                .as_deref(),
+            Some("OLD_KEY")
+        );
+        assert_eq!(merged.jwt_issuer.as_deref(), Some("new@example"));
+        assert_eq!(merged.jwt_key_id, None);
+    }
+
+    #[test]
+    fn jwt_algorithms_follow_the_provider_type() {
+        use CredentialProviderType::*;
+        use JwtSigningAlgorithm::*;
+        assert_eq!(OAuth2JwtBearer.default_jwt_algorithm(), Some(RS256));
+        assert_eq!(OAuth2ClientCredentialsJwtAuth.default_jwt_algorithm(), Some(PS256));
+        assert_eq!(OAuth2ClientCredentials.default_jwt_algorithm(), None);
+        assert!(OAuth2JwtBearer.allows_jwt_algorithm(RS256));
+        assert!(OAuth2JwtBearer.allows_jwt_algorithm(ES256));
+        assert!(!OAuth2JwtBearer.allows_jwt_algorithm(PS256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(PS256));
+        assert!(OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(RS256));
+        assert!(!OAuth2ClientCredentialsJwtAuth.allows_jwt_algorithm(ES256));
+        assert!(!ApiKey.allows_jwt_algorithm(RS256));
     }
 
     #[test]

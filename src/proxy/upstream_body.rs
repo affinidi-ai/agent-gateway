@@ -7,6 +7,25 @@ use bytes::{Bytes, BytesMut};
 
 use crate::config::TimeoutConfig;
 
+/// Whether an upstream answer is compressed: its `Content-Encoding` names a
+/// coding other than `identity`, or cannot be read. The gateway does not
+/// decompress, so the checks that read such a body would read none of it.
+pub(crate) fn is_compressed(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .map_or(true, |value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .any(|coding| !coding.is_empty() && !coding.eq_ignore_ascii_case("identity"))
+                })
+        })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamBodyLimits {
     max_bytes: usize,
@@ -45,7 +64,13 @@ pub(crate) enum UpstreamBodyError {
     #[error("upstream response body stalled or exceeded its read deadline")]
     TimedOut,
     #[error("failed to read upstream response: {0}")]
-    Read(#[from] reqwest::Error),
+    Read(reqwest::Error),
+}
+
+impl From<reqwest::Error> for UpstreamBodyError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Read(error.without_url())
+    }
 }
 
 impl UpstreamBodyError {
@@ -126,7 +151,7 @@ impl BoundedChunks {
             if error.is_timeout() {
                 UpstreamBodyError::TimedOut
             } else {
-                UpstreamBodyError::Read(error)
+                UpstreamBodyError::from(error)
             }
         })?;
         let Some(chunk) = chunk else {

@@ -190,17 +190,30 @@ export interface ListViewInfo {
   extras?: import('react').ReactNode[];
 }
 
+/** Where a node sits, for dependency rules that depend on its placement. */
+export interface DependencyNode {
+  id: string;
+  parentId?: string;
+  slotId?: string;
+}
+
+/** Surface facts an element's `edgeSnap.allows` can depend on. */
+export interface SnapContext {
+  /** The Managed Agent's endpoint. */
+  targetEndpoint?: unknown;
+}
+
 export interface FeatureDependency {
   /** Human-readable rule identifier. */
   description: string;
-  /** Predicate: when does this rule apply? */
-  condition: (config: any, ctx: SurfaceContext) => boolean;
+  /** Predicate: when does this rule apply? `node` is the canvas node when the caller has one. */
+  condition: (config: any, ctx: SurfaceContext, node?: DependencyNode) => boolean;
   /** Predicate: is the requirement satisfied? Return true to PASS. */
-  check: (config: any, ctx: SurfaceContext) => boolean;
+  check: (config: any, ctx: SurfaceContext, node?: DependencyNode) => boolean;
   /** Severity if check returns false while condition holds. */
   severity: 'error' | 'warning';
-  /** Message shown to the user. */
-  message: string;
+  /** Message shown to the user, or a function building it from the surface. */
+  message: string | ((config: any, ctx: SurfaceContext, node?: DependencyNode) => string);
 }
 
 export interface ConfigPanelProps {
@@ -312,6 +325,11 @@ export interface NodeDefinition {
     radius?: number;
     /** Allowed edge archetype ids. Undefined = all archetypes considered. */
     archetypes?: ReadonlyArray<string>;
+    /**
+     * Narrows `archetypes` for the current surface: return false to leave
+     * an archetype out. Only consulted when the caller passes a context.
+     */
+    allows?: (archetypeId: string, ctx: SnapContext) => boolean;
   };
   /**
    * Whether this element binds to a request arrow, a response arrow, either
@@ -371,9 +389,10 @@ export interface NodeDefinition {
    * `registry.isConfigured` is derived from this.
    *
    * For decorative elements (NPCs, actors, surface) return `null`
-   * unconditionally.
+   * unconditionally. `node` is the canvas node when the caller has one, for
+   * elements whose required fields depend on their placement.
    */
-  incompleteReason: (config: any) => string | null;
+  incompleteReason: (config: any, node?: DependencyNode) => string | null;
 
   /**
    * Format / value validators run on the current config. Distinct from
@@ -499,6 +518,19 @@ export interface NodeDefinition {
    * removed outside the dashboard is not restored from a stale blob.
    */
   payloadOwnsConfig?: boolean;
+
+  /**
+   * With `payloadOwnsConfig`, a blob node whose slice is missing is still
+   * restored when this returns true for its blob config: an unconfigured
+   * placeholder (e.g. from a template) that writes nothing to the payload.
+   * `node` is the blob node's placement (with its parent's type when the
+   * parent is known) and `payload` the stored surface.
+   */
+  isBlobPlaceholder?: (
+    config: any,
+    node: { slotId?: string; parentId?: string | null; parentType?: string },
+    payload: any
+  ) => boolean;
 
   /**
    * Returns the payload slices this element contributes. Called once per

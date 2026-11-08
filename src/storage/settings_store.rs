@@ -27,6 +27,20 @@ pub fn global_settings_store() -> Option<&'static SettingsStore> {
         .map(Arc::as_ref)
 }
 
+/// Feature flags only the system settings decide. The gateway enforces them, so
+/// a user's own overrides never change them, and the dashboard shows what the
+/// gateway does.
+pub const SYSTEM_ONLY_FLAGS: &[&str] =
+    &[crate::gateways::agent_pay_flag::FLAG_AGENT_PAY, crate::mediators::federation::FLAG_MEDIATOR_FEDERATION];
+
+/// Whether `flag` is explicitly on in the system settings; false when unset or
+/// before the settings store is registered.
+pub fn system_flag_enabled(flag: &str) -> bool {
+    GLOBAL_SETTINGS
+        .get()
+        .is_some_and(|store| store.flag_enabled(flag))
+}
+
 /// Read the current system-level settings from the global store.
 /// Returns `None` only before `set_global_settings_store` has been called.
 pub fn global_settings() -> Option<DashboardSettings> {
@@ -445,6 +459,42 @@ impl SettingsStore {
         Ok(())
     }
 
+    /// Whether `flag` is explicitly on.
+    pub fn flag_enabled(
+        &self,
+        flag: &str,
+    ) -> bool {
+        self.settings
+            .read()
+            .unwrap()
+            .feature_flags
+            .get(flag)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Turns `flag` on and saves, unless an operator has already set it either
+    /// way. Returns whether it changed.
+    pub async fn enable_flag_if_unset(
+        &self,
+        flag: &str,
+    ) -> Result<bool> {
+        {
+            let mut settings = self.settings.write().unwrap();
+            if settings
+                .feature_flags
+                .contains_key(flag)
+            {
+                return Ok(false);
+            }
+            settings
+                .feature_flags
+                .insert(flag.to_string(), true);
+        }
+        self.save().await?;
+        Ok(true)
+    }
+
     /// The operator-set appliance id, or `None` when it is empty.
     pub fn appliance_id_override(&self) -> Option<String> {
         let settings = self.settings.read().unwrap();
@@ -639,6 +689,7 @@ impl UserSettingsStore {
                     flags.extend(
                         user_flags
                             .iter()
+                            .filter(|(k, _)| !SYSTEM_ONLY_FLAGS.contains(&k.as_str()))
                             .map(|(k, v)| (k.clone(), *v)),
                     );
                 }
@@ -696,6 +747,81 @@ mod tests {
                 .appliance_id
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_flag_is_on_only_when_explicitly_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        let with_flags = |flags: &[(&str, bool)]| DashboardSettings {
+            feature_flags: flags
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect(),
+            ..DashboardSettings::default()
+        };
+        assert!(!store.flag_enabled("agent_pay_delegation"));
+        store
+            .update(with_flags(&[("agent_pay_delegation", false), ("mediator_federation", true)]))
+            .unwrap();
+        assert!(!store.flag_enabled("agent_pay_delegation"));
+        assert!(store.flag_enabled("mediator_federation"));
+    }
+
+    #[tokio::test]
+    async fn a_flag_is_turned_on_only_when_no_operator_has_set_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = SettingsStore::new(temp_dir.path());
+        assert!(
+            store
+                .enable_flag_if_unset("agent_pay_delegation")
+                .await
+                .unwrap()
+        );
+        assert!(store.flag_enabled("agent_pay_delegation"));
+        let reloaded = SettingsStore::new(temp_dir.path());
+        reloaded.load().await.unwrap();
+        assert!(reloaded.flag_enabled("agent_pay_delegation"), "the change is saved");
+
+        let off = SettingsStore::new(TempDir::new().unwrap().path());
+        off.update(DashboardSettings {
+            feature_flags: HashMap::from([("agent_pay_delegation".to_string(), false)]),
+            ..DashboardSettings::default()
+        })
+        .unwrap();
+        assert!(
+            !off.enable_flag_if_unset("agent_pay_delegation")
+                .await
+                .unwrap()
+        );
+        assert!(!off.flag_enabled("agent_pay_delegation"), "an operator's off is kept");
+    }
+
+    #[test]
+    fn a_user_override_never_changes_a_system_only_flag() {
+        let temp_dir = TempDir::new().unwrap();
+        let users = UserSettingsStore::new(temp_dir.path());
+        let system = DashboardSettings {
+            feature_flags: HashMap::from([
+                ("agent_pay_delegation".to_string(), true),
+                ("mediator_federation".to_string(), false),
+            ]),
+            ..DashboardSettings::default()
+        };
+        let user = UserSettings {
+            feature_flags: Some(HashMap::from([
+                ("agent_pay_delegation".to_string(), false),
+                ("mediator_federation".to_string(), true),
+                ("metrics".to_string(), false),
+            ])),
+            ..UserSettings::default()
+        };
+        let flags = users
+            .merge_with_system(&user, &system)
+            .feature_flags;
+        assert_eq!(flags.get("agent_pay_delegation"), Some(&true));
+        assert_eq!(flags.get("mediator_federation"), Some(&false));
+        assert_eq!(flags.get("metrics"), Some(&false), "other flags stay per user");
     }
 
     #[test]

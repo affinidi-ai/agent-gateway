@@ -1,10 +1,17 @@
 import * as Cap from '../capabilities';
-import type { NodeDefinition, PayloadSlice } from '../types';
+import type { DependencyNode, NodeDefinition, PayloadSlice } from '../types';
 import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
+import { isInboundIdentity } from './placement';
 import { DOCS_URL } from '../../../../config/docs';
+import { readMethods } from '../caller-auth/methods';
+
+export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
+  "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
+
+const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
 
 export const identityDefinition: NodeDefinition = {
   type: 'identity',
@@ -56,8 +63,10 @@ export const identityDefinition: NodeDefinition = {
         edge you drop this on. Configure the meta-field name
         (e.g. <code>agentIdentity</code>), the list of fields to pull,
         and an optional JSON schema to validate the extracted block.</li>
-        <li><strong>From API key</strong>: derive identity from the
-        configured API key id.</li>
+        <li><strong>From API key</strong>: on the Access Point → Managed
+        Agent request edge, each caller is identified by the API key it
+        presents (the Caller Context must use API Key or API Key Provider);
+        elsewhere, derive identity from the configured API key id.</li>
         <li><strong>From mTLS</strong>: take the identity from the other
         side's TLS client certificate (the caller's certificate on an
         inbound edge, the upstream's on an outbound edge).</li>
@@ -69,11 +78,7 @@ export const identityDefinition: NodeDefinition = {
       builder flags this as a missing-feature warning.</p>
     `,
   },
-  // Returns a reason only when a credential type has been picked but the
-  // required credential field is still missing (api_key_id, certificate_id,
-  // or static_did). No type selected → no credential requirements violated
-  // → returns null (not treated as incomplete on drop).
-  incompleteReason: config => identityIncompleteReason(config),
+  incompleteReason: (config, node) => identityIncompleteReason(config, node),
   defaultConfig: () => ({
     meta_field: 'agentIdentity',
     json_schema: {
@@ -107,13 +112,31 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
-        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate the caller with JWT Bearer',
+        'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
       condition: c => c.type === 'from_jwt_claim',
       check: (_c, ctx) =>
-        ctx.allNodes.some(n => n.type === 'caller-auth' && n.config?.method_type === 'jwt_bearer'),
+        ctx.allNodes.some(n => {
+          const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
+          return methods.length > 0 && methods.every(m => m.method_type === 'jwt_bearer');
+        }),
       severity: 'error',
       message:
-        'From JWT Claims requires a Caller Context using JWT Bearer. Switch it back, or change this extraction type.',
+        'From JWT Claims requires a Caller Context whose methods are all JWT Bearer. Remove the other methods, or change this extraction type.',
+    },
+    {
+      description:
+        'Inbound from_api_key identifies each caller by the key it presents, so every Caller Context method must be API Key or API Key Provider',
+      condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
+      check: (_c, ctx) => {
+        const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
+        const methods = callerAuth ? readMethods(callerAuth.config) : [];
+        return (
+          methods.length > 0 &&
+          methods.every(method => INBOUND_API_KEY_CALLER_METHODS.has(method.method_type))
+        );
+      },
+      severity: 'error',
+      message: INBOUND_API_KEY_NEEDS_API_KEY_CALLER,
     },
   ],
   ConfigPanel: IdentityPanel,
@@ -182,6 +205,7 @@ export const identityDefinition: NodeDefinition = {
 
       const value = identityConfigToWire(ic);
       if (!value) continue;
+      if (path === 'identity_slots.inbound') delete value.api_key_id;
       slices.push({ path, value });
     }
     return slices.length > 0 ? slices : undefined;
@@ -224,9 +248,13 @@ export function identityConfigToWire(ic: Record<string, any> | undefined): any |
  * reason. The empty string sentinel from the sidebar dropdown does NOT
  * count as a selected type.
  */
-function identityIncompleteReason(config: Record<string, any>): string | null {
+function identityIncompleteReason(
+  config: Record<string, any>,
+  node?: DependencyNode
+): string | null {
   if (!config.type) return 'Select an identity extraction type';
-  if (config.type === 'from_api_key' && !config.api_key_id) return 'Select an API key';
+  if (config.type === 'from_api_key' && !config.api_key_id && !isInboundIdentity(node))
+    return 'Select an API key';
   if (config.type === 'from_mtls' && !config.certificate_id) return 'Select a certificate';
   if (config.type === 'static' && !config.static_did) return 'Enter a static DID';
   return null;

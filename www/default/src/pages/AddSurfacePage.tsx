@@ -8,14 +8,25 @@ import type { Protocol, SurfaceSigning } from '../components/surface-builder/ele
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
-import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import SurfaceFormShell, {
+  type SurfaceFormView,
+} from '../components/surface-builder/SurfaceFormShell';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { freezeEmptyVariantOverrides } from '../components/surface-builder/variants/resolve';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
+import { withCallerAccessSettled } from '../components/surface-builder/elements/access-point/publicAccess';
+import {
+  accessPointStatus,
+  chooseAccessPointNotice,
+} from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -33,6 +44,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -125,9 +137,7 @@ const AddSurfacePage: React.FC = () => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
 
-  const [activeTab, setActiveTab] = useState<
-    'surface' | 'elements' | 'monitoring' | 'config' | 'editor'
-  >('surface');
+  const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
 
   const [editorTabNodeId, setEditorTabNodeId] = useState<string | null>(null);
   const [jsonOverride, setJsonOverride] = useState<string | null>(null);
@@ -388,13 +398,17 @@ const AddSurfacePage: React.FC = () => {
     );
     if (policyDefinitionsReason) return { message: policyDefinitionsReason };
     const firstIncomplete = builder.state.nodes.find(
-      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
     );
     if (firstIncomplete) {
       const def = registry.get(firstIncomplete.type);
       const reason =
-        getIncompleteReason(firstIncomplete.type, firstIncomplete.config, surfacePolicyIds) ||
-        'configuration is incomplete';
+        getIncompleteReason(
+          firstIncomplete.type,
+          firstIncomplete.config,
+          surfacePolicyIds,
+          firstIncomplete
+        ) || 'configuration is incomplete';
       return {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
@@ -454,17 +468,32 @@ const AddSurfacePage: React.FC = () => {
     setSaving(true);
     setError(null);
     try {
-      const payload: Partial<AgentSurface> = withA2aValidationSettled(buildSurfacePayload());
-      await apiClient.createSurface(payload);
+      const payload: Partial<AgentSurface> = withCallerAccessSettled(
+        withA2aValidationSettled(buildSurfacePayload())
+      );
+      let headerWarnings: string[] = [];
+      const created = await apiClient.createSurface(payload, {
+        onWarnings: warnings => {
+          headerWarnings = warnings;
+        },
+      });
       justCreatedRef.current = true;
-      showToast('success', `Agent Surface "${name}" created`);
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(created?.warnings)];
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      const warnings = validateSurfacePayload(payload).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, {
+        headerWarnings: serverWarnings,
+      });
+      // Warnings from the gateway go with the operator to the new surface's
+      // page, which lists them, since the toast goes after a few seconds.
+      const shown = shownSaveWarnings(serverWarnings);
+      if (shown.length > 0 && created?.surface_id) {
+        navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
+          state: { saveWarnings: shown },
+        });
+      } else {
+        navigate('/surfaces');
       }
-      navigate('/surfaces');
     } catch (err: any) {
       setError(err.message || 'Failed to create surface');
     } finally {
@@ -540,7 +569,13 @@ const AddSurfacePage: React.FC = () => {
     handleCreate();
   }, builder.commit);
 
-  const configEditorValue = jsonOverride ?? JSON.stringify(buildSurfacePayload(), null, 2);
+  const draftPayload = buildSurfacePayload();
+  const configEditorValue = jsonOverride ?? JSON.stringify(draftPayload, null, 2);
+  // Nothing is saved yet, so the draft decides; the gateway creates it closed.
+  const accessPointNotice = chooseAccessPointNotice(
+    null,
+    accessPointStatus(draftPayload, { isNew: true })
+  );
 
   /**
    * Live-apply a user-pasted/edited AgentSurface payload from the
@@ -650,7 +685,10 @@ const AddSurfacePage: React.FC = () => {
   // builder renders.
   if (protocolPickerShown) {
     return (
-      <div className="container-fluid surface-page-fill surface-page-fill--picker">
+      <div
+        className="container-fluid surface-page-fill surface-page-fill--picker"
+        data-testid="page-add-surface"
+      >
         <div className="surface-canvas-protocol-picker">
           <div
             className="card shadow channel-editor-card surface-picker-card"
@@ -697,6 +735,7 @@ const AddSurfacePage: React.FC = () => {
                     return (
                       <li
                         key={tpl.id}
+                        data-testid={`surface-template-row-${tpl.id}`}
                         className="surface-template-row surface-template-row--static"
                       >
                         <div
@@ -735,6 +774,7 @@ const AddSurfacePage: React.FC = () => {
                             type="button"
                             className="btn btn-sm btn-primary surface-template-row__action"
                             disabled={applying}
+                            data-testid={`surface-template-use-button-${tpl.id}`}
                             aria-label={`Use template ${tpl.name}`}
                             title={`Use template ${tpl.name}`}
                             onClick={e => {
@@ -770,6 +810,7 @@ const AddSurfacePage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary btn-sm"
+                data-testid="add-surface-cancel-button"
                 onClick={() => navigate('/surfaces')}
               >
                 Cancel
@@ -782,7 +823,7 @@ const AddSurfacePage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid surface-page-fill">
+    <div className="container-fluid surface-page-fill" data-testid="page-add-surface">
       {error && (
         <div className="alert alert-danger" role="alert">
           <i className="fas fa-exclamation-circle me-2" />
@@ -832,11 +873,14 @@ const AddSurfacePage: React.FC = () => {
         onApplyJsonPayload={applyJsonPayloadToCanvas}
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
+        saveError={error}
+        accessPointNotice={accessPointNotice}
         manageActions={
           <div className="d-flex gap-2">
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              data-testid="add-surface-back-button"
               onClick={discard}
               disabled={saving}
               title="Back to surfaces"
@@ -846,6 +890,7 @@ const AddSurfacePage: React.FC = () => {
             <button
               type="button"
               className="btn btn-success btn-sm"
+              data-testid="add-surface-create-button"
               onClick={handleCreate}
               disabled={saving || !!saveDisabledReason}
               title={saveDisabledReason || (saving ? 'Creating…' : 'Create surface')}

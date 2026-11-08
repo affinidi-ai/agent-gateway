@@ -283,7 +283,7 @@ const SettingsPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-settings">
       {/* Message Display */}
       {message && (
         <div
@@ -311,6 +311,7 @@ const SettingsPage: React.FC = () => {
         {isAdmin && (
           <Tab
             eventKey="system-settings"
+            tabAttrs={{ 'data-testid': 'settings-system-settings-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-cogs"></i> System
@@ -329,6 +330,7 @@ const SettingsPage: React.FC = () => {
 
         <Tab
           eventKey="user-settings"
+          tabAttrs={{ 'data-testid': 'settings-user-settings-tab-trigger' }}
           title={
             <>
               <i className="fas fa-user-cog"></i> User
@@ -349,6 +351,7 @@ const SettingsPage: React.FC = () => {
         {isAdmin && (
           <Tab
             eventKey="admin"
+            tabAttrs={{ 'data-testid': 'settings-admin-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-server"></i> Admin
@@ -367,6 +370,7 @@ const SettingsPage: React.FC = () => {
         {isAdmin && (
           <Tab
             eventKey="networking"
+            tabAttrs={{ 'data-testid': 'settings-networking-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-network-wired"></i> Networking
@@ -380,6 +384,7 @@ const SettingsPage: React.FC = () => {
         {isAdmin && (
           <Tab
             eventKey="security"
+            tabAttrs={{ 'data-testid': 'settings-security-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-file-contract"></i> Security
@@ -393,6 +398,7 @@ const SettingsPage: React.FC = () => {
         {canViewTerms && (
           <Tab
             eventKey="terms"
+            tabAttrs={{ 'data-testid': 'settings-terms-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-file-signature"></i> T&amp;C Manager
@@ -405,6 +411,7 @@ const SettingsPage: React.FC = () => {
 
         <Tab
           eventKey="limits"
+          tabAttrs={{ 'data-testid': 'settings-limits-tab-trigger' }}
           title={
             <>
               <i className="fas fa-gauge-high"></i> Limits
@@ -417,6 +424,7 @@ const SettingsPage: React.FC = () => {
         {canViewUsers && (
           <Tab
             eventKey="users"
+            tabAttrs={{ 'data-testid': 'settings-users-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-users-cog"></i> Users

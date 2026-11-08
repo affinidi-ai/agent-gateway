@@ -11,12 +11,17 @@ use serde_json::{Map, Value};
 use crate::sts::errors::StsError;
 use crate::sts::types::{TokenEndpointForm, TokenExchangeRequest, TokenType};
 
-/// Extract `(sub, act)` from a verified assertion's claim set. `act` is cloned
-/// through verbatim so an existing delegation chain is preserved when the
-/// gateway layers a new actor on top.
-pub fn extract_subject_and_act(claims: &Value) -> (Option<String>, Option<Value>) {
+/// Extract `(subject, act)` from a verified assertion's claim set, the subject
+/// being the value of `principal_claim`: the claim the verification strategy
+/// that accepted the assertion names its subjects by. `act` is cloned through
+/// verbatim so an existing delegation chain is preserved when the gateway
+/// layers a new actor on top.
+pub fn extract_subject_and_act(
+    claims: &Value,
+    principal_claim: &str,
+) -> (Option<String>, Option<Value>) {
     let sub = claims
-        .get("sub")
+        .get(principal_claim)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let act = claims.get("act").cloned();
@@ -77,7 +82,14 @@ pub fn build_access_token_claims(p: AccessTokenParams<'_>) -> Value {
         claims.insert("scope".to_string(), Value::String(p.scopes.join(" ")));
     }
     claims.insert("iat".to_string(), Value::Number(p.issued_at.into()));
-    claims.insert("exp".to_string(), Value::Number((p.issued_at + p.ttl_secs).into()));
+    claims.insert(
+        "exp".to_string(),
+        Value::Number(
+            p.issued_at
+                .saturating_add(p.ttl_secs)
+                .into(),
+        ),
+    );
     claims.insert("jti".to_string(), Value::String(p.jti.to_string()));
     if let Some(act) = compose_delegation_chain(p.subject_act, p.actor_sub) {
         claims.insert("act".to_string(), act);
@@ -252,9 +264,21 @@ mod tests {
     #[test]
     fn extract_subject_and_act_reads_both() {
         let claims = json!({ "sub": "did:example:user", "act": { "sub": "did:example:agent" } });
-        let (sub, act) = extract_subject_and_act(&claims);
+        let (sub, act) = extract_subject_and_act(&claims, "sub");
         assert_eq!(sub.as_deref(), Some("did:example:user"));
         assert_eq!(act, Some(json!({ "sub": "did:example:agent" })));
+    }
+
+    #[test]
+    fn extract_subject_and_act_reads_the_strategys_principal_claim() {
+        let claims = json!({ "sub": "pairwise", "oid": "person-1" });
+        assert_eq!(
+            extract_subject_and_act(&claims, "oid")
+                .0
+                .as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(extract_subject_and_act(&claims, "email").0, None);
     }
 
     #[test]
@@ -301,6 +325,26 @@ mod tests {
         assert_eq!(claims["exp"], 1_300);
         assert_eq!(claims["jti"], "jti-123");
         assert_eq!(claims["act"], json!({ "sub": "did:example:agent" }));
+    }
+
+    #[test]
+    fn build_claims_exp_saturates_at_the_u64_boundary() {
+        let params = |issued_at, ttl_secs| AccessTokenParams {
+            issuer: "iss",
+            subject: "sub",
+            subject_act: None,
+            actor_sub: None,
+            client_id: None,
+            audience: None,
+            scopes: &[],
+            issued_at,
+            ttl_secs,
+            jti: "j",
+        };
+        assert_eq!(build_access_token_claims(params(u64::MAX - 10, 300))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX, u64::MAX))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX - 300, 300))["exp"], u64::MAX);
+        assert_eq!(build_access_token_claims(params(u64::MAX - 301, 300))["exp"], u64::MAX - 1);
     }
 
     #[test]

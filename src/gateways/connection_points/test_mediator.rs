@@ -80,7 +80,7 @@ pub(super) async fn oob_invitation(
                     .fetch_add(1, Ordering::SeqCst);
                 let refused = installed
                     .refusals_left
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                     .is_ok();
                 async move {
                     if refused {

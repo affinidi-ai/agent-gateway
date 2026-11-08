@@ -360,10 +360,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_example_redactor_masks_an_unquoted_secret_variable_name() {
-        let unquoted =
-            "hook answered 401 Unauthorized: check that AG_EVENT_HOOK_SECRET matches the key the receiver uses";
-        assert_ne!(example_redactor().redact(unquoted), unquoted, "the test must be able to detect the problem");
+    fn the_example_redactor_masks_a_secret_assignment() {
+        let assignment = "hook answered 401 Unauthorized: AG_EVENT_HOOK_SECRET: hook-secret-value is wrong";
+        assert_ne!(example_redactor().redact(assignment), assignment, "the test must be able to detect the problem");
     }
 
     #[tokio::test]

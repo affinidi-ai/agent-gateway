@@ -128,6 +128,22 @@ deny_reason := sprintf("fabric source_id %v did not match expected %v", [input.g
     )
 }
 
+/// A surface policy that admits a request only when the agent card of the
+/// surface's Target names `agent_did`, which it reads into `input.agent.did`.
+pub fn build_surface_require_agent_did_policy(agent_did: &str) -> String {
+    let did_literal = serde_json::to_string(agent_did).expect("DID should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if input.agent.did == {did_literal}
+
+deny_reason := "the agent card did not name the expected agent DID" if not allow
+"#
+    )
+}
+
 /// Surface policy that allows only requests whose verified identity binding
 /// was issued by `issuer_did`. The receiving gateway sets
 /// `input.identity_binding` only when the binding VP verified against the
@@ -145,6 +161,43 @@ allow if {{
 }}
 
 deny_reason := sprintf("caller identity was not issued by gateway %v", [{did_literal}]) if not allow
+"#
+    )
+}
+
+/// Transit Point policy that admits only a call whose transit token was issued
+/// for a request the paired gateway with issuer DID `issuer_did` sent over
+/// Fabric, the recipe `docs/POLICY.md` gives.
+pub fn build_transit_point_partner_policy(issuer_did: &str) -> String {
+    let did_literal = serde_json::to_string(issuer_did).expect("DID should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+allow if {{
+    input.transit.caller.verification == "fabric_peer"
+    input.transit.caller.fabric.peer_issuer_did == {did_literal}
+}}
+"#
+    )
+}
+
+/// Admits a request only when its target-leg Trust Checks ran and none
+/// reported any of `error_codes`.
+pub fn build_surface_deny_target_trust_check_errors_policy(error_codes: &[&str]) -> String {
+    let codes_literal = serde_json::to_string(error_codes).expect("error codes should serialize");
+    format!(
+        r#"package surface.policy
+
+default allow := false
+
+denied_codes := {codes_literal}
+
+allow if {{
+    count(input.trust_check_results.target) > 0
+    count([r | r := input.trust_check_results.target[_]; r.error.code == denied_codes[_]]) == 0
+}}
 "#
     )
 }

@@ -63,7 +63,11 @@ changes:
 ## Tests
 
 - **Unit**: `#[cfg(test)] mod tests` inline in each module.
-- **Component**: `src/component_tests/` (helpers in `src/component_tests/helpers/`). Cross-module flows without Docker.
+- **Behaviour**: the acceptance layer. Gherkin scenarios under `tests/features/surface/` (`surface_bdd`, one gateway) and `tests/features/g2g/` (`g2g_bdd`, two gateways over the fabric). Every new behaviour an operator or caller can observe gets a scenario here; behaviour seen in the dashboard goes to Playwright in `ui-tests/`. After adding or changing a `.feature` file or a step binding, run `python3 scripts/bdd-gherkin.py --lint`; errors block, and CI runs the same check.
+  - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
+  - Exercise the real gateway through its public interfaces.
+  - Assert what the caller or operator observes, not internal state.
+- **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
 ## Frontend conventions
@@ -75,23 +79,145 @@ Frontend work spans two concerns:
 
 For frontend work under `www/default/` (the current dashboard shipped to users), use the scoped frontend instructions at [`www/default/AGENTS.md`](www/default/AGENTS.md).
 
+Laptop viewport rules (the Audit Log stacking breakpoint and scroll on select, wrapping badges in list tables, and the page header and chart rules for Tasks, Metrics, Identities and Connection Points) live under _Laptop layouts_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#laptop-layouts).
+
 The Surface Builder's **Send delegated credentials over Fabric** switch is per route
 (Managed Agent or Transit Point), off by default, and shown only for a `fabric://` route on
 a surface with credential bindings; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Surface Builder's Managed Agent and Transit Point **via Gateway Connection** routes and the
+Payment element share one gateway-then-surface picker with the same placeholders, empty and
+error states, add link (new tab), Refresh and test ids; Payment lists only the
+payment gateways from `GET /gateways/payment-providers`, with no switch to show others, and its
+**Add Payment Gateway** link opens the payment gateway wizard. See
+_Gateway picker_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+Connections has a **Payment Gateways** tab beside Gateways, Mediators and Registries, with a
+connect wizard that waits for agent-pay's approval and verifies the peer with `gateway-info`, a
+detail page per payment gateway, and a **Use as payment gateway** action on the Gateways tab; see
+_Connections page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#connections-page). All of
+it, the Payment element in the palette and payment templates show only while the
+`agent_pay_delegation` feature flag is on (default off); a surface's existing Payment element
+always stays. The Payments page needs only `payments.view`, so the payment ledger and legacy
+x402/MPP history stay readable with the flag off. See _Feature flags_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#feature-flags).
+
+The Surface Builder's Payment manifest preview shows each payment method with the logo agent-pay
+sent beside the manifest, served by `GET /v1/gateways/payment-logos/{sha256}`, or a generic icon;
+see _Payment_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md).
+
+The Payment triggers editor of an MCP surface edits one visible pattern list: selecting a tool
+adds `^<name>$` and clearing it removes that row, and a Charged | Free switch sets only what the
+list means (`match`, or `all` while empty, versus `exclude`), never rewriting it; with no trigger
+set the selection starts as Charged. It lists the Target's tools on
+demand through `POST /v1/mcp-proxies/discover-tools` (MCP Proxy and Direct URL Targets only; a
+saved surface's Target is asked by `surface_id` under the forward step's egress policy), with
+select-all, Select all and Clear over the filtered list. See _Payment_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Managed Agent panel's **Release per-user grants to Fabric callers** switch writes
+`target.delegated_credentials_for_fabric_callers`, off by default, and is shown only for an HTTP
+or HTTPS Target on a surface with credential bindings, with a warning while on; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder's **Transit Settings** offer no listener authentication, which the gateway
+does not support, and a dashboard save does not keep a stored `transit.source_auth`. The
+Transit Point element's **Who can call this Transit Point** section sets the transit token, a
+Transit Point's own `source_auth` (API key or JWT; an mTLS one set through the API is kept) and
+`allow_unauthenticated_callers`, and shows the exposure `Warning` headers a save answers with.
+See _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder offers **Override Agent Card Location** on a Transit Point with a URL
+destination only, not on a `fabric://` one; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A Transit Point's Rate Limit panel has a **Per caller** section that writes
+`transit.points[].per_caller_rate_limit` beside the point's shared `rate_limit`; see _Surface
+Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
 The Surface Builder labels an Access Point's URL **Entry point URL**, with a copy button in the
 Access Point panel and on the canvas, and names a new surface `<protocol>_surface_<n>`; see
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
+identified by the API key it presents, and blocks Save unless every Caller Context method is API
+Key or API Key Provider; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
+The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
+see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
+
+The Credentials audit tab shows a caller's Principal beside Subject when its strategy names a
+claim other than `sub`; see _Credentials audit tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
+
+The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
+and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+Point can take its credential from a credential provider; see _Credential provider editor_ and
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+A Trust Check on a Managed Agent → Transit Point arrow belongs to that Transit Point and saves
+to `transit.points[i].trust_check_list` (new ones on A2A and AP2 Transit Points only); the
+Managed Agent's own Trust Check is offered only for `a2a-proxy://` and `fabric://` targets (on
+any other target it blocks Save), Transit Points whose list was migrated from the old
+surface-wide list are flagged for review (migrated copies can exist on MCP and HTTP Transit
+Points, but new Trust Checks can't be added there), and every surface write and template create
+or update sends `trust_check_split: true`; see
+_Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
+
+The Gateways list shows, under a remote gateway's status, when its peer was last heard from
+(`peer_last_seen_at` on `GET /v1/gateways`), apart from this gateway's own mediator link; see
+_Elsewhere_ under remote gateway issuer DIDs in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
 The Trust Recorder panel and its entries warn while an entry uses the surface Issuer as its
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
+
+The Audit Log names the surface variant of each request record and describes `request_rejected`
+records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
+variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
+
+The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
+Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
+
+The Identities page shows the name and the DID in separate Name and DID columns, with no Usage
+Count column, and lists a managed agent DID shared by several surfaces once, as "Unnamed Agent"
+with its surface count and every one of its surfaces; see _Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
+The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
+and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
+
+The Caller Context element lists its caller authentication methods in order, in the sidebar and
+in the fullscreen editor, each row with a Configure button that opens that method's settings;
+see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
+authorization server discovery (`caller_authentication.protected_resource`), and Save removes
+a setting the operator switched off in the same PUT; see _Authorization server discovery_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+The Access Point panel's **Public access** switch writes `access_point.public`. A closed
+surface with no Caller Context saves but is not ready (unless it sends a Target credential,
+or has an `a2a-proxy://` Target, while `credential_policy.target_source_auth` is `enforce`,
+which refuses the save), shown as "Not ready for external access" under the Access Point URL
+with a **Configure Authentication** action. Saving a public surface, a not-ready one, or a
+surface without `public` and without a Caller Context, warns after the save; see
+_Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+The Dashboard shows the metrics **Delete** button only to users with `settings.edit`; see
+_Maintenance actions_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#maintenance-actions).
 
 Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI patterns evolve. Instruction drift is a blocker.
 
@@ -101,7 +227,7 @@ Keep `AGENTS.md` and any local `AGENTS.md` in sync in the same change when UI pa
 the inbound, outbound, and fabric paths, the system invariants, and a module map
 covering every entry in `src/`. Read it before changing anything on the request path.
 
-Five things are worth knowing before you open it.
+Six things are worth knowing before you open it.
 
 **The Agent Surface is the routing unit.** `AgentSurface`
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)) carries one Access Point,
@@ -123,12 +249,23 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. A surface that must
-reject unauthenticated callers needs a policy denying `input.source_auth.method == "failed"`.
-See [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
+let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
+a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
+(`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
+`reject`, and an MCP Access Point that publishes protected resource metadata (a missing or
+refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
+credential of another method a plain `401`). The
+admin API creates every surface closed unless `access_point.public` is `true`; a closed
+surface without source authentication is not ready and refuses every request with `503`.
+Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is
+`reject`, and policy must deny `input.source_auth.method == "failed"` to reject them.
+See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
+[`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 
 **MCP revisions are admitted per transport path.** Every MCP endpoint admits `2026-07-28`
-alongside `2024-11-05`. Resolve versions through `runtime_policy_for` /
+alongside the session revisions listed in [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md#modern-mcp-admission).
+Session revisions are forwarded to the upstream, except that gateway-owned MCP Proxies answer
+`initialize` themselves with `2024-11-05`. Resolve versions through `runtime_policy_for` /
 `admission_policy_for_target` ([`src/mcp/request_validation.rs`](src/mcp/request_validation.rs)),
 never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA.md).
 
@@ -138,6 +275,32 @@ never an appliance-wide constant. See [`docs/MCP_METADATA.md`](docs/MCP_METADATA
 A2A request shape). An `a2a-proxy://` surface's versions are fixed (`1.0` only when new; existing ones keep theirs), and it always checks `envelope`. Read them through `AgentSurface::a2a_settings`
 ([`src/config/agent_surface.rs`](src/config/agent_surface.rs)), never a global flag. See
 [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md#a2a-surface-settings).
+
+**Payment is delegated to agent-pay.** A surface charges only through an `agent_pay`
+payment policy that names a payment surface on a connected payment gateway: a remote gateway
+record with `role: payment`, managed under `/v1/payment-gateways/*` and `payment_gateways.*`
+while `/v1/gateways/*` serves peers only ([`src/gateways/role_scope.rs`](src/gateways/role_scope.rs));
+a payment gateway is never a `fabric://` route. An enabled local
+x402 or MPP policy still loads but is unsupported: the surface answers `503
+payment_unavailable` and the policy cannot be saved. Read it through
+`AgentSurface::agent_pay_policy` / `payment_policy_unsupported`
+([`src/config/agent_surface_accessors.rs`](src/config/agent_surface_accessors.rs)). This
+gateway decides whether a request is chargeable and agent-pay takes the payment, only after
+policy and just before forwarding, on every path (direct, `fabric://` Target, MCP and A2A
+proxy Targets, Fabric receive); a free request makes no fabric hop. The gate lives in
+[`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs). This gateway
+captures funds agent-pay only held (`payment-authorization`) once the Target delivered and voids
+them otherwise, recording the decision in the payments ledger first
+([`src/payments_ledger/settlement.rs`](src/payments_ledger/settlement.rs)); a streamed response
+is captured once a result is passed on, or settled when its stream ends ([`src/proxy/handler/agent_pay_gate/streamed.rs`](src/proxy/handler/agent_pay_gate/streamed.rs)),
+and callers poll held cases through
+[`src/payments_ledger/caller_api.rs`](src/payments_ledger/caller_api.rs). The gateway-signed
+payment credentials (receipt, rejection, access grant) are dispute evidence that nothing accepts
+as proof of access; their JWT stays in the local VP Audit Log and only the fingerprint leaves it
+(integrations, admin API). This gateway
+is not an x402 facilitator: a peer's fabric `x402/verify-request` or `x402/settle-request` is
+refused with `facilitator_disabled`, whatever `facilitator_mode` says. See
+[`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy).
 
 ### Where the detail lives
 
@@ -156,6 +319,7 @@ Do not summarise these here. Update the owning document in the same change as th
 | Management tokens and tenant ownership                                         | [`docs/ACCESS_TOKENS.md`](docs/ACCESS_TOKENS.md)                     |
 | Management RBAC                                                                | [`docs/RBAC.md`](docs/RBAC.md)                                       |
 | Configuration files and their effects                                          | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md) |
+| Surface payment policy (agent-pay delegation, manifests, legacy migration)     | [`docs/CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
 | Reload behaviour, server mode                                                  | [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md)       |
 | Self-hosting infrastructure requirements                                       | [`docs/DEPLOYMENT_REQUIREMENTS.md`](docs/DEPLOYMENT_REQUIREMENTS.md) |
 | Observability contracts, governance audit forwarding                           | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)                     |
@@ -172,9 +336,10 @@ Do not summarise these here. Update the owning document in the same change as th
 
 1. Clarify requirements first — one question at a time. Capture durable decisions in stable repo docs only when they truly belong there.
 2. Design interfaces/structure before code.
-3. Incremental steps validated by unit tests.
-4. Keep stable docs in sync, but do not treat temporary implementation or design plans as source of truth.
-5. Unit tests must assert returned values, not just no-error.
+3. Prepare Gherkin scenarios for each observable feature behaviour.
+4. Incremental steps, each test-first: write the unit test, watch it fail for the reason the step exists, then make it pass. A test that was never red proves nothing.
+5. Keep stable docs in sync, but do not treat temporary implementation or design plans as source of truth.
+6. Unit tests must assert returned values, not just no-error.
 
 ## Commands to run
 
@@ -207,3 +372,4 @@ directly.
 3. `cargo test --no-fail-fast --all-targets --all-features`
 4. If `www/default/` files changed: `cd www/default && npx prettier --write src && npm run lint`
 5. If MCP admission, forwarding or owned dispatch changed: `make mcp-conformance`
+6. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`

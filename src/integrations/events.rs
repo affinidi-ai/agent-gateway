@@ -61,6 +61,7 @@ const VARIABLES: &[VariableSpec] = &[
     var("GATEWAY_DESCRIPTION", "Gateway Description", "Description of the gateway"),
     var("GATEWAY_DID", "Gateway DID", "DID of the gateway"),
     var("GATEWAY_TYPE", "Gateway Type", "Type of the gateway"),
+    var("GATEWAY_ROLE", "Gateway Role", "What a remote gateway is used for: Peer or Payment"),
     var("GATEWAY_STATUS", "Gateway Status", "Status of the gateway after the event"),
     var("GATEWAY_OLD_STATUS", "Previous Gateway Status", "Status of the gateway before the change"),
     var("USER_ID", "User ID", "ID of the user"),
@@ -68,11 +69,12 @@ const VARIABLES: &[VariableSpec] = &[
     var("USER_EMAIL", "User Email", "Email of the user, when known"),
     var("USER_ROLE", "User Role", "Role of the user"),
     var("USER_STATUS", "User Status", "Status of the user"),
-    var("CP_ID", "Connection Point ID", "ID of the connection point that received the message"),
+    var("CP_ID", "Connection Point ID", "ID of the connection point"),
     var("CP_NAME", "Connection Point Name", "Name of the connection point"),
     var("CP_DESCRIPTION", "Connection Point Description", "Description of the connection point"),
+    var("CP_DID", "Connection Point DID", "DID of the connection point"),
     var("GATEWAY", "Gateway", "ID of the connection point's gateway"),
-    var("MEDIATOR_ID", "Mediator ID", "ID of the mediator the message arrived through"),
+    var("MEDIATOR_ID", "Mediator ID", "ID of the connection point's mediator"),
     var("MESSAGE_ID", "Message ID", "ID of the connection-setup message"),
     var("MESSAGE_TYPE", "Message Type", "DIDComm type of the connection-setup message"),
     var("FROM_DID", "Connecting DID", "DID of whoever connected"),
@@ -89,12 +91,47 @@ const VARIABLES: &[VariableSpec] = &[
     var("NETWORK", "Network", "Network the payment settled on"),
     var("SETTLEMENT_METHOD", "Settlement Method", "How the payment was settled"),
     var("ERROR_MESSAGE", "Error Message", "Why the payment step failed"),
-    var("SEVERITY", "Severity", "info or error"),
+    var("SEVERITY", "Severity", "info, warning or error"),
     var("TRANSACTIONS_DELETED", "Transactions Deleted", "Number of transactions the cleanup removed"),
     var("RETENTION_DAYS", "Retention Days", "Days transactions are kept before cleanup"),
     var("PAYMENT_METHOD", "Payment Method", "Payment method the caller used"),
     var("RESOURCE_URL", "Resource URL", "URL of the paid resource"),
     var("REFERENCE", "Reference", "Payment reference returned by the verifier"),
+    var("VARIANT", "Variant", "Surface variant that served the request; empty for the base surface"),
+    var("PAYMENT_GATEWAY_ID", "Payment Gateway ID", "ID of the connected agent-pay gateway"),
+    var("PAYMENT_SURFACE_ID", "Payment Surface ID", "ID of the payment surface on the agent-pay gateway"),
+    var("RESOURCE", "Resource", "Resource the payment is for; empty when unknown"),
+    var("RAIL", "Rail", "Payment rail (x402 or mpp); empty when the rail is not known"),
+    var("CURRENCY", "Currency", "Currency of the amount; empty when unknown"),
+    var("CASE_ID", "Case ID", "Review case ID of a held payment; empty otherwise"),
+    var("REMOTE_STATUS", "Remote Status", "HTTP status the payment gateway returned; empty when it gave none"),
+    var("TRACE_ID", "Trace ID", "Request trace ID"),
+    var(
+        "AUTHORIZATION_ID",
+        "Authorization ID",
+        "agent-pay's authorization of funds held until the Target delivers; empty otherwise",
+    ),
+    var(
+        "RECEIPT_REFERENCE",
+        "Receipt Reference",
+        "MPP receipt reference or x402 settlement transaction hash; empty without a receipt",
+    ),
+    var(
+        "QUOTED_AMOUNT",
+        "Quoted Amount",
+        "The manifest price when the receipt charged a different one; empty otherwise",
+    ),
+    var("QUOTED_CURRENCY", "Quoted Currency", "Currency of the quoted amount; empty otherwise"),
+    var(
+        "PRICE_MISMATCH",
+        "Price Mismatch",
+        "true when the receipt charged another price than the manifest quoted, else false",
+    ),
+    var(
+        "REASON",
+        "Reason",
+        "Why the payment was refused, failed or released, clipped and without credentials; empty otherwise",
+    ),
     var(
         "AUDIT_RECORD",
         "Audit Record",
@@ -112,6 +149,11 @@ const VARIABLES: &[VariableSpec] = &[
     ),
     var("AUDIT_SURFACE_ID", "Surface ID", "ID of the Agent Surface the record belongs to"),
     var("AUDIT_SURFACE_NAME", "Surface Name", "Name of the Agent Surface the record belongs to"),
+    var(
+        "AUDIT_SURFACE_VARIANT",
+        "Surface Variant",
+        "The variant the request resolved to: the variant's alias, _base_ when the base surface served it, _unknown_ when the URL named a variant the surface doesn't have, or the disabled variant's alias when it was refused as disabled. Empty outside surface requests and when the surface's default variant is misconfigured.",
+    ),
     var("AUDIT_PROTOCOL", "Protocol", "Protocol of the surface (a2a, mcp, …)"),
     var("AUDIT_AGENT_DID", "Agent DID", "DID of the agent the record was written for"),
     var(
@@ -164,7 +206,11 @@ const VARIABLES: &[VariableSpec] = &[
         "Policy Content Hash",
         "sha256:<hex> hash of the exact Rego enforced for policy_decision records, when known",
     ),
-    var("AUDIT_VP_JWT", "Signed VP", "Signed Verifiable Presentation (JWT) attached to the record"),
+    var(
+        "AUDIT_VP_JWT",
+        "Signed VP",
+        "Signed Verifiable Presentation (JWT) attached to the record; empty for payment records, which carry only the fingerprint",
+    ),
     var("AUDIT_VP_FINGERPRINT", "VP Fingerprint", "sha256:<hex> fingerprint of the signed VP attached to the record"),
 ];
 
@@ -176,10 +222,13 @@ const GATEWAY_VARIABLES: &[&str] = &[
     "GATEWAY_DESCRIPTION",
     "GATEWAY_DID",
     "GATEWAY_TYPE",
+    "GATEWAY_ROLE",
     "GATEWAY_STATUS",
 ];
 const USER_VARIABLES: &[&str] =
     &["OLD_STATE", "NEW_STATE", "USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"];
+const CONNECTION_POINT_VARIABLES: &[&str] =
+    &["OLD_STATE", "NEW_STATE", "CP_ID", "CP_NAME", "CP_DESCRIPTION", "CP_DID", "GATEWAY_ID", "MEDIATOR_ID"];
 const MESSAGE_VARIABLES: &[&str] = &[
     "CP_ID",
     "CP_NAME",
@@ -196,12 +245,33 @@ const MESSAGE_VARIABLES: &[&str] = &[
     "TIME",
     "DATETIME",
 ];
+const PAYMENT_VARIABLES: &[&str] = &[
+    "SURFACE_ID",
+    "VARIANT",
+    "PAYMENT_GATEWAY_ID",
+    "PAYMENT_SURFACE_ID",
+    "RESOURCE",
+    "RAIL",
+    "AMOUNT",
+    "CURRENCY",
+    "CASE_ID",
+    "REMOTE_STATUS",
+    "TRACE_ID",
+    "AUTHORIZATION_ID",
+    "RECEIPT_REFERENCE",
+    "QUOTED_AMOUNT",
+    "QUOTED_CURRENCY",
+    "PRICE_MISMATCH",
+    "REASON",
+    "SEVERITY",
+];
 const AUDIT_VARIABLES: &[&str] = &[
     "AUDIT_RECORD",
     "AUDIT_CATEGORY",
     "AUDIT_TRACE_ID",
     "AUDIT_SURFACE_ID",
     "AUDIT_SURFACE_NAME",
+    "AUDIT_SURFACE_VARIANT",
     "AUDIT_PROTOCOL",
     "AUDIT_AGENT_DID",
     "AUDIT_VIA_FABRIC",
@@ -239,6 +309,10 @@ const X402: Family = Family {
 const MPP: Family = Family {
     id: "mpp",
     label: "MPP Payments",
+};
+const PAYMENT: Family = Family {
+    id: "payment",
+    label: "Delegated Payments",
 };
 const AUDIT: Family = Family {
     id: "audit",
@@ -289,9 +363,30 @@ const EVENTS: &[EventSpec] = &[
     spec(USER, "user.accessed", "User Profile Accessed", "A user's profile was viewed", &[USER_VARIABLES]),
     spec(
         CONNECTION_POINT,
+        "connection_point.created",
+        "Connection Point Created",
+        "A connection point was created",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
+        "connection_point.updated",
+        "Connection Point Updated",
+        "A connection point's name, description, enabled state or exposed surfaces were changed",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
+        "connection_point.deleted",
+        "Connection Point Deleted",
+        "A connection point was deleted",
+        &[CONNECTION_POINT_VARIABLES],
+    ),
+    spec(
+        CONNECTION_POINT,
         "connection_point.connected",
         "Connection Point Connected",
-        "Someone connected through a connection point with its secret",
+        "A gateway paired through a connection point's invitation, using its secret",
         &[MESSAGE_VARIABLES],
     ),
     spec(
@@ -342,6 +437,70 @@ const EVENTS: &[EventSpec] = &[
         "MPP Challenge Issued",
         "A caller was asked to pay with MPP",
         &[&["SURFACE_ID", "SURFACE_NAME", "RESOURCE_URL", "SEVERITY"]],
+    ),
+    spec(
+        PAYMENT,
+        "payment.challenge_issued",
+        "Payment Challenge Issued",
+        "The payment gateway answered with a payment challenge",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(PAYMENT, "payment.paid", "Payment Paid", "The payment gateway accepted the payment", &[PAYMENT_VARIABLES]),
+    spec(
+        PAYMENT,
+        "payment.held",
+        "Payment Held",
+        "The payment gateway held the payment for review",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.rejected",
+        "Payment Rejected",
+        "The payment gateway rejected the payment",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.unconfirmed",
+        "Payment Unconfirmed",
+        "The payment gateway did not confirm whether the payment was taken",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.unavailable",
+        "Payment Unavailable",
+        "The payment gateway could not be reached or gave no usable answer",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.authorized",
+        "Payment Authorized",
+        "The payment gateway held the funds until the Target delivers",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.voided",
+        "Payment Voided",
+        "Held funds were released because the Target did not deliver",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.capture_failed",
+        "Payment Capture Failed",
+        "The Target delivered but capturing the held funds failed",
+        &[PAYMENT_VARIABLES],
+    ),
+    spec(
+        PAYMENT,
+        "payment.reconcile_failed",
+        "Payment Reconcile Failed",
+        "A held or unconfirmed payment could not be settled before its deadline",
+        &[PAYMENT_VARIABLES],
     ),
 ];
 
@@ -427,6 +586,9 @@ mod tests {
             "user.deleted",
             "user.login",
             "user.accessed",
+            "connection_point.created",
+            "connection_point.updated",
+            "connection_point.deleted",
             "connection_point.connected",
             "x402.verification.failed",
             "x402.settlement.failed",
@@ -435,6 +597,16 @@ mod tests {
             "mpp.verification.failed",
             "mpp.payment.verified",
             "mpp.challenge.issued",
+            "payment.challenge_issued",
+            "payment.paid",
+            "payment.held",
+            "payment.rejected",
+            "payment.unconfirmed",
+            "payment.unavailable",
+            "payment.authorized",
+            "payment.voided",
+            "payment.capture_failed",
+            "payment.reconcile_failed",
         ]
         .map(String::from)
         .to_vec();
@@ -577,6 +749,33 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn connection_point_changes_offer_the_connection_point_but_no_message() {
+        for id in ["connection_point.created", "connection_point.updated", "connection_point.deleted"] {
+            let event = find_event(id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!((event.family, event.family_label), ("connection_point", "Connection Point"), "{id}");
+            for name in
+                ["OLD_STATE", "NEW_STATE", "CP_ID", "CP_NAME", "CP_DESCRIPTION", "CP_DID", "GATEWAY_ID", "MEDIATOR_ID"]
+            {
+                assert!(
+                    event
+                        .variables
+                        .contains(&name),
+                    "{id} lacks {name}"
+                );
+            }
+            for name in ["FROM_DID", "MESSAGE_BODY", "MESSAGE_ID"] {
+                assert!(
+                    !event
+                        .variables
+                        .contains(&name),
+                    "{id} offers {name}"
+                );
+            }
+        }
+        assert_eq!(find_event("connection_point.error"), None);
     }
 
     #[test]

@@ -74,6 +74,84 @@ pub async fn strip_unsupported_header_metadata_mappings<S: AgentSurfaceStore + ?
     Ok(())
 }
 
+/// Keep only the first source authentication method of a stored surface whose
+/// methods break the rules for several methods, persisting the correction.
+///
+/// Before those rules the gateway enforced only the first method and ignored
+/// the rest, so a surface stored then can hold methods that now refuse it.
+/// Refusing to boot over them would take every surface down; keeping the
+/// first method serves the surface as it was served before.
+///
+/// Called from gateway startup (`main.rs::load_surfaces`) and the local
+/// config reload (`identity/handlers/config.rs::load_base_gateway_config`),
+/// before the surfaces are served. Only an active node persists the
+/// correction (`persist`); a standby node serves it from memory, as
+/// [`crate::surfaces::carry_over_a2a_settings`] does.
+pub async fn fall_back_to_first_source_auth_methods<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    channels: &mut [AgentSurface],
+    persist: bool,
+) -> anyhow::Result<()> {
+    for surface in channels.iter_mut() {
+        let fallbacks = crate::config::fall_back_to_first_source_auth_method(surface);
+        if fallbacks.is_empty() {
+            continue;
+        }
+        crate::config::log_source_auth_fallbacks(surface, &fallbacks);
+        if !persist {
+            continue;
+        }
+        store
+            .save(surface)
+            .await
+            .with_context(|| {
+                format!("Failed to persist the source authentication fallback for surface '{}'", surface.surface_id)
+            })?;
+    }
+    Ok(())
+}
+
+/// Drop the `default_variant_id` of a surface with no variants, persisting the
+/// correction to storage.
+///
+/// Save-time validation (`AgentSurface::validate_variants`) refuses one, but a
+/// surface stored before that check, or restored from a backup holding one,
+/// still has it, and every request to it would be refused as a misconfigured
+/// default. Without the default its base surface serves alias-less requests.
+/// A surface with variants keeps its default: the resolver stays strict.
+///
+/// Called from gateway startup (`main.rs::load_surfaces`), before the
+/// resolved-surface cache is seeded and the listeners are built.
+pub async fn clear_dangling_default_variants<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    channels: &mut [AgentSurface],
+) -> anyhow::Result<()> {
+    for surface in channels
+        .iter_mut()
+        .filter(|surface| surface.variants.is_empty())
+    {
+        let Some(dropped) = surface
+            .default_variant_id
+            .take()
+        else {
+            continue;
+        };
+        warn!(
+            surface = %surface.name,
+            config_id = %surface.surface_id,
+            default_variant_id = %dropped,
+            "Surface has a default_variant_id but no variants — dropping it so its base surface serves its requests"
+        );
+        store
+            .save(surface)
+            .await
+            .with_context(|| {
+                format!("Failed to persist the dropped default variant of surface '{}'", surface.surface_id)
+            })?;
+    }
+    Ok(())
+}
+
 /// The retired dashboard feature flag that once turned A2A 0.3 off gateway-wide.
 const RETIRED_A2A_LEGACY_COMPATIBILITY_FLAG: &str = "a2a_legacy_compatibility";
 
@@ -684,6 +762,251 @@ mod tests {
                 .access_point
                 .header_metadata_mapping
                 .is_some()
+        );
+    }
+
+    fn surface_with_default(
+        id: &str,
+        variants: serde_json::Value,
+        default_variant_id: &str,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": id,
+            "name": format!("{id}-name"),
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": format!("/agents/{id}"),
+                "protocol": "a2a"
+            },
+            "target": { "endpoint": "https://a2a.internal/a2a" },
+            "variants": variants,
+            "default_variant_id": default_variant_id
+        }))
+        .expect("test surface should deserialize")
+    }
+
+    fn surface_with_methods(
+        id: &str,
+        methods: serde_json::Value,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": id,
+            "name": format!("{id}-name"),
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": format!("/agents/{id}"),
+                "protocol": "a2a",
+                "caller_authentication": { "methods": methods }
+            },
+            "target": { "endpoint": "https://a2a.internal/a2a" }
+        }))
+        .expect("test surface should deserialize")
+    }
+
+    #[tokio::test]
+    async fn a_stored_surface_breaking_the_method_rules_keeps_its_first_method() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let jwt = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let shared_header = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "authorization"}, "secret_id": "keys"
+        });
+        let partner_key = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "keys"
+        });
+        let mut channels = vec![
+            surface_with_methods("s-legacy", serde_json::json!([jwt.clone(), shared_header])),
+            surface_with_methods("s-valid", serde_json::json!([jwt.clone(), partner_key])),
+        ];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels, true)
+            .await
+            .expect("fallback should succeed");
+
+        assert_eq!(
+            channels[0]
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert_eq!(channels[0].source_auth_methods()[0].method_tag(), "jwt_bearer");
+        let reloaded = store
+            .get("s-legacy")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(
+            reloaded
+                .source_auth_methods()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            channels[1]
+                .source_auth_methods()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .get("s-valid")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a valid surface is not rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_standby_node_serves_the_fallback_without_persisting_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let jwt = serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let shared_header = serde_json::json!({
+            "type": "api_key", "extraction": {"source": "http_header", "field": "authorization"}, "secret_id": "keys"
+        });
+        let mut channels = vec![surface_with_methods("s-standby", serde_json::json!([jwt, shared_header]))];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels, false)
+            .await
+            .expect("fallback should succeed");
+
+        assert_eq!(
+            channels[0]
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .get("s-standby")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a standby node does not rewrite storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_surface_with_a_later_jwt_bearer_beside_discovery_keeps_its_first_method() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut surface = surface_with_methods(
+            "s-discovery",
+            serde_json::json!([
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+                {"type": "jwt_bearer", "jwt_verification_strategy_id": "internal", "audiences": [],
+                    "token_header": "X-Internal-Token"}
+            ]),
+        );
+        surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::Mcp;
+        surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .expect("caller authentication")
+            .protected_resource = Some(
+            serde_json::from_value(serde_json::json!({
+                "resource": "https://gateway.example/agents/s-discovery",
+                "authorization_servers": ["https://idp.example"]
+            }))
+            .expect("protected resource"),
+        );
+        let mut channels = vec![surface];
+
+        fall_back_to_first_source_auth_methods(&store, &mut channels, true)
+            .await
+            .expect("fallback should succeed");
+
+        let reloaded = store
+            .get("s-discovery")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(
+            reloaded
+                .source_auth_methods()
+                .len(),
+            1
+        );
+        assert_eq!(reloaded.validate_protected_resource(), Ok(()));
+    }
+
+    #[test]
+    fn a_surface_whose_first_method_is_invalid_does_not_fall_back() {
+        let mut surface = surface_with_methods(
+            "s-bad-first",
+            serde_json::json!([
+                {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session"}, "challenge_ttl_seconds": 0},
+                {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Other"}}
+            ]),
+        );
+        assert!(crate::config::fall_back_to_first_source_auth_method(&mut surface).is_empty());
+        assert_eq!(
+            surface
+                .source_auth_methods()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_and_persists_the_default_of_a_surface_without_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut channels = vec![surface_with_default("s-none", serde_json::json!([]), "removed")];
+
+        clear_dangling_default_variants(&store, &mut channels)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(channels[0].default_variant_id, None);
+        let served = channels[0]
+            .serve_variant(None)
+            .expect("the base surface serves an alias-less request");
+        assert_eq!(served.recorded, crate::config::agent_surface_variants::SurfaceVariant::BASE);
+        let reloaded = store
+            .get("s-none")
+            .await
+            .expect("get should succeed")
+            .expect("surface should exist");
+        assert_eq!(reloaded.default_variant_id, None);
+    }
+
+    #[tokio::test]
+    async fn keeps_the_default_of_a_surface_with_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let variants = serde_json::json!([{ "id": "v-1", "alias": "beta", "name": "Beta" }]);
+        let mut channels = vec![
+            surface_with_default("s-valid", variants.clone(), "v-1"),
+            surface_with_default("s-dangling", variants, "removed"),
+        ];
+
+        clear_dangling_default_variants(&store, &mut channels)
+            .await
+            .expect("cleanup should succeed");
+
+        assert_eq!(
+            channels[0]
+                .default_variant_id
+                .as_deref(),
+            Some("v-1")
+        );
+        assert_eq!(
+            channels[1]
+                .default_variant_id
+                .as_deref(),
+            Some("removed")
+        );
+        assert!(
+            store
+                .get("s-dangling")
+                .await
+                .expect("get should succeed")
+                .is_none(),
+            "a surface left as it is is not rewritten"
         );
     }
 

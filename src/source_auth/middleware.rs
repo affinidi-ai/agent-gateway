@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::a2a::auth::{SecretsCache, get_cached_secret};
 use crate::api_keys::ApiKeyValidator;
 use crate::certificates::CertificateStore;
-use crate::didauth::sessions::DidAuthSessionStore;
+use crate::didauth::sessions::{DidAuthSessionStore, SessionView};
 use crate::jwt_bearer::{
     JwksClient, JwtBearerVerifier, JwtVerificationStrategyStorage, errors::JwtBearerError, models::JwtBearerAuthConfig,
 };
@@ -27,11 +27,19 @@ use crate::source_auth::mtls::{ResolvedTrustMaterial, TrustEntry, verify_peer_ce
 
 pub const SURFACE_AGENT_DID_AUDIENCE: &str = "{{ surface.agent_did }}";
 
+/// The audiences a surface's caller authentication accepts on the route
+/// called. The direct path and Fabric receive both resolve them here, so the
+/// protected resource the route publishes, if any, is the only audience either
+/// path accepts.
 pub async fn resolve_surface_audience(
     config: &SourceAuthConfig,
+    protected_resource: Option<&crate::protocols::protected_resource::ProtectedResourceConfig>,
     vc_issuer: Option<&crate::identity::VCIssuer>,
     surface_id: &str,
 ) -> SourceAuthResult<SourceAuthConfig> {
+    if let Some(protected_resource) = protected_resource {
+        return Ok(protected_resource.bind_audience(config.clone()));
+    }
     let SourceAuthConfig::JwtBearer(jwt_config) = config else {
         return Ok(config.clone());
     };
@@ -168,16 +176,17 @@ impl SourceAuthMiddleware {
     /// `peer_cert` is the (optional) client certificate captured by the
     /// listener layer. Required for mTLS auth; ignored otherwise.
     ///
-    /// `surface_id` is the authoritative identifier of the surface currently
-    /// being authenticated against. It is only consulted by DID Auth (to
-    /// reject session tokens minted for a different surface) — other auth
-    /// methods ignore it. Callers should always pass `state.surface.surface_id`.
+    /// `view` is the authoritative surface and variant currently being
+    /// authenticated against. It is only consulted by DID Auth (to reject
+    /// session tokens minted for a different surface or another view of this
+    /// one) - other auth methods ignore it. Callers should always pass
+    /// `state.surface.surface_id` and the variant serving the request.
     pub async fn authenticate(
         &self,
         config: &SourceAuthConfig,
         headers: &HeaderMap,
         channel_name: &str,
-        surface_id: &str,
+        view: SessionView<'_>,
         peer_cert: Option<&PeerCertInfo>,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         match config {
@@ -194,7 +203,7 @@ impl SourceAuthMiddleware {
                     .await
             }
             SourceAuthConfig::DidAuth(didauth_config) => {
-                self.authenticate_didauth(didauth_config, headers, channel_name, surface_id)
+                self.authenticate_didauth(didauth_config, headers, channel_name, view)
                     .await
             }
             SourceAuthConfig::Mtls(mtls_config) => {
@@ -212,7 +221,23 @@ impl SourceAuthMiddleware {
         headers: &HeaderMap,
         channel_name: &str,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
-        // 1. Extract bearer token from the configured header / scheme
+        // 1. Extract bearer token from the configured header / scheme. A value in
+        // another scheme, such as an MPP `Payment` credential, is not a token. A
+        // value under another spelling of the header, `_` for `-`, counts as a
+        // second token, since some servers read both spellings as one.
+        if headers
+            .iter()
+            .filter(|(name, value)| {
+                crate::config::target_auth_rules::same_header_name(name.as_str(), &config.token_header)
+                    && in_token_scheme(value.as_bytes(), &config.token_scheme)
+            })
+            .count()
+            > 1
+        {
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "More than one bearer token".to_string(),
+            });
+        }
         let header_value = headers
             .get(config.token_header.as_str())
             .and_then(|v| v.to_str().ok());
@@ -234,26 +259,35 @@ impl SourceAuthMiddleware {
                 ))
             })?;
 
+        let principal_claim = jwt_strategy
+            .principal_claim_name()
+            .map_err(SourceAuthError::from)?
+            .to_string();
+
         // 3. Verify
         let claims = self
             .jwt_verifier
             .validate(token, &jwt_strategy, &config.audiences)
             .await
             .map_err(SourceAuthError::from)?;
-
         let subject = claims
-            .get("sub")
+            .get(principal_claim.as_str())
             .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
             .unwrap_or("<none>")
             .to_string();
 
         info!(
             surface = %channel_name,
-            subject = %subject,
+            strategy_id = %config.jwt_verification_strategy_id,
             "JWT Bearer source authentication succeeded"
         );
 
-        Ok(AuthenticatedIdentity::JwtBearer { subject, claims })
+        Ok(AuthenticatedIdentity::JwtBearer {
+            subject,
+            principal_claim,
+            claims,
+        })
     }
 
     // ── API Key (SecretsStore) ─────────────────────────────────────────────
@@ -293,6 +327,7 @@ impl SourceAuthMiddleware {
                 );
                 return Ok(AuthenticatedIdentity::ApiKey {
                     key_name: config.secret_id.clone(),
+                    provider_agent_id: None,
                 });
             }
         }
@@ -333,7 +368,10 @@ impl SourceAuthMiddleware {
                     key_id = %meta.key_id,
                     "API Key Provider source authentication succeeded"
                 );
-                Ok(AuthenticatedIdentity::ApiKey { key_name: meta.key_id })
+                Ok(AuthenticatedIdentity::ApiKey {
+                    key_name: meta.key_id,
+                    provider_agent_id: Some(config.agent_id.clone()),
+                })
             }
             Ok(None) => {
                 debug!(channel = %channel_name, agent_id = %config.agent_id, "API key not found or revoked");
@@ -357,7 +395,7 @@ impl SourceAuthMiddleware {
         config: &crate::source_auth::models::DidAuthAuthConfig,
         headers: &HeaderMap,
         channel_name: &str,
-        surface_id: &str,
+        view: SessionView<'_>,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         let session_token =
             extract_credential(&config.extraction, headers).ok_or_else(|| SourceAuthError::MissingCredential {
@@ -372,20 +410,56 @@ impl SourceAuthMiddleware {
                 reason: "DID Auth session not found or expired".to_string(),
             })?;
 
-        // Reject cross-surface session replay: a token minted for surface A
-        // must not authenticate against surface B, even if the client
-        // presents it. Empty `session.surface_id` catches legacy on-disk
-        // records predating the binding and forces callers to re-mint.
-        if session.surface_id.is_empty() || session.surface_id != surface_id {
+        // Reject cross-surface and cross-view session replay: a token minted
+        // for surface A must not authenticate against surface B, nor one
+        // minted on a variant at the base surface or another variant, whose
+        // `allowed_dids` may differ, even if the client presents it. Empty
+        // `session.surface_id` catches legacy on-disk records predating the
+        // binding and forces callers to re-mint.
+        if !view.minted(&session) {
             warn!(
                 surface = %channel_name,
-                current_surface_id = %surface_id,
+                current_surface_id = %view.surface_id,
+                current_variant_id = view.variant_id,
                 bound_surface_id = %session.surface_id,
+                bound_variant_id = session.variant_id.as_deref(),
                 did = %session.did,
-                "DID Auth session bound to a different surface — rejecting"
+                "DID Auth session bound to a different surface or variant - rejecting"
             );
             return Err(SourceAuthError::InvalidCredential {
                 reason: "DID Auth session not bound to this surface".to_string(),
+            });
+        }
+
+        // The allow-list is the view's as it is now, not as it was when the
+        // session was minted: a DID added to no list, or removed from one,
+        // since then is refused on every use, as it would be at the challenge.
+        if !config.allowed_dids.is_empty()
+            && !config
+                .allowed_dids
+                .iter()
+                .any(|allowed| allowed.trim() == session.did)
+        {
+            warn!(
+                surface = %channel_name,
+                did = %session.did,
+                "DID Auth session's DID is not in the surface's allowed_dids - rejecting"
+            );
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "DID Auth session not bound to this surface".to_string(),
+            });
+        }
+
+        // However long the session was stored for, it authenticates no longer
+        // than the longest lifetime after it was minted.
+        if chrono::Utc::now()
+            > session.created_at
+                + chrono::Duration::seconds(
+                    crate::source_auth::models::DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS as i64,
+                )
+        {
+            return Err(SourceAuthError::InvalidCredential {
+                reason: "DID Auth session not found or expired".to_string(),
             });
         }
 
@@ -570,6 +644,7 @@ fn mtls_failure_reason(err: &SourceAuthError) -> &'static str {
                 "invalid_cert"
             }
         }
+        SourceAuthError::AmbiguousCredentials => "ambiguous_credentials",
         SourceAuthError::ConfigNotFound { .. } => "trust_misconfigured",
         SourceAuthError::Internal { .. } => "internal_error",
     }
@@ -606,6 +681,19 @@ fn extract_credential(
         // helper does not perform.
         CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
     }
+}
+
+/// Whether a token header value is in `scheme`, compared ignoring case as HTTP
+/// authentication schemes are. With no scheme, every value is a token.
+fn in_token_scheme(
+    value: &[u8],
+    scheme: &str,
+) -> bool {
+    scheme.is_empty()
+        || value
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(scheme.as_bytes()))
 }
 
 fn constant_time_compare(
@@ -661,6 +749,7 @@ mod tests {
                 channel_config_id: surface_id.to_string(),
                 usage_count: 1,
                 last_used_at,
+                role: None,
             }],
             private_key: None,
             vta_context_id: None,
@@ -691,6 +780,25 @@ mod tests {
         let records = vec![identity_record("did:webvh:other", "other-surface", Utc::now(), true)];
 
         assert_eq!(select_surface_agent_did(records, "shop-agent"), None);
+    }
+
+    #[tokio::test]
+    async fn a_published_protected_resource_is_the_only_audience_accepted() {
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            audiences: vec![SURFACE_AGENT_DID_AUDIENCE.to_string(), "https://other.example/mcp".to_string()],
+            ..Default::default()
+        });
+        let protected =
+            crate::protocols::protected_resource::fixtures::protected_resource("https://gateway.example/mcp/alpha");
+
+        let resolved = resolve_surface_audience(&config, Some(&protected), None, "alpha")
+            .await
+            .expect("bind the protected resource");
+
+        let SourceAuthConfig::JwtBearer(resolved) = resolved else {
+            panic!("expected JWT bearer config");
+        };
+        assert_eq!(resolved.audiences, vec!["https://gateway.example/mcp/alpha"]);
     }
 
     // ── In-memory Secrets Store ─────────────────────────────────────────────
@@ -1006,13 +1114,14 @@ mod tests {
         headers.insert("X-API-Key", HeaderValue::from_static("secret-123"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let identity = result.expect("should succeed");
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "my-secret".to_string()
+                key_name: "my-secret".to_string(),
+                provider_agent_id: None,
             }
         );
     }
@@ -1035,13 +1144,14 @@ mod tests {
         headers.insert("X-API-Key", HeaderValue::from_static("key-b"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let identity = result.expect("should succeed");
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "my-secret".to_string()
+                key_name: "my-secret".to_string(),
+                provider_agent_id: None,
             }
         );
     }
@@ -1059,7 +1169,7 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::MissingCredential { .. }), "expected MissingCredential, got: {err:?}");
@@ -1083,7 +1193,7 @@ mod tests {
         headers.insert("X-API-Key", HeaderValue::from_static("wrong-key"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
@@ -1110,13 +1220,14 @@ mod tests {
         headers.insert("X-API-Key", HeaderValue::from_static("provider-key-123"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let identity = result.expect("should succeed");
         assert_eq!(
             identity,
             AuthenticatedIdentity::ApiKey {
-                key_name: "key-id-1".to_string()
+                key_name: "key-id-1".to_string(),
+                provider_agent_id: Some("agent-1".to_string()),
             }
         );
     }
@@ -1137,7 +1248,7 @@ mod tests {
         headers.insert("X-API-Key", HeaderValue::from_static("bad-key"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
@@ -1149,11 +1260,11 @@ mod tests {
     async fn valid_session_returns_didauth_identity() {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
-        let session = didauth_store
+        let (session_id, _) = didauth_store
             .create_session(
                 "did:example:123".to_string(),
                 "test-channel".to_string(),
-                "test-surface-id".to_string(),
+                SessionView::base("test-surface-id"),
                 3600,
             )
             .await;
@@ -1163,10 +1274,10 @@ mod tests {
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_id).unwrap());
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let identity = result.expect("should succeed");
         assert_eq!(
@@ -1187,7 +1298,7 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::MissingCredential { .. }), "expected MissingCredential, got: {err:?}");
@@ -1205,7 +1316,7 @@ mod tests {
         headers.insert("X-Session-Token", HeaderValue::from_static("nonexistent-token"));
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
@@ -1216,11 +1327,11 @@ mod tests {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
         // Create a session with 0 second TTL — it expires immediately
-        let session = didauth_store
+        let (session_id, _) = didauth_store
             .create_session(
                 "did:example:expired".to_string(),
                 "test-channel".to_string(),
-                "test-surface-id".to_string(),
+                SessionView::base("test-surface-id"),
                 0,
             )
             .await;
@@ -1233,10 +1344,10 @@ mod tests {
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_id).unwrap());
 
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
@@ -1249,28 +1360,179 @@ mod tests {
     async fn session_bound_to_other_surface_is_rejected() {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
-        let session_on_a = didauth_store
-            .create_session("did:example:alice".to_string(), "surface-a".to_string(), "surface-a-id".to_string(), 3600)
+        let (session_on_a, _) = didauth_store
+            .create_session(
+                "did:example:alice".to_string(),
+                "surface-a".to_string(),
+                SessionView::base("surface-a-id"),
+                3600,
+            )
             .await;
 
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&session_on_a.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(&session_on_a).unwrap());
 
         // Presenting A's session token against surface B must fail closed.
         let result = mw
-            .authenticate(&config, &headers, "surface-b", "surface-b-id", None)
+            .authenticate(&config, &headers, "surface-b", SessionView::base("surface-b-id"), None)
             .await;
         let err = result.expect_err("cross-surface session must be rejected");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
 
         // Sanity check: the same token is still valid against surface A.
         let ok = mw
-            .authenticate(&config, &headers, "surface-a", "surface-a-id", None)
+            .authenticate(&config, &headers, "surface-a", SessionView::base("surface-a-id"), None)
             .await;
         assert!(ok.is_ok(), "same-surface reuse must still work");
+    }
+
+    /// The DID Auth settings of a view whose callers may list `allowed`.
+    fn listing(allowed: &[&str]) -> SourceAuthConfig {
+        let mut config = test_didauth_config("X-Session-Token");
+        config.allowed_dids = allowed
+            .iter()
+            .map(|did| did.to_string())
+            .collect();
+        SourceAuthConfig::DidAuth(config)
+    }
+
+    /// A session goes on authenticating only while `allowed_dids`, as the view
+    /// serving the request has it now, names its DID: one minted while the
+    /// list was empty, which admits any DID, is refused once a list that does
+    /// not name it is added, and one whose DID is removed from the list is
+    /// refused from then on.
+    #[tokio::test]
+    async fn a_session_authenticates_only_while_the_allow_list_names_its_did() {
+        let (secrets_store, didauth_store, strategy_store) = default_stores();
+        let view = SessionView::base("surface-a-id");
+        let (mallory, _) = didauth_store
+            .create_session("did:example:mallory".into(), "surface-a".into(), view, 3600)
+            .await;
+        let (bob, _) = didauth_store
+            .create_session("did:example:bob".into(), "surface-a".into(), view, 3600)
+            .await;
+        let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
+        let presenting = |session_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
+            headers
+        };
+
+        let open = listing(&[]);
+        assert!(
+            mw.authenticate(&open, &presenting(&mallory), "surface-a", view, None)
+                .await
+                .is_ok(),
+            "an empty allow-list admits any DID"
+        );
+        let alice_only = listing(&["did:example:alice"]);
+        let err = mw
+            .authenticate(&alice_only, &presenting(&mallory), "surface-a", view, None)
+            .await
+            .expect_err("a session minted while the list was empty is refused once a list leaves its DID out");
+        assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "{err:?}");
+
+        let alice_and_bob = listing(&["did:example:alice", " did:example:bob "]);
+        assert!(
+            mw.authenticate(&alice_and_bob, &presenting(&bob), "surface-a", view, None)
+                .await
+                .is_ok(),
+            "a listed DID's session authenticates"
+        );
+        let err = mw
+            .authenticate(&alice_only, &presenting(&bob), "surface-a", view, None)
+            .await
+            .expect_err("a session whose DID was removed from the list is refused");
+        assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "{err:?}");
+    }
+
+    /// A session authenticates only at the view it was minted on: one minted
+    /// on a variant is refused at the base surface and at another variant,
+    /// and one minted on the base at a variant, even where that view's
+    /// `allowed_dids` name its DID.
+    #[tokio::test]
+    async fn a_session_minted_on_one_view_is_refused_at_another() {
+        let (secrets_store, didauth_store, strategy_store) = default_stores();
+        let base = SessionView::base("surface-a-id");
+        let variant = SessionView {
+            surface_id: "surface-a-id",
+            variant_id: Some("variant-1"),
+        };
+        let other_variant = SessionView {
+            surface_id: "surface-a-id",
+            variant_id: Some("variant-2"),
+        };
+        let (on_the_variant, _) = didauth_store
+            .create_session("did:example:mallory".into(), "surface-a".into(), variant, 3600)
+            .await;
+        let (on_the_base, _) = didauth_store
+            .create_session("did:example:mallory".into(), "surface-a".into(), base, 3600)
+            .await;
+        let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
+        let config = listing(&["did:example:mallory"]);
+        let presenting = |session_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
+            headers
+        };
+
+        for (case, session, view) in [
+            ("minted on a variant, replayed on the base", &on_the_variant, base),
+            ("minted on a variant, replayed on another variant", &on_the_variant, other_variant),
+            ("minted on the base, replayed on a variant", &on_the_base, variant),
+        ] {
+            let err = mw
+                .authenticate(&config, &presenting(session), "surface-a", view, None)
+                .await
+                .expect_err(case);
+            assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "{case}: {err:?}");
+        }
+        for (session, view) in [(&on_the_variant, variant), (&on_the_base, base)] {
+            assert!(
+                mw.authenticate(&config, &presenting(session), "surface-a", view, None)
+                    .await
+                    .is_ok(),
+                "a session authenticates at the view it was minted on"
+            );
+        }
+    }
+
+    /// No session authenticates longer than
+    /// [`DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS`] after it was minted,
+    /// whatever expiry it was stored with.
+    #[tokio::test]
+    async fn a_session_never_authenticates_past_the_longest_lifetime() {
+        use crate::didauth::sessions::DidAuthSession;
+
+        let (secrets_store, didauth_store, strategy_store) = default_stores();
+        let minted =
+            chrono::Utc::now() - chrono::Duration::seconds(DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS as i64 + 60);
+        let session_id = "long-lived-token";
+        let session = DidAuthSession {
+            session_id_hash: crate::storage::filesystem::token_storage_id(session_id),
+            did: "did:example:alice".to_string(),
+            channel_name: "surface-a".to_string(),
+            surface_id: "surface-a-id".to_string(),
+            variant_id: None,
+            created_at: minted,
+            expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+            challenge: None,
+        };
+        didauth_store
+            .insert_for_test(session)
+            .await;
+        let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
+
+        let err = mw
+            .authenticate(&listing(&[]), &headers, "surface-a", SessionView::base("surface-a-id"), None)
+            .await
+            .expect_err("a session past the longest lifetime is refused");
+        assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "{err:?}");
     }
 
     /// Legacy on-disk sessions written before the surface_id binding was
@@ -1283,27 +1545,29 @@ mod tests {
         let (secrets_store, didauth_store, strategy_store) = default_stores();
 
         // Fabricate a legacy session record (surface_id empty).
+        let session_id = "legacy-token-xyz";
         let legacy = DidAuthSession {
-            session_id: "legacy-token-xyz".to_string(),
+            session_id_hash: crate::storage::filesystem::token_storage_id(session_id),
             did: "did:example:legacy".to_string(),
             channel_name: "some-old-channel".to_string(),
             surface_id: String::new(),
+            variant_id: None,
             created_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::seconds(3600),
             challenge: None,
         };
         didauth_store
-            .insert_for_test(legacy.clone())
+            .insert_for_test(legacy)
             .await;
 
         let mw = build_middleware(Some(secrets_store), None, didauth_store, strategy_store, default_jwks_client());
         let config = SourceAuthConfig::DidAuth(test_didauth_config("X-Session-Token"));
 
         let mut headers = HeaderMap::new();
-        headers.insert("X-Session-Token", HeaderValue::from_str(&legacy.session_id).unwrap());
+        headers.insert("X-Session-Token", HeaderValue::from_str(session_id).unwrap());
 
         let result = mw
-            .authenticate(&config, &headers, "any-surface", "any-surface-id", None)
+            .authenticate(&config, &headers, "any-surface", SessionView::base("any-surface-id"), None)
             .await;
         let err = result.expect_err("legacy unbound session must be rejected");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }));
@@ -1328,7 +1592,7 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::MissingCredential { .. }), "expected MissingCredential, got: {err:?}");
@@ -1384,12 +1648,23 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         String, // strategy_id
         crate::jwt_bearer::test_utils::TestServer,
     ) {
+        jwt_test_setup_naming(None).await
+    }
+
+    async fn jwt_test_setup_naming(
+        principal_claim: Option<&str>
+    ) -> (
+        SourceAuthMiddleware,
+        String, // strategy_id
+        crate::jwt_bearer::test_utils::TestServer,
+    ) {
         let kid = "source-auth-test-key";
         let (base, server) = start_jwks_server(ed25519_jwks_body(kid, ED25519_JWK_X), Some(3600)).await;
 
         let strategy_store = Arc::new(InMemoryStrategyStore::new());
         let strategy = strategy_store
             .create(JwtVerificationStrategy {
+                principal_claim: principal_claim.map(str::to_string),
                 id: String::new(),
                 tenant_id: None,
                 name: "Test EdDSA IdP".to_string(),
@@ -1436,11 +1711,11 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
 
         let headers = bearer(&token);
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let identity = result.expect("should succeed");
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => {
+            AuthenticatedIdentity::JwtBearer { subject, claims, .. } => {
                 assert_eq!(subject, "user-1");
                 assert_eq!(
                     claims
@@ -1464,6 +1739,109 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
     }
 
     #[tokio::test]
+    async fn a_strategy_that_names_a_principal_claim_identifies_the_caller_by_it() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("oid")).await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+        let token_with = |claims: serde_json::Value| {
+            let mut base = json!({
+                "iss": "https://issuer.example.com",
+                "sub": "pairwise-sub",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            });
+            base.as_object_mut()
+                .unwrap()
+                .extend(
+                    claims
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            make_token(base, kid)
+        };
+
+        let with_oid = token_with(json!({ "oid": "00000000-0000-0000-0000-0000000000aa" }));
+        let identity = mw
+            .authenticate(&config, &bearer(&with_oid), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect("a token with the claim authenticates");
+        match &identity {
+            AuthenticatedIdentity::JwtBearer { subject, principal_claim, .. } => {
+                assert_eq!(subject, "00000000-0000-0000-0000-0000000000aa");
+                assert_eq!(principal_claim, "oid");
+            }
+            _ => panic!("expected a JwtBearer identity"),
+        }
+        assert_eq!(
+            identity
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            crate::source_auth::models::jwt_caller_identity_hash(
+                "https://issuer.example.com",
+                Some("tenant-1"),
+                "00000000-0000-0000-0000-0000000000aa",
+                "oid"
+            )
+            .as_deref()
+        );
+
+        let without_oid = token_with(json!({}));
+        let identity = mw
+            .authenticate(&config, &bearer(&without_oid), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect("the token is valid; it just names no caller");
+        assert_eq!(identity.principal_hash(None), None, "a token without the claim names no caller");
+
+        let empty = token_with(json!({ "oid": "" }));
+        let identity = mw
+            .authenticate(&config, &bearer(&empty), "test-channel", SessionView::base("surface"), None)
+            .await
+            .unwrap();
+        assert_eq!(identity.principal(), "<none>", "an empty claim reaches policy as the placeholder");
+        assert_eq!(identity.principal_key(), "jwt:<none>");
+
+        let numeric = token_with(json!({ "oid": 7 }));
+        let identity = mw
+            .authenticate(&config, &bearer(&numeric), "test-channel", SessionView::base("surface"), None)
+            .await
+            .unwrap();
+        assert_eq!(identity.principal_hash(None), None, "a claim that is not a string names no caller");
+    }
+
+    #[tokio::test]
+    async fn a_strategy_stored_with_a_claim_the_api_refuses_authenticates_nobody() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("iss")).await;
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let error = mw
+            .authenticate(&config, &bearer(&token), "test-channel", SessionView::base("surface"), None)
+            .await
+            .expect_err("a strategy naming iss identifies nobody");
+        assert!(matches!(error, SourceAuthError::Internal { .. }), "{error}");
+        assert!(!error.is_caller_attributable(), "the strategy, not the caller, is at fault");
+    }
+
+    #[tokio::test]
     async fn missing_bearer_header_returns_missing_credential() {
         let (_mw, strategy_id, _server) = jwt_test_setup().await;
 
@@ -1475,7 +1853,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
 
         let headers = HeaderMap::new();
         let result = _mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::MissingCredential { .. }), "expected MissingCredential, got: {err:?}");
@@ -1505,7 +1883,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
 
         let headers = bearer(&token);
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
@@ -1535,7 +1913,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
 
         let headers = bearer(&token);
         let result = mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::ConfigNotFound { .. }), "expected ConfigNotFound, got: {err:?}");
@@ -1555,10 +1933,102 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         headers.insert(axum::http::header::AUTHORIZATION, HeaderValue::from_static("Bearer not.a.valid.jwt"));
 
         let result = _mw
-            .authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+            .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await;
         let err = result.expect_err("should fail");
         assert!(matches!(err, SourceAuthError::InvalidCredential { .. }), "expected InvalidCredential, got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_second_value_in_the_token_scheme_fails_and_one_in_another_scheme_does_not() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            ..Default::default()
+        });
+
+        for (case, second, verifies) in [
+            ("a second Bearer value", format!("Bearer {token}"), false),
+            ("a lower-case bearer value", "bearer other".to_string(), false),
+            ("a Payment value", "Payment credential".to_string(), true),
+        ] {
+            let mut headers = bearer(&token);
+            headers.append(axum::http::header::AUTHORIZATION, HeaderValue::from_str(&second).unwrap());
+            let result = mw
+                .authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                .await;
+            if verifies {
+                assert!(
+                    matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+                    "{case}"
+                );
+            } else {
+                assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_token_under_another_spelling_of_the_token_header_fails() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": "my-audience",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec!["my-audience".to_string()],
+            token_header: "X-User-Token".to_string(),
+            forward_header: true,
+            ..Default::default()
+        });
+        let authenticate = |headers: HeaderMap| {
+            let mw = &mw;
+            let config = &config;
+            async move {
+                mw.authenticate(config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
+                    .await
+            }
+        };
+        let valid = HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid.clone());
+        headers.insert("x_user_token", HeaderValue::from_static("Bearer other"));
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::InvalidCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x_user_token", valid.clone());
+        let result = authenticate(headers).await;
+        assert!(matches!(result, Err(SourceAuthError::MissingCredential { .. })), "{result:?}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-token", valid);
+        let result = authenticate(headers).await;
+        assert!(
+            matches!(&result, Ok(AuthenticatedIdentity::JwtBearer { subject, .. }) if subject == "user-1"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1586,7 +2056,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             ..Default::default()
         });
 
-        mw.authenticate(&config, &headers, "test-channel", "test-surface-id", None)
+        mw.authenticate(&config, &headers, "test-channel", SessionView::base("test-surface-id"), None)
             .await
             .expect("should succeed");
 

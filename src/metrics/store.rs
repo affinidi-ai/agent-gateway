@@ -422,7 +422,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         self.record_connection_with_ucp(
             channel_config_id,
@@ -437,7 +436,6 @@ impl MetricsStore {
             channel_request_latency_ms,
             channel_response_latency_ms,
             total_latency_ms,
-            variant_alias,
         )
         .await;
     }
@@ -457,7 +455,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         self.record_connection_with_bytes_and_ucp(
             channel_config_id,
@@ -474,7 +471,6 @@ impl MetricsStore {
             channel_request_latency_ms,
             channel_response_latency_ms,
             total_latency_ms,
-            variant_alias,
         )
         .await;
     }
@@ -495,7 +491,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         self.record_connection_with_bytes_and_ucp(
             channel_config_id,
@@ -512,7 +507,6 @@ impl MetricsStore {
             channel_request_latency_ms,
             channel_response_latency_ms,
             total_latency_ms,
-            variant_alias,
         )
         .await;
     }
@@ -534,7 +528,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         // Default to None transit_point (Access Point traffic). Outbound
         // (Transit Point) hops use `record_connection_with_transit_point`.
@@ -554,7 +547,6 @@ impl MetricsStore {
             channel_request_latency_ms,
             channel_response_latency_ms,
             total_latency_ms,
-            variant_alias,
         )
         .await;
     }
@@ -580,7 +572,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         self.record_connection_full(
             channel_config_id,
@@ -598,7 +589,6 @@ impl MetricsStore {
             channel_request_latency_ms,
             channel_response_latency_ms,
             total_latency_ms,
-            variant_alias,
         )
         .await;
     }
@@ -622,7 +612,6 @@ impl MetricsStore {
         channel_request_latency_ms: Option<u64>,
         channel_response_latency_ms: Option<u64>,
         total_latency_ms: u64,
-        variant_alias: Option<String>,
     ) {
         let metric = ConnectionMetric {
             timestamp: Utc::now(),
@@ -636,7 +625,7 @@ impl MetricsStore {
             identity_hash: identity_hash.clone(),
             ucp_operation: ucp_operation.clone(),
             transit_point,
-            variant_alias,
+            surface_variant: crate::observability::policy_audit::current_request_variant(),
             metric_type: crate::metrics::MetricType::Channel,
             // Channel-specific latency
             channel_request_latency_ms,
@@ -2323,7 +2312,7 @@ impl MetricsStore {
                 direction: conn.direction,
                 ucp_operation: conn.ucp_operation.clone(),
                 transit_point: conn.transit_point.clone(),
-                variant_alias: conn.variant_alias.clone(),
+                surface_variant: conn.surface_variant.clone(),
                 metric_type: conn.metric_type,
                 correlation_id: conn.correlation_id.clone(),
                 agent_identity: conn.agent_identity.clone(),
@@ -2423,7 +2412,7 @@ impl MetricsStore {
                                             trace_id: trace_id.clone(),
                                             ucp_operation: point.ucp_operation.clone(),
                                             transit_point: point.transit_point.clone(),
-                                            variant_alias: point.variant_alias.clone(),
+                                            surface_variant: point.surface_variant.clone(),
                                             metric_type: point.metric_type,
                                             correlation_id: point.correlation_id.clone(),
                                             agent_identity: point.agent_identity.clone(),
@@ -2599,7 +2588,7 @@ impl MetricsStore {
                 direction: conn.direction,
                 ucp_operation: conn.ucp_operation.clone(),
                 transit_point: conn.transit_point.clone(),
-                variant_alias: conn.variant_alias.clone(),
+                surface_variant: conn.surface_variant.clone(),
                 metric_type: conn.metric_type,
                 correlation_id: conn.correlation_id.clone(),
                 agent_identity: conn.agent_identity.clone(),
@@ -2757,6 +2746,90 @@ impl Default for MetricsStore {
 #[cfg(test)]
 mod tests {
     use super::MetricsStore;
+
+    async fn record_one(store: &MetricsStore) {
+        store
+            .record_connection(
+                "orders".to_string(),
+                "caller".to_string(),
+                "https://upstream".to_string(),
+                crate::metrics::ConnectionStatus::Success,
+                Some(5),
+                None,
+                crate::metrics::ConnectionDirection::Request,
+                "trace-1".to_string(),
+                None,
+                None,
+                5,
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_connection_recorded_in_a_request_carries_its_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        let store = MetricsStore::new(10);
+
+        in_request(RequestScope::new("0123456789abcdef".to_string()), async {
+            set_request_variant("beta");
+            record_one(&store).await;
+        })
+        .await;
+
+        let recorded = store
+            .get_recent_connections(10)
+            .await;
+        assert_eq!(recorded.len(), 1);
+        let json = serde_json::to_value(&recorded[0]).unwrap();
+        assert_eq!(json["surface_variant"], "beta");
+        assert!(
+            json.get("variant_alias")
+                .is_none(),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_recorded_outside_a_request_has_no_variant() {
+        let store = MetricsStore::new(10);
+
+        record_one(&store).await;
+
+        let json = serde_json::to_value(
+            &store
+                .get_recent_connections(10)
+                .await[0],
+        )
+        .unwrap();
+        assert!(
+            json.get("surface_variant")
+                .is_none(),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_written_with_variant_alias_loads_into_surface_variant() {
+        let metric: crate::metrics::ConnectionMetric = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-10-28T00:00:00Z", "channel_config_id": "orders", "source": "caller",
+            "destination": "https://upstream", "status": "success", "latency_ms": 5, "trace_id": "t",
+            "variant_alias": "beta"
+        }))
+        .unwrap();
+        let point: crate::metrics::ConnectionDataPoint = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-10-28T00:00:00Z", "status": "success", "latency_ms": 5, "variant_alias": "beta"
+        }))
+        .unwrap();
+
+        for json in [serde_json::to_value(&metric).unwrap(), serde_json::to_value(&point).unwrap()] {
+            assert_eq!(json["surface_variant"], "beta", "{json}");
+            assert!(
+                json.get("variant_alias")
+                    .is_none(),
+                "{json}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn record_user_login_increments_prometheus_counter() {

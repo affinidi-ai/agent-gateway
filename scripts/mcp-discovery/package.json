@@ -1,0 +1,12 @@
+{
+  "name": "agent-gateway-mcp-discovery",
+  "private": true,
+  "description": "MCP authorization server discovery demo against Ory Hydra",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.3.1"
+  }
+}

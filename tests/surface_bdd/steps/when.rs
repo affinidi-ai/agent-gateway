@@ -50,6 +50,19 @@ pub(crate) async fn record_replacement_mock_observation(world: &mut SurfaceWorld
     if let Some(observations) = replacement_observation {
         world.record_secondary_observations(Some(observations));
     }
+    record_transit_point_mock_observations(world).await;
+}
+
+async fn record_transit_point_mock_observations(world: &mut SurfaceWorld) {
+    let mut observations = Vec::new();
+    if let Some(infra) = world.infra.as_ref() {
+        for (collaborator_key, mock) in &infra.transit_point_mocks {
+            observations.push((collaborator_key.clone(), read_mock_observation(mock).await));
+        }
+    }
+    for (collaborator_key, observation) in observations {
+        world.record_observations(&collaborator_key, observation);
+    }
 }
 
 pub(crate) async fn ensure_gateway_running(world: &mut SurfaceWorld) {
@@ -100,6 +113,12 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
                     .contains_key(&val.key)
             });
 
+        assert!(
+            world
+                .plain_http_collaborators
+                .is_empty(),
+            "only the single-surface harness checks that a collaborator is reached over plain http"
+        );
         let need_some_starting = !all_gateway_processes_running || !all_agent_processes_running;
 
         if need_some_starting {
@@ -183,6 +202,29 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     } else {
         None
     };
+    let target_token_endpoint = if let Some(provider) = world
+        .surface_config
+        .target_auth_provider
+        .as_mut()
+    {
+        let mut response = crate::bdd_support::mock_server::MockResponse::json(serde_json::json!({
+            "access_token": crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
+            "token_type": "Bearer",
+            "expires_in": provider.expires_in,
+        }));
+        response.status = provider.token_status;
+        let mock = MockServer::start(response).await;
+        let token_endpoint = format!("{}/token", mock.url());
+        oauth_endpoint_allowlist.push(if provider.insecure_token_endpoint {
+            mock.url()
+        } else {
+            token_endpoint.clone()
+        });
+        provider.token_endpoint = Some(token_endpoint);
+        Some(mock)
+    } else {
+        None
+    };
 
     let (gateway_port, mut port_reservation) = config::reserve_free_port("gateway inbound port");
     if world
@@ -202,28 +244,61 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .surface_config
             .oauth_callback_base_url = Some(callback_base_url);
     }
-    let replacement_mock = if world
+    let mut replacement_mock = None;
+    let mut transit_point_mocks = std::collections::HashMap::new();
+    let mut transit_target_urls = std::collections::HashMap::new();
+    let mut collaborator_urls = std::collections::HashMap::from([(
+        PRIMARY_COLLABORATOR_KEY.to_string(),
+        config::single_surface_writer::effective_target_url(&mock.url(), &world.surface_config),
+    )]);
+    for transit_point in &world
         .surface_config
-        .transit_point
-        .is_some()
+        .transit_points
     {
-        Some(
-            MockServer::start(
-                world
-                    .collaborator_target(SECONDARY_COLLABORATOR_KEY)
-                    .configured_response
-                    .clone(),
-            )
-            .await,
+        let collaborator_key = world
+            .transit_point_collaborator_key(&transit_point.alias)
+            .to_string();
+        let mock = MockServer::start(
+            world
+                .collaborator_target(&collaborator_key)
+                .configured_response
+                .clone(),
         )
-    } else {
-        None
-    };
-    let (outbound_port, mut outbound_port_reservation) = if world
-        .surface_config
-        .transit_point
-        .is_some()
-    {
+        .await;
+        let target_url = if world.target_is_unreachable(&collaborator_key) {
+            "http://127.0.0.1:1".to_string()
+        } else {
+            format!(
+                "{}{}",
+                mock.url(),
+                transit_point
+                    .target_base_path
+                    .as_deref()
+                    .unwrap_or_default()
+            )
+        };
+        collaborator_urls.insert(collaborator_key.clone(), target_url.clone());
+        transit_target_urls.insert(transit_point.alias.clone(), target_url);
+        if collaborator_key == SECONDARY_COLLABORATOR_KEY {
+            replacement_mock = Some(mock);
+        } else {
+            transit_point_mocks.insert(collaborator_key, mock);
+        }
+    }
+    for collaborator_key in &world.plain_http_collaborators {
+        let url = collaborator_urls
+            .get(collaborator_key)
+            .unwrap_or_else(|| panic!("collaborator '{collaborator_key}' has no endpoint on the surface"));
+        assert!(
+            url.starts_with("http://"),
+            "collaborator '{collaborator_key}' must be reached over plain http, not {url}"
+        );
+    }
+    let has_outbound_listener = !transit_target_urls.is_empty()
+        || world
+            .surface_config
+            .outbound_public_origin;
+    let (outbound_port, mut outbound_port_reservation) = if has_outbound_listener {
         let (port, reservation) = config::reserve_free_port("gateway outbound port");
         (port, Some(reservation))
     } else {
@@ -255,21 +330,13 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         (None, None)
     };
 
-    if let Some(transit_target_url) = replacement_mock
-        .as_ref()
-        .map(MockServer::url)
-    {
-        let transit_target_url = if world.target_is_unreachable(SECONDARY_COLLABORATOR_KEY) {
-            "http://127.0.0.1:1".to_string()
-        } else {
-            transit_target_url
-        };
+    if has_outbound_listener {
         config::single_surface_writer::write_single_surface_config_with_outbound_listener(
             temp_dir.path(),
             gateway_port,
             outbound_port,
             &mock.url(),
-            &transit_target_url,
+            &transit_target_urls,
             &world.surface_config,
             jwks_files.as_ref(),
         );
@@ -333,6 +400,15 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
+    // A credentialed MCP proxy tool call vets its REST backend like any stored
+    // backend, which refuses loopback unless the egress allow-list names it.
+    if world
+        .surface_config
+        .mcp_proxy_target
+        .is_some()
+    {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+    }
     // The A2A proxy dial refuses loopback targets unless the gateway's
     // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
     if world
@@ -342,18 +418,21 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     {
         gateway_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
     }
-    let mut gateway = GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env);
+    let mut gateway = if world
+        .surface_config
+        .keeps_gateway_log
+    {
+        GatewayProcess::start_surface_logged_with_env(&config_path, temp_dir.path(), &gateway_env)
+    } else {
+        GatewayProcess::start_surface_with_env(&config_path, temp_dir.path(), &gateway_env)
+    };
     gateway = gateway
         .with_port(gateway_port)
         .with_port_reservation(port_reservation);
     gateway
         .wait_until_ready()
         .await;
-    if world
-        .surface_config
-        .transit_point
-        .is_some()
-    {
+    if has_outbound_listener {
         gateway
             .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
             .await
@@ -366,6 +445,8 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         gateway,
         mock,
         replacement_mock: replacement_mock.or(oauth_mock),
+        target_token_endpoint,
+        transit_point_mocks,
         affinidi_well,
         _jwks_server: jwks_server,
         gateway_port,
@@ -470,11 +551,41 @@ pub(crate) fn build_surface_payload(
             "listen_address": format!("http://localhost:{}", infra.gateway_port),
             "route": route,
             "protocol": world.surface_config.protocol,
+            "public": true,
         },
         "target": {
             "endpoint": target_url,
         }
     })
+}
+
+/// The payload that creates a new surface for `route`, with the scenario's
+/// caller authentication. It sets `access_point.public` only when the operator
+/// marks the Access Point public, so the gateway closes it otherwise.
+pub(crate) async fn build_new_surface_payload(
+    world: &mut SurfaceWorld,
+    route: &str,
+    public: bool,
+) -> serde_json::Value {
+    configure_unseeded_route(world, route);
+    let mut payload = build_primary_target_surface_payload(world, route).await;
+    let access_point = payload["access_point"]
+        .as_object_mut()
+        .expect("surface payload must have an access_point object");
+    access_point.remove("public");
+    if public {
+        access_point.insert("public".to_string(), serde_json::json!(true));
+    }
+    if let Some(auth) = &world
+        .surface_config
+        .source_auth
+    {
+        access_point.insert(
+            "caller_authentication".to_string(),
+            serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] }),
+        );
+    }
+    payload
 }
 
 fn record_caller_response(
@@ -594,7 +705,7 @@ async fn fetch_created_surface(
     fetch_surface_by_id(world, &surface_id).await;
 }
 
-fn build_request_body(protocol: &str) -> serde_json::Value {
+pub(crate) fn build_request_body(protocol: &str) -> serde_json::Value {
     match protocol {
         "a2a" => build_a2a_message_send_body("hello"),
         "mcp" => build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha")),
@@ -614,6 +725,7 @@ async fn send_json_request_to_path_and_record(
     let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path_and_query);
 
     world.sent_body = Some(body.clone());
+    world.sent_headers = headers.clone();
 
     let client = reqwest::Client::new();
     let response = post_json(&client, &url, &body, &headers)
@@ -998,6 +1110,7 @@ async fn operator_attempts_create_mcp_transit_point_with_header_metadata_mapping
             "protocol": "mcp",
             "listen_path": "/transit/tr1",
             "require_transit_token": false,
+            "allow_unauthenticated_callers": true,
             "header_metadata_mapping": {
                 "extension_uri": "https://fabric.affinidi.io/extensions/header-metadata/v1",
                 "headers": [{
@@ -1327,6 +1440,204 @@ pub async fn update_transit_point_listen_path(
     record_admin_response(world, response);
 }
 
+#[when(expr = "the operator saves Transit Point {string} with no way to authenticate its callers")]
+async fn operator_saves_a_transit_point_that_authenticates_no_caller(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "saving a Transit Point that authenticates no caller");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before saving the Transit Point: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before saving the Transit Point should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    let point = payload["transit"]["points"]
+        .as_array_mut()
+        .and_then(|points| {
+            points
+                .iter_mut()
+                .find(|point| point["alias"] == transit_point.as_str())
+        })
+        .unwrap_or_else(|| panic!("surface '{surface_id}' has no Transit Point '{transit_point}'"));
+    point["require_transit_token"] = serde_json::json!(false);
+    point["allow_unauthenticated_callers"] = serde_json::json!(false);
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("save the Transit Point through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
+#[when(expr = "the operator sets the surface's transit token lifetime to {int} seconds")]
+async fn operator_sets_the_transit_token_lifetime(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    set_transit_token_lifetime(world, lifetime_secs).await;
+}
+
+/// Save `lifetime_secs` as the surface's transit token lifetime through the
+/// admin API, and record its answer.
+pub(crate) async fn set_transit_token_lifetime(
+    world: &mut SurfaceWorld,
+    lifetime_secs: u64,
+) {
+    set_surface_transit_field(world, "transit_token_lifetime_secs", serde_json::json!(lifetime_secs)).await;
+}
+
+#[when(expr = "the operator sets the surface's transit token mode to {string}")]
+async fn operator_sets_the_transit_token_mode(
+    world: &mut SurfaceWorld,
+    mode: String,
+) {
+    set_surface_transit_field(world, "transit_token_mode", serde_json::json!(mode)).await;
+}
+
+/// Save the surface with `transit.<field>` set to `value` through the admin
+/// API, and record its answer.
+async fn set_surface_transit_field(
+    world: &mut SurfaceWorld,
+    field: &str,
+    value: serde_json::Value,
+) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "setting a transit setting");
+    let client = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist");
+    let current = client
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before setting transit.{field}: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before setting transit.{field} should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["transit"][field] = value;
+    let response = client
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("set transit.{field} through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
+#[when(
+    expr = "the operator asks Transit Point {string} for grants of credential provider {string} by external consent"
+)]
+async fn operator_asks_a_transit_point_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: String,
+    provider: String,
+) {
+    let (surface_id, payload) = surface_asking_for_external_consent(world, &alias, &provider).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .update_surface_recorded(&surface_id, &payload)
+        .await
+        .unwrap_or_else(|error| panic!("ask a Transit Point for external consent through admin API: {error}"));
+
+    record_admin_response(world, response);
+}
+
+#[when(
+    expr = "the operator creates a copy of the surface whose Transit Point {string} asks credential provider {string} for grants by external consent"
+)]
+async fn operator_creates_a_surface_asking_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: String,
+    provider: String,
+) {
+    let (surface_id, mut payload) = surface_asking_for_external_consent(world, &alias, &provider).await;
+    payload["surface_id"] = serde_json::json!(format!("{surface_id}-external-consent"));
+    payload["name"] = serde_json::json!("external consent copy");
+    let route = payload["access_point"]["route"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    payload["access_point"]["route"] = serde_json::json!(format!("{route}-external-consent"));
+    for point in payload["transit"]["points"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(listen_path) = point["listen_path"]
+            .as_str()
+            .map(str::to_string)
+        {
+            point["listen_path"] = serde_json::json!(format!("{listen_path}-external-consent"));
+        }
+    }
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .create_surface_recorded(&payload)
+        .await
+        .unwrap_or_else(|error| panic!("create a surface asking for external consent through admin API: {error}"));
+
+    world.admin_response = Some(response);
+}
+
+/// The tracked surface, as the admin API returns it, with no surface-level
+/// `outbound_credentials` and Transit Point `alias` binding `provider` by
+/// external consent for its owner.
+async fn surface_asking_for_external_consent(
+    world: &mut SurfaceWorld,
+    alias: &str,
+    provider: &str,
+) -> (String, serde_json::Value) {
+    ensure_admin_session(world).await;
+    let surface_id = get_tracked_surface_id(world, "asking a Transit Point for external consent");
+    let current = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .get_surface_recorded(&surface_id)
+        .await
+        .unwrap_or_else(|error| panic!("fetch surface before asking for external consent: {error}"));
+    assert_eq!(
+        current.status, 200,
+        "fetch surface before asking for external consent should succeed, got status {} body {}",
+        current.status, current.body
+    );
+
+    let mut payload = current.body;
+    payload["outbound_credentials"] = serde_json::json!([]);
+    let point = payload["transit"]["points"]
+        .as_array_mut()
+        .and_then(|points| {
+            points
+                .iter_mut()
+                .find(|point| point["alias"] == alias)
+        })
+        .unwrap_or_else(|| panic!("Transit Point {alias} must exist"));
+    point["transit_credentials"] = serde_json::json!({
+        "credential_provider_id": provider,
+        "consent_mode": "external",
+        "subject": "owner"
+    });
+    (surface_id, payload)
+}
+
 pub(crate) async fn delete_surface(world: &mut SurfaceWorld) {
     ensure_admin_session(world).await;
     let surface_id = get_tracked_surface_id(world, "deleting the surface");
@@ -1353,6 +1664,58 @@ async fn valid_surface_create_request_submitted(
     route: String,
 ) {
     create_valid_surface_for_route(world, &route).await;
+}
+
+pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "marking the surface public");
+    payload["access_point"]["public"] = serde_json::json!(true);
+
+    update_created_surface(world, payload, "marking the surface public").await;
+}
+
+/// Save the scenario's source authentication on the created surface.
+pub(crate) async fn add_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "adding source authentication");
+    let auth = world
+        .surface_config
+        .source_auth
+        .as_ref()
+        .expect("the scenario's source authentication must be configured");
+    payload["access_point"]["caller_authentication"] =
+        serde_json::json!({ "methods": [config::source_auth::caller_authentication_method_json(auth)] });
+
+    update_created_surface(world, payload, "adding source authentication").await;
+}
+
+pub(crate) async fn remove_source_authentication(world: &mut SurfaceWorld) {
+    let mut payload = get_current_admin_surface_body(world, "removing source authentication");
+    payload["access_point"]
+        .as_object_mut()
+        .expect("surface body must have an access_point object")
+        .remove("caller_authentication");
+
+    update_created_surface(world, payload, "removing source authentication").await;
+}
+
+pub(crate) async fn add_complete_variant_without_source_authentication(
+    world: &mut SurfaceWorld,
+    alias: &str,
+) {
+    let mut payload = get_current_admin_surface_body(world, "adding a variant");
+    let target_endpoint = payload["target"]["endpoint"].clone();
+    payload["variants"] = serde_json::json!([{
+        "id": format!("variant-{alias}"),
+        "alias": alias,
+        "name": alias,
+        "enabled": true,
+        "overrides": {
+            "complete": true,
+            "access_point": {},
+            "target": { "endpoint": target_endpoint }
+        }
+    }]);
+
+    update_created_surface(world, payload, "adding a variant").await;
 }
 
 #[when(expr = "the operator attempts to create an A2A surface for route {string} that accepts no A2A versions")]
@@ -1611,12 +1974,32 @@ fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
         .expect("jwt source_auth must be configured")
 }
 
-fn create_expired_jwt_for_issuer(issuer: String) -> String {
+/// The audience a caller's token names: the resource of the surface's route
+/// when it publishes protected resource metadata, so a test token fails only
+/// for the flaw it was made with, and none otherwise.
+fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
+    match world
+        .surface_config
+        .protected_resource
+    {
+        Some(_) => serde_json::json!(format!(
+            "{}{}",
+            crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+            world.surface_config.route
+        )),
+        None => serde_json::json!([]),
+    }
+}
+
+fn create_expired_jwt_for_issuer(
+    issuer: String,
+    audience: serde_json::Value,
+) -> String {
     let now = jwt::now_secs();
     let claims = serde_json::json!({
         "iss": issuer,
         "sub": "test-user",
-        "aud": [],
+        "aud": audience,
         "iat": now - 7200,
         "exp": now - 3600
     });
@@ -1705,8 +2088,16 @@ async fn send_request_with_bearer_token(
 #[when("the caller sends a request to the surface with an expired token")]
 async fn request_with_expired_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
     send_request_with_bearer_token(world, token).await;
+}
+
+#[when("the caller sends a request to the surface with a valid token and a valid API key")]
+async fn request_with_valid_token_and_valid_api_key(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let api_key = build_valid_api_key_source_auth_header(world);
+    send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), api_key]).await;
 }
 
 #[when("the caller sends a request to the surface with a malformed token")]
@@ -1736,37 +2127,37 @@ async fn request_without_api_key(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;
 }
 
+/// The API key method among the surface's source authentication methods:
+/// its header and the key the fixture stores as valid.
+fn api_key_source_auth(world: &SurfaceWorld) -> (String, String) {
+    world
+        .surface_config
+        .source_auth
+        .iter()
+        .chain(
+            &world
+                .surface_config
+                .additional_source_auth,
+        )
+        .find_map(|auth| match auth {
+            SurfaceSourceAuthConfig::ApiKey(config) => Some((config.header_name.clone(), config.valid_key.clone())),
+            SurfaceSourceAuthConfig::ApiKeyProvider(config) => {
+                Some((config.header_name.clone(), config.valid_key.clone()))
+            }
+            SurfaceSourceAuthConfig::JwtBearer(_) => None,
+        })
+        .expect("api key source_auth must be configured")
+}
+
 fn build_api_key_source_auth_header(
     world: &SurfaceWorld,
     key_value: String,
 ) -> (String, String) {
-    let header_name = world
-        .surface_config
-        .source_auth
-        .as_ref()
-        .map(|auth| match auth {
-            SurfaceSourceAuthConfig::ApiKey(config) => config.header_name.clone(),
-            SurfaceSourceAuthConfig::ApiKeyProvider(config) => config.header_name.clone(),
-            SurfaceSourceAuthConfig::JwtBearer(_) => panic!("api key source_auth must be configured"),
-        })
-        .expect("api key source_auth must be configured");
-
-    (header_name, key_value)
+    (api_key_source_auth(world).0, key_value)
 }
 
 fn build_valid_api_key_source_auth_header(world: &SurfaceWorld) -> (String, String) {
-    let (header_name, valid_key) = world
-        .surface_config
-        .source_auth
-        .as_ref()
-        .map(|auth| match auth {
-            SurfaceSourceAuthConfig::ApiKey(config) => (config.header_name.clone(), config.valid_key.clone()),
-            SurfaceSourceAuthConfig::ApiKeyProvider(config) => (config.header_name.clone(), config.valid_key.clone()),
-            SurfaceSourceAuthConfig::JwtBearer(_) => panic!("api key source_auth must be configured"),
-        })
-        .expect("api key source_auth must be configured");
-
-    (header_name, valid_key)
+    api_key_source_auth(world)
 }
 
 #[when("the caller sends a request to the surface with an invalid API key")]
@@ -1795,6 +2186,30 @@ async fn request_to_path_with_alternate_variant_api_key(
         _ => panic!("alternate variant must have an API Key source auth configured"),
     };
     send_request_to_path_and_record(world, &path, vec![(header_name, valid_key)]).await;
+}
+
+#[when("the caller fetches the protected resource metadata of the surface")]
+async fn fetch_protected_resource_metadata(world: &mut SurfaceWorld) {
+    ensure_gateway_running(world).await;
+
+    let infra = world.infra.as_ref().unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/.well-known/oauth-protected-resource{}",
+        infra.gateway_port, world.surface_config.route
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .expect("protected resource metadata request failed");
+
+    let status = resp.status().as_u16();
+    let headers = collect_headers(resp.headers());
+    let body = resp
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
 }
 
 #[when("the caller fetches the agent card")]
@@ -1827,15 +2242,31 @@ async fn fetch_agent_card_with_extra_headers(
     fetch_agent_card_with_headers(world, headers).await;
 }
 
-async fn fetch_agent_card_with_headers(
+#[when(expr = "the caller reads the surface path {string}")]
+async fn caller_reads_surface_path(
     world: &mut SurfaceWorld,
+    path: String,
+) {
+    get_path_and_record(world, &path, vec![]).await;
+}
+
+pub(crate) async fn fetch_agent_card_with_headers(
+    world: &mut SurfaceWorld,
+    headers: Vec<(String, String)>,
+) {
+    let path = format!("{}/.well-known/agent-card.json", world.surface_config.route);
+    get_path_and_record(world, &path, headers).await;
+}
+
+async fn get_path_and_record(
+    world: &mut SurfaceWorld,
+    path: &str,
     headers: Vec<(String, String)>,
 ) {
     ensure_gateway_running(world).await;
 
     let infra = world.infra.as_ref().unwrap();
-    let url =
-        format!("http://127.0.0.1:{}{}/.well-known/agent-card.json", infra.gateway_port, world.surface_config.route);
+    let url = format!("http://127.0.0.1:{}{}", infra.gateway_port, path);
 
     let mut req = reqwest::Client::new().get(&url);
     for (name, value) in &headers {
@@ -2082,7 +2513,7 @@ async fn caller_sends_modern_mcp_list_with_mirrored_method(
     send_json_request_and_record(world, body, modern_mcp_request_headers(&McpVersion::Modern, &mirrored_method)).await;
 }
 
-async fn send_mcp_request_through_transit_point(
+pub(crate) async fn send_mcp_request_through_transit_point(
     world: &mut SurfaceWorld,
     agent_name: &str,
     transit_point: &str,
@@ -2097,6 +2528,179 @@ async fn send_mcp_request_through_transit_point_path(
     agent_name: &str,
     path: &str,
     body: serde_json::Value,
+) {
+    send_mcp_request_through_transit_point_path_with_headers(world, agent_name, path, body, Vec::new()).await;
+}
+
+/// The transit token the Access Point hands the managed agent: the caller
+/// sends a request to the surface, and the copy the managed agent receives
+/// carries it.
+pub(crate) async fn transit_token_from_the_access_point(world: &mut SurfaceWorld) -> String {
+    send_request_and_record(world, Vec::new()).await;
+    let forwarded = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        .mock
+        .last_request()
+        .await
+        .expect("the managed agent must receive the caller's request");
+    forwarded
+        .headers
+        .get("x-transit-token")
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("the Access Point must hand the managed agent a transit token: {:?}", forwarded.headers)
+        })
+}
+
+/// The claims a transit token carries.
+pub(crate) fn transit_token_claims(token: &str) -> serde_json::Value {
+    use base64::Engine as _;
+
+    let payload = token
+        .split('.')
+        .nth(1)
+        .expect("a transit token is a JWT");
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .expect("a transit token's claims are base64url"),
+    )
+    .expect("a transit token's claims are JSON")
+}
+
+/// `token` with the claims in `changes` replaced, signed with the gateway's
+/// transit token key and naming it, as the gateway itself would issue it.
+pub(crate) fn reissued_transit_token(
+    world: &SurfaceWorld,
+    token: &str,
+    changes: serde_json::Value,
+) -> String {
+    let key_file = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        ._temp_dir
+        .path()
+        .join("_storage/vc_keys/transit_token_key.json");
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&key_file).expect("read the gateway's transit token key"))
+            .expect("the transit token key file is JSON");
+    let secret = hex::decode(
+        stored["key"]
+            .as_str()
+            .expect("the transit token key file names its key"),
+    )
+    .expect("the transit token key is hexadecimal");
+    let mut claims = transit_token_claims(token);
+    for (name, value) in changes
+        .as_object()
+        .expect("claim changes are a JSON object")
+    {
+        claims[name] = value.clone();
+    }
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    header.kid = stored["kid"]
+        .as_str()
+        .map(str::to_string);
+    jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_secret(&secret))
+        .expect("sign the transit token")
+}
+
+/// The headers a managed agent's Transit Point call carries: its transit token,
+/// and `extra`.
+fn with_transit_token(
+    world: &SurfaceWorld,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let token = world
+        .transit_token
+        .clone()
+        .expect("the managed agent must hold a transit token");
+    std::iter::once(("x-transit-token".to_string(), token))
+        .chain(extra)
+        .collect()
+}
+
+#[when(expr = "managed agent {string} asks for available tools through Transit Point {string} with its transit token")]
+async fn managed_agent_asks_for_tools_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    ask_for_tools_through_transit_point_with_its_token(world, &agent_name, &transit_point).await;
+}
+
+/// Managed agent `agent_name` asks for available tools through
+/// `transit_point` with the transit token it holds.
+pub(crate) async fn ask_for_tools_through_transit_point_with_its_token(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+) {
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    let headers = with_transit_token(world, Vec::new());
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        headers,
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} invokes MCP tool {string} through Transit Point {string} with its transit token and header {string} set to {string}"
+)]
+async fn managed_agent_invokes_tool_through_transit_point_with_its_token_and_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    tool_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "limit": 3 }));
+    let headers = with_transit_token(world, vec![(header, value)]);
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        headers,
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with header {string} set to {string}"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        vec![(header, value)],
+    )
+    .await;
+}
+
+async fn send_mcp_request_through_transit_point_path_with_headers(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    path: &str,
+    body: serde_json::Value,
+    headers: Vec<(String, String)>,
 ) {
     world
         .actors
@@ -2116,9 +2720,13 @@ async fn send_mcp_request_through_transit_point_path(
     let url = format!("http://127.0.0.1:{}{}", outbound_port, path);
 
     world.sent_body = Some(body.clone());
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&url)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .json(&body)
         .send()
         .await
@@ -2255,9 +2863,9 @@ async fn managed_agent_sends_a2a_request_through_transit_point_without_header(
 ) {
     let configured_headers = world
         .surface_config
-        .transit_point
-        .as_ref()
-        .filter(|configured| configured.alias == transit_point)
+        .transit_points
+        .iter()
+        .find(|configured| configured.alias == transit_point)
         .map(|configured| {
             configured
                 .header_metadata_mapping
@@ -2321,7 +2929,7 @@ async fn caller_asks_mcp_surface_for_available_tools_without_token(world: &mut S
 #[when("the caller asks the MCP surface for available tools with an expired token")]
 async fn caller_asks_mcp_surface_for_available_tools_with_expired_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let token = create_expired_jwt_for_issuer(get_jwt_source_auth_issuer(world), caller_token_audience(world));
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],
@@ -2353,6 +2961,53 @@ async fn caller_asks_mcp_surface_for_available_tools_with_tampered_token(world: 
 async fn caller_asks_mcp_surface_for_available_tools_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
     let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a token issued for the surface")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface(world: &mut SurfaceWorld) {
+    let audience = caller_token_audience(world);
+    ask_mcp_surface_for_available_tools_with_audience(world, audience).await;
+}
+
+#[when(
+    expr = "caller {string} asks the MCP surface for available tools with a token issued for the surface containing group {string}"
+)]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_surface_containing_group(
+    world: &mut SurfaceWorld,
+    caller: String,
+    group: String,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_subject(
+        get_jwt_source_auth_issuer(world),
+        &caller,
+        serde_json::json!({ "aud": caller_token_audience(world), "groups": [group] }),
+    );
+    ask_mcp_surface_for_available_tools_with_headers(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {}", token))],
+    )
+    .await;
+}
+
+#[when("the caller asks the MCP surface for available tools with a token issued for another resource")]
+async fn caller_asks_mcp_surface_for_available_tools_with_token_for_another_resource(world: &mut SurfaceWorld) {
+    let resource =
+        format!("{}/elsewhere", crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    ask_mcp_surface_for_available_tools_with_audience(world, serde_json::json!(resource)).await;
+}
+
+async fn ask_mcp_surface_for_available_tools_with_audience(
+    world: &mut SurfaceWorld,
+    audience: serde_json::Value,
+) {
+    ensure_gateway_running(world).await;
+    let token = create_valid_jwt_for_issuer_with_audience(get_jwt_source_auth_issuer(world), audience);
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],
@@ -2432,6 +3087,22 @@ async fn mcp_tool_call_with_city_argument_and_valid_api_key(
 ) {
     let header = build_valid_api_key_source_auth_header(world);
     let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
+#[when(expr = "the caller invokes the MCP tool {string} for city {string} once without and once with a valid API key")]
+async fn mcp_tool_call_with_city_argument_without_then_with_valid_api_key(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+) {
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({ "city": city }));
+    send_json_request_and_record(world, body.clone(), vec![]).await;
+    world.mcp_tool_response_without_target_credential = world
+        .caller_response
+        .as_ref()
+        .map(|response| response.body.clone());
+    let header = build_valid_api_key_source_auth_header(world);
     send_json_request_and_record(world, body, vec![header]).await;
 }
 
@@ -3116,7 +3787,10 @@ async fn caller_asks_mcp_surface_for_available_tools_with_named_valid_token_cont
 #[when(expr = "the caller asks the MCP surface for available tools with a token from an untrusted issuer")]
 async fn caller_asks_mcp_surface_for_available_tools_with_untrusted_issuer(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_valid_jwt_for_issuer("https://untrusted-issuer.example.test".to_string());
+    let token = create_valid_jwt_for_issuer_with_audience(
+        "https://untrusted-issuer.example.test".to_string(),
+        caller_token_audience(world),
+    );
     ask_mcp_surface_for_available_tools_with_headers(
         world,
         vec![("authorization".to_string(), format!("Bearer {}", token))],

@@ -133,6 +133,7 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
                 variant="primary"
                 size="md"
                 className="shadow-sm"
+                data-testid="authorities-add-button"
                 onClick={() => (onAdd ? onAdd() : navigate('/authorities/new'))}
                 iconStart={<i className="fas fa-plus fa-sm me-2" aria-hidden="true" />}
               >
@@ -165,7 +166,7 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
                   </thead>
                   <tbody>
                     {filteredAuthorities.map(authority => (
-                      <tr key={authority.id}>
+                      <tr key={authority.id} data-testid={`authorities-row-${authority.id}`}>
                         <td>
                           <div>{authority.name}</div>
                           {authority.description && (
@@ -191,6 +192,7 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
                             <AppButton
                               variant="outline-primary"
                               size="sm"
+                              data-testid={`authorities-edit-button-${authority.id}`}
                               aria-label={`Edit authority ${authority.name}`}
                               onClick={() =>
                                 onEdit
@@ -200,7 +202,10 @@ const AuthoritiesPage: React.FC<AuthoritiesPageProps> = ({
                             >
                               <i className="fas fa-edit" aria-hidden="true"></i>
                             </AppButton>
-                            <DeleteButton onDelete={() => handleDelete(authority.id)} />
+                            <DeleteButton
+                              data-testid={`authorities-delete-button-${authority.id}`}
+                              onDelete={() => handleDelete(authority.id)}
+                            />
                           </div>
                         </td>
                       </tr>

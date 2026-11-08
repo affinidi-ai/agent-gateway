@@ -246,6 +246,44 @@ pub fn validate_response<'response>(
     Ok(None)
 }
 
+/// The answer to a request whose upstream refused it for a missing session:
+/// `-32022` listing the session revisions, with the request's id.
+///
+/// An upstream that serves only session revisions refuses a request without
+/// `Mcp-Session-Id` before reading its id, with HTTP 400 and `-32000`, `"id":
+/// null` from the TypeScript SDK or `-32600`, `"id": "server-error"` from the
+/// Python SDK, so the request's revision is what it refused. Any other error
+/// for another id, such as a parse error, a crashed handler or a rate limit,
+/// stays invalid, so it is not mistaken for a session-only upstream.
+pub fn session_only_refusal(
+    request: &ValidatedModernMessage,
+    status: StatusCode,
+    response: &Value,
+) -> Option<Value> {
+    let expected_id = request_id(request).ok()?;
+    let envelope = response.as_object()?;
+    if status != StatusCode::BAD_REQUEST
+        || envelope
+            .get("jsonrpc")
+            .and_then(Value::as_str)
+            != Some("2.0")
+        || envelope.contains_key("method")
+        || envelope.contains_key("result")
+        || !envelope
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64)
+            .is_some_and(|code| [-32000, i64::from(error_codes::INVALID_REQUEST)].contains(&code))
+        || envelope
+            .get("id")
+            .is_none_or(|id| id == expected_id)
+    {
+        return None;
+    }
+    let refusal = McpRequestValidationError::legacy_only(Some(expected_id.clone()));
+    Some(super::errors::create_mcp_error_envelope(refusal.id, refusal.code, &refusal.message, refusal.data))
+}
+
 pub fn complete_response(
     request: &ValidatedModernMessage,
     mut fields: Map<String, Value>,
@@ -522,7 +560,7 @@ mod tests {
             learned_versions: None,
         };
         let mut response = json!({"jsonrpc": "2.0", "id": "request", "result": {
-            "resultType": "complete", "supportedVersions": [crate::mcp::MCP_MODERN_VERSION, "2025-11-25", crate::mcp::MCP_LEGACY_VERSION],
+            "resultType": "complete", "supportedVersions": [crate::mcp::MCP_MODERN_VERSION, "2025-11-25", "2099-01-01", crate::mcp::MCP_LEGACY_VERSION],
             "capabilities": {"tools": {"listChanged": true, "vendorField": [1, null]}, "resources": {"subscribe": true, "listChanged": true},
                 "prompts": {}, "logging": {}, "experimental": {"feature": {}},
                 "extensions": {"com.example/reviewed": {"opaque": [false, 5]}, "com.example/unavailable": {}}},
@@ -534,7 +572,7 @@ mod tests {
         assert_eq!(constrain_forwarded_discovery(&request, &mut response, &support), Ok(true));
         assert_eq!(
             response["result"]["supportedVersions"],
-            json!([crate::mcp::MCP_MODERN_VERSION, crate::mcp::MCP_LEGACY_VERSION])
+            json!([crate::mcp::MCP_MODERN_VERSION, "2025-11-25", crate::mcp::MCP_LEGACY_VERSION])
         );
         assert_eq!(
             response["result"]["capabilities"],
@@ -617,10 +655,7 @@ mod tests {
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let response = owned_discovery_response(&request, versions, "Owned tools", "1.0").unwrap();
         assert_eq!(response["result"]["resultType"], "complete");
-        assert_eq!(
-            response["result"]["supportedVersions"],
-            json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-        );
+        assert_eq!(response["result"]["supportedVersions"], json!(versions.supported_versions()));
         assert_eq!(response["result"]["capabilities"], json!({"tools": {"listChanged": true}}));
         assert_eq!(response["result"]["ttlMs"], 0);
         assert_eq!(response["result"]["cacheScope"], "private");
@@ -640,7 +675,9 @@ mod tests {
         assert_eq!(error.code, error_codes::UNSUPPORTED_PROTOCOL_VERSION);
         assert_eq!(
             error.data,
-            Some(json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": [crate::mcp::MCP_LEGACY_VERSION]}))
+            Some(
+                json!({"requested": crate::mcp::MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
+            )
         );
         assert_eq!(
             owned_discovery_response(&wrong_method, versions, "Owned tools", "1.0")
@@ -919,5 +956,49 @@ mod tests {
         request.kind = McpMessageKind::Notification;
         request.id = None;
         assert_eq!(complete_response(&request, Map::new()), Err(ModernResponseError::InvalidRequest));
+    }
+
+    #[test]
+    fn a_missing_session_refusal_for_another_id_becomes_a_session_only_refusal() {
+        let mut request = request("server/discover", json!({}));
+        for (id, code) in [(json!(null), -32000), (json!("server-error"), -32600), (json!(7), -32600)] {
+            let error = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": "Missing session ID"}});
+            assert_eq!(
+                validate_response(&request, &error, ResultSource::ModernServer),
+                Err(ModernResponseError::IdMismatch)
+            );
+            let refusal = session_only_refusal(&request, StatusCode::BAD_REQUEST, &error).expect("{id}");
+            assert_eq!(validate_response(&request, &refusal, ResultSource::ModernServer), Ok(None));
+            assert_eq!(refusal["id"], json!("request"));
+            assert_eq!(refusal["error"]["code"], crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+            assert_eq!(refusal["error"]["data"]["requested"], crate::mcp::MCP_MODERN_VERSION);
+            assert_eq!(refusal["error"]["data"]["supported"], json!(crate::mcp::request_validation::SESSION_VERSIONS));
+        }
+        for kept in [
+            json!({"jsonrpc": "2.0", "id": "request", "error": {"code": -32600, "message": "own"}}),
+            json!({"jsonrpc": "2.0", "error": {"code": -32600, "message": "no id"}}),
+            json!({"jsonrpc": "2.0", "id": null, "result": {"resultType": "complete"}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": "not an object"}),
+            json!({"jsonrpc": "1.0", "id": null, "error": {"code": -32600, "message": "old"}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32603, "message": "Internal error"}}),
+            json!({"jsonrpc": "2.0", "id": null, "error": {"message": "no code"}}),
+        ] {
+            assert_eq!(session_only_refusal(&request, StatusCode::BAD_REQUEST, &kept), None, "{kept}");
+        }
+        let error = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Missing session ID"}});
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(session_only_refusal(&request, status, &error), None, "{status}");
+        }
+        request.kind = McpMessageKind::Notification;
+        request.id = None;
+        assert_eq!(session_only_refusal(&request, StatusCode::BAD_REQUEST, &error), None);
     }
 }

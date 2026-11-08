@@ -1,5 +1,5 @@
 use super::helpers;
-use helpers::{GatewayHarness, MockServer};
+use helpers::{GatewayHarness, MockServer, write_api_key_secret};
 use serde_json::json;
 
 const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
@@ -9,35 +9,6 @@ const IDENTITY_BINDING_URI: &str = "https://fabric.affinidi.io/extensions/agent-
 const A2A_PROXY_PARITY_ID: &str = "entra-parity-proxy";
 const PARITY_ENTRA_AGENT_ID: &str = "agent-123";
 const PARITY_CLIENT_TENANT_ID: &str = "tenant-456";
-
-/// Returns true if `v` is a valid Verifiable Presentation — either a compact
-/// JWT string (three base64url segments), a JSON string containing a VP object,
-/// or a direct JSON-LD VP object with a `proof`.
-fn write_api_key_secret(
-    storage_path: &str,
-    secret_id: &str,
-    value: &str,
-) {
-    use crate::secrets::SecretsStore;
-
-    let store = crate::secrets::FilesystemSecretsStore::new(storage_path).expect("create secrets store");
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            store
-                .create(crate::secrets::CreateSecretRequest {
-                    tenant_id: None,
-                    name: "Slice 10 source API key".to_string(),
-                    secret_id: secret_id.to_string(),
-                    description: Some("component-test source auth secret".to_string()),
-                    value: value.to_string(),
-                    secret_type: "ApiKey".to_string(),
-                    tags: vec!["component-test".to_string()],
-                })
-                .await
-                .expect("create source auth secret");
-        })
-    });
-}
 
 fn write_entra_a2a_proxy_fixture(temp_dir: &std::path::Path) {
     let proxy_dir = temp_dir.join("a2a_proxies");
@@ -117,6 +88,8 @@ fn configure_header_metadata_inbound_identity_surface(
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            protected_resource: None,
+            on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
@@ -127,7 +100,7 @@ fn configure_header_metadata_inbound_identity_surface(
     }
 }
 
-fn a2a_request() -> serde_json::Value {
+pub(super) fn a2a_request() -> serde_json::Value {
     json!({
         "jsonrpc": "2.0",
         "method": "message/send",
@@ -167,7 +140,7 @@ fn find_did(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
+pub(super) fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
     use base64::Engine as _;
 
     let payload = jwt.split('.').nth(1)?;
@@ -204,7 +177,7 @@ fn agent_card_credential_did(card: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn forwarded_binding_did(h: &GatewayHarness) -> String {
+pub(super) fn forwarded_binding_did(h: &GatewayHarness) -> String {
     let received = h
         .mock
         .last_request_rx
@@ -2135,17 +2108,24 @@ async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
 /// external caller even though the same credential mode backs managed identities.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_slot_api_key_identity_is_recorded_as_external_caller() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "atgk_e2e0000000000000000000000000004" });
     let mut base_dir = std::path::PathBuf::new();
-    let h = GatewayHarness::start(|dir, gw_config, _| {
+    let h = GatewayHarness::start(|dir, gw_config, bootstrap| {
         base_dir = dir.to_path_buf();
         write_caller_verification_policies(dir);
-        gw_config.surfaces = vec![inbound_identity_surface(inbound, UNVERIFIED_CALLER_POLICY_ID)];
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![inbound_api_key_identity_surface(UNVERIFIED_CALLER_POLICY_ID)];
     })
     .await;
 
     let resp = reqwest::Client::new()
         .post(&h.gateway_url)
+        .header("x-api-key", INBOUND_CALLER_KEY)
         .json(&a2a_request())
         .send()
         .await
@@ -2162,7 +2142,12 @@ async fn inbound_slot_api_key_identity_is_recorded_as_external_caller() {
 const STATIC_CALLER_DID: &str = "did:web:static-caller.example";
 const UNVERIFIED_CALLER_POLICY_ID: &str = "unverified-caller-policy";
 const VERIFIED_CALLER_POLICY_ID: &str = "verified-caller-policy";
+const UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID: &str = "unverified-extension-identity-policy";
 const SOURCE_AUTH_CALLER_POLICY_ID: &str = "source-auth-caller-policy";
+const AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID: &str = "agent-did-is-resolved-caller-policy";
+const AGENT_DID_IS_ASSERTED_POLICY_ID: &str = "agent-did-is-asserted-policy";
+const AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID: &str = "agent-did-absent-on-failed-auth-policy";
+const ASSERTED_CALLER_DID: &str = "did:web:asserted.example";
 
 fn write_caller_verification_policies(temp_dir: &std::path::Path) {
     let policies = [
@@ -2192,6 +2177,18 @@ allow if input.agent.did_verified == true
 "#,
         ),
         (
+            UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    startswith(input.extension_identity.did, "did:webvh:")
+    input.extension_identity.verification == "unverified"
+}
+"#,
+        ),
+        (
             SOURCE_AUTH_CALLER_POLICY_ID,
             r#"package surface.policy
 
@@ -2202,6 +2199,45 @@ allow if {
     input.agent.did_verified == true
     input.agent.did_verification == "source_auth"
     input.extension_identity.verification == "source_auth"
+}
+"#,
+        ),
+        (
+            AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    startswith(input.agent.did, "did:webvh:")
+    input.agent.did == input.extension_identity.did
+    input.agent.did_verification == input.extension_identity.verification
+}
+"#,
+        ),
+        (
+            AGENT_DID_IS_ASSERTED_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.agent.did == "did:web:asserted.example"
+    input.agent.did != input.extension_identity.did
+}
+"#,
+        ),
+        (
+            AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.source_auth.method == "failed"
+    input.agent.did_verified == false
+    not input.agent.did
+    not input.extension_identity
 }
 "#,
         ),
@@ -2246,6 +2282,61 @@ fn inbound_identity_surface(
         require_agent_context: false,
     });
     surface
+}
+
+const INBOUND_CALLER_KEY_SECRET: &str = "inbound-caller-key";
+const INBOUND_CALLER_KEY: &str = "inbound-caller-key-value";
+
+/// An inbound `from_api_key` surface whose callers authenticate with the
+/// plain API Key in [`INBOUND_CALLER_KEY_SECRET`].
+fn inbound_api_key_identity_surface(policy_id: &str) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = inbound_identity_surface(json!({ "type": "from_api_key" }), policy_id);
+    surface
+        .access_point
+        .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+        protected_resource: None,
+        methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
+            secret_id: INBOUND_CALLER_KEY_SECRET.to_string(),
+        })],
+        on_failure: Default::default(),
+    });
+    surface
+}
+
+async fn send_api_key_identity_request(policy_id: &'static str) -> (reqwest::StatusCode, usize) {
+    send_api_key_identity_body(policy_id, a2a_request()).await
+}
+
+async fn send_api_key_identity_body(
+    policy_id: &'static str,
+    body: serde_json::Value,
+) -> (reqwest::StatusCode, usize) {
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![inbound_api_key_identity_surface(policy_id)];
+    })
+    .await;
+    let status = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("x-api-key", INBOUND_CALLER_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("inbound request failed")
+        .status();
+    let forwarded = h
+        .mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    (status, forwarded)
 }
 
 async fn send_configured_identity_request(
@@ -2296,14 +2387,228 @@ async fn inbound_static_identity_does_not_satisfy_a_verified_caller_policy() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_from_api_key_identity_reaches_policy_as_unverified() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "atgk_e2e0000000000000000000000000002" });
-    let (status, forwarded) = send_configured_identity_request(inbound.clone(), UNVERIFIED_CALLER_POLICY_ID).await;
-    assert_eq!(status, 200, "policy must see the API-key-derived DID as unverified");
+    let (status, forwarded) = send_api_key_identity_request(UNVERIFIED_CALLER_POLICY_ID).await;
+    assert_eq!(status, 200, "policy must see the plain-API-key-derived DID as unverified");
     assert_eq!(forwarded, 1);
 
-    let (status, forwarded) = send_configured_identity_request(inbound, VERIFIED_CALLER_POLICY_ID).await;
-    assert_eq!(status, 403, "an API-key-derived DID must not count as verified");
+    let (status, forwarded) = send_api_key_identity_request(VERIFIED_CALLER_POLICY_ID).await;
+    assert_eq!(status, 403, "a plain-API-key-derived DID must not count as verified");
     assert_eq!(forwarded, 0);
+}
+
+/// A caller that presents a valid API key and a verified identity VP is still
+/// identified by its key: `input.extension_identity` is the key's unverified
+/// DID, not the VP holder's `vp_unanchored` one.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_identity_wins_over_a_body_presentation() {
+    let signed = crate::identity::test_helpers::signed_agent_presentation().await;
+    let credential_uri = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+    let mut body = a2a_request();
+    body["params"]["message"]["extensions"] = json!([credential_uri]);
+    body["params"]["message"]["metadata"] = json!({
+        credential_uri: { "did": signed.holder_did, "verifiablePresentation": signed.presentation.to_string() }
+    });
+
+    let (status, forwarded) = send_api_key_identity_body(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID, body.clone()).await;
+    assert_eq!(status, 200, "policy must see the key's unverified DID, not the presentation's");
+    assert_eq!(forwarded, 1);
+
+    let (status, forwarded) = send_api_key_identity_body(VERIFIED_CALLER_POLICY_ID, body).await;
+    assert_eq!(status, 403, "the verified presentation must not supply the caller identity");
+    assert_eq!(forwarded, 0);
+}
+
+fn asserted_caller_did_body() -> serde_json::Value {
+    let tr_uri = crate::config::TRUST_REGISTRY_EXTENSION;
+    let mut body = a2a_request();
+    body["params"]["message"]["extensions"] = json!([tr_uri]);
+    body["params"]["message"]["metadata"] = json!({ tr_uri: { "agent_did": ASSERTED_CALLER_DID } });
+    body
+}
+
+async fn send_asserted_caller_did(
+    surface: crate::config::agent_surface::AgentSurface,
+    api_key: &'static str,
+) -> (reqwest::StatusCode, usize) {
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+    let status = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("x-api-key", api_key)
+        .json(&asserted_caller_did_body())
+        .send()
+        .await
+        .expect("inbound request failed")
+        .status();
+    let forwarded = h
+        .mock
+        .request_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    (status, forwarded)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_agent_did_is_the_key_did_not_a_body_asserted_one() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_api_key_identity_surface(AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID),
+        INBOUND_CALLER_KEY,
+    )
+    .await;
+    assert_eq!(status, 200, "surface policy must see the key's DID as input.agent.did");
+    assert_eq!(forwarded, 1);
+
+    let mut surface = inbound_api_key_identity_surface(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID);
+    surface
+        .access_point
+        .inbound_policy = Some(crate::config::agent_surface::PolicyRef {
+        policy_definition_id: AGENT_DID_IS_RESOLVED_CALLER_POLICY_ID.to_string(),
+        require_agent_context: false,
+    });
+    let (status, forwarded) = send_asserted_caller_did(surface, INBOUND_CALLER_KEY).await;
+    assert_eq!(status, 200, "access point policy must see the key's DID as input.agent.did");
+    assert_eq!(forwarded, 1);
+
+    let (status, forwarded) =
+        send_asserted_caller_did(inbound_api_key_identity_surface(AGENT_DID_IS_ASSERTED_POLICY_ID), INBOUND_CALLER_KEY)
+            .await;
+    assert_eq!(status, 403, "the body-asserted DID must not reach policy");
+    assert_eq!(forwarded, 0);
+}
+
+/// A self gateway whose enforced policy denies a request whose
+/// `input.agent.did` is [`ASSERTED_CALLER_DID`].
+fn write_self_gateway_denying_asserted_did(gateways_dir: &str) {
+    use crate::gateways::types::{Gateway, GatewayCreationType, GatewayOpaPolicyConfig, GatewayStatus, GatewayType};
+    let gateway = Gateway {
+        id: "self".into(),
+        tenant_id: None,
+        name: "self".into(),
+        description: String::new(),
+        did: "did:example:self".into(),
+        issuer_did: None,
+        issuer_did_source: None,
+        trusted_issuer_dids: Vec::new(),
+        gateway_type: GatewayType::SelfGateway,
+        status: GatewayStatus::Active,
+        creation_type: GatewayCreationType::User,
+        role: crate::gateways::types::GatewayRole::Peer,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        exposed_channels: Vec::new(),
+        exposure_mode: None,
+        opa_policy_config: Some(GatewayOpaPolicyConfig {
+            enabled: true,
+            policy: format!(
+                "package gateway.policy\n\ndefault allow := false\n\nallow if not asserted\n\nasserted if input.agent.did == \"{ASSERTED_CALLER_DID}\"\n"
+            ),
+            policy_definition_id: None,
+            ..Default::default()
+        }),
+    };
+    std::fs::create_dir_all(gateways_dir).expect("create gateways dir");
+    std::fs::write(
+        std::path::Path::new(gateways_dir).join("self.json"),
+        serde_json::to_string_pretty(&gateway).expect("serialize self gateway"),
+    )
+    .expect("write self gateway fixture");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_gateway_policy_never_sees_a_body_asserted_did() {
+    let mut body_did_kept = inbound_identity_surface(
+        json!({ "type": "static", "did": STATIC_CALLER_DID }),
+        AGENT_DID_IS_ASSERTED_POLICY_ID,
+    );
+    body_did_kept.surface_id = "body-did-kept".into();
+    body_did_kept.name = "body-did-kept".into();
+    body_did_kept
+        .access_point
+        .route = "/kept".into();
+    let mut api_key_identity = inbound_api_key_identity_surface(UNVERIFIED_EXTENSION_IDENTITY_POLICY_ID);
+    api_key_identity.surface_id = "api-key-identity".into();
+    let h = GatewayHarness::start(move |temp_dir, gw_config, bootstrap| {
+        helpers::configure_gateway_route_prefixes(
+            bootstrap,
+            &[("smoke", "smoke", "/smoke"), ("kept", "kept", "/kept")],
+        );
+        write_caller_verification_policies(temp_dir);
+        write_api_key_secret(
+            &bootstrap
+                .storage_paths
+                .secrets,
+            INBOUND_CALLER_KEY_SECRET,
+            INBOUND_CALLER_KEY,
+        );
+        write_self_gateway_denying_asserted_did(
+            &bootstrap
+                .storage_paths
+                .gateways,
+        );
+        gw_config.surfaces = vec![api_key_identity, body_did_kept];
+    })
+    .await;
+    let send = |url: String| async move {
+        reqwest::Client::new()
+            .post(url)
+            .header("x-api-key", INBOUND_CALLER_KEY)
+            .json(&asserted_caller_did_body())
+            .send()
+            .await
+            .expect("inbound request failed")
+            .status()
+    };
+
+    assert_eq!(
+        send(h.gateway_url.clone()).await,
+        200,
+        "gateway policy must not see the body-asserted DID on an API key surface"
+    );
+    assert_eq!(
+        send(format!("{}/kept/rpc", h.gateway_base)).await,
+        403,
+        "the same gateway policy denies the asserted DID where the body DID is kept"
+    );
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_static_identity_keeps_a_body_asserted_agent_did() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_identity_surface(
+            json!({ "type": "static", "did": STATIC_CALLER_DID }),
+            AGENT_DID_IS_ASSERTED_POLICY_ID,
+        ),
+        INBOUND_CALLER_KEY,
+    )
+    .await;
+    assert_eq!(status, 200, "a surface not identified by API key keeps the body-asserted DID");
+    assert_eq!(forwarded, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_from_api_key_failed_auth_leaves_no_agent_did() {
+    let (status, forwarded) = send_asserted_caller_did(
+        inbound_api_key_identity_surface(AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID),
+        "not-the-caller-key",
+    )
+    .await;
+    assert_eq!(status, 200, "a failed key must leave input.agent.did absent, not the body-asserted DID");
+    assert_eq!(forwarded, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2355,7 +2660,7 @@ async fn inbound_from_jwt_claim_identity_reaches_policy_as_source_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
-    let inbound = json!({ "type": "from_api_key", "api_key_id": "missing-secret-id" });
+    let inbound = json!({ "type": "from_api_key" });
     let h = GatewayHarness::start(move |temp_dir, gw_config, _| {
         write_caller_verification_policies(temp_dir);
         gw_config.surfaces = vec![inbound_identity_surface(inbound, UNVERIFIED_CALLER_POLICY_ID)];
@@ -2371,7 +2676,7 @@ async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
         .await
         .expect("inbound request failed")
         .status();
-    assert_eq!(rpc_status, 502, "an unresolvable credential identity must fail the request");
+    assert_eq!(rpc_status, 500, "an inbound from_api_key identity without API key auth must fail the request");
 
     let discovery_status = client
         .get(
@@ -2389,4 +2694,246 @@ async fn inbound_credential_identity_is_not_resolved_on_discovery_paths() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+}
+
+const STORED_INBOUND_API_KEY_SURFACE: &str = "stored-inbound-api-key";
+
+fn provider_caller_authentication(agent_id: &str) -> serde_json::Value {
+    json!({ "methods": [{
+        "type": "api_key_provider",
+        "extraction": { "source": "http_header", "field": "X-API-Key" },
+        "agent_id": agent_id
+    }] })
+}
+
+/// Store an inbound `from_api_key` surface as an older build saved it: with a
+/// key id on the inbound slot, in the base and in a disabled variant whose
+/// callers do not authenticate at all. Neither id names a secret.
+fn store_inbound_api_key_surface_with_stale_key_ids(
+    bootstrap: &crate::config::BootstrapConfig,
+    target: &str,
+) {
+    let gateway: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bootstrap.config_files.gateway).unwrap()).unwrap();
+    let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+        "surface_id": STORED_INBOUND_API_KEY_SURFACE,
+        "name": "stored-inbound-api-key",
+        "access_point": {
+            "listen_address": gateway["listeners"][0]["external_urls"][0],
+            "route": "/stored",
+            "protocol": "a2a",
+            "caller_authentication": provider_caller_authentication(STORED_INBOUND_API_KEY_SURFACE)
+        },
+        "target": { "endpoint": target },
+        "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-inbound-secret" } },
+        "variants": [{
+            "id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false,
+            "overrides": {
+                "access_point": { "caller_authentication": { "methods": [] } },
+                "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-variant-secret" } }
+            }
+        }]
+    }))
+    .expect("stored inbound from_api_key surface JSON");
+    let directory = std::path::Path::new(
+        &bootstrap
+            .storage_paths
+            .agent_surfaces,
+    );
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(
+        directory.join(format!("{STORED_INBOUND_API_KEY_SURFACE}.json")),
+        serde_json::to_vec_pretty(&surface).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn refusal_details(response: reqwest::Response) -> String {
+    assert_eq!(response.status(), 400);
+    let body: serde_json::Value = response.json().await.unwrap();
+    body["details"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The admin API keeps an inbound `from_api_key` identity only behind an API
+/// key caller method, saves a stored surface carrying an inbound key id
+/// without it, and refuses a Managed Agent `from_api_key` slot with no key.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_saves_inbound_from_api_key_only_behind_an_api_key_caller() {
+    use crate::identity::handlers::surfaces::{API_KEY_IDENTITY_NEEDS_ID, INBOUND_API_KEY_NEEDS_API_KEY_CALLER};
+
+    let mock = MockServer::start().await;
+    let target = mock.url();
+    let mut admin = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        store_inbound_api_key_surface_with_stale_key_ids(bootstrap, &target);
+    })
+    .await;
+    let admin = admin.unwrap();
+    let collection = format!("{}/api/v1/surfaces", h.gateway_base);
+    let stored_url = format!("{collection}/{STORED_INBOUND_API_KEY_SURFACE}");
+    let inbound_key_ids = |surface: &serde_json::Value| {
+        (
+            surface["identity_slots"]["inbound"]["api_key_id"].clone(),
+            surface["variants"][0]["overrides"]["identity_slots"]["inbound"]["api_key_id"].clone(),
+        )
+    };
+
+    let stored: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbound_key_ids(&stored), (json!("stale-inbound-secret"), json!("stale-variant-secret")), "{stored}");
+
+    let saved = admin
+        .put(&stored_url)
+        .json(&stored)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200);
+    let reloaded: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbound_key_ids(&reloaded), (serde_json::Value::Null, serde_json::Value::Null));
+    assert_eq!(reloaded["identity_slots"]["inbound"]["type"], "from_api_key");
+
+    let posted_id = "posted-inbound-api-key";
+    let mut posted = json!({
+        "surface_id": posted_id,
+        "name": posted_id,
+        "access_point": { "listen_address": h.gateway_base, "route": "/posted", "protocol": "a2a" },
+        "target": { "endpoint": h.mock.url() },
+        "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-posted-secret" } }
+    });
+    let without_caller = admin
+        .post(&collection)
+        .json(&posted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(without_caller).await, INBOUND_API_KEY_NEEDS_API_KEY_CALLER);
+    posted["access_point"]["caller_authentication"] = provider_caller_authentication(posted_id);
+    let created = admin
+        .post(&collection)
+        .json(&posted)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let created: serde_json::Value = created.json().await.unwrap();
+    assert_eq!(created["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+
+    let mut without_caller = reloaded.clone();
+    without_caller["access_point"]
+        .as_object_mut()
+        .unwrap()
+        .remove("caller_authentication");
+    let put = admin
+        .put(&stored_url)
+        .json(&without_caller)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(put).await, INBOUND_API_KEY_NEEDS_API_KEY_CALLER);
+
+    let mut enabled_variant = reloaded.clone();
+    enabled_variant["variants"][0]["enabled"] = json!(true);
+    let put = admin
+        .put(&stored_url)
+        .json(&enabled_variant)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal_details(put).await, format!("Variant 'candidate': {INBOUND_API_KEY_NEEDS_API_KEY_CALLER}"));
+
+    for (patch, expected) in [
+        (
+            json!({ "access_point": { "caller_authentication": null } }),
+            INBOUND_API_KEY_NEEDS_API_KEY_CALLER.to_string(),
+        ),
+        (
+            json!({ "identity_slots": { "protected": { "type": "from_api_key", "api_key_id": "" } } }),
+            format!("identity_slots.protected: {API_KEY_IDENTITY_NEEDS_ID}"),
+        ),
+    ] {
+        let response = admin
+            .patch(&stored_url)
+            .header("content-type", "application/merge-patch+json")
+            .body(patch.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refusal_details(response).await, expected, "{patch}");
+    }
+
+    let unchanged: serde_json::Value = admin
+        .get(&stored_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged["access_point"]["caller_authentication"],
+        provider_caller_authentication(STORED_INBOUND_API_KEY_SURFACE)
+    );
+    assert_eq!(unchanged["variants"][0]["enabled"], false);
+}
+
+/// Reassigning a surface stored with an inbound key id naming no secret moves
+/// it and saves it without that id.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_reassign_drops_a_stale_inbound_api_key_id() {
+    let mock = MockServer::start().await;
+    let target = mock.url();
+    let mut admin = None;
+    let h = GatewayHarness::start_with_mock(mock, |_, _, bootstrap| {
+        admin = Some(helpers::configure_admin_api(bootstrap));
+        store_inbound_api_key_surface_with_stale_key_ids(bootstrap, &target);
+    })
+    .await;
+    let admin = admin.unwrap();
+
+    let reassigned = admin
+        .put(format!("{}/api/v1/tenant-ownership/surfaces/{STORED_INBOUND_API_KEY_SURFACE}", h.gateway_base))
+        .json(&json!({ "tenant_id": "tenant-a" }))
+        .send()
+        .await
+        .unwrap();
+    let status = reassigned.status();
+    assert_eq!(
+        status,
+        200,
+        "{}",
+        reassigned
+            .text()
+            .await
+            .unwrap()
+    );
+
+    let stored: serde_json::Value = admin
+        .get(format!("{}/api/v1/surfaces/{STORED_INBOUND_API_KEY_SURFACE}", h.gateway_base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored["tenant_id"], "tenant-a");
+    assert_eq!(stored["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
+    assert_eq!(stored["variants"][0]["overrides"]["identity_slots"]["inbound"], json!({ "type": "from_api_key" }));
 }

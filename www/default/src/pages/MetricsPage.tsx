@@ -7,6 +7,7 @@ import { AppButton } from '../components/shared/AppButton';
 import FieldHelp from '../components/shared/FieldHelp';
 import MetricsFlowVisualization from '../components/MetricsFlowVisualization';
 import { formatDID } from '../utils/stringUtils';
+import { surfaceVariantAlias } from '../utils/surfaceVariant';
 import { FLOW_COLORS, UI_COLORS } from '../utils/uiPalette';
 
 interface ConnectionDataPoint {
@@ -15,7 +16,8 @@ interface ConnectionDataPoint {
   latency_ms?: number;
   identity_hash?: string;
   direction: 'request' | 'response';
-  variant_alias?: string;
+  /** The variant's alias, `_base_` for the base surface; absent outside surface requests. */
+  surface_variant?: string;
 }
 
 interface RuleValidationDataPoint {
@@ -305,7 +307,7 @@ const MetricsPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-metrics">
       {/* Flow Visualization */}
       <div className="card shadow mb-4">
         <div className="card-header py-3 d-flex flex-row align-items-center justify-content-between bg-gradient-primary">
@@ -316,6 +318,7 @@ const MetricsPage: React.FC = () => {
             <AppButton
               variant="secondary"
               size="md"
+              data-testid="metrics-configure-button"
               onClick={() => navigate('/metrics/configure')}
               iconStart={<i className="fas fa-cog fa-sm me-1" aria-hidden="true" />}
             >
@@ -324,6 +327,7 @@ const MetricsPage: React.FC = () => {
             <AppButton
               variant={isLive ? 'secondary' : 'outline-secondary'}
               size="md"
+              data-testid="metrics-live-toggle-button"
               onClick={() => setIsLive(prev => !prev)}
               title={isLive ? 'Pause live updates' : 'Resume live updates'}
               iconStart={
@@ -339,6 +343,7 @@ const MetricsPage: React.FC = () => {
               variant="primary"
               size="md"
               className="shadow-sm"
+              data-testid="metrics-refresh-button"
               onClick={loadMetrics}
               loading={loading}
               loadingLabel="Refreshing..."
@@ -489,6 +494,7 @@ const MetricsPage: React.FC = () => {
                     {/* Channel Level */}
                     <div
                       className="tree-item p-3 bg-light border rounded cursor-pointer"
+                      data-testid={`metrics-channel-${channelId}`}
                       onClick={() => toggleChannel(channelId)}
                       style={{ cursor: 'pointer' }}
                     >
@@ -755,10 +761,15 @@ const MetricsPage: React.FC = () => {
                                                                 <small className="text-muted">
                                                                   {formatTimestamp(point.timestamp)}
                                                                 </small>
-                                                                {point.variant_alias && (
+                                                                {surfaceVariantAlias(
+                                                                  point.surface_variant
+                                                                ) && (
                                                                   <span className="badge text-bg-secondary ms-2">
                                                                     <i className="fas fa-code-branch me-1"></i>
-                                                                    ${point.variant_alias}
+                                                                    $
+                                                                    {surfaceVariantAlias(
+                                                                      point.surface_variant
+                                                                    )}
                                                                   </span>
                                                                 )}
                                                               </div>
@@ -894,6 +905,7 @@ const MetricsPage: React.FC = () => {
                 size="sm"
                 className="mb-2"
                 data-bs-toggle="collapse"
+                data-testid="metrics-grafana-setup-button"
                 data-bs-target="#grafanaSetupInstructions"
                 iconStart={<i className="fas fa-question-circle fa-sm me-1" aria-hidden="true" />}
               >
@@ -1007,6 +1019,7 @@ const MetricsPage: React.FC = () => {
                 size="sm"
                 className="text-white"
                 data-bs-toggle="collapse"
+                data-testid="metrics-cloudwatch-setup-button"
                 data-bs-target="#cloudwatchSetupInstructions"
                 iconStart={<i className="fas fa-cog fa-sm me-1" aria-hidden="true" />}
               >

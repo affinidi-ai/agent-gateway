@@ -1,6 +1,7 @@
 import React from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
+import { agentPayEnabled, connectionsPermissions } from '../utils/featureFlags';
 import { usePermissions } from '../context/PermissionsContext';
 import { runNavGuard } from '../utils/navGuard';
 const Sidebar: React.FC = () => {
@@ -80,7 +81,7 @@ const Sidebar: React.FC = () => {
       id: 'payments',
       label: 'Payments',
       icon: 'fa-dollar-sign',
-      path: '/x402payments',
+      path: '/payments',
       permission: 'payments.view' as const,
     },
     {
@@ -93,7 +94,7 @@ const Sidebar: React.FC = () => {
       label: 'Connections',
       icon: 'fa-link',
       path: '/connections',
-      permission: 'gateways.view' as const,
+      permissionsAny: connectionsPermissions(agentPayEnabled(state.settings)),
     },
     {
       id: 'integrations',

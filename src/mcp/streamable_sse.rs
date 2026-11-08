@@ -10,8 +10,9 @@
 //!
 //! Design notes:
 //!
-//! - Sessions are keyed by `Mcp-Session-Id`, the same id the gateway mints
-//!   on the `initialize` response (see `proxy::handler` SSE wrapping site).
+//! - Sessions are keyed by surface and `Mcp-Session-Id`. The id can come from
+//!   the upstream, so a client on one surface must not be able to take over
+//!   another surface's stream by presenting the same id.
 //! - The registry stores a bounded `mpsc::Sender<sse::Event>` per session.
 //!   Bounded to prevent a slow/stalled client from causing unbounded memory
 //!   growth. If the buffer fills, new events are dropped and `send` returns
@@ -37,9 +38,11 @@ const SSE_CHANNEL_BUFFER: usize = 256;
 /// limit, `register` returns `None` and the caller responds 429.
 const MAX_SESSIONS: usize = 10_000;
 
+type EventSender = Sender<Result<Event, Infallible>>;
+
 #[derive(Debug, Default)]
 pub struct StreamableSessionRegistry {
-    inner: Mutex<HashMap<String, Sender<Result<Event, Infallible>>>>,
+    inner: Mutex<HashMap<(String, String), EventSender>>,
 }
 
 impl StreamableSessionRegistry {
@@ -54,14 +57,16 @@ impl StreamableSessionRegistry {
     /// the channel close and end gracefully.
     pub async fn register(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) -> Option<Receiver<Result<Event, Infallible>>> {
+        let key = (surface_id.to_string(), session_id.to_string());
         let mut guard = self.inner.lock().await;
-        if !guard.contains_key(session_id) && guard.len() >= MAX_SESSIONS {
+        if !guard.contains_key(&key) && guard.len() >= MAX_SESSIONS {
             return None;
         }
         let (tx, rx) = tokio::sync::mpsc::channel(SSE_CHANNEL_BUFFER);
-        guard.insert(session_id.to_string(), tx);
+        guard.insert(key, tx);
         Some(rx)
     }
 
@@ -70,6 +75,7 @@ impl StreamableSessionRegistry {
     /// (client disconnected) — caller treats that as "client unreachable".
     pub async fn send(
         &self,
+        surface_id: &str,
         session_id: &str,
         event: Event,
     ) -> bool {
@@ -77,7 +83,7 @@ impl StreamableSessionRegistry {
             .inner
             .lock()
             .await
-            .get(session_id)
+            .get(&(surface_id.to_string(), session_id.to_string()))
             .cloned();
         let Some(tx) = tx_opt else {
             return false;
@@ -89,24 +95,26 @@ impl StreamableSessionRegistry {
     /// entry. Idempotent.
     pub async fn drop_session(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) {
         self.inner
             .lock()
             .await
-            .remove(session_id);
+            .remove(&(surface_id.to_string(), session_id.to_string()));
     }
 
     /// Report whether the registry currently holds a live sender for this
     /// session. Used to decide between elicitation and fallback.
     pub async fn has_session(
         &self,
+        surface_id: &str,
         session_id: &str,
     ) -> bool {
         self.inner
             .lock()
             .await
-            .contains_key(session_id)
+            .contains_key(&(surface_id.to_string(), session_id.to_string()))
     }
 }
 
@@ -115,7 +123,7 @@ pub type SharedStreamableSessionRegistry = Arc<StreamableSessionRegistry>;
 static GLOBAL_STREAMABLE_SESSION_REGISTRY: std::sync::OnceLock<SharedStreamableSessionRegistry> =
     std::sync::OnceLock::new();
 
-/// Process-wide Streamable-HTTP session registry, keyed by `Mcp-Session-Id`.
+/// Process-wide Streamable-HTTP session registry, keyed by surface and `Mcp-Session-Id`.
 pub fn global_streamable_session_registry() -> &'static SharedStreamableSessionRegistry {
     GLOBAL_STREAMABLE_SESSION_REGISTRY.get_or_init(|| Arc::new(StreamableSessionRegistry::new()))
 }
@@ -128,29 +136,29 @@ mod tests {
     async fn register_returns_independent_receiver_per_session() {
         let reg = StreamableSessionRegistry::new();
         let mut rx_a = reg
-            .register("sess-a")
+            .register("surface", "sess-a")
             .await
             .unwrap();
         let mut rx_b = reg
-            .register("sess-b")
+            .register("surface", "sess-b")
             .await
             .unwrap();
 
         assert!(
-            reg.has_session("sess-a")
+            reg.has_session("surface", "sess-a")
                 .await
         );
         assert!(
-            reg.has_session("sess-b")
+            reg.has_session("surface", "sess-b")
                 .await
         );
 
         assert!(
-            reg.send("sess-a", Event::default().data("hello-a"))
+            reg.send("surface", "sess-a", Event::default().data("hello-a"))
                 .await
         );
         assert!(
-            reg.send("sess-b", Event::default().data("hello-b"))
+            reg.send("surface", "sess-b", Event::default().data("hello-b"))
                 .await
         );
 
@@ -175,7 +183,7 @@ mod tests {
     async fn send_to_unknown_session_returns_false() {
         let reg = StreamableSessionRegistry::new();
         assert!(
-            !reg.send("missing", Event::default().data("x"))
+            !reg.send("surface", "missing", Event::default().data("x"))
                 .await
         );
     }
@@ -184,15 +192,15 @@ mod tests {
     async fn drop_session_closes_receiver() {
         let reg = StreamableSessionRegistry::new();
         let mut rx = reg
-            .register("sess-z")
+            .register("surface", "sess-z")
             .await
             .unwrap();
-        reg.drop_session("sess-z")
+        reg.drop_session("surface", "sess-z")
             .await;
         // After drop, send returns false (no sender) and the receiver sees
         // channel closure.
         assert!(
-            !reg.send("sess-z", Event::default().data("late"))
+            !reg.send("surface", "sess-z", Event::default().data("late"))
                 .await
         );
         assert!(rx.recv().await.is_none());
@@ -202,21 +210,57 @@ mod tests {
     async fn re_register_replaces_previous_sender() {
         let reg = StreamableSessionRegistry::new();
         let mut rx_old = reg
-            .register("sess-r")
+            .register("surface", "sess-r")
             .await
             .unwrap();
         let mut rx_new = reg
-            .register("sess-r")
+            .register("surface", "sess-r")
             .await
             .unwrap();
         // Old receiver sees channel close because its sender was dropped.
         assert!(rx_old.recv().await.is_none());
         // New receiver still works.
         assert!(
-            reg.send("sess-r", Event::default().data("fresh"))
+            reg.send("surface", "sess-r", Event::default().data("fresh"))
                 .await
         );
         assert!(rx_new.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_same_session_id_on_another_surface_is_a_separate_stream() {
+        let reg = StreamableSessionRegistry::new();
+        let mut rx_a = reg
+            .register("surface-a", "shared")
+            .await
+            .unwrap();
+        let mut rx_b = reg
+            .register("surface-b", "shared")
+            .await
+            .unwrap();
+        assert!(
+            reg.send("surface-a", "shared", Event::default().data("for-a"))
+                .await
+        );
+        let got_a = format!(
+            "{:?}",
+            rx_a.recv()
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(got_a.contains("for-a"), "expected for-a, got {got_a}");
+        assert!(rx_b.try_recv().is_err());
+        assert!(
+            !reg.has_session("surface-c", "shared")
+                .await
+        );
+        reg.drop_session("surface-b", "shared")
+            .await;
+        assert!(
+            reg.has_session("surface-a", "shared")
+                .await
+        );
     }
 
     #[tokio::test]

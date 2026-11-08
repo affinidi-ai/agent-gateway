@@ -20,16 +20,8 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
     c.outbound_listen_address = t.outbound_listen_address;
     any = true;
   }
-  if (t.transit_token_mode) {
-    c.transit_token_mode = t.transit_token_mode;
-  } else {
-    c.transit_token_mode = 'embedded';
-  }
-  if (t.sign_requests !== undefined) {
-    c.sign_requests = !!t.sign_requests;
-  } else {
-    c.sign_requests = true;
-  }
+  // Only embedded tokens exist, so every save sends `embedded`.
+  c.transit_token_mode = 'embedded';
   if (t.transit_policy?.policy_definition_id) {
     c.transit_policy_definition_id = t.transit_policy.policy_definition_id;
     any = true;
@@ -42,24 +34,6 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
     c.rate_limit_requests = String(t.rate_limit.requests);
     c.rate_limit_window_secs = String(t.rate_limit.window_secs ?? 60);
     any = true;
-  }
-  // Reverse of the listener_auth_type → transit.source_auth projection.
-  const sa = t.source_auth;
-  if (sa && typeof sa === 'object' && sa.type) {
-    if (sa.type === 'api_key') {
-      c.listener_auth_type = 'api_key';
-      c.listener_auth_header = sa.extraction?.field || 'X-API-Key';
-      c.listener_auth_secret_id = sa.secret_id || '';
-      any = true;
-    } else if (sa.type === 'jwt_bearer') {
-      c.listener_auth_type = 'jwt_bearer';
-      c.listener_auth_strategy_id = sa.jwt_verification_strategy_id || '';
-      any = true;
-    } else if (sa.type === 'did_auth') {
-      c.listener_auth_type = 'did_auth';
-      c.listener_auth_header = sa.extraction?.field || 'Authorization';
-      any = true;
-    }
   }
   if (t.extension_rules?.required) {
     c.extension_required = true;
@@ -78,8 +52,8 @@ export function transitConfigConfigFromPayload(payload: any): Record<string, any
 
 /**
  * Transit Config — surface-wide settings shared by all transit points.
- * Owns the `transit.shared.*` fields (token mode, transit policy, signing,
- * workload binding, response extension rules). Each setting is written to
+ * Owns the `transit.shared.*` fields (token mode, transit policy, workload
+ * binding, response extension rules). Each setting is written to
  * its own dot-notation path so it deep-merges over the transit-point
  * coordinator's defaults.
  */
@@ -110,13 +84,11 @@ export const transitConfigDefinition: NodeDefinition = {
   ConfigPanel: TransitConfigPanel,
   defaultConfig: () => ({
     transit_token_mode: 'embedded',
-    sign_requests: true,
   }),
   summary: c => {
     if (!c) return null;
     const bits: string[] = [];
     if (c.transit_token_mode) bits.push(`token: ${c.transit_token_mode}`);
-    if (c.sign_requests === false) bits.push('unsigned');
     if (c.transit_policy_definition_id) bits.push('policy');
     return bits.length > 0 ? bits.join(' · ') : null;
   },
@@ -131,12 +103,7 @@ export const transitConfigDefinition: NodeDefinition = {
         value: c.outbound_listen_address.trim(),
       });
     }
-    if (c.transit_token_mode) {
-      slices.push({ path: 'transit.transit_token_mode', value: c.transit_token_mode });
-    }
-    if (c.sign_requests !== undefined) {
-      slices.push({ path: 'transit.sign_requests', value: !!c.sign_requests });
-    }
+    slices.push({ path: 'transit.transit_token_mode', value: 'embedded' });
     if (c.transit_policy_definition_id) {
       slices.push({
         path: 'transit.transit_policy',
@@ -154,43 +121,6 @@ export const transitConfigDefinition: NodeDefinition = {
           window_secs: parseInt(c.rate_limit_window_secs, 10) || 60,
         },
       });
-    }
-    // Listener auth → transit.source_auth (transit ingress credential
-    // validation, separate from the AP's caller_authentication).
-    const lat = c.listener_auth_type;
-    if (lat && lat !== 'none') {
-      const sa = (() => {
-        switch (lat) {
-          case 'api_key':
-            if (!c.listener_auth_secret_id) return null;
-            return {
-              type: 'api_key',
-              extraction: {
-                source: 'http_header',
-                field: c.listener_auth_header || 'X-API-Key',
-              },
-              secret_id: c.listener_auth_secret_id,
-            };
-          case 'jwt_bearer':
-            if (!c.listener_auth_strategy_id) return null;
-            return {
-              type: 'jwt_bearer',
-              jwt_verification_strategy_id: c.listener_auth_strategy_id,
-              audiences: [],
-            };
-          case 'did_auth':
-            return {
-              type: 'did_auth',
-              extraction: {
-                source: 'http_header',
-                field: c.listener_auth_header || 'Authorization',
-              },
-            };
-          default:
-            return null;
-        }
-      })();
-      if (sa) slices.push({ path: 'transit.source_auth', value: sa });
     }
     if (c.extension_required) {
       slices.push({ path: 'transit.extension_rules', value: { required: true } });

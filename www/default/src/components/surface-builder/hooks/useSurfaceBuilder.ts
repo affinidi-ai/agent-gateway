@@ -41,8 +41,12 @@ function isCascadeRoot(type: SurfaceNodeType): boolean {
   return !!registry.get(type)?.canvasOnly;
 }
 
-function isNodeConfigured(type: SurfaceNodeType, config: any): boolean {
-  return registry.isConfigured(type, config);
+function isNodeConfigured(
+  type: SurfaceNodeType,
+  config: any,
+  node: Pick<CanvasNode, 'id' | 'parentId' | 'slotId'>
+): boolean {
+  return registry.isConfigured(type, config, node);
 }
 
 function getNodeLabel(_type: SurfaceNodeType, config: any): string {
@@ -227,10 +231,11 @@ function attemptEdgeDrop(
     else if (slot.payloadPathTemplate === 'identity_slots.external')
       canonicalId = 'identity-external';
   }
-  // Trust Check ids mirror `hydrateLeg` so drop-time and reload-time
+  // Trust Check ids mirror registry hydration so drop-time and reload-time
   // ids match — otherwise the canvas-blob overlay can't reconcile
   // hydrated `trust-check-caller`/`trust-check-target` against a
   // drop-minted id, and duplicates get pushed as extras on every save.
+  // A Transit Point's own list keeps the owner id, `trust-check-<tp id>`.
   if (type === 'trust-check' && slot.payloadPathTemplate) {
     if (slot.payloadPathTemplate === 'access_point.trust_check_list')
       canonicalId = 'trust-check-caller';
@@ -268,7 +273,7 @@ function attemptEdgeDrop(
     id,
     type,
     label: '',
-    configured: isNodeConfigured(type, nodeConfig),
+    configured: isNodeConfigured(type, nodeConfig, { id, parentId, slotId: result.slotId }),
     config: nodeConfig,
     parentId,
     slotId: result.slotId,
@@ -473,7 +478,10 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
             id,
             type,
             label: '',
-            configured: isNodeConfigured(type, defaultConfig),
+            configured: isNodeConfigured(type, defaultConfig, {
+              id,
+              parentId: context.targetNodeId,
+            }),
             config: defaultConfig,
             parentId: context.targetNodeId,
           };
@@ -492,7 +500,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
           id,
           type,
           label: '',
-          configured: isNodeConfigured(type, defaultConfig),
+          configured: isNodeConfigured(type, defaultConfig, { id }),
           config: defaultConfig,
           parentId: undefined,
           // Persist the drop position when the canvas supplied one
@@ -560,7 +568,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
           return {
             ...n,
             config,
-            configured: isNodeConfigured(n.type, config),
+            configured: isNodeConfigured(n.type, config, n),
             label: getNodeLabel(n.type, config) || registry.get(n.type)?.label || n.type,
             description: getNodeDescription(config, n.description),
             connectionDirection: config.connection_direction || n.connectionDirection,
@@ -609,7 +617,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
             ...prev,
             nodes: prev.nodes.map(n =>
               n.id === createdId
-                ? { ...n, config: merged, configured: isNodeConfigured(n.type, merged) }
+                ? { ...n, config: merged, configured: isNodeConfigured(n.type, merged, n) }
                 : n
             ),
           };
@@ -664,7 +672,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
             nodes = nodes.map(n => {
               if (n.id !== attempt.createdId) return n;
               const merged = deepMergePreferringRight(n.config ?? {}, d.configOverrides);
-              return { ...n, config: merged, configured: isNodeConfigured(n.type, merged) };
+              return { ...n, config: merged, configured: isNodeConfigured(n.type, merged, n) };
             });
           }
           createdIds.push(attempt.createdId);
@@ -1072,7 +1080,7 @@ export function useSurfaceBuilder<T extends SurfaceBuilderState>(
     const out: Array<{ nodeId: string; nodeType: string; message: string }> = [];
     for (const n of state.nodes) {
       if (n.type === 'surface') continue;
-      const ws = registry.getDependencyWarnings(n.type, n.config, ctx);
+      const ws = registry.getDependencyWarnings(n.type, n.config, ctx, n);
       for (const w of ws) {
         if (w.severity === 'error') {
           out.push({ nodeId: n.id, nodeType: n.type, message: w.message });

@@ -23,7 +23,7 @@ use super::webhook::WebhookClient;
 use crate::comm::didcomm::client::DIDCommClient;
 use crate::gateways::filesystem::GatewayStore;
 use crate::identity::VCIssuer;
-use crate::mediators::utils::set_acl_to_allow_everything_and_more;
+use crate::mediators::utils::{InboundAcl, apply_inbound_acl};
 use crate::messages::MessageType;
 
 /// Emit a WARN reconnect summary every Nth consecutive failure, so a long
@@ -39,6 +39,10 @@ pub struct ConnectionPointMetrics {
     pub started_at: DateTime<Utc>,
     /// Last time a message was received
     pub last_activity: Option<DateTime<Utc>>,
+    /// Last time the paired peer gateway was heard from: an authenticated
+    /// message from its DID, or a pong to our ping
+    #[serde(default)]
+    pub peer_last_seen: Option<DateTime<Utc>>,
     /// Total number of messages received
     pub message_count: u64,
     /// Total number of errors encountered
@@ -62,6 +66,7 @@ impl Default for ConnectionPointMetrics {
             status: ConnectionStatus::Reconnecting,
             started_at: Utc::now(),
             last_activity: None,
+            peer_last_seen: None,
             message_count: 0,
             error_count: 0,
             reconnect_attempts: 0,
@@ -96,6 +101,9 @@ pub struct ListenerInfo {
     pub metrics: Arc<RwLock<ConnectionPointMetrics>>,
     /// DIDComm client for this connection
     pub client: DIDCommClient,
+    /// Who this connection point's mediator account should admit; account
+    /// repairs restore it.
+    pub inbound_acl: InboundAcl,
 }
 
 fn listener_index_priority(cp_type: &super::types::ConnectionPointType) -> u8 {
@@ -651,6 +659,7 @@ impl ConnectionPointListenerManager {
             "Starting WebSocket listener for connection point '{}' (Gateway: {}, Mediator: {})",
             connection_point.name, connection_point.gateway_id, mediator_did
         );
+        let inbound_acl = inbound_acl_for(connection_point, self.gateway_store.as_deref()).await;
 
         // Load connection point's unique DID and secrets
         // Each connection point has its own DID to avoid duplicate WebSocket connections
@@ -831,6 +840,7 @@ impl ConnectionPointListenerManager {
                 let starting_listeners_clone = Arc::clone(&self.starting_listeners);
                 let starting_listeners_notify_clone = Arc::clone(&self.starting_listeners_notify);
                 let self_ref_clone = self.self_ref.clone();
+                let inbound_acl_clone = inbound_acl.clone();
 
                 tokio::spawn(async move {
                     // No abort timeout: the listener task keeps retrying under the
@@ -869,6 +879,7 @@ impl ConnectionPointListenerManager {
                                         abort_handle: handle_clone,
                                         metrics: metrics_clone,
                                         client,
+                                        inbound_acl: inbound_acl_clone,
                                     };
 
                                     let old_listener = {
@@ -959,6 +970,7 @@ impl ConnectionPointListenerManager {
             abort_handle: handle.abort_handle(),
             metrics: Arc::clone(&metrics),
             client,
+            inbound_acl,
         };
 
         let old_listener = {
@@ -1189,6 +1201,26 @@ impl ConnectionPointListenerManager {
             .ok_or_else(|| format!("listener '{}' missing after restart", connection_point_id))
     }
 
+    /// When each running listener last heard from its paired peer gateway,
+    /// keyed by connection point id; listeners that have not are left out.
+    pub async fn peer_last_seen(&self) -> std::collections::HashMap<String, DateTime<Utc>> {
+        let mut seen = std::collections::HashMap::new();
+        for listener in self
+            .get_active_listeners()
+            .await
+        {
+            if let Some(at) = listener
+                .metrics
+                .read()
+                .await
+                .peer_last_seen
+            {
+                seen.insert(listener.connection_point_id, at);
+            }
+        }
+        seen
+    }
+
     /// Get information about active listeners
     pub async fn get_active_listeners(&self) -> Vec<ListenerInfo> {
         let listeners = self.listeners.read().await;
@@ -1264,6 +1296,23 @@ impl ConnectionPointListenerManager {
         } else {
             None
         }
+    }
+
+    /// Whether `gateway_id` is a payment gateway; `false` when it is unknown or
+    /// cannot be loaded.
+    pub async fn is_payment_gateway(
+        &self,
+        gateway_id: &str,
+    ) -> bool {
+        let Some(store) = self.gateway_store.as_ref() else {
+            return false;
+        };
+        store
+            .get(gateway_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|gateway| gateway.is_payment_gateway())
     }
 
     /// The DID of an active Remote gateway, and the tenant owning its record.
@@ -1831,9 +1880,10 @@ async fn run_websocket_listener<CS: super::ConnectionPointStore + 'static>(
             }
             _ => {}
         }
-        if let Err(e) = set_acl_to_allow_everything_and_more(client.atm(), Arc::clone(client.profile())).await {
+        let inbound_acl = inbound_acl_for(connection_point, gateway_store.as_deref()).await;
+        if let Err(e) = apply_inbound_acl(client.atm(), Arc::clone(client.profile()), &inbound_acl).await {
             warn!(
-                "Could not (re)apply ACL for connection point '{}': {}. Continuing with existing mediator permissions.",
+                "Could not (re)apply ACL for connection point '{}': {}. Continuing with existing mediator permissions; the account watch re-applies it.",
                 connection_point.name, e
             );
         }
@@ -2150,6 +2200,61 @@ fn received_message(
         message.body.clone(),
         message_metadata,
     )
+}
+
+/// Who a connection point's mediator account admits. A paired connection point
+/// (OOB responder or acceptor) admits only its peer: the secure DID recorded on
+/// it at pairing, else the DID on its remote gateway record; with neither it
+/// stays open, so an older pairing keeps working. The recorded DID comes first because a pairing's gateway
+/// record can still carry the peer's temporary DID when the listener starts. Every other connection point stays open, since invitation
+/// endpoints, pairing temporaries and legacy connection points do not serve a
+/// single known peer.
+pub(crate) async fn inbound_acl_for(
+    connection_point: &GatewayConnectionPoint,
+    gateway_store: Option<&crate::gateways::FileSystemGatewayStore>,
+) -> InboundAcl {
+    use super::types::ConnectionPointType;
+    let recorded_peer_key = match connection_point.cp_type {
+        ConnectionPointType::OobResponder => "acceptor_secure_did",
+        ConnectionPointType::OobAcceptor => "inviter_secure_did",
+        _ => return InboundAcl::Open,
+    };
+    let gateway_did = match gateway_store {
+        Some(store) => store
+            .get(&connection_point.gateway_id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|gateway| gateway.gateway_type == crate::gateways::types::GatewayType::Remote)
+            .map(|gateway| gateway.did)
+            .filter(|did| !did.is_empty()),
+        None => None,
+    };
+    let recorded_peer = connection_point
+        .oob_message
+        .get(recorded_peer_key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|did| !did.is_empty())
+        .map(str::to_string);
+    match recorded_peer.or(gateway_did) {
+        Some(peer) => InboundAcl::Peers(vec![peer]),
+        None => {
+            warn!(
+                "Connection point '{}' has no known peer DID; its mediator account stays open to any sender",
+                connection_point.name
+            );
+            InboundAcl::Open
+        }
+    }
+}
+
+/// Whether `message` comes from the paired peer gateway: authenticated, and
+/// sent by the peer DID recorded on the connection point's gateway.
+fn is_from_peer(
+    message: &ReceivedMessage,
+    peer_did: Option<&str>,
+) -> bool {
+    message.metadata.authenticated && peer_did.is_some() && message.from_did.as_deref() == peer_did
 }
 
 /// The mediator reports `account.not_found` when it no longer has this
@@ -2625,6 +2730,16 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
 ) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    let peer_did = match gateway_store.as_ref() {
+        Some(store) => store
+            .get(&connection_point.gateway_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|gateway| gateway.did),
+        None => None,
+    };
+
     let mut stream_listener = crate::proxy::fabric_stream::global()?
         .listener(connection_point.id.clone(), connection_point_did.to_string())?;
 
@@ -2842,8 +2957,12 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                         // Update metrics: increment message count and update last activity
                         {
                             let mut m = metrics.write().await;
+                            let now = Utc::now();
                             m.message_count += 1;
-                            m.last_activity = Some(Utc::now());
+                            m.last_activity = Some(now);
+                            if is_from_peer(&received_msg, peer_did.as_deref()) {
+                                m.peer_last_seen = Some(now);
+                            }
                         }
 
                         if let Some(code) = mediator_account_loss(&received_msg, mediator_did) {
@@ -3169,7 +3288,7 @@ async fn process_messages<CS: super::ConnectionPointStore + 'static>(
                     }
                 }
 
-                debug!("Message body: {}", serde_json::to_string_pretty(&message.body).unwrap_or_default());
+                debug!("Message {} ({}): {} body bytes", message.id, message.typ, message.body.to_string().len());
             }
             Ok(None) => {
                 debug!("No message received within timeout for connection point '{}'", connection_point.name);
@@ -3516,6 +3635,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
                         gateway_type: crate::gateways::types::GatewayType::Remote,
                         status: crate::gateways::types::GatewayStatus::Pending,
                         creation_type: crate::gateways::types::GatewayCreationType::System,
+                        role: crate::gateways::types::GatewayRole::Peer,
                         created_at: temp_connection_point.created_at,
                         updated_at: chrono::Utc::now(),
                         exposed_channels: Vec::new(),
@@ -3772,6 +3892,7 @@ async fn finalize_oob_connection_as_acceptor<S: GatewayStore, CS: super::Connect
             gateway_type: crate::gateways::types::GatewayType::Remote,
             status: crate::gateways::types::GatewayStatus::Pending,
             creation_type: crate::gateways::types::GatewayCreationType::System,
+            role: crate::gateways::types::GatewayRole::Peer,
             created_at: pending_conn.created_at,
             updated_at: chrono::Utc::now(),
             exposed_channels: Vec::new(),
@@ -4629,6 +4750,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn only_an_authenticated_message_from_the_paired_peer_counts_as_peer_contact() {
+        let from_peer = open_from(None);
+        assert!(super::is_from_peer(&from_peer, Some("did:example:peer")));
+        assert!(!super::is_from_peer(&from_peer, Some("did:example:other")));
+        assert!(!super::is_from_peer(&from_peer, None));
+
+        let mut unauthenticated = open_from(None);
+        unauthenticated
+            .metadata
+            .authenticated = false;
+        assert!(!super::is_from_peer(&unauthenticated, Some("did:example:peer")));
+
+        let mut anonymous = open_from(None);
+        anonymous.from_did = None;
+        assert!(!super::is_from_peer(&anonymous, None));
+    }
+
     #[tokio::test]
     async fn open_admission_runs_off_the_reader_loop_and_is_bounded() {
         use crate::proxy::fabric_stream::wire::StreamErrorCode;
@@ -5208,6 +5347,109 @@ mod tests {
             .as_str()
             .to_string();
         assert_eq!(super::mediator_account_loss(&not_a_report, MEDIATOR_DID), None);
+    }
+
+    #[tokio::test]
+    async fn only_a_paired_connection_point_narrows_its_mediator_account_to_its_peer() {
+        use super::super::types::{ConnectionPointType, GatewayConnectionPoint};
+        use crate::gateways::filesystem::GatewayStore;
+        use crate::gateways::types::{Gateway, GatewayType};
+        use crate::mediators::utils::InboundAcl;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::gateways::FileSystemGatewayStore::new(directory.path().to_path_buf(), None)
+            .await
+            .unwrap();
+        let peer = Gateway::new("Peer".into(), String::new(), "did:web:peer-cp.example".into(), GatewayType::Remote);
+        store
+            .create(&peer)
+            .await
+            .unwrap();
+        let connection_point = |gateway_id: &str, cp_type: ConnectionPointType, oob: serde_json::Value| {
+            GatewayConnectionPoint::new(
+                gateway_id.to_string(),
+                "did:example:mediator".to_string(),
+                "did:example:our-cp".to_string(),
+                "cp".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                oob,
+                None,
+                cp_type,
+                String::new(),
+            )
+        };
+
+        for cp_type in [ConnectionPointType::OobResponder, ConnectionPointType::OobAcceptor] {
+            assert_eq!(
+                super::inbound_acl_for(
+                    &connection_point(&peer.id, cp_type.clone(), serde_json::json!({})),
+                    Some(&store)
+                )
+                .await,
+                InboundAcl::Peers(vec!["did:web:peer-cp.example".into()]),
+                "{cp_type:?} admits the DID on its gateway record"
+            );
+        }
+        assert_eq!(
+            super::inbound_acl_for(
+                &connection_point(
+                    "unknown-gateway",
+                    ConnectionPointType::OobResponder,
+                    serde_json::json!({ "acceptor_secure_did": "did:web:acceptor.example" })
+                ),
+                Some(&store)
+            )
+            .await,
+            InboundAcl::Peers(vec!["did:web:acceptor.example".into()]),
+            "without a gateway record it admits the DID recorded at pairing"
+        );
+        assert_eq!(
+            super::inbound_acl_for(
+                &connection_point(
+                    &peer.id,
+                    ConnectionPointType::OobAcceptor,
+                    serde_json::json!({ "inviter_secure_did": "did:web:inviter-secure.example" })
+                ),
+                Some(&store)
+            )
+            .await,
+            InboundAcl::Peers(vec!["did:web:inviter-secure.example".into()]),
+            "the DID recorded at pairing wins over a gateway record that still holds the peer's temporary DID"
+        );
+        assert_eq!(
+            super::inbound_acl_for(
+                &connection_point(
+                    "unknown-gateway",
+                    ConnectionPointType::OobAcceptor,
+                    serde_json::json!({ "inviter_secure_did": "did:web:inviter.example" })
+                ),
+                None
+            )
+            .await,
+            InboundAcl::Peers(vec!["did:web:inviter.example".into()])
+        );
+        assert_eq!(
+            super::inbound_acl_for(
+                &connection_point("unknown-gateway", ConnectionPointType::OobAcceptor, serde_json::json!({})),
+                Some(&store)
+            )
+            .await,
+            InboundAcl::Open,
+            "a paired connection point with no known peer stays open"
+        );
+        for cp_type in [ConnectionPointType::User, ConnectionPointType::OobInviter, ConnectionPointType::System] {
+            assert_eq!(
+                super::inbound_acl_for(
+                    &connection_point(&peer.id, cp_type.clone(), serde_json::json!({})),
+                    Some(&store)
+                )
+                .await,
+                InboundAcl::Open,
+                "{cp_type:?} stays open"
+            );
+        }
     }
 
     #[tokio::test]

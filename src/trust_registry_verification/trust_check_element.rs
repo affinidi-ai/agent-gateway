@@ -1,10 +1,12 @@
 //! Trust Check element — per-leg, per-trust-registry verification declared on
 //! an Agent Surface and evaluated against a TRQP endpoint at request time.
 //!
-//! Persisted on `AccessPoint.trust_check_list` (caller leg, AP→MA) and
-//! `Target.trust_check_list` (target leg, MA→TP). Runtime evaluation,
-//! observability, and OPA wiring land in subsequent MRs; this module owns the
-//! configuration shape and the runtime result shape only.
+//! Persisted on `AccessPoint.trust_check_list` (caller leg) and on two
+//! target-leg lists: `TransitPoint.trust_check_list`, run for requests the
+//! managed agent sends through that Transit Point, and
+//! `Target.trust_check_list`, run for the managed agent's own `a2a-proxy://`
+//! target and for fabric send. This module owns the configuration shape and
+//! the runtime result shape only.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -295,7 +297,9 @@ pub struct TrustCheckResultsContext {
 pub enum TrustCheckLeg {
     /// `AccessPoint.trust_check_list` — caller-side verification.
     Caller,
-    /// `Target.trust_check_list` — target-side verification.
+    /// Target-side verification: the routed Transit Point's
+    /// `trust_check_list` on the outbound path, or `Target.trust_check_list`
+    /// for an `a2a-proxy://` target and fabric send.
     Target,
 }
 

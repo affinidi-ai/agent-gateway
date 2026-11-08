@@ -1,0 +1,226 @@
+branch: fix/transit-point-tokens-and-lifecycle
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Sign transit tokens with a random key kept in storage
+      description: >-
+        The gateway now signs transit tokens with a random 256-bit key it creates on its
+        first start and keeps beside its own keys under `[storage_paths] vc_keys`, readable
+        by the owner only, restricted to the owner again when a restore wrote it otherwise,
+        and encrypted when encryption at rest is on, so instances sharing storage agree.
+        Every token names the key in its `kid` header, and a token naming another key, or
+        none, is refused. A key file that cannot be read stops the gateway from starting
+        rather than being replaced, and a key directory on a filesystem without hard links
+        stops the first start with an error saying so.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Check a transit token's surface and lifetime on every Transit Point request
+      description: >-
+        Every Transit Point request now checks, alongside the transit token's signature,
+        issuer and expiry, that the token's surface is the Transit Point's surface, that its
+        issue time is not in the future, that its lifetime is no longer than the 300 seconds
+        the gateway issues, and that it carries a token ID, with 5 seconds of clock
+        allowance. A token can still be used any number of times until it expires. A refusal
+        says only that the token is missing or invalid; the reason is logged.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Take a deleted surface's Transit Points out of service at once
+      description: >-
+        Deleting a surface now retires its outbound state at once, so every route still
+        holding it, on a new or a kept-alive connection, answers `404`, and evicts its
+        compiled policies, MCP tool gating and rate limiters, those of its Transit Points
+        included. A surface without variants is deleted without rebinding the outbound
+        listener it shares with other surfaces, so their Transit Points are not interrupted;
+        deleting a surface with variants takes a full reload, which rebinds every listener.
+        Disabling a surface or removing all its Transit Points retires that state the same
+        way, including on connections kept alive on a TLS outbound listener.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Apply a Transit Point change to connections kept alive across a reload
+      description: >-
+        A reload now writes each surface's new configuration into the outbound state that
+        connections kept alive on a TLS outbound listener hold, before the API answers, so
+        on those connections a removed Transit Point answers `404` and a changed target or
+        token requirement takes effect, as on new connections.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse a gated Transit Point tool call when its tool gating is not in force
+      description: >-
+        A Transit Point whose configuration sets MCP tool gating that is not in force, as
+        when its surface is deleted while a `tools/call` is in flight, now refuses every
+        `tools/call` and answers `tools/list` with an empty tool list.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse Transit Point requests when `transit.source_auth` is set
+      description: >-
+        `transit.source_auth` is not supported. The admin API now refuses a surface that
+        sets it, on the surface or in a variant's overrides, and a surface stored with it
+        loads with a warning and has every request to its Transit Points refused with `503`,
+        told only that the Transit Point is unavailable. Transit Point callers are
+        authenticated by the transit token and, on an MCP Transit Point, by
+        `mcp_http.authorization`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Stop forwarding cookies and authentication challenges across a Transit Point
+      description: >-
+        A Transit Point no longer forwards the managed agent's `Cookie` to its target, or
+        returns the target's `Set-Cookie` and `WWW-Authenticate` to the agent, on HTTP and
+        Fabric targets and for every MCP revision; other headers, and the response status,
+        are unchanged.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Send only the gateway's value for a Transit Point's `target_auth` header
+      description: >-
+        A Transit Point no longer forwards a managed agent header named like its
+        `target_auth` header, such as `X-Api-Key`, whether or not the gateway adds its own
+        value to the request, so the target receives one value for that header.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse requests whose delegated credential cannot be resolved
+      description: >-
+        A request whose credential binding applies but whose credential cannot be resolved
+        is now refused without calling the target: a deleted or unreadable provider, an
+        unreadable API key secret, a failed client-credentials request, a vault read error,
+        or consent that cannot be asked for. A Transit Point also refuses a request whose
+        transit token names no caller, and no longer looks up a grant under the placeholder
+        agent `unknown` when no agent identity is resolved. Grants are keyed by agent DID,
+        caller and provider, not by surface, so surfaces that share an agent DID share
+        grants. The Access Point's consent body no longer carries the caller's identity hash
+        and agent DID.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Bind inbound listeners to their configured `bind_address`
+      description: >-
+        Inbound listeners now bind their `bind_address`, as outbound listeners already did,
+        on startup and on every reload, where they used to bind every interface. Inbound
+        listeners sharing a port are served by one listener task that binds each of their
+        addresses, instead of a second task that failed to bind the port again. An IPv4
+        caller that an IPv6 address such as `::` accepts matches the IPv4 entries of
+        `client_ip.trusted_proxies` and `tls.client_auth.trusted_proxies`, so a load
+        balancer listed there stays trusted.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Write the gateway's key files atomically with owner-only permissions
+      description: >-
+        The gateway's key files (DID keys, VC issuer keys and the transit token key) are now
+        written readable by their owner only and replaced atomically, including when
+        encryption at rest is turned on, so an instance starting beside another no longer
+        reads a partly written file and fails to start; an instance that finds a key file
+        migrated by another as it reads it reads the migrated file.
+  fixed:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Send a delegated `bearer_header` credential to a Transit Point's target
+      description: >-
+        A Transit Point resolved a delegated credential for a request that was not
+        `2026-07-28` MCP, then dropped it with the managed agent's own `Authorization`, so a
+        `bearer_header` credential never reached the target. A Transit Point now builds the
+        headers it sends by one rule on HTTP and Fabric targets: the agent's headers, then the
+        `target_auth` header, then the delegated credential headers, each replacing any earlier
+        header of the same name, so the target receives one value of each credential header and
+        a delegated credential under the same name as `target_auth` replaces it.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Record a Transit Point call as failed when its target refuses or fails it
+      description: >-
+        Every Transit Point call that returned a response was recorded as a successful
+        connection, so a target answering `401` or `502` looked healthy in the dashboard's
+        traffic, and a streamed MCP response that failed part way was not recorded at all. A
+        call is now recorded as successful only when the target answers with a 2xx and, on a
+        streamed MCP response, the stream completes, and as failed when the target answers
+        otherwise or the stream fails. A streamed response that the managed agent stops reading
+        before it ends is still not recorded.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Point a rewritten agent card at the route a Transit Point is served on
+      description: >-
+        When a Transit Point without its own `listen_path` returned an agent card, the gateway
+        rewrote the card's URLs to `/outgoing/<route>/<alias>`, a path no listener serves, so a
+        managed agent following the card was answered `404`. The card now names the
+        `/outbound/<route>/<alias>` route the Transit Point is mounted on.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Keep an outbound listener bound after its last Transit Point is removed
+      description: >-
+        A reload that left an outbound listener without Transit Points stopped listening on
+        its port, so `/alive` health checks on it failed until the gateway restarted, while
+        startup binds such a listener. Reloads now bind it the same way: it answers `/alive`
+        and refuses the removed Transit Point paths with `404`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Bind an outbound listener whose `bind_address` is an IPv6 address
+      description: >-
+        An outbound listener with an IPv6 `bind_address`, such as `::1`, passed validation but
+        never bound, because its socket address was built as text without brackets, and the
+        inbound listener sharing its host name forwarded `/outbound/*` to an address that did
+        not parse. Both now build the address from the IP address and port, so an IPv6
+        outbound listener binds and is reachable through the shared host name.
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse transit tokens issued before the upgrade or by an unshared instance
+      description: >-
+        Transit tokens issued before the upgrade are refused once, so a managed agent's
+        Transit Point calls fail until its next inbound request brings a new token, at
+        most five minutes later. Gateway instances that do not share `[storage_paths]
+        vc_keys` no longer accept each other's transit tokens; route a managed agent's
+        Transit Point calls to an instance sharing that directory with the one that served
+        its inbound request. During a rolling upgrade, instances on the old and new versions
+        refuse each other's tokens even when they share storage, so upgrade every instance
+        sharing storage together.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse a transit token 5 seconds after it expires instead of 60
+      description: >-
+        A Transit Point accepted a transit token for 60 seconds after its expiry. It now allows
+        5 seconds of clock difference, so a managed agent turn that runs past about 305 seconds
+        has its later Transit Point calls refused until its next inbound request brings a new
+        token.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Set Transit Point tool gating on the surface's Transit Point, not a variant's
+      description: >-
+        MCP tool gating is compiled from a surface's own Transit Points only, so a variant's
+        Transit Point is gated by the surface's Transit Point of the same alias. A variant
+        Transit Point that sets `mcp_tool_gating` where the surface's Transit Point of that
+        alias sets none, or that the surface does not have, now refuses every `tools/call`
+        and answers `tools/list` with no tools, as a per-Transit-Point policy set only on a
+        variant is already refused. Move such gating to the surface's Transit Point.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Remove `transit.source_auth` from surfaces to serve their Transit Points again
+      description: >-
+        A surface that sets `transit.source_auth` has every request to its Transit Points
+        refused, and the admin API refuses to save it with the field. Authenticate Transit
+        Point callers with `require_transit_token` and, on MCP Transit Points,
+        `mcp_http.authorization`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Give Transit Points with credential bindings an agent identity
+      description: >-
+        A Transit Point with `outbound_credentials` or `transit_credentials` now refuses a
+        request with `403` when no agent identity is resolved, because neither the Transit
+        Point's managed identity nor the transit token's caller DID is set, instead of keying
+        the vault on a shared placeholder. Configure a managed identity on such Transit Points,
+        or caller identity on the Access Point; a static key that does not depend on the agent
+        can use `target_auth` instead. Grants consented under the placeholder agent are no
+        longer released.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse credentialed Transit Point calls whose transit token names no caller
+      description: >-
+        A Transit Point with credential bindings now refuses with `403` a request whose transit
+        token carries no caller identity, instead of forwarding it without the credential.
+        That covers every request to such a Transit Point that sets `require_transit_token:
+        false`, and every request from an anonymous caller of an Access Point whose caller
+        authentication is optional. Authenticate the Access Point's callers, or move a static
+        credential to `target_auth`.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Refuse Access Point and Fabric calls whose delegated credential is unavailable
+      description: >-
+        An Access Point or Fabric receive with credential delegation now refuses with `503` a
+        request whose provider is deleted or unreadable, whose API key secret cannot be read,
+        whose client-credentials token request fails, whose vault read fails, or whose consent
+        cannot be asked for, instead of forwarding it without the credential. The refusal is a
+        JSON-RPC error (`-32603`) carrying the request's id on an MCP surface and an
+        `application/problem+json` body otherwise, where the gateway used to answer `503` in
+        plain text.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Forward Transit Point discovery reads without a delegated credential
+      description: >-
+        A `GET` of a public discovery path, such as an agent card, through a Transit Point with
+        credential bindings used to carry the delegated credential when its transit token named
+        a caller. It is now always forwarded without one, as it is without the `target_auth`
+        credential, because the gateway does not check a transit token on such a read.
+    - timestamp: '2026-10-28T00:00:00.000Z'
+      title: Check inbound listener `bind_address` values before upgrading
+      description: >-
+        An inbound listener whose `bind_address` is not `0.0.0.0` now accepts connections on
+        that address only, so a listener set to `127.0.0.1` is no longer reachable from other
+        hosts. Inbound listeners used to ignore their `bind_address`; one that is not an IP
+        address now stops the gateway from loading its network configuration, and one the host
+        does not own, such as an Elastic IP or a NAT address, now stops that port from serving,
+        the management API and dashboard included when they are on it. The example
+        configuration and Docker setup bind `0.0.0.0` and are unaffected.

@@ -6,7 +6,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::ErrorKind;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -44,6 +44,7 @@ fn emit_payment_audit(
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         },
         Some(&txn.surface_id),
         Some(&txn.channel_name),
@@ -299,7 +300,8 @@ pub struct X402Transaction {
 
 impl X402Transaction {
     /// Create new transaction with verification stage
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         correlation_id: String,
         surface_id: String,
         channel_name: String,
@@ -336,25 +338,6 @@ impl X402Transaction {
             rejection_vc_jwt: None,
             rejection_vc_fingerprint: None,
         }
-    }
-
-    /// Mark verification as completed successfully
-    pub fn complete_verification(&mut self) {
-        self.verification.status = VerificationStatus::Verified;
-        self.verification.completed_at = Some(Utc::now());
-        self.verification.error = None;
-        self.last_updated = Utc::now();
-    }
-
-    /// Mark verification as failed
-    pub fn fail_verification(
-        &mut self,
-        error: String,
-    ) {
-        self.verification.status = VerificationStatus::Failed;
-        self.verification.completed_at = Some(Utc::now());
-        self.verification.error = Some(error);
-        self.last_updated = Utc::now();
     }
 
     /// Initialize settlement stage
@@ -458,7 +441,6 @@ impl X402Transaction {
     }
 
     /// Mark as pending sync (notification sent to facilitator)
-    #[allow(dead_code)]
     pub fn mark_pending_sync(&mut self) {
         if let Some(settlement) = &mut self.settlement {
             settlement.sync_status = SyncStatus::PendingSync;
@@ -467,7 +449,6 @@ impl X402Transaction {
     }
 
     /// Mark as synced (ACK received from facilitator)
-    #[allow(dead_code)]
     pub fn mark_synced(&mut self) {
         if let Some(settlement) = &mut self.settlement {
             settlement.sync_status = SyncStatus::Synced;
@@ -545,26 +526,6 @@ impl TransactionStore {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    /// Persist a new transaction; returns `AlreadyExists` if a record is already on disk.
-    async fn create_on_disk(
-        &self,
-        transaction: &X402Transaction,
-    ) -> Result<(), std::io::Error> {
-        if self
-            .storage
-            .exists(&transaction.id)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-        {
-            return Err(std::io::Error::new(ErrorKind::AlreadyExists, "transaction already exists"));
-        }
-
-        self.storage
-            .save_atomic(transaction)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
-
     /// Delete transaction through the storage backend
     async fn delete_from_disk(
         &self,
@@ -576,54 +537,7 @@ impl TransactionStore {
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
-    /// Create new transaction (verification stage)
-    pub async fn create_transaction(
-        &self,
-        correlation_id: String,
-        channel_id: String,
-        channel_name: String,
-        resource_path: String,
-        payment_payload: PaymentPayload,
-        verification_mode: String,
-        facilitator_gateway_id: Option<String>,
-    ) -> Result<String, String> {
-        let mut cache = self.cache.write().await;
-
-        if cache.contains_key(&correlation_id) {
-            return Err(format!("Transaction already exists: {}", correlation_id));
-        }
-
-        let transaction = X402Transaction::new(
-            correlation_id.clone(),
-            channel_id,
-            channel_name,
-            resource_path,
-            payment_payload,
-            verification_mode,
-            facilitator_gateway_id,
-        );
-
-        if let Err(e) = self
-            .create_on_disk(&transaction)
-            .await
-        {
-            error!("Failed to save transaction to disk: {}", e);
-            if e.kind() == ErrorKind::AlreadyExists {
-                return Err(format!("Transaction already exists: {}", correlation_id));
-            }
-            return Err(format!("Failed to persist transaction: {}", e));
-        }
-
-        emit_payment_audit(&transaction, PaymentStage::VerifyAttempt, None, None);
-        cache.insert(correlation_id.clone(), transaction);
-
-        info!("[transaction-store] Created transaction: {}", correlation_id);
-
-        Ok(correlation_id)
-    }
-
     /// Get transaction by correlation_id
-    #[allow(dead_code)]
     pub async fn get(
         &self,
         correlation_id: &str,
@@ -632,97 +546,6 @@ impl TransactionStore {
         cache
             .get(correlation_id)
             .cloned()
-    }
-
-    /// Complete verification successfully
-    pub async fn complete_verification(
-        &self,
-        correlation_id: &str,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction.complete_verification();
-
-            let receipt = crate::payment_credentials::issue_payment_receipt(receipt_input_from_transaction(
-                transaction,
-                false,
-                None,
-            ))
-            .await;
-            if let Some(ref c) = receipt {
-                transaction.receipt_vc_jwt = Some(c.jwt.clone());
-                transaction.receipt_vc_fingerprint = Some(c.fingerprint.clone());
-            }
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            emit_payment_audit(
-                transaction,
-                PaymentStage::Verified,
-                None,
-                receipt
-                    .as_ref()
-                    .map(|c| c.jwt.as_str()),
-            );
-            info!("[transaction-store] Verification completed: {}", correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
-    /// Fail verification
-    pub async fn fail_verification(
-        &self,
-        correlation_id: &str,
-        error: String,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            let error_for_audit = error.clone();
-            transaction.fail_verification(error);
-
-            let rejection = crate::payment_credentials::issue_payment_rejection(rejection_input_from_transaction(
-                transaction,
-                error_for_audit.clone(),
-            ))
-            .await;
-            if let Some(ref c) = rejection {
-                transaction.rejection_vc_jwt = Some(c.jwt.clone());
-                transaction.rejection_vc_fingerprint = Some(c.fingerprint.clone());
-            }
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            emit_payment_audit(
-                transaction,
-                PaymentStage::Failed,
-                Some(error_for_audit),
-                rejection
-                    .as_ref()
-                    .map(|c| c.jwt.as_str()),
-            );
-            info!("[transaction-store] Verification failed: {}", correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
     }
 
     /// Initialize settlement stage
@@ -929,39 +752,7 @@ impl TransactionStore {
         }
     }
 
-    /// Set facilitator_gateway_id (used when remote gateway requests verification)
-    /// This allows the facilitator to send settlement-complete notification back to requester
-    pub async fn set_facilitator_gateway_id(
-        &self,
-        correlation_id: &str,
-        gateway_id: String,
-    ) -> Result<(), String> {
-        let mut cache = self.cache.write().await;
-
-        if let Some(transaction) = cache.get_mut(correlation_id) {
-            transaction
-                .verification
-                .facilitator_gateway_id = Some(gateway_id.clone());
-            transaction.last_updated = Utc::now();
-
-            // Save to disk
-            if let Err(e) = self
-                .save_to_disk(transaction)
-                .await
-            {
-                error!("Failed to save transaction to disk: {}", e);
-                return Err(format!("Failed to persist transaction: {}", e));
-            }
-
-            info!("[transaction-store] Set facilitator_gateway_id={} for: {}", gateway_id, correlation_id);
-            Ok(())
-        } else {
-            Err(format!("Transaction not found: {}", correlation_id))
-        }
-    }
-
     /// Mark as synced (ACK received from facilitator)
-    #[allow(dead_code)]
     pub async fn mark_synced(
         &self,
         correlation_id: &str,
@@ -1160,9 +951,24 @@ impl TransactionStore {
 }
 
 #[cfg(test)]
+impl TransactionStore {
+    pub(crate) async fn insert(
+        &self,
+        transaction: X402Transaction,
+    ) {
+        self.save_to_disk(&transaction)
+            .await
+            .unwrap();
+        self.cache
+            .write()
+            .await
+            .insert(transaction.id.clone(), transaction);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tokio::fs;
     use uuid::Uuid;
 
@@ -1205,38 +1011,28 @@ mod tests {
 
         let correlation_id = Uuid::new_v4().to_string();
 
-        // Create transaction
+        let mut transaction = X402Transaction::new(
+            correlation_id.clone(),
+            "channel-1".to_string(),
+            "Test Channel".to_string(),
+            "/test".to_string(),
+            payload,
+            "Local".to_string(),
+            None,
+        );
+        transaction
+            .verification
+            .status = VerificationStatus::Verified;
         store
-            .create_transaction(
-                correlation_id.clone(),
-                "channel-1".to_string(),
-                "Test Channel".to_string(),
-                "/test".to_string(),
-                payload.clone(),
-                "Local".to_string(),
-                None,
-            )
-            .await
-            .unwrap();
+            .insert(transaction)
+            .await;
 
-        // Verify it exists
-        let txn = store
-            .get(&correlation_id)
-            .await
-            .unwrap();
-        assert_eq!(txn.verification.status, VerificationStatus::Pending);
-        assert!(txn.settlement.is_none());
-
-        // Complete verification
-        store
-            .complete_verification(&correlation_id)
-            .await
-            .unwrap();
         let txn = store
             .get(&correlation_id)
             .await
             .unwrap();
         assert_eq!(txn.verification.status, VerificationStatus::Verified);
+        assert!(txn.settlement.is_none());
 
         // Initialize settlement
         store
@@ -1271,178 +1067,6 @@ mod tests {
         assert_eq!(txn.settlement.unwrap().status, SettlementStatus::Completed);
 
         // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn create_transaction_rejects_duplicate_correlation_id() {
-        let temp_dir = std::env::temp_dir().join(format!("x402-test-{}", Uuid::new_v4()));
-        let store = TransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-        let payload = mock_payment_payload();
-        let correlation_id = Uuid::new_v4().to_string();
-
-        let first_result = store
-            .create_transaction(
-                correlation_id.clone(),
-                "channel-1".to_string(),
-                "Test Channel".to_string(),
-                "/test".to_string(),
-                payload.clone(),
-                "Local".to_string(),
-                None,
-            )
-            .await;
-        let second_result = store
-            .create_transaction(
-                correlation_id.clone(),
-                "channel-2".to_string(),
-                "Other Channel".to_string(),
-                "/other".to_string(),
-                payload,
-                "Local".to_string(),
-                None,
-            )
-            .await;
-
-        assert_eq!(first_result.unwrap(), correlation_id);
-        assert!(
-            second_result
-                .unwrap_err()
-                .contains("already exists")
-        );
-
-        let transactions = store.list_all().await;
-        assert_eq!(transactions.len(), 1);
-        assert_eq!(transactions[0].surface_id, "channel-1");
-        assert_eq!(transactions[0].resource_path, "/test");
-
-        let _ = fs::remove_dir_all(&temp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn create_transaction_rejects_existing_transaction_file() {
-        let temp_dir = std::env::temp_dir().join(format!("x402-test-{}", Uuid::new_v4()));
-        let store = TransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-        let payload = mock_payment_payload();
-        let correlation_id = Uuid::new_v4().to_string();
-
-        store
-            .create_transaction(
-                correlation_id.clone(),
-                "channel-1".to_string(),
-                "Test Channel".to_string(),
-                "/test".to_string(),
-                payload.clone(),
-                "Local".to_string(),
-                None,
-            )
-            .await
-            .unwrap();
-
-        store
-            .cache
-            .write()
-            .await
-            .clear();
-
-        let second_result = store
-            .create_transaction(
-                correlation_id.clone(),
-                "channel-2".to_string(),
-                "Other Channel".to_string(),
-                "/other".to_string(),
-                payload,
-                "Local".to_string(),
-                None,
-            )
-            .await;
-
-        assert!(
-            second_result
-                .unwrap_err()
-                .contains("already exists")
-        );
-
-        let reloaded_store = TransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-        let transaction = reloaded_store
-            .get(&correlation_id)
-            .await
-            .unwrap();
-        assert_eq!(transaction.surface_id, "channel-1");
-        assert_eq!(transaction.resource_path, "/test");
-
-        let _ = fs::remove_dir_all(&temp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn concurrent_create_transaction_allows_only_one_record() {
-        let temp_dir = std::env::temp_dir().join(format!("x402-test-{}", Uuid::new_v4()));
-        let store = Arc::new(
-            TransactionStore::new(temp_dir.clone())
-                .await
-                .unwrap(),
-        );
-        let payload = mock_payment_payload();
-        let correlation_id = Uuid::new_v4().to_string();
-
-        let first_store = Arc::clone(&store);
-        let first_payload = payload.clone();
-        let first_correlation_id = correlation_id.clone();
-        let first = tokio::spawn(async move {
-            first_store
-                .create_transaction(
-                    first_correlation_id,
-                    "channel-1".to_string(),
-                    "Test Channel".to_string(),
-                    "/test".to_string(),
-                    first_payload,
-                    "Local".to_string(),
-                    None,
-                )
-                .await
-        });
-
-        let second_store = Arc::clone(&store);
-        let second_correlation_id = correlation_id.clone();
-        let second = tokio::spawn(async move {
-            second_store
-                .create_transaction(
-                    second_correlation_id,
-                    "channel-2".to_string(),
-                    "Other Channel".to_string(),
-                    "/other".to_string(),
-                    payload,
-                    "Local".to_string(),
-                    None,
-                )
-                .await
-        });
-
-        let first_result = first.await.unwrap();
-        let second_result = second.await.unwrap();
-        let success_count = [&first_result, &second_result]
-            .iter()
-            .filter(|result| result.is_ok())
-            .count();
-        let duplicate_count = [&first_result, &second_result]
-            .iter()
-            .filter(|result| {
-                result
-                    .as_ref()
-                    .is_err_and(|error| error.contains("already exists"))
-            })
-            .count();
-
-        assert_eq!(success_count, 1);
-        assert_eq!(duplicate_count, 1);
-        assert_eq!(store.list_all().await.len(), 1);
-
         let _ = fs::remove_dir_all(&temp_dir).await;
     }
 }

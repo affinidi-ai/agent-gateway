@@ -150,6 +150,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 type="button"
                 className="btn btn-warning btn-sm"
                 disabled={isSubmitting}
+                data-testid="settings-admin-truncate-metrics-button"
                 onClick={onTruncateMetrics}
               >
                 <i className="fas fa-cut"></i>{' '}
@@ -167,6 +168,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 type="button"
                 className="btn btn-warning btn-sm"
                 disabled={isTruncatingLogs}
+                data-testid="settings-admin-truncate-logs-button"
                 onClick={handleTruncateOldLogs}
               >
                 <i className={isTruncatingLogs ? 'fas fa-spinner fa-spin' : 'fas fa-cut'}></i>{' '}
@@ -215,6 +217,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 type="button"
                 className="btn btn-outline-info btn-sm"
                 disabled={isExporting || !exportPubKey.trim()}
+                data-testid="settings-admin-export-button"
                 onClick={handleExportStorage}
               >
                 <i className={isExporting ? 'fas fa-spinner fa-spin' : 'fas fa-download'}></i>{' '}
@@ -276,6 +279,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 type="button"
                 className="btn btn-outline-warning btn-sm"
                 disabled={isBackingUp}
+                data-testid="settings-admin-backup-button"
                 onClick={handleBackupStorage}
               >
                 <i className={isBackingUp ? 'fas fa-spinner fa-spin' : 'fas fa-download'}></i>{' '}
@@ -319,6 +323,7 @@ const SystemTab: React.FC<SystemTabProps> = ({
                 type="button"
                 className="btn btn-outline-danger btn-sm"
                 disabled={isRestoring}
+                data-testid="settings-admin-restore-button"
                 onClick={handleRestoreStorage}
               >
                 <i className={isRestoring ? 'fas fa-spinner fa-spin' : 'fas fa-upload'}></i>{' '}
@@ -403,15 +408,16 @@ const SystemTab: React.FC<SystemTabProps> = ({
                   disabled={isSubmitting}
                   description={
                     <>
-                      Adds the <code>Agent Pay (delegate payment)</code> provider option to the{' '}
-                      <code>Payment</code> element in the surface builder. UI-only: surfaces already
-                      configured to delegate payment to a connected Agent-Pay gateway continue to
-                      work regardless of this toggle.
+                      Shows the agent-pay UI: the <code>Payment Gateways</code> tab under{' '}
+                      <code>Connections</code>, the <code>Payment</code> element and payment
+                      templates in the surface builder, and <code>Use as payment gateway</code>.
+                      While off, no payment gateway can be added; surfaces that already take
+                      payments keep their Payment element and keep working.
                     </>
                   }
                   onChangeMessages={{
-                    on: 'Agent-Pay delegation shown in the Payment element.',
-                    off: 'Agent-Pay delegation hidden from the Payment element.',
+                    on: 'Agent-pay shown.',
+                    off: 'Agent-pay hidden.',
                   }}
                   featureFlags={featureFlags}
                   updateSettings={updateSettings}

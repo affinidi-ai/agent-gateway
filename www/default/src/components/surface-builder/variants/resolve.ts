@@ -57,28 +57,24 @@ const TARGET_FIELDS = [
   'a2a_proxy_id',
   'mcp_identity_config',
   'fabric_target_name',
-  'mpp_auto_pay',
-  'mpp_auto_pay_max_amount',
   'fabric_delegated_credentials',
+  'delegated_credentials_for_fabric_callers',
 ] as const;
 
 const SHARED_TRANSIT_FIELDS = [
-  'transit_token_mode',
   'transit_policy',
   'rate_limit',
-  'sign_requests',
   'workload_binding',
   'extension_rules',
   'custom_metadata',
   'response_extension_rules',
   'opa_policy_definition_id',
-  'source_auth',
 ] as const;
 
 /**
  * Surface-level access point fields. The URL identifiers identify the
  * listener and route, and `a2a` (accepted A2A versions and message
- * validation) is surface-level on the backend, so all of them MUST be
+ * validation) and `public` are surface-level on the backend, so all of them MUST be
  * identical across the base surface and every variant — a variant can never
  * carry a different URL or A2A settings. They are never emitted as
  * per-variant overrides: `computeOverridesFromPayload` omits them and
@@ -90,6 +86,7 @@ export const ACCESS_POINT_IDENTIFIER_FIELDS = [
   'protocol',
   'name',
   'a2a',
+  'public',
 ] as const;
 
 /**
@@ -193,6 +190,31 @@ function pickFields<T extends string>(
  * resolver is happy with full replacement because `Some(v)` simply wins
  * over base.
  */
+/**
+ * A variant's Transit Point without `per_caller_rate_limit`: the gateway
+ * limits it by the base surface's point of the same alias and refuses a
+ * variant point that sets another limit, so a variant never stores one.
+ */
+function withoutPerCallerRateLimit(point: any): any {
+  if (!point || typeof point !== 'object') return point;
+  const { per_caller_rate_limit: _enforcedFromBase, ...rest } = point;
+  return rest;
+}
+
+/**
+ * A variant's Transit Points showing the per-caller rate limit the gateway
+ * enforces on them: that of the base surface's point of the same alias.
+ */
+function withBasePerCallerRateLimits(points: any[], basePoints: unknown): any[] {
+  const base = Array.isArray(basePoints) ? basePoints : [];
+  return points.map(point => {
+    if (!point || typeof point !== 'object') return point;
+    const limit = base.find((b: any) => b?.alias === point.alias)?.per_caller_rate_limit;
+    const rest = withoutPerCallerRateLimit(point);
+    return limit ? { ...rest, per_caller_rate_limit: limit } : rest;
+  });
+}
+
 export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
   const out: SurfaceOverrides = { complete: true };
   const ap = pickFields(payload?.access_point, ACCESS_POINT_FIELDS);
@@ -207,7 +229,9 @@ export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
     // this an empty array drops out of the override and the backend
     // resolver inherits base's TPs, causing deleted TPs to
     // "resurrect" on save / reload.
-    transitOverride.points = Array.isArray(transit.points) ? transit.points : [];
+    transitOverride.points = (Array.isArray(transit.points) ? transit.points : []).map(
+      withoutPerCallerRateLimit
+    );
     const shared = pickFields(transit.shared, SHARED_TRANSIT_FIELDS);
     if (shared) transitOverride.shared = shared;
     out.transit = transitOverride;
@@ -235,9 +259,12 @@ export function computeOverridesFromPayload(payload: any): SurfaceOverrides {
   if (slots && typeof slots === 'object' && Object.keys(slots).length > 0) {
     out.identity_slots = slots;
   }
-  if (Array.isArray(payload?.outbound_credentials)) {
-    out.outbound_credentials = payload.outbound_credentials;
-  }
+  // Always emitted, an empty list included: the gateway keeps the base
+  // surface's bindings for a variant that leaves the list out, even a
+  // complete one, while this snapshot (like `resolveVariant`) has none.
+  out.outbound_credentials = Array.isArray(payload?.outbound_credentials)
+    ? payload.outbound_credentials
+    : [];
   return out;
 }
 
@@ -280,7 +307,7 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
         const baseTransit = (out.transit ?? {}) as Record<string, unknown>;
         out.transit = {
           outbound_listen_address: baseTransit.outbound_listen_address,
-          points: overrides.transit.points ?? [],
+          points: withBasePerCallerRateLimits(overrides.transit.points ?? [], baseTransit.points),
           shared: overrides.transit.shared ?? {},
         };
       }
@@ -310,7 +337,7 @@ export function resolveVariant(base: any, overrides: SurfaceOverrides | undefine
         out.transit && typeof out.transit === 'object' ? out.transit : { points: [], shared: {} };
       const merged = { ...baseTransit };
       if (overrides.transit.points) {
-        merged.points = overrides.transit.points;
+        merged.points = withBasePerCallerRateLimits(overrides.transit.points, baseTransit.points);
       }
       if (overrides.transit.shared) {
         merged.shared = { ...(merged.shared ?? {}), ...overrides.transit.shared };

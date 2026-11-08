@@ -16,6 +16,7 @@ pub struct AgentSurfaceFixture {
     pub transit_points: HashMap<String, TransitPointFixture>,
     pub mcp_http: Option<Value>,
     pub a2a_settings: Option<Value>,
+    pub tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,10 +25,12 @@ pub struct AccessPointFixture {
     pub route: String,
     pub protocol: String,
     pub caller_authentication_methods: Vec<Value>,
+    pub protected_resource: Option<Value>,
     pub inbound_policy_definition_id: Option<String>,
     pub agent_card_path: Option<String>,
     pub didwebvh_identity_id: Option<String>,
     pub caller_trust_check_list: Vec<Value>,
+    pub trust_recorder_entries: Vec<Value>,
     pub rate_limit: Option<Value>,
 }
 impl Default for AccessPointFixture {
@@ -37,10 +40,12 @@ impl Default for AccessPointFixture {
             route: "".to_string(),
             protocol: "".to_string(),
             caller_authentication_methods: Vec::new(),
+            protected_resource: None,
             inbound_policy_definition_id: None,
             agent_card_path: None,
             didwebvh_identity_id: None,
             caller_trust_check_list: Vec::new(),
+            trust_recorder_entries: Vec::new(),
             rate_limit: None,
         }
     }
@@ -83,7 +88,6 @@ pub struct TargetFixture {
     pub custom_metadata: Option<Value>,
     pub policy: Option<String>,
     pub response_policy: Option<String>,
-    pub trust_check_list: Vec<Value>,
 }
 
 impl Default for TargetFixture {
@@ -101,7 +105,6 @@ impl Default for TargetFixture {
             custom_metadata: None,
             policy: None,
             response_policy: None,
-            trust_check_list: Vec::new(),
         }
     }
 }
@@ -126,10 +129,12 @@ impl AgentSurfaceFixture {
                 route: route.into(),
                 protocol: protocol.into(),
                 caller_authentication_methods: Vec::new(),
+                protected_resource: None,
                 inbound_policy_definition_id: None,
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                trust_recorder_entries: Vec::new(),
                 rate_limit: None,
             },
             target: TargetFixture {
@@ -145,7 +150,6 @@ impl AgentSurfaceFixture {
                 custom_metadata: None,
                 policy: None,
                 response_policy: None,
-                trust_check_list: Vec::new(),
             },
             outbound_credentials: Vec::new(),
             transit: None,
@@ -153,6 +157,7 @@ impl AgentSurfaceFixture {
             transit_points: HashMap::new(),
             mcp_http: None,
             a2a_settings: None,
+            tenant_id: None,
         }
     }
 
@@ -163,6 +168,15 @@ impl AgentSurfaceFixture {
         self.access_point
             .caller_authentication_methods
             .push(method);
+        self
+    }
+
+    pub fn with_caller_protected_resource(
+        mut self,
+        protected_resource: Value,
+    ) -> Self {
+        self.access_point
+            .protected_resource = Some(protected_resource);
         self
     }
 
@@ -212,13 +226,13 @@ impl AgentSurfaceFixture {
         self
     }
 
-    pub fn with_target_trust_check_element(
+    pub fn with_trust_recorder_entry(
         mut self,
-        element: Value,
+        entry: Value,
     ) -> Self {
-        self.target
-            .trust_check_list
-            .push(element);
+        self.access_point
+            .trust_recorder_entries
+            .push(entry);
         self
     }
 
@@ -353,6 +367,12 @@ impl AgentSurfaceFixture {
             access_point["caller_authentication"] = json!({
                 "methods": self.access_point.caller_authentication_methods,
             });
+            if let Some(protected_resource) = &self
+                .access_point
+                .protected_resource
+            {
+                access_point["caller_authentication"]["protected_resource"] = protected_resource.clone();
+            }
         }
         if let Some(policy_definition_id) = &self
             .access_point
@@ -387,6 +407,13 @@ impl AgentSurfaceFixture {
                     .caller_trust_check_list
                     .clone(),
             );
+        }
+        if !self
+            .access_point
+            .trust_recorder_entries
+            .is_empty()
+        {
+            access_point["trust_recorder"] = json!({ "entries": self.access_point.trust_recorder_entries });
         }
 
         let mut target = json!({
@@ -436,17 +463,6 @@ impl AgentSurfaceFixture {
         if let Some(custom_metadata) = &self.target.custom_metadata {
             target["custom_metadata"] = custom_metadata.clone();
         }
-        if !self
-            .target
-            .trust_check_list
-            .is_empty()
-        {
-            target["trust_check_list"] = Value::Array(
-                self.target
-                    .trust_check_list
-                    .clone(),
-            );
-        }
 
         let mut surface = json!({
             "surface_id": self.surface_id,
@@ -474,6 +490,9 @@ impl AgentSurfaceFixture {
         if let Some(a2a) = &self.a2a_settings {
             surface["access_point"]["a2a"] = a2a.clone();
         }
+        if let Some(tenant_id) = &self.tenant_id {
+            surface["tenant_id"] = json!(tenant_id);
+        }
         if !self.identity_slots.is_empty() {
             surface["identity_slots"] = Value::Object(
                 self.identity_slots
@@ -497,6 +516,7 @@ impl AgentSurfaceFixture {
                         "listen_address": tp.listen_address.clone().unwrap_or_default(),
                         "listen_path": tp.listen_path.clone().unwrap_or_default(),
                         "require_transit_token": false,
+                        "allow_unauthenticated_callers": true,
                     });
                     if let Some(policy) = &tp.policy {
                         tp_json["policy"] = serde_json::json!({
@@ -514,7 +534,6 @@ impl AgentSurfaceFixture {
             if !transit.is_object() {
                 transit = serde_json::json!({});
             }
-            transit["sign_requests"] = serde_json::json!(true);
             transit["transit_token_mode"] = serde_json::json!("embedded");
             transit["points"] = serde_json::json!(transit_points_json);
             surface["transit"] = transit;
@@ -546,10 +565,12 @@ impl Default for AgentSurfaceFixture {
                 route: "".to_string(),
                 protocol: "".to_string(),
                 caller_authentication_methods: Vec::new(),
+                protected_resource: None,
                 inbound_policy_definition_id: None,
                 agent_card_path: None,
                 didwebvh_identity_id: None,
                 caller_trust_check_list: Vec::new(),
+                trust_recorder_entries: Vec::new(),
                 rate_limit: None,
             },
             target: TargetFixture {
@@ -565,7 +586,6 @@ impl Default for AgentSurfaceFixture {
                 custom_metadata: None,
                 policy: None,
                 response_policy: None,
-                trust_check_list: Vec::new(),
             },
             outbound_credentials: Vec::new(),
             transit: None,
@@ -573,6 +593,7 @@ impl Default for AgentSurfaceFixture {
             transit_points: HashMap::new(),
             mcp_http: None,
             a2a_settings: None,
+            tenant_id: None,
         }
     }
 }

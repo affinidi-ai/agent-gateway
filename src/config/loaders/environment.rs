@@ -24,64 +24,37 @@ pub fn env_or(
 mod tests {
     use super::*;
 
+    // Set by `.cargo/config.toml` `[env]`.
+    const PRESENT: &str = "AG_TEST_PRESENT_VAR";
+    const MISSING: &str = "AG_TEST_NEVER_SET_VAR_3F9C";
+
     #[test]
     fn test_required_env_success() {
-        unsafe {
-            std::env::set_var("TEST_VAR", "value");
-        }
-
-        assert_eq!(required_env("TEST_VAR").unwrap(), "value");
-
-        unsafe {
-            std::env::remove_var("TEST_VAR");
-        }
+        assert_eq!(required_env(PRESENT).unwrap(), "value");
     }
 
     #[test]
     fn test_required_env_missing() {
-        unsafe {
-            std::env::remove_var("MISSING_VAR");
-        }
-        assert!(required_env("MISSING_VAR").is_err());
+        assert!(required_env(MISSING).is_err());
     }
 
     #[test]
     fn test_optional_env_present() {
-        unsafe {
-            std::env::set_var("OPT_VAR", "value");
-        }
-        assert_eq!(optional_env("OPT_VAR"), Some("value".to_string()));
-
-        unsafe {
-            std::env::remove_var("OPT_VAR");
-        }
+        assert_eq!(optional_env(PRESENT), Some("value".to_string()));
     }
 
     #[test]
     fn test_optional_env_missing() {
-        unsafe {
-            std::env::remove_var("MISSING_OPT");
-        }
-        assert_eq!(optional_env("MISSING_OPT"), None);
+        assert_eq!(optional_env(MISSING), None);
     }
 
     #[test]
     fn test_env_or_present() {
-        unsafe {
-            std::env::set_var("ENV_VAR", "actual");
-        }
-        assert_eq!(env_or("ENV_VAR", "default"), "actual");
-
-        unsafe {
-            std::env::remove_var("ENV_VAR");
-        }
+        assert_eq!(env_or(PRESENT, "default"), "value");
     }
 
     #[test]
     fn test_env_or_missing_uses_default() {
-        unsafe {
-            std::env::remove_var("MISSING");
-        }
-        assert_eq!(env_or("MISSING", "default"), "default");
+        assert_eq!(env_or(MISSING, "default"), "default");
     }
 }

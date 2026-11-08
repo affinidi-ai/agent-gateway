@@ -1,30 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
-import AddResourceLink from '../../../shared/AddResourceLink';
-import { deepLinks } from '../../../../utils/deepLinks';
-import { ENABLE_MPP_PAYWALL } from '../../../../utils/featureFlags';
-import { filterSelectableGateways } from '../../../../utils/gateways';
 import type { ConfigPanelProps } from '../types';
 import FieldHelp from '../../../shared/FieldHelp';
 import FabricDelegatedCredentialsSection, {
   fabricPeerGatewayId,
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
+import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
+import {
+  loadFabricGateways,
+  parseFabricEndpoint,
+  surfaceMatchesProtocol,
+  useGatewaySurfaces,
+} from '../_shared/useGatewaySurfaces';
+import AgentCardFetchLine from '../../agent-card/AgentCardFetchLine';
+import PartnerGrantReleaseSection, { isHttpTarget } from './PartnerGrantReleaseSection';
 import A2aProxyEndpointFields, { type A2aProxyOption } from './A2aProxyEndpointFields';
-
-interface Gateway {
-  id: string;
-  name: string;
-  gateway_type: string;
-  creation_type: string;
-}
-
-interface GatewayChannel {
-  config_id: string;
-  name: string;
-  protocol?: string;
-}
 
 interface McpProxy {
   id: string;
@@ -42,11 +34,6 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
   openFullscreenEditor,
   allNodes,
 }) => {
-  const [gateways, setGateways] = useState<Gateway[]>([]);
-  const [gatewayChannels, setGatewayChannels] = useState<GatewayChannel[]>([]);
-  const [isLoadingChannels, setIsLoadingChannels] = useState(false);
-  const [channelsError, setChannelsError] = useState<string | null>(null);
-  const [channelsRefreshTick, setChannelsRefreshTick] = useState(0);
   const [mcpProxies, setMcpProxies] = useState<McpProxy[]>([]);
   const [a2aProxies, setA2aProxies] = useState<A2aProxyOption[]>([]);
 
@@ -55,17 +42,41 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
   // would silently drift from the saved wire shape (e.g. a saved
   // `fabric://...` endpoint would render as Direct URL on reload).
   const endpointType: 'url' | 'gateway' | 'mcp-proxy' | 'a2a-proxy' = config.endpoint_type || 'url';
-  const selectedGatewayId: string = config.gateway_id || '';
-  const selectedGatewayChannel: string = config.gateway_channel || '';
+  const fabricRoute = parseFabricEndpoint(config.endpoint);
+  const selectedGatewayId: string = config.gateway_id || fabricRoute?.gatewayId || '';
+  const selectedGatewayChannel: string = config.gateway_channel || fabricRoute?.surfaceId || '';
+  const gatewayState = useGatewaySurfaces({
+    enabled: endpointType === 'gateway' || !!fabricRoute,
+    gatewayId: endpointType === 'gateway' ? selectedGatewayId : '',
+    loadGateways: loadFabricGateways,
+  });
+  const compatibleSurfaces = useMemo(
+    () => gatewayState.surfaces.filter(s => surfaceMatchesProtocol(s, protocol)),
+    [gatewayState.surfaces, protocol]
+  );
 
-  useEffect(() => {
-    apiClient
-      .get('/gateways')
-      .then(res => {
-        setGateways(filterSelectableGateways(res.data));
-      })
-      .catch(() => {});
-  }, []);
+  const selectGateway = (id: string) => {
+    if (id === selectedGatewayId) return;
+    updateFields({
+      gateway_id: id,
+      gateway_channel: '',
+      endpoint: '',
+      fabric_remote_gateway_name: '',
+      fabric_remote_channel_name: '',
+    });
+  };
+
+  const selectSurface = (id: string) => {
+    const surface = compatibleSurfaces.find(s => s.config_id === id);
+    const gateway = gatewayState.gateways.find(g => g.id === selectedGatewayId);
+    updateFields({
+      gateway_id: selectedGatewayId,
+      gateway_channel: id,
+      endpoint: id ? `fabric://${selectedGatewayId}/${id}` : '',
+      fabric_remote_channel_name: surface?.name || '',
+      fabric_remote_gateway_name: config.fabric_remote_gateway_name || gateway?.name || '',
+    });
+  };
 
   useEffect(() => {
     if (endpointType !== 'mcp-proxy') return;
@@ -89,41 +100,18 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
       .catch(() => setA2aProxies([]));
   }, [endpointType]);
 
-  useEffect(() => {
-    if (!selectedGatewayId || endpointType !== 'gateway') return;
-    setIsLoadingChannels(true);
-    setChannelsError(null);
-    const force = channelsRefreshTick > 0 ? '?force_refresh=true' : '';
-    apiClient
-      .get(`/gateways/${selectedGatewayId}/surfaces${force}`)
-      .then(res => {
-        const data = res.data;
-        const channels = Array.isArray(data) ? data : data?.channels || [];
-        setGatewayChannels(channels);
-      })
-      .catch(err => {
-        setGatewayChannels([]);
-        const msg = err?.message || String(err);
-        if (msg.toLowerCase().includes('not connected') || msg.includes('503')) {
-          setChannelsError(
-            'Gateway is not currently connected. Channel list cannot be fetched until the remote gateway re-establishes its WebSocket session.'
-          );
-        } else if (msg.includes('404')) {
-          setChannelsError('Gateway not found.');
-        } else {
-          setChannelsError(`Failed to load channels: ${msg}`);
-        }
-      })
-      .finally(() => setIsLoadingChannels(false));
-  }, [selectedGatewayId, endpointType, channelsRefreshTick]);
-
   return (
     <>
       <div className="config-section">
         <label>Endpoint</label>
         <Form.Group className="mb-2">
           <div className="d-flex align-items-center gap-1 mb-1">
-            <Form.Label className="small text-muted mb-0">Endpoint Type</Form.Label>
+            <Form.Label
+              htmlFor="managed-agent-endpoint-type-select"
+              className="small text-muted mb-0"
+            >
+              Endpoint Type
+            </Form.Label>
             <FieldHelp
               testId="field-help-managed-agent-endpoint-type"
               ariaLabel="About Endpoint Type"
@@ -149,7 +137,9 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             </FieldHelp>
           </div>
           <Form.Select
+            id="managed-agent-endpoint-type-select"
             size="sm"
+            data-testid="managed-agent-endpoint-type-select"
             value={endpointType}
             onChange={e => {
               const newType = e.target.value as 'url' | 'gateway' | 'mcp-proxy' | 'a2a-proxy';
@@ -189,12 +179,14 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
 
         {endpointType === 'url' && (
           <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-1">
+            <Form.Label htmlFor="managed-agent-endpoint-input" className="small text-muted mb-1">
               Target Endpoint URL <span className="text-danger">*</span>
             </Form.Label>
             <Form.Control
+              id="managed-agent-endpoint-input"
               size="sm"
               type="text"
+              data-testid="managed-agent-endpoint-input"
               value={config.endpoint || ''}
               onChange={e => updateField('endpoint', e.target.value)}
               isInvalid={!!errorByField?.endpoint}
@@ -213,142 +205,55 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
 
         {endpointType === 'gateway' && (
           <>
-            <Form.Group className="mb-2">
-              <div className="d-flex align-items-center gap-1 mb-1">
-                <Form.Label className="small text-muted mb-0">Gateway</Form.Label>
-                <FieldHelp testId="field-help-managed-agent-gateway" ariaLabel="About Gateway">
+            <GatewaySurfacePicker
+              testIdPrefix="managed-agent"
+              state={gatewayState}
+              gatewayId={selectedGatewayId}
+              surfaceId={selectedGatewayChannel}
+              surfaces={compatibleSurfaces}
+              onGatewayChange={selectGateway}
+              onSurfaceChange={selectSurface}
+              gatewayLabel="Gateway"
+              gatewayPlaceholder="Select a gateway…"
+              gatewayHelp={
+                <>
                   <p>
                     Pick which connected remote Agent Gateway hosts the actual agent you want to
                     reach (a gateway your team has already connected to, not a general internet
                     address).
                   </p>
-                  <p>
-                    After picking one, you'll choose the specific agent surface on it to target.
+                  <p className="mb-0">
+                    After picking one, you&apos;ll choose the specific agent surface on it to
+                    target.
                   </p>
-                </FieldHelp>
-              </div>
-              <Form.Select
-                size="sm"
-                value={selectedGatewayId}
-                onChange={e => {
-                  const gwId = e.target.value;
-                  setGatewayChannels([]);
-                  updateFields({ gateway_id: gwId, gateway_channel: '', endpoint: '' });
-                }}
-              >
-                <option value="">-- Select a Gateway --</option>
-                {gateways.map(gw => (
-                  <option key={gw.id} value={gw.id}>
-                    {gw.name}
-                  </option>
-                ))}
-              </Form.Select>
-              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-                {gateways.length === 0
-                  ? 'No remote gateways connected yet. '
-                  : "Don't see the one you need? "}
-                <AddResourceLink
-                  to={deepLinks.remoteGateway}
-                  testid="managed-agent-add-gateway-link"
-                >
-                  Add Gateway
-                </AddResourceLink>
-              </Form.Text>
-            </Form.Group>
-            {selectedGatewayId &&
-              (() => {
-                const filteredChannels = protocol
-                  ? gatewayChannels.filter(
-                      ch => !ch.protocol || ch.protocol.toLowerCase() === protocol.toLowerCase()
-                    )
-                  : gatewayChannels;
-                return (
-                  <Form.Group className="mb-2">
-                    <div className="d-flex justify-content-between align-items-center mb-1">
-                      <div className="d-flex align-items-center gap-1">
-                        <Form.Label className="small text-muted mb-0">
-                          Agent Surface on Gateway
-                        </Form.Label>
-                        <FieldHelp
-                          testId="field-help-managed-agent-agent-surface-on-gateway"
-                          ariaLabel="About Agent Surface on Gateway"
-                        >
-                          <p>
-                            Choose which agent (an "Agent Surface") on the selected remote gateway
-                            this node should call.
-                          </p>
-                          <p>
-                            The list loads live from that gateway; if it's empty, either nothing
-                            matching this protocol has been published there yet, or the gateway is
-                            temporarily offline. Use refresh to try again.
-                          </p>
-                        </FieldHelp>
-                      </div>
-                      <button
-                        type="button"
-                        className="btn btn-link btn-sm p-0"
-                        style={{ fontSize: '10px' }}
-                        title="Refresh channel list from gateway"
-                        onClick={() => setChannelsRefreshTick(t => t + 1)}
-                        disabled={isLoadingChannels}
-                      >
-                        <i className={`fas fa-sync-alt ${isLoadingChannels ? 'fa-spin' : ''}`} />
-                      </button>
-                    </div>
-                    <Form.Select
-                      size="sm"
-                      value={selectedGatewayChannel}
-                      onChange={e => {
-                        const chId = e.target.value;
-                        const ch = filteredChannels.find(c => c.config_id === chId);
-                        const gw = gateways.find(g => g.id === selectedGatewayId);
-                        // Auto-populate the synth chain display
-                        // names from the real gateway/channel names
-                        // so the canvas reads sensibly straight
-                        // away. Existing user overrides are kept.
-                        const patch: Record<string, any> = {
-                          gateway_channel: chId,
-                          endpoint: `fabric://${selectedGatewayId}/${chId}`,
-                        };
-                        if (!config.fabric_remote_channel_name && ch?.name) {
-                          patch.fabric_remote_channel_name = ch.name;
-                        }
-                        if (!config.fabric_remote_gateway_name && gw?.name) {
-                          patch.fabric_remote_gateway_name = gw.name;
-                        }
-                        updateFields(patch);
-                      }}
-                      disabled={isLoadingChannels || filteredChannels.length === 0}
-                    >
-                      <option value="">
-                        {isLoadingChannels
-                          ? '-- Loading Agent Surfaces... --'
-                          : '-- Select an Agent Surface --'}
-                      </option>
-                      {filteredChannels.map(ch => (
-                        <option key={ch.config_id} value={ch.config_id}>
-                          {ch.name}
-                        </option>
-                      ))}
-                    </Form.Select>
-                    {!isLoadingChannels && channelsError && (
-                      <Form.Text className="text-danger" style={{ fontSize: '10px' }}>
-                        {channelsError}
-                      </Form.Text>
-                    )}
-                    {!isLoadingChannels &&
-                      !channelsError &&
-                      filteredChannels.length === 0 &&
-                      selectedGatewayId && (
-                        <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-                          {gatewayChannels.length === 0
-                            ? 'The remote gateway reported no published Agent Surfaces.'
-                            : `No ${protocol?.toUpperCase() || ''} Agent Surfaces on this gateway (${gatewayChannels.length} of other protocols hidden).`}
-                        </Form.Text>
-                      )}
-                  </Form.Group>
-                );
-              })()}
+                </>
+              }
+              noGatewayTitle="No connected gateway"
+              noGatewayText="Connect another Agent Gateway first, then select it here."
+              savedGatewayName={config.fabric_remote_gateway_name}
+              surfaceLabel="Agent Surface on Gateway"
+              surfacePlaceholder="Select an Agent Surface…"
+              surfaceHelp={
+                <>
+                  <p>
+                    Choose which agent (an &quot;Agent Surface&quot;) on the selected remote gateway
+                    this node should call.
+                  </p>
+                  <p className="mb-0">
+                    The list loads live from that gateway; if it&apos;s empty, either nothing
+                    matching this protocol has been published there yet, or the gateway is
+                    temporarily offline. Use Refresh to try again.
+                  </p>
+                </>
+              }
+              emptySurfacesText="The remote gateway reported no published Agent Surfaces. Publish one there, then Refresh."
+              hiddenSurfacesText={
+                protocol
+                  ? `No ${protocol.toUpperCase()} Agent Surfaces on this gateway (${gatewayState.surfaces.length} of other protocols hidden).`
+                  : undefined
+              }
+              savedSurfaceLabel={id => `${config.fabric_target_name || id} (not currently exposed)`}
+            />
             <Form.Group className="mb-2">
               <Form.Label className="small text-muted mb-1">Display name (optional)</Form.Label>
               <Form.Control
@@ -458,6 +363,7 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
             </div>
             <Form.Select
               size="sm"
+              data-testid="managed-agent-auth-type"
               value={config.target_auth_enabled ? config.target_auth_type || 'bearer' : 'none'}
               onChange={e => {
                 const v = e.target.value;
@@ -500,6 +406,8 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
         </div>
       )}
 
+      <AgentCardFetchLine />
+
       <div className="config-section">
         <label>Identity Binding VP</label>
         <Form.Check
@@ -538,43 +446,19 @@ const ManagedAgentPanel: React.FC<ConfigPanelProps> = ({
           testIdPrefix="managed-agent"
           checked={config.fabric_delegated_credentials === true}
           peerName={
-            gateways.find(g => g.id === fabricPeerGatewayId(config.endpoint, selectedGatewayId))
-              ?.name
+            gatewayState.gateways.find(
+              g => g.id === fabricPeerGatewayId(config.endpoint, selectedGatewayId)
+            )?.name
           }
           onChange={next => updateField('fabric_delegated_credentials', next)}
         />
       )}
 
-      {ENABLE_MPP_PAYWALL && config.endpoint?.startsWith('fabric://') && (
-        <div className="config-section">
-          <label>MPP Auto-Pay</label>
-          <Form.Check
-            type="switch"
-            id="mpp-autopay"
-            label="Automatically pay MPP challenges"
-            checked={config.mpp_auto_pay || false}
-            onChange={e => updateField('mpp_auto_pay', e.target.checked)}
-          />
-          {config.mpp_auto_pay && (
-            <Form.Group className="mt-2">
-              <Form.Label className="small text-muted mb-1">Max amount per request</Form.Label>
-              <Form.Control
-                size="sm"
-                type="text"
-                placeholder="1.00"
-                value={config.mpp_auto_pay_max_amount || ''}
-                onChange={e => updateField('mpp_auto_pay_max_amount', e.target.value)}
-              />
-              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-                A safety cap on the amount per request. This isn&apos;t tied to a specific currency:
-                set it assuming the same denomination the target&apos;s payment challenges will use
-                (for example, USD for a card-based target, or the token&apos;s base unit for a
-                crypto-based one). The gateway compares the numbers only, it doesn&apos;t convert or
-                verify units.
-              </Form.Text>
-            </Form.Group>
-          )}
-        </div>
+      {isHttpTarget(config.endpoint) && hasOutboundCredentialBindings(allNodes) && (
+        <PartnerGrantReleaseSection
+          checked={config.delegated_credentials_for_fabric_callers === true}
+          onChange={next => updateField('delegated_credentials_for_fabric_callers', next)}
+        />
       )}
     </>
   );

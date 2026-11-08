@@ -56,8 +56,6 @@ pub struct ProxyState {
     pub policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
     pub gateway_policy_manager: Option<Arc<crate::policies::GatewayPolicyManager>>,
     pub didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
-    pub transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-    pub mpp_transaction_store: Option<Arc<crate::mpp::MppTransactionStore>>,
 
     /// Optional trust registry listener manager for agent trust OPA context building
     pub trust_registry_listener_manager: Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>,
@@ -76,6 +74,11 @@ pub struct ProxyState {
 
     /// Delegation vault store for cached OAuth tokens
     pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
+
+    /// The test allow-list of fixtures Strict egress admits for a request
+    /// carrying the Access Point Target's grant by binding
+    /// ([`crate::egress::bdd_egress_allowlist`]); `None` in production.
+    pub egress_allowlist: Option<String>,
 
     /// Gateway base URL for building OAuth callback URLs
     pub gateway_base_url: Option<String>,
@@ -99,17 +102,18 @@ pub struct ProxyState {
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
 
-    /// Set when the requested alias could not select a variant and the
-    /// request fell back to the base surface. Legacy requests keep that
-    /// fallback; admitted modern requests are rejected instead.
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
-
     /// Resolved [`AgentSurface`] for this request — the source of
     /// truth for the hot path. Looked up from
     /// [`crate::surfaces::ResolvedSurfaceCache`] by `(surface_id,
     /// active_variant_alias)` so every variant override is already
     /// applied.
     pub surface: Arc<crate::config::agent_surface::AgentSurface>,
+
+    /// The surface as it is served, its base and every variant, before
+    /// [`Self::surface`] resolved this request's variant: the Target's grant
+    /// by binding is released only within every place that serves its
+    /// binding.
+    pub served_surface: Arc<crate::config::agent_surface::AgentSurface>,
 }
 
 /// Surface info with routing support (includes rules engines and identity selector)
@@ -134,4 +138,37 @@ pub struct SurfaceInfo {
     pub task_id: String,
     /// Pre-compiled engines for each virtual channel variant (keyed by variant_id)
     pub variant_engines: HashMap<String, VariantEngines>,
+}
+
+impl SurfaceInfo {
+    /// The engines a request runs with: the channel-level engines in base mode
+    /// (`variant_id` `None`), else the selected variant's pre-compiled engines,
+    /// `None` when that variant has none.
+    pub fn engines_for(
+        &self,
+        variant_id: Option<&str>,
+    ) -> Option<VariantEngines> {
+        match variant_id {
+            Some(id) => self
+                .variant_engines
+                .get(id)
+                .cloned(),
+            None => Some(VariantEngines {
+                identity_rules_engine: self
+                    .identity_rules_engine
+                    .clone(),
+                identity_selector: self.identity_selector.clone(),
+                protected_rules_engine: self
+                    .protected_rules_engine
+                    .clone(),
+                protected_selector: self
+                    .protected_selector
+                    .clone(),
+                external_rules_engine: self
+                    .external_rules_engine
+                    .clone(),
+                external_selector: self.external_selector.clone(),
+            }),
+        }
+    }
 }

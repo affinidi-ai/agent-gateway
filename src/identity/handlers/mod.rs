@@ -2,6 +2,7 @@
 pub mod agents;
 pub mod audit_log;
 pub mod config;
+mod credential_policy_report;
 pub mod credentials;
 pub mod debug_export;
 pub mod didcomm;
@@ -14,7 +15,9 @@ pub mod onboarding;
 pub mod policy_definitions;
 pub mod policy_validation;
 pub mod settings;
-mod surface_tenancy;
+pub(crate) mod surface_grants;
+mod surface_target_auth;
+pub(crate) mod surface_tenancy;
 pub mod surfaces;
 pub mod tenant_ownership;
 pub mod trust_check_predefined;
@@ -26,6 +29,7 @@ pub use agents::get_agents;
 pub use config::{
     get_networking_config, get_payment_policy, get_surface_routing_config, reload_configuration, reload_single_channel,
 };
+pub(crate) use credential_policy_report::report_credential_policy;
 pub use credentials::{
     get_did_document, issue_credential, resolve_did_document, resolve_did_document_spec, serve_agent_did_document,
     serve_gateway_did_document, serve_gateway_did_jsonl, serve_gateway_did_witness, serve_surface_did_jsonl,
@@ -50,8 +54,9 @@ pub use policy_definitions::{
 pub use policy_validation::validate_policy;
 pub use settings::{get_audit_event_catalog, get_settings, reset_settings, update_settings};
 pub use surfaces::{
-    create_surface, create_variant, delete_surface, delete_variant, get_resolved_variant, get_surface, list_surfaces,
-    promote_variant_to_default, update_surface, update_variant,
+    create_surface, create_variant, delete_surface, delete_variant, get_resolved_variant, get_surface,
+    get_surface_agent_card, get_trust_recorder_status, list_surfaces, promote_variant_to_default,
+    refresh_surface_agent_card, update_surface, update_variant,
 };
 pub use trust_check_predefined::list_predefined_trust_check_queries;
 pub use user_settings::{get_user_settings, get_user_settings_overrides, reset_user_settings, update_user_settings};

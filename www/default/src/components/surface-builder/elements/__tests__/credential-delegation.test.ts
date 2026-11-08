@@ -1,5 +1,9 @@
 import { registry } from '../index';
 import { credentialDelegationDefinition } from '../credential-delegation/definition';
+import {
+  outboundCredentialApiToForm,
+  outboundCredentialFormToApi,
+} from '../_shared/OutboundCredentialsListSection';
 import type { PayloadContext, SurfaceContext } from '../types';
 
 /**
@@ -244,6 +248,19 @@ describe('credential-delegation definition', () => {
       expect(identityRule.check(credNode.config, ctx)).toBe(false);
     });
 
+    it('needs no agent identity for an Access Point Target binding with external consent', () => {
+      const deps = credentialDelegationDefinition.featureDependencies!;
+      const identityRule = deps.find(d => /agent identity/i.test(d.description))!;
+      const external = {
+        outbound_credentials_form: [
+          { ...sampleBindingRow, consent_mode: 'external' as const, subject: 'owner' as const },
+        ],
+      };
+      expect(identityRule.condition(external, ctxWith([callerAuth]))).toBe(false);
+      const sourceAuthRule = deps.find(d => /source authentication/i.test(d.description))!;
+      expect(sourceAuthRule.condition(external, ctxWith([]))).toBe(true);
+    });
+
     it('passes both bindings rules when caller-auth and identity are present', () => {
       const deps = credentialDelegationDefinition.featureDependencies!;
       const ctx = ctxWith([callerAuth, identity]);
@@ -295,5 +312,101 @@ describe('credential-delegation definition', () => {
       expect(recovered.some(n => n.type === 'credential-delegation')).toBe(false);
       expect(recovered.some(n => n.type === 'workload-binding')).toBe(false);
     });
+
+    const external = {
+      credential_provider_id: 'vendor',
+      consent_mode: 'external',
+      subject: 'owner',
+    };
+    const bound = {
+      access_point: { route: '/api', protocol: 'mcp' },
+      target: { endpoint: 'https://mcp.vendor.example/mcp' },
+      outbound_credentials: [external],
+    };
+    const blobOf = (nodes: any[]) => ({
+      version: 1,
+      nodes: nodes.map(n => ({ id: n.id, type: n.type, config: n.config, parentId: n.parentId })),
+    });
+
+    it('never restores a binding the stored surface no longer holds from its canvas blob', () => {
+      // The binding moved to a variant, or was removed, outside the
+      // dashboard: the canvas blob still holds the old element.
+      const blob = blobOf(registry.nodesFromPayload(bound));
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      expect(recovered.some(n => n.type === 'credential-delegation')).toBe(false);
+      expect(registry.buildPayload(makeCtx(recovered)).outbound_credentials).toBeUndefined();
+    });
+
+    it('takes a stored binding from the surface, not from its canvas blob', () => {
+      const blob = blobOf(registry.nodesFromPayload(bound));
+      const recovered = registry.nodesFromPayload({ ...bound, canvas: blob });
+      expect(registry.buildPayload(makeCtx(recovered)).outbound_credentials).toEqual([
+        expect.objectContaining({
+          credential_provider_id: 'vendor',
+          consent_mode: 'external',
+          subject: 'owner',
+        }),
+      ]);
+    });
+
+    it('keeps a dropped element that has no binding yet through a reload', () => {
+      const blob = {
+        version: 1,
+        nodes: [
+          { id: 'cd', type: 'credential-delegation', config: { outbound_credentials_form: [] } },
+        ],
+      };
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      expect(recovered.some(n => n.type === 'credential-delegation')).toBe(true);
+    });
+
+    it('keeps an element whose rows name no provider yet through a reload', () => {
+      // Such a row is never saved, as from a template, so the blob is its only copy.
+      const unsaved = { credential_provider_id: '', consent_mode: 'on_demand', scopes: 'read' };
+      const blob = {
+        version: 1,
+        nodes: [
+          {
+            id: 'cd',
+            type: 'credential-delegation',
+            config: { outbound_credentials_form: [unsaved] },
+          },
+        ],
+      };
+      const recovered = registry.nodesFromPayload({
+        ...bound,
+        outbound_credentials: [],
+        canvas: blob,
+      });
+      const node = recovered.find(n => n.type === 'credential-delegation');
+      expect(node?.config.outbound_credentials_form).toEqual([expect.objectContaining(unsaved)]);
+    });
+  });
+});
+
+describe('an Access Point Target binding with external consent', () => {
+  it('keeps its consent mode and subject through the form', () => {
+    for (const subject of ['owner', 'caller']) {
+      const api = {
+        credential_provider_id: 'vendor',
+        scopes: ['read'],
+        required_for: 'all',
+        consent_mode: 'external',
+        subject,
+        inject_as: { type: 'bearer_header' },
+      };
+      const row = outboundCredentialApiToForm(api)!;
+      expect(row.consent_mode).toBe('external');
+      expect(row.subject).toBe(subject);
+      expect(outboundCredentialFormToApi(row)).toEqual(api);
+    }
   });
 });

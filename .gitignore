@@ -13,6 +13,8 @@ graphify-out
 
 # Configuration files with sensitive data
 config.toml
+# Except the cargo config, which holds only test-only values.
+!.cargo/config.toml
 saml.json
 pipes.json
 .env
@@ -75,6 +77,7 @@ tmp/
 proxy/data
 local*
 !www/default/src/**/local-*/
+!scripts/local/
 envs*
 docker
 itest/_storage
@@ -101,3 +104,4 @@ config/certs/openssl.cnf
 
 interop
 
+__pycache__/

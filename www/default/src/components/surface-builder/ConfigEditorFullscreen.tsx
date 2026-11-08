@@ -45,25 +45,26 @@ const ConfigEditorFullscreen: React.FC<ConfigEditorFullscreenProps> = ({
   };
 
   const ctx = buildSurfaceContext(protocol, allNodes);
-  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx);
+  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx, node);
 
   return (
     <div className="surface-builder-fullscreen-body">
-      {warnings.length > 0 && shouldShowDependencyWarnings(node.type, hasAttemptedSave) && (
-        <div className="mb-3">
-          {warnings.map((w, i) => (
-            <div
-              key={i}
-              className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-2 px-3 mb-2`}
-            >
-              <i
-                className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-2`}
-              />
-              {w.message}
-            </div>
-          ))}
-        </div>
-      )}
+      {warnings.length > 0 &&
+        shouldShowDependencyWarnings(node.type, hasAttemptedSave, node.config) && (
+          <div className="mb-3">
+            {warnings.map((w, i) => (
+              <div
+                key={i}
+                className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-2 px-3 mb-2`}
+              >
+                <i
+                  className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-2`}
+                />
+                {w.message}
+              </div>
+            ))}
+          </div>
+        )}
       <Panel
         node={node}
         config={node.config || {}}

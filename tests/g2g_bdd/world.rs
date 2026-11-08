@@ -83,6 +83,8 @@ pub struct TopologyBuilder {
     /// `(gw_index, surface_id)` whose `fabric://` Target receives delegated
     /// credentials. Applied once the fabric routes are ready.
     pub fabric_delegated_credentials: Vec<(usize, String)>,
+    /// Transit Points given a target-leg Trust Check once the fabric routes are ready.
+    pub transit_point_trust_checks: Vec<String>,
 }
 
 impl TopologyBuilder {
@@ -324,6 +326,9 @@ pub struct G2gWorld {
     /// The last consent request a gateway answered a caller with, and the
     /// request it answered.
     pub consent_request: Option<(ConsentRequest, Value)>,
+    /// How many Transit Point calls of a relay between two managed agents
+    /// were answered before one was refused.
+    pub relayed_transit_point_calls: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -365,6 +370,7 @@ impl G2gWorld {
             oauth_providers: HashMap::new(),
             caller_access_tokens: HashMap::new(),
             consent_request: None,
+            relayed_transit_point_calls: None,
         }
     }
 
@@ -491,6 +497,13 @@ impl G2gWorld {
                 .set_fabric_delegated_credentials(*gw_index, surface_id, true)
                 .await
                 .expect("opt the fabric route into delegated credentials");
+        }
+
+        for transit_point in &self
+            .topology
+            .transit_point_trust_checks
+        {
+            add_target_trust_check(&harness, self.transit_point_link(transit_point), transit_point).await;
         }
 
         for gw_index in 1..=count {
@@ -737,4 +750,46 @@ impl G2gWorld {
             })
             .unwrap_or(false)
     }
+}
+
+/// Gives a Transit Point a target-leg Trust Check naming a trust registry stored
+/// through the admin API. The registry never connects, so only the stages before
+/// its query run. The partner's managed agent then forgets the requests it has
+/// served, so a later agent card fetch is the Trust Check's own.
+async fn add_target_trust_check(
+    harness: &MultiGatewayHarness,
+    link: &TransitPointFabricLink,
+    transit_point: &str,
+) {
+    let admin = &harness.gw(link.from_gw).admin;
+    let registry_name = format!("{}-{transit_point}-registry", link.from_surface);
+    let created = admin
+        .create_trust_registry(&registry_name, "Unconnected registry", "http://127.0.0.1:1/unreachable")
+        .await;
+    let registry_id = admin
+        .list_trust_registries()
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"))
+        .into_iter()
+        .find(|registry| registry.name == registry_name)
+        .unwrap_or_else(|| panic!("trust registry '{registry_name}' was not stored: {created:?}"))
+        .id;
+    harness
+        .update_transit_point(link.from_gw, &link.from_surface, transit_point, |surface, index| {
+            surface["trust_check_split"] = serde_json::json!(true);
+            surface["transit"]["points"][index]["trust_check_list"] = serde_json::json!([{
+                "id": format!("{transit_point}-recognition"),
+                "trust_registry_id": registry_id,
+                "query_type": "recognition",
+                "query": { "authority_id": "did:example:authority", "entity_id": "{{ target.did }}" }
+            }]);
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    harness
+        .gw(link.to_gw)
+        .mock(&link.to_surface)
+        .unwrap_or_else(|| panic!("no managed agent backing surface '{}' on gateway {}", link.to_surface, link.to_gw))
+        .clear_requests()
+        .await;
 }

@@ -93,12 +93,14 @@ pub fn record_identity_binding(event: IdentityBindingAuditEvent<'_>) {
     let assurance_str = assurance.unwrap_or_default();
     let caller_fields_str = caller_field_names.join(",");
     let error_detail_str = error_detail.unwrap_or_default();
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
 
     match outcome {
         IdentityBindingOutcome::Invalid => {
             tracing::warn!(
                 target: "identity_binding_audit",
                 surface_id = surface_id,
+                surface_variant = surface_variant.as_deref(),
                 outcome = outcome_str,
                 agent_did = agent_did_str,
                 issuer_gateway = issuer_gateway_str,
@@ -116,6 +118,7 @@ pub fn record_identity_binding(event: IdentityBindingAuditEvent<'_>) {
             tracing::debug!(
                 target: "identity_binding_audit",
                 surface_id = surface_id,
+                surface_variant = surface_variant.as_deref(),
                 outcome = outcome_str,
                 agent_did = agent_did_str,
                 issuer_gateway = issuer_gateway_str,
@@ -428,18 +431,20 @@ mod tests {
     fn verified_event_carries_full_context_at_debug() {
         let caller_fields = vec!["sub".to_string(), "email".to_string()];
         let captured = capture(|| {
-            record_identity_binding(IdentityBindingAuditEvent {
-                surface_id: "surface-a",
-                outcome: IdentityBindingOutcome::Verified,
-                agent_did: Some("did:web:agent.example"),
-                issuer_gateway: Some("did:web:gw1.example"),
-                target: Some("fabric://gw2/alpha"),
-                transit_point: Some("delta"),
-                user_hash: Some("sha256-hash"),
-                assurance: Some("gateway_attested"),
-                delegated: true,
-                caller_field_names: &caller_fields,
-                error_detail: None,
+            crate::observability::policy_audit::with_request_variant("beta", || {
+                record_identity_binding(IdentityBindingAuditEvent {
+                    surface_id: "surface-a",
+                    outcome: IdentityBindingOutcome::Verified,
+                    agent_did: Some("did:web:agent.example"),
+                    issuer_gateway: Some("did:web:gw1.example"),
+                    target: Some("fabric://gw2/alpha"),
+                    transit_point: Some("delta"),
+                    user_hash: Some("sha256-hash"),
+                    assurance: Some("gateway_attested"),
+                    delegated: true,
+                    caller_field_names: &caller_fields,
+                    error_detail: None,
+                })
             });
         });
 
@@ -449,6 +454,7 @@ mod tests {
             .expect("identity binding audit event not captured");
 
         assert_eq!(ev.level, "DEBUG");
+        assert_eq!(field(ev, "surface_variant"), Some("beta"));
         assert_eq!(field(ev, "outcome"), Some("verified"));
         assert_eq!(field(ev, "agent_did"), Some("did:web:agent.example"));
         assert_eq!(field(ev, "issuer_gateway"), Some("did:web:gw1.example"));

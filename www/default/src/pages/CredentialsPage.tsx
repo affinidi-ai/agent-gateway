@@ -61,12 +61,13 @@ const CredentialsPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-credentials">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="credentials-search-input"
             placeholder="Filter JWT Verification, Providers, Tokens, Audit..."
             width="384px"
           />
@@ -84,6 +85,7 @@ const CredentialsPage: React.FC = () => {
       >
         <Tab
           eventKey="jwt-verification"
+          tabAttrs={{ 'data-testid': 'credentials-jwt-verification-tab-trigger' }}
           title={
             <>
               <i className="fas fa-id-badge"></i> JWT Verification {tabBadge(strategiesCount)}
@@ -98,6 +100,7 @@ const CredentialsPage: React.FC = () => {
 
         <Tab
           eventKey="credential-providers"
+          tabAttrs={{ 'data-testid': 'credentials-credential-providers-tab-trigger' }}
           title={
             <>
               <i className="fas fa-id-card"></i> Credential Providers {tabBadge(providersCount)}
@@ -112,6 +115,7 @@ const CredentialsPage: React.FC = () => {
 
         <Tab
           eventKey="credential-tokens"
+          tabAttrs={{ 'data-testid': 'credentials-credential-tokens-tab-trigger' }}
           title={
             <>
               <i className="fas fa-lock"></i> Credential Tokens {tabBadge(tokensCount)}
@@ -127,6 +131,7 @@ const CredentialsPage: React.FC = () => {
         {canViewSts && (
           <Tab
             eventKey="sts-clients"
+            tabAttrs={{ 'data-testid': 'credentials-sts-clients-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-right-left"></i> STS Clients {tabBadge(stsClientsCount)}
@@ -143,6 +148,7 @@ const CredentialsPage: React.FC = () => {
         {canViewAudit && (
           <Tab
             eventKey="credential-audit"
+            tabAttrs={{ 'data-testid': 'credentials-credential-audit-tab-trigger' }}
             title={
               <>
                 <i className="fas fa-clipboard-list"></i> Credential Delegation Audit{' '}

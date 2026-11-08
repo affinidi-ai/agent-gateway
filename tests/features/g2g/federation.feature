@@ -8,6 +8,20 @@ Feature: Fabric routing between gateways
     And the response status is 200
     And the A2A response result matches managed agent "bravo" response result
 
+  Scenario Outline: A surface policy on the fabric hop reads the agent DID from its Target's agent card
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" serves an agent card naming agent DID "did:example:bravo"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "charlie" has a policy that requires its Target's agent DID to be "<required>"
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is <status>
+
+    Examples:
+      | required          | status |
+      | did:example:bravo | 200    |
+      | did:example:other | 403    |
+
   Scenario Outline: An A2A method from either era survives the fabric hop unchanged
     # The gateway forwards the JSON-RPC method as-sent and never translates between
     # protocol eras, so a v1.0 PascalCase name must arrive at the remote managed

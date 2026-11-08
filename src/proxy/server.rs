@@ -12,11 +12,12 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, error, info, warn};
 
 use crate::config::GatewayConfig;
+use crate::observability::loggable;
 use crate::state::{MultiSurfaceProxyState, SurfaceInfo};
 
 // ── Credential delegation global stores ──────────────────────────────────────
-// Follows the same OnceLock pattern used for mpp_transaction_store and
-// trust_registry_listener_manager in gateways/connection_points/message_processor.rs
+// Follows the same OnceLock pattern used for trust_registry_listener_manager
+// in gateways/connection_points/message_processor.rs
 
 static GLOBAL_CREDENTIAL_PROVIDER_STORE: OnceLock<
     Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>,
@@ -81,6 +82,33 @@ fn cors_request_method(request_parts: &RequestParts) -> String {
 }
 
 fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
+    cors_layer(cors_origins, false)
+}
+
+/// Removes every `Set-Cookie` and `Set-Cookie2` from an Access Point's answer.
+/// The target shares the caller-facing host with the gateway's dashboard, so a
+/// cookie it sets would land on the dashboard's origin; and the caller's
+/// cookies are never forwarded to it, so a cookie it sets could never come back.
+async fn withhold_target_cookies(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove("set-cookie2");
+    response
+}
+
+/// CORS for protected resource metadata: browser MCP clients on any origin
+/// read it with `GET` or `HEAD`, and other methods keep the `cors` allowlist.
+/// It is layered on the metadata routes only, and only on a listener where no
+/// channel or proxy route also receives these paths, so a proxied Target's
+/// responses are never opened to every origin.
+fn metadata_cors_layer(cors_origins: &[String]) -> CorsLayer {
+    cors_layer(cors_origins, true)
+}
+
+fn cors_layer(
+    cors_origins: &[String],
+    any_origin_reads: bool,
+) -> CorsLayer {
     let origins = parse_cors_origins(cors_origins);
 
     CorsLayer::new()
@@ -92,9 +120,12 @@ fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
                 .path()
                 .to_string();
             let method = cors_request_method(request_parts);
-            async move { is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
+            let reads = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+            async move { any_origin_reads && reads || is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
         }))
         .allow_headers(Any)
+        // A browser MCP client reads the 401 challenge to find the metadata.
+        .expose_headers([axum::http::header::WWW_AUTHENTICATE])
 }
 
 pub fn init_certificates_store(store: Arc<dyn crate::certificates::CertificateStore>) {
@@ -138,8 +169,16 @@ pub fn get_gateway_base_url() -> Option<String> {
         .cloned()
 }
 
+/// Install the process-wide transit token issuer. The first issuer installed
+/// stays in use; a later one is ignored with a warning.
 pub fn init_transit_token_issuer(issuer: Arc<crate::proxy::transit_token::TransitTokenIssuer>) {
-    let _ = GLOBAL_TRANSIT_TOKEN_ISSUER.set(issuer);
+    if GLOBAL_TRANSIT_TOKEN_ISSUER
+        .set(issuer)
+        .is_err()
+    {
+        warn!(target: "transit_token", "Global transit token issuer is already initialized; keeping the first one");
+        return;
+    }
     info!(target: "transit_token", "Global transit token issuer initialized for proxy pipeline");
 }
 
@@ -175,28 +214,22 @@ pub(crate) fn join_host_and_route(
     }
 }
 
-/// Run a listener for a specific port that handles multiple channels with different routes
-/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
-/// Extract the hostname (no port, lowercase) from a URL string.
-/// Returns `None` for malformed URLs without `://`.
+/// The host of a URL string, without its port, in lower case and in the form the
+/// URL parser normalises it to: an IPv6 address in brackets and compressed, so
+/// `[2001:DB8:0::1]` and `[2001:db8::1]` are the same host. `None` for a URL
+/// that does not parse or has no host.
 fn extract_hostname(url: &str) -> Option<String> {
-    url.split("://")
-        .nth(1)
-        .and_then(|after| after.split('/').next())
-        .map(|host_port| {
-            host_port
-                .split(':')
-                .next()
-                .unwrap_or(host_port)
-                .to_lowercase()
-        })
+    url::Url::parse(url)
+        .ok()?
+        .host_str()
+        .map(str::to_ascii_lowercase)
 }
 
 /// Find the first outbound listener whose external URLs share a hostname with
 /// the inbound listener on `inbound_port`. Returns `None` when no overlap exists
 /// (i.e. inbound and outbound have fully separate domains).
 ///
-/// Used by `run_port_server` to decide whether to register the `/outbound/*`
+/// Used by `build_port_router` to decide whether to register the `/outbound/*`
 /// reverse-proxy on the inbound port.
 pub(crate) fn find_shared_outbound_listener(
     network_config: &crate::config::NetworkConfig,
@@ -222,7 +255,379 @@ pub(crate) fn find_shared_outbound_listener(
         })
 }
 
-pub async fn run_port_server(
+/// Whether the inbound listener's `/outbound` proxy passes `header` to the
+/// outbound listener: every header but hop-by-hop ones, `host`, and the
+/// forwarded client certificate header. The outbound listener sees this
+/// gateway as the peer, so it would take a certificate in that header, which
+/// this hop never verified, as one a trusted proxy forwarded. Unlike
+/// `should_forward_request_header` it keeps `x-transit-token`, which the
+/// Transit Point checks.
+fn shared_domain_proxy_forwards(
+    header: &str,
+    forwarded_cert_header: &str,
+) -> bool {
+    let header = header.to_ascii_lowercase();
+    !crate::a2a::is_hop_by_hop_header(&header)
+        && header != "host"
+        && !header.eq_ignore_ascii_case(forwarded_cert_header)
+}
+
+/// The longest the shared-host hop waits on a read from the outbound listener:
+/// the largest stream idle timeout and stream lifetime a surface can set,
+/// 86400 seconds.
+const SHARED_HOST_HOP_READ_IDLE: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+/// How far past `max_body_bytes` the hop streams a body without a declared
+/// length before it stops. More than hyper's largest write buffer (about
+/// 400 KiB), so the outbound listener has read past its own cap, refused the
+/// request and recorded the refusal before the hop aborts the connection.
+pub(crate) const SHARED_HOST_HOP_STREAM_MARGIN: usize = 512 * 1024;
+
+/// The shared-host `/outbound` hop: where it forwards, and the largest request
+/// body it passes on.
+pub(crate) struct SharedHostHop {
+    pub(crate) target: String,
+    pub(crate) client: reqwest::Client,
+    pub(crate) forwarded_cert_header: String,
+    pub(crate) max_body_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HopBodyFault {
+    TooLarge,
+    ReadFailed,
+}
+
+/// The request body as a stream that records once more than `max_bytes` have
+/// been read, passes on the chunk that takes it past `max_bytes` plus
+/// [`SHARED_HOST_HOP_STREAM_MARGIN`] and fails on the next poll without reading
+/// further, and fails and records when the caller's body fails. So it reads at
+/// most `max_bytes` plus the margin plus one chunk.
+fn capped_hop_body(
+    body: axum::body::Body,
+    max_bytes: usize,
+    fault: Arc<OnceLock<HopBodyFault>>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    use futures::StreamExt;
+    let stop_after = max_bytes.saturating_add(SHARED_HOST_HOP_STREAM_MARGIN);
+    let mut chunks = body.into_data_stream();
+    let mut read = 0usize;
+    let mut ended = false;
+    futures::stream::poll_fn(move |cx| {
+        if ended {
+            return std::task::Poll::Ready(None);
+        }
+        if read > stop_after {
+            ended = true;
+            return std::task::Poll::Ready(Some(Err(std::io::Error::other(
+                "request body exceeds the shared-host hop limit",
+            ))));
+        }
+        match std::task::ready!(chunks.poll_next_unpin(cx)) {
+            Some(Ok(bytes)) => {
+                read = read.saturating_add(bytes.len());
+                if read > max_bytes {
+                    let _ = fault.set(HopBodyFault::TooLarge);
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            Some(Err(error)) => {
+                ended = true;
+                let _ = fault.set(HopBodyFault::ReadFailed);
+                std::task::Poll::Ready(Some(Err(std::io::Error::other(error))))
+            }
+            None => std::task::Poll::Ready(None),
+        }
+    })
+}
+
+/// The hop's own 413 for a body over the cap, or 400 for one the caller failed
+/// to send: a JSON-RPC error for an MCP caller, an A2A problem otherwise.
+fn hop_refusal(
+    fault: HopBodyFault,
+    mcp: bool,
+    max_bytes: usize,
+) -> axum::response::Response {
+    match (fault, mcp) {
+        (HopBodyFault::TooLarge, true) => crate::mcp::modern_http::body_too_large_response(),
+        (HopBodyFault::TooLarge, false) => crate::proxy::body_too_large_response(max_bytes),
+        (HopBodyFault::ReadFailed, true) => crate::mcp::modern_http::body_read_failed_response(),
+        (HopBodyFault::ReadFailed, false) => {
+            crate::a2a::create_error_response(axum::http::StatusCode::BAD_REQUEST, "Failed to read request body")
+        }
+    }
+}
+
+/// Forwards a request on the inbound listener to the outbound listener that
+/// shares its host. The body is streamed, never buffered, so the outbound
+/// listener authenticates the caller before it is read. A declared length over
+/// `max_body_bytes` is refused with 413 without reading. A longer body is
+/// streamed until the outbound listener answers, at most to `max_body_bytes`
+/// plus [`SHARED_HOST_HOP_STREAM_MARGIN`]; when its answer is lost the hop
+/// answers 413 itself. One the caller fails to send is refused with 400, never
+/// forwarded empty. The response is streamed back.
+pub(crate) async fn forward_shared_host_hop(
+    hop: Arc<SharedHostHop>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    let caller = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map_or_else(|| "unknown".to_string(), |info| info.0.to_string());
+    let mcp = req
+        .headers()
+        .contains_key("mcp-protocol-version");
+    let declared_length = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let path = req.uri().path().to_string();
+    if declared_length.is_some_and(|length| length > hop.max_body_bytes as u64) {
+        warn!(
+            caller = %caller,
+            path = %path,
+            max = hop.max_body_bytes,
+            "Shared-host hop refused a declared oversize body"
+        );
+        return hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes);
+    }
+    let url = format!(
+        "{}{}",
+        hop.target,
+        req.uri()
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+    );
+    let mut builder = hop
+        .client
+        .request(req.method().clone(), &url);
+    for (key, value) in req.headers() {
+        if shared_domain_proxy_forwards(key.as_str(), &hop.forwarded_cert_header)
+            && let Ok(v) = value.to_str()
+        {
+            builder = builder.header(key.as_str(), v);
+        }
+    }
+    let fault = Arc::new(OnceLock::new());
+    if !req.body().is_end_stream() {
+        builder = builder.body(reqwest::Body::wrap_stream(capped_hop_body(
+            req.into_body(),
+            hop.max_body_bytes,
+            fault.clone(),
+        )));
+    }
+
+    match builder.send().await {
+        Ok(resp) => {
+            let status =
+                axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let mut response_builder = axum::response::Response::builder().status(status);
+            for (key, value) in resp.headers() {
+                if !crate::a2a::is_hop_by_hop_header(key.as_str()) {
+                    response_builder = response_builder.header(key.as_str(), value.as_bytes());
+                }
+            }
+            response_builder
+                .body(axum::body::Body::from_stream(resp.bytes_stream()))
+                .unwrap_or_else(|_| {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::BAD_GATEWAY)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                })
+        }
+        Err(e) => match fault.get() {
+            Some(HopBodyFault::TooLarge) if (e.is_body() || e.is_request()) && !e.is_timeout() => {
+                warn!(caller = %caller, path = %path, max = hop.max_body_bytes, "Shared-host hop refused an oversize body");
+                hop_refusal(HopBodyFault::TooLarge, mcp, hop.max_body_bytes)
+            }
+            Some(HopBodyFault::ReadFailed) => {
+                warn!(caller = %caller, path = %path, "Shared-host hop could not read the caller's body");
+                hop_refusal(HopBodyFault::ReadFailed, mcp, hop.max_body_bytes)
+            }
+            _ => {
+                if (e.is_body() || e.is_request()) && !e.is_connect() {
+                    debug!(error = %e.without_url(), url = %loggable::url(&url), "Outgoing proxy forward failed");
+                } else {
+                    warn!(error = %e.without_url(), url = %loggable::url(&url), "Outgoing proxy forward failed");
+                }
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::BAD_GATEWAY)
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
+            }
+        },
+    }
+}
+
+/// Whether callers on other hosts can use `url`: its host is not `localhost`
+/// or a loopback or unspecified address. A private or link-local address
+/// counts, as every workload on that network reaches it; so does any other
+/// host name, and a URL that does not parse.
+fn reachable_from_other_hosts(url: &str) -> bool {
+    let Some(host) = url::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.host()
+                .map(|host| host.to_owned())
+        })
+    else {
+        return true;
+    };
+    let this_host = |ip: std::net::IpAddr| {
+        let ip = ip.to_canonical();
+        ip.is_loopback() || ip.is_unspecified()
+    };
+    match host {
+        url::Host::Domain(name) => name != "localhost" && !name.ends_with(".localhost"),
+        url::Host::Ipv4(ip) => !this_host(ip.into()),
+        url::Host::Ipv6(ip) => !this_host(ip.into()),
+    }
+}
+
+/// The listener itself as `address:port` when it binds an address other hosts
+/// reach, which is any but loopback; a `bind_address` that does not parse
+/// counts too.
+fn exposed_bind_address(listener: &crate::config::network::Listener) -> Option<String> {
+    match crate::config::network::parse_bind_address(&listener.bind_address) {
+        Ok(ip)
+            if ip
+                .to_canonical()
+                .is_loopback() =>
+        {
+            None
+        }
+        Ok(ip) => Some(std::net::SocketAddr::new(ip, listener.port).to_string()),
+        Err(_) => Some(format!("{}:{}", listener.bind_address, listener.port)),
+    }
+}
+
+/// Where callers on other hosts reach the outbound listener on `port`: its own
+/// external URLs and those of every inbound listener that passes `/outbound`
+/// requests to it because the two share a host name, when such a URL is
+/// [`reachable_from_other_hosts`], and the bind address of each of those
+/// listeners that binds beyond loopback.
+pub(crate) fn exposed_outbound_addresses(
+    network_config: &crate::config::NetworkConfig,
+    port: u16,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    network_config
+        .listeners
+        .iter()
+        .filter(|listener| {
+            (listener.listener_type == "outbound" && listener.port == port)
+                || (listener.listener_type == "inbound"
+                    && find_shared_outbound_listener(network_config, listener.port)
+                        .is_some_and(|outbound| outbound.port == port))
+        })
+        .flat_map(|listener| {
+            listener
+                .external_urls
+                .iter()
+                .filter(|url| reachable_from_other_hosts(url))
+                .cloned()
+                .chain(exposed_bind_address(listener))
+        })
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
+}
+
+/// A Transit Point that serves callers it does not authenticate
+/// (`allow_unauthenticated_callers`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OpenTransitPoint {
+    pub alias: String,
+    /// The variant whose overrides define this Transit Point; `None` for the
+    /// surface's own.
+    pub variant: Option<String>,
+    /// The outbound listener it is served on, when its address resolves to one.
+    pub port: Option<u16>,
+    /// Where callers on other hosts reach it ([`exposed_outbound_addresses`]).
+    pub exposed_at: Vec<String>,
+}
+
+impl OpenTransitPoint {
+    /// What an operator is told about it when other hosts can reach it.
+    pub fn exposure(&self) -> Option<String> {
+        if self.exposed_at.is_empty() {
+            return None;
+        }
+        let variant = self
+            .variant
+            .as_deref()
+            .map(|variant| format!(" in variant '{variant}'"))
+            .unwrap_or_default();
+        Some(format!(
+            "Transit Point '{}'{variant} serves callers it does not authenticate and is reachable from other \
+             hosts: {}",
+            self.alias,
+            self.exposed_at.join(", ")
+        ))
+    }
+}
+
+/// The Transit Points of `surface`, and those its variants define, that serve
+/// callers they do not authenticate.
+pub(crate) fn open_transit_points(
+    network_config: &crate::config::NetworkConfig,
+    surface: &crate::config::agent_surface::AgentSurface,
+) -> Vec<OpenTransitPoint> {
+    let Some(transit) = surface.transit.as_ref() else {
+        return Vec::new();
+    };
+    let port_of = |address: Option<&str>| {
+        address.and_then(|address| network_config.map_url_to_port_for_type(address, Some("outbound")))
+    };
+    let surface_port = port_of(
+        transit
+            .outbound_listen_address
+            .as_deref(),
+    );
+    let variant_points = surface
+        .variants
+        .iter()
+        .flat_map(|variant| {
+            variant
+                .overrides
+                .transit
+                .iter()
+                .filter_map(|transit| transit.points.as_ref())
+                .flatten()
+                .map(move |point| (Some(variant.alias.clone()), point))
+        });
+    transit
+        .points
+        .iter()
+        .map(|point| (None, point))
+        .chain(variant_points)
+        .filter(|(_, point)| point.allow_unauthenticated_callers && !point.authenticates_callers())
+        .map(|(variant, point)| {
+            let port = port_of(
+                point
+                    .listen_address
+                    .as_deref(),
+            )
+            .or(surface_port);
+            OpenTransitPoint {
+                alias: point.alias.clone(),
+                variant,
+                port,
+                exposed_at: port
+                    .map(|port| exposed_outbound_addresses(network_config, port))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// Build the router of the inbound listener on `port`, which serves every
+/// surface on that port, with the MultiSurfaceProxyState its routes share so
+/// those surfaces can be updated in place. Binding the port is left to the
+/// caller, so a rebuilt router can replace the one a bound listener serves.
+pub async fn build_port_router(
     port: u16,
     surfaces: Vec<crate::config::agent_surface::AgentSurface>,
     _tls_acceptor: TlsAcceptor,
@@ -231,18 +636,15 @@ pub async fn run_port_server(
     bootstrap_config: Arc<crate::config::BootstrapConfig>,
     metrics_store: Option<Arc<crate::metrics::MetricsStore>>,
     task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    task_id: Option<String>,
     ws_state: Option<Arc<crate::server::WsState>>,
     vc_issuer: Option<Arc<crate::identity::VCIssuer>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
-    state_sender: Option<tokio::sync::oneshot::Sender<Arc<crate::state::MultiSurfaceProxyState>>>,
     identity_api_router: Option<axum::Router>,
     onboarding_router: Option<axum::Router>,
     did_router: Option<axum::Router>,
     secrets_router: Option<axum::Router>,
     secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>>,
     network_config: Arc<crate::config::NetworkConfig>,
-    use_tls: bool,
     policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
     gateway_policy_manager: Option<Arc<crate::policies::GatewayPolicyManager>>,
     mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
@@ -252,16 +654,13 @@ pub async fn run_port_server(
     _notification_store: Option<Arc<crate::integrations::FileSystemNotificationStore>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
-    direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     resolved_surface_cache: Arc<crate::surfaces::ResolvedSurfaceCache>,
     #[cfg(feature = "didwebvh")] didwebvh_identity_store: Option<
         Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>,
     >,
     #[cfg(feature = "didwebvh")] didwebvh_log_storage: Option<Arc<dyn crate::storage::DidLogStorage>>,
-) -> anyhow::Result<()> {
-    let _task_id = task_id.unwrap_or_else(|| format!("port-{}-{}", port, uuid::Uuid::new_v4()));
-
-    info!("Starting port listener on 0.0.0.0:{} for {} channel(s)", port, surfaces.len());
+) -> anyhow::Result<(Router, Arc<MultiSurfaceProxyState>)> {
+    info!("Building the port listener router on port {} for {} channel(s)", port, surfaces.len());
 
     // Build channel info for each channel on this port
     let mut channel_infos = Vec::new();
@@ -516,20 +915,6 @@ pub async fn run_port_server(
 
     let channel_infos_arc = Arc::new(RwLock::new(channel_infos));
 
-    // Use the global transaction store (created unconditionally in orchestrator.rs)
-    // This single store handles ALL x402 operations:
-    // - HTTP payment middleware (GW1 role: create payment, send to facilitator)
-    // - DIDComm message handlers (GW2 role: receive verify/settle requests)
-    // - Admin API (serves UI data)
-    // - Settlement worker (processes transactions where facilitator_gateway_id == this gateway)
-    let transaction_store = crate::gateways::connection_points::message_processor::get_transaction_store();
-    if transaction_store.is_none() {
-        warn!("Transaction store not initialized - x402 payment processing will fail");
-    }
-
-    // Transaction store workers (cleanup, crash recovery, settlement) are spawned in orchestrator.rs
-    // No duplicate workers needed here - all x402 operations use the single global store
-
     let state = Arc::new(MultiSurfaceProxyState {
         config: Arc::clone(&config),
         network_config: Arc::clone(&network_config),
@@ -545,8 +930,6 @@ pub async fn run_port_server(
         policy_manager: policy_manager.clone(),
         gateway_policy_manager: gateway_policy_manager.clone(),
         didauth_session_store: Arc::clone(&didauth_session_store),
-        transaction_store: transaction_store.clone(),
-        mpp_transaction_store: crate::gateways::connection_points::message_processor::get_mpp_transaction_store(),
         trust_registry_listener_manager:
             crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
         source_auth_middleware: source_auth_middleware.clone(),
@@ -561,17 +944,13 @@ pub async fn run_port_server(
 
         credential_provider_store: crate::proxy::server::get_credential_provider_store(),
         delegation_vault_store: crate::proxy::server::get_delegation_vault_store(),
+        egress_allowlist: crate::egress::bdd_egress_allowlist(),
         gateway_base_url: crate::proxy::server::get_gateway_base_url(),
         transit_token_issuer: crate::proxy::server::get_transit_token_issuer(),
         mcp_proxy_store: mcp_proxy_store.clone(),
         a2a_proxy_store: a2a_proxy_store.clone(),
         resolved_surface_cache: resolved_surface_cache.clone(),
     });
-
-    // Send the state back to the caller if requested
-    if let Some(sender) = state_sender {
-        let _ = sender.send(state.clone());
-    }
 
     // Settlement worker is spawned in orchestrator.rs - no duplicate needed here
 
@@ -585,18 +964,32 @@ pub async fn run_port_server(
     {
         profile.validate_network(&network_config)?;
         app = app.merge(profile.discovery_router()?);
-        app = app.merge(
-            Router::new()
-                .route(
-                    "/.well-known/oauth-protected-resource",
-                    axum::routing::get(crate::mcp::resource_server::surface_metadata),
-                )
-                .route(
-                    "/.well-known/oauth-protected-resource/{*path}",
-                    axum::routing::get(crate::mcp::resource_server::surface_metadata),
-                )
-                .with_state(state.as_ref().clone()),
-        );
+    }
+    match crate::protocols::protected_resource::metadata_path_owner(&network_config) {
+        Some(prefix) => warn!(
+            prefix,
+            "A configured prefix serves /.well-known/oauth-protected-resource; this listener publishes no protected resource metadata"
+        ),
+        None => {
+            app = app.merge(
+                Router::new()
+                    .route(
+                        "/.well-known/oauth-protected-resource",
+                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+                    )
+                    .route(
+                        "/.well-known/oauth-protected-resource/{*path}",
+                        axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
+                    )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
+                    .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
+                        proxy_cors_layer(&network_config.cors)
+                    } else {
+                        metadata_cors_layer(&network_config.cors)
+                    })
+                    .with_state(state.as_ref().clone()),
+            );
+        }
     }
 
     // Note: SPA-route collision validation is performed once at startup in
@@ -798,6 +1191,7 @@ pub async fn run_port_server(
                         &format!("{}/{{{}}}", prefix, "*path"),
                         axum::routing::any(super::handler::multi_channel_proxy_handler),
                     )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
                     .layer(proxy_cors_layer(&network_config.cors))
                     .with_state(state.as_ref().clone());
 
@@ -851,6 +1245,7 @@ pub async fn run_port_server(
         }
 
         let proxy_router = proxy_router
+            .layer(axum::middleware::map_response(withhold_target_cookies))
             .layer(axum::middleware::from_fn(crate::observability::trace_http_request))
             .layer(proxy_cors_layer(&network_config.cors))
             .with_state(state.as_ref().clone());
@@ -925,39 +1320,11 @@ pub async fn run_port_server(
         }
     }
 
-    // x402 e2e test endpoints — gated on `facilitator_mode.enable_test_endpoints`.
-    // These are unauthenticated conformance surfaces (incl. POST /close) and
-    // must stay off in non-test deployments.
     if config
         .facilitator_mode
         .enable_test_endpoints
     {
-        info!("Adding x402 multi-chain test endpoints: /protected (EVM + Solana), /health, /close");
-
-        let test_endpoints_config = match bootstrap_config.load_test_endpoints_config() {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                warn!("Failed to load test endpoints config: {}. Test endpoints will use default values.", e);
-                Arc::new(crate::config::TestEndpointsConfig {
-                    evm: None,
-                    solana_devnet: None,
-                    solana_mainnet: None,
-                })
-            }
-        };
-
-        let x402_test_router = axum::Router::new()
-            .route("/protected", axum::routing::get(crate::x402::protected_eip3009))
-            .route("/protected-permit2", axum::routing::get(crate::x402::protected_permit2))
-            .route("/protected-solana-devnet", axum::routing::get(crate::x402::protected_solana_devnet))
-            .route("/protected-solana-mainnet", axum::routing::get(crate::x402::protected_solana_mainnet))
-            .route("/health", axum::routing::get(crate::x402::test_health))
-            .route("/close", axum::routing::post(crate::x402::test_close))
-            .with_state(test_endpoints_config);
-
-        app = app.merge(x402_test_router);
-    } else {
-        info!("x402 test endpoints disabled (facilitator_mode.enable_test_endpoints=false)");
+        warn!("facilitator_mode.enable_test_endpoints is ignored: the x402 test endpoints are no longer served");
     }
 
     // Proxy {TP_OUTBOUND_PATH_PREFIX}/* to the outbound listener when inbound and outbound share a hostname.
@@ -973,8 +1340,8 @@ pub async fn run_port_server(
     // this inbound port's external URLs (detected by hostname intersection).
     {
         if let Some(outbound_listener) = find_shared_outbound_listener(&network_config, port) {
-            let outbound_target = format!("http://{}:{}", outbound_listener.bind_address, outbound_listener.port);
-            let proxy_client = client.clone();
+            let outbound_target =
+                format!("http://{}", listener_socket_address(&outbound_listener.bind_address, outbound_listener.port)?);
             info!(
                 inbound_port = port,
                 outbound_port = outbound_listener.port,
@@ -982,77 +1349,18 @@ pub async fn run_port_server(
                 "Shared-domain detected: registering outbound transit-point proxy on inbound listener -> outbound listener"
             );
 
-            let outbound_target_arc = std::sync::Arc::new(outbound_target);
-            let proxy_handler = move |req: axum::extract::Request| {
-                let target = outbound_target_arc.clone();
-                let http_client = proxy_client.clone();
-                async move {
-                    let path_and_query = req
-                        .uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or("/")
-                        .to_string();
-                    let url = format!("{}{}", target, path_and_query);
-                    let method = reqwest::Method::from_bytes(
-                        req.method()
-                            .as_str()
-                            .as_bytes(),
-                    )
-                    .unwrap_or(reqwest::Method::POST);
-                    let mut builder = http_client.request(method, &url);
-                    for (key, value) in req.headers() {
-                        // Transparent tunnel: forward everything except hop-by-hop headers and
-                        // `host` (set automatically by reqwest). Do NOT use
-                        // `should_forward_request_header` here — that strips `x-transit-token`,
-                        // which the outbound pipeline needs for transit-token validation.
-                        let lower = key
-                            .as_str()
-                            .to_ascii_lowercase();
-                        if !crate::a2a::is_hop_by_hop_header(&lower)
-                            && lower != "host"
-                            && let Ok(v) = value.to_str()
-                        {
-                            builder = builder.header(key.as_str(), v);
-                        }
-                    }
-                    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
-                        .await
-                        .unwrap_or_default();
-                    builder = builder.body(body);
-                    match builder.send().await {
-                        Ok(resp) => {
-                            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
-                                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
-                            let mut response_builder = axum::response::Response::builder().status(status);
-                            for (key, value) in resp.headers() {
-                                if !crate::a2a::is_hop_by_hop_header(key.as_str()) {
-                                    response_builder = response_builder.header(key.as_str(), value.as_bytes());
-                                }
-                            }
-                            let bytes = resp
-                                .bytes()
-                                .await
-                                .unwrap_or_default();
-                            response_builder
-                                .body(axum::body::Body::from(bytes))
-                                .unwrap_or_else(|_| {
-                                    axum::response::Response::builder()
-                                        .status(axum::http::StatusCode::BAD_GATEWAY)
-                                        .body(axum::body::Body::empty())
-                                        .unwrap()
-                                })
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, url = %url, "Outgoing proxy forward failed");
-                            axum::response::Response::builder()
-                                .status(axum::http::StatusCode::BAD_GATEWAY)
-                                .body(axum::body::Body::empty())
-                                .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty()))
-                        }
-                    }
-                }
-            };
+            let hop = Arc::new(SharedHostHop {
+                target: outbound_target,
+                client: crate::http_client::shared_host_hop(SHARED_HOST_HOP_READ_IDLE)?,
+                forwarded_cert_header: config
+                    .tls
+                    .client_auth
+                    .forwarded_header
+                    .header_name
+                    .clone(),
+                max_body_bytes: config.a2a.max_body_size,
+            });
+            let proxy_handler = move |req: axum::extract::Request| forward_shared_host_hop(hop.clone(), req);
 
             let outbound_prefix = crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX;
             app = app
@@ -1068,17 +1376,11 @@ pub async fn run_port_server(
         app = app.merge(secrets_router_ref.clone());
     }
 
-    // Merge x402 HTTP Facilitator API router if enabled in gateway config
     if config
         .facilitator_mode
         .facilitator_via_http
     {
-        info!("Merging x402 HTTP Facilitator API router at /api/x402 (standard spec endpoints)");
-        let http_facilitator_state = crate::x402::HttpFacilitatorState {
-            channels: state.channels.clone(),
-        };
-        let http_facilitator_router = crate::x402::create_http_facilitator_router().with_state(http_facilitator_state);
-        app = app.nest("/api/x402", http_facilitator_router);
+        warn!("facilitator_mode.facilitator_via_http is ignored: the /api/x402 facilitator is no longer served");
     }
 
     // Process fallback routes last so they don't override specific routes
@@ -1164,14 +1466,14 @@ pub async fn run_port_server(
     // extension. No-op when the upstream extension is absent.
     let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
 
-    // Bind to 0.0.0.0:{port} to accept connections on all interfaces for this port
-    let bind_addr: SocketAddr = format!("0.0.0.0:{}", port)
-        .parse()
-        .expect("Valid 0.0.0.0:port format");
-
-    info!("Port listener binding to {} for {} channels", bind_addr, surfaces.len());
+    info!("Port listener router on port {} serves {} channels", port, surfaces.len());
     for surface in &surfaces {
-        info!("  Channel '{}' route '{}' -> {}", surface.name, surface.route(), surface.target_endpoint());
+        info!(
+            "  Channel '{}' route '{}' -> {}",
+            surface.name,
+            surface.route(),
+            loggable::url(surface.target_endpoint())
+        );
     }
 
     // Update status to running for all channels
@@ -1184,57 +1486,7 @@ pub async fn run_port_server(
         }
     }
 
-    // Serve with or without TLS based on protocol
-    let result = if use_tls {
-        info!("Port {} using TLS (HTTPS)", port);
-        // Load TLS config (with optional client auth verifier).
-        let tls_config = crate::server::load_server_config(
-            &config.tls.cert_path,
-            &config.tls.key_path,
-            direct_client_auth
-                .as_deref()
-                .cloned(),
-        )?;
-
-        // Create TLS listener using axum_server. If direct client auth is
-        // enabled, wrap the acceptor so peer certs are captured into a
-        // per-request extension.
-        let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
-            axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
-        );
-        if direct_client_auth.is_some() {
-            let acceptor = crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor);
-            axum_server::bind(bind_addr)
-                .acceptor(acceptor)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-        } else {
-            axum_server::bind(bind_addr)
-                .acceptor(rustls_acceptor)
-                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-        }
-    } else {
-        info!("Port {} using plain HTTP (no TLS)", port);
-        // Create plain TCP listener
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
-    };
-
-    // Cleanup: Unregister tasks when server stops
-    if let Some(ref monitor) = task_monitor {
-        let channel_infos = channel_infos_arc.read().await;
-        info!("Port listener {} stopped, unregistering {} channel tasks", port, channel_infos.len());
-        for channel_info in channel_infos.iter() {
-            info!("Unregistering task {} for channel '{}'", channel_info.task_id, channel_info.surface.name);
-            monitor
-                .unregister_task(&channel_info.task_id)
-                .await;
-        }
-    }
-
-    result?;
-    Ok(())
+    Ok((app, state))
 }
 
 /// Get the shared outbound channel state for `config_id`.
@@ -1271,10 +1523,117 @@ fn get_or_create_outbound_channel_state(
     }
 }
 
-/// Run a simple outbound-only port listener.
+/// The socket address a listener binds on `port`, from its `bind_address`, an
+/// IPv4 or IPv6 address, the IPv6 one optionally in brackets.
+pub(crate) fn listener_socket_address(
+    bind_address: &str,
+    port: u16,
+) -> anyhow::Result<SocketAddr> {
+    let ip = crate::config::network::parse_bind_address(bind_address).map_err(|error| {
+        anyhow::anyhow!("Invalid bind_address '{bind_address}' for the listener on port {port}: {error}")
+    })?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// The addresses the inbound listener on `port` binds: the distinct
+/// `bind_address` of every inbound listener configured for the port, the
+/// unspecified ones first (`::` before `0.0.0.0`). A port without an inbound
+/// listener is an error rather than a bind on every interface.
+pub(crate) fn inbound_bind_addresses(
+    network_config: &crate::config::NetworkConfig,
+    port: u16,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut addresses = Vec::new();
+    for listener in network_config
+        .listeners
+        .iter()
+        .filter(|listener| listener.listener_type == "inbound" && listener.port == port)
+    {
+        let address = listener_socket_address(&listener.bind_address, port)?;
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if addresses.is_empty() {
+        anyhow::bail!("No inbound listener is configured for port {port}");
+    }
+    addresses.sort_by_key(|address| (!address.ip().is_unspecified(), address.is_ipv4()));
+    Ok(addresses)
+}
+
+/// Whether a listener bound on `bound` already accepts connections to
+/// `target`: `bound` is the unspecified address of the target's family, or the
+/// IPv6 unspecified address of a dual-stack socket (`only_v6` false) and the
+/// target is IPv4.
+fn bound_address_covers(
+    bound: SocketAddr,
+    bound_only_v6: bool,
+    target: SocketAddr,
+) -> bool {
+    bound.port() == target.port()
+        && bound.ip().is_unspecified()
+        && (bound.is_ipv4() == target.is_ipv4() || (bound.is_ipv6() && target.is_ipv4() && !bound_only_v6))
+}
+
+/// Whether a bound listener already accepts connections to `target`. A socket
+/// whose IPv6-only setting cannot be read is treated as IPv6-only.
+fn bound_listener_covers(
+    bound: &tokio::net::TcpListener,
+    target: SocketAddr,
+) -> bool {
+    let Ok(address) = bound.local_addr() else {
+        return false;
+    };
+    let only_v6 = address.is_ipv4()
+        || socket2::SockRef::from(bound)
+            .only_v6()
+            .unwrap_or(true);
+    bound_address_covers(address, only_v6, target)
+}
+
+/// Bind every inbound address of a port. An address the operating system
+/// reports in use while a listener already bound on the port accepts its
+/// connections, as an IPv6 dual-stack wildcard does for IPv4, is skipped.
+pub(crate) async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
+    let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
+    for &address in addresses {
+        match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => listeners.push(listener),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && listeners
+                        .iter()
+                        .any(|bound| bound_listener_covers(bound, address)) =>
+            {
+                info!(%address, "Inbound address is already served by the unspecified address bound on its port");
+            }
+            Err(error) => anyhow::bail!("Failed to bind inbound listener {address}: {error}"),
+        }
+    }
+    Ok(listeners)
+}
+
+/// Take a surface's shared outbound state out of service in place. Every route
+/// still holding it, on a listener being rebuilt or a connection kept alive
+/// past the rebuild, then refuses each request as for a surface without
+/// Transit Points, until the surface's Transit Points, if it regains them, are
+/// written back into the same state.
+pub(crate) fn retire_outbound_channel_state(retired: &std::sync::RwLock<crate::state::OutboundSurfaceState>) {
+    let mut state = retired
+        .write()
+        .expect("outbound channel_state lock poisoned");
+    let mut surface = (*state.surface).clone();
+    surface.transit = None;
+    surface.variants.clear();
+    state.surface = Arc::new(surface);
+    state.identity_rules_engine = None;
+    state.identity_selector = None;
+}
+
+/// Build the router of an outbound-only port listener.
 ///
 /// This is the server-side counterpart of the outbound pipeline.  Unlike
-/// [`run_port_server`] (which serves a complex multi-channel inbound router)
+/// [`build_port_router`] (which builds a complex multi-channel inbound router)
 /// this function is intentionally minimal:
 /// - One route per `(channel, virtual_channel)` pair.
 /// - No identity API, no MCP proxies, no payment routes.
@@ -1282,10 +1641,11 @@ fn get_or_create_outbound_channel_state(
 ///
 /// The caller is responsible for only passing channels that have `outbound.enabled = true`.
 ///
-/// Returns a map of `config_id → Arc<RwLock<OutboundSurfaceState>>` so the caller
-/// can store them for live updates (e.g. from `reload_single_channel`).
-pub async fn run_outbound_port_server(
-    bind_address: String,
+/// Every surface's state is in `outbound_channel_states` when this returns, so
+/// a later surface removal always finds the state it must retire. Binding the
+/// port is left to the caller, so a rebuilt router can replace the one a bound
+/// listener serves.
+pub async fn build_outbound_port_router(
     port: u16,
     channels: Vec<(crate::config::agent_surface::AgentSurface, Vec<crate::config::agent_surface::TransitPoint>)>,
     config: Arc<crate::config::GatewayConfig>,
@@ -1297,19 +1657,17 @@ pub async fn run_outbound_port_server(
     trust_registry_listener_manager: Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>,
     vc_issuer: Option<Arc<crate::identity::VCIssuer>>,
     task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    use_tls: bool,
     outbound_channel_states: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<std::sync::RwLock<crate::state::OutboundSurfaceState>>>,
         >,
     >,
-    direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
-    consent_identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
-) -> anyhow::Result<()> {
-    use axum::{Router, routing::any};
+    source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
+) -> anyhow::Result<Router> {
+    use axum::routing::any;
 
-    info!("Starting outbound port listener on {}:{} for {} channel(s)", bind_address, port, channels.len());
+    info!("Building the outbound port listener router on port {} for {} channel(s)", port, channels.len());
 
     // Liveness probe for the channel/outbound listener (e.g. port 5000). This
     // listener has no identity router, so `/alive` is registered directly here
@@ -1340,8 +1698,28 @@ pub async fn run_outbound_port_server(
         let outbound_surface = surface
             .resolve_variant(None)
             .unwrap_or_else(|_| surface.clone());
-        for e in outbound_surface.validate_outbound() {
+        let mut warnings = outbound_surface.validate_outbound();
+        for warning in surface.validate_outbound() {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        for e in warnings {
             tracing::warn!(channel = %outbound_surface.name, "Outbound validation warning: {}", e);
+        }
+        for open in open_transit_points(&network_config, surface)
+            .into_iter()
+            .filter(|open| open.port == Some(port))
+        {
+            match open.exposure() {
+                Some(exposure) => tracing::warn!(channel = %outbound_surface.name, "{exposure}"),
+                None => tracing::warn!(
+                    channel = %outbound_surface.name,
+                    transit_point = %open.alias,
+                    variant = ?open.variant,
+                    "Transit Point serves callers it does not authenticate"
+                ),
+            }
         }
         let route_prefix = outbound_surface
             .route()
@@ -1406,11 +1784,16 @@ pub async fn run_outbound_port_server(
                 transit_token_issuer: get_transit_token_issuer(),
                 delegation_vault_store: get_delegation_vault_store(),
                 credential_provider_store: get_credential_provider_store(),
-                consent_identity_strategies: consent_identity_strategies.clone(),
+                consent_identity_strategies: source_auth_middleware
+                    .as_ref()
+                    .map(|middleware| middleware.provider_store()),
+                source_auth_middleware: source_auth_middleware.clone(),
                 mcp_continuations: crate::mcp::continuations::config::global().map(|runtime| Arc::new(runtime.clone())),
                 gateway_base_url: get_gateway_base_url(),
                 task_monitor: task_monitor.clone(),
                 max_response_bytes: config.a2a.max_body_size,
+                max_request_bytes: config.a2a.max_body_size,
+                egress_allowlist: crate::egress::bdd_egress_allowlist(),
                 vc_alias_override: vc
                     .listen_path
                     .as_ref()
@@ -1437,7 +1820,7 @@ pub async fn run_outbound_port_server(
             info!(
                 surface = %outbound_surface.name,
                 alias = %vc.alias,
-                target = %vc.target_endpoint,
+                target = %loggable::url(&vc.target_endpoint),
                 route = %outbound_wildcard,
                 listen_path = ?vc.listen_path,
                 "Registering outbound virtual channel route"
@@ -1497,7 +1880,6 @@ pub async fn run_outbound_port_server(
             }
         }
     }
-
     if network_config
         .sts
         .mcp_issuer
@@ -1522,54 +1904,21 @@ pub async fn run_outbound_port_server(
         );
     }
 
-    // Bind address — use the configured bind_address, not 0.0.0.0.
-    let bind_addr: std::net::SocketAddr = format!("{}:{}", bind_address, port)
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid outbound bind address {}:{}: {}", bind_address, port, e))?;
-
-    info!("Outbound port listener binding to {}", bind_addr);
-
     let app = app.layer(axum::middleware::from_fn(crate::observability::trace_http_request));
     let app = app.layer(axum::middleware::from_fn(crate::observability::access_log));
     let app = app.layer(axum::middleware::from_fn_with_state(
         std::sync::Arc::new(config.tls.client_auth.clone()),
         crate::source_auth::peer_cert::forwarded_peer_cert,
     ));
-    let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
-
-    if use_tls {
-        let tls_config = crate::server::load_server_config(
-            &config.tls.cert_path,
-            &config.tls.key_path,
-            direct_client_auth
-                .as_deref()
-                .cloned(),
-        )?;
-        let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
-            axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
-        );
-        if direct_client_auth.is_some() {
-            let acceptor = crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor);
-            axum_server::bind(bind_addr)
-                .acceptor(acceptor)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-        } else {
-            axum_server::bind(bind_addr)
-                .acceptor(rustls_acceptor)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-        }
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
-    }
-    .map_err(|e| anyhow::anyhow!("Outbound port listener error: {}", e))
+    Ok(app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use futures::StreamExt;
 
     #[test]
     fn parse_cors_origins_keeps_valid_origins() {
@@ -1592,6 +1941,102 @@ mod tests {
             &origins,
         ));
         assert!(is_proxy_cors_origin_allowed(&origin, "HEAD", "/agents/copilot-worker/discovery", &origins,));
+    }
+
+    #[tokio::test]
+    async fn only_the_metadata_routes_let_any_origin_read_protected_resource_metadata() {
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+        let request = |method: &str, preflight_for: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/.well-known/oauth-protected-resource/mcp/alpha")
+                .header(header::ORIGIN, "https://client.example");
+            if let Some(requested) = preflight_for {
+                request = request.header(header::ACCESS_CONTROL_REQUEST_METHOD, requested);
+            }
+            request
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let allowed = |layer: CorsLayer, method: &'static str, preflight_for: Option<&'static str>| async move {
+            Router::new()
+                .route("/{*path}", axum::routing::any(|| async { StatusCode::OK }))
+                .layer(layer)
+                .oneshot(request(method, preflight_for))
+                .await
+                .unwrap()
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        };
+        let cors = ["https://dashboard.example.com".to_string()];
+
+        assert!(allowed(metadata_cors_layer(&cors), "GET", None).await);
+        let read = Router::new()
+            .route("/{*path}", axum::routing::any(|| async { StatusCode::UNAUTHORIZED }))
+            .layer(proxy_cors_layer(&["https://client.example".to_string()]))
+            .oneshot(request("GET", None))
+            .await
+            .unwrap();
+        assert_eq!(read.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS], "www-authenticate");
+        assert!(allowed(metadata_cors_layer(&cors), "HEAD", None).await);
+        assert!(allowed(metadata_cors_layer(&cors), "OPTIONS", Some("GET")).await);
+        assert!(!allowed(metadata_cors_layer(&cors), "OPTIONS", Some("POST")).await);
+        // A channel proxying the same path keeps the allowlist.
+        assert!(!allowed(proxy_cors_layer(&cors), "GET", None).await);
+    }
+
+    #[test]
+    fn only_a_catch_all_at_the_root_or_well_known_proxies_the_metadata_paths() {
+        use crate::protocols::protected_resource::proxies_metadata_paths;
+        let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
+        assert!(!proxies_metadata_paths(&network));
+        let channel = |prefix: &str| crate::config::network::ChannelPrefix {
+            id: "channel".into(),
+            name: "channel".into(),
+            prefix: prefix.into(),
+        };
+        for (prefix, proxies) in [
+            ("/.well-known", true),
+            ("/", false),
+            ("/agents", false),
+            ("/.well-known/oauth-protected-resource", false),
+            ("/.well-known/oauth-protected-resource/mcp", false),
+        ] {
+            network.channels = vec![channel(prefix)];
+            assert_eq!(proxies_metadata_paths(&network), proxies, "channel {prefix}");
+        }
+        network.channels = Vec::new();
+        for (prefix, proxies) in [("", true), ("/", false)] {
+            network.routes = serde_json::from_value(serde_json::json!({
+                "root": {"type": "proxy", "prefix": prefix}
+            }))
+            .unwrap();
+            assert_eq!(proxies_metadata_paths(&network), proxies, "proxy route {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_at_the_metadata_path_keeps_it() {
+        use crate::protocols::protected_resource::metadata_path_owner;
+        let mut network = crate::protocols::protected_resource::fixtures::discovery_network();
+        assert_eq!(metadata_path_owner(&network), None);
+        for prefix in ["/.well-known", "/.well-known/oauth-protected-resource/mcp", "/agents"] {
+            network.channels = vec![crate::config::network::ChannelPrefix {
+                id: "channel".into(),
+                name: "channel".into(),
+                prefix: prefix.into(),
+            }];
+            assert_eq!(metadata_path_owner(&network), None, "{prefix}");
+        }
+        for prefix in ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/"] {
+            network.channels = vec![crate::config::network::ChannelPrefix {
+                id: "channel".into(),
+                name: "channel".into(),
+                prefix: prefix.into(),
+            }];
+            assert_eq!(metadata_path_owner(&network), Some(prefix));
+        }
     }
 
     #[test]
@@ -1647,6 +2092,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_access_point_answer_carries_no_cookie_the_target_set() {
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                axum::routing::any(|| async {
+                    (
+                        [
+                            (header::SET_COOKIE, "__Host-session_token=planted; Path=/; Secure"),
+                            (header::SET_COOKIE, "lb=sticky"),
+                            (header::HeaderName::from_static("set-cookie2"), "legacy=1"),
+                            (header::CACHE_CONTROL, "no-store"),
+                        ],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .layer(axum::middleware::map_response(withhold_target_cookies));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agents/worker/rpc")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::SET_COOKIE)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie2")
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
     #[test]
     fn proxy_cors_keeps_allowlist_for_non_discovery_paths() {
         let origin = HeaderValue::from_static("https://copilotstudio.microsoft.com");
@@ -1662,7 +2152,7 @@ mod tests {
         use tower::ServiceExt;
 
         // Mirrors the `/alive` route registered on the outbound/channel listener
-        // in `run_outbound_port_server` (used by ECS/ALB health checks on the
+        // in `build_outbound_port_router` (used by ECS/ALB health checks on the
         // channel port, e.g. 5000).
         let app = Router::new().route("/alive", axum::routing::get(crate::identity::handlers::alive_check));
 
@@ -1780,17 +2270,23 @@ mod tests {
                     payment_policy: None,
                     networking: None,
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     identity_injection: Default::default(),
                     managed_identity: None,
                     transit_credentials: None,
                     workload_binding: None,
-                    gateway_url: "https://gw.internal:9000/outgoing/surfaces/order/partner-a".to_string(),
+                    gateway_url: "https://gw.internal:9000/outbound/surfaces/order/partner-a".to_string(),
                     agent_card_path: None,
                     listen_address: None,
                     listen_path: tp_listen_path.map(str::to_string),
                     require_transit_token: true,
+                    source_auth: None,
+                    allow_unauthenticated_callers: false,
                     extension_inspection: crate::config::types::ExtensionInspectionConfig::default(),
                     fabric_delegated_credentials: false,
+                    delegated_credentials_for_fabric_callers: false,
+                    trust_check_list: Vec::new(),
+                    trust_check_migrated: false,
                 }],
                 outbound_listen_address: None,
                 shared: SharedTransitConfig::default(),
@@ -2036,6 +2532,17 @@ mod tests {
         inbound_urls: Vec<&str>,
         outbound_urls: Vec<&str>,
     ) -> crate::config::NetworkConfig {
+        network_config_binding("0.0.0.0", inbound_urls, "0.0.0.0", outbound_urls)
+    }
+
+    /// An inbound listener on port 8080 and an outbound one on 9000, bound to
+    /// the given addresses.
+    fn network_config_binding(
+        inbound_bind: &str,
+        inbound_urls: Vec<&str>,
+        outbound_bind: &str,
+        outbound_urls: Vec<&str>,
+    ) -> crate::config::NetworkConfig {
         serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.example.com" },
             "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
@@ -2044,7 +2551,7 @@ mod tests {
                 {
                     "id": "inbound-http",
                     "name": "Inbound",
-                    "bind_address": "0.0.0.0",
+                    "bind_address": inbound_bind,
                     "port": 8080,
                     "protocol": "http",
                     "external_urls": inbound_urls,
@@ -2053,7 +2560,7 @@ mod tests {
                 {
                     "id": "outbound-http",
                     "name": "Outbound",
-                    "bind_address": "0.0.0.0",
+                    "bind_address": outbound_bind,
                     "port": 9000,
                     "protocol": "http",
                     "external_urls": outbound_urls,
@@ -2066,11 +2573,318 @@ mod tests {
     }
 
     #[test]
+    fn an_inbound_listener_binds_its_configured_address() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.example.com" },
+            "webauthn": { "rp_id": "test", "external_origin": "https://test.example.com" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [
+                { "id": "loopback", "name": "Loopback", "bind_address": "127.0.0.1", "port": 8080,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "loopback-v6", "name": "Loopback v6", "bind_address": "::1", "port": 8443,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "every-interface", "name": "Every interface", "bind_address": "0.0.0.0", "port": 8081,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "internal", "name": "Internal", "bind_address": "10.0.0.5", "port": 8444,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "sidecar", "name": "Sidecar", "bind_address": "127.0.0.1", "port": 8444,
+                    "protocol": "https", "external_urls": [] },
+                { "id": "narrow", "name": "Narrow", "bind_address": "127.0.0.1", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "wide-v4", "name": "Wide v4", "bind_address": "0.0.0.0", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "wide-v6", "name": "Wide v6", "bind_address": "::", "port": 8445,
+                    "protocol": "http", "external_urls": [] },
+                { "id": "outbound", "name": "Outbound", "bind_address": "10.0.0.9", "port": 8446,
+                    "protocol": "http", "external_urls": [], "listener_type": "outbound" },
+                { "id": "inbound-beside-outbound", "name": "Inbound", "bind_address": "127.0.0.1", "port": 8446,
+                    "protocol": "http", "external_urls": [] }
+            ],
+            "routes": {}
+        }))
+        .unwrap();
+
+        for (port, expected) in [
+            (8080, vec!["127.0.0.1:8080"]),
+            (8443, vec!["[::1]:8443"]),
+            (8081, vec!["0.0.0.0:8081"]),
+            (8444, vec!["10.0.0.5:8444", "127.0.0.1:8444"]),
+            (8445, vec!["[::]:8445", "0.0.0.0:8445", "127.0.0.1:8445"]),
+            (8446, vec!["127.0.0.1:8446"]),
+        ] {
+            assert_eq!(
+                inbound_bind_addresses(&config, port).unwrap(),
+                expected
+                    .iter()
+                    .map(|address| {
+                        address
+                            .parse::<SocketAddr>()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>(),
+                "{port}"
+            );
+        }
+        assert_eq!(config.get_ports(), vec![8080, 8443, 8081, 8444, 8445, 8446]);
+        assert_eq!(
+            inbound_bind_addresses(&config, 9999)
+                .unwrap_err()
+                .to_string(),
+            "No inbound listener is configured for port 9999",
+            "a port without an inbound listener is never bound on every interface"
+        );
+        let outbound_only = make_network_config_with_listeners(vec![], vec![]);
+        assert!(inbound_bind_addresses(&outbound_only, 9000).is_err());
+    }
+
+    #[test]
+    fn a_bound_address_covers_only_what_its_socket_accepts() {
+        let address = |value: &str| {
+            value
+                .parse::<SocketAddr>()
+                .unwrap()
+        };
+        let dual_stack = false;
+        let ipv6_only = true;
+
+        assert!(bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("0.0.0.0:80")));
+        assert!(bound_address_covers(address("[::]:80"), ipv6_only, address("[::1]:80")));
+        assert!(bound_address_covers(address("[::]:80"), dual_stack, address("0.0.0.0:80")));
+        assert!(bound_address_covers(address("[::]:80"), dual_stack, address("10.0.0.5:80")));
+
+        assert!(!bound_address_covers(address("[::]:80"), ipv6_only, address("0.0.0.0:80")));
+        assert!(!bound_address_covers(address("[::]:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("[::1]:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("[::]:80")));
+        assert!(!bound_address_covers(address("127.0.0.1:80"), ipv6_only, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("[::1]:80"), dual_stack, address("127.0.0.1:80")));
+        assert!(!bound_address_covers(address("0.0.0.0:80"), ipv6_only, address("127.0.0.1:81")));
+    }
+
+    #[test]
+    fn a_listener_binds_an_ipv4_or_ipv6_bind_address() {
+        for (bind_address, expected) in
+            [("127.0.0.1", "127.0.0.1:9000"), ("::1", "[::1]:9000"), ("::", "[::]:9000"), ("0.0.0.0", "0.0.0.0:9000")]
+        {
+            assert_eq!(
+                listener_socket_address(bind_address, 9000).unwrap(),
+                expected
+                    .parse::<SocketAddr>()
+                    .unwrap(),
+                "{bind_address}"
+            );
+        }
+        assert!(listener_socket_address("localhost", 9000).is_err());
+        assert!(listener_socket_address("[1.2.3.4]", 9000).is_err());
+        assert_eq!(
+            listener_socket_address("[::1]", 9000).unwrap(),
+            "[::1]:9000"
+                .parse::<SocketAddr>()
+                .unwrap()
+        );
+        assert_eq!(
+            format!("http://{}", listener_socket_address("::1", 9000).unwrap()),
+            "http://[::1]:9000",
+            "the shared-domain proxy reaches an IPv6 outbound listener at a URL that parses"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outbound_listener_binds_an_ipv6_bind_address() {
+        let Ok(probe) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("skipped: this host has no IPv6 loopback address");
+            return;
+        };
+        let port = probe
+            .local_addr()
+            .unwrap()
+            .port();
+        drop(probe);
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let router = build_outbound_port_router(
+            port,
+            Vec::new(),
+            Arc::new(config),
+            Arc::new(make_network_config_with_listeners(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+        let _server = crate::proxy::port_listener::BoundPort::bind(
+            port,
+            crate::proxy::port_listener::PortBinding {
+                addresses: vec![listener_socket_address("::1", port).unwrap()],
+                tls: false,
+            },
+            router,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+
+        let mut alive = None;
+        for _ in 0..50 {
+            if let Ok(response) = client
+                .get(format!("http://[::1]:{port}/alive"))
+                .send()
+                .await
+            {
+                alive = Some(response.status());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(alive, Some(reqwest::StatusCode::OK));
+    }
+
+    #[tokio::test]
+    async fn an_outbound_router_registers_its_surface_states_before_it_is_returned() {
+        let config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
+            "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
+                "categories": []},
+            "extension_inspection": {"enabled": false}
+        }))
+        .unwrap();
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "fresh", "name": "fresh", "status": "active",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/fresh", "protocol": "a2a" },
+            "target": { "endpoint": "http://localhost:9001" },
+            "transit": { "outbound_listen_address": "http://localhost:9000",
+                "points": [{ "alias": "partner", "target_endpoint": "http://localhost:9002" }] }
+        }))
+        .unwrap();
+        let points = surface
+            .transit
+            .as_ref()
+            .unwrap()
+            .points
+            .clone();
+        let states = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        let _router = build_outbound_port_router(
+            0,
+            vec![(surface, points)],
+            Arc::new(config),
+            Arc::new(make_network_config_with_listeners(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            states.clone(),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+        let registered: Vec<String> = states
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        assert_eq!(registered, ["fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_port_binds_each_inbound_address_and_skips_one_its_wildcard_already_serves() {
+        let held = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = held
+            .local_addr()
+            .unwrap()
+            .port();
+        let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+
+        let error = bind_inbound_listeners(&[loopback])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("Failed to bind inbound listener 127.0.0.1:"),
+            "{error}"
+        );
+        drop(held);
+
+        let listeners = bind_inbound_listeners(&[SocketAddr::from(([0, 0, 0, 0], port)), loopback])
+            .await
+            .unwrap();
+        assert!(
+            listeners
+                .iter()
+                .any(|listener| listener
+                    .local_addr()
+                    .unwrap()
+                    .ip()
+                    .is_unspecified())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(loopback))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
     fn extract_hostname_strips_scheme_port_and_path() {
         assert_eq!(extract_hostname("https://example.com/path"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("http://example.com:8080/foo"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("https://Example.COM"), Some("example.com".to_string()));
         assert_eq!(extract_hostname("no-scheme"), None);
+        assert_eq!(extract_hostname("http://10.0.0.1:8080/x"), Some("10.0.0.1".to_string()));
+        assert_eq!(extract_hostname("https://[2001:db8::1]:8443/x"), Some("[2001:db8::1]".to_string()));
+        assert_eq!(extract_hostname("https://[::1]"), Some("[::1]".to_string()));
+        assert_eq!(extract_hostname("https://[2001:DB8:0:0::1]"), Some("[2001:db8::1]".to_string()));
+        assert_eq!(extract_hostname("https://[2001:db8::1"), None);
+    }
+
+    #[test]
+    fn find_shared_outbound_listener_never_matches_different_ipv6_hosts() {
+        for (inbound, outbound) in [
+            ("https://[2001:db8::1]:8443", "https://[2001:db8::2]:9443"),
+            ("https://[::1]", "https://[::2]"),
+            ("https://[2001:db8::1]", "https://[2001:db9::1]"),
+        ] {
+            let config = make_network_config_with_listeners(vec![inbound], vec![outbound]);
+            assert!(find_shared_outbound_listener(&config, 8080).is_none(), "{inbound} and {outbound}");
+        }
+    }
+
+    #[test]
+    fn find_shared_outbound_listener_matches_one_ipv6_host_however_it_is_written() {
+        let config = make_network_config_with_listeners(
+            vec!["https://[2001:db8::1]:8443"],
+            vec!["https://[2001:DB8:0:0:0:0:0:1]:9443"],
+        );
+        assert!(find_shared_outbound_listener(&config, 8080).is_some());
     }
 
     #[test]
@@ -2121,11 +2935,636 @@ mod tests {
     }
 
     #[test]
+    fn the_outbound_proxy_on_an_inbound_listener_never_passes_a_forwarded_client_certificate() {
+        for header in ["X-Forwarded-Client-Cert", "x-forwarded-client-cert"] {
+            assert!(!shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+        assert!(!shared_domain_proxy_forwards("x-client-cert", "X-Client-Cert"));
+        for header in ["host", "connection", "transfer-encoding"] {
+            assert!(!shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+        for header in ["x-transit-token", "x-api-key", "authorization", "content-type"] {
+            assert!(shared_domain_proxy_forwards(header, "x-forwarded-client-cert"), "{header}");
+        }
+    }
+
+    #[test]
+    fn only_this_hosts_own_addresses_are_out_of_reach_of_other_hosts() {
+        for url in [
+            "https://gateway.example.com",
+            "https://gateway.internal:9000/outbound",
+            "http://203.0.113.7:9000",
+            "http://[2001:db8::1]:9000",
+            "http://10.1.2.3",
+            "http://172.16.0.1",
+            "http://192.168.1.10",
+            "http://169.254.169.254",
+            "http://[fd00::1]",
+            "http://[fe80::1]",
+            "http://[::ffff:10.0.0.1]",
+            "not a url",
+        ] {
+            assert!(reachable_from_other_hosts(url), "{url}");
+        }
+        for url in [
+            "http://localhost:9000",
+            "http://LOCALHOST:9000",
+            "http://gateway.localhost",
+            "http://127.0.0.1:9000",
+            "http://127.8.0.1",
+            "http://0.0.0.0:9000",
+            "http://[::1]:9000",
+            "http://[::ffff:127.0.0.1]",
+        ] {
+            assert!(!reachable_from_other_hosts(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_outbound_listener_is_exposed_on_its_urls_its_bind_address_and_an_inbound_listener_sharing_its_host() {
+        let loopback =
+            |inbound_urls, outbound_urls| network_config_binding("127.0.0.1", inbound_urls, "127.0.0.1", outbound_urls);
+        let addresses = |addresses: &[&str]| -> Vec<String> {
+            addresses
+                .iter()
+                .map(|address| address.to_string())
+                .collect()
+        };
+        let separate = loopback(vec!["https://inbound.example.com"], vec!["http://localhost:9000"]);
+        assert_eq!(exposed_outbound_addresses(&separate, 9000), addresses(&[]));
+
+        let own = loopback(
+            vec!["https://inbound.example.com"],
+            vec!["https://outbound.example.com", "http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&own, 9000), addresses(&["https://outbound.example.com"]));
+
+        let private = loopback(vec!["https://inbound.example.com"], vec!["http://10.0.0.5:9000"]);
+        assert_eq!(
+            exposed_outbound_addresses(&private, 9000),
+            addresses(&["http://10.0.0.5:9000"]),
+            "every workload on that network reaches a private address"
+        );
+
+        let shared =
+            loopback(vec!["https://gateway.example.com", "http://localhost:8080"], vec!["http://localhost:9000"]);
+        assert_eq!(
+            exposed_outbound_addresses(&shared, 9000),
+            addresses(&["https://gateway.example.com"]),
+            "the inbound listener passes /outbound to the outbound listener it shares localhost with"
+        );
+        assert_eq!(exposed_outbound_addresses(&shared, 9001), addresses(&[]));
+
+        let bound = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "0.0.0.0",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(
+            exposed_outbound_addresses(&bound, 9000),
+            addresses(&["0.0.0.0:9000"]),
+            "a listener bound beyond loopback is reachable whatever its URLs say"
+        );
+        let bound_v6 = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "::",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&bound_v6, 9000), addresses(&["[::]:9000"]));
+        let bracketed_loopback = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "[::1]",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(
+            exposed_outbound_addresses(&bracketed_loopback, 9000),
+            addresses(&[]),
+            "a bracketed IPv6 loopback bind address is loopback"
+        );
+        let bracketed_wildcard = network_config_binding(
+            "127.0.0.1",
+            vec!["https://inbound.example.com"],
+            "[::]",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&bracketed_wildcard, 9000), addresses(&["[::]:9000"]));
+
+        let shared_bound = network_config_binding(
+            "0.0.0.0",
+            vec!["http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(exposed_outbound_addresses(&shared_bound, 9000), addresses(&["0.0.0.0:8080"]));
+        let separate_bound = network_config_binding(
+            "0.0.0.0",
+            vec!["https://inbound.example.com"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        assert_eq!(
+            exposed_outbound_addresses(&separate_bound, 9000),
+            addresses(&[]),
+            "an inbound listener that does not pass /outbound on does not expose it"
+        );
+    }
+
+    #[test]
+    fn open_transit_points_name_the_addresses_other_hosts_reach_them_on() {
+        let network = network_config_binding(
+            "127.0.0.1",
+            vec!["https://gateway.example.com", "http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "exposure",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/exposure", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.internal" },
+            "transit": {
+                "outbound_listen_address": "http://localhost:9000",
+                "points": [
+                    { "alias": "open", "target_endpoint": "https://open.example", "require_transit_token": false,
+                        "allow_unauthenticated_callers": true },
+                    { "alias": "tokened", "target_endpoint": "https://tokened.example" },
+                    { "alias": "elsewhere", "target_endpoint": "https://elsewhere.example",
+                        "listen_address": "http://unknown:1", "require_transit_token": false,
+                        "allow_unauthenticated_callers": true }
+                ]
+            },
+            "variants": [{ "id": "candidate", "alias": "candidate", "name": "Candidate", "overrides": {
+                "transit": { "points": [{ "alias": "tokened", "target_endpoint": "https://tokened.example",
+                    "require_transit_token": false, "allow_unauthenticated_callers": true }] }
+            }}]
+        }))
+        .unwrap();
+        let exposed = vec!["https://gateway.example.com".to_string()];
+
+        let open = open_transit_points(&network, &surface);
+
+        assert_eq!(
+            open,
+            vec![
+                OpenTransitPoint {
+                    alias: "open".to_string(),
+                    variant: None,
+                    port: Some(9000),
+                    exposed_at: exposed.clone(),
+                },
+                OpenTransitPoint {
+                    alias: "elsewhere".to_string(),
+                    variant: None,
+                    port: Some(9000),
+                    exposed_at: exposed.clone(),
+                },
+                OpenTransitPoint {
+                    alias: "tokened".to_string(),
+                    variant: Some("candidate".to_string()),
+                    port: Some(9000),
+                    exposed_at: exposed,
+                },
+            ]
+        );
+        assert_eq!(
+            open[2].exposure().unwrap(),
+            "Transit Point 'tokened' in variant 'candidate' serves callers it does not authenticate and is \
+             reachable from other hosts: https://gateway.example.com"
+        );
+
+        let local = network_config_binding(
+            "127.0.0.1",
+            vec!["http://localhost:8080"],
+            "127.0.0.1",
+            vec!["http://localhost:9000"],
+        );
+        let open = open_transit_points(&local, &surface);
+        assert_eq!(open.len(), 3);
+        assert!(
+            open.iter()
+                .all(|point| point.exposure().is_none()),
+            "{open:?}"
+        );
+    }
+
+    #[test]
     fn tp_outbound_path_prefix_is_outbound() {
         assert_eq!(
             crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX,
             "/outbound",
             "changing this constant is a breaking change for all deployed transit points"
         );
+    }
+
+    /// A stand-in outbound listener: `/outbound/deny` answers 401 without
+    /// reading the body, `/outbound/stream` sends one event and holds the
+    /// stream open, and every other path reads the whole body and answers 201
+    /// with the method and body length. `started` counts requests that arrived,
+    /// `completed` those whose body was read to the end.
+    struct OutboundStub {
+        url: String,
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn outbound_stub() -> OutboundStub {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (on_start, on_complete) = (started.clone(), completed.clone());
+        let app = axum::Router::new()
+            .route(
+                "/outbound/deny",
+                axum::routing::any(|| async { (StatusCode::UNAUTHORIZED, "Transit token missing or invalid") }),
+            )
+            .route(
+                "/outbound/stream",
+                axum::routing::any(|| async {
+                    let first = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: first\n\n"))
+                    });
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(first.chain(futures::stream::pending())))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/outbound/stall",
+                axum::routing::any(|request: axum::extract::Request| async {
+                    let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await;
+                    futures::future::pending::<()>().await;
+                }),
+            )
+            .fallback(move |request: axum::extract::Request| {
+                let (on_start, on_complete) = (on_start.clone(), on_complete.clone());
+                async move {
+                    on_start.fetch_add(1, Ordering::SeqCst);
+                    let method = request.method().clone();
+                    match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+                        Ok(body) => {
+                            on_complete.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::CREATED, [("x-stub", "echo")], format!("{method} {}", body.len()))
+                                .into_response()
+                        }
+                        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+                    }
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        OutboundStub { url, started, completed }
+    }
+
+    fn hop_to(
+        stub: &OutboundStub,
+        max_body_bytes: usize,
+    ) -> Arc<SharedHostHop> {
+        Arc::new(SharedHostHop {
+            target: stub.url.clone(),
+            client: crate::http_client::shared_host_hop(SHARED_HOST_HOP_READ_IDLE).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes,
+        })
+    }
+
+    const HOP_CHUNK: usize = 1024;
+
+    /// An endless body of `HOP_CHUNK`-byte chunks that counts every byte the
+    /// hop pulls from it.
+    fn endless_counted_body(pulled: Arc<std::sync::atomic::AtomicUsize>) -> axum::body::Body {
+        axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+            pulled.fetch_add(HOP_CHUNK, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0u8; HOP_CHUNK]))
+        }))
+    }
+
+    async fn hop_call(
+        hop: Arc<SharedHostHop>,
+        request: axum::extract::Request,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), forward_shared_host_hop(hop, request))
+            .await
+            .expect("the hop must answer instead of reading an endless body");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the hop response must end")
+        .unwrap_or_default();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn hop_request(
+        method: &str,
+        path: &str,
+        content_length: Option<usize>,
+        body: axum::body::Body,
+    ) -> axum::extract::Request {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path);
+        if let Some(length) = content_length {
+            request = request.header("content-length", length);
+        }
+        request.body(body).unwrap()
+    }
+
+    fn failing_body() -> axum::body::Body {
+        axum::body::Body::from_stream(futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]))
+    }
+
+    /// The hop answers its own refusals as a JSON-RPC error with no id
+    /// when the request names an MCP protocol version, and as an A2A problem
+    /// otherwise.
+    #[tokio::test]
+    async fn the_hop_answers_its_refusals_in_the_shape_of_the_callers_protocol() {
+        let stub = outbound_stub().await;
+        let mcp = |mut request: axum::extract::Request| {
+            request
+                .headers_mut()
+                .insert("mcp-protocol-version", HeaderValue::from_static("2025-06-18"));
+            request
+        };
+
+        for (case, request, status, message) in [
+            (
+                "declared oversize",
+                mcp(hop_request("POST", "/outbound/echo", Some(4097), axum::body::Body::from(vec![0u8; 4097]))),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "MCP request body exceeds the configured limit",
+            ),
+            (
+                "failed body",
+                mcp(hop_request("POST", "/outbound/echo", None, failing_body())),
+                StatusCode::BAD_REQUEST,
+                "Failed to read MCP request body",
+            ),
+        ] {
+            let (answered, headers, body) = hop_call(hop_to(&stub, 4096), request).await;
+            assert_eq!(answered, status, "{case}: {body}");
+            assert_eq!(headers["content-type"], "application/json", "{case}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["jsonrpc"], "2.0", "{case}");
+            assert!(body.get("id").is_none(), "{case}: {body}");
+            assert_eq!(body["error"]["code"], crate::mcp::error_codes::INVALID_REQUEST, "{case}");
+            assert_eq!(body["error"]["message"], message, "{case}");
+        }
+
+        for (case, request, status) in [
+            (
+                "declared oversize",
+                hop_request("POST", "/outbound/echo", Some(4097), axum::body::Body::from(vec![0u8; 4097])),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            ("failed body", hop_request("POST", "/outbound/echo", None, failing_body()), StatusCode::BAD_REQUEST),
+        ] {
+            let (answered, _, body) = hop_call(hop_to(&stub, 4096), request).await;
+            assert_eq!(answered, status, "{case}: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["type"], "https://a2a-protocol.org/errors/proxy-error", "{case}");
+            assert!(body.get("jsonrpc").is_none(), "{case}");
+        }
+    }
+
+    /// A hop whose wait for the outbound listener times out after the body
+    /// passed the cap answers 502, not 413; a send that fails on the body
+    /// past the cap answers 413.
+    #[tokio::test]
+    async fn the_hop_reports_too_large_only_when_the_body_failed_the_send() {
+        let stub = outbound_stub().await;
+        let past_the_cap = || {
+            axum::body::Body::from_stream(futures::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from(
+                vec![0u8; 4096 + 1024],
+            ))]))
+        };
+        let stalling = Arc::new(SharedHostHop {
+            target: stub.url.clone(),
+            client: crate::http_client::shared_host_hop(std::time::Duration::from_millis(300)).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes: 4096,
+        });
+
+        let (status, _, body) = hop_call(stalling, hop_request("POST", "/outbound/stall", None, past_the_cap())).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request(
+                "POST",
+                "/outbound/echo",
+                None,
+                endless_counted_body(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    }
+
+    /// The hop's refusals are logged with the caller's socket address, and
+    /// never with the query.
+    #[tokio::test]
+    async fn the_hop_logs_its_refusals_with_the_callers_address() {
+        let stub = outbound_stub().await;
+        let caller: SocketAddr = "192.0.2.7:40123"
+            .parse()
+            .unwrap();
+        let with_caller = |mut request: axum::extract::Request| {
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(caller));
+            request
+        };
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        hop_call(
+            hop_to(&stub, 4096),
+            with_caller(hop_request(
+                "POST",
+                "/outbound/echo?secret=query",
+                Some(4097),
+                axum::body::Body::from(vec![0u8; 4097]),
+            )),
+        )
+        .await;
+        hop_call(
+            hop_to(&stub, 4096),
+            with_caller(hop_request(
+                "POST",
+                "/outbound/echo?secret=query",
+                None,
+                endless_counted_body(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            )),
+        )
+        .await;
+
+        let text = logs.text();
+        assert_eq!(
+            text.matches("caller=192.0.2.7:40123")
+                .count(),
+            2,
+            "{text}"
+        );
+        assert!(text.contains("refused a declared oversize body"), "{text}");
+        assert!(text.contains("refused an oversize body"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn the_hop_refuses_a_declared_oversize_body_without_reading_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request("POST", "/outbound/echo", Some(4097), endless_counted_body(pulled.clone())),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large (max: 4096)"), "{body}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            stub.started
+                .load(Ordering::SeqCst),
+            0,
+            "the outbound listener was called"
+        );
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, 4096),
+            hop_request("POST", "/outbound/echo", Some(4096), axum::body::Body::from(vec![0u8; 4096])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body, "POST 4096");
+    }
+
+    #[tokio::test]
+    async fn the_hop_cuts_an_endless_body_at_the_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let limit = 64 * 1024;
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, limit),
+            hop_request("POST", "/outbound/echo", None, endless_counted_body(pulled.clone())),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large"), "{body}");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(pulled <= limit + SHARED_HOST_HOP_STREAM_MARGIN + HOP_CHUNK, "pulled {pulled} bytes");
+        assert_eq!(
+            stub.completed
+                .load(Ordering::SeqCst),
+            0,
+            "a truncated body was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_stops_pulling_an_endless_body_the_outbound_listener_refuses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let stub = outbound_stub().await;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let limit = 10 * 1024 * 1024;
+
+        let (status, _, body) = hop_call(
+            hop_to(&stub, limit),
+            hop_request("POST", "/outbound/deny", None, endless_counted_body(pulled.clone())),
+        )
+        .await;
+        // The listener closes on the unread body, and the reset can reach the
+        // hop before its 401 does.
+        assert!([StatusCode::UNAUTHORIZED, StatusCode::BAD_GATEWAY].contains(&status), "{status}: {body}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let settled = pulled.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(pulled.load(Ordering::SeqCst), settled, "the hop kept pulling the refused body");
+        assert!(
+            settled <= limit / 2,
+            "pulled {settled} bytes of a body the listener refused; only socket and transport buffers, well under the {limit}-byte cap, should be read"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_refuses_a_body_the_caller_fails_to_send_instead_of_forwarding_it_empty() {
+        use std::sync::atomic::Ordering;
+        let stub = outbound_stub().await;
+        let failing = axum::body::Body::from_stream(futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]));
+
+        let (status, _, body) =
+            hop_call(hop_to(&stub, 4096), hop_request("POST", "/outbound/echo", None, failing)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Failed to read request body"), "{body}");
+        assert_eq!(
+            stub.completed
+                .load(Ordering::SeqCst),
+            0,
+            "a body was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hop_passes_the_method_status_headers_and_body_through() {
+        let stub = outbound_stub().await;
+
+        for (method, body, expected) in [
+            ("PATCH", axum::body::Body::from("abc"), "PATCH 3"),
+            ("DELETE", axum::body::Body::from("abcd"), "DELETE 4"),
+            ("GET", axum::body::Body::empty(), "GET 0"),
+        ] {
+            let (status, headers, answer) =
+                hop_call(hop_to(&stub, 4096), hop_request(method, "/outbound/echo", None, body)).await;
+            assert_eq!(status, StatusCode::CREATED, "{method}: {answer}");
+            assert_eq!(headers.get("x-stub").unwrap(), "echo", "{method}");
+            assert_eq!(answer, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hop_streams_the_response_before_the_outbound_listener_ends_it() {
+        let stub = outbound_stub().await;
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            forward_shared_host_hop(
+                hop_to(&stub, 4096),
+                hop_request("GET", "/outbound/stream", None, axum::body::Body::empty()),
+            ),
+        )
+        .await
+        .expect("the hop must answer before the stream ends");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let mut body = response
+            .into_body()
+            .into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), body.next())
+            .await
+            .expect("the first event must arrive while the stream is open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"data: first\n\n");
     }
 }

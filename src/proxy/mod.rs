@@ -3,21 +3,25 @@
 pub mod agent_card_cache;
 pub mod backend_identity;
 pub mod caller_identity;
+pub mod card_preview;
 pub mod channel_logging;
 pub mod credential_delegation;
 pub mod fabric_forward;
+pub(crate) mod fabric_hops;
 pub mod fabric_identity;
 pub(crate) mod fabric_response_waiter;
 pub(crate) mod fabric_stream;
 pub mod handler;
 pub mod outbound_handler;
 pub mod paths;
+pub mod port_listener;
 pub mod protocol_router;
 pub mod response_policy;
 pub mod route_variant;
 pub mod rules_engine;
 pub mod server;
 pub mod surface_manager;
+pub(crate) mod target_grant;
 pub mod trace;
 pub mod transit_token;
 pub(crate) mod upstream_body;
@@ -26,6 +30,20 @@ pub mod workload_binding;
 pub use protocol_router::*;
 pub use rules_engine::*;
 pub use surface_manager::SurfaceTaskManager;
+
+/// Whether reading a request body failed because it passed the length limit
+/// it was read with.
+pub(crate) fn exceeds_length_limit(error: &axum::Error) -> bool {
+    std::error::Error::source(error).is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+}
+
+/// The gateway's 413 for a request body over `max_bytes`, as an A2A problem.
+pub(crate) fn body_too_large_response(max_bytes: usize) -> axum::response::Response {
+    crate::a2a::create_error_response(
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        &format!("Request body too large (max: {max_bytes})"),
+    )
+}
 
 // ── Shared identity engine compilation ──────────────────────────────────────
 

@@ -2,19 +2,30 @@ import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
 import { apiClient } from '../../../../api';
 import FieldHelp from '../../../shared/FieldHelp';
+import {
+  outOfTenantLabel,
+  sendsGatewayCredential,
+  splitByTenant,
+} from '../../../../utils/tenantScope';
+import { useSurfaceTenant } from '../../SurfaceMetaContext';
 
 interface CredentialProviderOption {
   id: string;
   name: string;
   provider_id?: string;
   provider_type?: string;
+  issuer?: string | null;
   callback_url?: string;
+  tenant_id?: string | null;
 }
+
+/** The consent modes the panel's select sets; a stored `elicit` or `external` is kept. */
+type SelectableConsentMode = 'on_demand' | 'pre_authorize';
 
 export interface TransitCredentialsForm {
   credential_provider_id: string;
   scopes: string;
-  consent_mode: 'on_demand' | 'pre_authorize';
+  consent_mode: SelectableConsentMode | 'elicit' | 'external';
   inject_as_type: 'bearer_header' | 'custom_header' | 'meta';
   inject_as_custom_name?: string;
   inject_as_custom_format?: string;
@@ -22,7 +33,15 @@ export interface TransitCredentialsForm {
   /** Kept from the stored value: the panel has no control for them. */
   elicit_timeout_secs?: number;
   elicit_fallback?: string;
+  /** Whose account an `external` binding's grant is: kept from the stored value. */
+  subject?: 'owner' | 'caller';
 }
+
+/** Labels of the consent modes the select shows only when they are stored. */
+const KEPT_CONSENT_MODES: Record<string, string> = {
+  elicit: 'Elicit (set through the API)',
+  external: 'External consent (set through the API)',
+};
 
 export const EMPTY_TRANSIT_CREDENTIALS: TransitCredentialsForm = {
   credential_provider_id: '',
@@ -56,6 +75,7 @@ export function transitCredentialsFormToApi(f: TransitCredentialsForm | null | u
     inject_as,
     ...(f.elicit_timeout_secs !== undefined ? { elicit_timeout_secs: f.elicit_timeout_secs } : {}),
     ...(f.elicit_fallback !== undefined ? { elicit_fallback: f.elicit_fallback } : {}),
+    ...(f.subject !== undefined ? { subject: f.subject } : {}),
   };
 }
 
@@ -86,6 +106,7 @@ export function transitCredentialsApiToForm(api: any): TransitCredentialsForm | 
       ? { elicit_timeout_secs: api.elicit_timeout_secs }
       : {}),
     ...(api.elicit_fallback !== undefined ? { elicit_fallback: api.elicit_fallback } : {}),
+    ...(api.subject === 'owner' || api.subject === 'caller' ? { subject: api.subject } : {}),
   };
 }
 
@@ -117,6 +138,11 @@ interface Props {
 const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) => {
   const [providers, setProviders] = useState<CredentialProviderOption[]>([]);
   const [loading, setLoading] = useState(true);
+  const { offered, outside } = splitByTenant(
+    providers,
+    useSurfaceTenant(),
+    provider => !sendsGatewayCredential(provider)
+  );
 
   useEffect(() => {
     let alive = true;
@@ -136,6 +162,8 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
   }, []);
 
   const enabled = value !== null && value !== undefined;
+  /** Another system obtains an external binding's grant, so only its removal is offered here. */
+  const readOnly = value?.consent_mode === 'external';
 
   const toggle = () => {
     if (enabled) onChange(null);
@@ -172,15 +200,22 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               size="sm"
               value={value.credential_provider_id}
               onChange={e => update('credential_provider_id', e.target.value)}
-              disabled={loading}
+              disabled={loading || readOnly}
             >
               <option value="">{loading ? '-- Loading… --' : '-- Select provider --'}</option>
-              {providers.map(p => (
+              {offered.map(p => (
                 <option key={p.id} value={p.id}>
                   {p.name}
                   {p.provider_id ? ` (${p.provider_id})` : ''}
                 </option>
               ))}
+              {outside
+                .filter(p => p.id === value.credential_provider_id)
+                .map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} ({outOfTenantLabel(p)})
+                  </option>
+                ))}
             </Form.Select>
             {(() => {
               const selected = providers.find(p => p.id === value.credential_provider_id);
@@ -230,6 +265,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               value={value.scopes}
               onChange={e => update('scopes', e.target.value)}
               placeholder="repo, read:user (empty = provider defaults)"
+              disabled={readOnly}
             />
           </Form.Group>
 
@@ -250,14 +286,34 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
             </Form.Label>
             <Form.Select
               size="sm"
+              data-testid="transit-point-consent-mode-select"
               value={value.consent_mode}
+              disabled={readOnly}
               onChange={e =>
                 update('consent_mode', e.target.value as TransitCredentialsForm['consent_mode'])
               }
             >
               <option value="on_demand">On demand (signal consent_required)</option>
               <option value="pre_authorize">Pre-authorize (block until granted)</option>
+              {KEPT_CONSENT_MODES[value.consent_mode] && (
+                <option value={value.consent_mode} disabled>
+                  {KEPT_CONSENT_MODES[value.consent_mode]}
+                </option>
+              )}
             </Form.Select>
+            {readOnly && (
+              <Form.Text
+                className="text-muted d-block"
+                data-testid="transit-point-binding-subject"
+                style={{ fontSize: '10px' }}
+              >
+                {value.subject === 'caller'
+                  ? 'Each caller uses the grant of their own account.'
+                  : 'Every caller uses the one grant of the account that connected.'}{' '}
+                Another system obtains the grant; change this binding through the API. Changing or
+                removing this binding revokes its grants.
+              </Form.Text>
+            )}
           </Form.Group>
 
           <Form.Group className="mb-2">
@@ -280,6 +336,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
               onChange={e =>
                 update('inject_as_type', e.target.value as TransitCredentialsForm['inject_as_type'])
               }
+              disabled={readOnly}
             >
               <option value="bearer_header">Bearer header</option>
               <option value="custom_header">Custom header</option>
@@ -297,6 +354,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                   value={value.inject_as_custom_name ?? ''}
                   onChange={e => update('inject_as_custom_name', e.target.value)}
                   placeholder="X-GitHub-Token"
+                  disabled={readOnly}
                 />
               </Form.Group>
               <Form.Group className="mb-1">
@@ -307,6 +365,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                   value={value.inject_as_custom_format ?? ''}
                   onChange={e => update('inject_as_custom_format', e.target.value)}
                   placeholder="token {value}"
+                  disabled={readOnly}
                 />
               </Form.Group>
             </>
@@ -321,6 +380,7 @@ const TransitCredentialBindingSection: React.FC<Props> = ({ value, onChange }) =
                 value={value.inject_as_meta_field ?? ''}
                 onChange={e => update('inject_as_meta_field', e.target.value)}
                 placeholder="oauth_token"
+                disabled={readOnly}
               />
             </Form.Group>
           )}

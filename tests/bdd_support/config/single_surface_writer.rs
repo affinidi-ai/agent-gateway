@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::bdd_support::config::DEFAULT_HEADER_METADATA_EXTENSION_URI;
@@ -11,13 +11,19 @@ use crate::bdd_support::config::config_tree::{
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
-    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, SurfaceConfigBuilder,
-    SurfaceSourceAuthConfig,
+    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
+    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig, SurfaceTransitPointConfig,
+    TargetAuthProviderGrant,
 };
-use crate::bdd_support::config::target_auth::static_secret_target_auth_json;
+use crate::bdd_support::config::target_auth::{
+    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
+    TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET,
+    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_service_account_key_file,
+    target_auth_signing_key,
+};
 
 struct SingleSurfaceOptions<'a> {
-    outbound: Option<(u16, &'a str)>,
+    outbound: Option<(u16, &'a HashMap<String, String>)>,
     affinidi_terms_url: Option<&'a str>,
 }
 
@@ -67,7 +73,7 @@ pub fn write_single_surface_config_with_outbound_listener(
     gateway_port: u16,
     outbound_port: u16,
     mock_url: &str,
-    transit_target_url: &str,
+    transit_target_urls: &HashMap<String, String>,
     surface_config: &SurfaceConfigBuilder,
     jwks_fixture: Option<&JwksFiles>,
 ) {
@@ -78,10 +84,130 @@ pub fn write_single_surface_config_with_outbound_listener(
         surface_config,
         jwks_fixture,
         SingleSurfaceOptions {
-            outbound: Some((outbound_port, transit_target_url)),
+            outbound: Some((outbound_port, transit_target_urls)),
             affinidi_terms_url: None,
         },
     );
+}
+
+/// The Target endpoint the surface is written with, when its managed agent is served by the
+/// mock at `mock_url`.
+pub fn effective_target_url(
+    mock_url: &str,
+    surface_config: &SurfaceConfigBuilder,
+) -> String {
+    if let Some(proxy) = &surface_config.mcp_proxy_target {
+        format!("proxy://{}", proxy.proxy_id)
+    } else if let Some(proxy) = &surface_config.a2a_proxy_target {
+        format!("a2a-proxy://{}", proxy.proxy_id)
+    } else {
+        surface_config
+            .override_target_url
+            .clone()
+            .unwrap_or_else(|| target_url_under_base_path(mock_url, surface_config))
+    }
+}
+
+fn target_url_under_base_path(
+    mock_url: &str,
+    surface_config: &SurfaceConfigBuilder,
+) -> String {
+    format!(
+        "{mock_url}{}",
+        surface_config
+            .target_base_path
+            .as_deref()
+            .unwrap_or_default()
+    )
+}
+
+fn transit_point_json(
+    transit_point: &SurfaceTransitPointConfig,
+    target_endpoint: &str,
+    delegation_binding: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut transit_point_json = serde_json::json!({
+        "name": transit_point.alias,
+        "alias": transit_point.alias,
+        "target_endpoint": target_endpoint,
+        "protocol": transit_point.protocol,
+        "listen_path": format!("/transit/{}", transit_point.alias),
+        "require_transit_token": transit_point.require_transit_token
+    });
+    if let Some(source_auth) = &transit_point.source_auth {
+        transit_point_json["source_auth"] = source_auth.clone();
+    } else if !transit_point.require_transit_token && transit_point.allow_unauthenticated_callers {
+        transit_point_json["allow_unauthenticated_callers"] = serde_json::json!(true);
+    }
+    if let Some(binding) = delegation_binding
+        && transit_point.delegated_credentials
+    {
+        transit_point_json["transit_credentials"] = binding.clone();
+    }
+    if transit_point.target_auth_provider {
+        transit_point_json["target_auth"] =
+            credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &transit_point.target_auth_fallback);
+    } else if let Some(target_auth) = &transit_point.target_auth_secret {
+        transit_point_json["target_auth"] = static_secret_target_auth_json(
+            &target_auth.secret_id,
+            &target_auth.header_name,
+            &target_auth.header_format,
+            &target_auth.fallback,
+        );
+    }
+    if let Some(requests) = transit_point.per_caller_rate_limit_per_minute {
+        transit_point_json["per_caller_rate_limit"] = serde_json::json!({ "requests": requests, "window_secs": 60 });
+    }
+    if !transit_point
+        .header_metadata_mapping
+        .headers
+        .is_empty()
+    {
+        transit_point_json["header_metadata_mapping"] = serde_json::json!({
+            "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
+            "strip_mapped_headers": transit_point.header_metadata_mapping.strip_mapped_headers,
+            "headers": transit_point.header_metadata_mapping.headers.iter().map(|row| {
+                serde_json::json!({
+                    "header": &row.header,
+                    "field": &row.field,
+                })
+            }).collect::<Vec<_>>()
+        });
+    }
+    if let Some(managed_identity) = &transit_point.managed_identity {
+        let mut properties = serde_json::Map::new();
+        for field in &managed_identity.fields {
+            properties.insert(field.clone(), serde_json::json!({ "type": "string", "x-identity": true }));
+        }
+        transit_point_json["managed_identity"] = serde_json::json!({
+            "type": "payload_extraction",
+            "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
+            "meta_field": "agentIdentity",
+            "fields": &managed_identity.fields,
+            "json_schema": {
+                "type": "object",
+                "properties": properties,
+                "required": &managed_identity.fields,
+            }
+        });
+        transit_point_json["identity_injection"] = serde_json::json!({
+            "inject_vp": true,
+        });
+    }
+    if !transit_point
+        .trust_check_list
+        .is_empty()
+    {
+        transit_point_json["trust_check_list"] = serde_json::Value::Array(
+            transit_point
+                .trust_check_list
+                .clone(),
+        );
+    }
+    if let Some(policy) = &transit_point.policy {
+        transit_point_json["policy"] = serde_json::json!({ "policy_definition_id": policy.id });
+    }
+    transit_point_json
 }
 
 fn write_single_surface_config_inner(
@@ -92,9 +218,9 @@ fn write_single_surface_config_inner(
     jwks_fixture: Option<&JwksFiles>,
     options: SingleSurfaceOptions<'_>,
 ) {
-    let (outbound_port, transit_target_url) = options
+    let (outbound_port, transit_target_urls) = options
         .outbound
-        .map_or((None, None), |(port, url)| (Some(port), Some(url)));
+        .map_or((None, None), |(port, urls)| (Some(port), Some(urls)));
     let mut surface_routes = surface_config
         .registered_routes
         .clone();
@@ -128,16 +254,7 @@ fn write_single_surface_config_inner(
         .surface_name
         .as_deref()
         .unwrap_or("bdd-surface");
-    let effective_target_url = if let Some(proxy) = &surface_config.mcp_proxy_target {
-        format!("proxy://{}", proxy.proxy_id)
-    } else if let Some(proxy) = &surface_config.a2a_proxy_target {
-        format!("a2a-proxy://{}", proxy.proxy_id)
-    } else {
-        surface_config
-            .override_target_url
-            .clone()
-            .unwrap_or_else(|| mock_url.to_string())
-    };
+    let effective_target_url = effective_target_url(mock_url, surface_config);
     let mut surface_fixture = AgentSurfaceFixture::new(
         "bdd-surface",
         surface_name,
@@ -155,15 +272,29 @@ fn write_single_surface_config_inner(
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         surface_fixture = surface_fixture.with_a2a_proxy_id(&proxy.proxy_id);
     }
+    surface_fixture.tenant_id = surface_config
+        .tenant_id
+        .clone();
     if let Some(requests) = surface_config.rate_limit_per_minute {
         surface_fixture = surface_fixture.with_rate_limit(requests, 60);
     }
     if let Some(path) = &surface_config.agent_card_path {
         surface_fixture = surface_fixture.with_agent_card_path(path);
     }
-    if let Some(auth) = &surface_config.source_auth {
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
         let method = crate::bdd_support::config::source_auth::caller_authentication_method_json(auth);
         surface_fixture = surface_fixture.with_caller_auth_method(method);
+    }
+    if let Some(protected) = &surface_config.protected_resource {
+        surface_fixture = surface_fixture.with_caller_protected_resource(serde_json::json!({
+            "resource": format!("{PROTECTED_RESOURCE_PUBLIC_ORIGIN}{}", surface_config.route),
+            "authorization_servers": [protected.authorization_server],
+            "scopes": protected.scopes,
+        }));
     }
     if let Some(target_auth) = &surface_config.target_auth {
         surface_fixture = surface_fixture.with_target_auth(static_secret_target_auth_json(
@@ -172,6 +303,12 @@ fn write_single_surface_config_inner(
             &target_auth.header_format,
             &target_auth.fallback,
         ));
+    }
+    if let Some(provider) = &surface_config.target_auth_provider
+        && provider.authenticates_surface_target
+    {
+        surface_fixture = surface_fixture
+            .with_target_auth(credential_provider_target_auth_json(TARGET_AUTH_PROVIDER_ID, &provider.fallback));
     }
     if let Some(policy) = &surface_config.mcp_tool_policy {
         surface_fixture = surface_fixture.with_mcp_tool_policy(&policy.allowed_tool, &policy.policy_definition_id);
@@ -200,88 +337,78 @@ fn write_single_surface_config_inner(
             "injection_target": cm.injection_target.clone()
         }));
     }
-    if let Some(delegation) = &surface_config.credential_delegation {
-        let required_for = match &delegation.required_tool {
-            Some(tool) => serde_json::json!({ "tools": [tool] }),
-            None => serde_json::json!("all"),
-        };
-        let inject_as = match &delegation.inject_as {
-            DelegatedCredentialInjection::BearerHeader => serde_json::json!({ "type": "bearer_header" }),
-            DelegatedCredentialInjection::CustomHeader { name, format } => {
-                serde_json::json!({ "type": "custom_header", "name": name, "format": format })
-            }
-            DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
-        };
-        surface_fixture = surface_fixture.with_outbound_credential(serde_json::json!({
-            "credential_provider_id": delegation.provider_id,
-            "scopes": delegation.scopes,
-            "required_for": required_for,
-            "consent_mode": "on_demand",
-            "inject_as": inject_as,
-        }));
-    }
-    if let Some(transit_point) = &surface_config.transit_point {
-        let outbound_port = outbound_port.expect("outbound_port is required when a Transit Point is configured");
-        let target_endpoint =
-            transit_target_url.expect("transit_target_url is required when a Transit Point is configured");
-        let mut transit_point_json = serde_json::json!({
-            "name": transit_point.alias,
-            "alias": transit_point.alias,
-            "target_endpoint": target_endpoint,
-            "protocol": transit_point.protocol,
-            "listen_path": format!("/transit/{}", transit_point.alias),
-            "require_transit_token": false
-        });
-        if !transit_point
-            .header_metadata_mapping
-            .headers
-            .is_empty()
-        {
-            transit_point_json["header_metadata_mapping"] = serde_json::json!({
-                "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
-                "strip_mapped_headers": transit_point.header_metadata_mapping.strip_mapped_headers,
-                "headers": transit_point.header_metadata_mapping.headers.iter().map(|row| {
-                    serde_json::json!({
-                        "header": &row.header,
-                        "field": &row.field,
-                    })
-                }).collect::<Vec<_>>()
-            });
-        }
-        if let Some(managed_identity) = &transit_point.managed_identity {
-            let mut properties = serde_json::Map::new();
-            for field in &managed_identity.fields {
-                properties.insert(field.clone(), serde_json::json!({ "type": "string", "x-identity": true }));
-            }
-            transit_point_json["managed_identity"] = serde_json::json!({
-                "type": "payload_extraction",
-                "extension_uri": DEFAULT_HEADER_METADATA_EXTENSION_URI,
-                "meta_field": "agentIdentity",
-                "fields": &managed_identity.fields,
-                "json_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": &managed_identity.fields,
+    let delegation_binding = surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            let required_for = match &delegation.required_tool {
+                Some(tool) => serde_json::json!({ "tools": [tool] }),
+                None => serde_json::json!("all"),
+            };
+            let inject_as = match &delegation.inject_as {
+                DelegatedCredentialInjection::BearerHeader => serde_json::json!({ "type": "bearer_header" }),
+                DelegatedCredentialInjection::CustomHeader { name, format } => {
+                    serde_json::json!({ "type": "custom_header", "name": name, "format": format })
                 }
-            });
-            transit_point_json["identity_injection"] = serde_json::json!({
-                "inject_vp": true,
-            });
-        }
+                DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
+            };
+            serde_json::json!({
+                "credential_provider_id": delegation.provider_id,
+                "scopes": delegation.scopes,
+                "required_for": required_for,
+                "consent_mode": "on_demand",
+                "inject_as": inject_as,
+            })
+        });
+    if let Some(binding) = &delegation_binding
+        && !surface_config
+            .transit_points
+            .iter()
+            .any(|transit_point| transit_point.delegated_credentials)
+    {
+        surface_fixture = surface_fixture.with_outbound_credential(binding.clone());
+    }
+    if !surface_config
+        .transit_points
+        .is_empty()
+    {
+        let outbound_port = outbound_port.expect("outbound_port is required when a Transit Point is configured");
+        let transit_target_urls =
+            transit_target_urls.expect("transit_target_urls are required when a Transit Point is configured");
+        let points = surface_config
+            .transit_points
+            .iter()
+            .map(|transit_point| {
+                let target_endpoint = transit_target_urls
+                    .get(&transit_point.alias)
+                    .unwrap_or_else(|| panic!("no target URL for Transit Point '{}'", transit_point.alias));
+                transit_point_json(transit_point, target_endpoint, delegation_binding.as_ref())
+            })
+            .collect::<Vec<_>>();
         let mut transit_json = serde_json::json!({
             "outbound_listen_address": format!("http://localhost:{outbound_port}"),
-            "points": [transit_point_json]
+            "points": points
         });
         if let Some(policy) = &surface_config.transit_shared_policy {
             transit_json["opa_policy_definition_id"] = serde_json::json!(policy.id);
+        }
+        if surface_config.transit_source_auth {
+            transit_json["source_auth"] = serde_json::json!({
+                "type": "api_key",
+                "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "bdd-transit-caller-key"
+            });
+        }
+        if let Some(secs) = surface_config.transit_token_lifetime_secs {
+            transit_json["transit_token_lifetime_secs"] = serde_json::json!(secs);
         }
         surface_fixture = surface_fixture.with_transit(transit_json);
     }
     for element in &surface_config.caller_trust_check_list {
         surface_fixture = surface_fixture.with_caller_trust_check_element(element.clone());
     }
-    for element in &surface_config.target_trust_check_list {
-        surface_fixture = surface_fixture.with_target_trust_check_element(element.clone());
+    for entry in &surface_config.trust_recorder_entries {
+        surface_fixture = surface_fixture.with_trust_recorder_entry(entry.clone());
     }
     if let Some(identity) = &surface_config.didwebvh_identity {
         surface_fixture = surface_fixture.with_didwebvh_identity_id(
@@ -404,7 +531,11 @@ fn write_single_surface_config_inner(
     );
 
     if let Some(proxy) = &surface_config.mcp_proxy_target {
-        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, mock_url);
+        let mut base_url = target_url_under_base_path(mock_url, surface_config);
+        if proxy.https_base_url {
+            base_url = base_url.replacen("http://", "https://", 1);
+        }
+        let mut fixture = McpProxyFixture::new(&proxy.proxy_id, base_url);
         if let Some(spec) = &proxy.openapi_spec {
             fixture = fixture.with_openapi_spec(spec.clone());
         }
@@ -434,6 +565,105 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if surface_config
+        .protected_resource
+        .is_some()
+    {
+        add_public_origin(base_dir, 0, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+    if surface_config.outbound_public_origin {
+        add_public_origin(base_dir, 1, PROTECTED_RESOURCE_PUBLIC_ORIGIN);
+    }
+    if let Some(max_secs) = surface_config.transit_token_max_lifetime_secs {
+        set_transit_token_max_lifetime(base_dir, max_secs);
+    }
+    write_credential_policy(
+        base_dir,
+        &surface_config.enforced_credential_rules,
+        surface_config.token_request_timeout_secs,
+    );
+    if surface_config.logs_audit_events {
+        log_info(base_dir);
+    } else if surface_config.keeps_gateway_log {
+        log_warnings(base_dir);
+    }
+    if surface_config.writes_log_directory {
+        set_log_directory(base_dir);
+    }
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `info`.
+fn log_info(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"info\"", 1)).unwrap();
+}
+
+/// Lowers the gateway's log level from the harness default `error` to `warn`.
+fn log_warnings(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
+    std::fs::write(&path, config.replacen("level = \"error\"", "level = \"warn\"", 1)).unwrap();
+}
+
+/// Points the gateway's log directory at `_storage/logs`.
+fn set_log_directory(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    assert!(config.contains("[logging]\n"), "the gateway config must have a logging table");
+    let log_directory = base_dir.join("_storage/logs");
+    let setting = format!("[logging]\nlog_directory = \"{}\"\n", log_directory.display());
+    std::fs::write(&path, config.replacen("[logging]\n", &setting, 1)).unwrap();
+}
+
+/// Appends a `[credential_policy]` table setting each of `rules` to `enforce` and, when
+/// given, the token request timeout.
+fn write_credential_policy(
+    base_dir: &Path,
+    rules: &[String],
+    token_request_timeout_secs: Option<u64>,
+) {
+    if rules.is_empty() && token_request_timeout_secs.is_none() {
+        return;
+    }
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[credential_policy]\n");
+    for rule in rules {
+        config.push_str(&format!("{rule} = \"enforce\"\n"));
+    }
+    if let Some(secs) = token_request_timeout_secs {
+        config.push_str(&format!("token_request_timeout_secs = {secs}\n"));
+    }
+    std::fs::write(&path, config).unwrap();
+}
+
+fn set_transit_token_max_lifetime(
+    base_dir: &Path,
+    max_secs: u64,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    gateway["transit_token_max_lifetime_secs"] = serde_json::json!(max_secs);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+}
+
+/// Adds a public origin to the listener at `listener` (the inbound listener is first, the
+/// outbound one second), the origin an MCP resource must be published under.
+fn add_public_origin(
+    base_dir: &Path,
+    listener: usize,
+    origin: &str,
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    gateway["listeners"][listener]["external_urls"]
+        .as_array_mut()
+        .expect("listener external_urls")
+        .push(serde_json::json!(origin));
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 pub struct JwksFiles {
@@ -476,8 +706,14 @@ fn write_didwebvh_identity_file(
 
 fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> {
     let mut secrets = Vec::new();
-    if let Some(SurfaceSourceAuthConfig::ApiKey(config)) = &surface_config.source_auth {
-        secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
+        if let SurfaceSourceAuthConfig::ApiKey(config) = auth {
+            secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
+        }
     }
     if let Some(SurfaceSourceAuthConfig::ApiKey(config)) = &surface_config.alternate_variant_source_auth {
         secrets.push(SecretFixture::new(&config.secret_id, &config.valid_key));
@@ -491,6 +727,26 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         secrets.push(SecretFixture::new(&proxy.secret_id, &proxy.secret_value));
     }
+    match surface_config
+        .target_auth_provider
+        .as_ref()
+    {
+        Some(provider) if provider.grant == TargetAuthProviderGrant::ClientCredentials => {
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
+        }
+        Some(provider) => {
+            let signing_key = if provider.signing_key_is_service_account_file {
+                target_auth_service_account_key_file()
+            } else {
+                target_auth_signing_key()
+                    .private_pem
+                    .clone()
+            };
+            secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
+        }
+        None => {}
+    }
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
             CredentialProviderKind::OAuth2AuthorizationCode => {
@@ -503,6 +759,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
             }
+            CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => {}
         }
     }
     secrets
@@ -510,25 +767,82 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
 
 fn api_key_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<ApiKeyProviderFixture> {
     let mut api_key_providers = Vec::new();
-    if let Some(SurfaceSourceAuthConfig::ApiKeyProvider(config)) = &surface_config.source_auth {
-        api_key_providers.push(ApiKeyProviderFixture::new(
-            format!("key-provider-{}-{}", config.agent_id, config.key_id),
-            &config.agent_id,
-            &config.key_id,
-            &config.client_id,
-            &config.valid_key,
-        ));
+    for auth in surface_config
+        .source_auth
+        .iter()
+        .chain(&surface_config.additional_source_auth)
+    {
+        if let SurfaceSourceAuthConfig::ApiKeyProvider(config) = auth {
+            api_key_providers.push(ApiKeyProviderFixture::new(
+                format!("key-provider-{}-{}", config.agent_id, config.key_id),
+                &config.agent_id,
+                &config.key_id,
+                &config.client_id,
+                &config.valid_key,
+            ));
+        }
     }
     api_key_providers
 }
 
 fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<CredentialProviderFixture> {
+    let mut providers: Vec<_> = surface_config
+        .target_auth_provider
+        .iter()
+        .map(target_auth_provider_fixture)
+        .collect();
+    providers.extend(delegation_provider_fixture(surface_config));
+    providers
+}
+
+fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> CredentialProviderFixture {
+    let now = chrono::Utc::now();
+    let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
+    CredentialProviderFixture {
+        id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        name: TARGET_AUTH_PROVIDER_ID.to_string(),
+        provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        provider_type: if client_credentials {
+            "oauth2_client_credentials"
+        } else {
+            "oauth2_jwt_bearer"
+        }
+        .to_string(),
+        authorization_endpoint: None,
+        token_endpoint: Some(
+            provider
+                .token_endpoint
+                .clone()
+                .expect("the target credential provider's token endpoint must run before its fixture is written"),
+        ),
+        client_id_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_ID_SECRET.to_string()),
+        client_secret_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_SECRET_SECRET.to_string()),
+        default_scopes: vec![TARGET_AUTH_PROVIDER_SCOPE.to_string()],
+        callback_path: String::new(),
+        callback_url: None,
+        token_refresh_enabled: false,
+        api_key_secret_ref: None,
+        jwt_settings: (!client_credentials).then(|| {
+            serde_json::json!({
+                "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
+                "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
+                "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
+                "jwt_subject": provider.jwt_subject,
+            })
+        }),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<CredentialProviderFixture> {
     let Some(delegation) = &surface_config.credential_delegation else {
         return Vec::new();
     };
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
     let provider = match &delegation.provider_kind {
+        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => return Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
             let base_url = surface_config
                 .oauth_provider_base_url
@@ -551,6 +865,7 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
                     .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
                 token_refresh_enabled: true,
                 api_key_secret_ref: None,
+                jwt_settings: None,
                 created_at: now,
                 updated_at: now,
             }
@@ -569,6 +884,7 @@ fn credential_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<Cr
             callback_url: None,
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
+            jwt_settings: None,
             created_at: now,
             updated_at: now,
         },
@@ -600,6 +916,11 @@ fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitio
     }
     if let Some(policy) = &surface_config.transit_shared_policy {
         policies.push(policy.clone());
+    }
+    for transit_point in &surface_config.transit_points {
+        if let Some(policy) = &transit_point.policy {
+            policies.push(policy.clone());
+        }
     }
     if let Some(policy) = &surface_config.alternate_variant_inbound_policy {
         policies.push(PolicyDefinitionFixture::new(

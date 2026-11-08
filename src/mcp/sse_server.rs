@@ -35,6 +35,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use crate::observability::loggable;
+
 /// Channel buffer size for SSE event delivery.
 const SSE_CHANNEL_BUFFER: usize = 64;
 
@@ -91,7 +93,7 @@ impl SseSessionManager {
                 sessions.retain(|id, session| {
                     let alive = session.last_active.elapsed() < cleanup_timeout && !session.tx.is_closed();
                     if !alive {
-                        debug!(session_id = %id, "Cleaning up idle/disconnected SSE session");
+                        debug!(session_id = %loggable::secret(id), "Cleaning up idle/disconnected SSE session");
                     }
                     alive
                 });
@@ -133,7 +135,7 @@ impl SseSessionManager {
                 last_active: now,
             },
         );
-        debug!(session_id = %session_id, "Created new SSE session");
+        debug!(session_id = %loggable::secret(&session_id), "Created new SSE session");
 
         Some((session_id, ReceiverStream::new(rx)))
     }
@@ -161,7 +163,7 @@ impl SseSessionManager {
                 return true;
             }
             // Client disconnected — remove session
-            debug!(session_id = %session_id, "Client disconnected, removing session");
+            debug!(session_id = %loggable::secret(session_id), "Client disconnected, removing session");
             sessions.remove(session_id);
         }
         false
@@ -191,7 +193,7 @@ impl SseSessionManager {
             .remove(session_id)
             .is_some()
         {
-            debug!(session_id = %session_id, "Removed SSE session");
+            debug!(session_id = %loggable::secret(session_id), "Removed SSE session");
         }
     }
 
@@ -419,6 +421,32 @@ mod tests {
                 .await
         );
         assert_eq!(manager.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn session_logs_hold_only_a_session_id_prefix() {
+        let manager = SseSessionManager {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            idle_timeout: Duration::from_secs(300),
+            max_sessions: MAX_SESSIONS,
+        };
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let (session_id, receiver) = manager
+            .create_session()
+            .await
+            .unwrap();
+        drop(receiver);
+        let sent = manager
+            .send_response(&session_id, "{}")
+            .await;
+
+        assert!(!sent);
+        let text = logs.text();
+        let prefix = format!("session_id={}...", &session_id[..8]);
+        assert!(text.contains(&format!("Created new SSE session {prefix}")), "{text}");
+        assert!(text.contains(&format!("Client disconnected, removing session {prefix}")), "{text}");
+        assert!(!text.contains(&session_id), "a log holds the full session id: {text}");
     }
 
     #[tokio::test]

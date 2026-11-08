@@ -3,7 +3,7 @@
 #[path = "bdd_support/mod.rs"]
 mod bdd_support;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -134,6 +134,54 @@ fn write_config_writes_the_access_point_a2a_settings() {
     )
     .unwrap();
     assert_eq!(surface_json["access_point"]["a2a"], a2a);
+}
+
+fn written_log_directory(surface_config: &SurfaceConfigBuilder) -> (TempDir, Option<String>) {
+    let temp_dir = TempDir::new().unwrap();
+    config::single_surface_writer::write_single_surface_config(
+        temp_dir.path(),
+        32030,
+        "http://127.0.0.1:9",
+        surface_config,
+        None,
+    );
+    let config: toml::Table = std::fs::read_to_string(
+        temp_dir
+            .path()
+            .join("config.toml"),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    let log_directory = config["logging"]
+        .get("log_directory")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    (temp_dir, log_directory)
+}
+
+#[test]
+fn write_config_sets_no_log_directory_by_default() {
+    let (_temp_dir, log_directory) = written_log_directory(&SurfaceConfigBuilder::default());
+
+    assert_eq!(log_directory, None);
+}
+
+#[test]
+fn write_config_points_the_log_directory_into_storage_when_asked() {
+    let surface_config = SurfaceConfigBuilder {
+        writes_log_directory: true,
+        ..SurfaceConfigBuilder::default()
+    };
+
+    let (temp_dir, log_directory) = written_log_directory(&surface_config);
+
+    let expected = temp_dir
+        .path()
+        .join("_storage/logs")
+        .display()
+        .to_string();
+    assert_eq!(log_directory, Some(expected));
 }
 
 #[test]
@@ -293,12 +341,7 @@ fn write_config_seeds_mcp_tool_policy_definition() {
 fn write_config_can_seed_transit_point_with_outbound_listener() {
     let temp_dir = TempDir::new().unwrap();
     let surface_config = SurfaceConfigBuilder {
-        transit_point: Some(SurfaceTransitPointConfig {
-            alias: "alpha".to_string(),
-            protocol: "mcp".to_string(),
-            header_metadata_mapping: Default::default(),
-            managed_identity: None,
-        }),
+        transit_points: vec![SurfaceTransitPointConfig::new("alpha", "mcp")],
         ..SurfaceConfigBuilder::default()
     };
 
@@ -307,7 +350,7 @@ fn write_config_can_seed_transit_point_with_outbound_listener() {
         32005,
         32015,
         "http://127.0.0.1:9",
-        "http://127.0.0.1:10",
+        &HashMap::from([("alpha".to_string(), "http://127.0.0.1:10".to_string())]),
         &surface_config,
         None,
     );
@@ -336,6 +379,75 @@ fn write_config_can_seed_transit_point_with_outbound_listener() {
     assert_eq!(surface_json["transit"]["outbound_listen_address"], "http://localhost:32015");
     assert_eq!(surface_json["transit"]["points"][0]["alias"], "alpha");
     assert_eq!(surface_json["transit"]["points"][0]["target_endpoint"], "http://127.0.0.1:10");
+}
+
+#[test]
+fn write_config_gives_each_transit_point_its_own_destination_trust_checks_and_policy() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut alpha = SurfaceTransitPointConfig::new("alpha", "a2a");
+    alpha
+        .trust_check_list
+        .push(serde_json::json!({ "id": "alpha-check" }));
+    alpha.policy = Some(config::config_tree::PolicyDefinitionFixture::new(
+        "alpha-policy",
+        "Alpha policy",
+        "package surface.policy\n\ndefault allow := true\n",
+    ));
+    let surface_config = SurfaceConfigBuilder {
+        transit_points: vec![alpha, SurfaceTransitPointConfig::new("bravo", "a2a")],
+        ..SurfaceConfigBuilder::default()
+    };
+
+    config::single_surface_writer::write_single_surface_config_with_outbound_listener(
+        temp_dir.path(),
+        32005,
+        32015,
+        "http://127.0.0.1:9",
+        &HashMap::from([
+            ("alpha".to_string(), "http://127.0.0.1:10".to_string()),
+            ("bravo".to_string(), "http://127.0.0.1:11".to_string()),
+        ]),
+        &surface_config,
+        None,
+    );
+
+    let surface_json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("_storage/agent_surfaces/bdd-surface.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let points = &surface_json["transit"]["points"];
+    assert_eq!(points[0]["alias"], "alpha");
+    assert_eq!(points[0]["target_endpoint"], "http://127.0.0.1:10");
+    assert_eq!(points[0]["trust_check_list"][0]["id"], "alpha-check");
+    assert_eq!(points[0]["policy"]["policy_definition_id"], "alpha-policy");
+    assert_eq!(points[1]["alias"], "bravo");
+    assert_eq!(points[1]["target_endpoint"], "http://127.0.0.1:11");
+    assert!(
+        points[1]
+            .get("trust_check_list")
+            .is_none()
+    );
+    assert!(
+        points[1]
+            .get("policy")
+            .is_none()
+    );
+    assert!(
+        surface_json["target"]
+            .get("trust_check_list")
+            .is_none()
+    );
+    assert!(
+        temp_dir
+            .path()
+            .join("_storage/policies/alpha-policy.json")
+            .exists()
+    );
 }
 
 async fn spawn_gateway(seed_surface: bool) -> (TempDir, GatewayProcess) {

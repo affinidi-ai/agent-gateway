@@ -9,6 +9,7 @@ import {
 import CredentialDelegationPanel from './CredentialDelegationPanel';
 import CredentialDelegationFullscreenPanel from './CredentialDelegationFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import { readMethods } from '../caller-auth/methods';
 
 /**
  * Credential Delegation — drops on the Managed Agent → External arrow.
@@ -112,11 +113,13 @@ export const credentialDelegationDefinition: NodeDefinition = {
     },
     {
       description: 'Credential delegation requires an agent identity',
+      // A binding with external consent keeps its grant by binding, not by agent, and the
+      // gateway refuses a presentation of the agent beside it.
       condition: c => {
         const rows = Array.isArray(c?.outbound_credentials_form)
           ? (c.outbound_credentials_form as OutboundCredentialFormRow[])
           : [];
-        return rows.length > 0;
+        return rows.some(row => row.consent_mode !== 'external');
       },
       check: (_c, ctx) => surfaceHasAgentIdentity(ctx.allNodes),
       severity: 'error',
@@ -136,6 +139,16 @@ export const credentialDelegationDefinition: NodeDefinition = {
       : [];
     return { outbound_credentials_form: rows };
   },
+  // The stored `outbound_credentials` alone decide the rows, so a binding
+  // moved or removed outside the dashboard is never restored from a stale
+  // canvas blob. An element whose rows name no provider yet was never saved,
+  // so it survives a reload.
+  payloadOwnsConfig: true,
+  isBlobPlaceholder: c =>
+    !Array.isArray(c?.outbound_credentials_form) ||
+    (c.outbound_credentials_form as OutboundCredentialFormRow[]).every(
+      row => !row?.credential_provider_id
+    ),
   buildPayload: ctx => {
     const node = ctx.firstNodeOfType('credential-delegation');
     if (!node) return undefined;
@@ -160,7 +173,7 @@ export const credentialDelegationDefinition: NodeDefinition = {
  * check.
  */
 export function surfaceHasSourceAuth(nodes: CanvasNode[]): boolean {
-  return nodes.some(n => n.type === 'caller-auth' && !!n.config?.method_type);
+  return nodes.some(n => n.type === 'caller-auth' && readMethods(n.config).length > 0);
 }
 
 /**

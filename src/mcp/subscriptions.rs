@@ -1313,6 +1313,75 @@ mod tests {
         assert_eq!(changes.receiver_count(), 0);
     }
 
+    #[tokio::test]
+    async fn dropping_a_refused_token_leaves_subscriptions_open_and_a_revoke_ends_them() {
+        use std::time::Duration;
+
+        use crate::delegation_vault::storage::{
+            DelegationVaultStorage, FileSystemDelegationVaultStore, access_token_fingerprint,
+        };
+        use http_body_util::BodyExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = std::sync::Arc::new(
+            FileSystemDelegationVaultStore::new(directory.path().into())
+                .await
+                .unwrap(),
+        );
+        let now = chrono::Utc::now();
+        let mut stored = Vec::new();
+        for id in ["refused", "revoked"] {
+            let token: crate::delegation_vault::DelegationToken = serde_json::from_value(json!({
+                "id": id, "agent_did": format!("surface:{id}"), "user_identity_hash": "__target_auth__:a",
+                "credential_provider_id": "cp-1", "provider_id": "cp-1", "access_token": format!("{id}-token"),
+                "consent_granted_at": now, "created_at": now, "updated_at": now
+            }))
+            .unwrap();
+            stored.push(
+                vault
+                    .store(token)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let (_changes, receiver) = tokio::sync::broadcast::channel::<AccessScope>(16);
+        let mut lifetime = SubscriptionLifetime::new(Duration::from_secs(60), None);
+        lifetime.changes = receiver;
+        lifetime
+            .watch_vault(vault.clone())
+            .await
+            .unwrap();
+        let (sender, upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+        let mut body = lifetime
+            .wrap(axum::response::Response::new(axum::body::Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(upstream),
+            )))
+            .into_body();
+
+        assert!(
+            vault
+                .delete_token_holding(&stored[0].id, &access_token_fingerprint(&stored[0].access_token))
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(ACCESS_RECHECK_INTERVAL * 2 + ACCESS_CHECK_TIMEOUT, body.frame())
+                .await
+                .is_err(),
+            "dropping a refused token ends no subscription"
+        );
+        assert!(!sender.is_closed());
+
+        assert!(
+            vault
+                .delete(&stored[1].id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(closure(&mut body).await, "MCP subscription credentials were revoked");
+        assert!(sender.is_closed());
+    }
+
     #[derive(Default)]
     struct CountingVault {
         reads: std::sync::atomic::AtomicUsize,
@@ -1663,7 +1732,10 @@ mod tests {
 
     #[test]
     fn unauthenticated_listens_are_counted_by_peer_and_never_collide_with_principals() {
-        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey { key_name: "10.0.0.1".into() };
+        let identity = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "10.0.0.1".into(),
+            provider_agent_id: None,
+        };
         assert_ne!(listen_caller(Some(&identity), "10.0.0.1"), listen_caller(None, "10.0.0.1"));
         assert_eq!(listen_caller(None, "10.0.0.1"), listen_caller(None, "10.0.0.1"));
     }
@@ -1801,6 +1873,7 @@ mod tests {
     #[test]
     fn subscription_expiry_uses_only_verified_identity_claims() {
         let claims = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "caller".into(),
             claims: json!({"exp": 1}),
         };

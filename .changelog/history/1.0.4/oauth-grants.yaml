@@ -1,0 +1,52 @@
+branch: oauth-grants
+changes:
+  added:
+    - timestamp: '2026-10-29T22:20:00Z'
+      title: Add JWT Bearer and Client Credentials JWT credential provider types
+      description: >-
+        Credential providers gain oauth2_jwt_bearer, which signs an RS256 or ES256 JWT as
+        the grant (RFC 7523 section 2.1, for example a Google service account for Vertex AI
+        Agent Engine), and oauth2_client_credentials_jwt_auth, which authenticates the
+        client with a signed JWT instead of a client secret (private_key_jwt, for example an
+        Entra certificate credential or an Ory client with a JWKS). The private key and the
+        optional certificate, whose thumbprint Entra uses to find the key, are secret
+        references, checked to be PEM when the provider is saved.
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Let target authentication use a credential provider
+      description: >-
+        A Target or Transit Point target_auth can use method credential_provider to send a
+        client credentials, JWT Bearer, Client Credentials JWT or API key provider's token,
+        Authorization Bearer by default. Issued tokens are cached in the delegation vault per
+        surface and renewed before they expire. The dashboard offers it on the Managed Agent
+        and Transit Point, and a surface save refuses an authorization-code provider.
+    - timestamp: '2026-10-30T12:40:00Z'
+      title: Warn in the dashboard when an Entra v2.0 provider sets resource
+      description: >-
+        The Microsoft identity platform v2.0 token endpoint rejects the resource parameter
+        (AADSTS901002), so the credential provider form and list now warn when a provider with
+        such an endpoint sets one, and say to put the audience in the scopes as /.default.
+  changed:
+    - timestamp: '2026-10-30T09:30:00Z'
+      title: Check JWT key material on the credential provider validate endpoint
+      description: >-
+        POST /api/v1/credential-providers/validate now requires the credential provider edit
+        permission, applies the caller's tenant to the secrets it names, and for a JWT Bearer
+        or Client Credentials JWT provider checks that the signing key and certificate secrets
+        hold PEM key material before it tests the token endpoint.
+  fixed:
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Fetch an agent card protected by an expiring OAuth token
+      description: >-
+        The gateway's agent card fetch can now present a credential provider's token, so
+        agents whose card sits behind an Entra or Google OAuth token, such as Foundry and
+        Vertex AI Agent Engine agents, publish their card through the gateway.
+    - timestamp: '2026-10-29T23:30:00Z'
+      title: Renew delegated service tokens before they expire
+      description: >-
+        Client-credentials delegation tokens are renewed 60 seconds before they expire, and a
+        token response without expires_in is refused instead of being cached forever. A failed
+        token request now logs the token endpoint's error instead of returning it in the
+        delegation audit detail.
+  removed: []
+  security: []
+  breaking: []

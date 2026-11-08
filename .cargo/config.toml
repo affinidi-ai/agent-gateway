@@ -1,0 +1,13 @@
+# Environment for the test binaries, set once when cargo starts them. Tests
+# must not call std::env::set_var or remove_var: another test thread reading
+# the environment at the same moment can crash the whole test process
+# (clippy.toml disallows both). Cargo also sets these for `cargo run` and build
+# scripts; they hold only test values, and nothing outside tests reads them.
+[env]
+AG_TEST_BACKUP_KEY_RESOLVE = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+AG_TEST_ENCRYPTION_KEY = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
+AG_TEST_INVALID_ENCRYPTION_KEY = "tooshort"
+AG_TEST_MASTER_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+AG_TEST_PRESENT_VAR = "value"
+TG_TEST_VTA_BOOTSTRAP_DID_KEY = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
+VTA_LIVE_CONTROL_SEED = "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"

@@ -10,7 +10,6 @@
     "resolveJsonModule": true,
     "types": ["node"],
     "outDir": "./dist",
-    "rootDir": "./",
     "baseUrl": "./",
     "paths": {
       "@helpers/*": [

@@ -94,7 +94,7 @@ pub fn sanitize_description(raw: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedDisplayName {
     Named(DisplayName),
-    Conflict { surface_ids: Vec<String> },
+    Shared { surface_ids: Vec<String> },
     Unnamed,
 }
 
@@ -106,7 +106,7 @@ impl ManagedDisplayName {
     ) -> Option<&DisplayName> {
         match self {
             Self::Named(name) => Some(name),
-            Self::Conflict { surface_ids } => {
+            Self::Shared { surface_ids } => {
                 warn!(did, ?surface_ids, "DID is shared by several surfaces; no name published");
                 None
             }
@@ -119,7 +119,23 @@ fn is_managed(record: &AgentIdentityRecord) -> bool {
     record.effective_origin() == Some(IdentityOrigin::Managed)
 }
 
-pub fn surfaces_by_did(records: &[AgentIdentityRecord]) -> HashMap<String, BTreeSet<String>> {
+/// Whether a usage entry in `role` makes `surface` a managed surface of the DID: a managed
+/// use, or one recorded before roles, counts only while the surface still issues a managed
+/// identity.
+fn counts_as_managed(
+    role: Option<IdentityOrigin>,
+    surface: &AgentSurface,
+) -> bool {
+    role != Some(IdentityOrigin::ExternalCaller) && surface.has_managed_identity()
+}
+
+/// The live surfaces where each managed DID is the managed agent: surfaces where it was only
+/// a caller, and surfaces `live_surface` no longer finds, are left out. The dashboard, the
+/// name signed into the VC and Trust Registry publishing all read managed surfaces from here.
+pub fn managed_surfaces_by_did<'a>(
+    records: &[AgentIdentityRecord],
+    live_surface: impl Fn(&str) -> Option<&'a AgentSurface>,
+) -> HashMap<String, BTreeSet<String>> {
     let mut by_did: HashMap<String, BTreeSet<String>> = HashMap::new();
     for record in records
         .iter()
@@ -128,26 +144,34 @@ pub fn surfaces_by_did(records: &[AgentIdentityRecord]) -> HashMap<String, BTree
         let surfaces = by_did
             .entry(record.did.clone())
             .or_default();
-        let usage_ids = record
-            .channel_usage
-            .iter()
-            .map(|u| u.channel_config_id.as_str());
-        for id in record
+        let unrecorded_last_used = record
             .channel_config_id
             .as_deref()
-            .into_iter()
-            .chain(usage_ids)
-            .filter(|id| !id.is_empty())
-        {
-            surfaces.insert(id.to_string());
+            .filter(|id| {
+                !record
+                    .channel_usage
+                    .iter()
+                    .any(|u| u.channel_config_id == *id)
+            })
+            .map(|id| (id, None));
+        let usages = record
+            .channel_usage
+            .iter()
+            .map(|u| (u.channel_config_id.as_str(), u.role))
+            .chain(unrecorded_last_used);
+        for (id, role) in usages.filter(|(id, _)| !id.is_empty()) {
+            if live_surface(id).is_some_and(|surface| counts_as_managed(role, surface)) {
+                surfaces.insert(id.to_string());
+            }
         }
     }
     by_did
 }
 
 /// A managed agent is named by its target's Agent Card name when that is valid, else by its
-/// surface name. A DID managed on several surfaces has no name. Pass `card_name` only for
-/// dashboard display: signed and published names come from the surface alone.
+/// surface name. A DID managed on several surfaces is shared and has no name. Pass
+/// `card_name` only for dashboard display: signed and published names come from the surface
+/// alone.
 pub fn resolve_managed_display_name(
     surface: &AgentSurface,
     surfaces_for_did: &BTreeSet<String>,
@@ -159,7 +183,7 @@ pub fn resolve_managed_display_name(
     {
         let mut ids = surfaces_for_did.clone();
         ids.insert(surface.surface_id.clone());
-        return ManagedDisplayName::Conflict {
+        return ManagedDisplayName::Shared {
             surface_ids: ids.into_iter().collect(),
         };
     }
@@ -171,8 +195,10 @@ pub fn resolve_managed_display_name(
 
 type SurfacesByDid = HashMap<String, BTreeSet<String>>;
 
-/// Snapshot of [`surfaces_by_did`], reloaded once older than its TTL or when asked
-/// about a DID it does not contain, so a newly issued identity is seen at once.
+/// Snapshot of [`managed_surfaces_by_did`], reloaded once older than its TTL or when asked
+/// about a DID it does not contain, so a newly issued identity is seen at once. The snapshot
+/// also holds the live surface list, so a surface deleted or reconfigured since it was taken
+/// is seen only after the next reload.
 pub struct SurfacesByDidCache {
     ttl: Duration,
     snapshot: Mutex<Option<(Instant, SurfacesByDid)>>,
@@ -207,11 +233,12 @@ impl SurfacesByDidCache {
         by_did.get(did).cloned()
     }
 
-    /// Managed surfaces using `did`; `None` when the identity store cannot be listed.
+    /// Managed surfaces of `did`; `None` when the identity or surface store cannot be listed.
     pub async fn surfaces_for(
         &self,
         did: &str,
         identity_store: &dyn IdentityStore,
+        surface_store: &dyn AgentSurfaceStore,
     ) -> Option<BTreeSet<String>> {
         if let Some(surfaces) = self.cached(did) {
             return Some(surfaces);
@@ -226,7 +253,18 @@ impl SurfacesByDidCache {
                 return None;
             }
         };
-        let by_did = surfaces_by_did(&records);
+        let live_surfaces = match surface_store.list_all().await {
+            Ok(surfaces) => surfaces,
+            Err(e) => {
+                warn!(did, error = %e, "Failed to list surfaces for display name");
+                return None;
+            }
+        };
+        let live_by_id: HashMap<&str, &AgentSurface> = live_surfaces
+            .iter()
+            .map(|s| (s.surface_id.as_str(), s))
+            .collect();
+        let by_did = managed_surfaces_by_did(&records, |id| live_by_id.get(id).copied());
         let surfaces = by_did
             .get(did)
             .cloned()
@@ -239,15 +277,31 @@ impl SurfacesByDidCache {
     }
 }
 
-/// Name signed into the managed agent's VC and published for it: the surface name, never the
-/// target-controlled Agent Card name.
+/// Name signed into the managed agent's VC and published for it: the name of its one managed
+/// surface, never the target-controlled Agent Card name. `managed_on` is a surface where
+/// `did` is the managed agent in the current request, counted even before its usage is stored.
+/// `None` when the DID has no managed surface or a store is unavailable.
 pub async fn resolve_managed_display_name_in(
     surface_store: &dyn AgentSurfaceStore,
     did: &str,
-    surface_id: &str,
+    managed_on: Option<&str>,
     identity_store: &dyn IdentityStore,
     cache: &SurfacesByDidCache,
 ) -> Option<ManagedDisplayName> {
+    let mut surfaces = cache
+        .surfaces_for(did, identity_store, surface_store)
+        .await?;
+    surfaces.extend(managed_on.map(str::to_string));
+    let mut ids = surfaces.iter();
+    let surface_id = match (ids.next(), ids.next()) {
+        (Some(only), None) => only,
+        (Some(_), Some(_)) => {
+            return Some(ManagedDisplayName::Shared {
+                surface_ids: surfaces.into_iter().collect(),
+            });
+        }
+        (None, _) => return None,
+    };
     let surface = match surface_store
         .get(surface_id)
         .await
@@ -259,9 +313,6 @@ pub async fn resolve_managed_display_name_in(
             return None;
         }
     };
-    let surfaces = cache
-        .surfaces_for(did, identity_store)
-        .await?;
     Some(resolve_managed_display_name(&surface, &surfaces, None))
 }
 
@@ -335,9 +386,10 @@ mod tests {
             &self,
             identity_hash: &str,
             channel_config_id: Option<String>,
+            role: Option<IdentityOrigin>,
         ) -> anyhow::Result<()> {
             self.inner
-                .update_usage(identity_hash, channel_config_id)
+                .update_usage(identity_hash, channel_config_id, role)
                 .await
         }
 
@@ -363,13 +415,78 @@ mod tests {
         }
     }
 
+    struct Surfaces(Vec<AgentSurface>);
+
+    #[async_trait::async_trait]
+    impl AgentSurfaceStore for Surfaces {
+        async fn save(
+            &self,
+            _surface: &AgentSurface,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<AgentSurface>> {
+            Ok(self
+                .0
+                .iter()
+                .find(|s| s.surface_id == surface_id)
+                .cloned())
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>> {
+            Ok(self.0.clone())
+        }
+
+        async fn delete(
+            &self,
+            _surface_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn live(ids: &[&str]) -> Surfaces {
+        Surfaces(
+            ids.iter()
+                .map(|id| with_managed_identity(surface(id, &id.to_uppercase())))
+                .collect(),
+        )
+    }
+
     fn managed(
         did: &str,
         surface_id: &str,
     ) -> AgentIdentityRecord {
         let mut record = test_surface_identity_record(did, surface_id);
         record.origin = Some(IdentityOrigin::Managed);
+        record.channel_usage[0].role = Some(IdentityOrigin::Managed);
         record
+    }
+
+    use crate::identity::test_helpers::test_channel_usage as usage;
+
+    fn with_managed_identity(mut surface: AgentSurface) -> AgentSurface {
+        surface
+            .target
+            .identity_injection
+            .identity_type = Some("from_jwt_claim".to_string());
+        assert!(surface.has_managed_identity());
+        surface
+    }
+
+    fn by_did_over(
+        records: &[AgentIdentityRecord],
+        surfaces: &[AgentSurface],
+    ) -> HashMap<String, BTreeSet<String>> {
+        managed_surfaces_by_did(records, |id| {
+            surfaces
+                .iter()
+                .find(|s| s.surface_id == id)
+        })
     }
 
     fn surface(
@@ -487,28 +604,29 @@ mod tests {
         record
             .identity_fields
             .insert("certificate_id".to_string(), serde_json::json!("NITROGEN"));
-        let surfaces = surfaces_by_did(&[record]);
+        record.channel_usage[0].role = Some(IdentityOrigin::Managed);
+        let surfaces = by_did_over(&[record], &[surface("s1", "OXYGEN")]);
         let result = resolve_managed_display_name(&surface("s1", "OXYGEN"), &surfaces["did:web:a"], None);
         assert_eq!(result, ManagedDisplayName::Named(DisplayName::parse("OXYGEN").unwrap()));
     }
 
     #[test]
-    fn resolve_reports_conflict_with_sorted_ids() {
+    fn resolve_reports_shared_did_with_sorted_ids() {
         let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s3", "s2", "s1"]), None);
         assert_eq!(
             result,
-            ManagedDisplayName::Conflict {
+            ManagedDisplayName::Shared {
                 surface_ids: vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
             }
         );
     }
 
     #[test]
-    fn resolve_conflict_includes_current_surface_when_absent() {
+    fn resolve_shared_did_includes_current_surface_when_absent() {
         let result = resolve_managed_display_name(&surface("s2", "OXYGEN"), &set(&["s1"]), None);
         assert_eq!(
             result,
-            ManagedDisplayName::Conflict {
+            ManagedDisplayName::Shared {
                 surface_ids: vec!["s1".to_string(), "s2".to_string()]
             }
         );
@@ -527,9 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agent_card_name_does_not_override_conflict() {
+    fn resolve_agent_card_name_does_not_name_shared_did() {
         let result = resolve_managed_display_name(&surface("s2", "DEF"), &set(&["s1"]), Some("DateTime Agent"));
-        assert!(matches!(result, ManagedDisplayName::Conflict { .. }));
+        assert!(matches!(result, ManagedDisplayName::Shared { .. }));
     }
 
     #[test]
@@ -551,16 +669,11 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_by_did_unions_usage_and_ignores_callers_and_legacy_records() {
-        let mut managed = test_surface_identity_record("did:web:a", "s1");
-        managed.origin = Some(IdentityOrigin::Managed);
+    fn managed_surfaces_union_managed_usage_and_ignore_caller_records() {
+        let mut managed = managed("did:web:a", "s1");
         managed
             .channel_usage
-            .push(crate::identity::filesystem::ChannelUsage {
-                channel_config_id: "s2".to_string(),
-                usage_count: 1,
-                last_used_at: chrono::Utc::now(),
-            });
+            .push(usage("s2", Some(IdentityOrigin::Managed)));
         let mut legacy = test_surface_identity_record("did:web:a", "s3");
         legacy.identity_hash = "legacy".to_string();
         let mut caller = test_surface_identity_record("did:web:a", "s9");
@@ -568,20 +681,99 @@ mod tests {
         caller.origin = Some(IdentityOrigin::ExternalCaller);
         let mut legacy_remote = test_surface_identity_record("did:web:b", "s8");
         legacy_remote.is_local = false;
+        let surfaces: Vec<_> = ["s1", "s2", "s3", "s8", "s9"]
+            .into_iter()
+            .map(|id| with_managed_identity(surface(id, id)))
+            .collect();
 
-        let by_did = surfaces_by_did(&[managed, legacy, caller, legacy_remote]);
+        let by_did = by_did_over(&[managed, legacy, caller, legacy_remote], &surfaces);
 
         assert_eq!(by_did.get("did:web:a"), Some(&set(&["s1", "s2"])));
         assert_eq!(by_did.get("did:web:b"), None);
     }
 
     #[test]
-    fn surfaces_by_did_excludes_legacy_local_record_without_origin() {
+    fn managed_surfaces_exclude_legacy_local_record_without_origin() {
         let mut legacy = test_surface_identity_record("did:web:legacy", "s1");
         legacy.origin = None;
         legacy.is_local = true;
 
-        assert_eq!(surfaces_by_did(&[legacy]).get("did:web:legacy"), None);
+        assert_eq!(by_did_over(&[legacy], &[with_managed_identity(surface("s1", "A"))]).get("did:web:legacy"), None);
+    }
+
+    #[test]
+    fn managed_surfaces_leave_out_caller_only_surfaces() {
+        let mut record = managed("did:web:a", "alpha");
+        record
+            .channel_usage
+            .push(usage("delta", Some(IdentityOrigin::ExternalCaller)));
+        record.channel_config_id = Some("delta".to_string());
+        let surfaces =
+            [with_managed_identity(surface("alpha", "ALPHA")), with_managed_identity(surface("delta", "DELTA"))];
+
+        assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha"]));
+    }
+
+    #[test]
+    fn managed_surfaces_leave_out_deleted_surfaces() {
+        let mut record = managed("did:web:a", "alpha");
+        record
+            .channel_usage
+            .push(usage("bravo", Some(IdentityOrigin::Managed)));
+
+        assert_eq!(
+            by_did_over(&[record], &[with_managed_identity(surface("alpha", "ALPHA"))])["did:web:a"],
+            set(&["alpha"])
+        );
+    }
+
+    #[test]
+    fn managed_surfaces_leave_out_surfaces_that_no_longer_issue_a_managed_identity() {
+        let mut record = managed("did:web:a", "alpha");
+        record
+            .channel_usage
+            .push(usage("bravo", Some(IdentityOrigin::Managed)));
+        let surfaces = [with_managed_identity(surface("alpha", "ALPHA")), surface("bravo", "BRAVO")];
+
+        assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha"]));
+    }
+
+    #[test]
+    fn managed_surfaces_count_entries_without_role_only_on_surfaces_with_managed_identity() {
+        let mut record = managed("did:web:a", "alpha");
+        record.channel_usage = vec![usage("alpha", None), usage("bravo", None)];
+        record.channel_config_id = Some("charlie".to_string());
+        let surfaces = [
+            with_managed_identity(surface("alpha", "ALPHA")),
+            surface("bravo", "BRAVO"),
+            with_managed_identity(surface("charlie", "CHARLIE")),
+        ];
+
+        assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha", "charlie"]));
+    }
+
+    #[test]
+    fn managed_surfaces_count_entries_without_role_on_a2a_proxy_surfaces() {
+        let mut record = managed("did:web:a", "proxy");
+        record.channel_usage = vec![usage("proxy", None)];
+        let mut proxy = surface("proxy", "PROXY");
+        proxy.target.endpoint = "a2a-proxy://worker".to_string();
+
+        assert_eq!(by_did_over(&[record], &[proxy])["did:web:a"], set(&["proxy"]));
+    }
+
+    #[test]
+    fn managed_surfaces_count_shared_did_once_per_surface() {
+        let mut record = managed("did:web:a", "alpha");
+        record.channel_usage = vec![
+            usage("alpha", Some(IdentityOrigin::Managed)),
+            usage("bravo", Some(IdentityOrigin::Managed)),
+            usage("charlie", Some(IdentityOrigin::Managed)),
+            usage("delta", Some(IdentityOrigin::ExternalCaller)),
+        ];
+        let surfaces = ["alpha", "bravo", "charlie", "delta"].map(|id| with_managed_identity(surface(id, id)));
+
+        assert_eq!(by_did_over(&[record], &surfaces)["did:web:a"], set(&["alpha", "bravo", "charlie"]));
     }
 
     #[test]
@@ -589,7 +781,7 @@ mod tests {
         let oxygen = DisplayName::parse("OXYGEN").unwrap();
         assert_eq!(ManagedDisplayName::Named(oxygen.clone()).publishable("did:a"), Some(&oxygen));
         assert_eq!(
-            ManagedDisplayName::Conflict {
+            ManagedDisplayName::Shared {
                 surface_ids: vec!["s1".into(), "s2".into()]
             }
             .publishable("did:a"),
@@ -602,16 +794,17 @@ mod tests {
     async fn cache_serves_known_did_without_relisting() {
         let store = CountingStore::with(vec![managed("did:web:a", "s1")], false).await;
         let cache = SurfacesByDidCache::default();
+        let surfaces = live(&["s1", "s2"]);
 
         let first = cache
-            .surfaces_for("did:web:a", &store)
+            .surfaces_for("did:web:a", &store, &surfaces)
             .await;
         store
             .create(managed("did:web:x", "s2"))
             .await
             .unwrap();
         let second = cache
-            .surfaces_for("did:web:a", &store)
+            .surfaces_for("did:web:a", &store, &surfaces)
             .await;
 
         assert_eq!(first, Some(set(&["s1"])));
@@ -623,19 +816,20 @@ mod tests {
     async fn cache_reloads_for_unknown_did() {
         let store = CountingStore::with(vec![managed("did:web:a", "s1")], false).await;
         let cache = SurfacesByDidCache::default();
+        let surfaces = live(&["s1", "s2"]);
         cache
-            .surfaces_for("did:web:a", &store)
+            .surfaces_for("did:web:a", &store, &surfaces)
             .await;
 
         let missing = cache
-            .surfaces_for("did:web:new", &store)
+            .surfaces_for("did:web:new", &store, &surfaces)
             .await;
         store
             .create(managed("did:web:new", "s2"))
             .await
             .unwrap();
         let found = cache
-            .surfaces_for("did:web:new", &store)
+            .surfaces_for("did:web:new", &store, &surfaces)
             .await;
 
         assert_eq!(missing, Some(BTreeSet::new()));
@@ -647,8 +841,9 @@ mod tests {
     async fn cache_reloads_after_ttl() {
         let store = CountingStore::with(vec![managed("did:web:a", "s1")], false).await;
         let cache = SurfacesByDidCache::new(Duration::ZERO);
+        let surfaces = live(&["s1", "s2"]);
         cache
-            .surfaces_for("did:web:a", &store)
+            .surfaces_for("did:web:a", &store, &surfaces)
             .await;
         let mut sibling = managed("did:web:a", "s2");
         sibling.identity_hash = "sibling".to_string();
@@ -658,7 +853,7 @@ mod tests {
             .unwrap();
 
         let reloaded = cache
-            .surfaces_for("did:web:a", &store)
+            .surfaces_for("did:web:a", &store, &surfaces)
             .await;
 
         assert_eq!(reloaded, Some(set(&["s1", "s2"])));
@@ -666,13 +861,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_in_names_did_after_its_one_managed_surface() {
+        let mut record = managed("did:web:a", "s1");
+        record
+            .channel_usage
+            .push(usage("s2", Some(IdentityOrigin::ExternalCaller)));
+        record.channel_config_id = Some("s2".to_string());
+        let store = CountingStore::with(vec![record], false).await;
+
+        let name = resolve_managed_display_name_in(
+            &live(&["s1", "s2"]),
+            "did:web:a",
+            None,
+            &store,
+            &SurfacesByDidCache::default(),
+        )
+        .await;
+
+        assert_eq!(name, Some(ManagedDisplayName::Named(DisplayName::parse("S1").unwrap())));
+    }
+
+    #[tokio::test]
+    async fn resolve_in_counts_the_request_surface_before_its_usage_is_stored() {
+        let store = CountingStore::with(vec![], false).await;
+
+        let name = resolve_managed_display_name_in(
+            &live(&["s1"]),
+            "did:web:new",
+            Some("s1"),
+            &store,
+            &SurfacesByDidCache::default(),
+        )
+        .await;
+
+        assert_eq!(name, Some(ManagedDisplayName::Named(DisplayName::parse("S1").unwrap())));
+    }
+
+    #[tokio::test]
+    async fn resolve_in_reports_shared_did_and_none_without_managed_surface() {
+        let mut record = managed("did:web:a", "s1");
+        record
+            .channel_usage
+            .push(usage("s2", Some(IdentityOrigin::Managed)));
+        let store = CountingStore::with(vec![record], false).await;
+        let surfaces = live(&["s1", "s2"]);
+        let cache = SurfacesByDidCache::default();
+
+        let shared = resolve_managed_display_name_in(&surfaces, "did:web:a", Some("s1"), &store, &cache).await;
+        let unknown = resolve_managed_display_name_in(&surfaces, "did:web:none", None, &store, &cache).await;
+
+        assert_eq!(
+            shared,
+            Some(ManagedDisplayName::Shared {
+                surface_ids: vec!["s1".to_string(), "s2".to_string()]
+            })
+        );
+        assert_eq!(unknown, None);
+    }
+
+    #[tokio::test]
     async fn cache_returns_none_when_store_fails() {
         let store = CountingStore::with(vec![], true).await;
         let cache = SurfacesByDidCache::default();
+        let surfaces = live(&["s1", "s2"]);
 
         assert_eq!(
             cache
-                .surfaces_for("did:web:a", &store)
+                .surfaces_for("did:web:a", &store, &surfaces)
                 .await,
             None
         );

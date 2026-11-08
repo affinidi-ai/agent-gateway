@@ -37,11 +37,15 @@ authenticates as an OAuth client, not a dashboard session.
   behind a terminating HTTP proxy/tunnel the request carries neither the public
   host (`Host` is the internal `127.0.0.1:PORT`) nor the public scheme (the local
   hop is plain HTTP), and the tunnel may drop forwarding headers. The
-  request-derived fallback is itself **proxy-aware**: host prefers
+  request-derived fallback reads forwarding headers only from a connecting peer
+  in `client_ip.trusted_proxies`, which the client IP layer marks with
+  `FromTrustedProxy`, so discovery and the throttle use the same list after a
+  reload: host prefers
   `X-Forwarded-Host` (first comma-separated entry), then RFC 7239 `Forwarded
   host=`, else `Host`; scheme prefers `X-Forwarded-Proto`, then `Forwarded
-  proto=`, else `https`. Deployments with no inbound `external_urls` and no
-  forwarding headers behave as `Host`-derived.
+  proto=`, else `https`. Any other caller's forwarding headers are ignored, so
+  it gets its own `Host` and `https`. Deployments with no inbound
+  `external_urls` and no trusted proxy behave as `Host`-derived.
 
 ## Token types
 
@@ -51,8 +55,20 @@ In `types.rs`, subject/actor/requested URNs — JWT
 `draft-ietf-oauth-identity-assertion-authz-grant`), and the Affinidi extension
 VP (`urn:affinidi:params:oauth:token-type:vp`).
 
-- **Subject verification**: a JWT/ID-token is verified via the `jwt_bearer`
-  strategy resolved by the token's `iss` (`JwtBearerSubjectVerifier`); a VP is
+- **Subject verification**: a JWT/ID-token is verified via a `jwt_bearer`
+  strategy whose `expected_issuer` is the token's `iss`
+  (`JwtBearerSubjectVerifier`), chosen for the authenticated client's tenant
+  (`strategies_for_client`): the tenant's own strategies for that issuer or, when
+  it has none, the appliance-global ones. An appliance-global client uses only
+  appliance-global strategies, so a tenant's strategy can never shadow another
+  tenant's issuer or the appliance's. The token is accepted when any of those
+  strategies verifies it. The jwt-bearer grant therefore authenticates the client
+  before it verifies the assertion. A token whose `iss` is this gateway is
+  verified against the gateway's own JWKS. Verification itself checks no
+  audience; the grant checks it afterwards: a redeemed ID-JAG's `aud` must be
+  this gateway (`validate_id_jag`), and a token-exchange subject token's `aud`
+  is checked against the client's `allowed_subject_audiences` (opt-in, see
+  below). A VP is
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
   credential-subject DID.
@@ -90,7 +106,12 @@ In `handlers.rs`, `handle_token_exchange` runs: validate params → authenticate
 client (missing/bad creds → `invalid_client`, 401) → subject-token-type
 allowlist (`unauthorized_client`; a token whose JOSE `typ` is the ID-JAG media
 type counts as `id-jag` whatever type the client declares) → verify subject
-assertion + extract `sub`/`act` → resolve actor; a verified JWT subject or actor
+assertion + extract the subject (the value of the verifying strategy's
+`principal_claim`, `sub` by default, or `sub` for the gateway's own tokens and a VP; an issuer
+names callers by one claim in a tenant scope, so when the strategies for the issuer that the
+client's tenant may use, its own or else the appliance-global ones, name different claims, the
+assertion is refused with `invalid_grant` before any is tried) and `act` →
+resolve actor, named the same way; a verified JWT subject or actor
 the gateway signed itself (under its DID or the MCP issuer) is refused
 (`reject_self_issued`, `invalid_request`) unless, on `/oauth2/token`, it is one
 of the gateway's own access tokens (`typ: JWT`), so its ID-JAGs are consumed only
@@ -234,7 +255,9 @@ Per-connection controls:
   be created before the surface it will target exists. Appliance-global
   connections are administrator-created and unrestricted. Ownership reads the
   network configuration loaded at startup, so restart after changing listener
-  `external_urls`.
+  `external_urls`. Every grant runs this ownership check: token exchange,
+  ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
+  empty or lists the resource.
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.
@@ -249,11 +272,23 @@ CRUD is `/v1/sts/clients` (admin-only, RBAC `StsClientsView/Edit/Delete` in
 
 ## Token-endpoint throttle
 
-In `src/sts/throttle.rs`: `POST /oauth2/token` is rate-limited per client id and
-per source address (proxy-forwarded `X-Forwarded-For` first entry, then RFC 7239
-`Forwarded for=`, else no ip key). Every value comes from `gateway.json`
-(`sts.token_endpoint_throttle`: `enabled`, `failed_attempts_only`, `per_client` /
-`per_ip` each `{requests, window_secs}`, `lockout_secs`) — nothing is hardcoded.
+In `src/sts/throttle.rs`: `POST /oauth2/token` is rate-limited per client id from
+each source, and per source. The source is the caller's IP as
+`src/source_auth/client_ip.rs` resolves it, so `X-Forwarded-For` and `Forwarded`
+count only from `client_ip.trusted_proxies`, and an IPv6 address counts by its
+/64, since one host usually holds the whole /64. Without a resolved source (a
+server not built with `ConnectInfo`) a client id is counted on its own and there
+is no ip key. Counting a client id per source means failed attempts from one
+source, even with a known client id, never lock that client out for its other
+sources; the flip side is that `per_client` no longer bounds guessing one client's
+secret from many sources, so give each client a long random secret. Behind a load
+balancer that is not in `client_ip.trusted_proxies`, every caller it forwards is
+one source and shares both limits, so a burst of failed client logins through it
+locks every client out for `lockout_secs`; a lockout of a caller that no trusted
+proxy forwarded logs a `WARN` naming `client_ip.trusted_proxies`.
+Every value comes from `gateway.json` (`sts.token_endpoint_throttle`: `enabled`,
+`failed_attempts_only`, `per_client` / `per_ip` each `{requests, window_secs}`,
+`lockout_secs`) — nothing is hardcoded.
 A caller over its window limit is locked out for `lockout_secs` and receives
 `429 Too Many Requests` with `Retry-After` + `Cache-Control: no-store` **before**
 any dispatch (the token-exchange metric increments `result=denied` for that

@@ -383,6 +383,62 @@ describe('useVariantSnapshots', () => {
     });
   });
 
+  it('buildVariantsWireSlice leaves outbound_credentials out of a stored variant that inherits none', () => {
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload({
+        ...samplePayload,
+        variants: [
+          ...samplePayload.variants,
+          { id: 'v3', alias: 'none', name: 'None', overrides: { outbound_credentials: [] } },
+        ],
+      });
+    });
+    const wire = result.current.buildVariantsWireSlice(samplePayload);
+    const byId = (id: string) => wire.variants.find(v => v.id === id)!.overrides!;
+    expect('outbound_credentials' in byId('v1')).toBe(false);
+    expect('outbound_credentials' in byId('v2')).toBe(false);
+    expect(byId('v3').outbound_credentials).toEqual([]);
+  });
+
+  it('buildVariantsWireSlice sends an empty list when the operator clears inherited bindings', () => {
+    const binding = { credential_provider_id: 'p1', place: 'target' };
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload({ ...samplePayload, outbound_credentials: [binding] });
+    });
+    act(() => {
+      result.current.switchVariant('v2', samplePayload);
+    });
+    const liveV2 = {
+      access_point: { rate_limit: { rpm: 99 } },
+      target: { endpoint: 'https://fast/y', auth: { kind: 'none' } },
+      outbound_credentials: [],
+    };
+    const wire = result.current.buildVariantsWireSlice(liveV2);
+    const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+    expect(v2Wire.overrides?.outbound_credentials).toEqual([]);
+  });
+
+  it('buildVariantsWireSlice sends a binding the operator added to an inheriting variant', () => {
+    const binding = { credential_provider_id: 'p1', place: 'target' };
+    const { result } = renderHook(() => useVariantSnapshots());
+    act(() => {
+      result.current.hydrateFromPayload(samplePayload);
+    });
+    act(() => {
+      result.current.switchVariant('v2', samplePayload);
+    });
+    const liveV2 = {
+      access_point: { rate_limit: { rpm: 99 } },
+      target: { endpoint: 'https://fast/y', auth: { kind: 'none' } },
+      outbound_credentials: [binding],
+    };
+    const wire = result.current.buildVariantsWireSlice(liveV2);
+    const v2Wire = wire.variants.find(v => v.id === 'v2')!;
+    expect(v2Wire.overrides?.outbound_credentials).toEqual([binding]);
+  });
+
   it('returns the base snapshot when there are no variants', () => {
     const { result } = renderHook(() => useVariantSnapshots());
     let activePayload: any;
@@ -867,6 +923,40 @@ describe('syncAccessPointIdentifiers', () => {
     // Pre-existing protocol survives because source didn't carry one.
     expect(out.__base__.access_point.protocol).toBe('a2a');
     expect('protocol' in out.__base__.access_point).toBe(true);
+  });
+
+  it('clears public from every snapshot when the source has none (legacy switch off)', () => {
+    const canvas = (config: Record<string, unknown>) => ({
+      nodes: [{ id: 'access-point', config }],
+    });
+    // Public access was turned on in base and mirrored, then turned off again
+    // in variant v2 on a surface stored without `public`.
+    const source = {
+      access_point: { route: '/r' },
+      canvas: canvas({ route: '/r' }),
+    };
+    const snapshots = {
+      __base__: {
+        access_point: { route: '/r', public: true },
+        canvas: canvas({ route: '/r', public: true }),
+      },
+      v2: {
+        access_point: { route: '/r', public: true },
+        canvas: canvas({ route: '/r', public: true }),
+      },
+    };
+    const out = syncAccessPointIdentifiers(snapshots, source);
+    for (const id of ['__base__', 'v2'] as const) {
+      expect('public' in out[id].access_point).toBe(false);
+      expect('public' in out[id].canvas.nodes[0].config).toBe(false);
+    }
+  });
+
+  it('mirrors a closed public from the source into every snapshot', () => {
+    const source = { access_point: { route: '/r', public: false } };
+    const snapshots = { __base__: { access_point: { route: '/r', public: true } } };
+    const out = syncAccessPointIdentifiers(snapshots, source);
+    expect(out.__base__.access_point.public).toBe(false);
   });
 
   it('syncs the canvas identifier fields (incl. route_prefix/route_suffix) into every snapshot blob', () => {

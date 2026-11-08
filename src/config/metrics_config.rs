@@ -185,17 +185,33 @@ pub struct MetricsExportConfig {
     pub batch_max_export_size: Option<usize>,
 }
 
+/// `logs.targets` entry that exports every log target.
+pub const EVERY_LOG_TARGET: &str = "*";
+
 /// Logs configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogsConfig {
     /// Whether log export is enabled
     pub enabled: bool,
+
+    /// Log targets exported: an exact target such as `policy_audit`, or a module path
+    /// that also covers its submodules, such as `agent_gateway`. `"*"` (the default)
+    /// exports every target.
+    #[serde(default = "default_log_targets")]
+    pub targets: Vec<String>,
 }
 
 impl Default for LogsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            targets: default_log_targets(),
+        }
     }
+}
+
+fn default_log_targets() -> Vec<String> {
+    vec![EVERY_LOG_TARGET.to_string()]
 }
 
 /// CloudWatch configuration
@@ -429,6 +445,7 @@ impl From<&OpenTelemetryConfig> for crate::observability::OtelConfig {
             batch_max_queue_size: 2048,
             batch_scheduled_delay_ms: 5000,
             batch_max_export_size: 512,
+            log_targets: config.logs.targets.clone(),
         }
     }
 }
@@ -529,6 +546,30 @@ mod tests {
         assert_eq!(auth.header_name, "Authorization");
         assert_eq!(auth.secret_id, "otel-token");
         assert_eq!(auth.header_format, "Bearer {value}");
+    }
+
+    #[test]
+    fn logs_targets_default_to_every_target() {
+        let logs: LogsConfig = serde_json::from_str(r#"{ "enabled": true }"#).unwrap();
+        assert_eq!(logs.targets, vec![EVERY_LOG_TARGET.to_string()]);
+        assert_eq!(LogsConfig::default().targets, vec![EVERY_LOG_TARGET.to_string()]);
+    }
+
+    #[test]
+    fn logs_targets_parse_and_reach_the_otel_config() {
+        let json = r#"{
+            "enabled": true,
+            "endpoint": "http://localhost:4317",
+            "service_name": "svc",
+            "environment": "test",
+            "traces": { "enabled": true, "sample_rate": 1.0 },
+            "metrics": { "enabled": true, "export_interval_seconds": 60 },
+            "logs": { "enabled": true, "targets": ["agent_gateway", "policy_audit"] }
+        }"#;
+
+        let config: OpenTelemetryConfig = serde_json::from_str(json).unwrap();
+        let otel_config = crate::observability::OtelConfig::from(&config);
+        assert_eq!(otel_config.log_targets, vec!["agent_gateway".to_string(), "policy_audit".to_string()]);
     }
 
     #[test]

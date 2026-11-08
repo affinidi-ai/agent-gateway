@@ -72,6 +72,8 @@ pub fn header_derived_tenant_permitted(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename_all = "kebab-case"))]
 pub enum ResourceKind {
     Secrets,
     Certificates,
@@ -92,6 +94,9 @@ pub enum ResourceKind {
     JwtVerificationStrategies,
     StsClients,
     VtaConnections,
+    /// The delegation vault's grants by binding and their connects, named by
+    /// the surface they serve.
+    DelegationVault,
 }
 
 impl ResourceKind {
@@ -116,6 +121,7 @@ impl ResourceKind {
             "jwt-verification-strategies" => Some(Self::JwtVerificationStrategies),
             "sts-clients" => Some(Self::StsClients),
             "vta-connections" => Some(Self::VtaConnections),
+            "delegation-vault" => Some(Self::DelegationVault),
             _ => None,
         }
     }
@@ -141,6 +147,7 @@ impl ResourceKind {
             Self::JwtVerificationStrategies => "jwt-verification-strategies",
             Self::StsClients => "sts-clients",
             Self::VtaConnections => "vta-connections",
+            Self::DelegationVault => "delegation-vault",
         }
     }
 }
@@ -209,6 +216,44 @@ pub fn can_reference(
         Some(owner) => referenced_tenant_id.is_none_or(|referenced| referenced == owner),
         None => referenced_tenant_id.is_none(),
     }
+}
+
+/// The tenant of a surface and how strictly it is held to tenant isolation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SurfaceTenancy<'a> {
+    pub tenant_id: Option<&'a str>,
+    pub mode: crate::config::credential_policy::RuleMode,
+}
+
+impl<'a> SurfaceTenancy<'a> {
+    /// The tenancy of a surface under the configured `tenant_credential_isolation` mode.
+    pub fn configured(tenant_id: Option<&'a str>) -> Self {
+        Self {
+            tenant_id,
+            mode: crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+        }
+    }
+}
+
+/// May a resource owned by `owner_tenant_id` send the credential held by a resource of
+/// `referenced_tenant_id`? A tenant resource may always send its own tenant's credential.
+/// Sending an appliance-wide credential is allowed only when `mode` is `Warn`; use
+/// [`breaks_tenant_isolation`] to report it.
+pub fn can_reference_with_rule(
+    owner_tenant_id: Option<&str>,
+    referenced_tenant_id: Option<&str>,
+    mode: crate::config::credential_policy::RuleMode,
+) -> bool {
+    can_reference(owner_tenant_id, referenced_tenant_id)
+        && (!breaks_tenant_isolation(owner_tenant_id, referenced_tenant_id) || !mode.is_enforced())
+}
+
+/// Does a tenant resource reference an appliance-wide one?
+pub fn breaks_tenant_isolation(
+    owner_tenant_id: Option<&str>,
+    referenced_tenant_id: Option<&str>,
+) -> bool {
+    owner_tenant_id.is_some() && referenced_tenant_id.is_none()
 }
 
 pub fn scope_allows_resource(
@@ -320,6 +365,24 @@ mod tests {
         assert_eq!(tenant_for_create(Some("tenant-a".into()), false, None).unwrap(), Some("tenant-a".into()));
     }
 
+    #[test]
+    fn a_tenant_resource_sends_an_appliance_wide_credential_only_in_warn_mode() {
+        use crate::config::credential_policy::RuleMode::{Enforce, Warn};
+
+        for mode in [Warn, Enforce] {
+            assert!(can_reference_with_rule(Some("tenant-a"), Some("tenant-a"), mode));
+            assert!(can_reference_with_rule(None, None, mode));
+            assert!(!can_reference_with_rule(Some("tenant-a"), Some("tenant-b"), mode));
+            assert!(!can_reference_with_rule(None, Some("tenant-a"), mode));
+        }
+        assert!(can_reference_with_rule(Some("tenant-a"), None, Warn));
+        assert!(!can_reference_with_rule(Some("tenant-a"), None, Enforce));
+        assert!(breaks_tenant_isolation(Some("tenant-a"), None));
+        assert!(!breaks_tenant_isolation(Some("tenant-a"), Some("tenant-a")));
+        assert!(!breaks_tenant_isolation(None, None));
+        assert!(!breaks_tenant_isolation(None, Some("tenant-a")));
+    }
+
     fn selector(
         header_name: &str,
         broad: bool,
@@ -376,5 +439,53 @@ mod tests {
 
         // Broad selector: permitted only behind a covering, asserted trusted edge.
         assert!(header_derived_tenant_permitted(&broad, Some(&covering_edge)));
+    }
+
+    /// Every `ResourceKind` name, taken from the enum itself so a new variant is included.
+    fn resource_kind_names() -> Vec<String> {
+        <ResourceKind as ts_rs::TS>::inline()
+            .split(" | ")
+            .map(|name| {
+                name.trim_matches('"')
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The names of `ResourceKind` that the dashboard list `listed` leaves out.
+    fn kinds_missing_from(listed: &str) -> Vec<String> {
+        resource_kind_names()
+            .into_iter()
+            .filter(|name| !listed.contains(&format!("'{name}'")))
+            .collect()
+    }
+
+    #[test]
+    fn every_resource_kind_name_is_its_canonical_path_family() {
+        let names = resource_kind_names();
+        assert!(names.contains(&"delegation-vault".to_string()), "{names:?}");
+        for name in &names {
+            assert_eq!(ResourceKind::from_path_family(name).map(ResourceKind::as_str), Some(name.as_str()));
+        }
+    }
+
+    #[test]
+    fn the_access_token_form_lists_every_resource_kind() {
+        let helpers = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/www/default/src/pages/SecretsPage/accessTokenHelpers.ts"
+        ))
+        .expect("the dashboard's access token helpers are readable");
+        let listed = helpers
+            .split_once("ACCESS_TOKEN_RESOURCE_KINDS = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("accessTokenHelpers.ts declares ACCESS_TOKEN_RESOURCE_KINDS");
+
+        assert_eq!(kinds_missing_from(listed), Vec::<String>::new());
+        assert_eq!(
+            kinds_missing_from(&listed.replace("'delegation-vault',", "")),
+            vec!["delegation-vault".to_string()]
+        );
     }
 }

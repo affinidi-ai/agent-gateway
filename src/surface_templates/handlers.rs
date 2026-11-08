@@ -178,7 +178,9 @@ pub async fn create_template(
 
     let id = format!("user-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
-    let tpl = req.into_template(id, now);
+    let mut tpl = req.into_template(id, now);
+    refuse_reference_transit_tokens(&tpl)?;
+    tpl.settle_surface_markers();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -231,10 +233,26 @@ async fn update_stored_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
+    refuse_reference_transit_tokens(&tpl)?;
+    tpl.settle_surface_markers();
     s.save(&tpl)
         .await
         .map_err(|e| TemplateApiError::InternalError(format!("save: {}", e)))?;
     Ok(tpl)
+}
+
+/// Refuse a template whose surface sets `transit_token_mode: reference`, on
+/// the surface or in a variant's overrides, as a surface save refuses it, so a
+/// template never stores a surface every create from it would refuse.
+fn refuse_reference_transit_tokens(tpl: &SurfaceTemplate) -> Result<(), TemplateApiError> {
+    match tpl
+        .surface
+        .as_ref()
+        .and_then(crate::config::agent_surface::reference_transit_token_refusal)
+    {
+        Some(refusal) => Err(TemplateApiError::BadRequest(refusal)),
+        None => Ok(()),
+    }
 }
 
 /// `GET /v1/surface-templates/{id}/export`
@@ -306,6 +324,7 @@ pub async fn import_template(
     if tpl.name.trim().is_empty() {
         return Err(TemplateApiError::BadRequest("name must not be empty".to_string()));
     }
+    refuse_reference_transit_tokens(&tpl)?;
     if tpl.id.trim().is_empty()
         || s.get(&tpl.id)
             .await
@@ -317,6 +336,7 @@ pub async fn import_template(
     let now = chrono::Utc::now().to_rfc3339();
     tpl.created_at = Some(now.clone());
     tpl.updated_at = Some(now);
+    tpl.settle_surface_markers();
     if !template_writable(&tpl, &context, &scope) {
         return Err(TemplateApiError::Forbidden("Surface template is outside this token's permitted scope".into()));
     }
@@ -482,5 +502,194 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn fabric_surface(trust_check_split: Option<bool>) -> serde_json::Value {
+        let mut surface = serde_json::json!({
+            "name": "$NAME",
+            "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+            "target": {
+                "endpoint": "fabric://gw-b/surface-x",
+                "trust_check_list": [{
+                    "id": "fabric-target",
+                    "trust_registry_id": "tr-1",
+                    "query_type": "recognition",
+                    "query": {"authority_id": "did:example:authority", "entity_id": "{{ target.did }}"}
+                }]
+            },
+            "transit": {"points": [{"alias": "partner-a", "target_endpoint": "https://a.example/a2a"}]}
+        });
+        if let Some(split) = trust_check_split {
+            surface["trust_check_split"] = serde_json::json!(split);
+        }
+        surface
+    }
+
+    async fn update_and_reload(surface: serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+        let (store, template, dir) = stored_template(None).await;
+        let mut update = template.clone();
+        update.surface = Some(surface);
+        let saved = update_stored_template(&store, template.id.clone(), &None, &None, update)
+            .await
+            .unwrap()
+            .surface
+            .expect("surface");
+        let reloaded = super::super::FileSystemSurfaceTemplateStore::new(dir.path().join("templates"), None)
+            .await
+            .unwrap()
+            .get(&template.id)
+            .await
+            .unwrap()
+            .expect("template")
+            .surface
+            .expect("surface");
+        (saved, reloaded)
+    }
+
+    #[tokio::test]
+    async fn an_update_declaring_the_split_shape_is_kept_as_sent() {
+        let (saved, reloaded) = update_and_reload(fabric_surface(Some(true))).await;
+
+        assert_eq!(saved, fabric_surface(Some(true)), "a target list remains, so the marker is kept");
+        assert_eq!(reloaded, saved, "a declared-shape template is never migrated");
+        assert!(
+            saved["transit"]["points"][0]
+                .get("trust_check_list")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_without_the_marker_is_migrated() {
+        let (saved, reloaded) = update_and_reload(fabric_surface(None)).await;
+
+        assert_eq!(saved["trust_check_split"], serde_json::json!(true));
+        assert_eq!(saved["target"]["trust_check_list"][0]["id"], "fabric-target", "fabric keeps its own list");
+        assert_eq!(saved["transit"]["points"][0]["trust_check_list"][0]["id"], "fabric-target");
+        assert_eq!(saved["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
+        assert_eq!(reloaded, saved);
+    }
+
+    /// A template saved with a Transit Point that uses `source_auth` is marked
+    /// `transit_point_source_auth` in its surface, whatever the update sent, as
+    /// a saved surface is; one whose Transit Points do not use it is not.
+    #[tokio::test]
+    async fn an_update_marks_a_template_whose_transit_point_uses_source_auth() {
+        let surface = |source_auth: bool, marker: bool| {
+            let mut point = serde_json::json!({"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+                "require_transit_token": false, "allow_unauthenticated_callers": true});
+            if source_auth {
+                point = serde_json::json!({"alias": "partner", "target_endpoint": "https://partner.example/a2a",
+                    "require_transit_token": false, "source_auth": {"type": "api_key",
+                        "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "partner-callers"}});
+            }
+            serde_json::json!({
+                "name": "$NAME",
+                "access_point": {"listen_address": "$HOST", "route": "$ROUTE", "protocol": "a2a"},
+                "target": {"endpoint": "$TARGET_ENDPOINT"},
+                "transit": {"points": [point]},
+                "transit_point_source_auth": marker
+            })
+        };
+
+        let (saved, reloaded) = update_and_reload(surface(true, false)).await;
+        assert_eq!(saved["transit_point_source_auth"], serde_json::json!(true), "{saved}");
+        assert_eq!(reloaded, saved);
+
+        let (saved, reloaded) = update_and_reload(surface(false, true)).await;
+        assert!(
+            saved
+                .get("transit_point_source_auth")
+                .is_none(),
+            "{saved}"
+        );
+        assert_eq!(reloaded, saved);
+    }
+
+    #[test]
+    fn a_created_template_follows_the_declared_shape() {
+        let create = |surface: serde_json::Value| {
+            let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+                serde_json::json!({ "name": "Full", "kind": "full", "surface": surface }),
+            )
+            .unwrap()
+            .into_template("template-f".into(), "2026-01-01T00:00:00Z".into());
+            template.settle_surface_markers();
+            template
+                .surface
+                .expect("surface")
+        };
+
+        let declared = create(fabric_surface(Some(true)));
+        assert_eq!(declared, fabric_surface(Some(true)));
+
+        let legacy = create(fabric_surface(None));
+        assert_eq!(legacy["transit"]["points"][0]["trust_check_migrated"], serde_json::json!(true));
+        assert_eq!(legacy["trust_check_split"], serde_json::json!(true));
+
+        let mut without_target_list = fabric_surface(Some(true));
+        without_target_list["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("trust_check_list");
+        let settled = create(without_target_list);
+        assert!(
+            settled
+                .get("trust_check_split")
+                .is_none(),
+            "no target list, so no marker is persisted"
+        );
+    }
+
+    /// A template whose surface asks for `transit_token_mode: reference`, on
+    /// the surface or in a variant's overrides, is refused when it is saved,
+    /// as a surface save refuses it, rather than stored to fail when a surface
+    /// is created from it; `embedded` is saved.
+    #[tokio::test]
+    async fn a_template_asking_for_reference_transit_tokens_is_refused_when_saved() {
+        use crate::config::agent_surface::TRANSIT_TOKEN_REFERENCE_REFUSED;
+        let with_mode = |base: &str, variant: &str| {
+            let mut surface = fabric_surface(Some(true));
+            surface["transit"]["transit_token_mode"] = serde_json::json!(base);
+            surface["variants"] = serde_json::json!([{ "id": "candidate", "alias": "candidate", "name": "Candidate",
+                "overrides": { "transit": { "shared": { "transit_token_mode": variant } } } }]);
+            surface
+        };
+        for (case, surface, refused) in [
+            ("the surface", with_mode("reference", "embedded"), Some(TRANSIT_TOKEN_REFERENCE_REFUSED.to_string())),
+            (
+                "a variant",
+                with_mode("embedded", "reference"),
+                Some(format!("variant 'candidate' {TRANSIT_TOKEN_REFERENCE_REFUSED}")),
+            ),
+            ("embedded", with_mode("embedded", "embedded"), None),
+        ] {
+            let (store, template, _dir) = stored_template(None).await;
+            let mut update = template.clone();
+            update.surface = Some(surface);
+            let direct = match refuse_reference_transit_tokens(&update) {
+                Ok(()) => None,
+                Err(TemplateApiError::BadRequest(message)) => Some(message),
+                Err(other) => panic!("{case}: {other:?}"),
+            };
+            assert_eq!(direct, refused, "{case}: the check create and import run too");
+            let saved = update_stored_template(&store, template.id.clone(), &None, &None, update).await;
+            match (saved, refused) {
+                (Err(TemplateApiError::BadRequest(message)), Some(refused)) => assert_eq!(message, refused, "{case}"),
+                (Ok(_), None) => {}
+                (other, refused) => panic!("{case}: expected {refused:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_created_template_without_a_surface_is_left_without_one() {
+        let mut template = serde_json::from_value::<crate::surface_templates::types::CreateSurfaceTemplate>(
+            serde_json::json!({ "name": "Partial" }),
+        )
+        .unwrap()
+        .into_template("template-p".into(), "2026-01-01T00:00:00Z".into());
+        template.settle_surface_markers();
+        assert!(template.surface.is_none());
     }
 }

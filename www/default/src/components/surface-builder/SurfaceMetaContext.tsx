@@ -1,6 +1,7 @@
 import { createContext, useContext } from 'react';
 import type { AgentSurface } from '../../api';
 import type { Protocol, SurfaceSigning } from './elements/types';
+import type { AccessPointNotice } from './elements/access-point/readiness';
 
 export type DidwebvhInjectionMode = 'header' | 'signed_header' | 'protocol_native';
 
@@ -50,6 +51,28 @@ export interface SurfaceMetaValue {
   lastActivity?: string | null;
   /** Surface UUID; read-only display in edit mode. */
   surfaceId?: string;
+  /** Owning tenant of the stored surface: `null` when appliance-wide, absent while creating. */
+  tenantId?: string | null;
+  /** Alias of the named variant the canvas shows; absent while it shows the base. */
+  activeVariantAlias?: string;
+  /** True when that variant is the surface's default, which also answers on its route. */
+  activeVariantIsDefault?: boolean;
+  /** Message of the last failed save, so a panel can show it next to the field it names. */
+  saveError?: string | null;
+  /**
+   * Messages of the `Warning` headers the last successful save answered with.
+   * A new array on every save, so a panel can tell one save from the next.
+   */
+  saveWarnings?: readonly string[] | null;
+  /** Readiness notice shown under the Access Point URL; absent while it is ready. */
+  accessPointNotice?: AccessPointNotice | null;
+  /**
+   * The stored surface has no `access_point.public`: a legacy Access Point,
+   * which hands callers whose credential fails to policy unless it is closed.
+   */
+  legacyAccessPoint?: boolean;
+  /** Selects the Access Point and points at the Caller Context element in the palette. */
+  onConfigureAuthentication?: () => void;
   setName: (v: string) => void;
   setDescription: (v: string) => void;
   setTagsCsv: (v: string) => void;
@@ -62,6 +85,12 @@ export interface SurfaceMetaValue {
   setSigning: (v: SurfaceSigning | undefined) => void;
   /** Optional callback to snapshot the current surface as a reusable template. */
   onSaveAsTemplate?: () => void;
+  /** Opens the Agent Cards view. Set only while that view is offered for the surface's protocol. */
+  onOpenAgentCard?: () => void;
+  /** Opens the Surface view, which holds the Entry point URL and the canvas. */
+  onOpenSurfaceView?: () => void;
+  /** Changes when the saved surface changes or a Refresh in the Agent Cards view succeeds, so the Managed Agent card fetch line reads again. */
+  agentCardFetchRevision?: unknown;
 }
 
 const SurfaceMetaContext = createContext<SurfaceMetaValue | null>(null);
@@ -78,4 +107,9 @@ export function useSurfaceMeta(): SurfaceMetaValue {
 
 export function useOptionalSurfaceMeta(): SurfaceMetaValue | null {
   return useContext(SurfaceMetaContext);
+}
+
+/** The tenant of the surface being edited, or undefined when unknown (create mode, no provider). */
+export function useSurfaceTenant(): string | null | undefined {
+  return useContext(SurfaceMetaContext)?.tenantId;
 }

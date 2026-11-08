@@ -22,11 +22,15 @@ pub fn test_signing_key() -> ssi::jwk::JWK {
 /// Uses a `tempfile::tempdir()` for filesystem state — caller must hold
 /// the returned `TempDir` to keep the directory alive.
 pub async fn test_vc_issuer() -> (VCIssuer, tempfile::TempDir) {
+    test_vc_issuer_with(Arc::new(MockIdentityStore::new())).await
+}
+
+/// [`test_vc_issuer`] over `identity_store`.
+pub async fn test_vc_issuer_with(identity_store: Arc<dyn IdentityStore>) -> (VCIssuer, tempfile::TempDir) {
     crate::gateways::did_cache::init_shared_resolver()
         .await
         .expect("init_shared_resolver failed");
     let temp_dir = tempfile::tempdir().unwrap();
-    let identity_store = Arc::new(MockIdentityStore::new()) as Arc<dyn IdentityStore>;
     let vp_challenge_store = Arc::new(MockVpChallengeStore::new()) as Arc<dyn VpChallengeStore>;
     let issuer = VCIssuer::new(temp_dir.path(), "example.com", identity_store, vp_challenge_store, None, None)
         .await
@@ -46,11 +50,7 @@ pub fn test_surface_identity_record(
         identity_fields: HashMap::new(),
         usage_count: 1,
         last_used_at: Some(now),
-        channel_usage: vec![super::filesystem::ChannelUsage {
-            channel_config_id: surface_id.to_string(),
-            usage_count: 1,
-            last_used_at: now,
-        }],
+        channel_usage: vec![test_channel_usage(surface_id, Some(IdentityOrigin::Managed))],
         private_key: None,
         vta_context_id: None,
         vta_connection_id: None,
@@ -59,6 +59,37 @@ pub fn test_surface_identity_record(
         verified: true,
         origin: None,
     }
+}
+
+/// One use of an identity on `surface_id` in `role`.
+pub fn test_channel_usage(
+    surface_id: &str,
+    role: Option<IdentityOrigin>,
+) -> super::filesystem::ChannelUsage {
+    super::filesystem::ChannelUsage {
+        channel_config_id: surface_id.to_string(),
+        usage_count: 1,
+        last_used_at: chrono::Utc::now(),
+        role,
+    }
+}
+
+/// A surface named `name` that issues a managed agent identity, so a managed DID used on it
+/// counts as its managed agent.
+pub fn test_surface_with_managed_identity(
+    surface_id: &str,
+    name: &str,
+) -> crate::config::agent_surface::AgentSurface {
+    let mut surface = crate::config::agent_surface::AgentSurface {
+        surface_id: surface_id.to_string(),
+        name: name.to_string(),
+        ..Default::default()
+    };
+    surface
+        .target
+        .identity_injection
+        .identity_type = Some("from_jwt_claim".to_string());
+    surface
 }
 
 pub struct MockIdentityStore {
@@ -117,13 +148,15 @@ impl IdentityStore for MockIdentityStore {
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<IdentityOrigin>,
     ) -> Result<()> {
         let mut records = self.records.write().await;
         if let Some(record) = records.get_mut(identity_hash) {
+            let now = chrono::Utc::now();
             record.usage_count += 1;
-            record.last_used_at = Some(chrono::Utc::now());
+            record.last_used_at = Some(now);
             if let Some(cid) = channel_config_id {
-                record.channel_config_id = Some(cid);
+                record.record_channel_use(&cid, role, now);
             }
         }
         Ok(())
@@ -166,13 +199,143 @@ impl IdentityStore for MockIdentityStore {
         &self,
         identity_hash: &str,
         origin: IdentityOrigin,
-    ) -> Result<()> {
+    ) -> Result<Option<IdentityOrigin>> {
         let mut records = self.records.write().await;
         let record = records
             .get_mut(identity_hash)
             .ok_or_else(|| anyhow::anyhow!("identity record not found: {identity_hash}"))?;
-        record.origin = Some(origin);
-        Ok(())
+        Ok(Some(
+            *record
+                .origin
+                .get_or_insert(origin),
+        ))
+    }
+}
+
+/// A [`MockIdentityStore`] that cannot record an identity origin.
+pub struct OriginFailingIdentityStore(pub MockIdentityStore);
+
+#[async_trait]
+impl IdentityStore for OriginFailingIdentityStore {
+    async fn create(
+        &self,
+        record: AgentIdentityRecord,
+    ) -> Result<()> {
+        self.0.create(record).await
+    }
+
+    async fn find_by_hash(
+        &self,
+        identity_hash: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        self.0
+            .find_by_hash(identity_hash)
+            .await
+    }
+
+    async fn find_by_did(
+        &self,
+        did: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        self.0.find_by_did(did).await
+    }
+
+    async fn list_all(&self) -> Result<Vec<AgentIdentityRecord>> {
+        self.0.list_all().await
+    }
+
+    async fn update_usage(
+        &self,
+        identity_hash: &str,
+        channel_config_id: Option<String>,
+        role: Option<IdentityOrigin>,
+    ) -> Result<()> {
+        self.0
+            .update_usage(identity_hash, channel_config_id, role)
+            .await
+    }
+
+    async fn store_external_did(
+        &self,
+        did: &str,
+        identity_fields: HashMap<String, serde_json::Value>,
+        channel_config_id: Option<String>,
+        verified: bool,
+    ) -> Result<()> {
+        self.0
+            .store_external_did(did, identity_fields, channel_config_id, verified)
+            .await
+    }
+
+    async fn set_origin(
+        &self,
+        _identity_hash: &str,
+        _origin: IdentityOrigin,
+    ) -> Result<Option<IdentityOrigin>> {
+        Err(anyhow::anyhow!("origin store unavailable"))
+    }
+}
+
+/// An identity store whose every lookup and write fails with
+/// [`FailingIdentityStore::DETAIL`].
+pub struct FailingIdentityStore;
+
+impl FailingIdentityStore {
+    pub const DETAIL: &'static str = "identity store offline at shard-7";
+}
+
+#[async_trait]
+impl IdentityStore for FailingIdentityStore {
+    async fn create(
+        &self,
+        _record: AgentIdentityRecord,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn find_by_hash(
+        &self,
+        _identity_hash: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn find_by_did(
+        &self,
+        _did: &str,
+    ) -> Result<Option<AgentIdentityRecord>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn list_all(&self) -> Result<Vec<AgentIdentityRecord>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn update_usage(
+        &self,
+        _identity_hash: &str,
+        _channel_config_id: Option<String>,
+        _role: Option<IdentityOrigin>,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn store_external_did(
+        &self,
+        _did: &str,
+        _identity_fields: HashMap<String, serde_json::Value>,
+        _channel_config_id: Option<String>,
+        _verified: bool,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(Self::DETAIL))
+    }
+
+    async fn set_origin(
+        &self,
+        _identity_hash: &str,
+        _origin: IdentityOrigin,
+    ) -> Result<Option<IdentityOrigin>> {
+        Err(anyhow::anyhow!(Self::DETAIL))
     }
 }
 

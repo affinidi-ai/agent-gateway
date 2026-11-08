@@ -312,6 +312,8 @@ pub fn dispatch(
         return;
     };
     let values = Arc::new(event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override()));
+    #[cfg(test)]
+    dispatched::record(&event.id, &values);
     spawn_background_task(event_id, async move {
         let routes = match current_routes().await {
             Ok(routes) => routes,
@@ -324,6 +326,45 @@ pub fn dispatch(
             deliver(&route, &values).await
         });
     });
+}
+
+/// Every event dispatched in this test process, so a test can tell which events an operation
+/// raised without integrations or endpoints.
+#[cfg(test)]
+pub mod dispatched {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    static EVENTS: Mutex<Vec<(String, HashMap<String, String>)>> = Mutex::new(Vec::new());
+
+    pub(super) fn record(
+        event_id: &str,
+        values: &HashMap<String, String>,
+    ) {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((event_id.to_string(), values.clone()));
+    }
+
+    /// The ids of the dispatched events whose `variable` was `value`, in dispatch order.
+    pub fn with(
+        variable: &str,
+        value: &str,
+    ) -> Vec<String> {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(_, values)| {
+                values
+                    .get(variable)
+                    .map(String::as_str)
+                    == Some(value)
+            })
+            .map(|(event_id, _)| event_id.clone())
+            .collect()
+    }
 }
 
 /// Delivers each route in a background task of its own, so a slow or failing endpoint never

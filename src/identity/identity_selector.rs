@@ -209,11 +209,12 @@ impl IdentitySelector {
 /// Format every JSON Schema validation error against `payload` as a single
 /// human-readable string. Returns an empty string when the payload is valid.
 ///
-/// Each error entry includes the JSON Pointer to the offending instance
-/// location (or `<root>`) and the validator's message, e.g.
-/// `agentIdentity.provisioningInfo: "configFlags" is a required property`.
+/// Each error entry names the offending instance location (or `<root>`) and the
+/// schema rule it fails, never the payload value, e.g.
+/// `agentIdentity.provisioningInfo: "configFlags" is a required property` or
+/// `agentIdentity.model: fails 'type'`.
 /// Capped at 10 entries to keep error responses bounded.
-fn format_schema_errors(
+pub(crate) fn format_schema_errors(
     validator: &Validator,
     payload: &JsonValue,
 ) -> String {
@@ -227,7 +228,7 @@ fn format_schema_errors(
                 path.trim_start_matches('/')
                     .replace('/', ".")
             };
-            format!("{}: {}", location, e)
+            format!("{}: {}", location, schema_violation(&e))
         })
         .take(10)
         .collect();
@@ -237,6 +238,24 @@ fn format_schema_errors(
     // Stable order so identical payloads produce identical messages
     entries.sort();
     entries.join("; ")
+}
+
+/// The schema rule `error` reports. The validator's own message quotes the
+/// offending payload value, so only a missing property's name is kept.
+fn schema_violation(error: &jsonschema::ValidationError<'_>) -> String {
+    match error.kind() {
+        jsonschema::error::ValidationErrorKind::Required { property } => format!("{property} is a required property"),
+        _ => {
+            let schema_path = error
+                .schema_path()
+                .to_string();
+            let keyword = schema_path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            format!("fails '{keyword}'")
+        }
+    }
 }
 
 /// Extract field paths marked with x-identity: true from JSON Schema
@@ -384,6 +403,25 @@ mod tests {
             "detail should mention the failing path, got: {detail}"
         );
         assert!(detail.contains("configFlags"), "detail should name the missing field, got: {detail}");
+    }
+
+    #[test]
+    fn format_schema_errors_names_the_rule_but_not_the_payload_value() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "model": { "type": "integer" },
+                "region": { "enum": ["eu", "us"] }
+            }
+        });
+        let validator = Validator::options()
+            .build(&schema)
+            .unwrap();
+        let payload = json!({ "model": "caller-model-marker", "region": "caller-region-marker" });
+
+        let detail = format_schema_errors(&validator, &payload);
+
+        assert_eq!(detail, "model: fails 'type'; region: fails 'enum'");
     }
 
     #[test]

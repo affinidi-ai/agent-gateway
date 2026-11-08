@@ -74,15 +74,168 @@ impl AgentSurface {
 
     // ── Target shorthands ───────────────────────────────────────────────────
 
-    /// First caller-authentication method on the access point. Mirrors the
-    /// legacy `ChannelMapping::source_auth` field, which carried only the
-    /// first configured method.
+    /// Caller-authentication methods on the access point, in configured order.
     #[inline]
-    pub fn source_auth(&self) -> Option<&crate::source_auth::SourceAuthConfig> {
+    pub fn source_auth_methods(&self) -> &[crate::source_auth::SourceAuthConfig] {
         self.access_point
             .caller_authentication
             .as_ref()
-            .and_then(|ca| ca.methods.first())
+            .map_or(&[], |ca| ca.methods.as_slice())
+    }
+
+    /// Whether any caller-authentication method forwards the caller's own
+    /// credential to the Target (`jwt_bearer` with `forward_header`).
+    pub fn forwards_caller_credential(&self) -> bool {
+        self.source_auth_methods()
+            .iter()
+            .any(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
+    /// Whether every caller-authentication method forwards the caller's own
+    /// credential to the Target: a request is forwarded with the credential of
+    /// the method it matched, so a method that forwards none leaves its callers
+    /// without one.
+    pub fn forwards_every_caller_credential(&self) -> bool {
+        let methods = self.source_auth_methods();
+        !methods.is_empty()
+            && methods.iter().all(
+                |auth| matches!(auth, crate::source_auth::SourceAuthConfig::JwtBearer(config) if config.forward_header),
+            )
+    }
+
+    #[inline]
+    pub fn has_source_auth(&self) -> bool {
+        !self
+            .source_auth_methods()
+            .is_empty()
+    }
+
+    /// The caller-authentication method chosen for this request; see
+    /// [`crate::source_auth::models::select_source_auth_method`].
+    pub fn source_auth_for_request(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer_cert: Option<&crate::source_auth::models::PeerCertInfo>,
+    ) -> Option<crate::source_auth::models::SourceAuthSelection<'_>> {
+        crate::source_auth::models::select_source_auth_method(self.source_auth_methods(), headers, peer_cert.is_some())
+    }
+
+    /// The DID Auth method, which serves the `/authenticate` endpoints.
+    pub fn did_auth_config(&self) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+        self.source_auth_methods()
+            .iter()
+            .find_map(|method| match method {
+                crate::source_auth::SourceAuthConfig::DidAuth(config) => Some(config),
+                _ => None,
+            })
+    }
+
+    /// Every header a caller-authentication method reads. The gateway consumes
+    /// these credentials, so none of them is forwarded.
+    pub fn source_credential_headers(&self) -> Vec<&str> {
+        self.source_auth_methods()
+            .iter()
+            .filter_map(|method| method.credential_header_name())
+            .collect()
+    }
+
+    /// The DID Auth configurations that mint sessions: the Access Point's DID
+    /// Auth caller-authentication method, of which there is at most one, on the
+    /// surface and in each variant whose overrides set the Access Point's caller
+    /// authentication, with that variant. That method serves `/authenticate`,
+    /// and a Transit Point mints no session.
+    pub fn session_did_auth_configs(
+        &self
+    ) -> Vec<(Option<&super::agent_surface_variants::SurfaceVariant>, &crate::source_auth::models::DidAuthAuthConfig)>
+    {
+        fn did_auth(
+            authentication: &super::agent_surface::CallerAuthentication
+        ) -> Option<&crate::source_auth::models::DidAuthAuthConfig> {
+            authentication
+                .methods
+                .iter()
+                .find_map(|method| match method {
+                    crate::source_auth::SourceAuthConfig::DidAuth(config) => Some(config),
+                    _ => None,
+                })
+        }
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .and_then(did_auth)
+            .map(|config| (None, config))
+            .into_iter()
+            .chain(
+                self.variants
+                    .iter()
+                    .filter_map(move |variant| {
+                        variant
+                            .overrides
+                            .access_point
+                            .as_ref()?
+                            .caller_authentication
+                            .as_ref()
+                            .and_then(did_auth)
+                            .map(|config| (Some(variant), config))
+                    }),
+            )
+            .collect()
+    }
+
+    /// Whether any of the Access Point's caller-authentication methods
+    /// accepts a caller who names itself: DID Auth without `allowed_dids`
+    /// accepts any DID that signs its challenge, so whoever mints one is
+    /// authenticated, and named by nobody the gateway can check. No grant by
+    /// binding is released to such callers.
+    pub fn admits_self_named_callers(&self) -> bool {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .is_some_and(|authentication| {
+                authentication
+                    .methods
+                    .iter()
+                    .any(|method| {
+                        matches!(method, crate::source_auth::SourceAuthConfig::DidAuth(config)
+                            if config.allowed_dids.is_empty())
+                    })
+            })
+    }
+
+    /// Whether any of the Access Point's caller-authentication methods
+    /// accepts a token minted for any service: a JWT bearer method without
+    /// `audiences` skips the audience check, unless the Access Point publishes
+    /// a protected resource, whose `resource` is then the only audience
+    /// accepted. Whoever holds a token of the issuer, for any of its relying
+    /// parties, is then a caller. No grant by binding is released to such
+    /// callers.
+    pub fn admits_tokens_for_any_audience(&self) -> bool {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .is_some_and(|authentication| {
+                authentication
+                    .protected_resource
+                    .is_none()
+                    && authentication
+                        .methods
+                        .iter()
+                        .any(|method| {
+                            matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(config)
+                                if config.audiences.is_empty())
+                        })
+            })
+    }
+
+    /// RFC 9728 settings of the Access Point's caller authentication.
+    #[inline]
+    pub fn protected_resource(&self) -> Option<&crate::protocols::protected_resource::ProtectedResourceConfig> {
+        self.access_point
+            .caller_authentication
+            .as_ref()
+            .and_then(|ca| ca.protected_resource.as_ref())
     }
 
     /// Lift the surface `target.identity_injection` back to the legacy
@@ -104,6 +257,160 @@ impl AgentSurface {
             })
     }
 
+    /// Whether calls through `point` resolve a managed agent identity, as the
+    /// outbound pipeline resolves it: the Transit Point's own
+    /// `managed_identity`, else the surface's when the Transit Point injects a
+    /// VP, in any mode but `from_jwt_claim`, which is inbound only.
+    pub fn transit_point_has_managed_identity(
+        &self,
+        point: &super::agent_surface::TransitPoint,
+    ) -> bool {
+        point
+            .managed_identity
+            .clone()
+            .or_else(|| {
+                point
+                    .identity_injection
+                    .inject_vp
+                    .then(|| self.managed_identity())
+                    .flatten()
+            })
+            .is_some_and(|identity| !matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. }))
+    }
+
+    /// Whether the surface issues a managed agent identity: an `a2a-proxy://` target always
+    /// does, otherwise one configured on its target or on any Transit Point. Unlike
+    /// [`Self::transit_point_has_managed_identity`], a target `from_jwt_claim` counts, since
+    /// the target is reached on the inbound leg where that mode applies.
+    pub fn has_managed_identity(&self) -> bool {
+        self.is_a2a_proxy_target()
+            || self
+                .managed_identity()
+                .is_some()
+            || self
+                .transit
+                .as_ref()
+                .is_some_and(|transit| {
+                    transit
+                        .points
+                        .iter()
+                        .any(|point| {
+                            point
+                                .managed_identity
+                                .is_some()
+                        })
+                })
+    }
+
+    /// Why this surface's caller authentication cannot tell apart the users a
+    /// paired gateway sends requests for over Fabric, or `None` when it can.
+    /// Delegated per-user credentials for Fabric callers, on its Target and on
+    /// its Transit Points, are keyed by the caller it verifies, so
+    /// only a credential that names the end user keeps one user's grant from
+    /// another's: a resource token (`mcp_http.authorization`), or a
+    /// `jwt_bearer` method with an audience (its own, or the one
+    /// `protected_resource` binds) and a JWT verification strategy. The admin
+    /// API also checks that the strategy names an issuer. An `mtls` method
+    /// never verifies a request that arrives over Fabric, so it is no gap: it
+    /// leaves such a request with no verified caller, which is refused.
+    pub fn fabric_caller_authentication_gap(&self) -> Option<&'static str> {
+        use crate::source_auth::SourceAuthConfig;
+        let methods = self
+            .access_point
+            .caller_authentication
+            .as_ref()
+            .map(|authentication| {
+                authentication
+                    .methods
+                    .as_slice()
+            })
+            .unwrap_or_default();
+        let resource_tokens = self
+            .mcp_http
+            .as_ref()
+            .is_some_and(|http| http.authorization.is_some());
+        let verifies_over_fabric = methods
+            .iter()
+            .any(|method| !matches!(method, SourceAuthConfig::Mtls(_)));
+        if !verifies_over_fabric {
+            return (!resource_tokens).then_some("it verifies no caller");
+        }
+        methods
+            .iter()
+            .find_map(|method| match method {
+                SourceAuthConfig::JwtBearer(jwt)
+                    if jwt
+                        .jwt_verification_strategy_id
+                        .trim()
+                        .is_empty() =>
+                {
+                    Some("its jwt_bearer method names no JWT verification strategy, so no issuer")
+                }
+                SourceAuthConfig::JwtBearer(jwt)
+                    if jwt.audiences.is_empty()
+                        && self
+                            .protected_resource()
+                            .is_none() =>
+                {
+                    Some(
+                        "its jwt_bearer method names no audience, so it accepts a token the identity provider issued \
+                         for another service",
+                    )
+                }
+                SourceAuthConfig::JwtBearer(_) => None,
+                SourceAuthConfig::ApiKey(_) => Some(
+                    "an api_key method names every key in its secret as one caller, the partner's and direct \
+                     callers' alike",
+                ),
+                SourceAuthConfig::ApiKeyProvider(_) => {
+                    Some("an api_key_provider key names the client that holds it, not a user")
+                }
+                SourceAuthConfig::DidAuth(_) => {
+                    Some("a did_auth session names the DID that signed in, not the user a partner acts for")
+                }
+                SourceAuthConfig::Mtls(_) => None,
+            })
+    }
+
+    /// Whether this view's Target is an `http://` or `https://` URL exactly as
+    /// written ([`crate::config::agent_surface::endpoint_is_http_url`]), the
+    /// only Target Fabric receive dials through a client pinned to the address
+    /// it vetted, and so the only one it sends a delegated credential.
+    pub fn target_is_http_url(&self) -> bool {
+        crate::config::agent_surface::endpoint_is_http_url(&self.target.endpoint)
+    }
+
+    /// Whether this view releases its Target's per-user grants to legacy
+    /// Fabric requests: its Target is an HTTP or HTTPS URL
+    /// ([`Self::target_is_http_url`]) that sets
+    /// `delegated_credentials_for_fabric_callers`, and its caller
+    /// authentication tells a partner's users apart
+    /// ([`Self::fabric_caller_authentication_gap`]).
+    pub fn releases_target_grants_to_fabric_callers(&self) -> bool {
+        self.target
+            .delegated_credentials_for_fabric_callers
+            && self.target_is_http_url()
+            && self
+                .fabric_caller_authentication_gap()
+                .is_none()
+    }
+
+    /// The agent half of the vault key of this view's Target grants: the
+    /// surface on a view that releases them to Fabric callers, so one grant
+    /// serves a person whichever agent acts for them, directly or through a
+    /// partner; otherwise the agent a direct caller's request names, else the
+    /// surface. Fabric receive passes `None`, so nothing a partner names is
+    /// ever the agent half.
+    pub fn target_grant_agent_did<'a>(
+        &'a self,
+        caller_agent_did: Option<&'a str>,
+    ) -> &'a str {
+        if self.releases_target_grants_to_fabric_callers() {
+            return &self.surface_id;
+        }
+        caller_agent_did.unwrap_or(&self.surface_id)
+    }
+
     /// Slot 1 — caller identity extracted from inbound request (CA → AP).
     #[inline]
     pub fn inbound_identity(&self) -> Option<&crate::source_auth::ManagedIdentityConfig> {
@@ -120,6 +427,13 @@ impl AgentSurface {
     #[inline]
     pub fn inbound_identity_requires_payload(&self) -> bool {
         matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
+    }
+
+    /// True when slot 1 identifies the caller by the API key it presented
+    /// (`from_api_key`).
+    #[inline]
+    pub fn inbound_identity_from_api_key(&self) -> bool {
+        matches!(self.identity_slots.inbound, Some(crate::source_auth::ManagedIdentityConfig::FromApiKey { .. }))
     }
 
     /// Slot 2 — protected agent identity extracted from response (MA → AP).
@@ -152,7 +466,8 @@ impl AgentSurface {
     /// is populated. Mirrors the conversion in
     /// `agent_surface_compat::to_channel_mapping`. For display only: inject
     /// with [`Self::target_outbound_credentials`] or
-    /// [`Self::transit_point_outbound_credentials`].
+    /// [`Self::transit_point_outbound_credentials`]. A Transit Point's
+    /// `consent_mode = external` binding is not one of these.
     pub fn outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
         if !self
             .outbound_credentials
@@ -171,7 +486,7 @@ impl AgentSurface {
                         point
                             .transit_credentials
                             .as_ref()
-                            .map(transit_credential_binding)
+                            .and_then(transit_credential_binding)
                     })
                     .collect()
             })
@@ -180,15 +495,48 @@ impl AgentSurface {
 
     /// Outbound credential bindings for an Access Point request to the
     /// surface's Target. Only the surface-level `outbound_credentials`;
-    /// never a Transit Point's `transit_credentials`.
+    /// never a Transit Point's `transit_credentials`, nor the Target's
+    /// `consent_mode = external` binding, which
+    /// [`Self::target_external_credentials`] returns instead.
     pub fn target_outbound_credentials(&self) -> Vec<crate::config::types::OutboundCredentialBinding> {
+        self.agent_keyed_outbound_credentials()
+            .cloned()
+            .collect()
+    }
+
+    /// The surface-level `outbound_credentials` an agent-keyed path serves:
+    /// every one but the Access Point Target's `consent_mode = external`
+    /// binding.
+    pub fn agent_keyed_outbound_credentials(
+        &self
+    ) -> impl Iterator<Item = &crate::config::types::OutboundCredentialBinding> {
         self.outbound_credentials
-            .clone()
+            .iter()
+            .filter(|binding| !binding.is_external())
+    }
+
+    /// Whether the surface has a surface-level binding an agent-keyed path
+    /// serves.
+    pub fn has_agent_keyed_outbound_credentials(&self) -> bool {
+        self.agent_keyed_outbound_credentials()
+            .next()
+            .is_some()
+    }
+
+    /// The Access Point Target's `consent_mode = external` binding, whose
+    /// grant is kept by binding under the hop `target`.
+    pub fn target_external_credentials(&self) -> Option<&crate::config::types::OutboundCredentialBinding> {
+        self.outbound_credentials
+            .iter()
+            .find(|binding| binding.is_external())
     }
 
     /// Outbound credential bindings for a request through one Transit Point.
-    /// Prefers the surface-level `outbound_credentials` field; otherwise
-    /// only that point's own `transit_credentials`, never another point's.
+    /// Prefers the surface-level `outbound_credentials` field, without the
+    /// Access Point Target's `consent_mode = external` binding; otherwise
+    /// only that point's own `transit_credentials`, never another point's,
+    /// unless it is a `consent_mode = external` binding, which
+    /// [`Self::transit_point_external_credentials`] returns instead.
     pub fn transit_point_outbound_credentials(
         &self,
         point: &super::agent_surface::TransitPoint,
@@ -197,16 +545,27 @@ impl AgentSurface {
             .outbound_credentials
             .is_empty()
         {
-            return self
-                .outbound_credentials
-                .clone();
+            return self.target_outbound_credentials();
         }
         point
             .transit_credentials
             .as_ref()
-            .map(transit_credential_binding)
+            .and_then(transit_credential_binding)
             .into_iter()
             .collect()
+    }
+
+    /// A Transit Point's `consent_mode = external` binding, whose grant is
+    /// kept by binding. It applies whatever the surface-level
+    /// `outbound_credentials` say.
+    pub fn transit_point_external_credentials<'a>(
+        &self,
+        point: &'a super::agent_surface::TransitPoint,
+    ) -> Option<&'a super::agent_surface::TransitCredentials> {
+        point
+            .transit_credentials
+            .as_ref()
+            .filter(|credentials| credentials.is_external())
     }
 
     /// Target service-level credentials.
@@ -237,12 +596,6 @@ impl AgentSurface {
         self.target
             .extension_rules
             .as_ref()
-    }
-
-    /// Auto-pay MPP challenges for fabric:// targets.
-    #[inline]
-    pub fn mpp_auto_pay(&self) -> bool {
-        self.target.mpp_auto_pay
     }
 
     // ── Networking shorthands ───────────────────────────────────────────────
@@ -364,12 +717,116 @@ impl AgentSurface {
         }
     }
 
-    /// Mirrors legacy `channel.mpp_auto_pay_max_amount`.
+    /// Whether the Target's payment policy charges the Access Point's callers,
+    /// here or through a payment gateway.
+    pub fn charges_callers(&self) -> bool {
+        match self
+            .target
+            .payment_policy
+            .as_ref()
+        {
+            Some(crate::config::agent_surface::PaymentPolicy::X402(config)) => config.enabled,
+            Some(crate::config::agent_surface::PaymentPolicy::Mpp(config)) => config.enabled,
+            Some(crate::config::agent_surface::PaymentPolicy::AgentPay(_)) => true,
+            None => false,
+        }
+    }
+
+    /// The target's agent-pay payment policy, if any.
     #[inline]
-    pub fn mpp_auto_pay_max_amount(&self) -> Option<&str> {
+    pub fn agent_pay_policy(&self) -> Option<&crate::config::agent_surface::AgentPayPolicy> {
+        match self
+            .target
+            .payment_policy
+            .as_ref()?
+        {
+            crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(policy),
+            _ => None,
+        }
+    }
+
+    /// Gateways the `agent_pay` policies of the Target and of every variant name.
+    pub fn payment_gateway_ids(&self) -> Vec<&str> {
+        let variant_policies = self
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .target
+                    .as_ref()?
+                    .payment_policy
+                    .as_ref()
+            });
         self.target
-            .mpp_auto_pay_max_amount
-            .as_deref()
+            .payment_policy
+            .iter()
+            .chain(variant_policies)
+            .filter_map(|policy| match policy {
+                crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(
+                    policy
+                        .payment_gateway_id
+                        .trim(),
+                ),
+                _ => None,
+            })
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    /// Gateways reached over `fabric://` by the Target, the Transit Points and
+    /// every variant's overrides of them.
+    pub fn fabric_gateway_ids(&self) -> Vec<&str> {
+        let variant_targets = self
+            .variants
+            .iter()
+            .filter_map(|variant| {
+                variant
+                    .overrides
+                    .target
+                    .as_ref()?
+                    .endpoint
+                    .as_deref()
+            });
+        let transit_points = self
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .chain(
+                self.variants
+                    .iter()
+                    .filter_map(|variant| {
+                        variant
+                            .overrides
+                            .transit
+                            .as_ref()?
+                            .points
+                            .as_ref()
+                    })
+                    .flatten(),
+            )
+            .map(|point| point.target_endpoint.as_str());
+        std::iter::once(self.target.endpoint.as_str())
+            .chain(variant_targets)
+            .chain(transit_points)
+            .filter_map(|endpoint| {
+                endpoint
+                    .strip_prefix("fabric://")?
+                    .split('/')
+                    .next()
+                    .filter(|id| !id.is_empty())
+            })
+            .collect()
+    }
+
+    /// Whether the target carries an enabled local x402 or MPP policy, which
+    /// is no longer supported. Requests to such a surface fail closed.
+    #[inline]
+    pub fn payment_policy_unsupported(&self) -> bool {
+        self.target
+            .payment_policy
+            .as_ref()
+            .is_some_and(crate::config::agent_surface::PaymentPolicy::is_unsupported_legacy)
     }
 
     // ── Access-point shorthands ─────────────────────────────────────────────
@@ -466,6 +923,28 @@ impl AgentSurface {
             .workload_binding
             .as_ref()
             .filter(|wb| wb.enabled)
+    }
+
+    /// Whether a request to the Target carries a presentation of the agent in
+    /// its body: an identity VP ([`Self::inject_identity_vp`]), a workload
+    /// binding, or the surface's DID injected `protocol_native`.
+    pub fn presents_the_agent_to_the_target(&self) -> bool {
+        self.inject_identity_vp()
+            || self
+                .target_workload_binding()
+                .is_some()
+            || self
+                .access_point
+                .didwebvh_identity
+                .as_ref()
+                .is_some_and(|did| did.injection_mode == super::agent_surface::DidInjectionMode::ProtocolNative)
+    }
+
+    /// Whether the Target is sent operator-configured custom metadata, in the
+    /// request body or in `X-Gateway-*` headers.
+    pub fn injects_custom_metadata(&self) -> bool {
+        self.custom_metadata()
+            .is_some_and(|metadata| metadata.enabled)
     }
 
     // ── Transit shorthands ──────────────────────────────────────────────────
@@ -591,6 +1070,53 @@ impl AgentSurface {
             }
         }
 
+        if transit
+            .shared
+            .source_auth
+            .is_some()
+        {
+            errors.push(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string());
+        }
+        let variant_points = self
+            .variants
+            .iter()
+            .flat_map(|variant| {
+                variant
+                    .overrides
+                    .transit
+                    .iter()
+                    .filter_map(|transit| transit.points.as_ref())
+                    .flatten()
+                    .map(|tp| (format!("variant '{}': ", variant.alias), tp))
+            });
+        for (prefix, tp) in transit
+            .points
+            .iter()
+            .map(|tp| (String::new(), tp))
+            .chain(variant_points)
+        {
+            if let Some(reason) = tp.unenforceable_caller_authentication() {
+                errors.push(format!("{prefix}{reason}; every request to it is refused"));
+            } else if let Err(error) = tp.validate_caller_authentication() {
+                errors.push(format!("{prefix}{error}"));
+            }
+        }
+        for variant in &self.variants {
+            if variant
+                .overrides
+                .transit
+                .as_ref()
+                .and_then(|transit| transit.shared.as_ref())
+                .is_some_and(|shared| shared.source_auth.is_some())
+            {
+                errors.push(format!(
+                    "variant '{}': {}",
+                    variant.alias,
+                    crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED
+                ));
+            }
+        }
+
         errors
     }
 
@@ -635,12 +1161,14 @@ impl AgentSurface {
     }
 }
 
+/// A Transit Point's binding as an outbound credential binding, or `None`
+/// for a `consent_mode = external` binding, which no agent-keyed path serves.
 fn transit_credential_binding(
     cred: &super::agent_surface::TransitCredentials
-) -> crate::config::types::OutboundCredentialBinding {
+) -> Option<crate::config::types::OutboundCredentialBinding> {
     use crate::config::agent_surface as surface;
-    use crate::config::types::{ConsentMode, CredentialInjection, CredentialRequirement, ElicitFallback};
-    crate::config::types::OutboundCredentialBinding {
+    use crate::config::types::{ConsentMode, CredentialRequirement, ElicitFallback};
+    Some(crate::config::types::OutboundCredentialBinding {
         credential_provider_id: cred
             .credential_provider_id
             .clone(),
@@ -650,20 +1178,32 @@ fn transit_credential_binding(
             surface::ConsentMode::OnDemand => ConsentMode::OnDemand,
             surface::ConsentMode::PreAuthorize => ConsentMode::PreAuthorize,
             surface::ConsentMode::Elicit => ConsentMode::Elicit,
+            surface::ConsentMode::External => return None,
         },
-        inject_as: match &cred.inject_as {
-            surface::CredentialInjection::BearerHeader => CredentialInjection::BearerHeader,
-            surface::CredentialInjection::CustomHeader { name, format } => CredentialInjection::CustomHeader {
-                name: name.clone(),
-                format: format.clone(),
-            },
-            surface::CredentialInjection::Meta { field } => CredentialInjection::Meta { field: field.clone() },
-        },
+        inject_as: cred
+            .inject_as
+            .to_binding_injection(),
         elicit_timeout_secs: cred.elicit_timeout_secs,
         elicit_fallback: match cred.elicit_fallback {
             surface::ElicitFallback::OnDemand => ElicitFallback::OnDemand,
             surface::ElicitFallback::Fail => ElicitFallback::Fail,
         },
+        subject: None,
+    })
+}
+
+impl super::agent_surface::CredentialInjection {
+    /// The same injection as an outbound credential binding names it.
+    pub fn to_binding_injection(&self) -> crate::config::types::CredentialInjection {
+        use crate::config::types::CredentialInjection;
+        match self {
+            Self::BearerHeader => CredentialInjection::BearerHeader,
+            Self::CustomHeader { name, format } => CredentialInjection::CustomHeader {
+                name: name.clone(),
+                format: format.clone(),
+            },
+            Self::Meta { field } => CredentialInjection::Meta { field: field.clone() },
+        }
     }
 }
 
@@ -671,6 +1211,109 @@ fn transit_credential_binding(
 mod tests {
     use super::*;
     use crate::config::agent_surface::{AccessPoint, IdentityInjectionConfig, SurfaceStatus};
+
+    fn agent_pay(gateway_id: &str) -> crate::config::agent_surface::PaymentPolicy {
+        serde_json::from_value(serde_json::json!({
+            "type": "agent_pay",
+            "payment_gateway_id": gateway_id,
+            "payment_surface_id": "pay-1",
+        }))
+        .unwrap()
+    }
+
+    fn variant(overrides: serde_json::Value) -> crate::config::agent_surface_variants::SurfaceVariant {
+        serde_json::from_value(serde_json::json!({
+            "id": "v-1",
+            "alias": "pro",
+            "name": "Pro",
+            "overrides": overrides,
+        }))
+        .unwrap()
+    }
+
+    fn transit(endpoints: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "points": endpoints
+                .iter()
+                .enumerate()
+                .map(|(i, endpoint)| serde_json::json!({"alias": format!("tp-{i}"), "target_endpoint": endpoint}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn payment_gateway_ids_come_from_the_target_and_every_variant() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        assert!(
+            s.payment_gateway_ids()
+                .is_empty()
+        );
+        s.target.payment_policy = Some(agent_pay("pay-gw"));
+        s.variants.push(variant(
+            serde_json::json!({"target": {"payment_policy": serde_json::to_value(agent_pay("pay-gw-2")).unwrap()}}),
+        ));
+        s.variants.push(variant(
+            serde_json::json!({"target": {"payment_policy": serde_json::to_value(agent_pay(" ")).unwrap()}}),
+        ));
+        assert_eq!(s.payment_gateway_ids(), vec!["pay-gw", "pay-gw-2"]);
+    }
+
+    #[test]
+    fn fabric_gateway_ids_come_from_targets_and_transit_points() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        s.target.endpoint = "https://upstream.example/mcp".to_string();
+        assert!(
+            s.fabric_gateway_ids()
+                .is_empty()
+        );
+        s.target.endpoint = "fabric://gw-target/surface".to_string();
+        s.transit = Some(serde_json::from_value(transit(&["fabric://gw-transit/s", "https://x.example"])).unwrap());
+        s.variants
+            .push(variant(serde_json::json!({
+                "target": {"endpoint": "fabric://gw-variant/s"},
+                "transit": transit(&["fabric://gw-variant-transit/s", "fabric:///nothing"]),
+            })));
+        assert_eq!(s.fabric_gateway_ids(), vec!["gw-target", "gw-variant", "gw-transit", "gw-variant-transit"]);
+    }
+
+    fn surface_with_methods(methods: serde_json::Value) -> AgentSurface {
+        let mut surface = surface(SurfaceProtocol::A2a);
+        surface
+            .access_point
+            .caller_authentication =
+            Some(serde_json::from_value(serde_json::json!({ "methods": methods })).expect("caller authentication"));
+        surface
+    }
+
+    #[test]
+    fn did_auth_config_is_found_at_any_position() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "did_auth", "extraction": {"source": "http_header", "field": "X-Session-Token"}}
+        ]));
+        assert!(
+            surface
+                .did_auth_config()
+                .is_some()
+        );
+        assert!(
+            surface_with_methods(serde_json::json!([]))
+                .did_auth_config()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn every_method_header_is_a_source_credential_header() {
+        let surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []},
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"},
+            {"type": "mtls", "trust": {"type": "pinned", "certificate_ids": ["c1"]}, "identity_binding": {"type": "fingerprint"}}
+        ]));
+        assert_eq!(surface.source_credential_headers(), ["Authorization", "X-API-Key"]);
+        assert!(!surface_with_methods(serde_json::json!([])).has_source_auth());
+        assert!(surface.has_source_auth());
+    }
 
     fn surface(protocol: SurfaceProtocol) -> AgentSurface {
         AgentSurface {
@@ -705,6 +1348,7 @@ mod tests {
                 didwebvh_identity: None,
                 terminate_trace_id: false,
                 a2a: None,
+                public: None,
             },
             target: Target {
                 endpoint: "https://upstream:9000".to_string(),
@@ -728,6 +1372,7 @@ mod tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -739,6 +1384,8 @@ mod tests {
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
             signing: None,
+            trust_check_split: false,
+            transit_point_source_auth: false,
         }
     }
 
@@ -863,6 +1510,33 @@ mod tests {
     }
 
     #[test]
+    fn has_managed_identity_reads_the_target_and_every_transit_point() {
+        let mut point: crate::config::agent_surface::TransitPoint =
+            serde_json::from_value(serde_json::json!({"alias": "out", "target_endpoint": "https://out.example"}))
+                .unwrap();
+        let mut s = surface(SurfaceProtocol::A2a);
+        s.transit = Some(serde_json::from_value(serde_json::json!({"points": [point.clone()]})).unwrap());
+        assert!(!s.has_managed_identity());
+
+        point.managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromMtls {
+            certificate_id: "cert".to_string(),
+        });
+        s.transit = Some(serde_json::from_value(serde_json::json!({"points": [point]})).unwrap());
+        assert!(s.has_managed_identity());
+
+        let mut target_only = surface(SurfaceProtocol::A2a);
+        target_only
+            .target
+            .identity_injection
+            .identity_type = Some("from_jwt_claim".to_string());
+        assert!(target_only.has_managed_identity());
+
+        let mut a2a_proxy = surface(SurfaceProtocol::A2a);
+        a2a_proxy.target.endpoint = "a2a-proxy://worker".to_string();
+        assert!(a2a_proxy.has_managed_identity());
+    }
+
+    #[test]
     fn transit_point_outbound_credentials_use_only_that_points_own_credentials() {
         let point = |value: serde_json::Value| -> crate::config::agent_surface::TransitPoint {
             serde_json::from_value(value).unwrap()
@@ -900,5 +1574,194 @@ mod tests {
             vec![serde_json::from_value(serde_json::json!({"credential_provider_id": "surface-provider"})).unwrap()];
         assert_eq!(providers(s.transit_point_outbound_credentials(&peer_with_own)), vec!["surface-provider"]);
         assert_eq!(providers(s.target_outbound_credentials()), vec!["surface-provider"]);
+        assert!(
+            s.target_external_credentials()
+                .is_none()
+        );
+    }
+
+    /// The Access Point Target's external consent binding is served by its
+    /// grant by binding only: no agent-keyed path, on the Target or a Transit
+    /// Point, is given it.
+    #[test]
+    fn the_access_point_targets_external_binding_reaches_no_agent_keyed_path() {
+        let mut s = surface(SurfaceProtocol::Mcp);
+        s.outbound_credentials = serde_json::from_value(serde_json::json!([
+            {"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner"},
+            {"credential_provider_id": "agent-keyed"}
+        ]))
+        .unwrap();
+        let point: crate::config::agent_surface::TransitPoint = serde_json::from_value(serde_json::json!({
+            "alias": "partner", "target_endpoint": "https://partner.example/mcp"}))
+        .unwrap();
+        let providers = |bindings: Vec<crate::config::types::OutboundCredentialBinding>| {
+            bindings
+                .into_iter()
+                .map(|binding| binding.credential_provider_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(providers(s.target_outbound_credentials()), vec!["agent-keyed"]);
+        assert_eq!(providers(s.transit_point_outbound_credentials(&point)), vec!["agent-keyed"]);
+        let external = s
+            .target_external_credentials()
+            .expect("the Target's external binding");
+        assert_eq!(external.credential_provider_id, "vendor");
+        assert_eq!(external.subject, Some(crate::config::agent_surface::GrantSubject::Owner));
+        assert!(s.has_agent_keyed_outbound_credentials());
+
+        s.outbound_credentials
+            .truncate(1);
+        assert!(
+            s.target_outbound_credentials()
+                .is_empty()
+        );
+        assert!(!s.has_agent_keyed_outbound_credentials());
+        assert_eq!(providers(s.outbound_credentials()), vec!["vendor"], "the display keeps every binding");
+    }
+
+    #[test]
+    fn validate_outbound_warns_about_transit_source_auth_set_by_a_variant() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surf-1", "name": "test", "status": "active",
+            "access_point": { "listen_address": "http://localhost:8080", "route": "/test", "protocol": "a2a" },
+            "target": { "endpoint": "http://localhost:9000" },
+            "transit": { "outbound_listen_address": "http://localhost:9001",
+                "points": [{ "alias": "partner", "target_endpoint": "http://localhost:9002" }] },
+            "variants": [
+                { "id": "v1", "alias": "staging", "name": "Staging", "enabled": true,
+                    "overrides": { "transit": { "shared": { "source_auth": {
+                        "type": "api_key",
+                        "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    } } } } },
+                { "id": "v2", "alias": "plain", "name": "Plain", "enabled": true,
+                    "overrides": { "transit": { "shared": { "sign_requests": true } } } }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            surface.validate_outbound(),
+            vec![format!("variant 'staging': {}", crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED)]
+        );
+    }
+
+    /// A view releases its Target's per-user grants to Fabric callers only when
+    /// its Target is an HTTP or HTTPS URL that sets the switch and its caller
+    /// authentication tells a partner's users apart: a JWT naming an audience
+    /// or a resource token, with an mTLS method beside one of them, and no
+    /// method that names every user alike. On any other Target, including one
+    /// written with an upper-case scheme or a leading space, which Fabric
+    /// receive would not dial through its pinned client, the view keeps its
+    /// grants per agent, as with the switch off.
+    #[test]
+    fn releases_target_grants_to_fabric_callers_needs_the_switch_and_callers_told_apart() {
+        use serde_json::json;
+        let jwt = |audiences: serde_json::Value| json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": audiences });
+        let api_key = json!({ "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "keys" });
+        let mtls = json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["c1"] },
+            "identity_binding": { "type": "fingerprint" } });
+        let mut resource_tokens = surface_with_methods(json!([mtls.clone()]));
+        resource_tokens.mcp_http = Some(
+            serde_json::from_value(json!({ "authorization": { "resource": "https://gateway.example/mcp" } })).unwrap(),
+        );
+
+        for (case, view, tells_users_apart) in [
+            ("a JWT naming an audience", surface_with_methods(json!([jwt(json!(["api://agent"]))])), true),
+            ("a resource token beside mTLS", resource_tokens, true),
+            (
+                "mTLS beside a JWT naming an audience",
+                surface_with_methods(json!([mtls.clone(), jwt(json!(["api://agent"]))])),
+                true,
+            ),
+            ("an API key", surface_with_methods(json!([api_key.clone()])), false),
+            (
+                "an API Key Provider key",
+                surface_with_methods(json!([{ "type": "api_key_provider", "agent_id": "keys",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" } }])),
+                false,
+            ),
+            (
+                "DID Auth",
+                surface_with_methods(
+                    json!([{ "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session-Token" } }]),
+                ),
+                false,
+            ),
+            ("a JWT naming no audience", surface_with_methods(json!([jwt(json!([]))])), false),
+            ("mTLS only", surface_with_methods(json!([mtls.clone()])), false),
+            (
+                "an API key beside a JWT naming an audience",
+                surface_with_methods(json!([jwt(json!(["api://agent"])), api_key])),
+                false,
+            ),
+            ("no caller authentication", surface(SurfaceProtocol::A2a), false),
+        ] {
+            for switch in [false, true] {
+                let mut view = view.clone();
+                view.target
+                    .delegated_credentials_for_fabric_callers = switch;
+                assert_eq!(
+                    view.releases_target_grants_to_fabric_callers(),
+                    switch && tells_users_apart,
+                    "{case}, switch {switch}"
+                );
+            }
+        }
+
+        for (endpoint, releases) in [
+            ("fabric://peer-gateway/peer-surface", false),
+            ("proxy://tools", false),
+            ("a2a-proxy://worker", false),
+            ("HTTPS://upstream:9000", false),
+            ("HTTP://upstream:9000", false),
+            (" https://upstream:9000", false),
+            ("http://upstream:9000", true),
+            ("https://upstream:9000", true),
+        ] {
+            let mut view = surface_with_methods(json!([jwt(json!(["api://agent"]))]));
+            view.target
+                .delegated_credentials_for_fabric_callers = true;
+            view.target.endpoint = endpoint.to_string();
+            assert_eq!(view.target_is_http_url(), releases, "{endpoint}");
+            assert_eq!(view.releases_target_grants_to_fabric_callers(), releases, "{endpoint}");
+            assert_eq!(
+                view.target_grant_agent_did(Some("did:web:planner.example")),
+                if releases {
+                    "surf-1"
+                } else {
+                    "did:web:planner.example"
+                },
+                "{endpoint}"
+            );
+        }
+    }
+
+    /// On a view that releases its Target's grants to Fabric callers the agent
+    /// half of their key is the surface, whatever agent a caller names;
+    /// otherwise it is the agent a direct caller names, else the surface.
+    #[test]
+    fn target_grant_agent_did_is_the_surface_once_the_target_releases_grants_to_partners() {
+        let mut view = surface_with_methods(serde_json::json!([{ "type": "jwt_bearer",
+            "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] }]));
+        assert_eq!(view.target_grant_agent_did(Some("did:web:planner.example")), "did:web:planner.example");
+        assert_eq!(view.target_grant_agent_did(None), "surf-1");
+
+        view.target
+            .delegated_credentials_for_fabric_callers = true;
+        assert_eq!(view.target_grant_agent_did(Some("did:web:planner.example")), "surf-1");
+        assert_eq!(view.target_grant_agent_did(None), "surf-1");
+
+        let mut shared_key = surface_with_methods(serde_json::json!([{ "type": "api_key",
+            "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "keys" }]));
+        shared_key
+            .target
+            .delegated_credentials_for_fabric_callers = true;
+        assert_eq!(
+            shared_key.target_grant_agent_did(Some("did:web:planner.example")),
+            "did:web:planner.example",
+            "a view that cannot release grants to partners keeps them per agent"
+        );
     }
 }

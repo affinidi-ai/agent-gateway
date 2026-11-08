@@ -113,6 +113,9 @@ fn summary(
         "user.deleted" => "User ${USERNAME} was deleted",
         "user.login" => "User ${USERNAME} logged in",
         "user.accessed" => "User ${USERNAME}'s profile was viewed",
+        "connection_point.created" => "Connection point ${CP_NAME} was created",
+        "connection_point.updated" => "Connection point ${CP_NAME} was updated",
+        "connection_point.deleted" => "Connection point ${CP_NAME} was deleted",
         "connection_point.connected" => "${FROM_DID} connected through connection point ${CP_NAME}",
         "x402.verification.failed" => {
             "x402 payment ${TX_HASH} on surface ${SURFACE_ID} failed verification: ${ERROR_MESSAGE}"
@@ -131,6 +134,16 @@ fn summary(
             "MPP payment ${REFERENCE} for ${RESOURCE_URL} on surface ${SURFACE_NAME} was verified"
         }
         "mpp.challenge.issued" => "MPP payment requested for ${RESOURCE_URL} on surface ${SURFACE_NAME}",
+        "payment.challenge_issued" => "Payment requested for ${RESOURCE} on surface ${SURFACE_ID}",
+        "payment.paid" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was accepted",
+        "payment.held" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was held for review (case ${CASE_ID})",
+        "payment.rejected" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} was rejected: ${REASON}",
+        "payment.unconfirmed" => "Payment for ${RESOURCE} on surface ${SURFACE_ID} is unconfirmed: ${REASON}",
+        "payment.unavailable" => "Payment gateway unavailable for ${RESOURCE} on surface ${SURFACE_ID}: ${REASON}",
+        "payment.authorized" => "Funds for ${RESOURCE} on surface ${SURFACE_ID} are held until delivery",
+        "payment.voided" => "Held funds for ${RESOURCE} on surface ${SURFACE_ID} were released: ${REASON}",
+        "payment.capture_failed" => "Capturing held funds for ${RESOURCE} on surface ${SURFACE_ID} failed: ${REASON}",
+        "payment.reconcile_failed" => "A payment for ${RESOURCE} on surface ${SURFACE_ID} was not settled: ${REASON}",
         _ => return event.name.clone(),
     };
     render(&serde_json::Value::String(template.to_string()), values, Escaping::None, false)
@@ -283,6 +296,19 @@ mod tests {
         );
 
         assert_eq!(values["EVENT_SUMMARY"], "did:peer:partner connected through connection point Orders");
+    }
+
+    #[test]
+    fn a_connection_point_change_summary_names_the_connection_point() {
+        for (id, verb) in [
+            ("connection_point.created", "created"),
+            ("connection_point.updated", "updated"),
+            ("connection_point.deleted", "deleted"),
+        ] {
+            let values = event_values(event(id), trigger(&[("CP_NAME", "Orders")]), None);
+
+            assert_eq!(values["EVENT_SUMMARY"], format!("Connection point Orders was {verb}"));
+        }
     }
 
     #[test]

@@ -83,10 +83,10 @@ pub fn set_server_mode(mode: ServerMode) {
     // Bump the generation on *every* transition so a later readiness mark can be matched
     // to the exact activation window it was issued for (see `mark_activation_ready`).
     let previous = SERVE_STATE
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |packed| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |packed| {
             Some(pack(unpack_generation(packed).wrapping_add(1), state))
         })
-        .expect("fetch_update closure always returns Some");
+        .expect("try_update closure always returns Some");
     let generation = unpack_generation(previous).wrapping_add(1);
     let _ = mode_change_tx().send(ModeChange { mode, generation });
 }

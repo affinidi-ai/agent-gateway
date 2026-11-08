@@ -119,6 +119,7 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
               variant="primary"
               size="sm"
               className="shadow-sm"
+              data-testid="sts-clients-add-button"
               onClick={() => navigate('/sts-clients/new')}
               iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
             >
@@ -197,6 +198,7 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
                 <tbody>
                   {filtered.map(client => (
                     <tr
+                      data-testid={`sts-client-row-${client.id}`}
                       key={client.id}
                       onClick={() => canEdit && navigate(`/sts-clients/${client.id}`)}
                       style={{ cursor: canEdit ? 'pointer' : 'default' }}
@@ -254,6 +256,7 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
                             variant="outline-primary"
                             size="sm"
                             className="me-1"
+                            data-testid={`sts-client-edit-button-${client.id}`}
                             onClick={() => navigate(`/sts-clients/${client.id}`)}
                             aria-label={`Edit ${client.name}`}
                             iconStart={<i className="fas fa-edit" aria-hidden="true" />}
@@ -263,6 +266,7 @@ const StsClientsTab: React.FC<StsClientsTabProps> = ({
                           <AppButton
                             variant="outline-danger"
                             size="sm"
+                            data-testid={`sts-client-delete-button-${client.id}`}
                             onClick={() => handleDelete(client)}
                             disabled={deletingId === client.id}
                             aria-label={`Delete ${client.name}`}

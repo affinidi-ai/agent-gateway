@@ -144,7 +144,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
   const def = registry.get(node.type);
   const Panel = def?.ConfigPanel;
   const ctx = buildSurfaceContext(protocol, allNodes, base);
-  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx);
+  const warnings = registry.getDependencyWarnings(node.type, node.config, ctx, node);
   const validationErrors = registry.getValidationErrors(node.type, node.config);
   const label = defLabel(node.type);
   const isFullscreenSurface = def?.configSurface === 'fullscreen';
@@ -205,7 +205,7 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
         !node.configured &&
         (() => {
           if (def?.suppressIncompleteBanner?.(node.config)) return null;
-          const reason = getIncompleteReason(node.type, node.config);
+          const reason = getIncompleteReason(node.type, node.config, undefined, node);
           return reason ? (
             <div className="config-incomplete-banner">
               <i className="fas fa-exclamation-circle me-2" />
@@ -214,22 +214,23 @@ const NodeConfigPanel: React.FC<NodeConfigPanelProps> = ({
           ) : null;
         })()}
 
-      {warnings.length > 0 && shouldShowDependencyWarnings(node.type, hasAttemptedSave) && (
-        <div className="config-section">
-          {warnings.map((w, i) => (
-            <div
-              key={i}
-              className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-1 px-2 mb-1`}
-              style={{ fontSize: '11px' }}
-            >
-              <i
-                className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-1`}
-              />
-              {w.message}
-            </div>
-          ))}
-        </div>
-      )}
+      {warnings.length > 0 &&
+        shouldShowDependencyWarnings(node.type, hasAttemptedSave, node.config) && (
+          <div className="config-section">
+            {warnings.map((w, i) => (
+              <div
+                key={i}
+                className={`alert alert-${w.severity === 'error' ? 'danger' : 'warning'} py-1 px-2 mb-1`}
+                style={{ fontSize: '11px' }}
+              >
+                <i
+                  className={`fas fa-${w.severity === 'error' ? 'times-circle' : 'exclamation-triangle'} me-1`}
+                />
+                {w.message}
+              </div>
+            ))}
+          </div>
+        )}
 
       {node.type !== 'surface' && (
         <div className="config-section">

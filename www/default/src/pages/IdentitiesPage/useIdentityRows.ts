@@ -1,13 +1,12 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
+import { matchesRecorderFilter, type RecorderFilter } from './recorderFilter';
+import { isSharedManagedDid } from './sharedManagedDid';
 
 type SurfaceRef = Pick<
   Identity,
-  'surface_id' | 'surface_name' | 'channel_name' | 'channel_config_id'
+  'surface_id' | 'surface_name' | 'channel_name' | 'channel_config_id' | 'origin'
 >;
-
-const isUnnamed = (identity: Pick<Identity, 'display_name' | 'display_name_pending'>): boolean =>
-  !identity.display_name && identity.display_name_pending !== true;
 
 export interface SurfaceLink {
   id: string;
@@ -18,22 +17,23 @@ interface UseIdentityRowsOptions<T extends Identity> {
   identities: T[];
   channels?: Array<{ config_id: string; name: string }>;
   searchTerm: string;
-  showUnnamedOnly: boolean;
+  recorderFilter?: RecorderFilter;
 }
 
 export interface IdentityRowsView<T extends Identity> {
   filteredIdentities: T[];
   hasNamingMetadata: boolean;
-  unnamedCount: number;
+  hasRecorderStatus: boolean;
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
+  surfaceLinksFor: (identity: SurfaceRef & Pick<Identity, 'managed_surfaces'>) => SurfaceLink[];
 }
 
 export function useIdentityRows<T extends Identity>({
   identities,
   channels,
   searchTerm,
-  showUnnamedOnly,
+  recorderFilter = 'all',
 }: UseIdentityRowsOptions<T>): IdentityRowsView<T> {
   const hasNamingMetadata = useMemo(
     () =>
@@ -41,8 +41,13 @@ export function useIdentityRows<T extends Identity>({
         identity =>
           identity.origin !== undefined ||
           identity.display_name !== undefined ||
-          identity.name_conflict !== undefined
+          identity.managed_surfaces !== undefined
       ),
+    [identities]
+  );
+
+  const hasRecorderStatus = useMemo(
+    () => identities.some(identity => Boolean(identity.trust_recorder)),
     [identities]
   );
 
@@ -61,7 +66,7 @@ export function useIdentityRows<T extends Identity>({
           identity.surface_id;
         return { id: identity.surface_id, name };
       }
-      if (identity.channel_name && identity.channel_config_id) {
+      if (identity.origin !== 'managed' && identity.channel_name && identity.channel_config_id) {
         return { id: identity.channel_config_id, name: identity.channel_name };
       }
       return null;
@@ -69,30 +74,45 @@ export function useIdentityRows<T extends Identity>({
     [liveSurfaceNames]
   );
 
-  const unnamedCount = useMemo(() => identities.filter(isUnnamed).length, [identities]);
+  const surfaceLinksFor = useCallback(
+    (identity: SurfaceRef & Pick<Identity, 'managed_surfaces'>): SurfaceLink[] => {
+      if (isSharedManagedDid(identity)) {
+        return (identity.managed_surfaces ?? []).map(surface => ({
+          id: surface.surface_id,
+          name:
+            liveSurfaceNames.get(surface.surface_id) || surface.surface_name || surface.surface_id,
+        }));
+      }
+      const link = surfaceLinkFor(identity);
+      return link ? [link] : [];
+    },
+    [liveSurfaceNames, surfaceLinkFor]
+  );
 
   const filteredIdentities = useMemo(() => {
     const searchLower = searchTerm.trim().toLowerCase();
     return identities.filter(identity => {
-      if (hasNamingMetadata && showUnnamedOnly && !isUnnamed(identity)) return false;
+      if (hasRecorderStatus && !matchesRecorderFilter(identity, recorderFilter)) return false;
       if (!searchLower) return true;
       return [
         identity.name,
         identity.did,
-        identity.channel_name,
+        identity.origin === 'managed' ? undefined : identity.channel_name,
         identity.identity_hash,
         identity.display_name,
         identity.surface_name,
         identity.credential_principal?.name,
+        ...(identity.managed_surfaces ?? []).map(surface => surface.surface_name),
       ].some(value => typeof value === 'string' && value.toLowerCase().includes(searchLower));
     });
-  }, [identities, searchTerm, hasNamingMetadata, showUnnamedOnly]);
+  }, [identities, searchTerm, hasRecorderStatus, recorderFilter]);
 
   return {
     filteredIdentities,
     hasNamingMetadata,
-    unnamedCount,
+    hasRecorderStatus,
     liveSurfaceNames,
     surfaceLinkFor,
+    surfaceLinksFor,
   };
 }

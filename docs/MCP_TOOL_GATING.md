@@ -27,8 +27,11 @@ Validate every MCP POST on direct Access Point, MCP Transit Point, standalone MC
 Proxy and Fabric receive paths, including empty bodies. Wire validation runs before generic method-prefix
 protocol classification, so modern `tasks/*` requests receive MCP errors instead
 of being classified as A2A. The generic family guard still applies to
-legacy/no-signal traffic. A single `MCP-Protocol-Version: 2024-11-05` header
-alone stays legacy; modern body metadata or mirrored method/name headers still
+legacy/no-signal traffic. A single `MCP-Protocol-Version` header naming a
+session revision (`2024-11-05`, `2025-03-26`, `2025-06-18` or `2025-11-25`)
+stays legacy when modern body metadata is absent, even with mirrored
+`Mcp-Method` or `Mcp-Name` headers; those headers are still validated. Without
+a session-revision header, modern body metadata or mirrored method/name headers
 select validation, and duplicate version headers are rejected. Decode `Mcp-Name`
 only when both Base64 sentinel markers are present, using checked extraction so
 overlapping markers return `HeaderMismatch` rather than panicking.
@@ -47,9 +50,10 @@ method returns `400`.
 Validate every supplied `Mcp-Name` before version rejection, including methods
 without a mirrored name source. Well-formed extra headers are tolerated;
 malformed values return HTTP `400` / `HeaderMismatch` (`-32020`). Modern
-per-request metadata declaring the legacy `2024-11-05` version returns HTTP `400`
-/ `Invalid params` (`-32602`) with a mixed-era diagnostic, not an
-unsupported-version response listing that same version as supported. Actual
+per-request metadata declaring any session revision, such as `2024-11-05` or
+`2025-06-18`, returns HTTP `400` / `Invalid params` (`-32602`) with a mixed-era
+diagnostic, not an unsupported-version response listing that same version as
+supported. Actual
 header/body version mismatches still return `HeaderMismatch`.
 
 ## Firewall
@@ -114,7 +118,31 @@ Every gate fails closed on a `tools/call` whose tool name it cannot read (no
 `fabric://` send leg, the `proxy://` MCP proxy path, Fabric receive and each
 Transit Point deny it and record a deny decision, rather than checking an empty
 name that a deny-pattern gate would pass. A surface or Transit Point without
-gating is unaffected.
+gating is unaffected. A Transit Point whose configuration sets gating that is not
+in force, because it was evicted, as when its surface is deleted while the
+request is in flight, or never compiled, refuses every `tools/call` and answers
+`tools/list` with the fail-closed empty list below.
+
+An MCP Transit Point forwards with `Accept-Encoding: identity` in place of the managed agent's
+value, so its target answers uncompressed: the gateway does not decompress, and a `tools/list`
+filter or a response check reads the body as it is sent. An answer whose `Content-Encoding`
+names anything but `identity` all the same is refused with `502`, since none of it could be
+checked.
+
+Per-Transit-Point gating is compiled from the surface's own Transit Points only,
+so a variant's Transit Point is gated by the surface's Transit Point of the same
+alias, and a variant cannot change it. The admin API refuses with `400` a variant
+Transit Point that sets `mcp_tool_gating` other than that of the surface's Transit
+Point of the same alias, or that sets any where the surface has no Transit Point of
+that alias. Its `policy` and `response_policy` follow the same rule (see
+[`POLICY.md`](POLICY.md#policy-change-audit)). At request time, a stored variant whose
+Transit Point sets a non-empty `mcp_tool_gating`, or a `policy` or `response_policy`,
+other than that of the surface's Transit Point of the same alias has every request
+through that Transit Point refused with `403` before the target is called: a JSON-RPC
+error (`-32603`) carrying the request's id on an MCP Transit Point, an
+`application/problem+json` body otherwise. A variant Transit Point that leaves these
+out, or restates the surface's, is enforced with the surface Transit Point's gating
+and policies. Set new gating on the surface's Transit Point.
 
 - **SSE / Streamable-HTTP note**: when the upstream MCP server answers
   `tools/list` with `text/event-stream` (SSE), `src/proxy/handler.rs` buffers
@@ -144,7 +172,16 @@ gating is unaffected.
   `tools/call` toward the TP (→ `TransitMcpToolGated`, 403) and
   `filter_transit_mcp_tools_list` hides denied tools from the TP's `tools/list`
   response — both guarded on `virtual_channel.protocol == Mcp`, so a tool the
-  managed agent can't see through a TP it also can't call. The per-TP
+  managed agent can't see through a TP it also can't call. Their condition
+  input is the TP's own policy input (`build_outbound_policy_input`), so a
+  condition can read `input.transit.caller` (the end user the transit token
+  names) and `input.transit.client` (the principal the TP authenticated); see
+  [Caller in Transit Point policy input](POLICY.md#caller-in-transit-point-policy-input).
+  Without a transit token the caller is `anonymous`, so gate on
+  `input.transit.caller.verified` rather than its negation, as in a gate that
+  hides `admin_*` unless the caller is verified (condition `default allow :=
+  true`, `allow := false if input.transit.caller.verified`). A surface-wide
+  `target.mcp_tool_gating` condition has no `input.transit`. The per-TP
   `tools/list` filter handles the same SSE framing: when a TP answers
   `tools/list` as `text/event-stream`, `filter_transit_mcp_tools_list` extracts
   the last JSON-RPC frame (`mcp::sse_transport::extract_last_json_rpc_from_sse_bytes`),

@@ -246,12 +246,6 @@ describe('nodesFromPayload — ap-ma slot-driven hydration', () => {
       },
       target: {
         endpoint: 'https://protected-agent.example.com/a2a',
-        trust_check_list: [
-          {
-            id: 'responder-recognition',
-            query_type: 'recognition',
-          },
-        ],
       },
       identity_slots: {
         protected: { type: 'static', did: 'did:example:protected-agent' },
@@ -263,6 +257,12 @@ describe('nodesFromPayload — ap-ma slot-driven hydration', () => {
             protocol: 'a2a',
             target_endpoint: 'https://gw2.example.com/a2a',
             policy: { policy_definition_id: 'gw1-outbound-policy' },
+            trust_check_list: [
+              {
+                id: 'responder-recognition',
+                query_type: 'recognition',
+              },
+            ],
             managed_identity: { type: 'static', did: 'did:example:requester-agent' },
             workload_binding: {
               enabled: true,
@@ -292,10 +292,10 @@ describe('nodesFromPayload — ap-ma slot-driven hydration', () => {
             slotId: 'response:trust-recorder',
           },
           {
-            id: 'trust-check-target',
+            id: 'trust-check-transit-point-a2a-1',
             type: 'trust-check',
-            parentId: 'target',
-            slotId: 'request:trust-check-target_trust_check_list',
+            parentId: 'transit-point-a2a-1',
+            slotId: 'request:trust-check-transit_points_trust_check_list',
           },
           {
             id: 'policy-transit-point-a2a-1',
@@ -357,10 +357,11 @@ describe('nodesFromPayload — ap-ma slot-driven hydration', () => {
         parentId: 'transit-point-a2a-1',
         slotId: 'request:policy',
       });
-      expect(nodes.find(node => node.id === 'trust-check-target')).toMatchObject({
-        parentId: 'target',
-        slotId: 'request:trust-check-target_trust_check_list',
+      expect(nodes.find(node => node.id === 'trust-check-transit-point-a2a-1')).toMatchObject({
+        parentId: 'transit-point-a2a-1',
+        slotId: 'request:trust-check-transit_points_trust_check_list',
       });
+      expect(nodes.some(node => node.id === 'trust-check-target')).toBe(false);
       expect(nodes.find(node => node.id === 'trust-recorder-target-response')).toMatchObject({
         parentId: 'target',
         slotId: 'response:trust-recorder',
@@ -389,8 +390,9 @@ describe('nodesFromPayload — ap-ma slot-driven hydration', () => {
       firstNodeOfType: (type: string) => reloaded.find(node => node.type === type),
     } as any);
     expect(roundTripped.access_point.trust_recorder.entries).toHaveLength(1);
-    expect(roundTripped.target.trust_check_list).toMatchObject(
-      runtimePayload.target.trust_check_list
+    expect(roundTripped.target.trust_check_list).toBeUndefined();
+    expect(roundTripped.transit.points[0].trust_check_list).toMatchObject(
+      runtimePayload.transit.points[0].trust_check_list
     );
     expect(roundTripped.identity_slots.protected).toBeDefined();
     expect(roundTripped.transit.points[0].policy.policy_definition_id).toBe('gw1-outbound-policy');

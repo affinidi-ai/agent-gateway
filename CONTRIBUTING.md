@@ -6,7 +6,7 @@ Affinidi Agent Gateway is a single Rust binary (`agent-gateway`) with a dashboar
 
 ## Development Requirements
 
-- Rust `1.95.0` or newer, 2024 Edition (the minimum is declared in [`Cargo.toml`](Cargo.toml))
+- Rust `1.99.1` or newer, 2024 Edition (the minimum is declared in [`Cargo.toml`](Cargo.toml))
 - Node.js and npm (to build and run the dashboard under `www/default/`)
 
 Runtime state uses an in-memory DashMap cache backed by filesystem JSON storage — there is no
@@ -31,11 +31,14 @@ has no public release effect, leave all category lists empty.
 
 ## Code Quality Expectations
 
+[`AGENTS.md`](AGENTS.md) is the canonical rule set and the working method, for people and agents
+alike. The list below is what a contribution has to show at review.
+
 1. Make the smallest correct change and leave the code better than you found it — DRY, no dead code,
    single-responsibility functions.
 2. Cover changes with tests, positive and negative cases, and assert returned values rather than
-   just the absence of errors. [`docs/development/TESTING.md`](docs/development/TESTING.md) sets out
-   the four layers and which one a given change belongs in.
+   just the absence of errors. [`docs/development/TESTING.md`](docs/development/TESTING.md)
+   sets out the layers and which one a given change belongs in.
 3. Avoid comments unless a linter requires them or the intent is genuinely non-obvious; code should
    be self-explanatory. Never leave implementation-history breadcrumbs (plan numbers, phases,
    requirement labels).
@@ -50,6 +53,7 @@ Run the local checks and make sure CI passes:
 2. `cargo fmt --all`
 3. `cargo test --no-fail-fast --all-targets --all-features`
 4. If `www/default/` files changed: `cd www/default && npx prettier --write src && npm run lint`
+5. If `tests/features/` or a step binding changed: `python3 scripts/bdd-gherkin.py --lint`
 
 For faster inner-loop feedback, use `cargo test --no-run` for a compile check and
 `cargo test --bin agent-gateway "<module name>"` to run a single module's tests.

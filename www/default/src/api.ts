@@ -6,23 +6,49 @@ import {
   CliLoginRequest,
   CreateAccessTokenRequest,
   DashboardStats,
+  GatewayInfo,
   Issuer,
   LogEntry,
+  PaymentLedgerPage,
+  PaymentLedgerQuery,
+  PaymentLedgerRow,
+  PaymentManifest,
   PredefinedTrustCheckQuery,
   Settings,
   Task,
   TruncateLogsResult,
   TruncateMetricsResult,
+  TrustRecorderStatus,
   TrustRegistry,
+  SurfacePaymentPolicy,
   UpdateAccessTokenRequest,
   UserSettingsOverrides,
 } from './types';
 
 // Agent Surface types
 import type { SurfaceStatus } from './generated/SurfaceStatus';
-import { formatApiError } from './utils/apiError';
+import { extractErrorCode, formatApiError } from './utils/apiError';
+import { parseWarningHeader } from './utils/warningHeader';
+import type { GatewayListItem } from './utils/gateways';
 
 const API_BASE = '/api/v1';
+const ADMIN_API_BASE = '/api/admin';
+
+/**
+ * A request the server answered with an error status. The message is the
+ * formatted error text, as before; `status` lets a caller tell, say, a 403
+ * from a transient failure without reading the message, and `code` is the
+ * machine-readable error code of the response body, when it has one.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly code?: string
+  ) {
+    super(message);
+  }
+}
 
 export const TERMS_ACCEPTANCE_REQUIRED_EVENT = 'terms-acceptance-required';
 export const TERMS_OPERATIONAL_FAILURE_EVENT = 'terms-operational-failure';
@@ -83,16 +109,7 @@ class SessionManager {
   }
 
   getSessionToken(): string | null {
-    // Try sessionStorage first
-    let token = sessionStorage.getItem('session_token');
-    if (token) return token;
-
-    token = this.getCookie('session_token');
-    if (token) {
-      // Restore to sessionStorage for future calls
-      sessionStorage.setItem('session_token', token);
-    }
-    return token;
+    return sessionStorage.getItem('session_token');
   }
 
   getAuthHeaders(): Record<string, string> {
@@ -120,7 +137,6 @@ class SessionManager {
     }
 
     sessionStorage.removeItem('session_token');
-    document.cookie = 'session_token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
   }
 
   expireSession(): void {
@@ -132,11 +148,19 @@ class SessionManager {
 export const sessionManager = new SessionManager();
 
 class APIClient {
-  private async request<T>(
+  private request<T>(
     endpoint: string,
-    options?: RequestInit & { timeout?: number }
+    options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
   ): Promise<T> {
-    const url = `${API_BASE}${endpoint}`;
+    return this.requestUrl<T>(`${API_BASE}${endpoint}`, options);
+  }
+
+  /** `request` for a full path outside `API_BASE`; a 401 expires the session either way. */
+  private async requestUrl<T>(
+    url: string,
+    options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
+  ): Promise<T> {
+    const { onResponse, ...fetchOptions } = options ?? {};
 
     // Setup timeout using AbortController
     const controller = new AbortController();
@@ -146,16 +170,17 @@ class APIClient {
 
     try {
       const response = await fetch(url, {
+        ...fetchOptions,
         headers: {
           'Content-Type': 'application/json',
           ...sessionManager.getAuthHeaders(),
           ...options?.headers,
         },
-        ...options,
         signal: controller.signal,
       });
 
       await signalTermsAcceptanceRequired(response);
+      onResponse?.(response);
 
       if (response.status === 401) {
         sessionManager.expireSession();
@@ -163,7 +188,7 @@ class APIClient {
       }
 
       if (!response.ok) {
-        console.error('[API] Request failed:', endpoint, response.status, response.statusText);
+        console.error('[API] Request failed:', url, response.status, response.statusText);
         let errorBody: string | null = null;
         try {
           errorBody = await response.text();
@@ -173,7 +198,11 @@ class APIClient {
         } catch (e) {
           console.error('[API] Could not read error response:', e);
         }
-        throw new Error(formatApiError(response.status, errorBody, response.statusText));
+        throw new ApiError(
+          formatApiError(response.status, errorBody, response.statusText),
+          response.status,
+          extractErrorCode(errorBody)
+        );
       }
 
       // Don't try to parse JSON for 204 No Content responses
@@ -519,26 +548,101 @@ class APIClient {
     return fromBackendSurface(s);
   }
 
-  async createSurface(surface: Partial<AgentSurface>): Promise<AgentSurface> {
+  /**
+   * `onWarnings` receives the messages of the response's `Warning: 299`
+   * headers, the gateway's non-blocking notes on what was just saved, such as
+   * a Transit Point that serves callers it does not authenticate on an address
+   * other hosts reach. It is called with an empty list when there are none.
+   */
+  async createSurface(
+    surface: Partial<AgentSurface>,
+    options?: { onWarnings?: (warnings: string[]) => void }
+  ): Promise<AgentSurface> {
     const s = await this.request<AgentSurface>('/surfaces', {
       method: 'POST',
       body: JSON.stringify(toBackendSurface(surface)),
+      onResponse: warningsReader(options?.onWarnings),
     });
     return fromBackendSurface(s);
   }
 
-  async updateSurface(surfaceId: string, surface: Partial<AgentSurface>): Promise<AgentSurface> {
+  async updateSurface(
+    surfaceId: string,
+    surface: Partial<AgentSurface>,
+    options?: { onWarnings?: (warnings: string[]) => void }
+  ): Promise<AgentSurface> {
     const s = await this.request<AgentSurface>(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'PUT',
       body: JSON.stringify(toBackendSurface(surface)),
+      onResponse: warningsReader(options?.onWarnings),
     });
     return fromBackendSurface(s);
+  }
+
+  async getSurfaceTrustRecorderStatus(surfaceId: string): Promise<TrustRecorderStatus | null> {
+    const response = await this.request<{ status: TrustRecorderStatus | null }>(
+      `/surfaces/${encodeURIComponent(surfaceId)}/trust-recorder-status`
+    );
+    return response.status ?? null;
   }
 
   async deleteSurface(surfaceId: string): Promise<void> {
     await this.request(`/surfaces/${encodeURIComponent(surfaceId)}`, {
       method: 'DELETE',
     });
+  }
+
+  async getPaymentManifest(
+    gatewayId: string,
+    surfaceId: string,
+    forceRefresh = false
+  ): Promise<PaymentManifest | null> {
+    const query = forceRefresh ? '?force_refresh=true' : '';
+    const data = await this.request<{ manifest?: PaymentManifest | null }>(
+      `/payment-gateways/${encodeURIComponent(gatewayId)}/surfaces/${encodeURIComponent(surfaceId)}/payment-manifest${query}`,
+      { timeout: 10000 }
+    );
+    return data?.manifest ?? null;
+  }
+
+  async listPaymentGateways(): Promise<GatewayListItem[]> {
+    const data = await this.request<GatewayListItem[]>('/payment-gateways');
+    return Array.isArray(data) ? data : [];
+  }
+
+  async getPaymentGatewayInfo(gatewayId: string): Promise<GatewayInfo> {
+    return this.request<GatewayInfo>(`/payment-gateways/${encodeURIComponent(gatewayId)}/info`, {
+      timeout: 15000,
+    });
+  }
+
+  /** Turns a connected peer into a payment gateway. */
+  async setGatewayPaymentRole(gatewayId: string): Promise<GatewayListItem> {
+    return this.request<GatewayListItem>(
+      `/gateways/${encodeURIComponent(gatewayId)}/payment-role`,
+      { method: 'POST' }
+    );
+  }
+
+  async listPayments(query: PaymentLedgerQuery = {}): Promise<PaymentLedgerPage> {
+    const params = new URLSearchParams();
+    if (query.surface_id) params.set('surface_id', query.surface_id);
+    if (query.outcome) params.set('outcome', query.outcome);
+    if (query.limit) params.set('limit', String(query.limit));
+    const qs = params.toString();
+    const data = await this.requestUrl<Partial<PaymentLedgerPage> | null>(
+      `${ADMIN_API_BASE}/payments${qs ? `?${qs}` : ''}`
+    );
+    return {
+      payments: Array.isArray(data?.payments) ? data.payments : [],
+      total: typeof data?.total === 'number' ? data.total : 0,
+    };
+  }
+
+  async getPayment(id: string): Promise<PaymentLedgerRow> {
+    return this.requestUrl<PaymentLedgerRow>(
+      `${ADMIN_API_BASE}/payments/${encodeURIComponent(id)}`
+    );
   }
 
   // Surface Templates
@@ -553,14 +657,14 @@ class APIClient {
   async createSurfaceTemplate(tpl: Partial<SurfaceTemplate>): Promise<SurfaceTemplate> {
     return this.request<SurfaceTemplate>('/surface-templates', {
       method: 'POST',
-      body: JSON.stringify(tpl),
+      body: JSON.stringify(templateWithTrustCheckSplit(tpl)),
     });
   }
 
   async updateSurfaceTemplate(id: string, tpl: Partial<SurfaceTemplate>): Promise<SurfaceTemplate> {
     return this.request<SurfaceTemplate>(`/surface-templates/${encodeURIComponent(id)}`, {
       method: 'PUT',
-      body: JSON.stringify(tpl),
+      body: JSON.stringify(templateWithTrustCheckSplit(tpl)),
     });
   }
 
@@ -1210,8 +1314,27 @@ export interface McpHttpConfig {
   };
 }
 
+/**
+ * RFC 9728 discovery an MCP Access Point publishes for its JWT Bearer caller
+ * authentication (`ProtectedResourceConfig` in `src/protocols/protected_resource.rs`).
+ */
+export interface ProtectedResourceConfig {
+  resource: string;
+  authorization_servers: string[];
+  scopes?: string[];
+}
+
+export interface CallerAuthentication {
+  methods: unknown[];
+  /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
+  protected_resource?: ProtectedResourceConfig | null;
+  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed`. */
+  on_failure?: 'reject' | 'continue';
+}
+
 export interface AgentSurface {
   surface_id: string;
+  tenant_id?: string | null;
   name: string;
   description: string;
   status: SurfaceStatus;
@@ -1232,6 +1355,9 @@ export interface AgentSurface {
     listen_address: string;
     route: string;
     protocol: 'a2a' | 'ap2' | 'mcp';
+    caller_authentication?: CallerAuthentication;
+    /** `true` admits callers without credentials. Absent on surfaces created before it existed. */
+    public?: boolean;
     caller_context?: { mode: 'required' | 'optional' | 'anonymous' };
     identity_resolution?: any;
     inbound_policy?: { policy_definition_id: string };
@@ -1252,7 +1378,7 @@ export interface AgentSurface {
     auth?: any;
     policy?: { policy_definition_id: string };
     response_policy?: { policy_definition_id: string };
-    payment_policy?: any;
+    payment_policy?: SurfacePaymentPolicy;
     mcp_tool_policies?: any[];
     /** MCP Tool Gating firewall (`{ gates: [...] }`). Passed through verbatim. */
     mcp_tool_gating?: { gates?: any[] };
@@ -1278,8 +1404,10 @@ export interface AgentSurface {
   };
   transit?: {
     points: TransitPoint[];
+    /** Deprecated and ignored by the gateway; the dashboard never sends it. */
     sign_requests?: boolean;
-    transit_token_mode?: 'embedded' | 'reference';
+    /** Only `embedded` exists; the gateway refuses `reference` on save. */
+    transit_token_mode?: 'embedded';
     rate_limit?: { requests: number; window_secs: number };
   };
   /**
@@ -1300,7 +1428,28 @@ export interface AgentSurface {
    */
   default_variant_id?: string;
   last_activity?: string | null;
+  /**
+   * Set by the gateway while a Transit Point, base or variant, authenticates its
+   * callers with `source_auth`. Derived on every save; a write's value is ignored.
+   */
+  transit_point_source_auth?: boolean;
+  /**
+   * Read-only, set by the gateway on every surface response. `not_ready`: the
+   * Access Point is closed (`public: false`) with no caller authentication, so
+   * callers get 503 until one is added or Public access is turned on.
+   */
+  access_point_status?: AccessPointStatus;
+
+  /** Non-blocking notes returned by a save; never sent back. */
+  warnings?: SurfaceSaveWarning[];
 }
+
+export interface SurfaceSaveWarning {
+  code: string;
+  message: string;
+}
+
+export type AccessPointStatus = 'ready' | 'not_ready';
 
 /**
  * A single surface variant. `overrides` is a partial surface delta
@@ -1329,10 +1478,15 @@ export interface TransitPoint {
   mcp_http?: McpHttpConfig;
   target_auth?: any;
   policy?: { policy_definition_id: string };
-  payment_policy?: any;
   networking?: any;
   identity_injection?: { inject_vp: boolean };
   transit_credentials?: any;
+  /** Whether callers must carry the surface's transit token. Default true. */
+  require_transit_token?: boolean;
+  /** Authenticates the Transit Point's callers: API key, API key provider, JWT bearer or mTLS. */
+  source_auth?: Record<string, unknown>;
+  /** The explicit marking that the Transit Point serves callers it does not authenticate. */
+  allow_unauthenticated_callers?: boolean;
   /** Per-Transit-Point MCP Tool Gating firewall (`{ gates: [...] }`, MCP only). */
   mcp_tool_gating?: { gates?: any[] };
 }
@@ -1346,8 +1500,149 @@ export interface TransitPoint {
 // the single chokepoint that bridges the two shapes so the UI never leaks
 // backend-specific names and the backend can evolve without churning the UI.
 
-function toBackendSurface(surface: Partial<AgentSurface>): any {
-  if (!surface || !surface.target) return surface;
+/**
+ * Marks a surface write as using per-Transit-Point Trust Check lists. The
+ * gateway migrates a write without it that carries `target.trust_check_list`
+ * as the old surface-wide shape.
+ */
+export function withTrustCheckSplit<T>(surface: T): T {
+  if (!surface || typeof surface !== 'object' || Array.isArray(surface)) return surface;
+  return { ...surface, trust_check_split: true };
+}
+
+/** A Surface Template write with `trust_check_split` set inside its surface. */
+export function templateWithTrustCheckSplit<T>(template: T): T {
+  if (!template || typeof template !== 'object' || Array.isArray(template)) return template;
+  const surface = (template as { surface?: unknown }).surface;
+  if (!surface || typeof surface !== 'object' || Array.isArray(surface)) return template;
+  return { ...template, surface: withTrustCheckSplit(surface) };
+}
+
+/** A response handler that passes its `Warning: 299` messages on, if anyone listens. */
+function warningsReader(
+  onWarnings: ((warnings: string[]) => void) | undefined
+): ((response: Response) => void) | undefined {
+  return onWarnings
+    ? response => onWarnings(parseWarningHeader(response.headers?.get('Warning')))
+    : undefined;
+}
+
+/**
+ * The gateway keeps `transit_point_source_auth` in step with the Transit
+ * Points it stores and ignores a value a write sends, so a write never carries
+ * the copy it read.
+ */
+function withoutDerivedMarks<T>(surface: T): T {
+  if (!surface || typeof surface !== 'object' || !('transit_point_source_auth' in surface)) {
+    return surface;
+  }
+  const { transit_point_source_auth: _derived, ...rest } = surface as Record<string, unknown>;
+  return rest as T;
+}
+
+function withoutManifestSnapshot<T>(policy: T): T {
+  if (!policy || typeof policy !== 'object' || !('manifest_snapshot' in policy)) return policy;
+  const { manifest_snapshot: _snapshot, ...rest } = policy as Record<string, unknown>;
+  return rest as T;
+}
+
+function withoutServerWrittenPayment<T extends { payment_policy?: SurfacePaymentPolicy }>(
+  target: T
+): T {
+  if (!target || typeof target !== 'object' || !target.payment_policy) return target;
+  return { ...target, payment_policy: withoutManifestSnapshot(target.payment_policy) };
+}
+
+interface CanvasNodeLike {
+  config?: Record<string, unknown>;
+}
+
+const holdsSnapshot = (config: unknown): boolean => {
+  if (!config || typeof config !== 'object') return false;
+  const { manifest_snapshot, payment_policy } = config as Record<string, unknown>;
+  return (
+    manifest_snapshot !== undefined ||
+    (!!payment_policy &&
+      typeof payment_policy === 'object' &&
+      'manifest_snapshot' in payment_policy)
+  );
+};
+
+/** A node holds the snapshot as its own config (Payment) or inside its copy of the target slice (Managed Agent). */
+function withoutSnapshotInNodeConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const rest = withoutManifestSnapshot(config);
+  return rest.payment_policy
+    ? { ...rest, payment_policy: withoutManifestSnapshot(rest.payment_policy) }
+    : rest;
+}
+
+/** The canvas blob is stored verbatim, so it must never carry the snapshot, and one stored earlier is not believed. */
+function withoutServerWrittenCanvas<T>(canvas: T): T {
+  const nodes = (canvas as { nodes?: unknown } | null | undefined)?.nodes;
+  if (
+    !Array.isArray(nodes) ||
+    !nodes.some((n: CanvasNodeLike | null) => holdsSnapshot(n?.config))
+  ) {
+    return canvas;
+  }
+  return {
+    ...canvas,
+    nodes: nodes.map((node: CanvasNodeLike | null) => {
+      const config = node?.config;
+      return config && holdsSnapshot(config)
+        ? { ...node, config: withoutSnapshotInNodeConfig(config) }
+        : node;
+    }),
+  };
+}
+
+/** The surface canvas blob and every variant's canvas override, without the snapshot. */
+function withoutServerWrittenCanvases<S extends Partial<AgentSurface>>(surface: S): S {
+  const out = { ...surface };
+  if (out.canvas) out.canvas = withoutServerWrittenCanvas(out.canvas);
+  if (Array.isArray(out.variants)) {
+    out.variants = out.variants.map(v =>
+      v?.overrides?.canvas
+        ? {
+            ...v,
+            overrides: { ...v.overrides, canvas: withoutServerWrittenCanvas(v.overrides.canvas) },
+          }
+        : v
+    );
+  }
+  return out;
+}
+
+/**
+ * Drops fields the server writes and refuses on input: save `warnings`, the derived
+ * `access_point_status`, `transit_point_source_auth` and `manifest_snapshot`, from the
+ * policies and from the canvas blobs.
+ */
+export function stripServerWrittenFields(surface: Partial<AgentSurface>): Partial<AgentSurface> {
+  if (!surface || typeof surface !== 'object') return surface;
+  const {
+    warnings: _warnings,
+    access_point_status: _status,
+    ...rest
+  } = withoutDerivedMarks(surface);
+  const out: Partial<AgentSurface> = withoutServerWrittenCanvases(rest);
+  if (out.target) out.target = withoutServerWrittenPayment(out.target);
+  if (Array.isArray(out.variants)) {
+    out.variants = out.variants.map(v =>
+      v?.overrides?.target
+        ? {
+            ...v,
+            overrides: { ...v.overrides, target: withoutServerWrittenPayment(v.overrides.target) },
+          }
+        : v
+    );
+  }
+  return out;
+}
+
+function toBackendSurface(input: Partial<AgentSurface>): any {
+  const surface = stripServerWrittenFields(input);
+  if (!surface || !surface.target) return withTrustCheckSplit(surface);
   const target: any = { ...surface.target };
   const ai: any = (target as any).agent_identity;
   // Preserve any operator-set inject_vp toggle (Managed Agent panel); default
@@ -1366,7 +1661,7 @@ function toBackendSurface(surface: Partial<AgentSurface>): any {
   } else if (existingII && typeof existingII === 'object') {
     target.identity_injection = { inject_vp: injectVp };
   }
-  return { ...surface, target };
+  return withTrustCheckSplit({ ...surface, target });
 }
 
 function fromBackendSurface(surface: AgentSurface): AgentSurface {
@@ -1383,5 +1678,5 @@ function fromBackendSurface(surface: AgentSurface): AgentSurface {
     // `target.agent_identity` for the legacy Identity panel.
     target.identity_injection = { inject_vp: typeof inject_vp === 'boolean' ? inject_vp : true };
   }
-  return { ...surface, target };
+  return withoutServerWrittenCanvases({ ...surface, target });
 }

@@ -8,6 +8,7 @@ import ElementPalette from './ElementPalette';
 import SurfaceMonitoringPanel from './SurfaceMonitoringPanel';
 import TemplatesPanel from './templates/TemplatesPanel';
 import TemplateConflictModal from './templates/TemplateConflictModal';
+import AgentCardTab from './agent-card/AgentCardTab';
 import { applyPlan, planTemplate } from './templates/placement';
 import { autoApplyFullSurfaceTemplate } from './templates/applyFullTemplate';
 import { nodeToTemplateItem } from './templates/serializeTemplate';
@@ -21,6 +22,7 @@ import type { CanvasNode } from './SurfaceCanvas';
 import type { SurfaceTemplateItem } from '../../api';
 import { SurfaceMetaProvider, type DidwebvhConfig } from './SurfaceMetaContext';
 import type { SurfacePolicyDefinitionLoadState } from './elements/policy/status';
+import type { AccessPointNotice } from './elements/access-point/readiness';
 import { hasPolicyDefinitionReference, policyDefinitionsWarning } from './elements/policy/status';
 
 export type SurfaceFormMode = 'create' | 'edit';
@@ -30,6 +32,7 @@ export type SurfaceFormView =
   | 'elements'
   | 'monitoring'
   | 'config'
+  | 'agent-card'
   | 'editor';
 
 export interface SurfaceMetaState {
@@ -90,6 +93,7 @@ export interface SurfaceFormShellProps {
   onCloseFullscreenEditor: () => void;
   canvasOverlay?: React.ReactNode;
   surfaceId?: string;
+  tenantId?: string | null;
   lastActivity?: string | null;
   /**
    * Page-specific Save / Delete / etc. buttons rendered as a 'Manage'
@@ -119,6 +123,8 @@ export interface SurfaceFormShellProps {
    * snapshot manager which swaps canvas state atomically.
    */
   onSwitchVariant?: (variantId: string) => void;
+  /** Stored snapshots of the variants not shown on the canvas. */
+  otherVariantSnapshots?: ReadonlyArray<unknown>;
   /**
    * Open the variants editor AND seed a new variant. Wired to the
    * widget's zero-state "+" affordance.
@@ -144,6 +150,48 @@ export interface SurfaceFormShellProps {
    * Set to true by the page on first Create / Save attempt.
    */
   hasAttemptedSave?: boolean;
+  /**
+   * Message of the last failed save. Panels read it from the surface meta
+   * context to show an error next to the field it names, beside `topBanner`.
+   */
+  saveError?: string | null;
+  /** Warnings the last successful save answered with; panels show the ones naming them. */
+  saveWarnings?: readonly string[] | null;
+  /** True while the form differs from the saved surface; the Agent Cards view says it shows the saved one. */
+  isDirty?: boolean;
+  /** Changes whenever the saved surface changes, so the Agent Cards view reads the cards again. */
+  agentCardRefreshKey?: unknown;
+  /** True when the saved surface has enabled Surface Variants. */
+  hasVariants?: boolean;
+  /**
+   * Readiness notice shown under the Access Point URL, decided by the page;
+   * absent while the Access Point is ready.
+   */
+  accessPointNotice?: AccessPointNotice | null;
+  /** The stored surface has no `access_point.public`: a legacy Access Point. */
+  legacyAccessPoint?: boolean;
+}
+
+/** True when `variantId` is the default variant in the canvas's variant catalog. */
+function isDefaultVariant(nodes: CanvasNode[], variantId: string | null | undefined): boolean {
+  const defaultId: unknown = nodes.find(n => n.type === 'target-variant')?.config
+    ?.default_variant_id;
+  return !!variantId && defaultId === variantId;
+}
+
+/** Alias of the variant `variantId` in the canvas's variant catalog, if it is a named one. */
+function variantAlias(
+  nodes: CanvasNode[],
+  variantId: string | null | undefined
+): string | undefined {
+  if (!variantId) return undefined;
+  const catalog: unknown = nodes.find(n => n.type === 'target-variant')?.config?.variants;
+  if (!Array.isArray(catalog)) return undefined;
+  const entry: unknown = catalog.find(
+    v => !!v && typeof v === 'object' && (v as { id?: unknown }).id === variantId
+  );
+  const alias = entry ? (entry as { alias?: unknown }).alias : undefined;
+  return typeof alias === 'string' && alias ? alias : undefined;
 }
 
 /**
@@ -221,18 +269,28 @@ async function prepareTemplatePolicyDefinitions(
   return { ...template, items: preparedItems };
 }
 
+export const AGENT_CARD_PROTOCOLS: ReadonlyArray<Protocol> = ['a2a', 'ap2'];
+
 const SIDEBAR_VIEWS: ReadonlyArray<{
   key: SurfaceFormView;
   label: string;
   icon: string;
   editOnly?: boolean;
+  protocols?: ReadonlyArray<Protocol>;
 }> = [
   { key: 'surface', label: 'Surface', icon: 'fa-project-diagram' },
   { key: 'templates', label: 'Templates', icon: 'fa-layer-group' },
   { key: 'elements', label: 'Elements', icon: 'fa-list' },
+  { key: 'agent-card', label: 'Agent Cards', icon: 'fa-id-card', protocols: AGENT_CARD_PROTOCOLS },
   { key: 'monitoring', label: 'Monitoring', icon: 'fa-chart-line', editOnly: true },
   { key: 'config', label: 'Config', icon: 'fa-code' },
 ];
+
+export function visibleSidebarViews(mode: SurfaceFormMode, protocol: Protocol) {
+  return SIDEBAR_VIEWS.filter(
+    v => (!v.editOnly || mode === 'edit') && (!v.protocols || v.protocols.includes(protocol))
+  );
+}
 
 const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   mode,
@@ -253,16 +311,25 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   onCloseFullscreenEditor,
   canvasOverlay,
   surfaceId,
+  tenantId,
   lastActivity,
   manageActions,
   surfaceSizeRef,
   canvasViewRef,
   activeVariantId,
   onSwitchVariant,
+  otherVariantSnapshots,
   onAddVariant,
   topBanner,
   surfacePolicyLoadState,
   hasAttemptedSave,
+  saveError,
+  saveWarnings,
+  isDirty = false,
+  agentCardRefreshKey,
+  hasVariants = false,
+  accessPointNotice,
+  legacyAccessPoint,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -306,6 +373,20 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
     sidebarWidthRef.current = sidebarWidth;
   }, [sidebarWidth]);
   const [isResizingSidebar, setIsResizingSidebar] = React.useState(false);
+
+  // "Configure Authentication": the builder can't select an empty slot, so
+  // select the Access Point and point at the Caller Context in the palette,
+  // which is dragged onto the caller arrow.
+  const [paletteHighlight, setPaletteHighlight] = React.useState<{
+    type: SurfaceNodeType;
+  } | null>(null);
+  const handleNodeClick = builder.handleNodeClick;
+  const handleConfigureAuthentication = React.useCallback(() => {
+    setActiveTab('surface');
+    handleNodeClick('access-point');
+    setSidebarCollapsed(false);
+    setPaletteHighlight({ type: 'caller-auth' });
+  }, [handleNodeClick, setActiveTab]);
   const handleSidebarResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
     setIsResizingSidebar(true);
@@ -360,6 +441,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         canvasViewRef={canvasViewRef}
         activeVariantId={activeVariantId}
         onSwitchVariant={onSwitchVariant}
+        otherVariantSnapshots={otherVariantSnapshots}
         onAddVariant={onAddVariant}
         onCreateTemplateFromSelection={
           canEdit ? ids => createTemplateFromSelectionRef.current?.(ids) : undefined
@@ -412,6 +494,18 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
           <SurfaceMonitoringPanel
             surfaceId={surfaceId}
             surfaceName={meta.name || 'Agent Surface'}
+          />
+        );
+      case 'agent-card':
+        return (
+          <AgentCardTab
+            surfaceId={surfaceId}
+            isCreate={mode === 'create'}
+            isDirty={isDirty}
+            canEdit={canEdit}
+            hasVariants={hasVariants}
+            refreshKey={agentCardRefreshKey}
+            onRefreshed={handleAgentCardRefreshed}
           />
         );
       case 'config':
@@ -531,6 +625,37 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
       setActiveTab('surface');
     }
   }, [activeTab, editorNode, editorDef, setActiveTab]);
+
+  const agentCardShown = AGENT_CARD_PROTOCOLS.includes(meta.protocol);
+  React.useEffect(() => {
+    if (activeTab === 'agent-card' && !agentCardShown) setActiveTab('surface');
+  }, [activeTab, agentCardShown, setActiveTab]);
+
+  const [agentCardRefreshTick, setAgentCardRefreshTick] = React.useState(0);
+  const agentCardFetchRevision = React.useMemo(
+    () => [agentCardRefreshKey, agentCardRefreshTick],
+    [agentCardRefreshKey, agentCardRefreshTick]
+  );
+  const handleAgentCardRefreshed = React.useCallback(() => setAgentCardRefreshTick(t => t + 1), []);
+
+  const shellRef = React.useRef<HTMLDivElement>(null);
+  const pendingViewFocus = React.useRef<SurfaceFormView | null>(null);
+  const openViewFromContent = React.useCallback(
+    (view: SurfaceFormView) => {
+      pendingViewFocus.current = view;
+      setActiveTab(view);
+    },
+    [setActiveTab]
+  );
+  React.useEffect(() => {
+    if (pendingViewFocus.current !== activeTab) return;
+    pendingViewFocus.current = null;
+    const root = shellRef.current;
+    const target =
+      root?.querySelector<HTMLElement>(`[data-testid="surface-view-${activeTab}"]`) ??
+      root?.querySelector<HTMLElement>('[data-testid="agent-card-heading"]');
+    target?.focus();
+  }, [activeTab]);
 
   React.useEffect(() => {
     if (!pendingTemplateEditorNodeId) return;
@@ -724,6 +849,14 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         isCreate: mode === 'create',
         lastActivity,
         surfaceId,
+        tenantId,
+        activeVariantAlias: variantAlias(builder.state.nodes, activeVariantId),
+        activeVariantIsDefault: isDefaultVariant(builder.state.nodes, activeVariantId),
+        saveError,
+        saveWarnings,
+        accessPointNotice,
+        legacyAccessPoint,
+        onConfigureAuthentication: handleConfigureAuthentication,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,
         setTagsCsv: setMeta.setTagsCsv,
@@ -740,9 +873,12 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
               setTemplatesCreateMode(true);
             }
           : undefined,
+        onOpenAgentCard: agentCardShown ? () => openViewFromContent('agent-card') : undefined,
+        onOpenSurfaceView: () => openViewFromContent('surface'),
+        agentCardFetchRevision,
       }}
     >
-      <div className="card shadow mb-4 channel-editor-card">
+      <div className="card shadow mb-4 channel-editor-card" ref={shellRef}>
         <div className="card-body p-0">
           <div
             className={`surface-form-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}
@@ -782,7 +918,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                   <div className="surface-form-sidebar-scroll">
                     <div className="surface-form-sidebar-section">
                       <div className="surface-form-sidebar-heading">Views</div>
-                      {SIDEBAR_VIEWS.filter(v => !v.editOnly || mode === 'edit').map(v => (
+                      {visibleSidebarViews(mode, meta.protocol).map(v => (
                         <div
                           key={v.key}
                           className={`surface-form-sidebar-item${activeTab === v.key ? ' active' : ''}`}
@@ -791,6 +927,8 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                           <button
                             type="button"
                             className="surface-form-sidebar-item-main"
+                            data-testid={`surface-view-${v.key}`}
+                            aria-current={activeTab === v.key ? 'page' : undefined}
                             onClick={() => setActiveTab(v.key)}
                             style={{
                               flex: 1,
@@ -876,6 +1014,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
                           variant="inline"
                           existingNodes={builder.state.nodes}
                           protocol={meta.protocol}
+                          highlight={paletteHighlight}
                           onAnyDragStart={() => {
                             if (activeTab !== 'surface') setActiveTab('surface');
                           }}

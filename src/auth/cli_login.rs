@@ -26,6 +26,7 @@ use crate::auth::session::{SessionManager, TermsSessionGate};
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::middleware::{extract_session_token_from_headers, user_is_approved};
 use crate::config::types::LoginThrottleConfig;
+use crate::observability::loggable;
 use crate::source_auth::client_ip::ClientIp;
 use crate::sts::throttle::TokenEndpointThrottle;
 
@@ -387,15 +388,40 @@ fn is_same_origin_request(headers: &HeaderMap) -> bool {
     matches!((origin_authority, host), (Some(origin), Some(host)) if origin.eq_ignore_ascii_case(host))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ExchangeRequest {
     code: String,
     verifier: String,
 }
 
-#[derive(Debug, Serialize)]
+impl std::fmt::Debug for ExchangeRequest {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExchangeRequest")
+            .field("code", &loggable::secret(&self.code))
+            .field("verifier", &loggable::REDACTED)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
 pub struct ExchangeResponse {
     pub session_token: String,
+}
+
+impl std::fmt::Debug for ExchangeResponse {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExchangeResponse")
+            .field("session_token", &loggable::secret(&self.session_token))
+            .finish()
+    }
 }
 
 /// Every failure answers `{"error", "error_description"}` JSON with `no-store`: `invalid_request`
@@ -572,6 +598,34 @@ mod tests {
 
     fn test_challenge() -> String {
         pkce_challenge_s256(TEST_VERIFIER)
+    }
+
+    #[test]
+    fn exchange_request_debug_hides_the_code_and_the_verifier() {
+        let code = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let request = ExchangeRequest {
+            code: code.to_string(),
+            verifier: TEST_VERIFIER.to_string(),
+        };
+
+        let rendered = format!("{request:?}");
+
+        assert_eq!(rendered, r#"ExchangeRequest { code: "0f2c9d7e...", verifier: "<redacted>" }"#);
+        assert!(!rendered.contains(code), "{rendered}");
+        assert!(!rendered.contains(TEST_VERIFIER), "{rendered}");
+    }
+
+    #[test]
+    fn exchange_response_debug_shows_only_a_session_token_prefix() {
+        let session_token = "7c1e5a90-2d4b-4f6e-9a8c-b1d2e3f4a5b6";
+        let response = ExchangeResponse {
+            session_token: session_token.to_string(),
+        };
+
+        let rendered = format!("{response:?}");
+
+        assert_eq!(rendered, r#"ExchangeResponse { session_token: "7c1e5a90..." }"#);
+        assert!(!rendered.contains(session_token), "{rendered}");
     }
 
     #[test]

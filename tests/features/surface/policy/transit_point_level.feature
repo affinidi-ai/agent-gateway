@@ -24,7 +24,7 @@ Feature: Transit-point level policy enforcement
         And surface "alpha" uses path "/example"
         And surface "alpha" has direct A2A transit point "tr1" to agent "agent-external"
         And transit point "tr1" uses path "/example/forward/unallowed"
-        And transit point "tr1" has policy "tp-policy-1" that allows outbound requests only to "/outgoing/agent-external/example/forward/allowed"
+        And transit point "tr1" has policy "tp-policy-1" that allows outbound requests only to "/transit/agent-external/example/forward/allowed"
         When the caller sends A2A request to the surface path "/example/foo" in gateway "gateway-1"
         Then the response status is 403
         And the response body is error "transit_point_request_policy_denied"
@@ -37,7 +37,7 @@ Feature: Transit-point level policy enforcement
         And surface "alpha" uses path "/example"
         And surface "alpha" has direct A2A transit point "tr1" to agent "agent-external"
         And transit point "tr1" uses path "/example/forward/allowed"
-        And transit point "tr1" has policy "tp-policy-1" that allows outbound requests only to "/outgoing/agent-external/example/forward/allowed"
+        And transit point "tr1" has policy "tp-policy-1" that allows outbound requests only to "/transit/agent-external/example/forward/allowed"
         When the caller sends A2A request to the surface path "/example/foo" in gateway "gateway-1"
         Then the response status is 200
         And the response body matches agent "agent-external" response

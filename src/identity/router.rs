@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::{debug, error, info};
 
+use crate::audit::policy_refusals::{PolicyWrite, PolicyWriteRoutes};
 use crate::identity::handlers;
 use crate::identity::state::IdentityApiState;
 use crate::metrics::MetricsStore;
@@ -233,6 +234,7 @@ pub async fn create_identity_api_router(
     authority_store: Option<std::sync::Arc<crate::authorities::FileSystemAuthorityStore>>,
     x402_admin_router: Option<Router>,
     mpp_admin_router: Option<Router>,
+    payments_ledger_router: Router,
     metric_store: Option<Arc<MetricsStore>>,
     sts_client_store: Option<std::sync::Arc<dyn crate::sts::store::StsClientStorage>>,
     mcp_replay: Option<std::sync::Arc<crate::sts::replay::McpReplay>>,
@@ -357,14 +359,11 @@ pub async fn create_identity_api_router(
         // NOTE: storage backup/restore/export and agents-api sign-jwt are admin-only
         // and are registered on the RBAC-gated `auth_manager_router` below, not here.
         // Metrics routes
-        .route("/v1/metrics/truncate", post(handlers::truncate_metrics))
         .route("/v1/metrics/prometheus", get(handlers::prometheus_metrics))
         .route("/v1/metrics/otlp-status", get(handlers::get_otlp_status))
         // NOTE: the metrics configuration routes write the OTLP exporter destination and its
         // secret-store-resolved auth header, and the log download returns the whole log
         // directory, so all four are RBAC-gated on `rbac_identity_router` below.
-        // Logs routes
-        .route("/v1/logs/truncate", post(handlers::truncate_old_logs))
         // NOTE: the VP Audit Log (/v1/audit) can include caller context and VP
         // JWTs, so it is RBAC-gated behind administrator-only `audit.view` on
         // the `rbac_identity_router` below, not registered here.
@@ -737,10 +736,18 @@ pub async fn create_identity_api_router(
                     Feature::SettingsEdit,
                 )),
             )
+            .route(
+                "/v1/metrics/truncate",
+                post(handlers::truncate_metrics).layer(require_feature(s.clone(), r.clone(), Feature::SettingsEdit)),
+            )
             // Server logs routinely carry tokens, request detail and PII.
             .route(
                 "/v1/logs/download",
                 get(handlers::download_logs).layer(require_feature(s.clone(), r.clone(), Feature::AuditView)),
+            )
+            .route(
+                "/v1/logs/truncate",
+                post(handlers::truncate_old_logs).layer(require_feature(s.clone(), r.clone(), Feature::SettingsEdit)),
             )
             // H1 / H16 — surface mutations (H16 collapses into H1 because the
             // channel-policy update is reached via the surface PUT/DELETE)
@@ -755,6 +762,30 @@ pub async fn create_identity_api_router(
             .route(
                 "/v1/surfaces/{surface_id}",
                 get(handlers::get_surface).layer(require_feature(s.clone(), r.clone(), Feature::SurfacesView)),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/trust-recorder-status",
+                get(handlers::get_trust_recorder_status).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/agent-card",
+                get(handlers::get_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesView,
+                )),
+            )
+            .route(
+                "/v1/surfaces/{surface_id}/agent-card/refresh",
+                post(handlers::refresh_surface_agent_card).layer(require_feature(
+                    s.clone(),
+                    r.clone(),
+                    Feature::SurfacesEdit,
+                )),
             )
             .route(
                 "/v1/surfaces/{surface_id}",
@@ -890,24 +921,24 @@ pub async fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-definitions",
+            .policy_write(
+                PolicyWrite::CreateDefinition,
                 post(handlers::create_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::UpdateDefinition,
                 put(handlers::update_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
                     Feature::PoliciesEdit,
                 )),
             )
-            .route(
-                "/v1/policy-definitions/{policy_id}",
+            .policy_write(
+                PolicyWrite::DeleteDefinition,
                 delete(handlers::delete_policy_definition).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -930,8 +961,8 @@ pub async fn create_identity_api_router(
                     Feature::PoliciesView,
                 )),
             )
-            .route(
-                "/v1/policy-assignments",
+            .policy_write(
+                PolicyWrite::Assignments,
                 put(handlers::update_policy_assignments).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -946,8 +977,8 @@ pub async fn create_identity_api_router(
                     Feature::TenantOwnershipManage,
                 )),
             )
-            .route(
-                "/v1/tenant-ownership/{kind}/{id}",
+            .policy_write(
+                PolicyWrite::ReassignOwner,
                 put(handlers::tenant_ownership::reassign_ownership).layer(require_feature(
                     s.clone(),
                     r.clone(),
@@ -1053,6 +1084,7 @@ pub async fn create_identity_api_router(
         // When passkey storage is not configured (auth-disabled build) the
         // gate is a no-op; otherwise non-admin callers are rejected with 403.
         use crate::auth_manager::middleware::require_feature;
+        use crate::gateways::types::GatewayRole;
         use crate::rbac::Feature;
         let storage_opt = passkey_storage_for_manager.clone();
         let rbac = rbac_config.clone();
@@ -1063,6 +1095,11 @@ pub async fn create_identity_api_router(
                 mr.layer(axum::middleware::from_fn(crate::auth_manager::middleware::deny_unguarded_request))
             }
         };
+        let scoped_gate = |role: GatewayRole, mr: axum::routing::MethodRouter, feat: Feature| {
+            gate(crate::gateways::role_scope::scope_route(mr, store.clone(), role), feat)
+        };
+        let peer_gate = |mr, feat| scoped_gate(GatewayRole::Peer, mr, feat);
+        let payment_gate = |mr, feat| scoped_gate(GatewayRole::Payment, mr, feat);
 
         let mut router = Router::new()
             .route(
@@ -1071,21 +1108,21 @@ pub async fn create_identity_api_router(
             )
             .route(
                 "/v1/gateways",
-                gate(
+                peer_gate(
                     get(crate::gateways::handlers::list_gateways::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysView,
                 ),
             )
             .route(
                 "/v1/gateways",
-                gate(
+                peer_gate(
                     post(crate::gateways::handlers::create_gateway::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
                 ),
             )
             .route(
                 "/v1/gateways/connect-via-oob",
-                gate(
+                peer_gate(
                     post(
                         crate::gateways::handlers::connect_via_oob::<
                             crate::gateways::FileSystemGatewayStore,
@@ -1098,28 +1135,74 @@ pub async fn create_identity_api_router(
             )
             .route(
                 "/v1/gateways/{id}",
-                gate(
+                peer_gate(
                     get(crate::gateways::handlers::get_gateway::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysView,
                 ),
             )
             .route(
                 "/v1/gateways/{id}",
-                gate(
+                peer_gate(
                     put(crate::gateways::handlers::update_gateway::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
                 ),
             )
             .route(
-                "/v1/gateways/{id}/policy",
+                "/v1/gateways/{id}/payment-role",
                 gate(
-                    get(crate::gateways::handlers::get_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
-                    Feature::GatewaysView,
+                    peer_gate(
+                        crate::gateways::agent_pay_flag::gate_adding_payment_gateways(post(
+                            crate::gateways::handlers::set_payment_role::<crate::gateways::FileSystemGatewayStore>,
+                        )),
+                        Feature::GatewaysEdit,
+                    ),
+                    Feature::PaymentGatewaysEdit,
+                ),
+            )
+            .route(
+                "/v1/payment-gateways",
+                payment_gate(
+                    get(crate::gateways::handlers::list_gateways::<crate::gateways::FileSystemGatewayStore>),
+                    Feature::PaymentGatewaysView,
+                ),
+            )
+            .route(
+                "/v1/payment-gateways/connect-via-oob",
+                payment_gate(
+                    crate::gateways::agent_pay_flag::gate_adding_payment_gateways(post(
+                        crate::gateways::handlers::connect_via_oob::<
+                            crate::gateways::FileSystemGatewayStore,
+                            crate::gateways::FileSystemConnectionPointStore,
+                            crate::mediators::FileSystemMediatorStore,
+                        >,
+                    )),
+                    Feature::PaymentGatewaysEdit,
+                ),
+            )
+            .route(
+                "/v1/payment-gateways/{id}",
+                payment_gate(
+                    get(crate::gateways::handlers::get_gateway::<crate::gateways::FileSystemGatewayStore>),
+                    Feature::PaymentGatewaysView,
+                ),
+            )
+            .route(
+                "/v1/payment-gateways/{id}",
+                payment_gate(
+                    put(crate::gateways::handlers::update_gateway::<crate::gateways::FileSystemGatewayStore>),
+                    Feature::PaymentGatewaysEdit,
                 ),
             )
             .route(
                 "/v1/gateways/{id}/policy",
-                gate(
+                peer_gate(
+                    get(crate::gateways::handlers::get_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
+                    Feature::GatewaysView,
+                ),
+            )
+            .policy_write(
+                PolicyWrite::GatewayPolicy,
+                peer_gate(
                     put(crate::gateways::handlers::update_gateway_policy::<crate::gateways::FileSystemGatewayStore>),
                     Feature::GatewaysEdit,
                 ),
@@ -1200,14 +1283,14 @@ pub async fn create_identity_api_router(
                 router
                     .route(
                         "/v1/gateways/{id}/ping",
-                        gate(
+                        peer_gate(
                             post(crate::gateways::handlers::ping_gateway::<crate::gateways::FileSystemGatewayStore>),
                             Feature::GatewaysEdit,
                         ),
                     )
                     .route(
                         "/v1/gateways/{id}/issuer",
-                        gate(
+                        peer_gate(
                             post(
                                 crate::gateways::handlers::request_gateway_issuer::<
                                     crate::gateways::FileSystemGatewayStore,
@@ -1223,7 +1306,7 @@ pub async fn create_identity_api_router(
                     )
                     .route(
                         "/v1/gateways/{id}/trusted-issuers",
-                        gate(
+                        peer_gate(
                             post(
                                 crate::gateways::handlers::add_trusted_issuer::<
                                     crate::gateways::FileSystemGatewayStore,
@@ -1234,7 +1317,7 @@ pub async fn create_identity_api_router(
                     )
                     .route(
                         "/v1/gateways/{id}/trusted-issuers/{issuer_did}",
-                        gate(
+                        peer_gate(
                             axum::routing::delete(
                                 crate::gateways::handlers::remove_trusted_issuer::<
                                     crate::gateways::FileSystemGatewayStore,
@@ -1245,7 +1328,7 @@ pub async fn create_identity_api_router(
                     )
                     .route(
                         "/v1/gateways/{id}/surfaces",
-                        gate(
+                        peer_gate(
                             get(crate::gateways::handlers::get_gateway_surfaces::<
                                 crate::gateways::FileSystemGatewayStore,
                             >),
@@ -1253,17 +1336,53 @@ pub async fn create_identity_api_router(
                         ),
                     )
                     .route(
+                        "/v1/gateways/payment-logos/{sha256}",
+                        gate(get(crate::gateways::handlers::get_payment_logo), Feature::PaymentGatewaysView),
+                    )
+                    .route(
                         "/v1/gateways/payment-providers",
                         gate(
                             get(crate::gateways::handlers::list_payment_gateways::<
                                 crate::gateways::FileSystemGatewayStore,
                             >),
-                            Feature::GatewaysView,
+                            Feature::PaymentGatewaysView,
+                        ),
+                    )
+                    .route(
+                        "/v1/payment-gateways/{id}/ping",
+                        payment_gate(
+                            post(crate::gateways::handlers::ping_gateway::<crate::gateways::FileSystemGatewayStore>),
+                            Feature::PaymentGatewaysEdit,
+                        ),
+                    )
+                    .route(
+                        "/v1/payment-gateways/{id}/surfaces",
+                        payment_gate(
+                            get(crate::gateways::handlers::get_gateway_surfaces::<
+                                crate::gateways::FileSystemGatewayStore,
+                            >),
+                            Feature::PaymentGatewaysView,
+                        ),
+                    )
+                    .route(
+                        "/v1/payment-gateways/{id}/surfaces/{surface_id}/payment-manifest",
+                        payment_gate(
+                            get(crate::gateways::handlers::get_payment_manifest::<
+                                crate::gateways::FileSystemGatewayStore,
+                            >),
+                            Feature::PaymentGatewaysView,
+                        ),
+                    )
+                    .route(
+                        "/v1/payment-gateways/{id}/info",
+                        payment_gate(
+                            get(crate::gateways::handlers::get_gateway_info::<crate::gateways::FileSystemGatewayStore>),
+                            Feature::PaymentGatewaysView,
                         ),
                     )
                     .route(
                         "/v1/gateways/{id}/exposed-surfaces",
-                        gate(
+                        peer_gate(
                             put(crate::gateways::handlers::update_gateway_exposed_surfaces::<
                                 crate::gateways::FileSystemGatewayStore,
                             >),
@@ -1272,7 +1391,7 @@ pub async fn create_identity_api_router(
                     )
                     .route(
                         "/v1/gateways/refresh-surfaces",
-                        gate(
+                        peer_gate(
                             post(
                                 crate::gateways::handlers::refresh_gateway_surfaces_cache::<
                                     crate::gateways::FileSystemGatewayStore,
@@ -1299,7 +1418,7 @@ pub async fn create_identity_api_router(
             router = router
                 .route(
                     "/v1/gateways/{id}/approve",
-                    gate(
+                    peer_gate(
                         post(
                             crate::gateways::approve::approve_gateway::<
                                 crate::gateways::FileSystemGatewayStore,
@@ -1340,7 +1459,7 @@ pub async fn create_identity_api_router(
             let mut delete_router = Router::new()
                 .route(
                     "/v1/gateways/{id}",
-                    gate(
+                    peer_gate(
                         delete(
                             crate::gateways::handlers::delete_gateway::<
                                 crate::gateways::FileSystemGatewayStore,
@@ -1350,11 +1469,28 @@ pub async fn create_identity_api_router(
                         Feature::GatewaysDelete,
                     ),
                 )
+                .route(
+                    "/v1/payment-gateways/{id}",
+                    payment_gate(
+                        delete(
+                            crate::gateways::handlers::delete_gateway::<
+                                crate::gateways::FileSystemGatewayStore,
+                                crate::gateways::FileSystemConnectionPointStore,
+                            >,
+                        ),
+                        Feature::PaymentGatewaysDelete,
+                    ),
+                )
                 .layer(Extension(store.clone()))
                 .layer(Extension(cp_store.clone()))
                 .layer(Extension(listener_mgr.clone()))
                 .layer(Extension(pending_connection_store.clone()))
-                .layer(Extension(notification_store.clone()));
+                .layer(Extension(notification_store.clone()))
+                .layer(Extension(
+                    state
+                        .agent_surface_store
+                        .clone(),
+                ));
 
             if let (Some(sess_mgr), Some(user_storage)) = (gateway_session_mgr.as_ref(), gateway_user_storage.as_ref())
             {
@@ -1557,9 +1693,13 @@ pub async fn create_identity_api_router(
                 .route(
                     "/v1/gateways/{gateway_id}/connection-points",
                     gate(
-                        get(crate::gateways::connection_points::handlers::list_gateway_connection_points::<
-                            crate::gateways::FileSystemConnectionPointStore,
-                        >),
+                        crate::gateways::role_scope::scope_route(
+                            get(crate::gateways::connection_points::handlers::list_gateway_connection_points::<
+                                crate::gateways::FileSystemConnectionPointStore,
+                            >),
+                            gw_store.clone(),
+                            crate::gateways::types::GatewayRole::Peer,
+                        ),
                         crate::rbac::Feature::GatewaysView,
                     ),
                 )
@@ -1897,6 +2037,12 @@ pub async fn create_identity_api_router(
             .layer(Extension(store))
             .layer(Extension(mcp_server_manager))
             .layer(Extension(secrets_store.clone()))
+            .layer(Extension(
+                state
+                    .agent_surface_store
+                    .clone()
+                    .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+            ))
             .layer(Extension(notification_store.clone()))
             .layer(Extension(resource_owners.clone()))
     } else {
@@ -2096,69 +2242,86 @@ pub async fn create_identity_api_router(
 
     // Create notification routes if store is provided
     let notification_router = if let Some(store) = notification_store {
-        let router =
-            Router::new()
-                .route(
-                    "/v1/notifications",
-                    get(crate::integrations::handlers::list_notifications::<
+        use crate::auth_manager::middleware::{RbacGuard, maybe_gate};
+        use crate::rbac::Feature;
+        let notification_guard = passkey_storage_for_manager
+            .as_ref()
+            .map(|auth_storage| RbacGuard::new(auth_storage.clone(), rbac_config.clone()));
+        let guard = notification_guard.as_ref();
+        let router = Router::new()
+            .route(
+                "/v1/notifications",
+                get(crate::integrations::handlers::list_notifications::<
+                    crate::integrations::FileSystemNotificationStore,
+                >),
+            )
+            .route(
+                "/v1/notifications",
+                post(
+                    crate::integrations::handlers::create_notification::<
                         crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications",
-                    post(
-                        crate::integrations::handlers::create_notification::<
-                            crate::integrations::FileSystemNotificationStore,
-                        >,
-                    ),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    get(crate::integrations::handlers::get_notification::<
+                    >,
+                ),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                get(
+                    crate::integrations::handlers::get_notification::<crate::integrations::FileSystemNotificationStore>,
+                ),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                put(crate::integrations::handlers::update_notification::<
+                    crate::integrations::FileSystemNotificationStore,
+                >),
+            )
+            .route(
+                "/v1/notifications/{id}",
+                delete(
+                    crate::integrations::handlers::delete_notification::<
                         crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    put(crate::integrations::handlers::update_notification::<
-                        crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/{id}",
-                    delete(
-                        crate::integrations::handlers::delete_notification::<
-                            crate::integrations::FileSystemNotificationStore,
-                        >,
-                    ),
-                )
-                .route(
-                    "/v1/notifications/unread/count",
-                    get(crate::integrations::handlers::get_unread_count::<
-                        crate::integrations::FileSystemNotificationStore,
-                    >),
-                )
-                .route(
-                    "/v1/notifications/user-welcome-template",
+                    >,
+                ),
+            )
+            .route(
+                "/v1/notifications/unread/count",
+                get(
+                    crate::integrations::handlers::get_unread_count::<crate::integrations::FileSystemNotificationStore>,
+                ),
+            )
+            .route(
+                "/v1/notifications/user-welcome-template",
+                maybe_gate(
+                    guard,
                     get(crate::integrations::handlers::get_user_welcome_template::<
                         crate::integrations::FileSystemNotificationStore,
                     >),
-                )
-                .route(
-                    "/v1/notifications/user-welcome-template",
+                    Feature::UsersApprove,
+                ),
+            )
+            .route(
+                "/v1/notifications/user-welcome-template",
+                maybe_gate(
+                    guard,
                     put(crate::integrations::handlers::set_user_welcome_template::<
                         crate::integrations::FileSystemNotificationStore,
                     >),
-                )
-                .route(
-                    "/v1/notifications/send-welcome",
+                    Feature::UsersApprove,
+                ),
+            )
+            .route(
+                "/v1/notifications/send-welcome",
+                maybe_gate(
+                    guard,
                     post(
                         crate::integrations::handlers::send_user_welcome::<
                             crate::integrations::FileSystemNotificationStore,
                         >,
                     ),
-                )
-                .layer(Extension(store));
+                    Feature::UsersApprove,
+                ),
+            )
+            .layer(Extension(store));
 
         // Add session manager if available (works for both Passkey and SAML modes)
         if let Some(sess_mgr) = &session_manager_for_manager {
@@ -2572,6 +2735,12 @@ pub async fn create_identity_api_router(
         Router::new()
     };
 
+    let dashboard_router = match passkey_storage_for_manager.as_ref() {
+        Some(storage) => dashboard_router
+            .layer(Extension(crate::auth_manager::middleware::RbacGuard::new(storage.clone(), rbac_config.clone()))),
+        None => dashboard_router,
+    };
+
     let mut app = Router::new()
         .merge(cli_login_router)
         .merge(didwebvh_router)
@@ -2635,6 +2804,18 @@ pub async fn create_identity_api_router(
         };
         app = app.nest("/admin", admin_router);
     }
+
+    // Delegated payment ledger routes become `/api/admin/payments...`, gated on `payments.view`.
+    let payments_ledger_router = match passkey_storage_for_manager.as_ref() {
+        Some(storage) => payments_ledger_router.layer(crate::auth_manager::middleware::require_feature(
+            storage.clone(),
+            rbac_config.clone(),
+            crate::rbac::Feature::PaymentsView,
+        )),
+        None => payments_ledger_router
+            .layer(axum::middleware::from_fn(crate::auth_manager::middleware::deny_unguarded_request)),
+    };
+    app = app.nest("/admin", payments_ledger_router);
 
     // Apply global session auth middleware when a session manager is available
     if let Some(sess_mgr) = session_mgr_for_global_auth {

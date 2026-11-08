@@ -47,6 +47,237 @@ pub struct PolicyInput {
     /// is an empty list, so OPA rules don't need null checks).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
+
+    /// The Transit Point call's own context. Present on every outbound
+    /// evaluation, never on an inbound one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transit: Option<TransitContext>,
+}
+
+/// `input.transit`: what the gateway knows about a Transit Point call.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitContext {
+    /// The end user the transit token names.
+    pub caller: TransitCallerContext,
+    /// The client the Transit Point authenticated itself on this request,
+    /// kept apart from `caller`. Absent when it authenticated none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<TransitClientContext>,
+}
+
+/// What established the caller of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitCallerVerification {
+    /// The gateway-signed transit token carries a principal that source
+    /// authentication verified on the Access Point.
+    TransitToken,
+    /// A valid transit token names a caller DID, but nothing it carries was
+    /// verified by credential: the DID was asserted or derived from request
+    /// fields on the Access Point.
+    Unverified,
+    /// The transit token was issued for a request that arrived over Fabric. The
+    /// peer gateway that sent it is verified; its caller is verified only when
+    /// the receiving surface's own `source_auth` or resource token verified it.
+    FabricPeer,
+    /// Nothing identifies the caller.
+    Anonymous,
+}
+
+/// `input.transit.caller.fabric`: the peer gateway that sent the request a
+/// Fabric-issued transit token was issued for. The Fabric handshake verified
+/// the peer; `caller_did` is the peer's word about its caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransitFabricPeer {
+    pub peer_gateway_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_issuer_did: Option<String>,
+    pub hops: u8,
+    /// The caller DID a presentation from one of the connection's issuers
+    /// carried (`fabric.caller_did` in the token). Never verified, so never
+    /// the caller's `did`, which sits beside a `verified` that covers only the
+    /// identity hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_did: Option<String>,
+}
+
+impl From<&crate::proxy::transit_token::FabricTransitClaims> for TransitFabricPeer {
+    fn from(claims: &crate::proxy::transit_token::FabricTransitClaims) -> Self {
+        Self {
+            peer_gateway_id: claims.peer_gateway_id.clone(),
+            peer_issuer_did: claims.peer_issuer_did.clone(),
+            hops: claims.hops,
+            caller_did: claims.caller_did.clone(),
+        }
+    }
+}
+
+/// `input.transit.caller`: the caller of a Transit Point call and how the
+/// gateway came to know it.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitCallerContext {
+    /// `true` for a `transit_token` caller, and for a `fabric_peer` when the
+    /// receiving surface verified the caller of the Fabric request; `false` for
+    /// `unverified`, any other `fabric_peer` and `anonymous`.
+    pub verified: bool,
+    pub verification: TransitCallerVerification,
+    /// How the caller DID was established: the transit token's
+    /// `identity_source` (`gateway-computed`, `self-presented`,
+    /// `verified-presentation`, or `fabric-presentation` and `fabric-asserted`
+    /// for a token issued on Fabric receive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<String>,
+    /// The caller's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash))
+    /// the Access Point computed. Present only when `verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The caller DID an Access Point's transit token carries (`sub`). Always
+    /// asserted: nothing on the Access Point verifies a DID presentation yet,
+    /// so there is no `did_verified` and no Agent DNA UAI here. Never present
+    /// for a `fabric_peer` caller, whose DID is the peer's word, in
+    /// `fabric.caller_did`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    /// The operator-allowlisted `caller_context_fields` the transit token
+    /// carries, verbatim. Empty unless the caller is `verified`.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// The peer gateway, when the transit token was issued for a request that
+    /// arrived over Fabric.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fabric: Option<TransitFabricPeer>,
+}
+
+impl TransitCallerContext {
+    pub fn anonymous() -> Self {
+        Self {
+            verified: false,
+            verification: TransitCallerVerification::Anonymous,
+            identity_source: None,
+            user_identity_hash: None,
+            did: None,
+            fields: serde_json::Map::new(),
+            fabric: None,
+        }
+    }
+
+    /// The caller a validated transit token carries. Only a token whose
+    /// `user_identity_hash` came from source authentication verifies the
+    /// caller; the allowlisted fields are copied from that authenticated
+    /// identity, so they are dropped when there is no hash. A token issued for
+    /// a request that arrived over Fabric is a `fabric_peer` caller: the peer
+    /// that sent the request is verified, and the caller is verified only by
+    /// `fabric.principal_hash`, the caller the receiving surface's own
+    /// `source_auth` or resource token verified on that request, never by
+    /// anything the peer said. The caller's DID is never verified, even when a
+    /// connection issuer's presentation carried it (`fabric-presentation`), so
+    /// it is the peer's, in `fabric.caller_did`, never the caller's `did`.
+    pub fn from_transit_token(claims: &crate::proxy::transit_token::TransitTokenClaims) -> Self {
+        if let Some(fabric) = &claims.fabric {
+            let verified = fabric
+                .principal_hash
+                .is_some();
+            return Self {
+                verified,
+                verification: TransitCallerVerification::FabricPeer,
+                identity_source: claims.identity_source.clone(),
+                user_identity_hash: fabric.principal_hash.clone(),
+                did: None,
+                fields: if verified {
+                    claims
+                        .caller_context_fields
+                        .clone()
+                } else {
+                    serde_json::Map::new()
+                },
+                fabric: Some(fabric.into()),
+            };
+        }
+        let verified = claims
+            .user_identity_hash
+            .is_some();
+        let did = claims.sub.clone();
+        if !verified && did.is_none() {
+            return Self::anonymous();
+        }
+        Self {
+            verified,
+            verification: if verified {
+                TransitCallerVerification::TransitToken
+            } else {
+                TransitCallerVerification::Unverified
+            },
+            identity_source: claims.identity_source.clone(),
+            user_identity_hash: claims
+                .user_identity_hash
+                .clone(),
+            did,
+            fields: if verified {
+                claims
+                    .caller_context_fields
+                    .clone()
+            } else {
+                serde_json::Map::new()
+            },
+            fabric: None,
+        }
+    }
+}
+
+/// What authenticated the client of a Transit Point call. Serialized as
+/// `verification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitClientVerification {
+    /// The Transit Point verified the client's resource-server token
+    /// (`mcp_http.authorization`) on this request.
+    ResourceToken,
+    /// The Transit Point's own `source_auth` verified the client's credential
+    /// on this request.
+    SourceAuth,
+}
+
+/// `input.transit.client`: the principal the Transit Point authenticated
+/// itself, and how.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransitClientContext {
+    pub verification: TransitClientVerification,
+    /// The source-auth method that verified the credential (`jwt_bearer`,
+    /// `api_key`, `did_auth`, `mtls`).
+    pub method: String,
+    /// The client's identity hash
+    /// ([`AuthenticatedIdentity::principal_hash`](crate::source_auth::AuthenticatedIdentity::principal_hash)).
+    /// Absent for a credential that names no subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_identity_hash: Option<String>,
+    /// The verified principal itself. Absent with the hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl TransitClientContext {
+    /// A client `verification` authenticated on a surface of `tenant_id`.
+    pub fn new(
+        identity: &crate::source_auth::AuthenticatedIdentity,
+        verification: TransitClientVerification,
+        tenant_id: Option<&str>,
+    ) -> Self {
+        let user_identity_hash = identity.principal_hash(tenant_id);
+        Self {
+            verification,
+            method: identity.method().to_string(),
+            subject: user_identity_hash
+                .as_ref()
+                .map(|_| {
+                    identity
+                        .principal()
+                        .to_string()
+                }),
+            user_identity_hash,
+        }
+    }
 }
 
 impl PolicyInput {
@@ -95,7 +326,9 @@ impl PolicyInput {
     /// `agent.did_verified` / `did_verification`; a payload-asserted
     /// `agent.did` equal to the resolved extension DID is marked verified when
     /// the extension identity is. No-op when `agent.did` is already set to a
-    /// different DID or `extension_identity.did` is missing.
+    /// different DID or `extension_identity.did` is missing. On inbound
+    /// `from_api_key` surfaces the direct path binds `agent.did` to the
+    /// presented key's DID with [`AgentContext::bind_caller_did`] first.
     pub fn normalize_caller_did(&mut self) {
         let Some((ext_did, verification)) = self
             .extension_identity
@@ -300,6 +533,45 @@ pub struct AgentContext {
     pub tr_identity_mismatch: bool,
 }
 
+impl AgentContext {
+    /// Make `did` the gateway-resolved caller DID, replacing any DID the
+    /// request body asserted, or clear it when no caller identity was
+    /// resolved. When the DID changes or no caller identity was resolved,
+    /// everything the body asserted or the gateway verified about the previous
+    /// DID (trust registry, provider, authority, issuer, Agent DNA and trust
+    /// verification) is dropped, so the caller cannot choose them.
+    pub fn bind_caller_did(
+        &mut self,
+        extension_identity: Option<&ExtensionIdentityContext>,
+    ) {
+        let resolved = extension_identity.and_then(|e| {
+            e.did
+                .clone()
+                .map(|did| (did, e.verification))
+        });
+        let resolved_did = resolved
+            .as_ref()
+            .map(|(did, _)| did.as_str());
+        if resolved_did.is_none() || self.did.as_deref() != resolved_did {
+            self.trust_verification = None;
+            self.source_trust_verification = None;
+            self.target_trust_verification = None;
+            self.agent_dna = None;
+            self.trust_registry_did = None;
+            self.provider_did = None;
+            self.authority_did = None;
+            self.identity_issuer_did = None;
+        }
+        self.did_verified = resolved
+            .as_ref()
+            .is_some_and(|(_, v)| v.is_verified());
+        self.did_verification = resolved
+            .as_ref()
+            .map(|(_, v)| *v);
+        self.did = resolved.map(|(did, _)| did);
+    }
+}
+
 // ── Context types (moved from gateway_manager.rs) ──────────
 
 /// Gateway-level policy context added to `input.gateway` in Rego
@@ -366,11 +638,11 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
     fn from(identity: &crate::source_auth::AuthenticatedIdentity) -> Self {
         use crate::source_auth::AuthenticatedIdentity;
         match identity {
-            AuthenticatedIdentity::JwtBearer { subject, claims } => SourceAuthContext::JwtBearer {
+            AuthenticatedIdentity::JwtBearer { subject, claims, .. } => SourceAuthContext::JwtBearer {
                 subject: subject.clone(),
                 claims: claims.clone(),
             },
-            AuthenticatedIdentity::ApiKey { key_name } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
+            AuthenticatedIdentity::ApiKey { key_name, .. } => SourceAuthContext::ApiKey { key_name: key_name.clone() },
             AuthenticatedIdentity::DidAuth { did } => SourceAuthContext::DidAuth { did: did.clone() },
             AuthenticatedIdentity::Mtls {
                 principal,
@@ -378,7 +650,7 @@ impl From<&crate::source_auth::AuthenticatedIdentity> for SourceAuthContext {
                 subject_dn,
                 issuer_dn,
                 sans,
-                source: _,
+                ..
             } => SourceAuthContext::Mtls {
                 principal: principal.clone(),
                 fingerprint: fingerprint.clone(),
@@ -409,11 +681,13 @@ pub enum IdentityVerification {
     /// `input.agent.identity_issuer_did`.
     VpUnanchored,
     /// The DID is bound to the source credential this gateway authenticated on
-    /// this request (`from_jwt_claim`).
+    /// this request: `from_jwt_claim`, or an API Key Provider key on an inbound
+    /// `from_api_key` slot.
     SourceAuth,
     /// Nothing in this request proves the DID: `x-identity` payload
-    /// pseudonyms and identities configured on the surface (`static`,
-    /// `from_mtls`, `from_api_key`).
+    /// pseudonyms, identities configured on the surface (`static`,
+    /// `from_mtls`, a stored-key `from_api_key`), and a plain API Key on an
+    /// inbound `from_api_key` slot, shared by every holder of the secret.
     Unverified,
 }
 
@@ -459,11 +733,18 @@ impl serde::Serialize for ExtensionIdentityContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `input.payment`: whether the request is chargeable under the surface's
+/// payment policy, and the rail and price it would be charged at, when known.
+/// Payment is taken after policy, so a denied request is never charged.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PaymentContext {
-    pub verified: bool,
+    pub required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_header: Option<String>,
+    pub rail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
 }
 
 /// Identity binding from an upstream gateway's request-path VP.
@@ -1574,6 +1855,168 @@ allow if {
         let agent = input.agent.as_ref().unwrap();
         assert_eq!(agent.did.as_deref(), Some("did:webvh:from-payload"));
         assert!(!agent.did_verified, "a differing payload DID must never inherit the extension's verification");
+    }
+
+    fn caller_trust_check_entity(
+        input: &PolicyInput
+    ) -> Result<String, crate::trust_registry_verification::template::TemplateError> {
+        crate::trust_registry_verification::template::resolve(
+            crate::trust_registry_verification::predefined_queries::AGENT_POLICY_AGENT_TEMPLATE,
+            &serde_json::json!({ "input": serde_json::to_value(input).unwrap() }),
+        )
+    }
+
+    #[test]
+    fn bind_caller_did_replaces_a_payload_asserted_did() {
+        let mut input = make_input();
+        let mut agent = agent_with_body_assertions("did:web:asserted.example");
+        input.extension_identity = Some(ExtensionIdentityContext {
+            did: Some("did:webvh:key".into()),
+            identity_hash: Some("hash-key".into()),
+            verification: IdentityVerification::SourceAuth,
+        });
+
+        agent.bind_caller_did(
+            input
+                .extension_identity
+                .as_ref(),
+        );
+        input.agent = Some(agent);
+        input.normalize_caller_did();
+
+        let agent = input.agent.as_ref().unwrap();
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:key"));
+        assert!(agent.did_verified);
+        assert_eq!(agent.did_verification, Some(IdentityVerification::SourceAuth));
+        assert_eq!(caller_trust_check_entity(&input).unwrap(), "did:webvh:key");
+        assert_body_assertions_dropped(agent);
+    }
+
+    fn agent_with_body_assertions(did: &str) -> AgentContext {
+        let mut agent = agent_with_did(did);
+        agent.trust_verification = Some(true);
+        agent.source_trust_verification = Some(true);
+        agent.target_trust_verification = Some(true);
+        agent.trust_registry_did = Some("did:web:registry.example".into());
+        agent.provider_did = Some("did:web:provider.example".into());
+        agent.authority_did = Some("did:web:authority.example".into());
+        agent.identity_issuer_did = Some("did:web:issuer.example".into());
+        agent.agent_dna = Some(crate::identity::uai::types::AgentDna {
+            uai: "uai:asserted".into(),
+            ..Default::default()
+        });
+        agent
+    }
+
+    fn assert_body_assertions_dropped(agent: &AgentContext) {
+        assert_eq!(agent.trust_verification, None);
+        assert_eq!(agent.source_trust_verification, None);
+        assert_eq!(agent.target_trust_verification, None);
+        assert_eq!(agent.trust_registry_did, None);
+        assert_eq!(agent.provider_did, None);
+        assert_eq!(agent.authority_did, None);
+        assert_eq!(agent.identity_issuer_did, None);
+        assert!(agent.agent_dna.is_none());
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_about_another_did() {
+        let mut agent = agent_with_body_assertions("did:web:asserted.example");
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_without_naming_a_did() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_drops_what_the_body_asserted_when_no_did_is_named_or_resolved() {
+        let mut agent = agent_with_body_assertions("did:web:unused.example");
+        agent.did = None;
+
+        agent.bind_caller_did(None);
+
+        assert_eq!(agent.did, None);
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, None);
+        assert_body_assertions_dropped(&agent);
+    }
+
+    #[test]
+    fn bind_caller_did_keeps_what_the_body_asserted_about_the_same_did() {
+        let mut agent = agent_with_body_assertions("did:webvh:caller");
+
+        agent.bind_caller_did(Some(&extension_identity(false)));
+
+        assert_eq!(agent.did.as_deref(), Some("did:webvh:caller"));
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, Some(IdentityVerification::Unverified));
+        assert_eq!(agent.trust_verification, Some(true));
+        assert_eq!(agent.source_trust_verification, Some(true));
+        assert_eq!(agent.target_trust_verification, Some(true));
+        assert_eq!(
+            agent
+                .trust_registry_did
+                .as_deref(),
+            Some("did:web:registry.example")
+        );
+        assert_eq!(agent.provider_did.as_deref(), Some("did:web:provider.example"));
+        assert_eq!(agent.authority_did.as_deref(), Some("did:web:authority.example"));
+        assert_eq!(
+            agent
+                .identity_issuer_did
+                .as_deref(),
+            Some("did:web:issuer.example")
+        );
+        assert_eq!(
+            agent
+                .agent_dna
+                .as_ref()
+                .map(|dna| dna.uai.as_str()),
+            Some("uai:asserted")
+        );
+    }
+
+    #[test]
+    fn bind_caller_did_clears_the_did_when_no_caller_was_resolved() {
+        let mut input = make_input();
+        let mut agent = agent_with_did("did:web:asserted.example");
+        agent.did_verified = true;
+        agent.did_verification = Some(IdentityVerification::Vp);
+        agent.trust_verification = Some(true);
+
+        agent.bind_caller_did(None);
+        input.agent = Some(agent);
+        input.normalize_caller_did();
+
+        let agent = input.agent.as_ref().unwrap();
+        assert_eq!(agent.did, None);
+        assert!(!agent.did_verified);
+        assert_eq!(agent.did_verification, None);
+        assert_eq!(agent.trust_verification, None);
+        assert!(caller_trust_check_entity(&input).is_err());
+    }
+
+    #[test]
+    fn caller_trust_check_entity_is_the_payload_did_without_binding() {
+        let mut input = make_input();
+        input.extension_identity = Some(extension_identity(true));
+        input.agent = Some(agent_with_did("did:web:asserted.example"));
+
+        input.normalize_caller_did();
+
+        assert_eq!(caller_trust_check_entity(&input).unwrap(), "did:web:asserted.example");
     }
 
     fn identity_policy_input_json(verified: bool) -> serde_json::Value {

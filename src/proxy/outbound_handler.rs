@@ -31,6 +31,7 @@ use crate::a2a::create_error_response;
 use crate::config::ChannelProtocol;
 use crate::config::agent_surface::SharedTransitConfig;
 use crate::config::agent_surface::TransitPoint;
+use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::state::OutboundProxyState;
 
@@ -69,14 +70,25 @@ pub(crate) enum OutboundPipelineError {
     #[error("Unknown outbound virtual channel alias: '{0}'")]
     UnknownVirtualChannelAlias(String),
 
+    #[error("{}", .0.message())]
+    VariantRefused(crate::audit::request_events::RoutingRefusal),
+
     #[error("Failed to read request body: {0}")]
     BodyReadFailed(String),
+
+    #[error("Request body too large (max: {0})")]
+    BodyTooLarge(usize),
 
     #[error("Request protocol '{detected}' does not match transit point protocol '{expected}'")]
     ProtocolMismatch { expected: String, detected: String },
 
     #[error("Outbound rate limit exceeded")]
     RateLimitExceeded,
+
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
+    #[error("Rate limit exceeded")]
+    CallerRateLimitExceeded { retry_after: std::time::Duration, mcp_request_id: Option<serde_json::Value> },
 
     #[error("Extension validation failed: {0}")]
     #[allow(dead_code)]
@@ -91,8 +103,10 @@ pub(crate) enum OutboundPipelineError {
     #[error("Header Metadata Mapping failed: {0}")]
     HeaderMetadataMappingFailed(String),
 
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
     #[error("Metadata injection failed")]
-    MetadataInjectionFailed,
+    MetadataInjectionFailed { mcp_request_id: Option<serde_json::Value> },
 
     #[error("MCP request validation failed: {}", .0.message)]
     McpValidation(Box<crate::mcp::request_validation::McpRequestValidationError>),
@@ -128,22 +142,58 @@ pub(crate) enum OutboundPipelineError {
     #[error("Request blocked by surface policy")]
     SurfacePolicyError(crate::observability::PolicyEvaluationError),
 
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
     #[error("Target authentication credentials unavailable")]
-    TargetAuthUnavailable,
+    TargetAuthUnavailable { mcp_request_id: Option<serde_json::Value> },
 
-    #[error("Transit token missing or invalid: {0}")]
+    /// The request's surface variant sets another policy, response policy,
+    /// MCP tool gating or per-caller rate limit on its Transit Point than the
+    /// base surface does; those are enforced only as the base surface
+    /// configures them. Why is logged, never shown to the caller.
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP.
+    #[error("This Transit Point variant is unavailable")]
+    TransitVariantPolicyChanged { mcp_request_id: Option<serde_json::Value> },
+
+    /// Why the token was refused is logged, never shown to the caller.
+    #[error("Transit token missing or invalid")]
     TransitTokenInvalid(String),
+
+    /// How the Transit Point authenticates its callers cannot be enforced, or
+    /// its caller authentication is unavailable, so the request is refused.
+    /// The reason is logged, never shown to the caller. `mcp_request_id` is
+    /// set, to the id the JSON-RPC error answers, when the Transit Point speaks
+    /// MCP.
+    #[error("This Transit Point is unavailable")]
+    TransitPointUnavailable { mcp_request_id: Option<serde_json::Value> },
+
+    /// The Transit Point's `source_auth` refused the caller's credential. Why
+    /// is logged, never shown to the caller. `mcp_request_id` is set, to the id
+    /// the JSON-RPC error answers, when the Transit Point speaks MCP.
+    #[error("Caller credential missing or invalid")]
+    TransitCallerUnauthenticated { mcp_request_id: Option<serde_json::Value> },
 
     #[error("Credential delegation consent required")]
     ConsentRequired(String),
 
-    #[error("Delegated credentials unavailable")]
-    DelegationUnavailable,
+    /// The request's delegated credentials cannot be resolved, so it is refused
+    /// rather than forwarded without them. `mcp_request_id` is set, to the id
+    /// the JSON-RPC error answers, when the Transit Point speaks MCP.
+    #[error("{refusal}")]
+    DelegationRefused { refusal: DelegationRefusal, mcp_request_id: Option<serde_json::Value> },
+
+    /// A grant by binding cannot be released, or the vendor refused it: the
+    /// fixed reason the caller is told, never a URL or the vendor's words.
+    /// `mcp_request_id` is set, to the id the JSON-RPC error answers, when the
+    /// Transit Point speaks MCP; otherwise the answer is a problem JSON.
+    #[error("{}", refusal.message())]
+    GrantRefused { refusal: crate::delegation_vault::release::GrantRefusal, mcp_request_id: Option<serde_json::Value> },
 
     #[error("MCP resource authorization failed")]
     McpResourceAuthorization {
         config: Box<crate::mcp::resource_server::McpResourceServerConfig>,
-        error: crate::mcp::resource_server::ResourceTokenError,
+        error: crate::protocols::protected_resource::ResourceTokenError,
     },
 
     #[error("Upstream request timed out")]
@@ -154,6 +204,12 @@ pub(crate) enum OutboundPipelineError {
 
     #[error("Upstream Fabric stream capacity reached")]
     UpstreamCapacityReached(Option<serde_json::Value>),
+
+    /// Sending the request on over Fabric would take it past the most Fabric
+    /// crossings a request may make. `mcp_request_id` is set, to the id the
+    /// JSON-RPC error answers, when the Transit Point speaks MCP.
+    #[error("The request passed through too many gateways")]
+    FabricChainTooLong { mcp_request_id: Option<serde_json::Value> },
 
     #[error("Failed to read upstream response")]
     UpstreamResponseReadFailed,
@@ -175,10 +231,55 @@ pub(crate) enum OutboundPipelineError {
     IdentityInjectionFailed(String),
 }
 
+/// Why a Transit Point refused a request whose delegated credentials it could
+/// not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum DelegationRefusal {
+    #[error("Delegated credentials need the caller's identity, and this request does not establish one")]
+    CallerIdentityMissing,
+    #[error(
+        "Delegated credentials need the managed agent's identity, and neither this Transit Point's managed \
+         identity nor the transit token establishes one"
+    )]
+    AgentIdentityMissing,
+    #[error("{}", crate::proxy::credential_delegation::DELEGATION_UNAVAILABLE)]
+    Unavailable,
+    /// A caller that arrived over Fabric has no grant yet, and consent is
+    /// never started through a partner: a person consents by connecting to
+    /// this gateway directly.
+    #[error("{}", crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE)]
+    ConsentNotAvailableForPartners,
+}
+
+impl DelegationRefusal {
+    fn status_code(self) -> StatusCode {
+        match self {
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing | Self::ConsentNotAvailableForPartners => {
+                StatusCode::FORBIDDEN
+            }
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    fn jsonrpc_code(self) -> i32 {
+        match self {
+            Self::CallerIdentityMissing | Self::AgentIdentityMissing | Self::ConsentNotAvailableForPartners => -32001,
+            Self::Unavailable => crate::mcp::errors::error_codes::INTERNAL_ERROR,
+        }
+    }
+
+    /// The fixed reason the caller is told, for a refusal that has one.
+    fn reason(self) -> Option<&'static str> {
+        matches!(self, Self::ConsentNotAvailableForPartners)
+            .then_some(crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON)
+    }
+}
+
 impl OutboundPipelineError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::McpValidation(error) => error.status,
+            Self::VariantRefused(refusal) => refusal.status(),
             Self::McpIdentityInvalid | Self::McpBodyRefused(crate::mcp::tool_analyzer::BodyRefusal::Batch) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -198,13 +299,23 @@ impl OutboundPipelineError {
                 StatusCode::BAD_REQUEST
             }
 
+            Self::BodyTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+
             Self::ExtensionValidationFailed(_) | Self::ProtocolMismatch { .. } => StatusCode::UNPROCESSABLE_ENTITY,
 
-            Self::RateLimitExceeded | Self::UpstreamCapacityReached(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::RateLimitExceeded | Self::CallerRateLimitExceeded { .. } | Self::UpstreamCapacityReached(_) => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
 
-            Self::TransitTokenInvalid(_) | Self::ConsentRequired(_) => StatusCode::UNAUTHORIZED,
+            Self::TransitTokenInvalid(_) | Self::TransitCallerUnauthenticated { .. } | Self::ConsentRequired(_) => {
+                StatusCode::UNAUTHORIZED
+            }
 
-            Self::DelegationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TransitPointUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::FabricChainTooLong { .. } => StatusCode::LOOP_DETECTED,
+            Self::TransitVariantPolicyChanged { .. } => StatusCode::FORBIDDEN,
+            Self::DelegationRefused { refusal, .. } => refusal.status_code(),
+            Self::GrantRefused { refusal, .. } => refusal.status(),
             Self::McpResourceAuthorization { error, .. } => error.status_code(),
 
             Self::GatewayPolicyDenied
@@ -221,7 +332,7 @@ impl OutboundPipelineError {
                 IdentityResolutionFailure::BackendUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             },
 
-            Self::TargetAuthUnavailable
+            Self::TargetAuthUnavailable { .. }
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
             | Self::ResponseValidationFailed(_)
@@ -230,7 +341,7 @@ impl OutboundPipelineError {
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
 
             Self::BodyNotAvailable(_)
-            | Self::MetadataInjectionFailed
+            | Self::MetadataInjectionFailed { .. }
             | Self::ResponseBuildFailed
             | Self::IdentityInjectionFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -256,6 +367,77 @@ impl IntoResponse for OutboundPipelineError {
         }
         if let Self::UpstreamCapacityReached(id) = self {
             return crate::proxy::fabric_forward::capacity_response(id);
+        }
+        if let Self::CallerRateLimitExceeded { retry_after, mcp_request_id } = self {
+            let mut response = match mcp_request_id {
+                Some(id) => crate::mcp::request_validation::McpRequestValidationError {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    id: Some(id),
+                    code: -32000,
+                    message: "Rate limit exceeded".to_string(),
+                    data: None,
+                }
+                .into_response(),
+                None => create_error_response(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+            };
+            let whole_seconds = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(whole_seconds));
+            return response;
+        }
+        if let Self::DelegationRefused {
+            refusal,
+            mcp_request_id: Some(id),
+        } = self
+        {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: refusal.status_code(),
+                id: Some(id),
+                code: refusal.jsonrpc_code(),
+                message: refusal.to_string(),
+                data: refusal
+                    .reason()
+                    .map(|reason| serde_json::json!({ "reason": reason })),
+            }
+            .into_response();
+        }
+        if let Self::GrantRefused { refusal, mcp_request_id } = self {
+            return refusal.response(mcp_request_id);
+        }
+        if let Self::DelegationRefused { refusal, mcp_request_id: None } = &self
+            && let Some(reason) = refusal.reason()
+        {
+            return crate::proxy::credential_delegation::refusal_problem(
+                refusal.status_code(),
+                &refusal.to_string(),
+                reason,
+            );
+        }
+        if let Self::TransitCallerUnauthenticated { mcp_request_id: Some(id) } = &self {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: self.status_code(),
+                id: Some(id.clone()),
+                code: -32001,
+                message: self.to_string(),
+                data: None,
+            }
+            .into_response();
+        }
+        if let Self::TransitPointUnavailable { mcp_request_id: Some(id) }
+        | Self::FabricChainTooLong { mcp_request_id: Some(id) }
+        | Self::TransitVariantPolicyChanged { mcp_request_id: Some(id) }
+        | Self::TargetAuthUnavailable { mcp_request_id: Some(id) }
+        | Self::MetadataInjectionFailed { mcp_request_id: Some(id) } = &self
+        {
+            return crate::mcp::request_validation::McpRequestValidationError {
+                status: self.status_code(),
+                id: Some(id.clone()),
+                code: crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                message: self.to_string(),
+                data: None,
+            }
+            .into_response();
         }
         if let Self::McpMetadata { error, body, response } = self {
             return error.into_response(
@@ -310,6 +492,17 @@ pub struct OutboundPipelineContext {
     pub original_method: Method,
     /// Original request headers (minus hop-by-hop), preserved before the request is consumed.
     pub original_headers: HeaderMap,
+    /// Delegated credential headers resolved for this request. Kept apart from the
+    /// managed agent's headers and sent after the agent's headers are filtered, in
+    /// place of any agent header of the same name.
+    pub delegated_credential_headers: HeaderMap,
+    /// The only origin a request carrying a grant by binding may be sent to: its
+    /// provider's `resource`. Set when such a grant is injected; the forward then
+    /// goes through Strict pinned egress to that origin only, never over Fabric.
+    pub grant_destination: Option<url::Origin>,
+    /// The grant by binding the request carries, so a vendor's `401` can be
+    /// answered by a refresh and one retry.
+    pub released_grant: Option<Box<ReleasedGrant>>,
     /// Request path (used to build target URL).
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
@@ -318,7 +511,12 @@ pub struct OutboundPipelineContext {
     pub protocol: Option<ChannelProtocol>,
     pub mcp_metadata_context: crate::mcp::meta::McpMetadataContext,
     pub mcp_classification: Option<crate::mcp::request_validation::McpRequestClassification>,
+    /// The caller this Transit Point authenticated itself, with
+    /// `mcp_http.authorization` or `source_auth`.
     pub authenticated_identity: Option<crate::source_auth::AuthenticatedIdentity>,
+    /// What authenticated `authenticated_identity`, set with it. An identity
+    /// without one is not reported as `input.transit.client`.
+    pub authenticated_by: Option<crate::surface_context::TransitClientVerification>,
     pub mcp_resource_authorization: Option<crate::mcp::resource_server::McpResourceServerConfig>,
     pub modern_delegation: Option<Box<crate::proxy::credential_delegation::modern::PreparedDelegation>>,
     /// Extracted method / tool name / operation identifier.
@@ -330,7 +528,7 @@ pub struct OutboundPipelineContext {
     /// consumes this to synthesize `AGENT_CARD_UNAVAILABLE` results per
     /// configured element instead of executing TRQP probes.
     pub target_agent_card_unavailable: bool,
-    /// Marker: the surface has a non-empty target-leg `trust_check_list`
+    /// Marker: the routed Transit Point's `trust_check_list` is non-empty
     /// (Trust Check active) and the target card's agent identity could not
     /// be established — either the `agent-identity-credential/v1` VP is
     /// absent, or it is present but fails cryptographic verification
@@ -344,8 +542,9 @@ pub struct OutboundPipelineContext {
     pub target_identity_failure: Option<crate::trust_registry_verification::TrustCheckIdentityVerificationFailure>,
     /// Per-leg Trust Check stage results (populated by
     /// `step_trust_check`). Threaded into every outbound OPA evaluation
-    /// via `build_outbound_policy_input`. `None` when the target leg has
-    /// no `trust_check_list` configured for this surface variant.
+    /// via `build_outbound_policy_input`. `None` when the routed Transit
+    /// Point's `trust_check_list` is empty; otherwise the routed Transit
+    /// Point's results under `target`.
     pub trust_check_results: Option<crate::trust_registry_verification::TrustCheckResultsContext>,
     /// Unique request ID for tracing.
     pub request_id: String,
@@ -358,6 +557,11 @@ pub struct OutboundPipelineContext {
     /// Validated transit token claims (populated by step_validate_transit_token).
     /// Carries the original caller context from the inbound request.
     pub transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
+    /// Claims of a valid transit token sent to a Transit Point that does not
+    /// require one. Only `input.transit.caller`, the per-caller rate limit and
+    /// the Fabric hop count read them: delegation, Workload Binding, stream
+    /// expiry and the trace id keep treating the call as carrying no token.
+    pub optional_transit_token_claims: Option<crate::proxy::transit_token::TransitTokenClaims>,
     /// Size in bytes of the upstream response body, captured by
     /// `step_process_response` before the body is consumed. Used by
     /// `step_record_metrics` for per-transit-point throughput accounting.
@@ -366,13 +570,23 @@ pub struct OutboundPipelineContext {
     /// `None` when the request targets the default variant.
     pub active_variant_alias: Option<String>,
     pub active_variant_id: Option<String>,
-    pub variant_resolution_error: Option<crate::config::agent_surface_variants::VariantResolveError>,
+    /// A modern MCP request refused at routing, already recorded. It is
+    /// answered before any other step, once the body has been read for its `id`.
+    pub pending_variant_refusal: Option<crate::audit::request_events::RoutingRefusal>,
+    /// The resolved variant's Transit Point sets another policy, response policy
+    /// or MCP tool gating than the base surface's Transit Point of its alias.
+    pub variant_changes_enforced_policy: bool,
     /// Resolved [`AgentSurface`] for this outbound request, symmetric
     /// to inbound `ProxyState::surface`. Built once per request via
     /// `from_channel_mapping → resolve_variant(alias)` so downstream
     /// consumers can read from the surface while the legacy `channel`
     /// projection remains available during the transition.
     pub surface: Arc<crate::config::agent_surface::AgentSurface>,
+    /// The surface as it is served, its base and every variant, before
+    /// [`Self::surface`] resolved this request's variant: a grant by binding
+    /// is released only within every binding of its Transit Point, wherever
+    /// the surface serves it.
+    pub served_surface: Arc<crate::config::agent_surface::AgentSurface>,
     /// Rules engine scoped to identity management (compiled from managed_identity.extension_rules).
     pub identity_rules_engine: Option<Arc<crate::proxy::RulesEngine>>,
     /// Identity selector with compiled JSON schema (for schema validation and x-identity field extraction).
@@ -392,6 +606,7 @@ impl OutboundPipelineContext {
         addr: SocketAddr,
         req: Request,
         state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
     ) -> Result<Self, OutboundPipelineError> {
         // Read the latest channel state (sub-microsecond lock).
         let cs = state
@@ -423,7 +638,7 @@ impl OutboundPipelineContext {
 
         // Resolve virtual channel. When the route was registered at a
         // custom `listen_path`, the request path no longer follows the
-        // `/outgoing/<route>/<alias>` convention — `state.vc_alias_override`
+        // `/outbound/<route>/<alias>` convention - `state.vc_alias_override`
         // tells us exactly which VC this handler instance serves.
         let path = req.uri().path();
         let surface_for_resolve = cs_surface_for_resolve.clone();
@@ -457,44 +672,16 @@ impl OutboundPipelineContext {
             resolve_virtual_channel(path, &surface_for_resolve)?
         };
 
-        // Resolve the variant from the surface. On failure we fall
-        // back to the unresolved base surface so the request still
-        // proceeds.
-        let active_variant_id = match active_variant_alias.as_deref() {
-            Some(alias) => surface_for_resolve
-                .variants
-                .iter()
-                .find(|variant| variant.enabled && variant.alias == alias)
-                .map(|variant| variant.id.clone()),
-            None => surface_for_resolve
-                .default_variant_id
-                .clone(),
-        };
-        let (surface, variant_resolution_error) =
-            match surface_for_resolve.resolve_variant(active_variant_alias.as_deref()) {
-                Ok(resolved) => {
-                    let error = active_variant_alias
-                        .as_deref()
-                        .filter(|alias| {
-                            !surface_for_resolve
-                                .variants
-                                .iter()
-                                .any(|variant| variant.alias == *alias)
-                        })
-                        .map(|alias| {
-                            crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(alias.to_string())
-                        });
-                    (Arc::new(resolved), error)
+        // The URL's alias, else the default variant, else the base surface
+        // serves the request. A variant that can't be resolved leaves the
+        // request on the unresolved surface, to be refused below.
+        let (active_variant_id, surface, unresolved) =
+            match surface_for_resolve.serve_variant(active_variant_alias.as_deref()) {
+                Ok(served) => {
+                    crate::observability::policy_audit::set_request_variant(&served.recorded);
+                    (served.id, Arc::new(served.surface), None)
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        surface = %cs_surface_for_resolve.name,
-                        alias = ?active_variant_alias,
-                        error = %e,
-                        "AgentSurface variant resolution failed; using base surface"
-                    );
-                    (surface_for_resolve, Some(e))
-                }
+                Err(error) => (None, Arc::clone(&surface_for_resolve), Some(error)),
             };
 
         let virtual_channel = surface
@@ -509,11 +696,52 @@ impl OutboundPipelineContext {
                         .clone(),
                 )
             })?;
-        let outbound_shared = surface
+
+        // The refusal is recorded only once nothing else can fail, so its record
+        // matches the answer. A modern MCP request, whatever its method, is
+        // answered later, once its body is read for the `id`; every other
+        // request now. So a request that reaches any later step and names an
+        // alias always has that alias's `active_variant_id`.
+        let modern_mcp = matched_virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp
+            && crate::mcp::request_validation::has_modern_header(&original_headers, versions);
+        let pending_variant_refusal = match unresolved {
+            None => None,
+            Some(error) => {
+                let rpc_error_code = modern_mcp.then_some(i64::from(crate::mcp::error_codes::INTERNAL_ERROR));
+                let refusal = crate::audit::request_events::refuse_routing(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &surface_for_resolve.surface_id,
+                        channel_name: &surface_for_resolve.name,
+                        trace_id: None,
+                        via_fabric: false,
+                    },
+                    &error,
+                    rpc_error_code,
+                );
+                refusal.warn(&surface_for_resolve);
+                if !modern_mcp {
+                    return Err(OutboundPipelineError::VariantRefused(refusal));
+                }
+                Some(refusal)
+            }
+        };
+        let variant_changes_enforced_policy =
+            changes_enforced_transit_policy(&matched_virtual_channel, &virtual_channel);
+        let base_source_auth = outbound_shared
+            .source_auth
+            .clone();
+        let mut outbound_shared = surface
             .transit
             .as_ref()
             .map(|t| t.shared.clone())
             .unwrap_or(outbound_shared);
+        // A complete variant replaces the shared block; the base source_auth refusal still applies.
+        if outbound_shared
+            .source_auth
+            .is_none()
+        {
+            outbound_shared.source_auth = base_source_auth;
+        }
 
         // Per-VC identity override: when this outbound virtual channel
         // declares its own `managed_identity`, build a per-VC selector
@@ -564,12 +792,16 @@ impl OutboundPipelineContext {
             body_bytes: None,
             original_method,
             original_headers,
+            delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
+            released_grant: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
             mcp_metadata_context: crate::mcp::meta::McpMetadataContext::legacy(surface.mcp_legacy_metadata_output),
             mcp_classification: None,
             authenticated_identity: None,
+            authenticated_by: None,
             mcp_resource_authorization: None,
             modern_delegation: None,
             operation: None,
@@ -582,15 +814,70 @@ impl OutboundPipelineContext {
             _outbound_rules_engine: outbound_rules_engine,
             outbound_response_rules_engine,
             transit_token_claims: None,
+            optional_transit_token_claims: None,
             response_bytes: None,
             active_variant_alias,
             active_variant_id,
-            variant_resolution_error,
+            pending_variant_refusal,
+            variant_changes_enforced_policy,
             surface,
+            served_surface: cs_surface_for_resolve,
             identity_rules_engine,
             identity_selector,
         })
     }
+
+    /// Answers a modern MCP request refused at routing with the JSON-RPC error,
+    /// reading the body within the Transit Point's MCP body limit only to echo
+    /// its `id`. A body that can't be read is answered without one.
+    async fn answer_variant_refusal(
+        &mut self,
+        state: &OutboundProxyState,
+        versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+        refusal: &crate::audit::request_events::RoutingRefusal,
+    ) -> Response {
+        crate::mcp::request_validation::answer_routing_refusal(
+            refusal,
+            self.virtual_channel
+                .mcp_http
+                .as_ref(),
+            &state
+                .network_config
+                .get_outbound_external_urls(),
+            versions,
+            self.request
+                .take()
+                .map(Request::into_body),
+        )
+        .await
+    }
+}
+
+/// Whether `resolved`, a variant's Transit Point, has another policy, response
+/// policy, MCP tool gating or per-caller rate limit than `base`, the base
+/// surface's Transit Point of the same alias. Those are compiled from the base
+/// surface's Transit Points only.
+fn changes_enforced_transit_policy(
+    base: &TransitPoint,
+    resolved: &TransitPoint,
+) -> bool {
+    let serialized = |policy: &Option<crate::config::agent_surface::PolicyRef>| serde_json::to_value(policy).ok();
+    fn gating(point: &TransitPoint) -> Option<&crate::config::agent_surface::McpToolGatingConfig> {
+        point
+            .mcp_tool_gating
+            .as_ref()
+            .filter(|gating| !gating.is_empty())
+    }
+    (gating(resolved).is_some() && gating(base) != gating(resolved))
+        || (resolved.policy.is_some() && serialized(&base.policy) != serialized(&resolved.policy))
+        || (resolved
+            .response_policy
+            .is_some()
+            && serialized(&base.response_policy) != serialized(&resolved.response_policy))
+        || (resolved
+            .per_caller_rate_limit
+            .is_some()
+            && !base.has_same_per_caller_rate_limit(resolved))
 }
 
 // ── Virtual channel resolution ──────────────────────────────────────────────
@@ -598,9 +885,9 @@ impl OutboundPipelineContext {
 /// Extract the transit-point name (and optional surface-variant alias) from
 /// the outbound path and look up the matching outbound virtual channel.
 ///
-/// Path layout:  `/outgoing/<aap-path>[$variant-alias]/<tp-name>[/<remainder>]`
+/// Path layout:  `/outbound/<aap-path>[$variant-alias]/<tp-name>[/<remainder>]`
 ///
-/// Axum provides the full request path including `/outgoing/`. The optional
+/// Axum provides the full request path including `/outbound/`. The optional
 /// `$variant-alias` suffix on the route selects a surface variant; the
 /// variant alias is returned to the caller so it can be threaded through
 /// the pipeline.
@@ -608,7 +895,7 @@ fn resolve_virtual_channel(
     path: &str,
     surface: &crate::config::agent_surface::AgentSurface,
 ) -> Result<(TransitPoint, Option<String>), OutboundPipelineError> {
-    // Strip the /outgoing prefix first.
+    // Strip the /outbound prefix first.
     let after_outgoing = path
         .strip_prefix(TP_OUTBOUND_PATH_PREFIX)
         .unwrap_or(path);
@@ -706,9 +993,32 @@ async fn outbound_proxy_handler_with_mcp_versions(
     req: Request,
     versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
 ) -> Result<Response, OutboundPipelineError> {
+    use crate::observability::policy_audit::{RequestScope, in_request, response_in_request};
+
+    let scope = RequestScope::fresh();
+    in_request(scope.clone(), Box::pin(outbound_proxy_handler_in_request_scope(addr, state, req, versions)))
+        .await
+        .map(|response| response_in_request(scope, response))
+}
+
+async fn outbound_proxy_handler_in_request_scope(
+    addr: SocketAddr,
+    state: OutboundProxyState,
+    req: Request,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+) -> Result<Response, OutboundPipelineError> {
     let mut subscription_access =
         crate::mcp::subscriptions::SubscriptionLifetime::new(std::time::Duration::from_secs(86_400), None);
-    let mut ctx = OutboundPipelineContext::new(addr, req, &state)?;
+    let mut ctx = OutboundPipelineContext::new(addr, req, &state, versions)?;
+    step_provider_key_gate(&mut ctx).await?;
+    if let Some(refusal) = ctx
+        .pending_variant_refusal
+        .take()
+    {
+        return Ok(ctx
+            .answer_variant_refusal(&state, versions, &refusal)
+            .await);
+    }
 
     step_source_auth(&state, &mut ctx).await?;
 
@@ -725,30 +1035,18 @@ async fn outbound_proxy_handler_with_mcp_versions(
         return Ok(response);
     }
 
-    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) = ctx
+    step_refuse_variant_changing_enforced_policy(&ctx)?;
+
+    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(_)) = ctx
         .mcp_classification
         .as_ref()
     {
-        if let Some(error) = ctx
-            .variant_resolution_error
-            .as_ref()
-        {
-            let status = match error {
-                crate::config::agent_surface_variants::VariantResolveError::UnknownAlias(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            return Err(OutboundPipelineError::McpValidation(Box::new(
-                crate::mcp::request_validation::McpRequestValidationError {
-                    status,
-                    id: request.id.clone(),
-                    code: crate::mcp::error_codes::INTERNAL_ERROR,
-                    message: "MCP Transit Point variant is unavailable".into(),
-                    data: None,
-                },
-            )));
-        }
         step_validate_transit_token(&state, &mut ctx).await?;
     }
+
+    // A call that would take the request past the Fabric hop limit is refused
+    // before anything is resolved or forwarded for it.
+    step_check_fabric_hops(&ctx)?;
 
     let subscription_lifetime = match ctx
         .mcp_classification
@@ -832,11 +1130,9 @@ async fn outbound_proxy_handler_with_mcp_versions(
     // [7] Custom Metadata Injection
     step_inject_custom_metadata(&state, &mut ctx).await?;
 
-    // Public/discovery paths (agent card, UCP well-known) are metadata-
-    // only GETs — skip trust context, trust check, and OPA evaluation.
-    let is_discovery = ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path);
-
-    if !is_discovery {
+    // Public discovery reads (agent card, UCP well-known) are metadata-only
+    // reads — skip trust context, trust check, and OPA evaluation.
+    if !is_transit_discovery_read(&ctx) {
         // [8] Trust Context Collection
         step_collect_trust_context(&state, &mut ctx).await?;
 
@@ -866,9 +1162,19 @@ async fn outbound_proxy_handler_with_mcp_versions(
     step_inject_credentials(&state, &mut ctx).await?;
 
     request_uncompressed_extended_agent_card(&mut ctx);
+    request_uncompressed_mcp_response(&mut ctx);
 
-    // [12] Forward Request
-    let upstream_response = step_forward_request(&state, &mut ctx).await?;
+    // [12] Forward Request. A target that cannot be reached, or whose response
+    // cannot be read, is recorded as a failed call.
+    let upstream_response = match step_forward_request(&state, &mut ctx).await {
+        Ok(response) => response,
+        Err(error) => {
+            step_record_metrics(&state, &ctx, false);
+            return Err(error);
+        }
+    };
+    let upstream_response = step_answer_a_refused_grant(&state, &mut ctx, upstream_response).await?;
+    refuse_a_compressed_mcp_answer(&ctx, &upstream_response)?;
 
     if matches!(
         ctx.mcp_classification
@@ -883,10 +1189,22 @@ async fn outbound_proxy_handler_with_mcp_versions(
     }
 
     // [13] Response Processing
-    let processed_response = step_process_response(&state, &mut ctx, upstream_response).await?;
+    let processed_response = match step_process_response(&state, &mut ctx, upstream_response).await {
+        Ok(response) => response,
+        Err(error) => {
+            step_record_metrics(&state, &ctx, false);
+            return Err(error);
+        }
+    };
 
     // [13] Metrics & Logging (never fails)
-    step_record_metrics(&state, &ctx);
+    step_record_metrics(
+        &state,
+        &ctx,
+        processed_response
+            .status()
+            .is_success(),
+    );
 
     Ok(processed_response)
 }
@@ -896,6 +1214,27 @@ async fn outbound_proxy_handler_with_mcp_versions(
 // Each step is an independent `async fn`. Steps that are not yet
 // implemented are stubs returning `Ok(())`.
 
+/// Refuse a request whose surface variant sets another policy, response policy,
+/// MCP tool gating or per-caller rate limit on its Transit Point than the base
+/// surface does, before anything is sent to the target: those are enforced only
+/// as the base surface configures them.
+fn step_refuse_variant_changing_enforced_policy(ctx: &OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
+    if !ctx.variant_changes_enforced_policy {
+        return Ok(());
+    }
+    warn!(
+        request_id = %ctx.request_id,
+        transit_point = %ctx.virtual_channel.alias,
+        variant = ?ctx.active_variant_alias,
+        "Transit Point request refused: its surface variant changes the Transit Point's policy, response \
+         policy, MCP tool gating or per-caller rate limit, which are enforced only as the base surface \
+         configures them"
+    );
+    Err(OutboundPipelineError::TransitVariantPolicyChanged {
+        mcp_request_id: mcp_refusal_id(ctx),
+    })
+}
+
 /// [0] Transit Token Validation — verifies the `X-Transit-Token` header.
 ///
 /// Per §5.5 of the Agent Surface Design, transit calls MUST include a valid
@@ -903,38 +1242,41 @@ async fn outbound_proxy_handler_with_mcp_versions(
 /// carries the caller context (who initiated the inbound request) and is bound
 /// to specific transit points.
 ///
-/// Without a valid transit token, the request is rejected with 401 Unauthorized.
+/// Without a valid transit token, the request is rejected with 401 Unauthorized,
+/// and why is logged.
 async fn step_validate_transit_token(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    // Public/discovery endpoints (agent card, `.well-known/*`) are unauthenticated
-    // metadata GETs. The transit token is a transit-point *authorization* control,
-    // so it doesn't apply to them — mirroring the discovery bypass the later
+    let validated = validate_transit_token(state, ctx).await;
+    if let Err(OutboundPipelineError::TransitTokenInvalid(reason)) = &validated {
+        warn!(
+            request_id = %ctx.request_id,
+            transit_point = %ctx.virtual_channel.alias,
+            reason = %reason,
+            "Transit token refused"
+        );
+    }
+    validated
+}
+
+async fn validate_transit_token(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(), OutboundPipelineError> {
+    // Public discovery reads (a GET or HEAD of an agent card or other discovery
+    // document at the Transit Point's root) are unauthenticated metadata reads.
+    // The transit token is a transit-point *authorization* control, so it
+    // doesn't apply to them — mirroring the discovery bypass the later
     // identity/trust-context/trust-check/OPA stages already use. Without this an
     // agent-card fetch through a transit point is rejected for a missing
     // `X-Transit-Token` before it can reach those bypasses. The trace id stays the
     // one `OutboundContext::new` derived (no token to adopt one from), which is
-    // fine for a standalone metadata GET.
-    if ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path) {
+    // fine for a standalone metadata read.
+    if is_transit_discovery_read(ctx) {
         debug!(
             request_id = %ctx.request_id,
             "Transit token validation skipped for public discovery path"
-        );
-        return Ok(());
-    }
-
-    if !ctx
-        .virtual_channel
-        .require_transit_token
-    {
-        // Per-TP opt-out: this transit point is configured to accept
-        // calls without a transit token (e.g. dev/testing or a TP whose
-        // callers cannot carry one).
-        debug!(
-            request_id = %ctx.request_id,
-            alias = %ctx.virtual_channel.alias,
-            "Transit token enforcement disabled for this transit point, skipping validation"
         );
         return Ok(());
     }
@@ -944,18 +1286,58 @@ async fn step_validate_transit_token(
             .as_ref(),
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(_))
     );
+
+    if !ctx
+        .virtual_channel
+        .require_transit_token
+    {
+        // Per-TP opt-out: this transit point is configured to accept
+        // calls without a transit token (e.g. dev/testing or a TP whose
+        // callers cannot carry one). A token the agent sends anyway is still
+        // checked so policy and the per-caller rate limit see the caller it
+        // names, and only those: it does not drive delegation, Workload
+        // Binding, stream expiry or the trace id. One that does not verify is ignored and the caller stays
+        // anonymous. Each pass replaces the last, so a token the first pass
+        // accepted within the clock leeway and the strict modern MCP pass
+        // refuses no longer names the caller.
+        ctx.optional_transit_token_claims = None;
+        let mut tokens = ctx
+            .original_headers
+            .get_all("x-transit-token")
+            .iter();
+        let token = match (tokens.next(), tokens.next()) {
+            (Some(value), None) => value.to_str().ok(),
+            _ => None,
+        };
+        match state
+            .transit_token_issuer
+            .as_ref()
+            .zip(token)
+        {
+            Some((issuer, token)) => match verify_transit_token(ctx, issuer, token, modern) {
+                Ok(claims) => ctx.optional_transit_token_claims = Some(claims),
+                Err(OutboundPipelineError::TransitTokenInvalid(reason)) => debug!(
+                    request_id = %ctx.request_id,
+                    alias = %ctx.virtual_channel.alias,
+                    reason = %reason,
+                    "Optional transit token did not verify, caller treated as anonymous"
+                ),
+                Err(_) => {}
+            },
+            None => debug!(
+                request_id = %ctx.request_id,
+                alias = %ctx.virtual_channel.alias,
+                "Transit token enforcement disabled for this transit point, skipping validation"
+            ),
+        }
+        return Ok(());
+    }
+
     if modern {
         ctx.transit_token_claims = None;
     }
     let Some(ref issuer) = state.transit_token_issuer else {
-        if modern {
-            return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
-        }
-        // Transit token issuer not configured — skip validation.
-        // This allows the outbound pipeline to degrade gracefully when the
-        // gateway is not configured for transit token enforcement.
-        debug!(request_id = %ctx.request_id, "Transit token issuer not configured, skipping validation");
-        return Ok(());
+        return Err(OutboundPipelineError::TransitTokenInvalid("Transit token validation is unavailable".into()));
     };
 
     if modern
@@ -983,10 +1365,28 @@ async fn step_validate_transit_token(
         return Err(OutboundPipelineError::TransitTokenInvalid("missing X-Transit-Token header".to_string()));
     };
 
-    // Validate the token and check it's authorized for this specific transit point.
+    let claims = verify_transit_token(ctx, issuer, token, modern)?;
+    adopt_transit_token(ctx, claims);
+    Ok(())
+}
+
+/// Validates the token and checks it was issued for this surface, lives no
+/// longer than the surface now allows, and opens this transit point.
+fn verify_transit_token(
+    ctx: &OutboundPipelineContext,
+    issuer: &crate::proxy::transit_token::TransitTokenIssuer,
+    token: &str,
+    modern: bool,
+) -> Result<crate::proxy::transit_token::TransitTokenClaims, OutboundPipelineError> {
     let transit_point_name = &ctx.virtual_channel.alias;
     let claims = issuer
-        .validate_for_transit_point(token, transit_point_name)
+        .validate_for_transit_point(
+            token,
+            &ctx.surface.surface_id,
+            transit_point_name,
+            ctx.surface
+                .transit_token_lifetime_secs(),
+        )
         .map_err(|e| OutboundPipelineError::TransitTokenInvalid(e.to_string()))?;
 
     if modern {
@@ -996,13 +1396,7 @@ async fn step_validate_transit_token(
                 OutboundPipelineError::TransitTokenInvalid("Transit token validation clock is unavailable".into())
             })?
             .as_secs();
-        if claims.surface_id != ctx.surface.surface_id
-            || claims.surface_id.is_empty()
-            || claims.exp <= now
-            || claims.iat > now
-            || claims.exp <= claims.iat
-            || claims.jti.is_empty()
-        {
+        if claims.exp <= now || claims.iat > now {
             return Err(OutboundPipelineError::TransitTokenInvalid(
                 "Transit token is not live for this surface".into(),
             ));
@@ -1016,7 +1410,14 @@ async fn step_validate_transit_token(
         transit_point = %transit_point_name,
         "Transit token validated successfully"
     );
+    Ok(claims)
+}
 
+/// Records a verified transit token's claims on the request.
+fn adopt_transit_token(
+    ctx: &mut OutboundPipelineContext,
+    claims: crate::proxy::transit_token::TransitTokenClaims,
+) {
     // Continue the originating inbound request's trace across the transit hop.
     // The inbound pipeline stamped its `trace_id` into this token; reusing it
     // (over the fresh id minted in `OutboundContext::new`) keeps one end-to-end
@@ -1028,20 +1429,101 @@ async fn step_validate_transit_token(
     }
 
     ctx.transit_token_claims = Some(claims);
-    Ok(())
 }
 
+/// The Fabric crossings a call to a `fabric://` target makes: one more than
+/// the managed agent's Fabric-issued transit token records, required or not,
+/// or the first for any other token or none. A call that would pass the limit
+/// is refused, so nothing is resolved or forwarded for it.
+fn outgoing_fabric_hops(ctx: &OutboundPipelineContext) -> Result<u8, OutboundPipelineError> {
+    crate::proxy::fabric_hops::next_fabric_hops(
+        ctx.transit_token_claims
+            .as_ref()
+            .or(ctx
+                .optional_transit_token_claims
+                .as_ref())
+            .and_then(|claims| claims.fabric.as_ref())
+            .map(|fabric| fabric.hops),
+    )
+    .ok_or_else(|| OutboundPipelineError::FabricChainTooLong {
+        mcp_request_id: mcp_refusal_id(ctx),
+    })
+}
+
+/// Refuses a call to a `fabric://` target that would take the request past
+/// the most Fabric crossings it may make, before anything is resolved for it,
+/// and records it as a `request_rejected` at the `forward` stage.
+fn step_check_fabric_hops(ctx: &OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
+    if !ctx
+        .virtual_channel
+        .target_endpoint
+        .starts_with("fabric://")
+    {
+        return Ok(());
+    }
+    outgoing_fabric_hops(ctx)
+        .map(|_| ())
+        .inspect_err(|refusal| {
+            warn!(
+                request_id = %ctx.request_id,
+                transit_point = %ctx.virtual_channel.alias,
+                "Refusing a Transit Point call that would pass the Fabric hop limit"
+            );
+            crate::audit::request_events::request_rejected(
+                &transit_audit_facts(ctx),
+                crate::audit::request_events::RejectionStage::Forward,
+                crate::audit::request_events::RejectionReason::FabricChainTooLong,
+                refusal.status_code().as_u16(),
+                mcp_refusal_id(ctx).map(|_| i64::from(crate::mcp::errors::error_codes::INTERNAL_ERROR)),
+            );
+        })
+}
+
+/// Caller authentication, before anything else reads or forwards the request.
+/// A Transit Point whose caller authentication cannot be enforced
+/// ([`TransitPoint::unenforceable_caller_authentication`]), or whose surface
+/// sets `transit.source_auth`, which the gateway does not enforce, has every
+/// request refused. An MCP Transit Point with `mcp_http.authorization` requires
+/// its resource access token, and one with `source_auth` the credential it
+/// names, which is never forwarded. The transit token is checked next.
 async fn step_source_auth(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
+    let unenforceable = if ctx
+        .outbound_shared
+        .source_auth
+        .is_some()
+    {
+        Some(crate::config::agent_surface::TRANSIT_SOURCE_AUTH_REFUSED.to_string())
+    } else {
+        ctx.virtual_channel
+            .unenforceable_caller_authentication()
+    };
+    if let Some(reason) = unenforceable {
+        warn!(
+            request_id = %ctx.request_id,
+            surface_id = %ctx.surface.surface_id,
+            transit_point = %ctx.virtual_channel.alias,
+            reason = %reason,
+            "Transit Point request refused: its caller authentication cannot be enforced"
+        );
+        return Err(transit_point_unavailable(ctx));
+    }
+    if let Some(source_auth) = ctx
+        .virtual_channel
+        .source_auth
+        .clone()
+    {
+        return authenticate_transit_caller(state, ctx, &source_auth).await;
+    }
     if let Some(authorization) = ctx
         .virtual_channel
         .mcp_http
         .as_ref()
         .and_then(|http| http.authorization.as_ref())
     {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
 
         let fail = |error| OutboundPipelineError::McpResourceAuthorization {
             config: Box::new(authorization.clone()),
@@ -1093,10 +1575,6 @@ async fn step_source_auth(
             .map(|listener| listener.external_urls.clone())
             .unwrap_or_default();
         if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp
-            || ctx
-                .outbound_shared
-                .source_auth
-                .is_some()
             || authorization
                 .validate_endpoint(&origins, &base_path)
                 .is_err()
@@ -1130,19 +1608,141 @@ async fn step_source_auth(
                 .remove(axum::http::header::AUTHORIZATION);
         }
         ctx.authenticated_identity = Some(identity);
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
         ctx.mcp_resource_authorization = Some(authorization);
-        return Ok(());
     }
-    if ctx
-        .outbound_shared
-        .source_auth
-        .is_none()
-    {
-        return Ok(());
-    }
-    // Future: delegate to SourceAuthMiddleware.
-    debug!(request_id = %ctx.request_id, "step_source_auth: source_auth present but not yet enforced (MVP)");
     Ok(())
+}
+
+/// Authenticates the caller with the Transit Point's `source_auth`, as the
+/// Access Point does. A missing or refused credential is refused with `401`,
+/// and a check the gateway cannot run with `503`; why is logged. The
+/// credential's header is removed, so it never reaches the target.
+async fn authenticate_transit_caller(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    source_auth: &crate::source_auth::SourceAuthConfig,
+) -> Result<(), OutboundPipelineError> {
+    let middleware = crate::source_auth::middleware::require_installed(
+        state
+            .source_auth_middleware
+            .clone(),
+    )
+    .map_err(|error| caller_authentication_unavailable(ctx, &error))?;
+    // A Transit Point publishes no protected resource metadata, so its
+    // `source_auth` keeps the audiences it names.
+    let config = crate::source_auth::middleware::resolve_surface_audience(
+        source_auth,
+        None,
+        state.vc_issuer.as_deref(),
+        &ctx.surface.surface_id,
+    )
+    .await
+    .map_err(|error| caller_authentication_unavailable(ctx, &error))?;
+    let peer_cert = ctx
+        .request
+        .as_ref()
+        .and_then(|request| {
+            request
+                .extensions()
+                .get::<crate::source_auth::models::PeerCertInfo>()
+        });
+    let view = crate::didauth::sessions::SessionView {
+        surface_id: &ctx.surface.surface_id,
+        variant_id: ctx
+            .active_variant_id
+            .as_deref(),
+    };
+    let authenticated = middleware
+        .authenticate(&config, &ctx.original_headers, &ctx.surface.name, view, peer_cert)
+        .await;
+    match authenticated {
+        Ok(identity) => {
+            if let Some(header) = config.credential_header_name() {
+                ctx.original_headers
+                    .remove(header);
+                if let Some(request) = ctx.request.as_mut() {
+                    request
+                        .headers_mut()
+                        .remove(header);
+                }
+            }
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            Ok(())
+        }
+        Err(error) if error.is_caller_attributable() => {
+            warn!(
+                request_id = %ctx.request_id,
+                surface_id = %ctx.surface.surface_id,
+                transit_point = %ctx.virtual_channel.alias,
+                method = config.method_tag(),
+                error = ?error,
+                "Transit Point caller authentication failed"
+            );
+            crate::audit::request_events::auth_failed(
+                &transit_audit_facts(ctx),
+                crate::audit::request_events::source_auth_scheme(&config),
+                crate::audit::request_events::source_auth_reason(&error),
+                true,
+                Some(ctx.remote_addr.ip()),
+            );
+            Err(OutboundPipelineError::TransitCallerUnauthenticated {
+                mcp_request_id: mcp_id_before_body(ctx),
+            })
+        }
+        Err(error) => Err(caller_authentication_unavailable(ctx, &error)),
+    }
+}
+
+fn caller_authentication_unavailable(
+    ctx: &OutboundPipelineContext,
+    error: &crate::source_auth::errors::SourceAuthError,
+) -> OutboundPipelineError {
+    warn!(
+        request_id = %ctx.request_id,
+        surface_id = %ctx.surface.surface_id,
+        transit_point = %ctx.virtual_channel.alias,
+        error = ?error,
+        "Transit Point caller authentication is unavailable"
+    );
+    transit_point_unavailable(ctx)
+}
+
+/// Refuses every request through a Transit Point of a surface that derives a
+/// DID from an API key it may not use, as its Access Point is refused.
+async fn step_provider_key_gate(ctx: &mut OutboundPipelineContext) -> Result<(), OutboundPipelineError> {
+    let surface = ctx.surface.clone();
+    let Some(reason) = crate::identity::provider_key_gate::gate()
+        .refuses(&surface)
+        .await
+    else {
+        return Ok(());
+    };
+    warn!(
+        request_id = %ctx.request_id,
+        surface_id = %ctx.surface.surface_id,
+        transit_point = %ctx.virtual_channel.alias,
+        rule = crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
+        reason = reason.as_str(),
+        "Transit Point request refused: the surface is not ready"
+    );
+    Err(transit_point_unavailable(ctx))
+}
+
+/// Refuses a request the Transit Point cannot serve; on an MCP Transit Point
+/// as a JSON-RPC error, sent before the request id is read.
+fn transit_point_unavailable(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    OutboundPipelineError::TransitPointUnavailable {
+        mcp_request_id: mcp_id_before_body(ctx),
+    }
+}
+
+/// The JSON-RPC id of a refusal sent before the request body is read: `null`
+/// on an MCP Transit Point, none otherwise.
+fn mcp_id_before_body(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
+    (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp)
+        .then_some(serde_json::Value::Null)
 }
 
 /// [4] Agent Identity Resolution — extracts, validates, and resolves the
@@ -1215,7 +1815,7 @@ async fn step_resolve_agent_identity(
     // so body-based identity extraction would always fail with 422. Skip
     // identity resolution entirely — the response-path agent card rewrite
     // still runs.
-    if ctx.original_method == Method::GET && crate::proxy::paths::is_public_path(&ctx.request_path) {
+    if is_transit_discovery_read(ctx) {
         debug!(
             request_id = %ctx.request_id,
             "Outbound: public discovery path — skipping identity resolution"
@@ -1239,11 +1839,7 @@ async fn step_resolve_agent_identity(
     // credential (mTLS cert, API key) or fixed. Resolve them here so the
     // pipeline does not insist on parsing a JSON body when none is expected.
     let cred_id_start = Instant::now();
-    let cred_id_channel = ctx
-        .surface
-        .config_id()
-        .unwrap_or("unknown")
-        .to_string();
+    let cred_id_channel = ctx.surface.name.clone();
     let mode_label = match managed_identity {
         crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_) => "payload_extraction",
         crate::source_auth::ManagedIdentityConfig::FromMtls { .. } => "from_mtls",
@@ -1636,16 +2232,20 @@ async fn step_rate_limit(
         .virtual_channel
         .rate_limit
         .is_some();
-    if !channel_rl && !vc_rl {
-        return Ok(());
-    }
-
     let Some(pm) = state.policy_manager.as_ref() else {
-        // Rate limit configured but no policy manager — log and allow.
-        warn!(
-            request_id = %ctx.request_id,
-            "Outbound rate limit configured but SurfacePolicyManager not available"
-        );
+        if channel_rl
+            || vc_rl
+            || ctx
+                .virtual_channel
+                .per_caller_rate_limit
+                .is_some()
+        {
+            // Rate limit configured but no policy manager — log and allow.
+            warn!(
+                request_id = %ctx.request_id,
+                "Outbound rate limit configured but SurfacePolicyManager not available"
+            );
+        }
         return Ok(());
     };
 
@@ -1653,6 +2253,50 @@ async fn step_rate_limit(
         .surface
         .config_id()
         .unwrap_or("unknown");
+
+    match pm
+        .caller_rate_limit(config_id, &ctx.virtual_channel.alias)
+        .await
+    {
+        None => {}
+        Some(crate::policies::CallerLimit::Unenforceable) => {
+            warn!(
+                request_id = %ctx.request_id,
+                surface_id = %ctx.surface.surface_id,
+                transit_point = %ctx.virtual_channel.alias,
+                "Transit Point request refused: its per-caller rate limit cannot be enforced"
+            );
+            return Err(transit_point_unavailable(ctx));
+        }
+        // Refused by `step_refuse_variant_changing_enforced_policy` once the
+        // body names the JSON-RPC id, so it spends nothing of its caller's
+        // allowance first.
+        Some(crate::policies::CallerLimit::Enforced(_)) if ctx.variant_changes_enforced_policy => {}
+        Some(crate::policies::CallerLimit::Enforced(limiter)) => {
+            let caller = rate_limit_caller_hash(ctx);
+            if let Err(refusal) = limiter.check(caller.as_deref()) {
+                debug!(request_id = %ctx.request_id, overflow = refusal.overflow, "Outbound rate limit exceeded (per caller)");
+                crate::audit::request_events::transit_point_caller_rate_limited(
+                    &crate::audit::request_events::RequestFacts {
+                        surface_id: &ctx.surface.surface_id,
+                        channel_name: &ctx.surface.name,
+                        trace_id: Some(&ctx.request_id),
+                        via_fabric: ctx
+                            .transit_token_claims
+                            .as_ref()
+                            .is_some_and(|claims| claims.fabric.is_some()),
+                    },
+                    &ctx.virtual_channel.alias,
+                    caller.as_deref(),
+                    refusal,
+                );
+                return Err(OutboundPipelineError::CallerRateLimitExceeded {
+                    retry_after: refusal.retry_after,
+                    mcp_request_id: mcp_id_before_body(ctx),
+                });
+            }
+        }
+    }
 
     if channel_rl {
         pm.check_rate_limit(config_id)
@@ -1727,7 +2371,7 @@ async fn step_extract_protocol_context_with_versions(
             versions,
         ).map_err(|error| {
             error!(request_id = %ctx.request_id, error = %error, "Invalid MCP Transit Point HTTP configuration");
-            OutboundPipelineError::MetadataInjectionFailed
+            metadata_injection_failed(ctx)
         })?)
         } else {
             None
@@ -1747,12 +2391,28 @@ async fn step_extract_protocol_context_with_versions(
             req.into_body(),
             mcp_http
                 .as_ref()
-                .map_or(usize::MAX, |policy| policy.body_limit()),
+                .map_or(state.max_request_bytes, |policy| policy.body_limit()),
         )
         .await
         .map_err(|error| {
             if let Some(policy) = &mcp_http {
-                return OutboundPipelineError::McpValidation(policy.body_read_error(error));
+                let error = policy.body_read_error(error);
+                if error.status == StatusCode::PAYLOAD_TOO_LARGE {
+                    crate::audit::request_events::mcp_request_rejected(
+                        &crate::audit::request_events::RequestFacts {
+                            surface_id: &ctx.surface.surface_id,
+                            channel_name: &ctx.surface.name,
+                            trace_id: Some(&ctx.request_id),
+                            via_fabric: false,
+                        },
+                        &error,
+                    );
+                }
+                return OutboundPipelineError::McpValidation(error);
+            }
+            if crate::proxy::exceeds_length_limit(&error) {
+                record_body_too_large(ctx, state.max_request_bytes);
+                return OutboundPipelineError::BodyTooLarge(state.max_request_bytes);
             }
             OutboundPipelineError::BodyReadFailed(error.to_string())
         })?;
@@ -1807,7 +2467,7 @@ async fn step_extract_protocol_context_with_versions(
             .validate_mcp_metadata_base()
             .map_err(|error| {
                 error!(request_id = %ctx.request_id, error = %error, "Invalid MCP metadata configuration");
-                OutboundPipelineError::MetadataInjectionFailed
+                metadata_injection_failed(ctx)
             })?;
         ctx.mcp_metadata_context = crate::mcp::meta::McpMetadataContext::from_classification(
             &classification,
@@ -1830,12 +2490,7 @@ async fn step_extract_protocol_context_with_versions(
         crate::protocols::extensions::verify_mcp_metadata_identity(
             &body,
             state.vc_issuer.as_ref(),
-            &crate::audit::request_events::RequestFacts {
-                surface_id: &ctx.surface.surface_id,
-                channel_name: &ctx.surface.name,
-                trace_id: Some(&ctx.request_id),
-                via_fabric: false,
-            },
+            &transit_audit_facts(ctx),
             None,
         )
         .await
@@ -2017,7 +2672,12 @@ async fn step_map_transit_point_header_metadata(
     }
 }
 
-fn should_forward_outbound_request_header(
+/// Whether a Transit Point caller's request header goes on to its target, over
+/// HTTP or Fabric. The caller's `Authorization`, cookies, proxy forwarding headers
+/// ([`is_proxy_forwarding_header`]), and caller-info and DID identity headers
+/// ([`crate::proxy::caller_identity::CallerHeaders::NAMES`]) never do; its other
+/// headers, such as its own API key header for the target, do.
+pub(crate) fn should_forward_outbound_request_header(
     name: &str,
     header_metadata_mapping: Option<&crate::config::header_metadata_mapping::HeaderMetadataMappingConfig>,
 ) -> bool {
@@ -2025,7 +2685,11 @@ fn should_forward_outbound_request_header(
         return false;
     }
 
-    if name.eq_ignore_ascii_case("authorization") {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || is_proxy_forwarding_header(name)
+        || crate::proxy::caller_identity::CallerHeaders::is_caller_info_header(name)
+    {
         return false;
     }
 
@@ -2040,6 +2704,202 @@ fn should_forward_outbound_request_header(
     }
 
     true
+}
+
+/// The proxy and CDN headers, other than `X-Forwarded-*`, that claim the client's
+/// address, the host or path it asked for or the scheme it used.
+const PROXY_FORWARDING_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-real-ip",
+    "true-client-ip",
+    "client-ip",
+    "x-client-ip",
+    "x-cluster-client-ip",
+    "cf-connecting-ip",
+    "cf-connecting-ipv6",
+    "fastly-client-ip",
+    "fly-client-ip",
+    "x-arr-clientip",
+    "x-azure-clientip",
+    "x-proxyuser-ip",
+    "x-original-forwarded-for",
+    "proxy-client-ip",
+    "wl-proxy-client-ip",
+    "x-originating-ip",
+    "x-remote-ip",
+    "x-remote-addr",
+    "x-envoy-external-address",
+    "cloudfront-viewer-address",
+    "x-original-host",
+    "x-host",
+    "x-original-url",
+    "x-original-uri",
+    "x-rewrite-url",
+    "x-scheme",
+    "x-url-scheme",
+    "x-arr-ssl",
+    "front-end-https",
+];
+
+/// Whether `name` is a header a proxy or CDN sets to tell the next hop who
+/// connected to it, for which host and path and over what: [`PROXY_FORWARDING_HEADERS`]
+/// and every `X-Forwarded-*` header, also spelled with `_` for `-`, which
+/// CGI-style servers read as the same header.
+fn is_proxy_forwarding_header(name: &str) -> bool {
+    const X_FORWARDED: &str = "x-forwarded-";
+    let name = name.replace('_', "-");
+    PROXY_FORWARDING_HEADERS
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+        || name
+            .get(..X_FORWARDED.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(X_FORWARDED))
+}
+
+/// The headers a Transit Point sends to its target, over HTTP or Fabric: the
+/// managed agent's forwardable headers, then the target authentication header,
+/// then the delegated credential headers, each replacing any earlier header of
+/// the same name, so the target receives one value of each credential header. An
+/// agent header named like the `target_auth` header or like the header of any
+/// delegated credential binding of the Transit Point is never forwarded, whether
+/// or not the gateway adds its own value.
+async fn transit_request_headers(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<HeaderMap, OutboundPipelineError> {
+    let target_auth = transit_target_auth_header(state, ctx).await?;
+    let mapping = ctx
+        .virtual_channel
+        .header_metadata_mapping_if_supported();
+    let credential_headers = transit_credential_header_names(ctx);
+    let mut headers = HeaderMap::new();
+    for (name, value) in &ctx.original_headers {
+        if should_forward_outbound_request_header(name.as_str(), mapping)
+            && !crate::proxy::handler::is_credential_header(name.as_str(), &credential_headers)
+        {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    if let Some((name, value)) = target_auth {
+        headers.insert(name, value);
+    }
+    for (name, value) in &ctx.delegated_credential_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+    Ok(headers)
+}
+
+/// The names of the headers that carry the Transit Point's credentials: its
+/// `target_auth` header and the header of each of its delegated credential
+/// bindings, whether or not the request is given a value for them.
+fn transit_credential_header_names(ctx: &OutboundPipelineContext) -> Vec<String> {
+    let target_auth = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+        .and_then(|target_auth| {
+            target_auth
+                .method
+                .header_name()
+                .map(str::to_string)
+        });
+    let delegated = ctx
+        .surface
+        .transit_point_outbound_credentials(&ctx.virtual_channel)
+        .into_iter()
+        .filter_map(|binding| {
+            binding
+                .inject_as
+                .header_name()
+                .map(str::to_string)
+        });
+    target_auth
+        .into_iter()
+        .chain(delegated)
+        .collect()
+}
+
+/// The Transit Point's target authentication header, when the request may carry
+/// it. A credential that cannot be resolved refuses the request when the
+/// Transit Point's `target_auth.fallback` is `reject`, and is left out otherwise.
+async fn transit_target_auth_header(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<Option<(axum::http::HeaderName, axum::http::HeaderValue)>, OutboundPipelineError> {
+    let Some(target_auth) = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+    else {
+        return Ok(None);
+    };
+    match crate::proxy::handler::inject_target_auth_header(
+        target_auth,
+        &crate::proxy::handler::TargetAuthContext::of_surface(
+            &ctx.surface,
+            state.secrets_store.as_ref(),
+            state
+                .credential_provider_store
+                .as_ref(),
+            state
+                .delegation_vault_store
+                .as_ref(),
+        )
+        .for_transit_point(&ctx.virtual_channel),
+        &ctx.surface.name,
+        transit_caller_assertion(ctx),
+    )
+    .await
+    {
+        Ok(Some((name, value))) => {
+            match (axum::http::HeaderName::from_bytes(name.as_bytes()), axum::http::HeaderValue::from_str(&value)) {
+                (Ok(name), Ok(value)) => Ok(Some((name, value))),
+                _ => {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                    Err(target_auth_unavailable(ctx))
+                }
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            warn!(request_id = %ctx.request_id, error = %error, "Failed to resolve target auth credentials");
+            crate::proxy::handler::record_target_auth_failure(
+                &transit_audit_facts(ctx),
+                Some(&ctx.virtual_channel.alias),
+                target_auth,
+                &error,
+            );
+            if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
+                return Err(target_auth_unavailable(ctx));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn transit_audit_facts(ctx: &OutboundPipelineContext) -> crate::audit::request_events::RequestFacts<'_> {
+    crate::audit::request_events::RequestFacts {
+        surface_id: &ctx.surface.surface_id,
+        channel_name: &ctx.surface.name,
+        trace_id: Some(&ctx.request_id),
+        via_fabric: false,
+    }
+}
+
+/// Remove the target response headers a Transit Point never returns to the
+/// managed agent: the target's cookies (`Set-Cookie`, `Set-Cookie2`), and its
+/// authentication challenges and results (`WWW-Authenticate`,
+/// `Authentication-Info`), which would have the agent authenticate with the
+/// target itself rather than through the gateway's credentials.
+fn withhold_target_response_headers(headers: &mut HeaderMap) {
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove("set-cookie2");
+    headers.remove(axum::http::header::WWW_AUTHENTICATE);
+    headers.remove("authentication-info");
 }
 
 /// Detect the protocol and extract the method/tool from a JSON-RPC body.
@@ -2265,10 +3125,7 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
             )
             .await
             .map_err(|e| {
@@ -2277,7 +3134,7 @@ async fn step_inject_custom_metadata(
                     error = %e,
                     "Metadata injection failed"
                 );
-                OutboundPipelineError::MetadataInjectionFailed
+                metadata_injection_failed(ctx)
             })?;
             ctx.body_bytes = Some(modified);
         }
@@ -2287,17 +3144,14 @@ async fn step_inject_custom_metadata(
                 metadata_config,
                 channel_name,
                 &state.secrets_store,
-                crate::protocols::MetadataRuntimeContext {
-                    request_id: Some(ctx.request_id.as_str()),
-                    surface_id: ctx.surface.config_id(),
-                },
+                crate::protocols::MetadataRuntimeContext::for_surface(&ctx.surface, Some(ctx.request_id.as_str())),
                 ctx.mcp_metadata_context,
                 crate::mcp::meta::McpMetaTarget::TopLevel,
             )
             .await
             .map_err(|e| {
                 error!(request_id = %ctx.request_id, error = %e, "MCP metadata injection failed");
-                OutboundPipelineError::MetadataInjectionFailed
+                metadata_injection_failed(ctx)
             })?;
 
             ctx.body_bytes = Some(result.body);
@@ -2318,26 +3172,112 @@ async fn step_inject_custom_metadata(
     Ok(())
 }
 
-/// Resolve the agent card fetch URL for a transit point.
-///
-/// For `fabric://` targets the endpoint is a virtual routing address (not
-/// HTTP-resolvable). This helper resolves the URL from the transit point's
-/// own `listen_address` + `listen_path` instead — hitting the gateway
-/// itself on a public path (bypasses auth) and proxying through to the
-/// real upstream agent card. For non-fabric targets the endpoint and
-/// optional `agent_card_path` are returned as-is.
-fn resolve_agent_card_url(tp: &TransitPoint) -> (String, Option<String>) {
-    if tp
-        .target_endpoint
-        .starts_with("fabric://")
-    {
-        if let (Some(addr), Some(path)) = (tp.listen_address.as_deref(), tp.listen_path.as_deref()) {
-            (format!("{}{}", addr.trim_end_matches('/'), path), None)
-        } else {
-            (tp.target_endpoint.clone(), tp.agent_card_path.clone())
+/// Where a Transit Point's target card is read, which also keys the card
+/// cache: the target and its `agent_card_path`, which does not apply to a
+/// `fabric://` target.
+fn agent_card_location(tp: &TransitPoint) -> (String, Option<String>) {
+    let path = tp
+        .agent_card_path
+        .clone()
+        .filter(|_| {
+            !tp.target_endpoint
+                .starts_with("fabric://")
+        });
+    (tp.target_endpoint.clone(), path)
+}
+
+/// The read of a Transit Point target's agent card, taken from the request so
+/// that it can run without borrowing the pipeline context.
+struct TargetCardRead {
+    target: String,
+    agent_card_path: Option<String>,
+    request_id: String,
+    log_label: String,
+    timeout: std::time::Duration,
+    limits: crate::proxy::upstream_body::UpstreamBodyLimits,
+}
+
+impl TargetCardRead {
+    fn of(
+        state: &OutboundProxyState,
+        ctx: &OutboundPipelineContext,
+    ) -> Self {
+        let (target, agent_card_path) = agent_card_location(&ctx.virtual_channel);
+        Self {
+            target,
+            agent_card_path,
+            request_id: ctx.request_id.clone(),
+            log_label: ctx.surface.name.clone(),
+            timeout: resolve_outbound_timeout(ctx),
+            limits: agent_card_limits(state, ctx),
         }
-    } else {
-        (tp.target_endpoint.clone(), tp.agent_card_path.clone())
+    }
+
+    /// The card from the card cache, or read and cached. A read that never
+    /// reached a `fabric://` target's gateway is not cached, so the next
+    /// request tries again.
+    async fn cached(
+        &self,
+        state: &OutboundProxyState,
+    ) -> Option<serde_json::Value> {
+        let path = self
+            .agent_card_path
+            .as_deref();
+        if let Some(card) = crate::proxy::agent_card_cache::lookup(&self.target, path) {
+            return card;
+        }
+        let (card, cacheable) = self.fetch(state).await;
+        if cacheable {
+            crate::proxy::agent_card_cache::insert(&self.target, path, card.clone());
+        }
+        card
+    }
+
+    /// The card, and whether the result may be cached.
+    async fn fetch(
+        &self,
+        state: &OutboundProxyState,
+    ) -> (Option<serde_json::Value>, bool) {
+        if !self
+            .target
+            .starts_with("fabric://")
+        {
+            let card = fetch_agent_card(
+                &self.target,
+                self.agent_card_path
+                    .as_deref(),
+                &self.request_id,
+                self.timeout,
+                self.limits,
+            )
+            .await;
+            return (card, true);
+        }
+        let trace_id = Uuid::new_v4().to_string();
+        let outcome = crate::proxy::fabric_forward::read_fabric_card(
+            &state.listener_manager,
+            &crate::proxy::fabric_forward::FabricCardRequest {
+                fabric_target: &self.target,
+                paths: &crate::proxy::fabric_forward::FABRIC_AGENT_CARD_PATHS,
+                headers: std::collections::HashMap::new(),
+                timeout: self.timeout,
+                max_bytes: self.limits.max_bytes(),
+                trace_id: &trace_id,
+                log_label: &self.log_label,
+            },
+        )
+        .await;
+        let cacheable = outcome.describes_the_remote();
+        let card = outcome.into_card();
+        if card.is_none() {
+            warn!(
+                request_id = %self.request_id,
+                card_trace_id = %trace_id,
+                target = %self.target,
+                "Failed to fetch agent card over Fabric"
+            );
+        }
+        (card, cacheable)
     }
 }
 
@@ -2366,6 +3306,7 @@ pub(crate) async fn fetch_agent_card(
     };
 
     for card_url in &urls {
+        let logged_url = loggable::url(card_url);
         let candidate = card_url.clone();
         let client = match tokio::task::spawn_blocking(move || {
             crate::egress::pinned_forward_client(&candidate, timeout)
@@ -2374,11 +3315,11 @@ pub(crate) async fn fetch_agent_card(
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card URL blocked by egress policy: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card URL blocked by egress policy: {}", e);
                 continue;
             }
             Err(e) => {
-                warn!(request_id = %request_id, url = %card_url, "Agent card egress validation task failed: {}", e);
+                warn!(request_id = %request_id, url = %logged_url, "Agent card egress validation task failed: {}", e);
                 continue;
             }
         };
@@ -2398,7 +3339,7 @@ pub(crate) async fn fetch_agent_card(
                         debug!(
                             request_id = %request_id,
                             error = %e,
-                            url = %card_url,
+                            url = %logged_url,
                             "Agent card URL response exceeded its bounds, trying next"
                         );
                     }
@@ -2408,15 +3349,15 @@ pub(crate) async fn fetch_agent_card(
                 debug!(
                     request_id = %request_id,
                     status = %resp.status(),
-                    url = %card_url,
+                    url = %logged_url,
                     "Agent card URL returned non-success status, trying next"
                 );
             }
             Err(e) => {
                 debug!(
                     request_id = %request_id,
-                    error = %e,
-                    url = %card_url,
+                    error = %e.without_url(),
+                    url = %logged_url,
                     "Failed to fetch agent card URL, trying next"
                 );
             }
@@ -2432,7 +3373,7 @@ pub(crate) async fn fetch_agent_card(
 
 /// [8] Trust Context Collection — fetches target agent card and queries trust registry.
 ///
-/// Runs whenever the surface's target-leg Trust Check list is non-empty.
+/// Runs whenever the routed Transit Point's Trust Check list is non-empty.
 /// A card-fetch failure is soft; the marker is threaded to
 /// `step_trust_check` which synthesizes `AGENT_CARD_UNAVAILABLE` results
 /// per element so OPA remains authoritative on how to react.
@@ -2444,8 +3385,7 @@ async fn step_collect_trust_context(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let target_trust_check_present = !ctx
-        .surface
-        .target
+        .virtual_channel
         .trust_check_list
         .is_empty();
 
@@ -2453,35 +3393,15 @@ async fn step_collect_trust_context(
         return Ok(());
     }
 
-    let (target_url, agent_card_path) = resolve_agent_card_url(&ctx.virtual_channel);
-
-    // Consult the process-global card cache before touching the network.
-    let cached = crate::proxy::agent_card_cache::lookup(&target_url, agent_card_path.as_deref());
-    let card_json = match cached {
-        Some(payload) => payload,
-        None => {
-            let fetched = fetch_agent_card(
-                &target_url,
-                agent_card_path.as_deref(),
-                &ctx.request_id,
-                resolve_outbound_timeout(ctx),
-                agent_card_limits(state, ctx),
-            )
-            .await;
-            crate::proxy::agent_card_cache::insert(&target_url, agent_card_path.as_deref(), fetched.clone());
-            fetched
-        }
-    };
-
-    let card_json = match card_json {
-        Some(card) => card,
-        None => {
-            // Trust-Check-only path: leave target_agent_context unpopulated
-            // and let `step_trust_check` synthesize AGENT_CARD_UNAVAILABLE
-            // results per configured element.
-            ctx.target_agent_card_unavailable = true;
-            return Ok(());
-        }
+    let Some(card_json) = TargetCardRead::of(state, ctx)
+        .cached(state)
+        .await
+    else {
+        // Trust-Check-only path: leave target_agent_context unpopulated
+        // and let `step_trust_check` synthesize AGENT_CARD_UNAVAILABLE
+        // results per configured element.
+        ctx.target_agent_card_unavailable = true;
+        return Ok(());
     };
 
     // Build AgentContext from body + optional agent card + trust registry.
@@ -2582,9 +3502,8 @@ async fn step_collect_trust_context(
 /// [8b] Trust Check stage (target leg). Runs after legacy trust context
 /// collection and before any OPA evaluation, so all three outbound OPA
 /// scopes (gateway, channel, transit point) see the same
-/// `input.trust_check_results`. No-ops when the surface variant has no
-/// `target.trust_check_list` configured or when the listener manager is
-/// not available. Per-element failures are encoded inside the result
+/// `input.trust_check_results`. Runs the routed Transit Point's list and
+/// no-ops when it is empty or when the listener manager is not available. Per-element failures are encoded inside the result
 /// list (`ok = false`, `error = Some(_)`); the stage never returns Err
 /// — the OPA author decides how to react via `input.trust_check_results`.
 ///
@@ -2620,8 +3539,8 @@ async fn step_collect_trust_context(
 /// [8b] Trust Check stage (target leg). Runs after legacy trust context
 /// collection and before any OPA evaluation, so all three outbound OPA
 /// scopes (gateway, channel, transit point) see the same
-/// `input.trust_check_results`. No-ops when the surface variant has no
-/// `target.trust_check_list` configured. Per-element failures are
+/// `input.trust_check_results`. Runs the routed Transit Point's list and
+/// no-ops when it is empty. Per-element failures are
 /// encoded inside the result list (`ok = false`, `error = Some(_)`);
 /// the stage never returns Err — the OPA author decides how to react
 /// via `input.trust_check_results`.
@@ -2654,7 +3573,7 @@ async fn step_collect_trust_context(
 ///
 /// When the target card **was** fetched but its target agent identity
 /// could not be established (set by [`step_collect_trust_context`] when the
-/// target leg has an active `trust_check_list`), this stage synthesizes a
+/// routed Transit Point has an active `trust_check_list`), this stage synthesizes a
 /// result for **every** configured element using the carried code:
 /// `IDENTITY_VP_VERIFICATION_FAILED` when an `agent-identity-credential/v1`
 /// VP was present but could not be cryptographically verified, or
@@ -2668,19 +3587,25 @@ async fn step_trust_check(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let target_elements = ctx
-        .surface
-        .target
+        .virtual_channel
         .trust_check_list
         .clone();
     if target_elements.is_empty() {
         return Ok(());
     }
+    let surface_id = ctx.surface.surface_id.clone();
+    let transit_point = ctx
+        .virtual_channel
+        .alias
+        .clone();
+    let origin = crate::observability::trust_check_audit::TrustCheckOrigin {
+        surface_id: &surface_id,
+        transit_point: Some(&transit_point),
+    };
 
     if ctx.target_agent_card_unavailable {
         let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
-            ctx.surface
-                .surface_id
-                .as_str(),
+            origin,
             &target_elements,
             crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE,
             "target agent card could not be fetched",
@@ -2709,9 +3634,7 @@ async fn step_trust_check(
         .clone()
     {
         let synthesized = crate::trust_registry_verification::synthesize_unavailable_target(
-            ctx.surface
-                .surface_id
-                .as_str(),
+            origin,
             &target_elements,
             failure.code,
             failure.detail,
@@ -2737,9 +3660,7 @@ async fn step_trust_check(
         let wrapped_input = serde_json::json!({ "input": &probe_input });
         let (synthesized_by_index, _runnable) =
             crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures(
-                ctx.surface
-                    .surface_id
-                    .as_str(),
+                origin,
                 crate::trust_registry_verification::TrustCheckLeg::Target,
                 &target_elements,
                 &wrapped_input,
@@ -2764,9 +3685,7 @@ async fn step_trust_check(
 
     let client = crate::trust_registry_verification::TrqpListenerClient::new(manager);
     let target_ctx = crate::trust_registry_verification::run_trust_check_stage(
-        ctx.surface
-            .surface_id
-            .as_str(),
+        origin,
         crate::trust_registry_verification::TrustCheckLeg::Target,
         &target_elements,
         &probe_input,
@@ -2794,11 +3713,19 @@ fn outbound_actor_did(ctx: &OutboundPipelineContext) -> Option<&str> {
     }
 }
 
-/// The inbound caller a transit token carries, for attributing outbound decisions.
+/// The caller of a Transit Point call, for attributing outbound decisions: the
+/// inbound caller a transit token carries, else the caller the Transit Point
+/// verified itself, by its resource token or `source_auth`.
 fn outbound_caller(ctx: &OutboundPipelineContext) -> Option<crate::delegation_vault::audit::AuditCallerContext> {
     ctx.transit_token_claims
         .as_ref()
         .and_then(crate::delegation_vault::audit::transit_caller_context)
+        .or_else(|| {
+            ctx.authenticated_identity
+                .as_ref()
+                .filter(|_| ctx.authenticated_by.is_some())
+                .map(crate::delegation_vault::audit::build_caller_context)
+        })
 }
 
 /// Shared audit context for an outbound OPA evaluation so each site records a
@@ -2810,6 +3737,7 @@ struct OutboundPolicyAudit<'a> {
     policy_definition_id: Option<&'a str>,
     policy_name: Option<&'a str>,
     surface_id: Option<&'a str>,
+    surface_name: Option<&'a str>,
     http_method: &'a str,
     path: &'a str,
     actor_did: Option<&'a str>,
@@ -2853,6 +3781,7 @@ impl OutboundPolicyAudit<'_> {
             policy_definition_id: self.policy_definition_id,
             policy_name: self.policy_name,
             surface_id: self.surface_id,
+            surface_name: self.surface_name,
             http_method: Some(self.http_method),
             path: Some(self.path),
             actor_did: self.actor_did,
@@ -2873,7 +3802,7 @@ async fn step_gateway_opa_policy(
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
     let Some(ref gw_pm) = state.gateway_policy_manager else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no gateway_policy_manager");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no gateway_policy_manager");
         return Ok(());
     };
 
@@ -2887,31 +3816,29 @@ async fn step_gateway_opa_policy(
     // policy is actually found and enforced on egress too. The policy can branch
     // on `input.gateway.direction == "outbound"` to gate egress specifically.
     let Some(gateway_id) = gw_pm.get_self_gateway_id() else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA skipped: no self gateway id");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA skipped: no self gateway id");
         return Ok(());
     };
     if !gw_pm.is_enforced(&gateway_id) {
         info!(
             request_id = %ctx.request_id,
             gateway_id = %gateway_id,
-            "[OPA-INPUT] Outbound gateway OPA skipped: no gateway policy configured, allowing"
+            "[OPA] Outbound gateway OPA skipped: no gateway policy configured, allowing"
         );
         return Ok(());
     }
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway OPA using gateway_id={}", gateway_id);
+    info!(request_id = %ctx.request_id, "[OPA] Outbound gateway OPA using gateway_id={}", gateway_id);
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound gateway policy input before eval
-    info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound gateway policy input before eval: {}", input_value);
     let (policy_definition_id, policy_name, policy_version, policy_hash) = match gw_pm.policy_evidence(&gateway_id) {
         Some((id, version, hash)) => {
             let name = gw_pm
-                .resolve_policy_name_or_default(id.as_deref())
+                .resolve_policy_name(id.as_deref())
                 .await;
             (id, name, version, Some(hash))
         }
-        None => (None, crate::policies::GATEWAY_POLICY_PACKAGE.to_string(), None, None),
+        None => (None, None, None, None),
     };
     let caller = outbound_caller(ctx);
 
@@ -2919,8 +3846,9 @@ async fn step_gateway_opa_policy(
         scope: crate::observability::PolicyScope::Gateway,
         policy_id: crate::policies::GATEWAY_POLICY_PACKAGE,
         policy_definition_id: policy_definition_id.as_deref(),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -2965,6 +3893,7 @@ fn record_surface_policy_unavailable(
         policy_definition_id,
         policy_name: None,
         surface_id: ctx.surface.config_id(),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -2988,14 +3917,14 @@ async fn step_surface_opa_policy(
         .outbound_shared
         .opa_policy_definition_id
     else {
-        info!(request_id = %ctx.request_id, "[OPA-INPUT] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
+        info!(request_id = %ctx.request_id, "[OPA] Outbound channel OPA skipped: no opa_policy_definition_id on outbound config");
         return Ok(());
     };
 
     let Some(pm) = &state.policy_manager else {
         warn!(
             request_id = %ctx.request_id,
-            "[OPA-INPUT] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
+            "[OPA] Outbound channel OPA skipped: SurfacePolicyManager not available; denying"
         );
         return Err(record_surface_policy_unavailable(
             ctx,
@@ -3031,16 +3960,6 @@ async fn step_surface_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound surface policy input before eval
-    info!(request_id = %ctx.request_id, config_id = %config_id,
-        "[OPA-INPUT] Outbound surface policy input before eval: {}", input_value);
-
-    debug!(
-        request_id = %ctx.request_id,
-        config_id = %config_id,
-        input = %serde_json::to_string_pretty(&input_value).unwrap_or_default(),
-        "Outbound channel OPA policy input"
-    );
 
     let def_id = ctx
         .outbound_shared
@@ -3054,8 +3973,9 @@ async fn step_surface_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: def_id,
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3114,16 +4034,13 @@ async fn step_transit_point_opa_policy(
             .target_agent_context
             .is_none()
     {
-        let (resolved_url, resolved_card_path) = resolve_agent_card_url(&ctx.virtual_channel);
-
-        let card_json = fetch_agent_card(
-            &resolved_url,
-            resolved_card_path.as_deref(),
-            &ctx.request_id,
-            resolve_outbound_timeout(ctx),
-            agent_card_limits(state, ctx),
-        )
-        .await;
+        let card_json = if ctx.target_agent_card_unavailable {
+            None
+        } else {
+            TargetCardRead::of(state, ctx)
+                .cached(state)
+                .await
+        };
 
         let body_json: Option<serde_json::Value> = ctx
             .body_bytes
@@ -3184,9 +4101,6 @@ async fn step_transit_point_opa_policy(
 
     let policy_input = build_outbound_policy_input(ctx);
     let input_value = serde_json::to_value(&policy_input).unwrap_or_default();
-    // [OPA-INPUT] Outbound transit point policy input before eval
-    info!(request_id = %ctx.request_id, alias = %ctx.virtual_channel.alias,
-        "[OPA-INPUT] Outbound transit point policy input before eval: {}", input_value);
 
     let (policy_name, policy_version, policy_hash) = pm
         .resolve_policy_decision_evidence(Some(tp_def_id.as_str()))
@@ -3196,8 +4110,9 @@ async fn step_transit_point_opa_policy(
         scope: crate::observability::PolicyScope::Surface,
         policy_id: crate::policies::SURFACE_POLICY_PACKAGE,
         policy_definition_id: Some(tp_def_id.as_str()),
-        policy_name: Some(policy_name.as_str()),
+        policy_name: policy_name.as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3241,6 +4156,33 @@ async fn step_transit_point_opa_policy(
     Ok(())
 }
 
+/// The MCP tool gating in force for this request's Transit Point, when it gates
+/// anything.
+fn compiled_transit_mcp_tool_gating(
+    state: &OutboundProxyState,
+    ctx: &OutboundPipelineContext,
+) -> Option<Arc<crate::policies::mcp_tool_gating::CompiledMcpToolGating>> {
+    state
+        .policy_manager
+        .as_ref()?
+        .compiled_mcp_tool_gating_for_transit(
+            ctx.surface
+                .config_id()
+                .unwrap_or("unknown"),
+            &ctx.virtual_channel.alias,
+        )
+        .filter(|gating| !gating.is_empty())
+}
+
+/// Whether this request's Transit Point is configured with MCP tool gating that
+/// gates anything.
+fn transit_mcp_tool_gating_configured(ctx: &OutboundPipelineContext) -> bool {
+    ctx.virtual_channel
+        .mcp_tool_gating
+        .as_ref()
+        .is_some_and(|gating| !gating.is_empty())
+}
+
 /// [10.6] Per-Transit-Point MCP Tool Gating — `tools/call` leg.
 ///
 /// Blocks an outbound `tools/call` toward this transit point when the TP's
@@ -3250,6 +4192,8 @@ async fn step_transit_point_opa_policy(
 /// that have gating installed; absent gating passes through, while a
 /// `tools/call` whose tool name can't be read is blocked. The gate condition is evaluated against the same outbound
 /// `PolicyInput` the transit-point OPA gate sees, with `mcp.method` pinned to
+/// `tools/call`. A Transit Point whose configuration has gating that is not in
+/// force, such as one deleted while the request was in flight, blocks every
 /// `tools/call`.
 async fn step_transit_mcp_tool_gating(
     state: &OutboundProxyState,
@@ -3261,9 +4205,6 @@ async fn step_transit_mcp_tool_gating(
     if ctx.operation.as_deref() != Some("tools/call") {
         return Ok(());
     }
-    let Some(pm) = state.policy_manager.as_ref() else {
-        return Ok(());
-    };
     let config_id = ctx
         .surface
         .config_id()
@@ -3272,10 +4213,15 @@ async fn step_transit_mcp_tool_gating(
         .virtual_channel
         .alias
         .as_str();
-    let Some(gating) = pm
-        .compiled_mcp_tool_gating_for_transit(config_id, alias)
-        .filter(|g| !g.is_empty())
-    else {
+    let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
+        if transit_mcp_tool_gating_configured(ctx) {
+            warn!(
+                request_id = %ctx.request_id,
+                alias = %alias,
+                "Per-transit-point MCP tool gating is configured but not in force; blocking tools/call"
+            );
+            return Err(OutboundPipelineError::TransitMcpToolGated);
+        }
         return Ok(());
     };
 
@@ -3293,6 +4239,7 @@ async fn step_transit_mcp_tool_gating(
             reason: Some("tools/call without a readable tool name under per-transit-point MCP tool gating"),
             policy_id: Some("mcp_tool_gating"),
             surface_id: Some(config_id),
+            surface_name: Some(ctx.surface.name.as_str()),
             trace_id: Some(ctx.request_id.as_str()),
             http_method: Some(ctx.original_method.as_str()),
             path: Some(ctx.request_path.as_str()),
@@ -3342,6 +4289,7 @@ async fn step_transit_mcp_tool_gating(
         },
         policy_id: Some("mcp_tool_gating"),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         trace_id: Some(ctx.request_id.as_str()),
         http_method: Some(ctx.original_method.as_str()),
         path: Some(ctx.request_path.as_str()),
@@ -3449,15 +4397,15 @@ fn step_transit_point_response_policy(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let input = ResponsePolicyInput {
-        response: ResponseContext {
+    let input = ResponsePolicyInput::new(
+        ResponseContext {
             status_code: status.as_u16(),
             body: body_json,
             content_type,
             is_error: status.is_client_error() || status.is_server_error(),
             method: None,
         },
-        caller: RpCallerContext {
+        RpCallerContext {
             did: match &ctx.resolved_identity {
                 ProtectedAgentIdentity::Managed { did, .. } => Some(did.clone()),
                 ProtectedAgentIdentity::Anonymous => None,
@@ -3465,13 +4413,18 @@ fn step_transit_point_response_policy(
             identity_source: None,
             dna_uai: None,
         },
-        surface: SurfaceContext {
+        SurfaceContext {
             id: config_id.to_string(),
             name: ctx.surface.name.clone(),
             protocol: format!("{:?}", ctx.surface.channel_protocol()).to_lowercase(),
         },
-        metadata: None,
-    };
+    )
+    .for_transit_point(
+        outbound_transit_context(ctx),
+        ctx.authenticated_identity
+            .as_ref()
+            .map(crate::surface_context::SourceAuthContext::from),
+    );
 
     let decision = evaluate_response_policy(pm.as_ref(), &policy_key, input);
     let caller = outbound_caller(ctx);
@@ -3483,6 +4436,7 @@ fn step_transit_point_response_policy(
             .name
             .as_deref(),
         surface_id: Some(config_id),
+        surface_name: Some(ctx.surface.name.as_str()),
         http_method: ctx.original_method.as_str(),
         path: ctx.request_path.as_str(),
         actor_did: outbound_actor_did(ctx),
@@ -3514,6 +4468,66 @@ fn step_transit_point_response_policy(
         "Per-transit-point response OPA policy allowed"
     );
     Ok(())
+}
+
+/// `input.transit` for a Transit Point call. `caller` is the end user the
+/// transit token names, required or optional, anonymous without one; its
+/// `fields` are only those this Transit Point allowlists, as the token carries
+/// every Transit Point's. A Fabric-issued token's caller is a `fabric_peer`
+/// that carries the peer gateway, verified only when the receiving surface
+/// verified the caller of the Fabric request.
+/// `client` is the principal the Transit Point authenticated itself, so a
+/// policy can tell the two apart.
+fn outbound_transit_context(ctx: &OutboundPipelineContext) -> crate::surface_context::TransitContext {
+    use crate::surface_context::{TransitCallerContext, TransitClientContext, TransitContext};
+    let caller = match ctx
+        .transit_token_claims
+        .as_ref()
+        .or(ctx
+            .optional_transit_token_claims
+            .as_ref())
+        .map(TransitCallerContext::from_transit_token)
+    {
+        Some(mut caller) => {
+            let allowlist = transit_token_caller_fields(&ctx.virtual_channel);
+            caller
+                .fields
+                .retain(|name, _| allowlist.contains(name));
+            caller
+        }
+        None => TransitCallerContext::anonymous(),
+    };
+    let client = ctx
+        .authenticated_identity
+        .as_ref()
+        .zip(ctx.authenticated_by)
+        .map(|(identity, verification)| {
+            TransitClientContext::new(
+                identity,
+                verification,
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
+        });
+    TransitContext { caller, client }
+}
+
+/// The caller claims a Transit Point copies from the transit token: its enabled
+/// workload binding's `caller_context_fields`, when that binding reads the token.
+fn transit_token_caller_fields(point: &TransitPoint) -> &[String] {
+    point
+        .workload_binding
+        .as_ref()
+        .filter(|binding| {
+            binding.enabled && binding.caller_source == crate::config::types::CallerContextSource::TransitToken
+        })
+        .map(|binding| {
+            binding
+                .caller_context_fields
+                .as_slice()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the `PolicyInput` for outbound OPA evaluations.
@@ -3602,7 +4616,50 @@ fn build_outbound_policy_input(ctx: &OutboundPipelineContext) -> crate::surface_
         trust_check_results: ctx
             .trust_check_results
             .clone(),
+        transit: Some(outbound_transit_context(ctx)),
         ..Default::default()
+    }
+}
+
+/// The caller context a Transit Point's Workload Binding binds into the signed
+/// presentation. A JWT caller is read from the claims the Transit Point's own
+/// authentication verified, never from an `Authorization` header it did not
+/// verify; the raw header is read only when the Transit Point authenticated no
+/// caller itself.
+fn capture_workload_binding_caller(
+    ctx: &OutboundPipelineContext,
+    cfg: &crate::config::types::WorkloadBindingConfig,
+) -> Option<crate::proxy::workload_binding::CapturedCallerContext> {
+    match cfg.caller_source {
+        crate::config::types::CallerContextSource::TransitToken => ctx
+            .transit_token_claims
+            .as_ref()
+            .and_then(|claims| {
+                crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields).ok()
+            }),
+        crate::config::types::CallerContextSource::AuthorizationBearerJwt => match ctx
+            .authenticated_identity
+            .as_ref()
+        {
+            Some(crate::source_auth::AuthenticatedIdentity::JwtBearer { claims, .. }) => {
+                crate::proxy::workload_binding::capture_from_verified_claims(claims, &cfg.caller_context_fields).ok()
+            }
+            Some(_) => None,
+            None => ctx
+                .original_headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|auth| {
+                    crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
+                }),
+        },
+        // Transit Point calls are made by the managed agent, not the original
+        // DID-authenticated caller — the raw DID is not available on this hop.
+        // Use `TransitToken` here so the AP-hop's `SHA256(did)` user_hash flows
+        // through the transit token, then set `caller_source: did` on the
+        // target-leg workload binding where the AP-inbound authenticated
+        // identity is still in scope.
+        crate::config::types::CallerContextSource::Did => None,
     }
 }
 
@@ -3672,30 +4729,7 @@ async fn step_inject_trusted_identity(
             .as_ref();
         let captured = wb_config
             .filter(|c| c.enabled)
-            .and_then(|cfg| match cfg.caller_source {
-                crate::config::types::CallerContextSource::TransitToken => ctx
-                    .transit_token_claims
-                    .as_ref()
-                    .and_then(|claims| {
-                        crate::proxy::workload_binding::capture_from_transit_token(claims, &cfg.caller_context_fields)
-                            .ok()
-                    }),
-                crate::config::types::CallerContextSource::AuthorizationBearerJwt => ctx
-                    .original_headers
-                    .get(axum::http::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|auth| {
-                        crate::proxy::workload_binding::capture_from_bearer_jwt(auth, &cfg.caller_context_fields).ok()
-                    }),
-                // Transit Point calls are made by the managed agent, not the
-                // original DID-authenticated caller — the raw DID is not
-                // available on this hop. Use `TransitToken` here so the
-                // AP-hop's `SHA256(did)` user_hash flows through the transit
-                // token, then set `caller_source: did` on the target-leg
-                // workload binding where the AP-inbound authenticated
-                // identity is still in scope.
-                crate::config::types::CallerContextSource::Did => None,
-            });
+            .and_then(|cfg| capture_workload_binding_caller(ctx, cfg));
         let mut wb = crate::proxy::workload_binding::maybe_build_workload_binding_subject(
             wb_config,
             crate::proxy::workload_binding::WorkloadBindingInputs {
@@ -3714,13 +4748,16 @@ async fn step_inject_trusted_identity(
         // token's `sub`) as `userIdentity.id` + `delegated`, matching the
         // fabric response-leg shape, alongside the redesign's nested `caller`
         // context object. Only applies when a workloadBinding is already being
-        // produced (WB configured on this Transit Point).
+        // produced (WB configured on this Transit Point), and never for a token
+        // issued for a peer gateway's request, whose `sub` only the peer vouches
+        // for.
         if let Some(obj) = wb
             .as_mut()
             .and_then(|v| v.as_object_mut())
             && let Some(caller_did) = ctx
                 .transit_token_claims
                 .as_ref()
+                .filter(|claims| claims.fabric.is_none())
                 .and_then(|c| c.sub.as_deref())
                 .filter(|d| !d.is_empty())
         {
@@ -3842,11 +4879,7 @@ async fn step_prepare_modern_credentials(
     else {
         return Ok(None);
     };
-    if ctx
-        .surface
-        .outbound_credentials
-        .is_empty()
-    {
+    if !crate::proxy::credential_delegation::modern::transit_point_bindings_apply(&ctx.surface) {
         return Ok(None);
     }
     if ctx
@@ -3855,6 +4888,16 @@ async fn step_prepare_modern_credentials(
     {
         log_fabric_delegation_withheld(ctx);
         return Ok(None);
+    }
+    if let Some(reason) = modern_fabric_caller_refusal(ctx) {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            reason,
+            "Delegated credentials are not released for this request that arrived over Fabric - refusing the request"
+        );
+        return Ok(Some(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing).into_response()));
     }
     let Some(runtime) = state
         .mcp_continuations
@@ -3872,14 +4915,14 @@ async fn step_prepare_modern_credentials(
             let body = ctx
                 .body_bytes
                 .as_ref()
-                .ok_or(OutboundPipelineError::MetadataInjectionFailed)?;
+                .ok_or_else(|| metadata_injection_failed(ctx))?;
             let restored = prepared
                 .rewrite_body(body)
                 .and_then(|body| prepared.inject_body_credentials(&body))
-                .map_err(|_| OutboundPipelineError::MetadataInjectionFailed)?;
+                .map_err(|_| metadata_injection_failed(ctx))?;
             prepared
                 .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?;
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?;
             ctx.body_bytes = Some(restored);
             ctx.mcp_classification = Some(crate::mcp::request_validation::McpRequestClassification::Modern(Box::new(
                 prepared.request.clone(),
@@ -3887,8 +4930,45 @@ async fn step_prepare_modern_credentials(
             ctx.modern_delegation = Some(prepared);
             Ok(None)
         }
+        Err(error @ ModernDelegationError::ConsentNotAvailableForPartners) => {
+            record_partner_consent_refusal(ctx);
+            Ok(Some(error.response(&request)))
+        }
         Err(error) => Ok(Some(error.response(&request))),
     }
+}
+
+/// Why a `2026-07-28` MCP Transit Point call carrying a Fabric-issued transit
+/// token may not use delegated credentials, or `None` when it may. The token
+/// decides the caller, as on the legacy path ([`delegation_caller_hash`]), but
+/// a modern grant is keyed by the Transit Point's resource-token caller, so the
+/// call proceeds only when that caller is the one the receiving surface
+/// verified, on a Transit Point that opts Fabric callers in.
+fn modern_fabric_caller_refusal(ctx: &OutboundPipelineContext) -> Option<&'static str> {
+    ctx.transit_token_claims
+        .as_ref()
+        .and_then(|claims| claims.fabric.as_ref())?;
+    if !ctx
+        .virtual_channel
+        .delegated_credentials_for_fabric_callers
+    {
+        return Some("delegated_credentials_for_fabric_callers=false");
+    }
+    let Some(principal) = delegation_caller_hash(ctx) else {
+        return Some("no_fabric_caller_verified");
+    };
+    let resource_caller = ctx
+        .authenticated_identity
+        .as_ref()
+        .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::ResourceToken))
+        .and_then(|identity| {
+            identity.principal_hash(
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
+        });
+    (resource_caller.as_deref() != Some(principal.as_str())).then_some("fabric_caller_is_not_the_resource_token_caller")
 }
 
 fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
@@ -3896,39 +4976,243 @@ fn log_fabric_delegation_withheld(ctx: &OutboundPipelineContext) {
         target: "credential_delegation",
         request_id = %ctx.request_id,
         surface_id = %ctx.surface.surface_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
         route = %ctx.virtual_channel.alias,
         reason = "fabric_delegated_credentials=false",
         "Delegated credentials withheld from Fabric peer"
     );
 }
 
+/// The JSON-RPC id a refusal of this request answers, when the Transit Point
+/// speaks MCP.
+fn mcp_refusal_id(ctx: &OutboundPipelineContext) -> Option<serde_json::Value> {
+    (ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp).then(|| {
+        match ctx
+            .mcp_classification
+            .as_ref()
+        {
+            Some(crate::mcp::request_validation::McpRequestClassification::Modern(request)) => request.id.clone(),
+            _ => ctx
+                .body_bytes
+                .as_deref()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+                .and_then(|body| body.get("id").cloned()),
+        }
+        .unwrap_or(serde_json::Value::Null)
+    })
+}
+
+/// The caller half of the vault key for a Transit Point's delegated
+/// credentials, legacy and modern. A transit token decides it, as it decides
+/// the caller of the Transit Point's policy input: an Access Point's token by
+/// its `user_identity_hash`; a token issued for a request that arrived over
+/// Fabric only by the caller the receiving surface verified
+/// (`fabric.principal_hash`), never by anything the peer named, and only on a
+/// Transit Point with `delegated_credentials_for_fabric_callers`. Without the
+/// switch, or without that caller, there is no key, and a client the Transit
+/// Point verified on the same call keys none either. With no token, the key
+/// is the identity hash of a caller the Transit Point's `source_auth`
+/// verified, the value an Access Point puts in a transit token for a caller it
+/// identified the same way. A credential that names no subject identifies no
+/// caller.
+pub(crate) fn delegation_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
+    if let Some(claims) = ctx
+        .transit_token_claims
+        .as_ref()
+    {
+        return token_caller_hash(ctx, claims);
+    }
+    source_auth_client_hash(ctx)
+}
+
+/// The identity hash of the client the Transit Point's own `source_auth`
+/// verified on this call, if it names a subject.
+fn source_auth_client_hash(ctx: &OutboundPipelineContext) -> Option<String> {
+    ctx.authenticated_identity
+        .as_ref()
+        .filter(|_| ctx.authenticated_by == Some(crate::surface_context::TransitClientVerification::SourceAuth))
+        .and_then(|identity| {
+            identity.principal_hash(
+                ctx.surface
+                    .tenant_id
+                    .as_deref(),
+            )
+        })
+}
+
+/// The caller a transit token names, as [`delegation_caller_hash`] reads it.
+fn token_caller_hash(
+    ctx: &OutboundPipelineContext,
+    claims: &crate::proxy::transit_token::TransitTokenClaims,
+) -> Option<String> {
+    if let Some(fabric) = &claims.fabric {
+        return fabric
+            .principal_hash
+            .clone()
+            .filter(|_| {
+                ctx.virtual_channel
+                    .delegated_credentials_for_fabric_callers
+                    && ctx
+                        .surface
+                        .fabric_caller_authentication_gap()
+                        .is_none()
+            });
+    }
+    claims
+        .user_identity_hash
+        .clone()
+}
+
+/// The caller a Transit Point's per-caller rate limit counts a request
+/// against: the caller its transit token names, required or a verified
+/// optional one, read as [`delegation_caller_hash`] reads it, else the client
+/// the Transit Point's `source_auth` verified. Unlike a delegation key, a
+/// token that names no caller falls back to that client, since it only picks
+/// a bucket.
+fn rate_limit_caller_hash(ctx: &OutboundPipelineContext) -> Option<String> {
+    ctx.transit_token_claims
+        .as_ref()
+        .or(ctx
+            .optional_transit_token_claims
+            .as_ref())
+        .and_then(|claims| token_caller_hash(ctx, claims))
+        .or_else(|| source_auth_client_hash(ctx))
+}
+
+/// The agent half of the vault key for a Transit Point's delegated
+/// credentials, legacy and modern: the Transit Point's managed identity, else
+/// the caller DID an Access Point's transit token carries, never one a Fabric
+/// peer named. Without one no grant is looked up, so a grant is never shared
+/// between agents or surfaces under a placeholder key.
+pub(crate) fn delegation_agent_did(ctx: &OutboundPipelineContext) -> Option<&str> {
+    match &ctx.resolved_identity {
+        ProtectedAgentIdentity::Managed { did, .. } => Some(did.as_str()),
+        ProtectedAgentIdentity::Anonymous => None,
+    }
+    .or_else(|| {
+        ctx.transit_token_claims
+            .as_ref()
+            .filter(|claims| claims.fabric.is_none())
+            .and_then(|claims| claims.sub.as_deref())
+    })
+}
+
+/// Refuse a request whose target authentication credential cannot be resolved
+/// or sent.
+fn target_auth_unavailable(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    OutboundPipelineError::TargetAuthUnavailable {
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// Refuse a request whose metadata or credentials cannot be injected, or whose
+/// Transit Point's MCP configuration is invalid.
+fn metadata_injection_failed(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    OutboundPipelineError::MetadataInjectionFailed {
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// Refuse a request whose delegated credentials cannot be resolved.
+fn refuse_delegation(
+    ctx: &OutboundPipelineContext,
+    refusal: DelegationRefusal,
+) -> OutboundPipelineError {
+    OutboundPipelineError::DelegationRefused {
+        refusal,
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// Logs and records, as a `request_rejected` at the `admission` stage, the
+/// refusal of a call carrying a Fabric-issued transit token whose caller has
+/// no grant yet: consent is never started through a partner, so a person
+/// connects to this gateway directly first.
+fn record_partner_consent_refusal(ctx: &OutboundPipelineContext) {
+    let refusal = DelegationRefusal::ConsentNotAvailableForPartners;
+    warn!(
+        target: "credential_delegation",
+        request_id = %ctx.request_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        reason = crate::proxy::credential_delegation::PARTNER_CONSENT_UNAVAILABLE_REASON,
+        "The caller of a request that arrived over Fabric has no grant, and consent is not started through a \
+         partner - refusing the request"
+    );
+    crate::audit::request_events::request_rejected(
+        &transit_audit_facts(ctx),
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::ConsentNotAvailableForPartners,
+        refusal.status_code().as_u16(),
+        mcp_refusal_id(ctx).map(|_| i64::from(refusal.jsonrpc_code())),
+    );
+}
+
+/// Logs and records, as a `request_rejected` at the `admission` stage, a
+/// request body over `max_bytes`.
+fn record_body_too_large(
+    ctx: &OutboundPipelineContext,
+    max_bytes: usize,
+) {
+    warn!(
+        request_id = %ctx.request_id,
+        transit_point = %ctx.virtual_channel.alias,
+        max = max_bytes,
+        "Request body too large"
+    );
+    crate::audit::request_events::request_rejected(
+        &crate::audit::request_events::RequestFacts {
+            surface_id: &ctx.surface.surface_id,
+            channel_name: &ctx.surface.name,
+            trace_id: Some(&ctx.request_id),
+            via_fabric: false,
+        },
+        crate::audit::request_events::RejectionStage::Admission,
+        crate::audit::request_events::RejectionReason::BodyTooLarge,
+        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+        None,
+    );
+}
+
+/// [`record_partner_consent_refusal`], and the refusal itself.
+fn refuse_partner_consent(ctx: &OutboundPipelineContext) -> OutboundPipelineError {
+    record_partner_consent_refusal(ctx);
+    refuse_delegation(ctx, DelegationRefusal::ConsentNotAvailableForPartners)
+}
+
 /// [11] Credential Injection — resolve delegated OAuth tokens from the credential
 /// vault and inject them into the outbound request, or return a consent_required
 /// signal if the user has not yet authorized.
 ///
-/// The user identity hash is extracted from the transit token claims (which encodes
-/// the original caller's authenticated identity). The channel's `outbound_credentials`
-/// bindings determine which credential providers to look up.
+/// The caller is the one [`delegation_caller_hash`] names. The channel's `outbound_credentials`
+/// bindings determine which credential providers to look up. A binding that applies
+/// but cannot be resolved refuses the request; it is never forwarded without the
+/// credential. A public discovery read carries no caller, so, as with target
+/// authentication, no caller's credential is released for it.
 async fn step_inject_credentials(
     state: &OutboundProxyState,
     ctx: &mut OutboundPipelineContext,
 ) -> Result<(), OutboundPipelineError> {
-    if ctx
-        .variant_resolution_error
-        .is_some()
-    {
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    if !transit_caller_assertion(ctx).permits_target_credential() {
         return Ok(());
     }
     let mut outbound_creds = ctx
         .surface
         .transit_point_outbound_credentials(&ctx.virtual_channel);
-    if !outbound_creds.is_empty()
+    let external = ctx
+        .surface
+        .transit_point_external_credentials(&ctx.virtual_channel)
+        .cloned();
+    if (!outbound_creds.is_empty() || external.is_some())
         && ctx
             .virtual_channel
             .withholds_delegated_credentials()
     {
         log_fabric_delegation_withheld(ctx);
         return Ok(());
+    }
+    if let Some(binding) = external.as_ref() {
+        step_inject_external_grant(state, ctx, binding).await?;
     }
     if let Some(prepared) = ctx.modern_delegation.as_ref() {
         outbound_creds.retain(|binding| {
@@ -3957,42 +5241,62 @@ async fn step_inject_credentials(
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
-                "Credential delegation configured but stores not available — skipping"
+                surface_variant = surface_variant.as_deref(),
+                "Credential delegation configured but stores not available - refusing the request"
             );
-            return Ok(());
+            return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
         }
     };
 
-    // Extract user_identity_hash from the transit token (carries the original caller context)
-    let user_hash = match ctx
-        .transit_token_claims
-        .as_ref()
-        .and_then(|c| {
-            c.user_identity_hash
-                .as_deref()
-        }) {
-        Some(h) => h.to_string(),
-        None => {
+    let Some(user_hash) = delegation_caller_hash(ctx) else {
+        if ctx
+            .transit_token_claims
+            .as_ref()
+            .is_some_and(|claims| claims.fabric.is_some())
+        {
+            if ctx
+                .virtual_channel
+                .delegated_credentials_for_fabric_callers
+            {
+                warn!(
+                    target: "credential_delegation",
+                    request_id = %ctx.request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    reason = "no_fabric_caller_verified",
+                    "The receiving surface verified no caller of the request that arrived over Fabric - refusing \
+                     the request"
+                );
+            } else {
+                warn!(
+                    target: "credential_delegation",
+                    request_id = %ctx.request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    reason = "delegated_credentials_for_fabric_callers=false",
+                    "Delegated credentials are not released for requests that arrived over Fabric - refusing the \
+                     request"
+                );
+            }
+        } else {
             warn!(
                 target: "credential_delegation",
                 request_id = %ctx.request_id,
-                "Transit token does not carry user_identity_hash — cannot look up credentials"
+                surface_variant = surface_variant.as_deref(),
+                "Neither the transit token nor the Transit Point's source_auth identifies the caller - refusing the request"
             );
-            return Ok(());
         }
+        return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
     };
 
-    // Use agent DID from identity extraction or fall back to surface_id from token
-    let agent_did = match &ctx.resolved_identity {
-        ProtectedAgentIdentity::Managed { did, .. } => Some(did.as_str()),
-        ProtectedAgentIdentity::Anonymous => None,
-    }
-    .or_else(|| {
-        ctx.transit_token_claims
-            .as_ref()
-            .and_then(|c| c.sub.as_deref())
-    })
-    .unwrap_or("unknown");
+    let Some(agent_did) = delegation_agent_did(ctx).map(str::to_string) else {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
+            "No managed agent identity for delegated credentials - refusing the request"
+        );
+        return Err(refuse_delegation(ctx, DelegationRefusal::AgentIdentityMissing));
+    };
+    let agent_did = agent_did.as_str();
 
     let channel_id = ctx
         .surface
@@ -4005,7 +5309,7 @@ async fn step_inject_credentials(
         .and_then(crate::mcp::tool_analyzer::called_tool_name);
 
     let audit_ctx = crate::proxy::credential_delegation::DelegationAuditContext {
-        caller: None,
+        caller: outbound_caller(ctx),
         channel_name: Some(ctx.surface.name.clone()),
         target_endpoint: Some(
             ctx.virtual_channel
@@ -4030,6 +5334,11 @@ async fn step_inject_credentials(
         &user_hash,
         agent_did,
         channel_id,
+        crate::tenancy::SurfaceTenancy::configured(
+            ctx.surface
+                .tenant_id
+                .as_deref(),
+        ),
         mcp_tool.as_deref(),
         vault_store,
         provider_store,
@@ -4049,7 +5358,23 @@ async fn step_inject_credentials(
             matches!(&resolution.result, crate::proxy::credential_delegation::DelegationLookupResult::Unavailable)
         })
     {
-        return Err(OutboundPipelineError::DelegationUnavailable);
+        return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
+    }
+
+    if ctx
+        .transit_token_claims
+        .as_ref()
+        .is_some_and(|claims| claims.fabric.is_some())
+        && results
+            .iter()
+            .any(|resolution| {
+                matches!(
+                    &resolution.result,
+                    crate::proxy::credential_delegation::DelegationLookupResult::ConsentRequired { .. }
+                )
+            })
+    {
+        return Err(refuse_partner_consent(ctx));
     }
 
     // Check for consent_required — if any binding needs consent, return the signal
@@ -4073,6 +5398,7 @@ async fn step_inject_credentials(
         info!(
             target: "credential_delegation",
             request_id = %ctx.request_id,
+            surface_variant = surface_variant.as_deref(),
             providers = %consent_entries.len(),
             user_hash = %user_hash,
             agent_did = %agent_did,
@@ -4094,62 +5420,368 @@ async fn step_inject_credentials(
 
     for resolution in &results {
         if let crate::proxy::credential_delegation::DelegationLookupResult::Inject(injections) = &resolution.result {
-            for injection in injections {
-                match injection {
-                    crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta { field, value } => {
-                        let Some(body_bytes) = ctx.body_bytes.as_ref() else {
-                            warn!(
-                                target: "credential_delegation",
-                                request_id = %ctx.request_id,
-                                meta_field = %field,
-                                "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
-                            );
-                            return Err(OutboundPipelineError::MetadataInjectionFailed);
-                        };
-                        match crate::proxy::credential_delegation::inject_delegated_credential_into_mcp_meta(
-                            body_bytes, field, value,
-                        ) {
-                            Ok(modified) => {
-                                ctx.body_bytes = Some(modified.into());
-                                debug!(
-                                    target: "credential_delegation",
-                                    request_id = %ctx.request_id,
-                                    meta_field = %field,
-                                    "Injecting delegated credential into outbound MCP metadata"
-                                );
-                            }
-                            Err(error) => {
-                                warn!(
-                                    target: "credential_delegation",
-                                    request_id = %ctx.request_id,
-                                    meta_field = %field,
-                                    error = %error,
-                                    "Failed to inject delegated credential into outbound MCP metadata"
-                                );
-                                return Err(OutboundPipelineError::MetadataInjectionFailed);
-                            }
-                        }
-                    }
-                    crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
-                        debug!(
-                            target: "credential_delegation",
-                            request_id = %ctx.request_id,
-                            header = %name,
-                            "Injecting delegated credential header into outbound request"
-                        );
-                        if let Ok(header_name) = name.parse::<axum::http::header::HeaderName>()
-                            && let Ok(header_value) = value.parse::<axum::http::header::HeaderValue>()
-                        {
-                            ctx.original_headers
-                                .insert(header_name, header_value);
-                        }
-                    }
-                }
-            }
+            apply_credential_injections(ctx, injections)?;
         }
     }
 
     Ok(())
+}
+
+/// Put resolved delegated credentials into the outbound request: headers into
+/// the delegated credential headers, `_meta` values into the MCP body.
+fn apply_credential_injections(
+    ctx: &mut OutboundPipelineContext,
+    injections: &[crate::proxy::credential_delegation::ResolvedCredentialInjection],
+) -> Result<(), OutboundPipelineError> {
+    let surface_variant = crate::observability::policy_audit::current_request_variant();
+    for injection in injections {
+        match injection {
+            crate::proxy::credential_delegation::ResolvedCredentialInjection::McpMeta { field, value } => {
+                let Some(body_bytes) = ctx.body_bytes.as_ref() else {
+                    warn!(
+                        target: "credential_delegation",
+                        request_id = %ctx.request_id,
+                        surface_variant = surface_variant.as_deref(),
+                        meta_field = %field,
+                        "Failed to inject delegated credential into outbound MCP metadata because body is unavailable"
+                    );
+                    return Err(metadata_injection_failed(ctx));
+                };
+                match crate::proxy::credential_delegation::inject_delegated_credential_into_mcp_meta(
+                    body_bytes, field, value,
+                ) {
+                    Ok(modified) => {
+                        ctx.body_bytes = Some(modified.into());
+                        debug!(
+                            target: "credential_delegation",
+                            request_id = %ctx.request_id,
+                            surface_variant = surface_variant.as_deref(),
+                            meta_field = %field,
+                            "Injecting delegated credential into outbound MCP metadata"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "credential_delegation",
+                            request_id = %ctx.request_id,
+                            surface_variant = surface_variant.as_deref(),
+                            meta_field = %field,
+                            error = %error,
+                            "Failed to inject delegated credential into outbound MCP metadata"
+                        );
+                        return Err(metadata_injection_failed(ctx));
+                    }
+                }
+            }
+            crate::proxy::credential_delegation::ResolvedCredentialInjection::Header { name, value } => {
+                debug!(
+                    target: "credential_delegation",
+                    request_id = %ctx.request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    header = %name,
+                    "Injecting delegated credential header into outbound request"
+                );
+                let (Ok(header_name), Ok(header_value)) =
+                    (name.parse::<axum::http::header::HeaderName>(), value.parse::<axum::http::header::HeaderValue>())
+                else {
+                    warn!(
+                        target: "credential_delegation",
+                        request_id = %ctx.request_id,
+                        surface_variant = surface_variant.as_deref(),
+                        header = %name,
+                        "Delegated credential is not a valid header - refusing the request"
+                    );
+                    return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
+                };
+                ctx.delegated_credential_headers
+                    .insert(header_name, header_value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a Transit Point request whose `consent_mode = external` grant
+/// cannot be released, logging why: `connector_unavailable` unless `refusal`
+/// says otherwise.
+fn refuse_grant(
+    ctx: &OutboundPipelineContext,
+    refusal: crate::delegation_vault::release::GrantRefusal,
+    reason: &'static str,
+) -> OutboundPipelineError {
+    warn!(
+        target: "credential_delegation",
+        request_id = %ctx.request_id,
+        surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+        reason,
+        refusal = refusal.reason(),
+        "The Transit Point's grant by binding cannot be released - refusing the request"
+    );
+    OutboundPipelineError::GrantRefused {
+        refusal,
+        mcp_request_id: mcp_refusal_id(ctx),
+    }
+}
+
+/// Refuse a Transit Point request whose `consent_mode = external` grant
+/// cannot be released for a reason a new connect would not fix:
+/// `connector_unavailable`.
+fn refuse_external_grant(
+    ctx: &OutboundPipelineContext,
+    reason: &'static str,
+) -> OutboundPipelineError {
+    refuse_grant(ctx, crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable, reason)
+}
+
+/// The grant by binding a request carries, with what releasing it again
+/// needs.
+pub struct ReleasedGrant {
+    grant: crate::delegation_vault::grants::DelegatedGrant,
+    provider: crate::credential_providers::CredentialProvider,
+    key: crate::delegation_vault::grants::GrantKey,
+    subject: crate::config::agent_surface::GrantSubject,
+    injection: crate::config::types::CredentialInjection,
+}
+
+/// [11a] A Transit Point's `consent_mode = external` binding: release the
+/// grant kept for this binding and principal, keyed by the surface's tenant,
+/// the surface, this Transit Point's id, the provider and the principal
+/// (`owner`, or the caller [`delegation_caller_hash`] names). No managed agent
+/// identity is needed, and no authorization URL is ever built: a call with no
+/// releasable grant is refused before it is forwarded, with a fixed reason
+/// ([`crate::delegation_vault::release`]). A grant due a refresh is refreshed
+/// first. Like every delegated credential, the grant is released only for a
+/// request whose caller is identified, whichever account it is. A
+/// `2026-07-28` MCP request is refused: such a binding's vendor is reached
+/// over a session revision.
+async fn step_inject_external_grant(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    binding: &crate::config::agent_surface::TransitCredentials,
+) -> Result<(), OutboundPipelineError> {
+    use crate::config::agent_surface::GrantSubject;
+    use crate::delegation_vault::grants::GrantKey;
+
+    if let Some(crate::mcp::request_validation::McpRequestClassification::Modern(_)) = ctx
+        .mcp_classification
+        .as_ref()
+    {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            "A 2026-07-28 MCP request was sent to a Transit Point with external consent - refusing the request"
+        );
+        return Err(OutboundPipelineError::McpValidation(Box::new(
+            crate::mcp::request_validation::McpRequestValidationError {
+                status: StatusCode::BAD_REQUEST,
+                id: mcp_refusal_id(ctx),
+                code: crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                message: "Unsupported protocol version".into(),
+                data: Some(serde_json::json!({
+                    "requested": crate::mcp::MCP_MODERN_VERSION,
+                    "supported": [crate::mcp::MCP_LEGACY_VERSION],
+                })),
+            },
+        )));
+    }
+    let (Some(vault), Some(providers)) = (&state.delegation_vault_store, &state.credential_provider_store) else {
+        return Err(refuse_external_grant(ctx, "stores_unavailable"));
+    };
+    if !ctx
+        .surface
+        .outbound_credentials
+        .is_empty()
+    {
+        return Err(refuse_external_grant(ctx, "surface_outbound_credentials"));
+    }
+    if let Some(unchecked) = binding
+        .subject
+        .and_then(|subject| crate::proxy::target_grant::unchecked_callers(&ctx.surface, subject))
+    {
+        return Err(refuse_external_grant(ctx, unchecked.reason()));
+    }
+    if ctx
+        .virtual_channel
+        .presents_the_agent()
+    {
+        return Err(refuse_external_grant(ctx, "presentation_of_the_agent"));
+    }
+    let Some(caller) = delegation_caller_hash(ctx) else {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            reason = "caller_not_identified",
+            "The Transit Point's grant by binding cannot be released - refusing the request"
+        );
+        return Err(refuse_delegation(ctx, DelegationRefusal::CallerIdentityMissing));
+    };
+    let provider = match providers
+        .get(&binding.credential_provider_id)
+        .await
+    {
+        Ok(Some(provider)) => provider,
+        Ok(None) | Err(_) => {
+            return Err(refuse_external_grant(ctx, "provider_unavailable"));
+        }
+    };
+    if !provider.is_external_consent() {
+        return Err(refuse_external_grant(ctx, "provider_without_issuer"));
+    }
+    if provider.tenant_id != ctx.surface.tenant_id {
+        return Err(refuse_external_grant(ctx, "provider_of_another_tenant"));
+    }
+    let Ok(destination) = crate::credential_providers::external::check_grant_destination(
+        &provider,
+        &ctx.virtual_channel
+            .target_endpoint,
+        state
+            .egress_allowlist
+            .as_deref(),
+    )
+    .await
+    else {
+        return Err(refuse_external_grant(ctx, "destination_not_the_resource"));
+    };
+    if !crate::credential_providers::external::resource_permitted(
+        &provider,
+        &state
+            .network_config
+            .external_consent_resource_origins,
+    ) {
+        return Err(refuse_external_grant(ctx, "resource_not_permitted_for_issuer"));
+    }
+    if crate::credential_providers::external::issuer_permitted(
+        &provider,
+        state
+            .network_config
+            .external_consent_issuers
+            .as_ref(),
+    )
+    .is_err()
+    {
+        return Err(refuse_external_grant(ctx, "issuer_not_permitted"));
+    }
+    let surface = ctx.surface.clone();
+    let tenant = surface.tenant_id.as_deref();
+    let surface_id = surface.surface_id.as_str();
+    let hop = ctx.virtual_channel.id.clone();
+    let hop = hop.as_str();
+    if hop.is_empty() {
+        return Err(refuse_external_grant(ctx, "transit_point_without_id"));
+    }
+    let (key, subject) = match binding.subject {
+        Some(GrantSubject::Owner) => (GrantKey::owner(tenant, surface_id, hop, &provider.id), GrantSubject::Owner),
+        Some(GrantSubject::Caller) => match GrantKey::caller(tenant, surface_id, hop, &provider.id, &caller) {
+            Some(key) => (key, GrantSubject::Caller),
+            None => {
+                return Err(refuse_external_grant(ctx, "caller_without_identity_hash"));
+            }
+        },
+        None => return Err(refuse_external_grant(ctx, "no_subject")),
+    };
+    let release = crate::delegation_vault::release::ReleaseContext {
+        vault,
+        secrets: state.secrets_store.as_ref(),
+        exact_allowlist: state
+            .egress_allowlist
+            .as_deref(),
+        refusal_limit: crate::delegation_vault::release::refusal_limit(
+            state
+                .network_config
+                .external_consent_refresh_refusals,
+        ),
+    };
+    let grant = match release
+        .release(&provider, &key, subject)
+        .await
+    {
+        Ok(grant) => grant,
+        Err(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
+    };
+    // Within the binding serving this call, and within every place the
+    // surface serves this Transit Point, as storing a grant and the sweep
+    // decide: a surface stored outside the API may serve one Transit Point id
+    // with other scopes in its base and a variant.
+    if !crate::identity::handlers::surface_grants::binding_permits(&binding.scopes, &provider.default_scopes, &grant)
+        || !crate::identity::handlers::surface_grants::serves_grant(
+            &ctx.served_surface,
+            &grant,
+            &provider.default_scopes,
+        )
+    {
+        return Err(refuse_grant(
+            ctx,
+            crate::delegation_vault::release::GrantRefusal::connect_required(&key, subject),
+            "grant_beyond_the_bindings_scopes",
+        ));
+    }
+    let injection = binding
+        .inject_as
+        .to_binding_injection();
+    let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &grant.access_token);
+    ctx.grant_destination = Some(destination);
+    apply_credential_injections(ctx, &injections)?;
+    if grant.use_is_due(chrono::Utc::now()) {
+        let vault = Arc::clone(vault);
+        let id = grant.id.clone();
+        let request_id = ctx.request_id.clone();
+        let surface_variant = crate::observability::policy_audit::current_request_variant();
+        tokio::spawn(async move {
+            if let Err(error) = vault
+                .mark_grant_used(&id)
+                .await
+            {
+                debug!(
+                    target: "credential_delegation",
+                    request_id = %request_id,
+                    surface_variant = surface_variant.as_deref(),
+                    error = %error,
+                    "Failed to record a grant's use"
+                );
+            }
+        });
+    }
+    audit_grant_injected(ctx, &caller, &provider, &grant, subject);
+    ctx.released_grant = Some(Box::new(ReleasedGrant {
+        grant,
+        provider,
+        key,
+        subject,
+        injection,
+    }));
+    Ok(())
+}
+
+/// Audit that a grant by binding was injected into a request.
+fn audit_grant_injected(
+    ctx: &OutboundPipelineContext,
+    caller: &str,
+    provider: &crate::credential_providers::CredentialProvider,
+    grant: &crate::delegation_vault::grants::DelegatedGrant,
+    subject: crate::config::agent_surface::GrantSubject,
+) {
+    crate::delegation_vault::audit::emit("token_injected", || {
+        let mut event = crate::delegation_vault::audit::audit_event(
+            crate::delegation_vault::audit::DelegationAuditAction::TokenInjected,
+            None,
+            Some(caller),
+            Some(&provider.id),
+            Some(&grant.surface_id),
+        );
+        event.token_id = Some(grant.id.clone());
+        event.provider_name = Some(provider.name.clone());
+        event.scopes = Some(grant.scopes.clone());
+        event.detail = Some(
+            match subject {
+                crate::config::agent_surface::GrantSubject::Owner => "grant_by_binding:owner",
+                crate::config::agent_surface::GrantSubject::Caller => "grant_by_binding:caller",
+            }
+            .to_string(),
+        );
+        event.caller = outbound_caller(ctx);
+        event
+    });
 }
 
 /// Unified upstream response, abstracting over the two outbound transports so
@@ -4182,11 +5814,132 @@ async fn step_forward_request(
         .target_endpoint
         .starts_with("fabric://")
     {
+        if ctx
+            .grant_destination
+            .is_some()
+        {
+            return Err(refuse_external_grant(ctx, "forward_over_fabric"));
+        }
         return step_forward_request_fabric(state, ctx).await;
     }
 
     let response = step_forward_request_http(state, ctx).await?;
     Ok(UpstreamResponse::Http(response))
+}
+
+/// The client a request carrying a grant by binding is sent with: to the
+/// grant's origin only, through Strict, `https`-only egress pinned to the vetted
+/// addresses, with redirects refused.
+async fn grant_forward_client(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    target_url: &str,
+    destination: &url::Origin,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client, OutboundPipelineError> {
+    if !url::Url::parse(target_url).is_ok_and(|url| url.origin() == *destination) {
+        return Err(refuse_external_grant(ctx, "forward_outside_the_grants_origin"));
+    }
+    crate::egress::pinned_vendor_client(
+        target_url,
+        timeout,
+        state
+            .egress_allowlist
+            .as_deref(),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            error = ?error.to_string(),
+            "The target of a request carrying a grant by binding was refused by Strict egress"
+        );
+        refuse_external_grant(ctx, "forward_refused_by_strict_egress")
+    })
+}
+
+/// The headers a Fabric forward carries, built by [`transit_request_headers`]:
+/// as a map of upper-cased names, so the remote gateway and its upstream see
+/// case-stable names, as the inbound Fabric forward sends them, and as the header
+/// map a `2026-07-28` MCP stream sends, with that request's prepared delegated
+/// credentials applied last and its session headers removed. Both carry the
+/// Fabric crossings the request will have made ([`outgoing_fabric_hops`]). The
+/// Fabric envelope carries header values as strings, so a header that is not
+/// one is left out, and a credential header that is not one refuses the
+/// request rather than being sent without it.
+async fn fabric_forward_headers(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+) -> Result<(std::collections::HashMap<String, String>, HeaderMap), OutboundPipelineError> {
+    let hops = outgoing_fabric_hops(ctx)?;
+    let mut headers_map = std::collections::HashMap::new();
+    let mut stream_headers = HeaderMap::new();
+    let credential_headers = transit_credential_header_names(ctx);
+    for (key, value) in &transit_request_headers(state, ctx).await? {
+        let Ok(v) = value.to_str() else {
+            if ctx
+                .delegated_credential_headers
+                .contains_key(key)
+            {
+                warn!(request_id = %ctx.request_id, header = %key, "Delegated credential header is not a string Fabric can carry - refusing the request");
+                return Err(refuse_delegation(ctx, DelegationRefusal::Unavailable));
+            }
+            if credential_headers
+                .iter()
+                .any(|credential| {
+                    key.as_str()
+                        .eq_ignore_ascii_case(credential)
+                })
+            {
+                warn!(request_id = %ctx.request_id, header = %key, "Target authentication header is not a string Fabric can carry - refusing the request");
+                if let Some(target_auth) = ctx
+                    .virtual_channel
+                    .target_auth
+                    .as_ref()
+                    .filter(|target_auth| {
+                        target_auth
+                            .method
+                            .header_name()
+                            .is_some_and(|name| {
+                                key.as_str()
+                                    .eq_ignore_ascii_case(name)
+                            })
+                    })
+                {
+                    crate::proxy::handler::record_target_auth_refusal(
+                        &transit_audit_facts(ctx),
+                        Some(&ctx.virtual_channel.alias),
+                        target_auth,
+                    );
+                }
+                return Err(target_auth_unavailable(ctx));
+            }
+            continue;
+        };
+        headers_map.insert(key.as_str().to_uppercase(), v.to_string());
+        stream_headers.append(key.clone(), value.clone());
+    }
+    crate::proxy::fabric_hops::set_fabric_hops(&mut headers_map, hops);
+    crate::proxy::fabric_hops::set_stream_fabric_hops(&mut stream_headers, hops);
+    if matches!(
+        ctx.mcp_classification
+            .as_ref(),
+        Some(crate::mcp::request_validation::McpRequestClassification::Modern(_))
+    ) {
+        if let Some(prepared) = ctx.modern_delegation.as_ref() {
+            for (name, value) in prepared
+                .credential_headers()
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?
+                .iter()
+            {
+                stream_headers.insert(name.clone(), value.clone());
+            }
+        }
+        crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
+    }
+    Ok((headers_map, stream_headers))
 }
 
 /// Forward the prepared request to a remote gateway channel over `fabric://`.
@@ -4216,65 +5969,27 @@ async fn step_forward_request_fabric(
     } else {
         format!("/{}", remainder)
     };
+    if let Some(target_auth) = ctx
+        .virtual_channel
+        .target_auth
+        .as_ref()
+        && !crate::proxy::paths::appended_path_stays_below_base(&path)
+    {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request that climbs out of its path: it would carry the Target credential");
+        crate::proxy::handler::record_target_auth_refusal(
+            &transit_audit_facts(ctx),
+            Some(&ctx.virtual_channel.alias),
+            target_auth,
+        );
+        return Err(target_auth_unavailable(ctx));
+    }
 
-    // Forward safe, non-hop-by-hop request headers (keys uppercased so the
-    // remote gateway and upstream see case-stable header names, matching the
-    // inbound fabric forward).
-    let mut headers_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut stream_headers = axum::http::HeaderMap::new();
     let is_modern = matches!(
         ctx.mcp_classification
             .as_ref(),
         Some(crate::mcp::request_validation::McpRequestClassification::Modern(_))
     );
-    for (key, value) in &ctx.original_headers {
-        if should_forward_outbound_request_header(
-            key.as_str(),
-            ctx.virtual_channel
-                .header_metadata_mapping_if_supported(),
-        ) && let Ok(v) = value.to_str()
-        {
-            headers_map.insert(key.as_str().to_uppercase(), v.to_string());
-            stream_headers.append(key.clone(), value.clone());
-        }
-    }
-
-    // Apply target authentication if configured.
-    if let Some(ref target_auth) = ctx
-        .virtual_channel
-        .target_auth
-    {
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            &ctx.surface.name,
-            crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
-                if is_modern {
-                    let name = axum::http::HeaderName::from_bytes(header_name.as_bytes())
-                        .map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?;
-                    let value = axum::http::HeaderValue::from_str(&header_value)
-                        .map_err(|_| OutboundPipelineError::TargetAuthUnavailable)?;
-                    stream_headers.insert(name, value);
-                }
-                headers_map.insert(header_name.to_uppercase(), header_value);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    request_id = %ctx.request_id,
-                    error = %e,
-                    "Failed to resolve target auth credentials for fabric forward"
-                );
-                if matches!(target_auth.fallback, crate::config::TargetAuthFallback::Reject) {
-                    return Err(OutboundPipelineError::TargetAuthUnavailable);
-                }
-            }
-        }
-    }
+    let (headers_map, stream_headers) = fabric_forward_headers(state, ctx).await?;
 
     let timeout = resolve_outbound_timeout(ctx);
 
@@ -4292,16 +6007,6 @@ async fn step_forward_request_fabric(
         .unwrap_or_default();
 
     if is_modern {
-        if let Some(prepared) = ctx.modern_delegation.as_ref() {
-            for (name, value) in prepared
-                .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?
-                .iter()
-            {
-                stream_headers.insert(name.clone(), value.clone());
-            }
-        }
-        crate::mcp::modern_http::strip_protocol_session_headers(&mut stream_headers);
         let response = crate::proxy::fabric_forward::forward_stream_via_fabric(
             &state.listener_manager,
             crate::proxy::fabric_forward::FabricStreamForwardRequest {
@@ -4344,13 +6049,16 @@ async fn step_forward_request_fabric(
             timeout,
             trace_id: &ctx.request_id,
             log_label: &ctx.surface.name,
+            extra_body: None,
         },
     )
     .await
     .map_err(|e| {
         error!(request_id = %ctx.request_id, error = %e, "Outbound fabric forward failed");
         match e {
-            FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
+            FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_) => {
+                OutboundPipelineError::UpstreamTimeout
+            }
             other => OutboundPipelineError::UpstreamConnectionFailed(other.to_string()),
         }
     })?;
@@ -4425,6 +6133,35 @@ async fn step_forward_request_http(
             .as_deref(),
     );
 
+    if ctx
+        .virtual_channel
+        .target_auth
+        .is_some()
+        && !crate::proxy::paths::is_target_credential_destination(
+            &ctx.virtual_channel
+                .target_endpoint,
+            ctx.original_method.as_str(),
+            &target_url,
+            ctx.virtual_channel
+                .agent_card_path
+                .as_deref(),
+        )
+    {
+        warn!(request_id = %ctx.request_id, "Refusing a Transit Point request outside its base path: it would carry the Target credential");
+        if let Some(target_auth) = ctx
+            .virtual_channel
+            .target_auth
+            .as_ref()
+        {
+            crate::proxy::handler::record_target_auth_refusal(
+                &transit_audit_facts(ctx),
+                Some(&ctx.virtual_channel.alias),
+                target_auth,
+            );
+        }
+        return Err(target_auth_unavailable(ctx));
+    }
+
     // Defense-in-depth SSRF guard at the forwarding layer. `pinned_forward_client`
     // fails closed on an unparseable URL, resolves DNS once to block a host that
     // *resolves* to a cloud-metadata endpoint, and returns a redirect-disabled
@@ -4432,27 +6169,41 @@ async fn step_forward_request_http(
     // window between vetting and connect and returning an upstream 3xx to the
     // caller rather than following it to an unvetted `Location`. Loopback and
     // RFC 1918 stay allowed on purpose — a transit point legitimately targets a
-    // localhost sidecar or same-VPC host.
+    // localhost sidecar or same-VPC host. A request carrying a grant by binding
+    // is held to its grant's origin under the Strict policy instead.
     let candidate = target_url.clone();
     let forward_timeout = resolve_outbound_timeout(ctx);
-    let forward_client =
+    let forward_client = if let Some(destination) = ctx.grant_destination.clone() {
+        grant_forward_client(state, ctx, &target_url, &destination, forward_timeout).await?
+    } else {
         match tokio::task::spawn_blocking(move || crate::egress::pinned_forward_client(&candidate, forward_timeout))
             .await
         {
             Ok(Ok((client, _target))) => client,
             Ok(Err(e)) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF blocked at forwarding layer: {}", e);
-                return Err(OutboundPipelineError::TargetAuthUnavailable);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF blocked at forwarding layer: {}",
+                    e
+                );
+                return Err(target_auth_unavailable(ctx));
             }
             Err(e) => {
-                warn!(request_id = %ctx.request_id, target = %target_url, "SSRF egress validation task failed: {}", e);
-                return Err(OutboundPipelineError::TargetAuthUnavailable);
+                warn!(
+                    request_id = %ctx.request_id,
+                    target = %loggable::url(&target_url),
+                    "SSRF egress validation task failed: {}",
+                    e
+                );
+                return Err(target_auth_unavailable(ctx));
             }
-        };
+        }
+    };
 
     debug!(
         request_id = %ctx.request_id,
-        target = %target_url,
+        target = %loggable::url(&target_url),
         method = %ctx.original_method,
         "Outbound: forwarding request"
     );
@@ -4475,59 +6226,13 @@ async fn step_forward_request_http(
         )
         .body(body);
 
-    // Forward safe, non-hop-by-hop request headers.
-    for (key, value) in &ctx.original_headers {
-        if should_forward_outbound_request_header(
-            key.as_str(),
-            ctx.virtual_channel
-                .header_metadata_mapping_if_supported(),
-        ) && let Ok(v) = value.to_str()
-        {
-            req_builder = req_builder.header(key.as_str(), v);
-        }
-    }
-
-    // Apply target authentication if configured.
-    if let Some(ref target_auth) = ctx
-        .virtual_channel
-        .target_auth
-    {
-        match crate::proxy::handler::inject_target_auth_header(
-            target_auth,
-            &state.secrets_store,
-            &ctx.surface.name,
-            crate::proxy::handler::CallerAssertion::for_request(ctx.original_method.as_str(), &ctx.request_path),
-        )
-        .await
-        {
-            Ok(Some((header_name, header_value))) => {
-                req_builder = req_builder.header(header_name, header_value);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    request_id = %ctx.request_id,
-                    error = %e,
-                    "Failed to resolve target auth credentials"
-                );
-                if matches!(
-                    ctx.virtual_channel
-                        .target_auth
-                        .as_ref()
-                        .map(|ta| &ta.fallback),
-                    Some(crate::config::TargetAuthFallback::Reject)
-                ) {
-                    return Err(OutboundPipelineError::TargetAuthUnavailable);
-                }
-            }
-        }
-    }
+    req_builder = req_builder.headers(transit_request_headers(state, ctx).await?);
 
     if let Some(prepared) = ctx.modern_delegation.as_ref() {
         req_builder = req_builder.headers(
             prepared
                 .credential_headers()
-                .map_err(|_| OutboundPipelineError::DelegationUnavailable)?,
+                .map_err(|_| refuse_delegation(ctx, DelegationRefusal::Unavailable))?,
         );
     }
     if matches!(
@@ -4554,7 +6259,11 @@ async fn step_forward_request_http(
                 if error.is_timeout() {
                     OutboundPipelineError::UpstreamTimeout
                 } else {
-                    OutboundPipelineError::UpstreamConnectionFailed(error.to_string())
+                    OutboundPipelineError::UpstreamConnectionFailed(
+                        error
+                            .without_url()
+                            .to_string(),
+                    )
                 }
             });
     }
@@ -4569,6 +6278,7 @@ async fn step_forward_request_http(
         .send()
         .await
         .map_err(|e| {
+            let e = e.without_url();
             if e.is_timeout() {
                 warn!(request_id = %ctx.request_id, error = %e, "Outbound request timed out");
                 OutboundPipelineError::UpstreamTimeout
@@ -4654,7 +6364,7 @@ fn agent_card_override_url(
 
 /// Compute the path suffix to forward, after stripping the transit point's
 /// listen prefix (its custom `listen_path`, or the derived
-/// `/outgoing/<route>/<alias>` convention).
+/// `/outbound/<route>/<alias>` convention).
 ///
 /// Returns the remainder **without** a leading slash (e.g. `message/send`), or
 /// an empty string when the request targets the transit point root. Both the
@@ -4702,6 +6412,33 @@ fn compute_outbound_remainder_path(
         .to_string()
 }
 
+/// Whether the request is a public discovery read of the Transit Point's target:
+/// a `GET` or `HEAD` of a discovery document at the target's root. It is
+/// forwarded without a transit token check, the request gates, or any credential.
+fn is_transit_discovery_read(ctx: &OutboundPipelineContext) -> bool {
+    crate::proxy::paths::is_transit_discovery_request(
+        ctx.original_method.as_str(),
+        &compute_outbound_remainder_path(
+            &ctx.request_path,
+            &ctx.surface.access_point.route,
+            &ctx.virtual_channel.alias,
+            ctx.virtual_channel
+                .listen_path
+                .as_deref(),
+        ),
+    )
+}
+
+/// A public discovery read was not authenticated, so the gateway vouches for no
+/// caller on it; any other Transit Point request was.
+fn transit_caller_assertion(ctx: &OutboundPipelineContext) -> crate::proxy::handler::CallerAssertion {
+    if is_transit_discovery_read(ctx) {
+        crate::proxy::handler::CallerAssertion::Unauthenticated
+    } else {
+        crate::proxy::handler::CallerAssertion::Authenticated
+    }
+}
+
 /// Whether the request fetches the extended agent card over the HTTP+JSON binding
 /// on an A2A/AP2 transit point.
 fn is_rest_extended_card_request(ctx: &OutboundPipelineContext) -> bool {
@@ -4729,6 +6466,138 @@ fn is_rpc_extended_card_request(ctx: &OutboundPipelineContext) -> bool {
             .operation
             .as_deref()
             .is_some_and(crate::a2a::is_extended_agent_card_method)
+}
+
+/// An MCP Transit Point's target is asked for an uncompressed answer, whatever
+/// the agent accepts: the gateway does not decompress, so tool gating and the
+/// response checks read the body as it is sent.
+fn request_uncompressed_mcp_response(ctx: &mut OutboundPipelineContext) {
+    if ctx.virtual_channel.protocol == crate::config::agent_surface::TransitProtocol::Mcp {
+        ctx.original_headers
+            .insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
+    }
+}
+
+/// An MCP Transit Point's target is asked for an uncompressed answer
+/// ([`request_uncompressed_mcp_response`]); one compressed all the same is
+/// refused, since tool gating and the response checks read the body as it is
+/// sent, and would read none of it.
+fn refuse_a_compressed_mcp_answer(
+    ctx: &OutboundPipelineContext,
+    upstream: &UpstreamResponse,
+) -> Result<(), OutboundPipelineError> {
+    let UpstreamResponse::Http(response) = upstream else {
+        return Ok(());
+    };
+    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+        return Ok(());
+    }
+    if crate::proxy::upstream_body::is_compressed(response.headers()) {
+        warn!(
+            request_id = %ctx.request_id,
+            alias = %ctx.virtual_channel.alias,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            "An MCP Transit Point's target compressed its answer although none was accepted - refusing it, since \
+             its body could not be checked"
+        );
+        return Err(OutboundPipelineError::UpstreamResponseReadFailed);
+    }
+    Ok(())
+}
+
+/// [12a] A vendor's refusal of a grant by binding. A `401` whose `Bearer`
+/// challenge rejects the token (`invalid_token`) gets one refresh,
+/// single-flight, and one retry with the new token. A grant that cannot be
+/// refreshed, or a refresh token the authorization server refuses
+/// (`invalid_grant`), removes the grant, revoking it at the vendor, and
+/// answers `connect_required`, but only while the grant still holds the token
+/// refused: a grant refreshed or reconnected meanwhile is kept. A second `401`
+/// refuses that request, not the fresh grant, which is kept, and answers
+/// `connector_unavailable`. A `401` without such a challenge, as a front
+/// proxy or a firewall answers, or with one that names no error, and a
+/// refresh that fails for a reason a new connect would not fix (the client
+/// refused, its secret unresolved, the endpoint unreachable), keep the grant
+/// and answer `connector_unavailable`. An MCP server checks the token before
+/// it acts, so a `401` means nothing ran. A `403` whose `Bearer`
+/// challenge says `insufficient_scope` answers `scope_insufficient`, naming
+/// the scope: a wider scope is never asked for silently. Any other answer, and
+/// any answer to a call that carries no such grant, passes through. The
+/// Access Point's Target decides alike
+/// ([`crate::delegation_vault::release::vendor_answer`]).
+async fn step_answer_a_refused_grant(
+    state: &OutboundProxyState,
+    ctx: &mut OutboundPipelineContext,
+    upstream: UpstreamResponse,
+) -> Result<UpstreamResponse, OutboundPipelineError> {
+    use crate::delegation_vault::release::{VendorAnswer, vendor_answer, vendor_answer_to_a_retry};
+    let UpstreamResponse::Http(response) = upstream else {
+        return Ok(upstream);
+    };
+    let Some(released) = ctx.released_grant.take() else {
+        return Ok(UpstreamResponse::Http(response));
+    };
+    match vendor_answer(response.status(), response.headers()) {
+        VendorAnswer::Pass => {
+            ctx.released_grant = Some(released);
+            return Ok(UpstreamResponse::Http(response));
+        }
+        VendorAnswer::Refuse(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
+        VendorAnswer::TokenRejected => drop(response),
+    }
+    let ReleasedGrant {
+        grant,
+        provider,
+        key,
+        subject,
+        injection,
+    } = *released;
+    let Some(vault) = state
+        .delegation_vault_store
+        .as_ref()
+    else {
+        return Err(refuse_external_grant(ctx, "stores_unavailable"));
+    };
+    let release = crate::delegation_vault::release::ReleaseContext {
+        vault,
+        secrets: state.secrets_store.as_ref(),
+        exact_allowlist: state
+            .egress_allowlist
+            .as_deref(),
+        refusal_limit: crate::delegation_vault::release::refusal_limit(
+            state
+                .network_config
+                .external_consent_refresh_refusals,
+        ),
+    };
+    let may_resend = ctx
+        .body_bytes
+        .as_ref()
+        .map_or(0, Bytes::len)
+        <= crate::delegation_vault::release::RETRY_BODY_LIMIT;
+    let fresh = match release
+        .retry_grant(&provider, &key, subject, &grant, may_resend)
+        .await
+    {
+        Ok(fresh) => fresh,
+        Err(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
+    };
+    let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &fresh.access_token);
+    apply_credential_injections(ctx, &injections)?;
+    let caller = delegation_caller_hash(ctx).unwrap_or_default();
+    audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
+    let retried = step_forward_request_http(state, ctx).await?;
+    if let Err(refused) = vendor_answer_to_a_retry(retried.status(), retried.headers()) {
+        drop(retried);
+        return Err(refuse_grant(ctx, refused.refusal, refused.reason));
+    }
+    ctx.released_grant = Some(Box::new(ReleasedGrant {
+        grant: fresh,
+        provider,
+        key,
+        subject,
+        injection,
+    }));
+    Ok(UpstreamResponse::Http(retried))
 }
 
 /// A compressed extended card cannot be rewritten, so the Target is asked for an
@@ -4771,21 +6640,24 @@ fn filter_transit_mcp_tools_list(
     if ctx.operation.as_deref() != Some("tools/list") {
         return body_bytes;
     }
-    let Some(pm) = state.policy_manager.as_ref() else {
-        return body_bytes;
-    };
-    let config_id = ctx
-        .surface
-        .config_id()
-        .unwrap_or("unknown");
     let alias = ctx
         .virtual_channel
         .alias
         .as_str();
-    let Some(gating) = pm
-        .compiled_mcp_tool_gating_for_transit(config_id, alias)
-        .filter(|g| !g.is_empty())
-    else {
+    let Some(gating) = compiled_transit_mcp_tool_gating(state, ctx) else {
+        if transit_mcp_tool_gating_configured(ctx) {
+            warn!(
+                request_id = %ctx.request_id,
+                alias = %alias,
+                "Per-transit-point MCP tool gating is configured but not in force; failing closed (empty tool list)"
+            );
+            return Bytes::from(crate::mcp::fail_closed_tools_list(
+                ctx.body_bytes
+                    .as_deref()
+                    .unwrap_or_default(),
+                ctx.mcp_metadata_context,
+            ));
+        }
         return body_bytes;
     };
     if body_bytes.is_empty() {
@@ -4992,6 +6864,8 @@ async fn process_modern_outbound_response(
     };
     let mut processing_headers = headers.clone();
     processing_headers.insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+    let mut headers = headers;
+    withhold_target_response_headers(&mut headers);
     let prepared = ctx.modern_delegation.take();
     let continuations = state
         .mcp_continuations
@@ -5052,7 +6926,9 @@ async fn process_modern_outbound_response(
     .await
     .map_err(|error| {
         if let Ok(snapshot) = shared.lock() {
-            warn!(request_id = %snapshot.1.request_id, error = %error, "Invalid modern MCP upstream response");
+            let (state, ctx) = &*snapshot;
+            warn!(request_id = %ctx.request_id, error = %error, "Invalid modern MCP upstream response");
+            step_record_metrics(state, ctx, false);
         }
         OutboundPipelineError::UpstreamResponseReadFailed
     })?;
@@ -5060,10 +6936,10 @@ async fn process_modern_outbound_response(
         if let Ok(mut snapshot) = shared.lock() {
             let (state, ctx) = &mut *snapshot;
             ctx.response_bytes = Some(outcome.bytes);
-            if outcome.completed {
-                step_record_metrics(state, ctx);
+            if outcome.completed || outcome.failed {
+                step_record_metrics(state, ctx, outcome.completed && status.is_success());
             } else {
-                warn!(request_id = %ctx.request_id, failed = outcome.failed, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
+                warn!(request_id = %ctx.request_id, response_bytes = outcome.bytes, "Modern MCP response ended before completion");
             }
         }
     }))
@@ -5205,11 +7081,14 @@ fn process_outbound_response_body(
         body_bytes
     };
 
-    // Build the response, forwarding non-hop-by-hop headers.
+    // Build the response, forwarding non-hop-by-hop headers other than the
+    // withheld ones.
     // Skip content-length: the body may have been rewritten (e.g. agent card URL
     // rewriting), so the upstream content-length is stale. Axum/hyper will set
     // the correct value from the actual body bytes.
     let mut builder = axum::response::Response::builder().status(status);
+    let mut upstream_headers = upstream_headers;
+    withhold_target_response_headers(&mut upstream_headers);
 
     for (key, value) in &upstream_headers {
         if !is_hop_by_hop_header(key.as_str()) && key != axum::http::header::CONTENT_LENGTH {
@@ -5229,10 +7108,13 @@ fn process_outbound_response_body(
         })
 }
 
-/// [13] Metrics & Logging — records latency and status.  Never fails.
+/// [13] Metrics & Logging - records latency and status, `succeeded` when the
+/// target answered with a 2xx and the response reached the agent whole. Never
+/// fails.
 fn step_record_metrics(
     state: &OutboundProxyState,
     ctx: &OutboundPipelineContext,
+    succeeded: bool,
 ) {
     let latency_ms = ctx
         .start_time
@@ -5287,18 +7169,20 @@ fn step_record_metrics(
             .virtual_channel
             .alias
             .clone();
-        let variant_alias = ctx
-            .active_variant_alias
-            .clone();
         let metrics = Arc::clone(metrics);
+        let status = if succeeded {
+            crate::metrics::ConnectionStatus::Success
+        } else {
+            crate::metrics::ConnectionStatus::Failed
+        };
 
-        tokio::spawn(async move {
+        crate::observability::policy_audit::spawn_in_request(async move {
             metrics
                 .record_connection_with_transit_point(
                     channel_config_id,
                     source,
                     dest,
-                    crate::metrics::ConnectionStatus::Success,
+                    status,
                     Some(latency_ms),
                     None,
                     crate::metrics::ConnectionDirection::Request,
@@ -5310,7 +7194,6 @@ fn step_record_metrics(
                     None,
                     None,
                     latency_ms,
-                    variant_alias,
                 )
                 .await;
         });
@@ -5323,7 +7206,9 @@ fn modern_fabric_failure(
 ) -> OutboundPipelineError {
     use crate::proxy::fabric_forward::FabricForwardError;
     match error {
-        FabricForwardError::NoResponse(_) => OutboundPipelineError::UpstreamTimeout,
+        FabricForwardError::NoResponse(_) | FabricForwardError::ReplyNotReceived(_) => {
+            OutboundPipelineError::UpstreamTimeout
+        }
         FabricForwardError::RemoteLegacyOnly => OutboundPipelineError::McpValidation(
             crate::mcp::request_validation::McpRequestValidationError::legacy_only(request_id),
         ),
@@ -5352,6 +7237,10 @@ mod tests {
         ));
         assert!(matches!(
             modern_fabric_failure(FabricForwardError::NoResponse("gw".into()), None),
+            OutboundPipelineError::UpstreamTimeout
+        ));
+        assert!(matches!(
+            modern_fabric_failure(FabricForwardError::ReplyNotReceived("gw".into()), None),
             OutboundPipelineError::UpstreamTimeout
         ));
         assert!(matches!(
@@ -5451,6 +7340,7 @@ mod tests {
                     policy_definition_id: None,
                     policy_name: None,
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5469,6 +7359,7 @@ mod tests {
                     policy_definition_id: Some("def-uuid-7"),
                     policy_name: Some("Partner egress policy"),
                     surface_id: Some("surf-1"),
+                    surface_name: Some("Surface one"),
                     http_method: "GET",
                     path: "/payments/pioneer/trust",
                     actor_did: Some("did:web:agent"),
@@ -5522,7 +7413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbound_policy_audit_falls_back_to_package_name_when_unnamed() {
+    async fn outbound_policy_audit_falls_back_to_the_definition_id_when_unnamed() {
         use crate::observability::policy_audit::POLICY_DECISION_COLLECTOR;
         use std::sync::Mutex;
 
@@ -5535,6 +7426,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -5551,8 +7443,7 @@ mod tests {
         let decisions = collector.lock().unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].scope, "response");
-        // No operator name → the human-readable name falls back to the package.
-        assert_eq!(decisions[0].policy_name, "surface.policy");
+        assert_eq!(decisions[0].policy_name, "def-resp-1");
         assert!(
             decisions[0]
                 .caller_did
@@ -5574,6 +7465,7 @@ mod tests {
                     policy_definition_id: Some("def-resp-1"),
                     policy_name: None,
                     surface_id: Some("surf-2"),
+                    surface_name: Some("Surface two"),
                     http_method: "POST",
                     path: "/a2a",
                     actor_did: None,
@@ -5604,7 +7496,7 @@ mod tests {
         serde_json::from_value(json!({
             "alias": "partner-a",
             "target_endpoint": "https://partner.example.com/a2a",
-            "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a",
+            "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a",
             "identity_injection": { "inject_vp": true }
         }))
         .unwrap()
@@ -5624,8 +7516,8 @@ mod tests {
             },
             "transit": {
                 "points": [
-                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/a2a", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a" },
-                    { "alias": "partner-b", "target_endpoint": "https://partner-b.example.com", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-b" }
+                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/a2a", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a" },
+                    { "alias": "partner-b", "target_endpoint": "https://partner-b.example.com", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-b" }
                 ]
             }
         }))
@@ -5644,12 +7536,16 @@ mod tests {
             body_bytes: None,
             original_method: Method::POST,
             original_headers: HeaderMap::new(),
+            delegated_credential_headers: HeaderMap::new(),
+            grant_destination: None,
+            released_grant: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
             mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
             mcp_classification: None,
             authenticated_identity: None,
+            authenticated_by: None,
             mcp_resource_authorization: None,
             modern_delegation: None,
             operation: None,
@@ -5662,10 +7558,13 @@ mod tests {
             _outbound_rules_engine: None,
             outbound_response_rules_engine: None,
             transit_token_claims: None,
+            optional_transit_token_claims: None,
             response_bytes: None,
             active_variant_alias: None,
             active_variant_id: None,
-            variant_resolution_error: None,
+            pending_variant_refusal: None,
+            served_surface: Arc::clone(&surface),
+            variant_changes_enforced_policy: false,
             surface,
             identity_rules_engine: None,
             identity_selector: None,
@@ -5701,10 +7600,13 @@ mod tests {
             delegation_vault_store: None,
             credential_provider_store: None,
             consent_identity_strategies: None,
+            source_auth_middleware: None,
             mcp_continuations: None,
             gateway_base_url: None,
             task_monitor: None,
             max_response_bytes: crate::config::A2aConfig::default().max_body_size,
+            max_request_bytes: crate::config::A2aConfig::default().max_body_size,
+            egress_allowlist: None,
             vc_alias_override: None,
         }
     }
@@ -5769,7 +7671,6 @@ mod tests {
         use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
         use crate::mcp::continuations::{config::ContinuationRuntime, negative_cases, protected::ContinuationRoute};
         use futures::TryStreamExt;
-        use sha2::{Digest, Sha256};
         use std::collections::HashMap;
 
         type ObservedCalls = Arc<tokio::sync::Mutex<Vec<(HeaderMap, serde_json::Value)>>>;
@@ -6091,7 +7992,7 @@ mod tests {
         assert_eq!(bound.resource, resource);
         assert!(calls.lock().await.is_empty());
         let token = serde_json::from_value(json!({
-            "id": "verified-token", "agent_did": "did:web:agent.example", "user_identity_hash": hex::encode(Sha256::digest(b"user")),
+            "id": "verified-token", "agent_did": "did:web:agent.example", "user_identity_hash": bound.user_identity_hash,
             "credential_provider_id": "provider", "provider_id": "provider", "access_token": "verified-transit-credential", "scopes": ["read"],
             "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
             "consent_identity": {"principal": bound.principal,
@@ -6345,7 +8246,7 @@ mod tests {
             );
         }
         let transit_issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"subscription-transit-fixture-signing-key",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gateway".into(),
         );
         state.transit_token_issuer = Some(Arc::new(transit_issuer.clone()));
@@ -6377,13 +8278,7 @@ mod tests {
         for invalid in ["missing", "surface", "point", "expired", "duplicate", "missing-issuer"] {
             let mut request = subscription_request();
             let token = transit_issuer
-                .clone()
-                .with_ttl(if invalid == "expired" {
-                    0
-                } else {
-                    300
-                })
-                .issue(
+                .issue_with_caller_context(
                     if invalid == "surface" {
                         "different-surface"
                     } else {
@@ -6399,8 +8294,22 @@ mod tests {
                     } else {
                         "partner-a".into()
                     }],
+                    serde_json::Map::new(),
+                    300,
                 )
                 .unwrap();
+            let token = if invalid == "expired" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 600;
+                claims.exp -= 600;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             if invalid != "missing" {
                 request
                     .headers_mut()
@@ -6517,14 +8426,32 @@ mod tests {
                 assert_eq!(metadata["scopes_supported"], json!(["read"]));
             }
             let token = transit_issuer
-                .clone()
-                .with_ttl(if termination == "transit-expiry" {
-                    3
-                } else {
-                    300
-                })
-                .issue(&surface.surface_id, None, None, None, None, None, vec!["partner-a".into()])
+                .issue_with_caller_context(
+                    &surface.surface_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec!["partner-a".into()],
+                    serde_json::Map::new(),
+                    300,
+                )
                 .unwrap();
+            // The shortest lifetime the issuer allows is 30 seconds, so back-date a
+            // token to leave it three seconds.
+            let token = if termination == "transit-expiry" {
+                let mut claims = transit_issuer
+                    .validate(&token, 300)
+                    .unwrap();
+                claims.iat -= 297;
+                claims.exp -= 297;
+                transit_issuer
+                    .sign(&claims)
+                    .unwrap()
+            } else {
+                token
+            };
             let mut authenticated_request = subscription_request();
             authenticated_request
                 .headers_mut()
@@ -6603,7 +8530,13 @@ mod tests {
                     .insert("x-transit-token", token.parse().unwrap());
                 let mut context_request = subscription_request();
                 *context_request.uri_mut() = variant_uri.parse().unwrap();
-                let context = OutboundPipelineContext::new(address, context_request, &request_state).unwrap();
+                let context = OutboundPipelineContext::new(
+                    address,
+                    context_request,
+                    &request_state,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )
+                .unwrap();
                 assert_eq!(
                     context
                         .active_variant_id
@@ -7470,7 +9403,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{body}: {error:?}"));
 
             assert_eq!(
-                ctx.original_headers
+                ctx.delegated_credential_headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok()),
                 expected,
@@ -7510,7 +9443,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            ctx.original_headers
+            ctx.delegated_credential_headers
                 .get("authorization")
                 .is_none()
         );
@@ -7551,7 +9484,8 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr),
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": format!("http://{}", target.addr),
                 "mcp_tool_gating": {"gates": [{"id": "g1", "name": "no admin",
                     "action": {"effect": "deny", "patterns": ["^admin_"]}}]}}]},
             "outbound_credentials": [{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]}}]
@@ -7642,7 +9576,8 @@ mod tests {
             "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
             "target": {"endpoint": "http://127.0.0.1:1"},
             "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]}
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": format!("http://{}", target.addr)}]}
         }))
         .unwrap();
         let state = test_outbound_state();
@@ -7711,6 +9646,77 @@ mod tests {
                 "an unmarked {method} without a body is forwarded"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn transit_requests_each_carry_their_own_request_id() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "request-id-surface", "name": "Request id surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"opa_policy_definition_id": "def-1", "points": [{"alias": "partner-a", "protocol": "mcp",
+                "require_transit_token": false, "allow_unauthenticated_callers": true,
+                "target_endpoint": "http://127.0.0.1:9"}]}
+        }))
+        .unwrap();
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner-a")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state.clone(),
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            let decisions: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.event, crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { .. })
+                })
+                .collect();
+            assert_eq!(decisions.len(), 1, "{events:?}");
+            assert_eq!(
+                decisions[0]
+                    .channel_name
+                    .as_deref(),
+                Some("Request id surface")
+            );
+            assert_eq!(
+                decisions[0]
+                    .surface_id
+                    .as_deref(),
+                Some("request-id-surface")
+            );
+            seen.push(
+                decisions[0]
+                    .request_id
+                    .clone()
+                    .expect("the decision carries the request id"),
+            );
+        }
+        assert!(seen.iter().all(|id| {
+            id.len() == 16
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        }));
+        assert_ne!(seen[0], seen[1], "each request has its own id");
     }
 
     // ── detect_protocol_and_operation ───────────────────────────────────────
@@ -8022,7 +10028,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn modern_transit_variant_failures_never_dispatch_the_base_target() {
+    async fn transit_variant_failures_are_refused_and_never_dispatch_the_base_target() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
         let target = crate::component_tests::helpers::MockServer::start_with_response(
             json!({
                 "jsonrpc": "2.0", "id": "variant", "result": {
@@ -8033,20 +10040,37 @@ mod tests {
         )
         .await;
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
-        for case in ["empty-catalog", "unknown", "disabled", "missing-default", "disabled-default"] {
+        let code = i64::from(crate::mcp::error_codes::INTERNAL_ERROR);
+        for (case, modern, sent, status, reason, requested_variant) in [
+            ("empty-catalog", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "malformed", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "20 KiB", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "GET", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", true, "DELETE", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("unknown", false, "envelope", 404, RejectionReason::UnknownVariant, Some("unknown")),
+            ("disabled", true, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("disabled", false, "envelope", 404, RejectionReason::VariantDisabled, None),
+            ("missing-default", true, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("empty-catalog-missing-default", false, "envelope", 500, RejectionReason::MisconfiguredDefault, None),
+            ("disabled-default", true, "envelope", 404, RejectionReason::VariantDisabled, None),
+        ] {
+            let label = format!("{case} modern={modern} body={sent}");
             let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                 "surface_id": "variant-surface", "name": "Variant surface",
                 "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
                 "target": {"endpoint": "http://127.0.0.1:1"},
                 "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
-                    "require_transit_token": false, "target_endpoint": format!("http://{}", target.addr)}]},
+                    "require_transit_token": false, "allow_unauthenticated_callers": true,
+                    "target_endpoint": format!("http://{}", target.addr)}]},
                 "variants": [{"id": "candidate", "alias": "candidate", "name": "Candidate", "enabled": false}]
             }))
             .unwrap();
-            if case == "empty-catalog" {
+            if case.starts_with("empty-catalog") {
                 surface.variants.clear();
             }
-            if case == "missing-default" {
+            if case.ends_with("missing-default") {
                 surface.default_variant_id = Some("absent".into());
             }
             if case == "disabled-default" {
@@ -8054,9 +10078,176 @@ mod tests {
             }
             let path = match case {
                 "disabled" => "/outbound/mcp$candidate/partner-a",
-                "missing-default" | "disabled-default" => "/outbound/mcp/partner-a",
+                "missing-default" | "disabled-default" | "empty-catalog-missing-default" => "/outbound/mcp/partner-a",
                 _ => "/outbound/mcp$unknown/partner-a",
             };
+            let state = test_outbound_state();
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let method = match sent {
+                "GET" | "DELETE" => sent,
+                _ => "POST",
+            };
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            let mut body = json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list"});
+            if modern {
+                request = request
+                    .header("mcp-method", "tools/list")
+                    .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION);
+                body["params"] = json!({"_meta": {
+                    "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }});
+            }
+            if sent == "20 KiB" {
+                body["params"]["padding"] = json!("x".repeat(20 * 1024));
+            }
+            let body = match sent {
+                "malformed" => "not json".to_string(),
+                "GET" | "DELETE" => String::new(),
+                _ => body.to_string(),
+            };
+            let request = request
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    versions,
+                )))
+                .await;
+            let response = response.unwrap_or_else(|error| error.into_response());
+            assert_eq!(response.status().as_u16(), status, "{label}");
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let answer: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if modern {
+                assert_eq!(content_type, "application/json", "{label}");
+                assert_eq!(answer["jsonrpc"], "2.0", "{label}: {answer}");
+                let id = (sent == "envelope").then_some("variant");
+                assert_eq!(
+                    answer
+                        .get("id")
+                        .and_then(serde_json::Value::as_str),
+                    id,
+                    "{label}: {answer}"
+                );
+                assert_eq!(answer.get("id").is_some(), id.is_some(), "{label}: no null id: {answer}");
+                assert_eq!(answer["error"]["code"], code, "{label}: {answer}");
+            } else {
+                assert_eq!(content_type, "application/problem+json", "{label}");
+                assert!(
+                    answer
+                        .get("jsonrpc")
+                        .is_none(),
+                    "{label}: {answer}"
+                );
+            }
+            let refusals: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        requested_variant,
+                        ..
+                    } => Some((*stage, *reason, *http_status, *rpc_error_code, requested_variant.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                refusals,
+                vec![(
+                    RejectionStage::Routing,
+                    reason,
+                    Some(status),
+                    modern.then_some(code),
+                    requested_variant.map(str::to_string)
+                )],
+                "{label}"
+            );
+            let expected_variant = match reason {
+                RejectionReason::UnknownVariant => Some("_unknown_"),
+                RejectionReason::VariantDisabled => Some("candidate"),
+                _ => None,
+            };
+            assert_eq!(
+                events[0]
+                    .surface_variant
+                    .as_deref(),
+                expected_variant,
+                "{label}"
+            );
+            assert_eq!(
+                target
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_credential_delegation_line_names_the_request_variant() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let ctx = test_pipeline_context();
+
+        crate::observability::policy_audit::with_request_variant("beta", || log_fabric_delegation_withheld(&ctx));
+        log_fabric_delegation_withheld(&ctx);
+
+        let lines: Vec<String> = logs
+            .text()
+            .lines()
+            .filter(|line| line.contains("Delegated credentials withheld"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        assert!(!lines[1].contains("surface_variant"), "{}", lines[1]);
+    }
+
+    #[tokio::test]
+    async fn every_transit_point_record_names_the_variant_that_served_it() {
+        for (variants, path, expected) in [
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {
+                    "shared": {"opa_policy_definition_id": "unavailable"},
+                    "points": [{"alias": "partner-a", "protocol": "mcp",
+                        "require_transit_token": false, "allow_unauthenticated_callers": true,
+                        "target_endpoint": "http://127.0.0.1:1"}]
+                },
+                "variants": variants
+            }))
+            .unwrap();
             let state = test_outbound_state();
             state
                 .channel_state
@@ -8066,52 +10257,28 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri(path)
-                .header("mcp-method", "tools/list")
-                .header("mcp-protocol-version", crate::mcp::MCP_MODERN_VERSION)
                 .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .body(axum::body::Body::from(
-                    json!({"jsonrpc": "2.0", "id": "variant", "method": "tools/list", "params": {"_meta": {
-                        "io.modelcontextprotocol/protocolVersion": crate::mcp::MCP_MODERN_VERSION,
-                        "io.modelcontextprotocol/clientCapabilities": {}
-                    }}})
-                    .to_string(),
-                ))
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
                 .unwrap();
-            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            let (_, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
                 "127.0.0.1:12345"
                     .parse()
                     .unwrap(),
                 state,
                 request,
-                versions,
-            ))
-            .await
-            .unwrap_or_else(|error| error.into_response());
-            assert_eq!(
-                response.status(),
-                if matches!(case, "empty-catalog" | "unknown") {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                },
-                "{case}"
-            );
-            let error: serde_json::Value = serde_json::from_slice(
-                &axum::body::to_bytes(response.into_body(), 16384)
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(error["id"], "variant");
-            assert!(error.get("result").is_none());
-            assert_eq!(
-                target
-                    .request_count
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                0,
-                "{case}"
-            );
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )))
+            .await;
+            assert!(!events.is_empty(), "{path}: the Transit Point request writes records");
+            for event in &events {
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
+            }
         }
     }
 
@@ -8174,6 +10341,7 @@ mod tests {
                 .unwrap(),
             req,
             &state,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
         )
         .expect("context should resolve variant Transit Point");
 
@@ -8200,7 +10368,177 @@ mod tests {
         );
     }
 
-    // ── step_source_auth (MVP: no-op) ──────────────────────────────────────
+    #[test]
+    fn only_a_variant_point_setting_a_different_enforced_policy_changes_it() {
+        let point = |extra: serde_json::Value| -> TransitPoint {
+            let mut point =
+                json!({"id": "tp", "alias": "partner", "target_endpoint": "https://t.example", "protocol": "mcp"});
+            for (key, value) in extra.as_object().unwrap() {
+                point[key] = value.clone();
+            }
+            serde_json::from_value(point).unwrap()
+        };
+        let gating =
+            json!({"gates": [{"id": "g1", "name": "no admin", "action": {"effect": "deny", "patterns": ["^admin_"]}}]});
+        let base = point(json!({
+            "mcp_tool_gating": gating,
+            "policy": {"policy_definition_id": "base-policy"},
+            "response_policy": {"policy_definition_id": "base-response"},
+            "per_caller_rate_limit": {"requests": 5, "window_secs": 60}
+        }));
+
+        for (case, variant, changes) in [
+            ("omits every field", json!({}), false),
+            ("sets empty gating", json!({"mcp_tool_gating": {}}), false),
+            (
+                "restates the base",
+                json!({"mcp_tool_gating": gating, "policy": {"policy_definition_id": "base-policy"}}),
+                false,
+            ),
+            (
+                "sets other gating",
+                json!({"mcp_tool_gating": {"gates": []}, "policy": {"policy_definition_id": "other"}}),
+                true,
+            ),
+            ("sets another response policy", json!({"response_policy": {"policy_definition_id": "other"}}), true),
+            (
+                "restates the per-caller rate limit",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60}}),
+                false,
+            ),
+            (
+                "restates the per-caller rate limit with its burst",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60, "burst": 5}}),
+                false,
+            ),
+            (
+                "sets another per-caller burst",
+                json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60, "burst": 10}}),
+                true,
+            ),
+            (
+                "sets another per-caller rate limit",
+                json!({"per_caller_rate_limit": {"requests": 50, "window_secs": 60}}),
+                true,
+            ),
+        ] {
+            assert_eq!(changes_enforced_transit_policy(&base, &point(variant)), changes, "{case}");
+        }
+        assert!(
+            changes_enforced_transit_policy(&point(json!({})), &point(json!({"mcp_tool_gating": gating}))),
+            "gating on a variant point whose base has none"
+        );
+        assert!(
+            changes_enforced_transit_policy(
+                &point(json!({})),
+                &point(json!({"per_caller_rate_limit": {"requests": 5, "window_secs": 60}}))
+            ),
+            "a per-caller rate limit on a variant point whose base has none"
+        );
+    }
+
+    #[test]
+    fn a_complete_variant_does_not_lift_the_base_transit_source_auth() {
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-complete-variant",
+            "name": "complete-variant",
+            "description": "",
+            "access_point": {
+                "listen_address": "0.0.0.0:8443",
+                "route": "/surfaces/order",
+                "protocol": "a2a"
+            },
+            "target": { "endpoint": "https://managed.example/a2a" },
+            "transit": {
+                "points": [{
+                    "id": "tp-base",
+                    "alias": "partner-a",
+                    "target_endpoint": "https://base.example/a2a",
+                    "protocol": "a2a"
+                }],
+                "source_auth": {
+                    "type": "api_key",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }
+            },
+            "variants": [{
+                "id": "variant-snapshot",
+                "alias": "snapshot",
+                "name": "Snapshot",
+                "enabled": true,
+                "overrides": { "complete": true, "transit": { "shared": {} } }
+            }]
+        }))
+        .expect("surface should deserialize");
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/outbound/surfaces/order$snapshot/partner-a/message/send")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let ctx = OutboundPipelineContext::new(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            req,
+            &state,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        )
+        .expect("context should resolve the complete variant");
+
+        assert_eq!(
+            ctx.active_variant_alias
+                .as_deref(),
+            Some("snapshot")
+        );
+        assert!(
+            ctx.outbound_shared
+                .source_auth
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_retired_outbound_state_refuses_every_route_still_holding_it() {
+        let mut held_by_listen_path_route = test_outbound_state();
+        held_by_listen_path_route.vc_alias_override = Some("partner-a".into());
+        let held_by_outbound_route = test_outbound_state();
+        held_by_listen_path_route.channel_state = held_by_outbound_route
+            .channel_state
+            .clone();
+
+        crate::proxy::server::retire_outbound_channel_state(&held_by_outbound_route.channel_state);
+
+        for (state, path) in [
+            (&held_by_outbound_route, "/outbound/surfaces/order/partner-a/message/send"),
+            (&held_by_outbound_route, "/outbound/surfaces/order$dev/partner-a/message/send"),
+            (&held_by_listen_path_route, "/custom/partner-a"),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let result = OutboundPipelineContext::new(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                request,
+                state,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            );
+            assert!(matches!(result, Err(OutboundPipelineError::OutboundDisabled)), "{path}");
+        }
+    }
+
+    // ── step_source_auth ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_step_source_auth_noop_when_none() {
@@ -8212,6 +10550,432 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn a_transit_point_naming_another_tenants_api_key_refuses_every_request_when_enforced() {
+        let _gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("owner-a", "atgk_transit_a"), ("owner-b", "atgk_transit_b")],
+        )
+        .await;
+        let naming = |key_id: &str| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            let mut surface = (*ctx.surface).clone();
+            surface.tenant_id = Some("tenant-a".into());
+            let mut point = ctx.virtual_channel.clone();
+            point.managed_identity =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": key_id})).unwrap());
+            surface.transit = Some(crate::config::agent_surface::TransitConfig {
+                points: vec![point],
+                outbound_listen_address: None,
+                shared: Default::default(),
+            });
+            ctx.surface = Arc::new(surface);
+            ctx
+        };
+
+        let mut cross = naming("atgk_transit_b");
+        let error = step_provider_key_gate(&mut cross)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                OutboundPipelineError::TransitPointUnavailable {
+                    mcp_request_id: Some(serde_json::Value::Null)
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let mut own = naming("atgk_transit_a");
+        assert!(
+            step_provider_key_gate(&mut own)
+                .await
+                .is_ok(),
+            "its own tenant's key is served"
+        );
+    }
+
+    #[tokio::test]
+    async fn transit_source_auth_refuses_every_request() {
+        let state = test_outbound_state();
+        for (case, method, path, mcp_resource_authorization) in [
+            ("tool call", Method::POST, "/outbound/surfaces/order/partner-a", false),
+            ("discovery read", Method::GET, "/outbound/surfaces/order/partner-a/.well-known/agent-card.json", false),
+            ("resource token", Method::POST, "/outbound/surfaces/order/partner-a", true),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.original_method = method;
+            ctx.request_path = path.to_string();
+            ctx.outbound_shared
+                .source_auth = Some(
+                serde_json::from_value(json!({
+                    "type": "api_key",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }))
+                .unwrap(),
+            );
+            if mcp_resource_authorization {
+                ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+                ctx.virtual_channel.mcp_http = Some(
+                    serde_json::from_value(json!({
+                        "authorization": {
+                            "resource": "https://outbound.example/outbound/surfaces/order/partner-a",
+                            "scopes": ["read"]
+                        }
+                    }))
+                    .unwrap(),
+                );
+            }
+
+            let error = step_source_auth(&state, &mut ctx)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{case}: {error:?}");
+            assert!(
+                ctx.authenticated_identity
+                    .is_none(),
+                "{case}"
+            );
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if mcp_resource_authorization {
+                assert_eq!(
+                    body,
+                    json!({"jsonrpc": "2.0", "id": null, "error": {
+                        "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                        "message": "This Transit Point is unavailable"
+                    }}),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(body["detail"], "This Transit Point is unavailable", "{case}: {body}");
+            }
+            assert!(
+                !body
+                    .to_string()
+                    .contains("source_auth"),
+                "{case}: the caller is not told why: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_whose_caller_authentication_cannot_be_enforced_refuses_every_request() {
+        let state = test_outbound_state();
+        let point = |fields: serde_json::Value| -> TransitPoint {
+            let mut point = serde_json::to_value(test_virtual_channel()).unwrap();
+            point
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    fields
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(point).unwrap()
+        };
+        let cases = [
+            ("no caller authentication", point(json!({ "require_transit_token": false }))),
+            (
+                "DID Auth",
+                point(json!({ "source_auth": {
+                    "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session" }
+                }})),
+            ),
+            (
+                "a forwarded JWT",
+                point(json!({ "source_auth": {
+                    "type": "jwt_bearer", "jwt_verification_strategy_id": "strategy", "audiences": [],
+                    "forward_header": true
+                }})),
+            ),
+            (
+                "source_auth beside mcp_http.authorization",
+                point(json!({
+                    "protocol": "mcp",
+                    "mcp_http": { "authorization": {
+                        "resource": "https://outbound.example/outbound/surfaces/order/partner-a"
+                    }},
+                    "source_auth": {
+                        "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    }
+                })),
+            ),
+        ];
+        for (case, transit_point) in cases {
+            for method in [Method::POST, Method::GET] {
+                let mut ctx = test_pipeline_context();
+                ctx.original_method = method.clone();
+                ctx.request_path = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json".to_string();
+                ctx.virtual_channel = transit_point.clone();
+                ctx.original_headers
+                    .insert("x-api-key", HeaderValue::from_static("any-key"));
+
+                let error = step_source_auth(&state, &mut ctx)
+                    .await
+                    .unwrap_err();
+
+                assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{case} {method}");
+                assert!(
+                    ctx.authenticated_identity
+                        .is_none(),
+                    "{case}"
+                );
+                let response = error.into_response();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case} {method}");
+                let body = String::from_utf8(
+                    axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .to_vec(),
+                )
+                .unwrap();
+                assert!(body.contains("This Transit Point is unavailable"), "{case}: {body}");
+                for detail in ["source_auth", "authenticat", "did_auth", "mcp_http"] {
+                    assert!(!body.contains(detail), "{case}: the caller is not told why: {body}");
+                }
+            }
+        }
+
+        let mut open = test_pipeline_context();
+        open.virtual_channel
+            .require_transit_token = false;
+        open.virtual_channel
+            .allow_unauthenticated_callers = true;
+        step_source_auth(&state, &mut open)
+            .await
+            .unwrap();
+        assert!(
+            open.authenticated_identity
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_refuses_its_source_auth_when_the_gateway_cannot_run_it() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .require_transit_token = false;
+        ctx.virtual_channel
+            .source_auth = Some(
+            serde_json::from_value(json!({
+                "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                "secret_id": "transit-caller-key"
+            }))
+            .unwrap(),
+        );
+        ctx.original_headers
+            .insert("x-api-key", HeaderValue::from_static("caller-key"));
+
+        let error = step_source_auth(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OutboundPipelineError::TransitPointUnavailable { .. }), "{error:?}");
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            ctx.authenticated_identity
+                .is_none()
+        );
+    }
+
+    /// An outbound state whose `source_auth` middleware knows the API key
+    /// secret `transit-caller-key`, whose value is `right-key`.
+    async fn transit_caller_key_state(directory: &std::path::Path) -> OutboundProxyState {
+        use crate::secrets::SecretsStore;
+
+        let secrets = Arc::new(
+            crate::secrets::FilesystemSecretsStore::new_async(
+                directory
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        secrets
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Transit Point callers".to_string(),
+                secret_id: "transit-caller-key".to_string(),
+                description: None,
+                value: "right-key".to_string(),
+                secret_type: "ApiKey".to_string(),
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let strategies =
+            crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(directory.join("strategies"))
+                .await
+                .unwrap();
+        let mut state = test_outbound_state();
+        state.source_auth_middleware = Some(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::sessions::DidAuthSessionStore::new()),
+            Arc::new(strategies),
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            Some(secrets),
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        )));
+        state
+    }
+
+    /// A Transit Point records every caller its `source_auth` refuses as an
+    /// `auth_failed` event, and names the caller it admitted on its policy and
+    /// delegation audit records.
+    #[tokio::test]
+    async fn a_transit_point_audits_the_callers_its_source_auth_refuses_and_names_the_one_it_admits() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = transit_caller_key_state(directory.path()).await;
+        let context = |key: Option<&'static str>| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .require_transit_token = false;
+            ctx.virtual_channel
+                .source_auth = Some(
+                serde_json::from_value(json!({
+                    "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                    "secret_id": "transit-caller-key"
+                }))
+                .unwrap(),
+            );
+            if let Some(key) = key {
+                ctx.original_headers
+                    .insert("x-api-key", HeaderValue::from_static(key));
+            }
+            ctx
+        };
+
+        for (key, reason) in [(Some("wrong-key"), "invalid_credential"), (None, "missing_credential")] {
+            let mut ctx = context(key);
+            let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut ctx)).await;
+            assert!(matches!(result, Err(OutboundPipelineError::TransitCallerUnauthenticated { .. })), "{result:?}");
+            assert_eq!(events.len(), 1, "{reason}: {events:?}");
+            assert!(
+                matches!(
+                    &events[0].event,
+                    DelegationAuditAction::AuthFailed {
+                        scheme: crate::audit::events::AuthScheme::ApiKey,
+                        reason: recorded,
+                        blocking: true,
+                        client_ip: Some(ip),
+                    } if recorded == reason && ip == "127.0.0.1"
+                ),
+                "{reason}: {events:?}"
+            );
+            assert_eq!(
+                events[0]
+                    .surface_id
+                    .as_deref(),
+                Some(
+                    ctx.surface
+                        .surface_id
+                        .as_str()
+                )
+            );
+            assert_eq!(events[0].trace_id.as_deref(), Some("test-request-id"));
+        }
+
+        let mut admitted = context(Some("right-key"));
+        let (result, events) = crate::audit::producer::capture(step_source_auth(&state, &mut admitted)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(events.is_empty(), "{events:?}");
+        let caller = outbound_caller(&admitted).expect("the admitted caller is named");
+        assert_eq!(caller.auth_method, "api_key");
+        assert_eq!(caller.sub.as_deref(), Some("transit-caller-key"));
+
+        admitted.authenticated_by = None;
+        assert!(outbound_caller(&admitted).is_none(), "an identity nothing verified names no caller");
+    }
+
+    /// The `auth_failed` record a Transit Point's `source_auth` writes names
+    /// the surface variant that served the request, as every other Transit
+    /// Point record does.
+    #[tokio::test]
+    async fn a_transit_point_source_auth_refusal_names_the_variant_that_served_it() {
+        use crate::delegation_vault::audit::DelegationAuditAction;
+
+        for (variants, path, expected) in [
+            (json!([{"id": "v-beta", "alias": "beta", "name": "Beta"}]), "/outbound/mcp$beta/partner-a", "beta"),
+            (json!([]), "/outbound/mcp/partner-a", "_base_"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                "surface_id": "variant-surface", "name": "Variant surface",
+                "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "a2a"},
+                "target": {"endpoint": "http://127.0.0.1:1"},
+                "transit": {"points": [{"alias": "partner-a", "protocol": "mcp",
+                    "require_transit_token": false, "target_endpoint": "http://127.0.0.1:1",
+                    "source_auth": {
+                        "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" },
+                        "secret_id": "transit-caller-key"
+                    }}]},
+                "variants": variants
+            }))
+            .unwrap();
+            let state = transit_caller_key_state(directory.path()).await;
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(surface);
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("x-api-key", "wrong-key")
+                .body(axum::body::Body::from(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string()))
+                .unwrap();
+            let (response, events) =
+                crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                    "127.0.0.1:12345"
+                        .parse()
+                        .unwrap(),
+                    state,
+                    request,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                )))
+                .await;
+            assert!(
+                matches!(response, Err(OutboundPipelineError::TransitCallerUnauthenticated { .. })),
+                "{path}: {response:?}"
+            );
+            let refusals = events
+                .iter()
+                .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { .. }))
+                .count();
+            assert_eq!(refusals, 1, "{path}: {events:?}");
+            for event in &events {
+                assert_eq!(
+                    event
+                        .surface_variant
+                        .as_deref(),
+                    Some(expected),
+                    "{path}: {event:?}"
+                );
+            }
+        }
+    }
+
     // ── step_rate_limit ────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -8221,6 +10985,258 @@ mod tests {
         ctx.outbound_shared.rate_limit = None;
         let result = step_rate_limit(&state, &mut ctx).await;
         assert!(result.is_ok());
+    }
+
+    async fn per_caller_limited_context(
+        protocol: &str,
+        requests: u32,
+    ) -> (OutboundProxyState, OutboundPipelineContext) {
+        rate_limited_context(
+            json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp", "protocol": protocol,
+                    "per_caller_rate_limit": { "requests": requests, "window_secs": 60 } }),
+        )
+        .await
+    }
+
+    async fn rate_limited_context(point: serde_json::Value) -> (OutboundProxyState, OutboundPipelineContext) {
+        rate_limited_variant_context(transit_surface(json!([point]), json!([])), None).await
+    }
+
+    async fn rate_limited_variant_context(
+        surface: crate::config::agent_surface::AgentSurface,
+        variant: Option<&str>,
+    ) -> (OutboundProxyState, OutboundPipelineContext) {
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.policy_manager = Some(Arc::new(manager));
+        let (resolved, point) = resolved_transit_point(&surface, variant, "partner");
+        (state, legacy_delegation_context(resolved, point))
+    }
+
+    fn as_caller(
+        ctx: &OutboundPipelineContext,
+        identity_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let mut next = test_pipeline_context();
+        next.served_surface = Arc::clone(&ctx.served_surface);
+        next.surface = Arc::clone(&ctx.surface);
+        next.virtual_channel = ctx.virtual_channel.clone();
+        next.transit_token_claims = ctx
+            .transit_token_claims
+            .clone()
+            .map(|mut claims| {
+                claims.user_identity_hash = identity_hash.map(str::to_string);
+                claims
+            });
+        next
+    }
+
+    #[tokio::test]
+    async fn a_transit_points_per_caller_limit_gives_each_caller_a_bucket_of_their_own() {
+        let (state, ctx) = per_caller_limited_context("mcp", 2).await;
+        for _ in 0..2 {
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .expect("alice is within her limit");
+        }
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap_err();
+        match refused {
+            OutboundPipelineError::CallerRateLimitExceeded { retry_after, mcp_request_id } => {
+                assert!(retry_after > std::time::Duration::from_secs(20), "{retry_after:?}");
+                assert_eq!(mcp_request_id, Some(serde_json::Value::Null));
+            }
+            other => panic!("expected the per-caller refusal, got {other:?}"),
+        }
+        for _ in 0..2 {
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("bob-hash")))
+                .await
+                .expect("bob is not held up by alice");
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_with_no_identified_caller_share_one_per_caller_bucket() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        step_rate_limit(&state, &mut as_caller(&ctx, None))
+            .await
+            .expect("the first anonymous request");
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, None))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
+        step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .expect("an identified caller has a bucket of their own");
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_without_a_per_caller_limit_is_not_limited_per_caller() {
+        let (state, ctx) =
+            rate_limited_context(json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp",
+                                         "protocol": "mcp" }))
+            .await;
+        for _ in 0..5 {
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_variant_point_that_omits_the_per_caller_limit_is_limited_by_the_surfaces() {
+        let surface = transit_surface(
+            json!([{ "alias": "partner", "target_endpoint": "https://partner.example/mcp", "protocol": "mcp",
+                     "per_caller_rate_limit": { "requests": 1, "window_secs": 60 } }]),
+            json!([{ "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true,
+                     "overrides": { "transit": { "points": [{ "alias": "partner",
+                         "target_endpoint": "https://partner-dev.example/mcp", "protocol": "mcp" }] } } }]),
+        );
+        let (state, ctx) = rate_limited_variant_context(surface, Some("dev")).await;
+        assert!(
+            ctx.virtual_channel
+                .per_caller_rate_limit
+                .is_none(),
+            "the variant's point leaves the limit out"
+        );
+        step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap();
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn an_optional_transit_token_gives_its_caller_a_bucket_of_their_own() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        let with_optional_token = |identity_hash: &str| {
+            let mut next = as_caller(&ctx, Some(identity_hash));
+            next.optional_transit_token_claims = next
+                .transit_token_claims
+                .take();
+            next
+        };
+        step_rate_limit(&state, &mut with_optional_token("alice-hash"))
+            .await
+            .unwrap();
+        let refused = step_rate_limit(&state, &mut with_optional_token("alice-hash"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::CallerRateLimitExceeded { .. }), "{refused:?}");
+        step_rate_limit(&state, &mut with_optional_token("bob-hash"))
+            .await
+            .expect("bob, named by his own optional token, is not held up by alice");
+    }
+
+    #[tokio::test]
+    async fn a_request_its_variant_refuses_spends_no_allowance() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        for _ in 0..3 {
+            let mut refused_later = as_caller(&ctx, Some("alice-hash"));
+            refused_later.variant_changes_enforced_policy = true;
+            step_rate_limit(&state, &mut refused_later)
+                .await
+                .unwrap();
+        }
+        step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .expect("alice's allowance is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_per_caller_limit_that_cannot_be_enforced_refuses_every_request() {
+        let (state, ctx) =
+            rate_limited_context(json!({ "alias": "partner", "target_endpoint": "https://partner.example/mcp",
+                                         "protocol": "mcp",
+                                         "per_caller_rate_limit": { "requests": 0, "window_secs": 60 } }))
+            .await;
+        let refused = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, OutboundPipelineError::TransitPointUnavailable { .. }), "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn a_per_caller_refusal_says_how_long_to_wait_in_the_protocols_shape() {
+        for (protocol, mcp) in [("mcp", true), ("http", false)] {
+            let (state, ctx) = per_caller_limited_context(protocol, 1).await;
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .unwrap();
+            let response = step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .unwrap_err()
+                .into_response();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            let wait: u64 = response.headers()[axum::http::header::RETRY_AFTER]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((55..=60).contains(&wait), "{wait}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("alice"), "no caller is named: {text}");
+            if mcp {
+                let rpc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(rpc["error"]["code"], -32000);
+                assert_eq!(rpc["error"]["message"], "Rate limit exceeded");
+                assert_eq!(rpc["id"], serde_json::Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_per_caller_refusal_is_audited_with_the_point_and_the_caller() {
+        let (state, ctx) = per_caller_limited_context("mcp", 1).await;
+        let (refusals, events) = crate::audit::producer::capture(async {
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .unwrap();
+            step_rate_limit(&state, &mut as_caller(&ctx, Some("alice-hash")))
+                .await
+                .unwrap_err()
+        })
+        .await;
+        assert!(matches!(refusals, OutboundPipelineError::CallerRateLimitExceeded { .. }));
+        assert_eq!(events.len(), 1, "only the refusal is an event: {events:?}");
+        assert_eq!(
+            events[0]
+                .user_identity_hash
+                .as_deref(),
+            Some("alice-hash")
+        );
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some(
+                ctx.surface
+                    .surface_id
+                    .as_str()
+            )
+        );
+        match &events[0].event {
+            crate::delegation_vault::audit::DelegationAuditAction::RateLimited {
+                scope,
+                transit_point,
+                retry_after_ms,
+            } => {
+                assert_eq!(*scope, crate::audit::events::RateLimitScope::TransitPointCaller);
+                assert_eq!(transit_point.as_deref(), Some("partner"));
+                assert!(retry_after_ms.is_some());
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
     }
 
     // ── step_extract_protocol_context ──────────────────────────────────────
@@ -8406,7 +11422,7 @@ mod tests {
     async fn test_step_extract_protocol_context_caps_initialize_to_a_served_revision() {
         let state = test_outbound_state();
         let legacy = crate::mcp::MCP_LEGACY_VERSION;
-        for (requested, forwarded) in [("2025-11-25", legacy), (legacy, legacy)] {
+        for (requested, forwarded) in [("2099-01-01", legacy), (legacy, legacy), ("2025-06-18", "2025-06-18")] {
             let mut ctx = test_pipeline_context();
             Arc::make_mut(&mut ctx.surface)
                 .access_point
@@ -8460,8 +11476,8 @@ mod tests {
         for (target, version, admitted) in [
             ("fabric://gateway/channel", crate::mcp::MCP_MODERN_VERSION, true),
             ("https://agent.example/mcp", crate::mcp::MCP_MODERN_VERSION, true),
-            ("fabric://gateway/channel", "2025-11-25", false),
-            ("https://agent.example/mcp", "2025-11-25", false),
+            ("fabric://gateway/channel", "2099-01-01", false),
+            ("https://agent.example/mcp", "2099-01-01", false),
         ] {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
@@ -8491,10 +11507,7 @@ mod tests {
                 assert_eq!(error.status, StatusCode::BAD_REQUEST);
                 assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
                 assert_eq!(error.id, Some(json!("transit-admission")));
-                assert_eq!(
-                    error.data.unwrap()["supported"],
-                    json!([crate::mcp::MCP_LEGACY_VERSION, crate::mcp::MCP_MODERN_VERSION])
-                );
+                assert_eq!(error.data.unwrap()["supported"], json!(versions.supported_versions()));
                 assert!(
                     ctx.mcp_classification
                         .is_none()
@@ -8514,7 +11527,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_step_extract_protocol_context_advertises_versions_learned_from_transit_discovery() {
-        use crate::mcp::{MCP_LEGACY_VERSION, MCP_MODERN_VERSION};
+        use crate::mcp::MCP_MODERN_VERSION;
 
         let versions = crate::mcp::request_validation::MODERN_CAPABLE_POLICY;
         let transit_point = |ctx: &mut OutboundPipelineContext, alias: &str| {
@@ -8573,10 +11586,10 @@ mod tests {
                 .map(|_| ctx.mcp_classification)
         };
         for (alias, supported) in [
-            ("learned-discovery", json!([MCP_LEGACY_VERSION])),
-            ("unlearned-discovery", json!([MCP_LEGACY_VERSION, MCP_MODERN_VERSION])),
+            ("learned-discovery", json!(crate::mcp::request_validation::SESSION_VERSIONS)),
+            ("unlearned-discovery", json!(versions.supported_versions())),
         ] {
-            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2025-11-25").await else {
+            let Err(OutboundPipelineError::McpValidation(error)) = admit(alias, "2099-01-01").await else {
                 panic!("expected MCP version rejection for {alias}");
             };
             assert_eq!(error.code, crate::mcp::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
@@ -8888,6 +11901,181 @@ mod tests {
         let mapping = test_header_metadata_mapping(false);
 
         assert!(should_forward_outbound_request_header("x-ms-entra-agent-id", Some(&mapping)));
+    }
+
+    #[test]
+    fn a_managed_agents_cookies_and_authorization_never_reach_a_transit_point_target() {
+        for withheld in [
+            "cookie",
+            "Cookie",
+            "authorization",
+            "x-transit-token",
+            "X-Caller-DID",
+            "x-caller-identity-source",
+            "x-caller-dna-uai",
+            "x-gateway-did",
+            "X-DID-Identity",
+            "x-did-signed-identity",
+        ] {
+            assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
+        }
+        for forwarded in ["x-api-key", "accept", "content-type", "mcp-protocol-version", "x-caller-context"] {
+            assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
+        }
+    }
+
+    #[test]
+    fn a_managed_agents_forwarding_headers_never_reach_a_transit_point_target() {
+        for withheld in [
+            "x-forwarded-for",
+            "X-Forwarded-For",
+            "x-forwarded-host",
+            "X-Forwarded-Proto",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "X-Forwarded-Client-Cert",
+            "forwarded",
+            "Forwarded",
+            "x-real-ip",
+            "X-Forwarded_For",
+            "x_forwarded_host",
+            "X-Real_IP",
+            "True-Client-IP",
+            "true_client_ip",
+            "Client-IP",
+            "X-Client-IP",
+            "X-Cluster-Client-IP",
+            "CF-Connecting-IP",
+            "CF-Connecting-IPv6",
+            "Fastly-Client-IP",
+            "X-Original-Forwarded-For",
+            "X-Original-Host",
+            "x_original_host",
+            "X-Host",
+            "X-Url-Scheme",
+            "Front-End-Https",
+            "Fly-Client-IP",
+            "X-ARR-ClientIP",
+            "X-Azure-ClientIP",
+            "X-ProxyUser-Ip",
+            "X-Original-URL",
+            "x_original_url",
+            "X-Original-URI",
+            "X-Rewrite-URL",
+            "X-Scheme",
+            "X-ARR-SSL",
+            "Proxy-Client-IP",
+            "WL-Proxy-Client-IP",
+            "wl_proxy_client_ip",
+            "X-Originating-IP",
+            "X-Remote-IP",
+            "X-Remote-Addr",
+            "X-Envoy-External-Address",
+            "CloudFront-Viewer-Address",
+        ] {
+            assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
+        }
+        for forwarded in [
+            "x-forwarded",
+            "x-forwardedfor",
+            "forwarded-for",
+            "x-real-ip-note",
+            "x-vendor-forwarded-for",
+            "x-client-ip-hint",
+            "x-hostname",
+            "x-original-hosts",
+            "client-ipaddress",
+            "x-original-urls",
+            "x-schemes",
+            "x-remote-address",
+            "x-envoy-external-addresses",
+        ] {
+            assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        let mut upstream_headers = HeaderMap::new();
+        upstream_headers.append("set-cookie", HeaderValue::from_static("vendor_sid=one; HttpOnly"));
+        upstream_headers.append("set-cookie", HeaderValue::from_static("vendor_lb=two"));
+        upstream_headers.insert(
+            "www-authenticate",
+            HeaderValue::from_static(
+                r#"Bearer resource_metadata="https://vendor.example/.well-known/oauth-protected-resource""#,
+            ),
+        );
+        upstream_headers.insert("set-cookie2", HeaderValue::from_static("vendor_old=three; Version=1"));
+        upstream_headers.insert("authentication-info", HeaderValue::from_static(r#"nextnonce="47364c23432d2e13""#));
+        upstream_headers.insert("location", HeaderValue::from_static("https://vendor.example/next"));
+        upstream_headers.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream_headers.insert("x-vendor-request-id", HeaderValue::from_static("vendor-7"));
+
+        let response = process_outbound_response_body(
+            &state,
+            &mut ctx,
+            StatusCode::UNAUTHORIZED,
+            upstream_headers,
+            Bytes::from_static(br#"{"error":"invalid_token"}"#),
+            &crate::policies::PolicyAttestation::default(),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie")
+        );
+        for withheld in ["set-cookie", "set-cookie2", "www-authenticate", "authentication-info"] {
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(withheld),
+                "{withheld}"
+            );
+        }
+        assert_eq!(response.headers()["location"], "https://vendor.example/next");
+        assert_eq!(response.headers()["x-vendor-request-id"], "vendor-7");
+        assert_eq!(response.headers()["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn a_modern_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let upstream = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header("content-type", "application/json")
+                .header("set-cookie", "vendor_sid=one; HttpOnly")
+                .header("www-authenticate", "Bearer error=\"insufficient_scope\"")
+                .header("x-vendor-request-id", "vendor-8")
+                .body(reqwest::Body::from(
+                    json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+
+        let response = process_modern_outbound_response(
+            test_outbound_state(),
+            modern_pipeline_context("tools/call"),
+            UpstreamResponse::Http(upstream),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie")
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("www-authenticate")
+        );
+        assert_eq!(response.headers()["x-vendor-request-id"], "vendor-8");
     }
 
     // ── step_resolve_agent_identity ──────────────────────────────────────
@@ -9448,6 +12636,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_step_resolve_agent_identity_shares_the_did_of_an_api_key_that_identifies_a_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let (fields, hash) = crate::identity::credential_identity::global_resolver()
+            .resolve_presented_api_key("atgk_ob_caller", true, None)
+            .await
+            .unwrap();
+        let caller = vc_issuer
+            .issue_or_get_caller_credential(fields, Some(hash.clone()), None, None)
+            .await
+            .unwrap();
+        let vc_issuer = Arc::new(vc_issuer);
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(vc_issuer.clone());
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .managed_identity = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
+            api_key_id: Some("atgk_ob_caller".to_string()),
+        });
+        let mut surface = (*ctx.surface).clone();
+        surface.surface_id = "ob-shared-key".to_string();
+        surface.name = "ob-shared-key-name".to_string();
+        ctx.surface = Arc::new(surface);
+        let count = |channel: &str, result: &str| {
+            crate::metrics::backends::prometheus::MANAGED_IDENTITY_RESOLVE
+                .with_label_values(&[channel, "from_api_key", result])
+                .get()
+        };
+
+        step_resolve_agent_identity(&state, &mut ctx)
+            .await
+            .expect("an API key that identifies a caller also resolves as the Managed Agent");
+
+        match &ctx.resolved_identity {
+            ProtectedAgentIdentity::Managed { did, .. } => assert_eq!(did, &caller.did),
+            ProtectedAgentIdentity::Anonymous => panic!("expected Managed identity, got Anonymous"),
+        }
+        let record = vc_issuer
+            .get_identity_store()
+            .find_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.origin, Some(crate::identity::IdentityOrigin::ExternalCaller));
+        assert_eq!(count("ob-shared-key-name", "ok_cached"), 1);
+        assert_eq!(count("ob-shared-key", "ok_cached"), 0);
+    }
+
+    #[tokio::test]
     async fn test_step_resolve_agent_identity_rejects_missing_required_mapped_header_metadata() {
         let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let vc_issuer = Arc::new(vc_issuer);
@@ -9770,7 +13006,7 @@ mod tests {
 
         let result = step_inject_custom_metadata(&state, &mut ctx).await;
         assert!(
-            matches!(result, Err(OutboundPipelineError::MetadataInjectionFailed)),
+            matches!(result, Err(OutboundPipelineError::MetadataInjectionFailed { .. })),
             "expected MetadataInjectionFailed, got: {result:?}"
         );
     }
@@ -9864,6 +13100,99 @@ mod tests {
             Some("staging"),
             "default: X-Gateway-env header should be injected"
         );
+    }
+
+    /// Injects `{"credential": "$SECRET:<secret_id>"}` on a `tenant-a` surface under `mode` and
+    /// returns the injected value, read from the A2A metadata extension or the MCP `_meta`.
+    async fn inject_tenant_secret(
+        protocol: ChannelProtocol,
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Result<serde_json::Value, OutboundPipelineError> {
+        let (_dir, secrets_store) = crate::secrets::test_support::tenant_secrets().await;
+        let mut state = test_outbound_state();
+        state.secrets_store = secrets_store;
+        let is_mcp = protocol == ChannelProtocol::Mcp;
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".into());
+        ctx.protocol = Some(protocol);
+        ctx.body_bytes = Some(if is_mcp {
+            mcp_body()
+        } else {
+            Bytes::from(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {"parts": []}}})
+                    .to_string(),
+            )
+        });
+        ctx.outbound_shared
+            .custom_metadata = Some(crate::config::CustomMetadata {
+            enabled: true,
+            payload: Some(json!({ "credential": format!("$SECRET:{secret_id}") })),
+            injection_target: Some(crate::config::MetadataInjectionTarget::Meta),
+        });
+        let policy: &'static crate::config::credential_policy::CredentialPolicyConfig =
+            Box::leak(Box::new(crate::config::credential_policy::CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+        crate::config::credential_policy::TEST_CREDENTIAL_POLICY
+            .scope(policy, step_inject_custom_metadata(&state, &mut ctx))
+            .await?;
+        let body: serde_json::Value = serde_json::from_slice(
+            ctx.body_bytes
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        let pointer = if is_mcp {
+            "/_meta/credential".to_string()
+        } else {
+            format!(
+                "/params/message/metadata/{}/credential",
+                crate::config::AFFINIDI_AGENT_METADATA_EXTENSION.replace('/', "~1")
+            )
+        };
+        Ok(body
+            .pointer(&pointer)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {pointer} in {body}")))
+    }
+
+    #[tokio::test]
+    async fn test_step_inject_custom_metadata_holds_a_secret_to_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        for protocol in [ChannelProtocol::A2a, ChannelProtocol::Mcp] {
+            for mode in [RuleMode::Warn, RuleMode::Enforce] {
+                assert_eq!(
+                    inject_tenant_secret(protocol.clone(), mode, "own")
+                        .await
+                        .ok(),
+                    Some(json!("own-value")),
+                    "{protocol:?} {mode:?}"
+                );
+                assert!(
+                    matches!(
+                        inject_tenant_secret(protocol.clone(), mode, "other").await,
+                        Err(OutboundPipelineError::MetadataInjectionFailed { .. })
+                    ),
+                    "{protocol:?} {mode:?}"
+                );
+            }
+            assert_eq!(
+                inject_tenant_secret(protocol.clone(), RuleMode::Warn, "wide")
+                    .await
+                    .ok(),
+                Some(json!("wide-value")),
+                "{protocol:?}"
+            );
+            assert!(
+                matches!(
+                    inject_tenant_secret(protocol.clone(), RuleMode::Enforce, "wide").await,
+                    Err(OutboundPipelineError::MetadataInjectionFailed { .. })
+                ),
+                "{protocol:?}"
+            );
+        }
     }
 
     // ── step_inject_trusted_identity ──────────────────────────────────────
@@ -9971,6 +13300,7 @@ mod tests {
             caller_context_fields: serde_json::Map::from_iter([("email".to_string(), json!("ada@example.com"))]),
             allowed_transit_points: vec![],
             trace_id: None,
+            fabric: None,
         });
 
         let (result, events) =
@@ -9990,6 +13320,111 @@ mod tests {
                 .and_then(|caller| caller.email.as_deref()),
             Some("ada@example.com")
         );
+    }
+
+    /// Every `workloadBinding` object in `value`, reading inside the
+    /// presentations it carries as JSON text.
+    fn signed_workload_bindings(value: &serde_json::Value) -> Vec<serde_json::Value> {
+        let mut found = Vec::new();
+        match value {
+            serde_json::Value::String(text) => {
+                if let Ok(decoded @ serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(text) {
+                    found.extend(signed_workload_bindings(&decoded));
+                }
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .for_each(|value| found.extend(signed_workload_bindings(value))),
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "workloadBinding" {
+                        found.push(value.clone());
+                    }
+                    found.extend(signed_workload_bindings(value));
+                }
+            }
+            _ => {}
+        }
+        found
+    }
+
+    /// The VP a Transit Point signs for its managed agent names the user an
+    /// Access Point's transit token carries, acting for it, and never the caller
+    /// a partner gateway's request named: this gateway verified neither that
+    /// caller nor its DID.
+    #[tokio::test]
+    async fn the_onward_vp_names_the_user_of_an_access_point_token_and_never_a_partners_caller() {
+        let (vc_issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let mut state = test_outbound_state();
+        state.vc_issuer = Some(Arc::new(vc_issuer));
+        for (claims, names_the_user) in [
+            (caller_claims(Some("did:web:victim.example"), Some("gateway-computed"), Some("abc123"), json!({})), true),
+            (fabric_claims(Some("did:web:victim.example"), "fabric-presentation", None, 1), false),
+            (fabric_claims(Some("did:web:victim.example"), "fabric-asserted", None, 1), false),
+        ] {
+            let mut ctx = test_pipeline_context();
+            Arc::make_mut(&mut ctx.surface)
+                .identity_slots
+                .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+                crate::source_auth::models::PayloadExtractionConfig {
+                    extension_uri: None,
+                    meta_field: "agentIdentity".to_string(),
+                    fields: Vec::new(),
+                    json_schema: None,
+                    extension_rules: None,
+                    strip_raw_meta: false,
+                },
+            ));
+            allowlist_caller_fields(&mut ctx.virtual_channel, &[]);
+            ctx.protocol = Some(ChannelProtocol::A2a);
+            ctx.body_bytes = Some(Bytes::from(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "message/send",
+                    "params": { "message": { "metadata": {
+                        "https://fabric.affinidi.io/extensions/agent-identity/v1": { "cloudProvider": "local", "model": "gpt-4" }
+                    }}}
+                }))
+                .unwrap(),
+            ));
+            step_resolve_agent_identity(&state, &mut ctx)
+                .await
+                .unwrap();
+            let fabric = claims.fabric.is_some();
+            ctx.transit_token_claims = Some(claims);
+
+            step_inject_trusted_identity(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            let body: serde_json::Value = serde_json::from_slice(
+                ctx.body_bytes
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            let bindings = signed_workload_bindings(&body);
+            assert!(!bindings.is_empty(), "the Transit Point signs a workload binding (fabric: {fabric})");
+            for binding in bindings {
+                if names_the_user {
+                    assert_eq!(binding["userIdentity"]["id"], "did:web:victim.example", "{binding}");
+                    assert_eq!(binding["delegated"], true, "{binding}");
+                } else {
+                    assert!(
+                        binding
+                            .get("userIdentity")
+                            .is_none(),
+                        "{binding}"
+                    );
+                    assert!(
+                        !binding
+                            .to_string()
+                            .contains("did:web:victim.example"),
+                        "{binding}"
+                    );
+                }
+            }
+        }
     }
 
     // ── step_collect_trust_context ─────────────────────────────────────────
@@ -10114,7 +13549,118 @@ mod tests {
         let mut state = test_outbound_state();
         state.metrics_store = None;
         let ctx = test_pipeline_context();
-        step_record_metrics(&state, &ctx);
+        step_record_metrics(&state, &ctx, true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_target_error_as_a_failed_call() {
+        for (target_status, recorded) in [
+            (StatusCode::OK, crate::metrics::ConnectionStatus::Success),
+            (StatusCode::UNAUTHORIZED, crate::metrics::ConnectionStatus::Failed),
+            (StatusCode::BAD_GATEWAY, crate::metrics::ConnectionStatus::Failed),
+        ] {
+            let target = crate::component_tests::helpers::RecordingTarget::start(target_status, &[]).await;
+            let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+            let mut state = test_outbound_state();
+            state.metrics_store = Some(metrics.clone());
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
+                    "allow_unauthenticated_callers": true, "target_endpoint": target.url}]),
+                json!([]),
+            ));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/mcp/partner")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"ping":true}"#))
+                .unwrap();
+
+            let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                state,
+                request,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(response.status(), target_status);
+
+            let mut connections = Vec::new();
+            for _ in 0..50 {
+                connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                if !connections.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(connections.len(), 1, "{target_status}");
+            assert_eq!(connections[0].status, recorded, "{target_status}");
+        }
+    }
+
+    /// A `2026-07-28` MCP response stream that fails part way through is
+    /// recorded as a failed call, and one that completes as a successful call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_modern_stream_that_fails_as_a_failed_call() {
+        let event = |message: serde_json::Value| {
+            Ok::<_, std::io::Error>(Bytes::from(format!("event: message\ndata: {message}\n\n")))
+        };
+        let progress = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+            "params": {"progressToken": "work", "progress": 1}});
+        let result = json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}});
+        for (case, events, recorded) in [
+            (
+                "fails",
+                vec![event(progress.clone()), Err(std::io::Error::other("the target reset the stream"))],
+                crate::metrics::ConnectionStatus::Failed,
+            ),
+            (
+                "completes",
+                vec![event(progress.clone()), event(result.clone())],
+                crate::metrics::ConnectionStatus::Success,
+            ),
+        ] {
+            let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+            let mut state = test_outbound_state();
+            state.metrics_store = Some(metrics.clone());
+            let upstream = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(reqwest::Body::wrap_stream(futures::stream::iter(events)))
+                    .unwrap(),
+            );
+
+            let response = process_modern_outbound_response(
+                state,
+                modern_pipeline_context("tools/call"),
+                UpstreamResponse::Http(upstream),
+            )
+            .await
+            .unwrap();
+            let read = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            assert_eq!(read.is_ok(), recorded == crate::metrics::ConnectionStatus::Success, "{case}: {read:?}");
+
+            let mut connections = Vec::new();
+            for _ in 0..50 {
+                connections = metrics
+                    .get_recent_connections(10)
+                    .await;
+                if !connections.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(connections.len(), 1, "{case}");
+            assert_eq!(connections[0].status, recorded, "{case}");
+        }
     }
 
     // ── build_outbound_policy_input ────────────────────────────────────────
@@ -10164,6 +13710,1151 @@ mod tests {
                 .as_deref(),
             Some("test-channel")
         );
+    }
+
+    fn caller_claims(
+        sub: Option<&str>,
+        identity_source: Option<&str>,
+        user_identity_hash: Option<&str>,
+        fields: serde_json::Value,
+    ) -> crate::proxy::transit_token::TransitTokenClaims {
+        crate::proxy::transit_token::TransitTokenClaims {
+            iss: "gw".to_string(),
+            sub: sub.map(str::to_string),
+            surface_id: "s".to_string(),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".to_string(),
+            identity_source: identity_source.map(str::to_string),
+            caller_dna_uai: Some("uai:1".to_string()),
+            user_identity_hash: user_identity_hash.map(str::to_string),
+            caller_context_fields: fields
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            allowed_transit_points: vec![],
+            trace_id: None,
+            fabric: None,
+        }
+    }
+
+    fn transit_caller_json(ctx: &OutboundPipelineContext) -> serde_json::Value {
+        serde_json::to_value(build_outbound_policy_input(ctx)).unwrap()["transit"]["caller"].clone()
+    }
+
+    #[test]
+    fn outbound_policy_input_says_a_call_with_no_caller_is_anonymous() {
+        let ctx = test_pipeline_context();
+        assert_eq!(transit_caller_json(&ctx), json!({ "verified": false, "verification": "anonymous" }));
+    }
+
+    #[test]
+    fn a_tool_gating_condition_reads_the_transit_caller() {
+        // Hides `admin_*` unless the caller is verified; written so an absent
+        // `input.transit` keeps the deny gate active.
+        let config: crate::config::agent_surface::McpToolGatingConfig = serde_json::from_value(json!({
+            "gates": [{
+                "id": "g1", "name": "admin for verified callers",
+                "condition_policy_definition_id": "unverified-caller",
+                "action": { "effect": "deny", "patterns": ["^admin_"] }
+            }]
+        }))
+        .unwrap();
+        let gating = crate::policies::mcp_tool_gating::CompiledMcpToolGating::build(&config, |_| {
+            Some(
+                "package surface.policy\n\ndefault allow := true\n\nallow := false if {\n    input.transit.caller.verified\n}\n"
+                    .to_string(),
+            )
+        });
+
+        let mut ctx = test_pipeline_context();
+        let anonymous = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap();
+        assert!(!gating.is_tool_call_allowed("admin_reset", &anonymous));
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        let verified = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap();
+        assert!(gating.is_tool_call_allowed("admin_reset", &verified));
+    }
+
+    fn allowlist_caller_fields(
+        point: &mut TransitPoint,
+        fields: &[&str],
+    ) {
+        point.workload_binding = Some(
+            serde_json::from_value(json!({
+                "enabled": true, "caller_source": "transit_token", "caller_context_fields": fields
+            }))
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_the_verified_caller_of_a_transit_token() {
+        let mut ctx = test_pipeline_context();
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email"]);
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:alice-agent"),
+            Some("self-presented"),
+            Some("abc123"),
+            json!({ "email": "alice@example.com" }),
+        ));
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": true,
+                "verification": "transit_token",
+                "identity_source": "self-presented",
+                "user_identity_hash": "abc123",
+                "did": "did:example:alice-agent",
+                "fields": { "email": "alice@example.com" }
+            })
+        );
+    }
+
+    /// The transit token carries the fields every Transit Point of the surface
+    /// allowlists; a Transit Point's policy sees only those it allowlists itself.
+    #[test]
+    fn outbound_policy_input_carries_only_the_fields_this_transit_point_allowlists() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            None,
+            Some("gateway-computed"),
+            Some("abc123"),
+            json!({ "email": "alice@example.com", "tid": "tenant-1" }),
+        ));
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["tid"]);
+        assert_eq!(transit_caller_json(&ctx)["fields"], json!({ "tid": "tenant-1" }));
+
+        ctx.virtual_channel
+            .workload_binding = None;
+        assert!(
+            transit_caller_json(&ctx)
+                .get("fields")
+                .is_none(),
+            "{}",
+            transit_caller_json(&ctx)
+        );
+
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email", "tid"]);
+        ctx.virtual_channel
+            .workload_binding
+            .as_mut()
+            .unwrap()
+            .enabled = false;
+        assert!(
+            transit_caller_json(&ctx)
+                .get("fields")
+                .is_none(),
+            "a disabled binding allowlists nothing"
+        );
+    }
+
+    /// Nothing verifies a DID presentation or an Agent DNA UAI yet, so a token
+    /// that claims either must not reach policy as a verified-looking value.
+    #[test]
+    fn outbound_policy_input_omits_a_claimed_did_verification_and_dna_uai() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:alice-agent"),
+            Some("verified-presentation"),
+            Some("abc123"),
+            json!({}),
+        ));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["did"], "did:example:alice-agent");
+        assert!(
+            caller
+                .get("did_verified")
+                .is_none(),
+            "{caller}"
+        );
+        assert!(
+            caller
+                .get("caller_dna_uai")
+                .is_none(),
+            "{caller}"
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_does_not_verify_a_token_that_only_names_a_did() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(caller_claims(
+            Some("did:example:claimed"),
+            Some("self-presented"),
+            None,
+            json!({ "email": "claimed@example.com" }),
+        ));
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": false,
+                "verification": "unverified",
+                "identity_source": "self-presented",
+                "did": "did:example:claimed"
+            })
+        );
+    }
+
+    fn transit_client_json(ctx: &OutboundPipelineContext) -> serde_json::Value {
+        serde_json::to_value(build_outbound_policy_input(ctx)).unwrap()["transit"]["client"].clone()
+    }
+
+    fn authenticate_by_resource_token(
+        ctx: &mut OutboundPipelineContext,
+        identity: crate::source_auth::AuthenticatedIdentity,
+    ) {
+        ctx.authenticated_identity = Some(identity);
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
+    }
+
+    #[test]
+    fn the_per_caller_rate_limit_counts_the_token_caller_else_the_source_auth_client() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let client_hash = rate_limit_caller_hash(&ctx).expect("the client the Transit Point verified is counted");
+
+        ctx.optional_transit_token_claims = Some(caller_claims(None, None, Some("alice-hash"), json!({})));
+        assert_eq!(
+            rate_limit_caller_hash(&ctx).as_deref(),
+            Some("alice-hash"),
+            "an optional token's caller wins over the client"
+        );
+
+        ctx.optional_transit_token_claims = None;
+        ctx.transit_token_claims = Some(caller_claims(None, None, Some("alice-hash"), json!({})));
+        assert_eq!(rate_limit_caller_hash(&ctx).as_deref(), Some("alice-hash"), "so does a required token's");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), None, json!({})));
+        assert_eq!(
+            rate_limit_caller_hash(&ctx),
+            Some(client_hash),
+            "a token that names no caller counts the client, unlike a delegation key"
+        );
+    }
+
+    /// A transit token that names no verified end user is not replaced by the
+    /// client the Transit Point authenticated: that client's grant belongs to
+    /// the client, not to an end user the Access Point could not identify.
+    #[test]
+    fn delegation_keys_on_the_transit_point_client_only_when_no_token_names_the_caller() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let client_hash = delegation_caller_hash(&ctx).expect("a client the Transit Point verified keys its grant");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), None, json!({})));
+        assert_eq!(delegation_caller_hash(&ctx), None, "a token with no verified end user refuses, not falls back");
+
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert_eq!(delegation_caller_hash(&ctx).as_deref(), Some("abc123"));
+        assert_ne!(Some("abc123"), Some(client_hash.as_str()));
+    }
+
+    /// Delegated credentials on a `2026-07-28` MCP request are keyed through the
+    /// Transit Point's resource-server authorization. A Transit Point cannot have
+    /// both that and `source_auth`, so a caller its `source_auth` verified, or one
+    /// only a transit token names, is refused there, while the legacy path keys a
+    /// `source_auth` caller by its identity hash.
+    #[tokio::test]
+    async fn a_modern_mcp_request_from_a_source_auth_caller_cannot_use_delegated_credentials() {
+        use crate::mcp::continuations::ContinuationError;
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, ValidatedModernMessage};
+        use crate::proxy::credential_delegation::modern::{ModernDelegationError, prepare_transit};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let runtime = continuation_runtime(now, 60);
+        let request = ValidatedModernMessage {
+            protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+            client_capabilities: None,
+            client_info: None,
+            method: "tools/call".into(),
+            params: None,
+            id: Some(json!(1)),
+            kind: McpMessageKind::Request,
+        };
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        assert!(
+            delegation_caller_hash(&ctx).is_some(),
+            "the legacy path keys this caller by its identity hash when no transit token names one"
+        );
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+        assert!(
+            ctx.mcp_resource_authorization
+                .is_none()
+        );
+
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("the modern path refuses without a resource-server authorization");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+
+        ctx.authenticated_identity = None;
+        ctx.authenticated_by = None;
+        ctx.transit_token_claims =
+            Some(caller_claims(Some("did:example:agent"), Some("gateway-computed"), Some("abc123"), json!({})));
+        let refused = prepare_transit(&state, &runtime, &mut ctx, &request)
+            .await
+            .err()
+            .expect("a caller only a transit token names is refused on the modern path too");
+        assert!(matches!(refused, ModernDelegationError::Continuation(ContinuationError::BindingMismatch)));
+    }
+
+    /// On a `2026-07-28` MCP request a Transit Point whose caller `source_auth`
+    /// verified has no resource-server authorization to key a grant by. A
+    /// request that no binding applies to, such as `tools/list` with tool-scoped
+    /// bindings, is sent on without delegated credentials; one an `all` binding
+    /// applies to is answered `403` with `-32001` and its own id, and never
+    /// reaches the target.
+    #[tokio::test]
+    async fn a_modern_mcp_request_through_a_source_auth_transit_point_is_refused_only_where_a_binding_applies() {
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, McpRequestClassification, ValidatedModernMessage};
+
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_continuations = Some(continuation_runtime(now, 60));
+        let tool_scoped = {
+            let mut surface = test_surface();
+            surface.outbound_credentials = vec![
+                serde_json::from_value(json!({
+                    "credential_provider_id": "provider",
+                    "required_for": {"tools": ["get_current_date_time"]}
+                }))
+                .unwrap(),
+            ];
+            surface
+        };
+        let mut all = tool_scoped.clone();
+        all.outbound_credentials[0].required_for = crate::config::types::CredentialRequirement::All;
+
+        for (surface, refused) in [(tool_scoped, false), (all, true)] {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = Arc::new(surface);
+            ctx.mcp_classification = Some(McpRequestClassification::Modern(Box::new(ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/list".into(),
+                params: None,
+                id: Some(json!(7)),
+                kind: McpMessageKind::Request,
+            })));
+            ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+                key_name: "copilot-studio".to_string(),
+                provider_agent_id: None,
+            });
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx.transit_token_claims = Some(caller_claims(Some("did:example:agent"), None, None, json!({})));
+
+            let answer = step_prepare_modern_credentials(&state, &mut ctx)
+                .await
+                .unwrap();
+            match (answer, refused) {
+                (None, false) => {}
+                (Some(response), true) => {
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["error"]["code"], -32001, "{body}");
+                    assert_eq!(body["id"], 7, "the refusal answers the request's own id: {body}");
+                }
+                (answer, refused) => {
+                    panic!("refused: {refused}, but the step answered {:?}", answer.map(|r| r.status()))
+                }
+            }
+        }
+    }
+
+    /// On a `2026-07-28` MCP request a Fabric-issued transit token decides the
+    /// caller as it does on the legacy path. Without
+    /// `delegated_credentials_for_fabric_callers`, or without a caller the
+    /// receiving surface verified, a binding that applies refuses the call
+    /// with `403`, never serving the grant of the Transit Point's
+    /// resource-token caller. With it, the call goes on to be keyed only when
+    /// that resource-token caller is the one the receiving surface verified.
+    #[tokio::test]
+    async fn a_modern_mcp_request_with_a_fabric_token_uses_delegated_credentials_only_as_opted_in() {
+        use crate::mcp::continuations::negative_cases::continuation_runtime;
+        use crate::mcp::request_validation::{McpMessageKind, McpRequestClassification, ValidatedModernMessage};
+
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let mut state = test_outbound_state();
+        state.mcp_continuations = Some(continuation_runtime(now, 60));
+        let mut surface = telling_users_apart(test_surface());
+        surface.outbound_credentials =
+            vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
+        let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+        };
+        let alice_hash = alice
+            .principal_hash(None)
+            .unwrap();
+        let answer = async |opted_in: bool, claims: crate::proxy::transit_token::TransitTokenClaims| {
+            let mut ctx = test_pipeline_context();
+            ctx.surface = Arc::new(surface.clone());
+            ctx.virtual_channel
+                .delegated_credentials_for_fabric_callers = opted_in;
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            ctx.mcp_classification = Some(McpRequestClassification::Modern(Box::new(ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/call".into(),
+                params: None,
+                id: Some(json!(7)),
+                kind: McpMessageKind::Request,
+            })));
+            ctx.authenticated_identity = Some(alice.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::ResourceToken);
+            ctx.transit_token_claims = Some(claims);
+            let response = step_prepare_modern_credentials(&state, &mut ctx)
+                .await
+                .unwrap()
+                .expect("a binding applies and no grant is prepared");
+            let status = response.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["id"], 7, "{body}");
+            (
+                status,
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        };
+        let refused = (StatusCode::FORBIDDEN, DelegationRefusal::CallerIdentityMissing.to_string());
+
+        assert_eq!(answer(false, verified_fabric_claims(None, &alice_hash)).await, refused, "the switch off");
+        assert_eq!(answer(true, fabric_claims(None, "fabric-asserted", None, 2)).await, refused, "no verified caller");
+        assert_eq!(
+            answer(true, verified_fabric_claims(None, "another-callers-hash")).await,
+            refused,
+            "the resource-token caller is not the one the receiving surface verified"
+        );
+        assert_ne!(
+            answer(true, verified_fabric_claims(None, &alice_hash)).await,
+            refused,
+            "the same caller goes on to the modern credential path"
+        );
+        assert_ne!(
+            answer(false, caller_claims(None, None, Some(&alice_hash), json!({}))).await,
+            refused,
+            "an Access Point's token is not a Fabric caller"
+        );
+    }
+
+    /// A Fabric caller the receiving surface verified, on a Transit Point that
+    /// opts in, gets only a grant already stored for its
+    /// `fabric.principal_hash` and the Transit Point's managed identity: a
+    /// person consents by connecting to this gateway directly, never through a
+    /// partner. Its first call, with no grant yet, starts no consent. It is
+    /// refused with `403` and `consent_not_available_for_partners`, with no
+    /// authorization URL, stores nothing for that caller or for a client the
+    /// Transit Point verified on the call, and is recorded as a
+    /// `request_rejected`, answered as a JSON-RPC error with its id on an MCP
+    /// Transit Point and as a problem JSON otherwise. Once that user's grant
+    /// exists, the same call is served with it. A caller an Access Point's
+    /// token names still gets the consent answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opted_in_fabric_caller_gets_only_an_existing_grant_and_never_starts_consent() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _) = delegation_pipeline(directory.path(), "https://partner.example/mcp", &[]).await;
+        let carol_hash = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "carol".to_string(),
+            provider_agent_id: None,
+        }
+        .principal_hash(None)
+        .unwrap();
+        let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "dave".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+        };
+        let direct_client_hash = direct_client
+            .principal_hash(None)
+            .unwrap();
+        let call = |protocol: &str| {
+            let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("consent"));
+            point["delegated_credentials_for_fabric_callers"] = json!(true);
+            point["protocol"] = json!(protocol);
+            let surface = telling_users_apart(transit_surface(json!([point]), json!([])));
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = legacy_delegation_context(resolved, point);
+            let mut claims = verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash);
+            claims.user_identity_hash = Some("sha256:user".to_string());
+            ctx.transit_token_claims = Some(claims);
+            ctx.authenticated_identity = Some(direct_client.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx
+        };
+        let vault = state
+            .delegation_vault_store
+            .clone()
+            .unwrap();
+
+        for protocol in ["mcp", "a2a"] {
+            let mut first = call(protocol);
+            let (result, events) = crate::audit::producer::capture(step_inject_credentials(&state, &mut first)).await;
+            let refused = result.expect_err("no consent is started for a Fabric caller");
+            assert!(
+                matches!(
+                    refused,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::ConsentNotAvailableForPartners,
+                        ..
+                    }
+                ),
+                "{protocol}: {refused:?}"
+            );
+            let rejected: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage, reason, ..
+                    } => Some((*stage, *reason)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rejected,
+                [(RejectionStage::Admission, RejectionReason::ConsentNotAvailableForPartners)],
+                "{protocol}"
+            );
+            let response = refused.into_response();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{protocol}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                !body
+                    .to_string()
+                    .contains("authorize"),
+                "{protocol}: no authorization URL: {body}"
+            );
+            if protocol == "mcp" {
+                assert_eq!(body["id"], 1, "{body}");
+                assert_eq!(body["error"]["code"], -32001, "{body}");
+                assert_eq!(body["error"]["data"]["reason"], "consent_not_available_for_partners", "{body}");
+            } else {
+                assert_eq!(body["status"], 403, "{body}");
+                assert_eq!(body["reason"], "consent_not_available_for_partners", "{body}");
+            }
+        }
+        for user in [carol_hash.as_str(), direct_client_hash.as_str(), "sha256:user"] {
+            assert!(
+                matches!(
+                    vault
+                        .lookup("did:web:agent.example", user, "consent")
+                        .await
+                        .unwrap(),
+                    crate::delegation_vault::VaultLookupResult::NotFound
+                ),
+                "nothing is stored for {user}"
+            );
+        }
+
+        vault
+            .store(
+                serde_json::from_value(json!({
+                    "id": "carol-consent", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": carol_hash, "credential_provider_id": "consent",
+                    "provider_id": "consent", "access_token": "carol-access", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-10-01T00:00:00Z",
+                    "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(injected_credential(&state, call("mcp")).await, "carol-access", "the grant that already exists");
+
+        let mut direct = call("mcp");
+        direct.transit_token_claims = Some(caller_claims(None, None, Some("sha256:direct-user"), json!({})));
+        assert!(
+            matches!(
+                step_inject_credentials(&state, &mut direct).await,
+                Err(OutboundPipelineError::ConsentRequired(_))
+            ),
+            "a caller an Access Point's token names connected directly, so it is asked for consent"
+        );
+    }
+
+    fn bearer_workload_binding() -> crate::config::types::WorkloadBindingConfig {
+        serde_json::from_value(json!({
+            "enabled": true,
+            "caller_source": "authorization_bearer_jwt",
+            "caller_context_fields": ["tid"]
+        }))
+        .unwrap()
+    }
+
+    fn unverified_bearer(claims: serde_json::Value) -> axum::http::HeaderValue {
+        use base64::Engine as _;
+        let b64 = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+        axum::http::HeaderValue::from_str(&format!(
+            "Bearer {}.{}.sig",
+            b64(br#"{"alg":"none"}"#),
+            b64(claims.to_string().as_bytes())
+        ))
+        .unwrap()
+    }
+
+    /// A Workload Binding that reads the caller's bearer JWT binds the claims the
+    /// Transit Point's own authentication verified, whichever header or method
+    /// carried them, and never those of an `Authorization` header nothing verified.
+    #[test]
+    fn a_bearer_workload_binding_reads_the_claims_the_transit_point_verified() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("a verified JWT caller is captured");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")), "the verified claims win over the header");
+        assert_eq!(captured.fields.len(), 1, "only the allowlisted claim is bound");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "copilot-studio".to_string(),
+            provider_agent_id: None,
+        });
+        assert!(
+            capture_workload_binding_caller(&ctx, &config).is_none(),
+            "a caller verified another way binds nothing from a header the gateway did not verify"
+        );
+    }
+
+    #[test]
+    fn a_bearer_workload_binding_reads_the_header_when_the_transit_point_authenticates_no_caller() {
+        let config = bearer_workload_binding();
+        let mut ctx = test_pipeline_context();
+        assert!(capture_workload_binding_caller(&ctx, &config).is_none(), "no credential, nothing to bind");
+        ctx.original_headers
+            .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "contoso" })));
+        let captured = capture_workload_binding_caller(&ctx, &config).expect("the header is read");
+        assert_eq!(captured.fields.get("tid"), Some(&json!("contoso")));
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".to_string());
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({
+                "verification": "source_auth",
+                "method": "jwt_bearer",
+                "user_identity_hash": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    br#"["jwt_bearer","https://idp.example","tenant-a","alice"]"#
+                )),
+                "subject": "alice"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(build_outbound_policy_input(&ctx).source_auth).unwrap()["claims"]["tid"],
+            "tenant-1",
+            "the verified token's claims stay in input.source_auth"
+        );
+        assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "<none>".to_string(),
+            claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
+        });
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({ "verification": "source_auth", "method": "jwt_bearer" }),
+            "a token that names no subject has neither a hash nor a subject"
+        );
+    }
+
+    #[test]
+    fn outbound_policy_input_carries_the_client_the_transit_point_authenticated() {
+        let mut ctx = test_pipeline_context();
+        authenticate_by_resource_token(
+            &mut ctx,
+            crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
+                subject: "alice".to_string(),
+                claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+            },
+        );
+        assert_eq!(
+            transit_client_json(&ctx),
+            json!({
+                "verification": "resource_token",
+                "method": "jwt_bearer",
+                "user_identity_hash": hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    br#"["jwt_bearer","https://idp.example",null,"alice"]"#
+                )),
+                "subject": "alice"
+            })
+        );
+        assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the end user");
+    }
+
+    /// The end user a transit token names and the client the Transit Point
+    /// authenticated are both verified, and a policy sees each in its own field.
+    #[test]
+    fn outbound_policy_input_keeps_the_transit_token_caller_and_the_client_apart() {
+        let mut ctx = test_pipeline_context();
+        authenticate_by_resource_token(
+            &mut ctx,
+            crate::source_auth::AuthenticatedIdentity::ApiKey {
+                key_name: "cloud-agent".to_string(),
+                provider_agent_id: None,
+            },
+        );
+        ctx.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "transit_token");
+        assert_eq!(caller["user_identity_hash"], "abc123");
+        let client = transit_client_json(&ctx);
+        assert_eq!(client["verification"], "resource_token");
+        assert_eq!(client["method"], "api_key");
+        assert_eq!(client["subject"], "cloud-agent");
+
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:claimed"), None, None, json!({})));
+        assert_eq!(transit_caller_json(&ctx)["verification"], "unverified");
+        assert_eq!(transit_client_json(&ctx)["subject"], "cloud-agent");
+    }
+
+    /// An identity set without the mechanism that authenticated it is never
+    /// reported, so it cannot be mislabelled.
+    #[test]
+    fn outbound_policy_input_omits_an_identity_without_its_mechanism() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "cloud-agent".to_string(),
+            provider_agent_id: None,
+        });
+        assert!(transit_client_json(&ctx).is_null());
+        assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous");
+    }
+
+    /// A transit token issued for a request that arrived over Fabric, with the
+    /// peer's `hops` and `caller_did`; `user_identity_hash` is one no Fabric
+    /// token carries.
+    fn fabric_claims(
+        caller_did: Option<&str>,
+        identity_source: &str,
+        user_identity_hash: Option<&str>,
+        hops: u8,
+    ) -> crate::proxy::transit_token::TransitTokenClaims {
+        let mut claims =
+            caller_claims(None, Some(identity_source), user_identity_hash, json!({ "email": "a@b.example" }));
+        claims.fabric = Some(crate::proxy::transit_token::FabricTransitClaims {
+            peer_gateway_id: "partner-record".to_string(),
+            peer_issuer_did: Some("did:web:partner.example".to_string()),
+            hops,
+            caller_did: caller_did.map(str::to_string),
+            principal_hash: None,
+        });
+        claims
+    }
+
+    /// A Fabric-issued token whose request the receiving surface's own
+    /// `source_auth` or resource token verified as `principal_hash`.
+    fn verified_fabric_claims(
+        caller_did: Option<&str>,
+        principal_hash: &str,
+    ) -> crate::proxy::transit_token::TransitTokenClaims {
+        let mut claims = fabric_claims(caller_did, "fabric-asserted", None, 2);
+        claims
+            .fabric
+            .as_mut()
+            .unwrap()
+            .principal_hash = Some(principal_hash.to_string());
+        claims
+    }
+
+    /// A Fabric-issued token is a `fabric_peer` caller: not verified without a
+    /// caller the receiving surface verified, whatever else it carries, its
+    /// DID never verified, even when a connection issuer's presentation
+    /// carried it (the peer vouches for it, this gateway checked nothing), so
+    /// named as the peer's (`fabric.caller_did`), and always with the peer
+    /// that sent the request.
+    #[test]
+    fn outbound_policy_input_names_the_peer_gateway_of_a_fabric_issued_token() {
+        let mut ctx = test_pipeline_context();
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email"]);
+        let peer =
+            json!({ "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example", "hops": 2 });
+
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:agent.example"), "fabric-presentation", None, 2));
+        let mut vouching = peer.clone();
+        vouching["caller_did"] = json!("did:web:agent.example");
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": false,
+                "verification": "fabric_peer",
+                "identity_source": "fabric-presentation",
+                "fabric": vouching
+            })
+        );
+
+        ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", Some("abc123"), 2));
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": false,
+                "verification": "fabric_peer",
+                "identity_source": "fabric-asserted",
+                "fabric": peer
+            }),
+            "a Fabric token never verifies a caller, whatever it carries"
+        );
+    }
+
+    /// A Fabric-issued token is the call's `fabric_peer` caller, naming the
+    /// peer that sent the request, and a client the Transit Point verified
+    /// itself stays apart from it in `client`.
+    #[test]
+    fn a_fabric_token_is_the_caller_and_the_transit_points_own_client_stays_apart() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "partner-agent".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:agent.example"), "fabric-presentation", None, 4));
+        let transit = serde_json::to_value(build_outbound_policy_input(&ctx)).unwrap()["transit"].clone();
+        assert_eq!(transit["caller"]["verification"], "fabric_peer");
+        assert_eq!(transit["caller"]["verified"], false);
+        assert!(
+            transit["caller"]
+                .get("did")
+                .is_none(),
+            "the peer's DID is not the caller's"
+        );
+        assert_eq!(
+            transit["caller"]["fabric"],
+            json!({ "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example", "hops": 4,
+                "caller_did": "did:web:agent.example" })
+        );
+        assert_eq!(transit["client"]["verification"], "source_auth");
+        assert_eq!(transit["client"]["subject"], "partner-agent");
+
+        ctx.transit_token_claims = Some(caller_claims(Some("did:example:claimed"), None, None, json!({})));
+        assert!(
+            transit_caller_json(&ctx)
+                .get("fabric")
+                .is_none(),
+            "an Access Point token names no peer"
+        );
+    }
+
+    /// A Transit Point's audit records name the caller the transit token
+    /// carries, a Fabric-issued one as the peer's assertion, even when the
+    /// Transit Point verified a client itself, and that client without a token.
+    #[test]
+    fn the_audit_names_the_token_caller_and_a_fabric_one_as_asserted_by_the_peer() {
+        let mut ctx = test_pipeline_context();
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:victim.example"), "fabric-presentation", None, 1));
+        let asserted = outbound_caller(&ctx).unwrap();
+        assert_eq!(asserted.auth_method, "fabric_asserted");
+        assert_eq!(asserted.iss.as_deref(), Some("did:web:partner.example"), "the peer that asserted it");
+        assert_eq!(asserted.sub.as_deref(), Some("did:web:victim.example"));
+
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "partner-agent".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+        assert_eq!(
+            outbound_caller(&ctx)
+                .unwrap()
+                .auth_method,
+            "fabric_asserted",
+            "the token's caller, not the Transit Point's client"
+        );
+
+        ctx.transit_token_claims = None;
+        let caller = outbound_caller(&ctx).unwrap();
+        assert_eq!((caller.auth_method.as_str(), caller.sub.as_deref()), ("api_key", Some("partner-agent")));
+    }
+
+    /// A Fabric-issued token whose request the receiving surface verified is a
+    /// verified `fabric_peer` caller: its identity hash is the one the
+    /// receiving surface verified, its fields only those this Transit Point
+    /// allowlists, and the DID the peer named stays the peer's, under
+    /// `fabric`, never beside `verified` as the caller's `did`.
+    #[test]
+    fn a_fabric_token_naming_the_caller_the_receiving_surface_verified_is_a_verified_fabric_peer() {
+        let mut ctx = test_pipeline_context();
+        allowlist_caller_fields(&mut ctx.virtual_channel, &["email"]);
+        let mut claims = verified_fabric_claims(Some("did:web:agent.example"), "receiver-verified-hash");
+        claims
+            .caller_context_fields
+            .insert("name".to_string(), json!("Ada"));
+        ctx.transit_token_claims = Some(claims);
+
+        assert_eq!(
+            transit_caller_json(&ctx),
+            json!({
+                "verified": true,
+                "verification": "fabric_peer",
+                "identity_source": "fabric-asserted",
+                "user_identity_hash": "receiver-verified-hash",
+                "fields": { "email": "a@b.example" },
+                "fabric": { "peer_gateway_id": "partner-record", "peer_issuer_did": "did:web:partner.example",
+                    "hops": 2, "caller_did": "did:web:agent.example" }
+            })
+        );
+    }
+
+    /// A Fabric-issued token that names a caller the receiving surface
+    /// verified is the verified caller in policy input, beside the client the
+    /// Transit Point verified itself, and in audit records it is named ahead of
+    /// that client, as an Access Point's verified token is; one that names none
+    /// is still the caller, as the peer's assertion.
+    #[test]
+    fn a_verified_fabric_token_outranks_a_client_the_transit_point_verified() {
+        let mut ctx = test_pipeline_context();
+        ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "partner-agent".to_string(),
+            provider_agent_id: None,
+        });
+        ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+
+        ctx.transit_token_claims =
+            Some(verified_fabric_claims(Some("did:web:victim.example"), "receiver-verified-hash"));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "fabric_peer");
+        assert_eq!(caller["verified"], true);
+        assert_eq!(caller["user_identity_hash"], "receiver-verified-hash");
+        assert!(
+            caller
+                .get("subject")
+                .is_none(),
+            "{caller}"
+        );
+        assert_eq!(transit_client_json(&ctx)["subject"], "partner-agent");
+        let audited = outbound_caller(&ctx).unwrap();
+        assert_eq!(audited.auth_method, "fabric_verified");
+        assert_eq!(
+            audited
+                .user_identity_hash
+                .as_deref(),
+            Some("receiver-verified-hash")
+        );
+        assert_eq!(
+            audited
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(audited.iss, None);
+        assert_eq!(audited.email.as_deref(), Some("a@b.example"), "the claims the receiving surface verified");
+        assert_eq!(audited.sub, None, "never the DID the peer asserted");
+
+        ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, 2));
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "fabric_peer");
+        assert_eq!(caller["verified"], false);
+        assert_eq!(transit_client_json(&ctx)["subject"], "partner-agent");
+        let audited = outbound_caller(&ctx).unwrap();
+        assert_eq!(
+            (audited.auth_method.as_str(), audited.iss.as_deref()),
+            ("fabric_asserted", Some("did:web:partner.example")),
+            "an unverified Fabric token is still the caller, as any transit token is"
+        );
+    }
+
+    /// The policy recipes the docs give: admit one partner gateway's requests,
+    /// and keep partner requests off a Transit Point; and that a partner's
+    /// vouching never verifies a caller, while `verified` covers the identity
+    /// hash, never the DID.
+    #[tokio::test]
+    async fn a_transit_point_policy_admits_one_partner_gateway_and_can_refuse_every_partner() {
+        async fn decide(
+            ctx: &mut OutboundPipelineContext,
+            rego: &str,
+        ) -> bool {
+            ctx.virtual_channel.policy =
+                Some(serde_json::from_value(json!({"policy_definition_id": "request"})).unwrap());
+            let manager = crate::policies::SurfacePolicyManager::new();
+            let key = format!(
+                "transit:{}:{}",
+                ctx.surface
+                    .config_id()
+                    .unwrap_or("unknown"),
+                ctx.virtual_channel.alias
+            );
+            manager
+                .load_policy_text(&key, rego)
+                .unwrap();
+            let mut state = test_outbound_state();
+            state.policy_manager = Some(Arc::new(manager));
+            step_transit_point_opa_policy(&state, ctx)
+                .await
+                .is_ok()
+        }
+        let one_partner = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                           input.transit.caller.verification == \"fabric_peer\"\n    \
+                           input.transit.caller.fabric.peer_issuer_did == \"did:web:partner.example\"\n}\n";
+        let no_partners = "package surface.policy\n\ndefault allow := true\n\n\
+                           allow := false if input.transit.caller.fabric\n";
+        let verified_caller = "package surface.policy\n\ndefault allow := false\n\n\
+                               allow if input.transit.caller.verification == \"transit_token\"\n";
+
+        // A Fabric caller's DID is the partner's word, so it is never the
+        // caller's `did`, beside a `verified` that covers only the identity
+        // hash: a rule on both admits no partner, and the DID is matched, as
+        // the peer's assertion, under `fabric.caller_did`.
+        let verified_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                            input.transit.caller.did == \"did:web:q-agent.example\"\n    \
+                            input.transit.caller.verified\n}\n";
+        let vouched_did = "package surface.policy\n\ndefault allow := false\n\nallow if {\n    \
+                           input.transit.caller.fabric.caller_did == \"did:web:q-agent.example\"\n    \
+                           input.transit.caller.identity_source == \"fabric-presentation\"\n    \
+                           input.transit.caller.fabric.peer_issuer_did == \"did:web:partner.example\"\n}\n";
+        let mut verified_partner = test_pipeline_context();
+        verified_partner.transit_token_claims =
+            Some(verified_fabric_claims(Some("did:web:q-agent.example"), "receiver-verified-hash"));
+        assert!(
+            !decide(&mut verified_partner, verified_did).await,
+            "a partner's DID never sits beside `verified` as the caller's"
+        );
+        let caller = transit_caller_json(&verified_partner);
+        assert_eq!(caller["verified"], true);
+        assert!(caller.get("did").is_none(), "{caller}");
+        assert_eq!(caller["fabric"]["caller_did"], "did:web:q-agent.example", "{caller}");
+        let mut vouched = test_pipeline_context();
+        vouched.transit_token_claims =
+            Some(fabric_claims(Some("did:web:q-agent.example"), "fabric-presentation", None, 1));
+        assert!(
+            !decide(&mut vouched, verified_did).await,
+            "a DID a partner only vouches for never passes a verified-caller rule"
+        );
+        assert!(decide(&mut vouched, vouched_did).await, "the DID one partner's presentation carried");
+
+        let mut partner = test_pipeline_context();
+        partner.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, 1));
+        let mut other = test_pipeline_context();
+        let mut other_claims = fabric_claims(None, "fabric-asserted", None, 1);
+        other_claims
+            .fabric
+            .as_mut()
+            .unwrap()
+            .peer_issuer_did = Some("did:web:other.example".to_string());
+        other.transit_token_claims = Some(other_claims);
+        let mut direct = test_pipeline_context();
+        direct.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+
+        assert!(decide(&mut partner, one_partner).await);
+        assert!(!decide(&mut other, one_partner).await);
+        assert!(!decide(&mut direct, one_partner).await, "a verified Access Point caller is not a partner");
+        assert!(
+            !decide(&mut partner, verified_caller).await,
+            "a caller any partner vouches for never passes a verified-caller rule"
+        );
+        assert!(decide(&mut direct, verified_caller).await, "the rule admits a caller the Access Point verified");
+        assert!(!decide(&mut partner, no_partners).await);
+        assert!(decide(&mut direct, no_partners).await);
+    }
+
+    /// A Transit Point response policy reads the caller as its request policies
+    /// do, so a deny-list rule on an anonymous caller holds the response back
+    /// and one on a claim of the verified caller sees that claim.
+    #[test]
+    fn a_transit_point_response_policy_sees_the_caller_of_the_call() {
+        let decide = |ctx: &mut OutboundPipelineContext, rego: &str| {
+            ctx.virtual_channel
+                .response_policy = Some(serde_json::from_value(json!({"policy_definition_id": "response"})).unwrap());
+            let manager = crate::policies::SurfacePolicyManager::new();
+            let key = format!(
+                "response:transit:{}:{}",
+                ctx.surface
+                    .config_id()
+                    .unwrap_or("unknown"),
+                ctx.virtual_channel.alias
+            );
+            manager
+                .load_policy_text(&key, rego)
+                .unwrap();
+            let mut state = test_outbound_state();
+            state.policy_manager = Some(Arc::new(manager));
+            step_transit_point_response_policy(
+                &state,
+                ctx,
+                StatusCode::OK,
+                &Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+                &reqwest::header::HeaderMap::new(),
+                &crate::policies::PolicyAttestation::default(),
+            )
+            .is_ok()
+        };
+        let refuse_anonymous = "package surface.policy\n\ndefault allow := true\n\n\
+                                allow := false if input.transit.caller.verification == \"anonymous\"\n";
+        let only_tenant = "package surface.policy\n\ndefault allow := false\n\n\
+                           allow if {\n    input.transit.client.verification == \"resource_token\"\n    \
+                           input.source_auth.claims.tid == \"tenant-1\"\n}\n";
+
+        let mut anonymous = test_pipeline_context();
+        assert!(!decide(&mut anonymous, refuse_anonymous), "the response to an anonymous caller is held back");
+
+        let mut verified = test_pipeline_context();
+        verified.transit_token_claims = Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({})));
+        assert!(decide(&mut verified, refuse_anonymous), "the response to a verified caller is released");
+
+        let mut resource_caller = test_pipeline_context();
+        authenticate_by_resource_token(
+            &mut resource_caller,
+            crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
+                subject: "alice".to_string(),
+                claims: json!({ "sub": "alice", "tid": "tenant-1" }),
+            },
+        );
+        assert!(decide(&mut resource_caller, only_tenant), "the verified client's claims reach the response policy");
+        assert!(!decide(&mut anonymous, only_tenant));
     }
 
     #[test]
@@ -10226,15 +14917,15 @@ mod tests {
 
     #[tokio::test]
     async fn modern_transit_tokens_require_live_surface_bound_authority() {
-        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer};
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
 
-        let signing_secret = b"modern-transit-fixture-signing-key";
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
         let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
         for case in ["valid", "other-surface", "expired", "future-issued", "other-point", "duplicate", "missing-issuer"]
         {
             let mut state = test_outbound_state();
             if case != "missing-issuer" {
-                state.transit_token_issuer = Some(Arc::new(TransitTokenIssuer::new(signing_secret, "gateway".into())));
+                state.transit_token_issuer = Some(Arc::new(issuer.clone()));
             }
             let mut ctx = modern_pipeline_context("tools/list");
             Arc::make_mut(&mut ctx.surface).surface_id = "current-surface".into();
@@ -10243,16 +14934,11 @@ mod tests {
             let claims: TransitTokenClaims = serde_json::from_value(json!({
                 "iss": "gateway", "surface_id": if case == "other-surface" { "another-surface" } else { "current-surface" },
                 "iat": if case == "future-issued" { now + 120 } else { now - 1 },
-                "exp": if case == "expired" { now - 1 } else { now + 300 },
+                "exp": if case == "expired" { now - 1 } else { now + 299 },
                 "jti": uuid::Uuid::new_v4().to_string(),
                 "allowed_transit_points": [if case == "other-point" { "partner-b" } else { "partner-a" }]
             })).unwrap();
-            let token = jsonwebtoken::encode(
-                &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-                &claims,
-                &jsonwebtoken::EncodingKey::from_secret(signing_secret),
-            )
-            .unwrap();
+            let token = issuer.sign(&claims).unwrap();
             ctx.original_headers
                 .insert("x-transit-token", token.parse().unwrap());
             if case == "duplicate" {
@@ -10275,23 +14961,134 @@ mod tests {
         }
     }
 
+    /// A Transit Point checks a transit token against the lifetime its surface
+    /// sets when the token is presented.
     #[tokio::test]
-    async fn test_transit_token_validation_skipped_when_no_issuer() {
+    async fn the_transit_token_step_checks_the_lifetime_the_surface_sets() {
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
+
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        for (case, lifetime, iat, exp, accepted) in [
+            ("issued 400 s ago to live 600 s", Some(600), now - 400, now + 200, true),
+            ("the same token once the surface allows 300 s", Some(300), now - 400, now + 200, false),
+            ("the same token on a surface that sets no lifetime", None, now - 400, now + 200, false),
+            ("living 1 s longer than the surface allows", Some(600), now, now + 601, false),
+        ] {
+            let mut ctx = test_pipeline_context();
+            let surface = Arc::make_mut(&mut ctx.surface);
+            surface.surface_id = "surf-001".into();
+            surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .shared
+                .transit_token_lifetime_secs = lifetime;
+            let claims: TransitTokenClaims = serde_json::from_value(json!({
+                "iss": "gateway", "surface_id": "surf-001", "iat": iat, "exp": exp,
+                "jti": uuid::Uuid::new_v4().to_string(), "allowed_transit_points": ["partner-a"]
+            }))
+            .unwrap();
+            ctx.original_headers.insert(
+                "x-transit-token",
+                issuer
+                    .sign(&claims)
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+            );
+
+            let result = step_validate_transit_token(&state, &mut ctx).await;
+
+            if accepted {
+                result.unwrap();
+                assert_eq!(
+                    ctx.transit_token_claims
+                        .as_ref()
+                        .map(|claims| (claims.iat, claims.exp)),
+                    Some((iat, exp)),
+                    "{case}"
+                );
+            } else {
+                assert!(
+                    matches!(&result, Err(OutboundPipelineError::TransitTokenInvalid(reason))
+                        if reason == "transit token lives longer than its surface allows"),
+                    "{case}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transit_token_validation_refuses_when_no_issuer() {
         let state = test_outbound_state(); // transit_token_issuer = None
         let mut ctx = test_pipeline_context();
         let result = step_validate_transit_token(&state, &mut ctx).await;
-        assert!(result.is_ok());
+        assert!(
+            matches!(result, Err(OutboundPipelineError::TransitTokenInvalid(ref reason)) if reason.contains("unavailable")),
+            "a Transit Point that requires the token refuses when it cannot check it: {result:?}"
+        );
         assert!(
             ctx.transit_token_claims
                 .is_none()
         );
+
+        ctx.virtual_channel
+            .require_transit_token = false;
+        assert!(
+            step_validate_transit_token(&state, &mut ctx)
+                .await
+                .is_ok(),
+            "a Transit Point that does not require the token is unaffected"
+        );
+    }
+
+    /// Only a `GET` or `HEAD` of a discovery document at the Transit Point's
+    /// root, as its target receives the path, skips the transit token, and
+    /// exactly those requests carry no caller credential.
+    #[tokio::test]
+    async fn only_a_discovery_read_at_the_transit_point_root_skips_the_transit_token() {
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gw-test".to_string(),
+        )));
+        let base = "/outbound/surfaces/order/partner-a";
+        for (method, path, discovery) in [
+            (Method::GET, ".well-known/agent-card.json", true),
+            (Method::HEAD, ".well-known/agent-card.json", true),
+            (Method::GET, "agent.json", true),
+            (Method::GET, "discovery", true),
+            (Method::HEAD, "discovery/", true),
+            (Method::GET, "message/send", false),
+            (Method::POST, "agent.json", false),
+            (Method::GET, "x/admin/discovery", false),
+            (Method::HEAD, "x/admin/discovery", false),
+            (Method::GET, "admin/.well-known/agent-card.json", false),
+            (Method::GET, "admin%2Fdiscovery", false),
+            (Method::GET, "admin/%2e%2e/discovery", false),
+            (Method::GET, "admin/../discovery", false),
+            (Method::GET, "admin;/discovery", false),
+            (Method::GET, "discovery;x=1", false),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.original_method = method.clone();
+            ctx.request_path = format!("{base}/{path}");
+
+            let result = step_validate_transit_token(&state, &mut ctx).await;
+
+            assert_eq!(result.is_ok(), discovery, "{method} {path}: {result:?}");
+            assert_eq!(transit_caller_assertion(&ctx).permits_target_credential(), !discovery, "{method} {path}");
+        }
     }
 
     #[tokio::test]
     async fn test_transit_token_validation_rejects_missing_header() {
         let mut state = test_outbound_state();
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
         state.transit_token_issuer = Some(Arc::new(issuer));
@@ -10312,7 +15109,7 @@ mod tests {
     async fn test_transit_token_validation_rejects_invalid_token() {
         let mut state = test_outbound_state();
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
         state.transit_token_issuer = Some(Arc::new(issuer));
@@ -10336,7 +15133,7 @@ mod tests {
     #[tokio::test]
     async fn test_transit_token_validation_accepts_valid_token() {
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
 
@@ -10357,6 +15154,7 @@ mod tests {
         state.transit_token_issuer = Some(Arc::new(issuer));
 
         let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
         ctx.original_headers
             .insert("X-Transit-Token", token.parse().unwrap());
 
@@ -10371,10 +15169,106 @@ mod tests {
         assert_eq!(claims.identity_source, Some("gateway_computed".to_string()));
     }
 
+    /// A valid token sent to a Transit Point that does not require one names
+    /// the caller to policy only. The claims that drive delegation, Workload
+    /// Binding, stream expiry and the trace id stay empty, as without a token.
+    #[tokio::test]
+    async fn an_optional_transit_token_reaches_policy_only() {
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gw-test".to_string(),
+        );
+        let token = issuer
+            .issue(
+                "surf-001",
+                Some("did:example:caller"),
+                Some("gateway_computed"),
+                None,
+                None,
+                None,
+                vec!["partner-a".to_string()],
+            )
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer));
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
+        ctx.virtual_channel
+            .require_transit_token = false;
+        ctx.original_headers
+            .insert("X-Transit-Token", token.parse().unwrap());
+
+        step_validate_transit_token(&state, &mut ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.transit_token_claims
+                .is_none()
+        );
+        assert_eq!(ctx.request_id, "test-request-id");
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "unverified", "{caller}");
+        assert_eq!(caller["did"], "did:example:caller", "{caller}");
+    }
+
+    /// On a Transit Point that does not require a transit token, a token that
+    /// expired within the clock leeway passes the first check, but once the
+    /// strict modern MCP check refuses it the caller is anonymous again.
+    #[tokio::test]
+    async fn an_optional_transit_token_the_strict_check_refuses_names_no_caller() {
+        use crate::proxy::transit_token::{TransitTokenClaims, TransitTokenIssuer, TransitTokenKey};
+
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
+        let now = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+        let claims: TransitTokenClaims = serde_json::from_value(json!({
+            "iss": "gateway", "surface_id": "surf-001", "sub": "did:example:caller",
+            "iat": now - 2, "exp": now - 1, "jti": uuid::Uuid::new_v4().to_string(),
+            "allowed_transit_points": ["partner-a"]
+        }))
+        .unwrap();
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        let mut ctx = modern_pipeline_context("tools/call");
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
+        ctx.virtual_channel
+            .require_transit_token = false;
+        ctx.original_headers.insert(
+            "x-transit-token",
+            issuer
+                .sign(&claims)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        let classification = ctx.mcp_classification.take();
+
+        step_validate_transit_token(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert!(
+            ctx.optional_transit_token_claims
+                .is_some(),
+            "the lenient check accepts the token"
+        );
+
+        ctx.mcp_classification = classification;
+        step_validate_transit_token(&state, &mut ctx)
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.optional_transit_token_claims
+                .is_none()
+        );
+        let caller = transit_caller_json(&ctx);
+        assert_eq!(caller["verification"], "anonymous", "{caller}");
+    }
+
     #[tokio::test]
     async fn test_transit_token_validation_rejects_wrong_transit_point() {
         let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
-            b"test-secret-key-32-bytes-long!!",
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
             "gw-test".to_string(),
         );
 
@@ -10387,6 +15281,7 @@ mod tests {
         state.transit_token_issuer = Some(Arc::new(issuer));
 
         let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
         ctx.original_headers
             .insert("X-Transit-Token", token.parse().unwrap());
 
@@ -10398,6 +15293,89 @@ mod tests {
             }
             other => panic!("unexpected error: {:?}", other),
         }
+    }
+
+    /// A refused transit token is answered without saying which check it
+    /// failed, such as that it was issued for another surface.
+    #[tokio::test]
+    async fn a_refused_transit_token_is_not_told_why() {
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gw-test".to_string(),
+        );
+        let token = issuer
+            .issue("another-surface", None, None, None, None, None, vec![])
+            .unwrap();
+        let mut state = test_outbound_state();
+        state.transit_token_issuer = Some(Arc::new(issuer));
+        let mut ctx = test_pipeline_context();
+        Arc::make_mut(&mut ctx.surface).surface_id = "surf-001".into();
+        ctx.original_headers
+            .insert("X-Transit-Token", token.parse().unwrap());
+
+        let error = step_validate_transit_token(&state, &mut ctx)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, OutboundPipelineError::TransitTokenInvalid(reason) if reason.contains("another surface")),
+            "{error:?}"
+        );
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["detail"], "Transit token missing or invalid", "{body}");
+    }
+
+    /// A Transit Point configured with MCP tool gating that is not in force, as
+    /// when its surface was deleted while the request was in flight, refuses a
+    /// `tools/call` and lists no tools.
+    #[tokio::test]
+    async fn a_transit_point_whose_tool_gating_is_not_in_force_fails_closed() {
+        let mut state = test_outbound_state();
+        state.policy_manager = Some(Arc::new(crate::policies::SurfacePolicyManager::new()));
+        let gated = |operation: &str| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            ctx.operation = Some(operation.to_string());
+            ctx.body_bytes = Some(Bytes::from(
+                json!({"jsonrpc": "2.0", "id": 9, "method": operation, "params": {"name": "admin_reset"}}).to_string(),
+            ));
+            ctx.virtual_channel
+                .mcp_tool_gating = Some(
+                serde_json::from_value(json!({"gates": [{"id": "g1", "name": "no admin",
+                    "action": {"effect": "deny", "patterns": ["^admin_"]}}]}))
+                .unwrap(),
+            );
+            ctx
+        };
+
+        let mut call = gated("tools/call");
+        assert!(matches!(
+            step_transit_mcp_tool_gating(&state, &mut call).await,
+            Err(OutboundPipelineError::TransitMcpToolGated)
+        ));
+        let listed = filter_transit_mcp_tools_list(
+            &state,
+            &gated("tools/list"),
+            Bytes::from(json!({"jsonrpc": "2.0", "id": 9, "result": {"tools": [{"name": "admin_reset"}]}}).to_string()),
+        );
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&listed).unwrap()["result"]["tools"], json!([]));
+
+        let mut ungated = gated("tools/call");
+        ungated
+            .virtual_channel
+            .mcp_tool_gating = None;
+        assert!(
+            step_transit_mcp_tool_gating(&state, &mut ungated)
+                .await
+                .is_ok()
+        );
     }
 
     // ── step_collect_trust_context ─────────────────────────────────────────
@@ -10531,7 +15509,15 @@ mod tests {
         (format!("http://{}", addr), TrustCheckTestServer(handle))
     }
 
-    fn attach_target_trust_check_list(
+    fn attach_transit_point_trust_check_list(
+        ctx: &mut OutboundPipelineContext,
+        elements: Vec<crate::trust_registry_verification::TrustCheckElement>,
+    ) {
+        ctx.virtual_channel
+            .trust_check_list = elements;
+    }
+
+    fn attach_surface_target_trust_check_list(
         ctx: &mut OutboundPipelineContext,
         elements: Vec<crate::trust_registry_verification::TrustCheckElement>,
     ) {
@@ -10540,6 +15526,447 @@ mod tests {
             .target
             .trust_check_list = elements;
         ctx.surface = Arc::new(surface);
+    }
+
+    async fn spawn_counting_agent_card_server(
+        card_body: serde_json::Value
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, TrustCheckTestServer) {
+        use axum::Router;
+        use axum::routing::get;
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let body_str = card_body.to_string();
+        let app = Router::new().fallback(get(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = body_str.clone();
+            async move { ([("Content-Type", "application/json")], body) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}", addr), hits, TrustCheckTestServer(handle))
+    }
+
+    fn result_ids(ctx: &OutboundPipelineContext) -> Vec<String> {
+        ctx.trust_check_results
+            .as_ref()
+            .expect("trust check results populated")
+            .target
+            .iter()
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn outbound_transit_point_without_trust_checks_skips_card_fetch_and_results() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp2".to_string();
+        ctx.virtual_channel
+            .target_endpoint = endpoint;
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no Trust Check agent-card fetch for tp2");
+        assert!(
+            ctx.target_agent_context
+                .is_none()
+        );
+        assert!(!ctx.target_agent_card_unavailable);
+        assert!(
+            ctx.target_identity_failure
+                .is_none()
+        );
+        assert!(
+            ctx.trust_check_results
+                .is_none(),
+            "tp2 has no Trust Checks, so no results"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_transit_point_with_trust_checks_fetches_its_card() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp1".to_string();
+        ctx.virtual_channel
+            .target_endpoint = endpoint;
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1, "tp1's Trust Check fetches its card");
+        assert!(
+            ctx.target_agent_context
+                .is_some()
+        );
+        assert_eq!(
+            ctx.target_identity_failure
+                .as_ref()
+                .map(|f| f.code),
+            Some(crate::trust_registry_verification::TARGET_AGENT_IDENTITY_UNAVAILABLE)
+        );
+    }
+
+    /// The card of a `fabric://` Transit Point's target is read over Fabric,
+    /// never through the Transit Point's own listener, which may require a
+    /// caller credential the gateway does not hold.
+    #[tokio::test]
+    async fn a_fabric_transit_points_trust_check_never_reads_the_card_through_the_transit_point_itself() {
+        let (own_listener, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "partner".to_string();
+        ctx.virtual_channel
+            .target_endpoint = format!("fabric://partner-gateway/{}", Uuid::new_v4());
+        ctx.virtual_channel
+            .agent_card_path = Some("/cards/agent.json".to_string());
+        ctx.virtual_channel
+            .listen_address = Some(own_listener);
+        ctx.virtual_channel
+            .listen_path = Some("/partner".to_string());
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("partner-a")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the card must not be read through the Transit Point's own listener"
+        );
+        assert!(ctx.target_agent_card_unavailable, "with no Fabric connection the card is unavailable");
+        assert_eq!(
+            crate::proxy::agent_card_cache::lookup(
+                &ctx.virtual_channel
+                    .target_endpoint,
+                None
+            ),
+            None,
+            "a read that never reached the partner gateway is not cached"
+        );
+    }
+
+    /// A card is read at, and cached under, the target and its
+    /// `agent_card_path`, except that the path does not apply over Fabric.
+    #[test]
+    fn a_card_location_keeps_the_agent_card_path_except_over_fabric() {
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .agent_card_path = Some("/cards/agent.json".to_string());
+        for (target, path) in [
+            ("https://partner.example/a2a", Some("/cards/agent.json".to_string())),
+            ("fabric://partner-gateway/partner-surface", None),
+        ] {
+            ctx.virtual_channel
+                .target_endpoint = target.to_string();
+            assert_eq!(agent_card_location(&ctx.virtual_channel), (target.to_string(), path), "{target}");
+        }
+    }
+
+    /// A Transit Point policy that needs agent context reads a `fabric://`
+    /// target's card over Fabric too, not through the Transit Point itself.
+    #[tokio::test]
+    async fn a_fabric_transit_points_policy_never_reads_the_card_through_the_transit_point_itself() {
+        let (own_listener, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = "fabric://partner-gateway/partner-surface".to_string();
+        ctx.virtual_channel
+            .listen_address = Some(own_listener);
+        ctx.virtual_channel
+            .listen_path = Some("/partner".to_string());
+        require_agent_context(&mut ctx);
+
+        let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the card must not be read through the Transit Point's own listener"
+        );
+        assert!(
+            ctx.target_agent_context
+                .is_some(),
+            "agent context is still built without the card"
+        );
+    }
+
+    fn require_agent_context(ctx: &mut OutboundPipelineContext) {
+        ctx.virtual_channel.policy = Some(crate::config::agent_surface::PolicyRef {
+            policy_definition_id: "needs-agent-context".to_string(),
+            require_agent_context: true,
+        });
+    }
+
+    /// A Transit Point policy that needs agent context reads the card when no
+    /// earlier stage did, and does not read it again when this request
+    /// already found it unavailable.
+    #[tokio::test]
+    async fn a_transit_point_policy_reads_the_card_once_per_request() {
+        for (already_unavailable, expected_reads) in [(false, 1), (true, 0)] {
+            let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+            let state = test_outbound_state();
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .target_endpoint = endpoint;
+            ctx.target_agent_card_unavailable = already_unavailable;
+            require_agent_context(&mut ctx);
+
+            let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::SeqCst),
+                expected_reads,
+                "card already unavailable: {already_unavailable}"
+            );
+            assert!(
+                ctx.target_agent_context
+                    .is_some()
+            );
+        }
+    }
+
+    /// A Transit Point policy that needs agent context takes a cached card
+    /// rather than reading it again. Other tests clear the process-wide cache
+    /// at any time, so an attempt whose entry was cleared is retried.
+    #[tokio::test]
+    async fn a_transit_point_policy_takes_a_cached_card() {
+        let (endpoint, hits, _server) = spawn_counting_agent_card_server(json!({"protocolVersion": "1.0"})).await;
+        let state = test_outbound_state();
+        let mut used_the_cache = false;
+        for _ in 0..20 {
+            crate::proxy::agent_card_cache::insert(&endpoint, None, Some(json!({"name": "cached"})));
+            let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .target_endpoint = endpoint.clone();
+            require_agent_context(&mut ctx);
+            let _ = step_transit_point_opa_policy(&state, &mut ctx).await;
+            if hits.load(std::sync::atomic::Ordering::SeqCst) == before {
+                used_the_cache = true;
+                break;
+            }
+        }
+        assert!(used_the_cache, "the policy step read the card despite a cached one");
+    }
+
+    /// An `http(s)` Transit Point's Trust Check reads the card at its
+    /// `agent_card_path` on the target's origin.
+    #[tokio::test]
+    async fn an_http_transit_points_trust_check_reads_the_card_at_its_agent_card_path() {
+        use axum::Router;
+        use axum::routing::get;
+        let app = Router::new().route(
+            "/cards/agent.json",
+            get(|| async { ([("Content-Type", "application/json")], r#"{"name":"custom-path-card"}"#) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        let _server = TrustCheckTestServer(tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        }));
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = format!("http://{addr}/base");
+        ctx.virtual_channel
+            .agent_card_path = Some("cards/agent.json".to_string());
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("custom-path")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+
+        assert!(!ctx.target_agent_card_unavailable, "the card is read at the custom path");
+        assert!(
+            ctx.target_agent_context
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_card_unavailable_results_cover_only_the_routed_transit_points_elements() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.alias = "tp1".to_string();
+        ctx.virtual_channel
+            .target_endpoint = "http://127.0.0.1:1".to_string();
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a"), make_test_element("tp1-b")]);
+
+        let (_guard, events) = crate::observability::trust_check_audit::test_support::capture_until_dropped();
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert!(ctx.target_agent_card_unavailable);
+        assert_eq!(result_ids(&ctx), vec!["tp1-a".to_string(), "tp1-b".to_string()]);
+        let results = ctx
+            .trust_check_results
+            .as_ref()
+            .expect("results");
+        assert!(results.caller.is_empty());
+        assert!(
+            results
+                .target
+                .iter()
+                .all(|r| !r.ok
+                    && r.error
+                        .as_ref()
+                        .map(|e| e.code.as_str())
+                        == Some(crate::trust_registry_verification::AGENT_CARD_UNAVAILABLE))
+        );
+
+        use crate::observability::trust_check_audit::test_support::field;
+        let events = events
+            .lock()
+            .expect("events lock")
+            .clone();
+        let audited: Vec<_> = events
+            .iter()
+            .filter(|e| field(e, "element_id").is_some_and(|id| id.starts_with("tp1-") || id == "surface-wide"))
+            .map(|e| (field(e, "element_id").unwrap_or_default(), field(e, "transit_point").unwrap_or_default()))
+            .collect();
+        assert_eq!(audited, vec![("tp1-a", "tp1"), ("tp1-b", "tp1")]);
+    }
+
+    #[tokio::test]
+    async fn outbound_variant_request_runs_the_variants_transit_point_list() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let element = |id: &str| serde_json::to_value(make_test_element(id)).expect("element");
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-variant-tc",
+            "name": "variant-tc",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/surfaces/order", "protocol": "a2a"},
+            "target": {"endpoint": "https://managed.example/a2a"},
+            "transit": {"points": [{
+                "id": "tp-base", "alias": "partner-a", "target_endpoint": "http://127.0.0.1:1",
+                "protocol": "a2a", "trust_check_list": [element("base-check")]
+            }]},
+            "variants": [{
+                "id": "variant-dev", "alias": "dev", "name": "Development", "enabled": true,
+                "overrides": {"transit": {"points": [{
+                    "id": "tp-dev", "alias": "partner-a", "target_endpoint": "http://127.0.0.1:1",
+                    "protocol": "a2a", "trust_check_list": [element("dev-check-1"), element("dev-check-2")]
+                }]}}
+            }]
+        }))
+        .expect("surface should deserialize");
+        let state = test_outbound_state();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+
+        let mut ran = Vec::new();
+        for path in
+            ["/outbound/surfaces/order$dev/partner-a/message/send", "/outbound/surfaces/order/partner-a/message/send"]
+        {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let mut ctx = OutboundPipelineContext::new(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+                req,
+                &state,
+                crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            )
+            .expect("context resolves the Transit Point");
+            step_collect_trust_context(&state, &mut ctx)
+                .await
+                .expect("collect ok");
+            step_trust_check(&state, &mut ctx)
+                .await
+                .expect("trust check ok");
+            ran.push(result_ids(&ctx));
+        }
+
+        assert_eq!(
+            ran,
+            vec![vec!["dev-check-1".to_string(), "dev-check-2".to_string()], vec!["base-check".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_mcp_transit_point_runs_its_trust_check_list() {
+        crate::proxy::agent_card_cache::invalidate_all();
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+        ctx.virtual_channel
+            .target_endpoint = "http://127.0.0.1:1".to_string();
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("mcp-check")]);
+
+        step_collect_trust_context(&state, &mut ctx)
+            .await
+            .expect("collect ok");
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(result_ids(&ctx), vec!["mcp-check".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn outbound_identity_failure_results_cover_only_the_routed_transit_points_elements() {
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        attach_surface_target_trust_check_list(&mut ctx, vec![make_test_element("surface-wide")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tp1-a")]);
+        ctx.target_identity_failure = Some(crate::trust_registry_verification::TrustCheckIdentityVerificationFailure {
+            code: crate::trust_registry_verification::IDENTITY_VP_VERIFICATION_FAILED,
+            detail: "target agent identity credential could not be verified",
+        });
+
+        step_trust_check(&state, &mut ctx)
+            .await
+            .expect("trust check ok");
+
+        assert_eq!(result_ids(&ctx), vec!["tp1-a".to_string()]);
+        assert_eq!(
+            ctx.trust_check_results
+                .as_ref()
+                .expect("results")
+                .target[0]
+                .error
+                .as_ref()
+                .map(|e| e.code.as_str()),
+            Some(crate::trust_registry_verification::IDENTITY_VP_VERIFICATION_FAILED)
+        );
     }
 
     fn make_test_element(id: &str) -> crate::trust_registry_verification::TrustCheckElement {
@@ -10617,7 +16044,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         let result = step_collect_trust_context(&state, &mut ctx).await;
         assert!(result.is_ok(), "widened gate should open without TR-verify: {:?}", result);
@@ -10676,7 +16103,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         let result = step_collect_trust_context(&state, &mut ctx).await;
         assert!(result.is_ok(), "widened gate should open without TR-verify: {:?}", result);
@@ -10703,7 +16130,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
         ctx.target_identity_failure = Some(crate::trust_registry_verification::TrustCheckIdentityVerificationFailure {
             code: crate::trust_registry_verification::TARGET_AGENT_IDENTITY_UNAVAILABLE,
             detail: "target agent card carries no agent-identity-credential",
@@ -10811,7 +16238,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = endpoint;
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
 
         step_collect_trust_context(&state, &mut ctx)
             .await
@@ -10897,7 +16324,7 @@ mod tests {
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = "http://127.0.0.1:1".to_string();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
 
         step_collect_trust_context(&state, &mut ctx)
             .await
@@ -10927,108 +16354,34 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_agent_card_unavailable_synthesized_results_emit_audit_events() {
-        use std::sync::{Arc as StdArc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing_subscriber::layer::{Context as LayerContext, Layer};
-        use tracing_subscriber::prelude::*;
+        use crate::observability::trust_check_audit::test_support::{CapturedEvent, capture_until_dropped, field};
 
-        #[derive(Default, Clone)]
-        struct CapturedEvent {
-            level: String,
-            fields: Vec<(String, String)>,
-        }
-        struct FieldVisitor(Vec<(String, String)>);
-        impl Visit for FieldVisitor {
-            fn record_debug(
-                &mut self,
-                f: &Field,
-                v: &dyn std::fmt::Debug,
-            ) {
-                self.0
-                    .push((f.name().to_string(), format!("{:?}", v)));
-            }
-            fn record_str(
-                &mut self,
-                f: &Field,
-                v: &str,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-            fn record_u64(
-                &mut self,
-                f: &Field,
-                v: u64,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-            fn record_bool(
-                &mut self,
-                f: &Field,
-                v: bool,
-            ) {
-                self.0
-                    .push((f.name().to_string(), v.to_string()));
-            }
-        }
-        struct CapturingLayer(StdArc<Mutex<Vec<CapturedEvent>>>);
-        impl<S: tracing::Subscriber> Layer<S> for CapturingLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: LayerContext<'_, S>,
-            ) {
-                let mut v = FieldVisitor(Vec::new());
-                event.record(&mut v);
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push(CapturedEvent {
-                        level: event
-                            .metadata()
-                            .level()
-                            .to_string(),
-                        fields: v.0,
-                    });
-            }
-        }
-
-        let events = StdArc::new(Mutex::new(Vec::<CapturedEvent>::new()));
-        let subscriber = tracing_subscriber::registry().with(CapturingLayer(events.clone()));
-        let _default_guard = tracing::subscriber::set_default(subscriber);
-
+        let (default_guard, events) = capture_until_dropped();
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
         ctx.virtual_channel
             .target_endpoint = "http://127.0.0.1:1".to_string();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1"), make_test_element("tc-2")]);
         ctx.target_agent_card_unavailable = true;
 
         step_trust_check(&state, &mut ctx)
             .await
             .expect("synthesis ok");
 
-        drop(_default_guard);
-        let events = events.lock().unwrap();
+        drop(default_guard);
+        let events = events
+            .lock()
+            .expect("events lock")
+            .clone();
         let agent_card_unavailable_events: Vec<&CapturedEvent> = events
             .iter()
-            .filter(|e| {
-                e.fields
-                    .iter()
-                    .any(|(k, v)| k == "error_code" && v == "AGENT_CARD_UNAVAILABLE")
-            })
+            .filter(|e| field(e, "error_code") == Some("AGENT_CARD_UNAVAILABLE"))
             .collect();
         assert_eq!(agent_card_unavailable_events.len(), 2, "one audit event per synthesized element");
         for ev in agent_card_unavailable_events {
             assert_eq!(ev.level, "WARN", "failures log at WARN so OTEL exporter captures them");
-            let latency = ev
-                .fields
-                .iter()
-                .find(|(k, _)| k == "latency_ms")
-                .map(|(_, v)| v.as_str());
-            assert_eq!(latency, Some("0"), "no network call fired");
+            assert_eq!(field(ev, "latency_ms"), Some("0"), "no network call fired");
         }
     }
 
@@ -11044,7 +16397,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(
+        attach_transit_point_trust_check_list(
             &mut ctx,
             vec![
                 make_test_element_referencing_provider_did("tc-1"),
@@ -11108,7 +16461,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(
+        attach_transit_point_trust_check_list(
             &mut ctx,
             vec![make_test_element_referencing_provider_did("gated"), make_test_element("runnable")],
         );
@@ -11158,7 +16511,7 @@ mod tests {
         crate::proxy::agent_card_cache::invalidate_all();
         let state = test_outbound_state();
         let mut ctx = test_pipeline_context();
-        attach_target_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
+        attach_transit_point_trust_check_list(&mut ctx, vec![make_test_element("tc-1")]);
         ctx.target_agent_context = Some(crate::surface_context::AgentContext {
             did_verified: false,
             did_verification: None,
@@ -11286,7 +16639,7 @@ mod tests {
             "target": { "endpoint": "http://localhost:9000" },
             "transit": {
                 "points": [
-                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/mcp", "gateway_url": "https://gw.internal:9000/outgoing/surfaces/order/partner-a" }
+                    { "alias": "partner-a", "target_endpoint": "https://partner.example.com/mcp", "gateway_url": "https://gw.internal:9000/outbound/surfaces/order/partner-a" }
                 ]
             }
         }))
@@ -11436,6 +16789,7 @@ mod tests {
         transit_point: TransitPoint,
     ) -> OutboundPipelineContext {
         let mut ctx = test_pipeline_context();
+        ctx.served_surface = Arc::clone(&surface);
         ctx.surface = surface;
         ctx.virtual_channel = transit_point;
         ctx.body_bytes = Some(bytes::Bytes::from_static(
@@ -11481,6 +16835,21 @@ mod tests {
                 "inject_as": {"type": "meta", "field": DELEGATED_CREDENTIAL_FIELD}});
         }
         point
+    }
+
+    /// `surface` with caller authentication that tells a partner's users
+    /// apart: a JWT that names an audience.
+    fn telling_users_apart(
+        mut surface: crate::config::agent_surface::AgentSurface
+    ) -> crate::config::agent_surface::AgentSurface {
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{ "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] }] }))
+            .unwrap(),
+        );
+        surface
     }
 
     fn transit_surface(
@@ -11599,6 +16968,3185 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_the_transit_points_source_auth_verified_keys_delegated_credentials_by_its_identity_hash() {
+        use crate::surface_context::TransitClientVerification::{ResourceToken, SourceAuth};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: subject.to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": subject }),
+        };
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "alice-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": jwt_caller("alice").principal_hash(None), "credential_provider_id": "provider",
+                    "provider_id": "provider", "access_token": "alice-access",
+                    "refresh_token": "alice-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity, verified_by, with_transit_token: bool| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            if !with_transit_token {
+                ctx.transit_token_claims = None;
+            }
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(verified_by);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(jwt_caller("alice"), SourceAuth, false)).await, "alice-access");
+        assert_eq!(
+            injected_credential(&state, context(jwt_caller("alice"), SourceAuth, true)).await,
+            "token-caller-access",
+            "the transit token's caller keys the grant when there is one"
+        );
+
+        let mut bob = context(jwt_caller("bob"), SourceAuth, false);
+        assert!(
+            step_inject_credentials(&state, &mut bob)
+                .await
+                .is_err(),
+            "a caller without a grant of its own is not given another caller's"
+        );
+
+        let mut resource_token_caller = context(jwt_caller("alice"), ResourceToken, false);
+        let refused = step_inject_credentials(&state, &mut resource_token_caller)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+    }
+
+    /// The stores of a gateway whose vault keeps grants by binding: at-rest
+    /// encryption on (when asked), an external consent provider per tenant,
+    /// and an agent-keyed provider.
+    async fn external_grant_state(
+        directory: &std::path::Path,
+        encrypted: bool,
+    ) -> OutboundProxyState {
+        use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
+        if encrypted {
+            crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig {
+                enabled: true,
+                key_env_var: "AG_TEST_MASTER_KEY".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let providers = Arc::new(
+            FileSystemCredentialProviderStore::new(directory.join("providers"))
+                .await
+                .unwrap(),
+        );
+        for (id, tenant, issuer, resource) in [
+            ("vendor", None, Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-tenant-b", Some("tenant-b"), Some("https://vendor.example"), Some("https://vendor.example/mcp")),
+            ("vendor-private", None, Some("https://10.0.0.5"), Some("https://10.0.0.5/mcp")),
+            ("vendor-elsewhere", None, Some("https://auth.vendor.example"), Some("https://vendor.example/mcp")),
+            ("agent-keyed", None, None, None),
+        ] {
+            providers
+                .create(
+                    serde_json::from_value(json!({
+                        "id": id, "tenant_id": tenant, "name": id, "provider_id": id, "issuer": issuer,
+                        "resource": resource, "default_scopes": ["read"],
+                        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut state = test_outbound_state();
+        state.credential_provider_store = Some(providers);
+        state.delegation_vault_store = Some(Arc::new(
+            crate::delegation_vault::storage::FileSystemDelegationVaultStore::new(directory.join("vault"))
+                .await
+                .unwrap(),
+        ));
+        state.secrets_store = Some(Arc::new(
+            crate::secrets::FilesystemSecretsStore::new(
+                directory
+                    .join("secrets")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap(),
+        ));
+        state.gateway_base_url = Some("https://gateway.example".into());
+        state
+    }
+
+    const VENDOR_HOP: &str = "vendor-transit-point";
+
+    /// A Transit Point to a vendor, with no managed identity, whose binding
+    /// asks for external consent.
+    fn vendor_transit_point(
+        id: &str,
+        provider: &str,
+        subject: &str,
+    ) -> serde_json::Value {
+        json!({"id": id, "alias": format!("{id}-alias"), "target_endpoint": "https://vendor.example/mcp",
+            "require_transit_token": true,
+            "transit_credentials": {"credential_provider_id": provider, "consent_mode": "external",
+                "subject": subject, "scopes": ["read"]}})
+    }
+
+    fn external_grant_context(
+        surface: &crate::config::agent_surface::AgentSurface,
+        hop: &str,
+        caller_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
+        external_grant_variant_context(surface, None, hop, caller_hash)
+    }
+
+    fn external_grant_variant_context(
+        surface: &crate::config::agent_surface::AgentSurface,
+        variant: Option<&str>,
+        hop: &str,
+        caller_hash: Option<&str>,
+    ) -> OutboundPipelineContext {
+        let resolved = Arc::new(
+            surface
+                .resolve_variant(variant)
+                .unwrap(),
+        );
+        let point = resolved
+            .transit_points()
+            .iter()
+            .find(|point| point.id == hop)
+            .cloned()
+            .unwrap();
+        let mut ctx = legacy_delegation_context(resolved, point);
+        ctx.served_surface = Arc::new(surface.clone());
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        ctx.transit_token_claims = caller_hash.map(|hash| {
+            serde_json::from_value(json!({"iss": "https://gateway.example", "surface_id": "transit-fabric",
+                "iat": 0, "exp": u64::MAX, "jti": "jti", "user_identity_hash": hash}))
+            .unwrap()
+        });
+        ctx
+    }
+
+    async fn store_grant(
+        state: &OutboundProxyState,
+        key: crate::delegation_vault::grants::GrantKey,
+        access_token: &str,
+        expires_in_secs: i64,
+    ) {
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, access_token);
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(expires_in_secs));
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(grant)
+            .await
+            .unwrap();
+    }
+
+    fn bearer(ctx: &OutboundPipelineContext) -> Option<String> {
+        ctx.delegated_credential_headers
+            .get(axum::http::header::AUTHORIZATION)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+    }
+
+    /// A grant is released only while its provider's resource is permitted for
+    /// its issuer: a resource off the issuer's host needs the operator's entry
+    /// in gateway.json, and once the entry is removed the grant is refused and
+    /// the log says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_resource_is_permitted_for_its_issuer() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let surface =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-elsewhere", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-elsewhere"), "access", 3600)
+            .await;
+        let caller = "a".repeat(64);
+
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("resource_not_permitted_for_issuer"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_resource_origins =
+            std::collections::HashMap::from([(
+                "https://auth.vendor.example".to_string(),
+                vec!["https://vendor.example".to_string()],
+            )]);
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("the operator's entry permits the resource");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+    }
+
+    /// With `external_consent_issuers` set, a grant is released only while its
+    /// provider's issuer is listed; once it is not, the grant is refused and
+    /// the log says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_providers_issuer_is_permitted() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "access", 3600).await;
+        let caller = "a".repeat(64);
+        Arc::make_mut(&mut state.network_config).external_consent_issuers =
+            Some(std::collections::HashMap::from([("https://other.example".to_string(), Vec::new())]));
+
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("issuer_not_permitted"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_issuers =
+            Some(std::collections::HashMap::from([("https://vendor.example".to_string(), Vec::new())]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("the listed issuer is permitted");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+    }
+
+    /// A gateway whose provider `fixture-vendor` is served by test fixtures:
+    /// its token and revocation endpoints on `authorization_server`, its
+    /// resource on `vendor`, both on the test allow-list.
+    async fn fixture_grant_state(
+        directory: &std::path::Path,
+        authorization_server: &crate::delegation_vault::revocation::tests::RecordingServer,
+        vendor: &crate::delegation_vault::revocation::tests::RecordingServer,
+    ) -> OutboundProxyState {
+        let mut state = external_grant_state(directory, true).await;
+        let issuer = authorization_server.origin();
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "fixture-vendor", "name": "Fixture vendor", "provider_id": "fixture-vendor",
+                    "provider_type": "oauth2_authorization_code", "issuer": issuer,
+                    "authorization_endpoint": format!("{issuer}/authorize"),
+                    "token_endpoint": format!("{issuer}/token"), "revocation_endpoint": format!("{issuer}/revoke"),
+                    "token_endpoint_auth_method": "none", "client_id": "fixture-client",
+                    "callback_url": "https://boris.example/cb", "resource": format!("{}/mcp", vendor.origin()),
+                    "default_scopes": ["read"],
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state.egress_allowlist = Some(format!("{issuer},{}", vendor.origin()));
+        state
+    }
+
+    /// An MCP Transit Point to the fixture vendor whose binding asks for
+    /// external consent, for `subject`.
+    fn fixture_surface(
+        vendor: &crate::delegation_vault::revocation::tests::RecordingServer,
+        subject: &str,
+        protocol: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", subject);
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["protocol"] = json!(protocol);
+        transit_surface(json!([point]), json!([]))
+    }
+
+    /// Release, forward and answer a refused grant, as the pipeline does.
+    async fn send_with_grant(
+        state: &OutboundProxyState,
+        ctx: &mut OutboundPipelineContext,
+    ) -> Result<reqwest::StatusCode, OutboundPipelineError> {
+        step_inject_credentials(state, ctx).await?;
+        request_uncompressed_mcp_response(ctx);
+        let upstream = step_forward_request(state, ctx).await?;
+        let upstream = step_answer_a_refused_grant(state, ctx, upstream).await?;
+        refuse_a_compressed_mcp_answer(ctx, &upstream)?;
+        match upstream {
+            UpstreamResponse::Http(response) => Ok(response.status()),
+            _ => panic!("an HTTP forward answers over HTTP"),
+        }
+    }
+
+    /// An MCP Transit Point's target that compresses its answer although the
+    /// gateway asked for none is refused: tool gating and the response checks
+    /// read the body as it is sent, and would read none of it. Other Transit
+    /// Points pass a compressed answer on, as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_compressed_answer_on_an_mcp_transit_point_is_refused() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        for (protocol, encoding, refused) in
+            [("mcp", "gzip", true), ("mcp", "identity", false), ("http", "gzip", false), ("mcp", "br, gzip", true)]
+        {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor =
+                RecordingServer::start_answering(vec![Answer::status(200).with_header("Content-Encoding", encoding)])
+                    .await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            store_grant(&state, key.clone(), "access", 3600).await;
+            let surface = fixture_surface(&vendor, "owner", protocol);
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            let sent = send_with_grant(&state, &mut ctx).await;
+            assert_eq!(
+                matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)),
+                refused,
+                "{protocol} {encoding}: {sent:?}"
+            );
+        }
+    }
+
+    fn vendor_bearers(vendor: &crate::delegation_vault::revocation::tests::RecordingServer) -> Vec<String> {
+        vendor
+            .requests()
+            .iter()
+            .filter_map(|(head, _)| {
+                head.lines()
+                    .find_map(|line| line.strip_prefix("authorization: "))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn refresh_answer(access_token: &str) -> crate::delegation_vault::revocation::tests::Answer {
+        crate::delegation_vault::revocation::tests::Answer::json(
+            200,
+            json!({"access_token": access_token, "token_type": "Bearer", "expires_in": 3600,
+                "refresh_token": format!("{access_token}-refresh"), "scope": "read"}),
+        )
+    }
+
+    /// A grant due a refresh is refreshed before it is sent, single-flight,
+    /// with its refresh token, its scopes and the provider's resource; the
+    /// vendor receives the new token, and the rotated tokens are kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_due_a_refresh_is_refreshed_before_it_is_sent() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![refresh_answer("refreshed")]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key.clone(), "stale", 30).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        let (_, body) = authorization_server.requests()[0].clone();
+        let sent: std::collections::HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(sent["grant_type"], "refresh_token");
+        assert_eq!(sent["refresh_token"], "stale-refresh");
+        assert_eq!(sent["scope"], "read");
+        assert_eq!(sent["resource"], format!("{}/mcp", vendor.origin()));
+        let kept = state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .grant(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.access_token, "refreshed");
+        assert_eq!(kept.refresh_token.as_deref(), Some("refreshed-refresh"));
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            authorization_server
+                .requests()
+                .len(),
+            1,
+            "a fresh grant is not refreshed again"
+        );
+    }
+
+    /// A refresh token the authorization server refuses with `invalid_grant`
+    /// deletes the grant, and the call is refused `connect_required`; a refresh
+    /// that fails otherwise keeps the grant, answers `connector_unavailable`
+    /// once the access token has expired, and is not tried again until its
+    /// wait is over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_refresh_needs_a_connect_and_a_failed_one_waits() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let refusing =
+            RecordingServer::start_answering(vec![Answer::json(400, json!({"error": "invalid_grant"}))]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &refusing, &vendor).await;
+        let caller = "c".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "expired", -60).await;
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&GrantRefusal::ConnectRequired {
+                subject: crate::config::agent_surface::GrantSubject::Caller,
+                hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
+            })
+        );
+        assert!(
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .grant(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(vendor.requests().is_empty());
+
+        let unavailable = RecordingServer::start_answering(vec![Answer::status(503)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &unavailable, &vendor).await;
+        store_grant(&state, key.clone(), "expired", -60).await;
+        for _ in 0..2 {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let refused = send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable));
+        }
+        assert_eq!(unavailable.requests().len(), 1, "the second call waits out the backoff");
+        let kept = state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .grant(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.state(), "refresh_failed");
+        assert!(vendor.requests().is_empty());
+    }
+
+    /// A vendor's `401` gets one refresh and one retry with the new token. A
+    /// second `401`, after a refresh the authorization server granted, refuses
+    /// this request, not the connection, which any caller of an owner binding
+    /// could otherwise end: the grant is kept, nothing is revoked, and the
+    /// call answers `connector_unavailable`. The vendor's challenge never
+    /// reaches the agent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendors_401_is_refreshed_and_retried_once() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = |answer: Answer| answer.with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        let authorization_server = RecordingServer::start_answering(vec![
+            refresh_answer("second"),
+            refresh_answer("third"),
+            Answer::status(200),
+        ])
+        .await;
+        let vendor = RecordingServer::start_answering(vec![challenge(Answer::status(401)), Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer first", "Bearer second"]);
+
+        let rejecting = RecordingServer::start_answering(vec![challenge(Answer::status(401))]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &rejecting).await;
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = fixture_surface(&rejecting, "owner", "http");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable));
+        assert_eq!(vendor_bearers(&rejecting), ["Bearer first", "Bearer third"]);
+        assert_eq!(
+            stored_grant(&state, &key)
+                .await
+                .expect("the refreshed grant is kept")
+                .access_token,
+            "third"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !authorization_server
+                .revoked_tokens()
+                .iter()
+                .any(|token| token.starts_with("third")),
+            "and never revoked: {:?}",
+            authorization_server.revoked_tokens()
+        );
+
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none()
+        );
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/problem+json");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["reason"], "connector_unavailable");
+        assert_eq!(body["status"], 503);
+    }
+
+    /// A refresh that would widen the grant's scopes is not kept: the grant is
+    /// never refreshed again, the call answers `connect_required` once the
+    /// token has expired, and the wider tokens are revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_that_widens_the_scopes_is_refused_and_its_tokens_revoked() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![
+            Answer::json(
+                200,
+                json!({"access_token": "wide", "token_type": "Bearer", "refresh_token": "wide-refresh",
+                    "scope": "read admin"}),
+            ),
+            Answer::status(200),
+        ])
+        .await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key.clone(), "expired", -60).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&GrantRefusal::ConnectRequired {
+                subject: crate::config::agent_surface::GrantSubject::Owner,
+                hint: None,
+            })
+        );
+        assert!(
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .refresh_abandoned()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !authorization_server
+                .revoked_tokens()
+                .contains(&"wide-refresh".to_string())
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the wider tokens are revoked");
+        assert!(vendor.requests().is_empty());
+    }
+
+    /// Wait, up to five seconds, until `condition` holds.
+    async fn eventually(condition: impl Fn() -> bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the condition holds within five seconds");
+    }
+
+    fn stored_grant(
+        state: &OutboundProxyState,
+        key: &crate::delegation_vault::grants::GrantKey,
+    ) -> impl std::future::Future<Output = Option<crate::delegation_vault::grants::DelegatedGrant>> {
+        let vault = state
+            .delegation_vault_store
+            .clone()
+            .unwrap();
+        let key = key.clone();
+        async move {
+            vault
+                .grant(&key)
+                .await
+                .unwrap()
+        }
+    }
+
+    /// A person who reconnects while a refresh of their old grant is in
+    /// flight keeps the new connection, whatever the authorization server
+    /// answers that refresh: `invalid_grant` about the old grant deletes
+    /// nothing, and the call uses the new grant. A refresh that obtained
+    /// tokens has them revoked, since the grant they were for is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_during_a_refresh_keeps_the_new_connection() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        for answer in [Answer::json(400, json!({"error": "invalid_grant"})), refresh_answer("refreshed")] {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let refused = answer.status == 400;
+            let authorization_server =
+                RecordingServer::start_answering(vec![answer.held(&gate), Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+            store_grant(&state, key.clone(), "first", -60).await;
+            let surface = fixture_surface(&vendor, "owner", "mcp");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            let (sent, ()) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+                eventually(|| {
+                    authorization_server
+                        .requests()
+                        .len()
+                        == 1
+                })
+                .await;
+                // The person reconnects, as a connect's completion stores a grant.
+                store_grant(&state, key.clone(), "second", 3600).await;
+                gate.add_permits(1);
+            });
+            assert_eq!(sent.unwrap(), reqwest::StatusCode::OK, "refused: {refused}");
+            assert_eq!(vendor_bearers(&vendor), ["Bearer second"], "refused: {refused}");
+            assert_eq!(
+                stored_grant(&state, &key)
+                    .await
+                    .unwrap()
+                    .access_token,
+                "second",
+                "refused: {refused}"
+            );
+            if !refused {
+                eventually(|| {
+                    let revoked = authorization_server.revoked_tokens();
+                    revoked.contains(&"refreshed".to_string()) && revoked.contains(&"refreshed-refresh".to_string())
+                })
+                .await;
+            }
+            assert!(
+                !authorization_server
+                    .revoked_tokens()
+                    .iter()
+                    .any(|token| token.starts_with("second")),
+                "the new connection is never revoked"
+            );
+        }
+    }
+
+    /// The vendor refusing an old grant never removes a grant the person
+    /// reconnected meanwhile: when the refresh after a `401` is refused while
+    /// a reconnect lands, the call is retried with the new grant; when the
+    /// retry is refused again while a reconnect lands, the new grant is kept
+    /// and the call answers `connector_unavailable`, so the agent tries again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendor_refusal_never_removes_a_grant_reconnected_meanwhile() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = |answer: Answer| answer.with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server = RecordingServer::start_answering(vec![
+            Answer::json(400, json!({"error": "invalid_grant"})).held(&gate),
+            Answer::status(200),
+        ])
+        .await;
+        let vendor = RecordingServer::start_answering(vec![challenge(Answer::status(401)), Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let (sent, ()) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+            eventually(|| {
+                authorization_server
+                    .requests()
+                    .len()
+                    == 1
+            })
+            .await;
+            store_grant(&state, key.clone(), "second", 3600).await;
+            gate.add_permits(1);
+        });
+        assert_eq!(sent.unwrap(), reqwest::StatusCode::OK);
+        assert_eq!(vendor_bearers(&vendor), ["Bearer first", "Bearer second"]);
+        assert_eq!(
+            stored_grant(&state, &key)
+                .await
+                .unwrap()
+                .access_token,
+            "second"
+        );
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server =
+            RecordingServer::start_answering(vec![refresh_answer("refreshed"), Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            challenge(Answer::status(401)),
+            challenge(Answer::status(401)).held(&gate),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let (sent, ()) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+            eventually(|| vendor.requests().len() == 2).await;
+            store_grant(&state, key.clone(), "third", 3600).await;
+            gate.add_permits(1);
+        });
+        assert_eq!(grant_refusal(&sent.unwrap_err()), Some(&GrantRefusal::ConnectorUnavailable));
+        assert_eq!(vendor_bearers(&vendor), ["Bearer first", "Bearer refreshed"]);
+        assert_eq!(
+            stored_grant(&state, &key)
+                .await
+                .unwrap()
+                .access_token,
+            "third",
+            "the reconnected grant is kept"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !authorization_server
+                .revoked_tokens()
+                .iter()
+                .any(|token| token.starts_with("third")),
+            "and never revoked"
+        );
+    }
+
+    /// A refresh asks again for the scopes the person consented to, not the
+    /// vendor's spelling of them, and an Entra answer that qualifies Graph
+    /// scopes and adds the OpenID Connect ones and `User.Read` is kept for a
+    /// provider that compares scopes as Microsoft's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_asks_for_the_consented_scopes_and_reads_the_answer_as_its_vendor_writes_it() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let entra = Answer::json(
+            200,
+            json!({"token_type": "Bearer",
+                "scope": "https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/User.Read openid profile email",
+                "expires_in": 4247, "ext_expires_in": 4247, "access_token": "refreshed",
+                "refresh_token": "refreshed-refresh"}),
+        );
+        let authorization_server = RecordingServer::start_answering(vec![entra]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let providers = state
+            .credential_provider_store
+            .as_ref()
+            .unwrap();
+        let mut provider = providers
+            .get("fixture-vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.scope_comparison = crate::credential_providers::scope_comparison::ScopeComparison::Microsoft;
+        providers
+            .update(provider)
+            .await
+            .unwrap();
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "stale");
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+        grant.requested_scopes = Some(vec!["Mail.Read".into()]);
+        grant.scopes = vec!["https://graph.microsoft.com/Mail.Read".into(), "openid".into()];
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(grant)
+            .await
+            .unwrap();
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", "owner");
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["transit_credentials"]["scopes"] = json!(["Mail.Read"]);
+        let surface = transit_surface(json!([point]), json!([]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        let (_, body) = authorization_server.requests()[0].clone();
+        let sent: std::collections::HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(sent["scope"], "Mail.Read", "the consented scopes, as the connect asked for them");
+        let kept = stored_grant(&state, &key)
+            .await
+            .unwrap();
+        assert_eq!(kept.access_token, "refreshed");
+        assert_eq!(kept.requested_scopes, Some(vec!["Mail.Read".to_string()]));
+        assert_eq!(kept.scopes.len(), 5, "the vendor's own words are kept: {:?}", kept.scopes);
+    }
+
+    /// A grant the person consented to more narrowly than its connect asked
+    /// is refreshed for the scopes it holds only, never for ones it was not
+    /// granted (RFC 6749 section 6), and an answer that names no scope keeps
+    /// the scopes the grant held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_narrowed_grant_is_refreshed_for_the_scopes_it_holds() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let answer = Answer::json(
+            200,
+            json!({"token_type": "Bearer", "expires_in": 3600, "access_token": "refreshed",
+                "refresh_token": "refreshed-refresh"}),
+        );
+        let authorization_server = RecordingServer::start_answering(vec![answer]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "stale");
+        grant.expires_at = Some(chrono::Utc::now() + chrono::Duration::seconds(30));
+        grant.requested_scopes = Some(vec!["read".into(), "write".into()]);
+        grant.scopes = vec!["read".into()];
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(grant)
+            .await
+            .unwrap();
+        let mut point = vendor_transit_point(VENDOR_HOP, "fixture-vendor", "owner");
+        point["target_endpoint"] = json!(format!("{}/mcp", vendor.origin()));
+        point["transit_credentials"]["scopes"] = json!(["read", "write"]);
+        let surface = transit_surface(json!([point]), json!([]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        let (_, body) = authorization_server.requests()[0].clone();
+        let sent: std::collections::HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(sent["scope"], "read", "only the scope the grant holds");
+        let kept = stored_grant(&state, &key)
+            .await
+            .unwrap();
+        assert_eq!(kept.access_token, "refreshed");
+        assert_eq!(kept.scopes, ["read"], "an answer naming no scope keeps the grant's");
+        assert_eq!(kept.requested_scopes, Some(vec!["read".to_string(), "write".to_string()]));
+    }
+
+    /// A grant asked for beyond its binding's scopes as saved now, as one
+    /// left by a binding later narrowed, is never released: the call answers
+    /// `connect_required`, since a new connect asks within the binding. A
+    /// grant within them is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_beyond_its_bindings_scopes_is_not_released() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor");
+        let caller = "a".repeat(64);
+        for (scopes, released) in [(vec!["read", "write"], false), (vec!["read"], true)] {
+            let mut grant = crate::delegation_vault::grants::tests::grant(&key, "access");
+            grant.requested_scopes = Some(
+                scopes
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+            );
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .store_grant(grant)
+                .await
+                .unwrap();
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let outcome = step_inject_credentials(&state, &mut ctx).await;
+            if released {
+                outcome.expect("a grant within the binding's scopes is released");
+                assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+            } else {
+                assert_eq!(
+                    grant_refusal(&outcome.unwrap_err()),
+                    Some(&GrantRefusal::ConnectRequired {
+                        subject: crate::config::agent_surface::GrantSubject::Owner,
+                        hint: None,
+                    }),
+                    "{scopes:?}"
+                );
+                assert_eq!(bearer(&ctx), None);
+            }
+        }
+    }
+
+    /// A vault that counts the grants read by key, so a test can tell how
+    /// often a call waiting for a refresh reads and decrypts its grant.
+    struct CountingVault {
+        inner: Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::delegation_vault::storage::DelegationVaultStorage for CountingVault {
+        async fn store(
+            &self,
+            token: crate::delegation_vault::DelegationToken,
+        ) -> anyhow::Result<crate::delegation_vault::DelegationToken> {
+            self.inner.store(token).await
+        }
+
+        async fn get(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::delegation_vault::DelegationToken>> {
+            self.inner.get(id).await
+        }
+
+        async fn lookup(
+            &self,
+            agent_did: &str,
+            user_identity_hash: &str,
+            provider_id: &str,
+        ) -> anyhow::Result<crate::delegation_vault::VaultLookupResult> {
+            self.inner
+                .lookup(agent_did, user_identity_hash, provider_id)
+                .await
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::delegation_vault::DelegationToken>> {
+            self.inner.list_all().await
+        }
+
+        async fn delete(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<bool> {
+            self.inner.delete(id).await
+        }
+
+        async fn delete_by_user(
+            &self,
+            user_identity_hash: &str,
+        ) -> anyhow::Result<usize> {
+            self.inner
+                .delete_by_user(user_identity_hash)
+                .await
+        }
+
+        async fn update(
+            &self,
+            token: crate::delegation_vault::DelegationToken,
+        ) -> anyhow::Result<crate::delegation_vault::DelegationToken> {
+            self.inner.update(token).await
+        }
+
+        async fn mark_used(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner.mark_used(id).await
+        }
+
+        async fn grant(
+            &self,
+            key: &crate::delegation_vault::grants::GrantKey,
+        ) -> anyhow::Result<Option<crate::delegation_vault::grants::DelegatedGrant>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.grant(key).await
+        }
+
+        async fn store_grant(
+            &self,
+            grant: crate::delegation_vault::grants::DelegatedGrant,
+        ) -> anyhow::Result<crate::delegation_vault::grants::StoredGrant> {
+            self.inner
+                .store_grant(grant)
+                .await
+        }
+
+        async fn mark_grant_used(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .mark_grant_used(id)
+                .await
+        }
+
+        async fn claim_grant_refresh(
+            &self,
+            grant: &crate::delegation_vault::grants::DelegatedGrant,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::delegation_vault::storage::GrantRefreshClaim, crate::delegation_vault::storage::RefreshError>
+        {
+            self.inner
+                .claim_grant_refresh(grant, now)
+                .await
+        }
+
+        async fn complete_grant_refresh(
+            &self,
+            claim: crate::delegation_vault::storage::GrantRefreshClaim,
+            tokens: crate::delegation_vault::grants::ObtainedTokens,
+            now: chrono::DateTime<chrono::Utc>,
+        ) -> Result<crate::delegation_vault::grants::DelegatedGrant, crate::delegation_vault::storage::RefreshError>
+        {
+            self.inner
+                .complete_grant_refresh(claim, tokens, now)
+                .await
+        }
+    }
+
+    /// A call that needs a refresh another call is running waits for that
+    /// refresh to be written, and is woken by it, rather than reading and
+    /// decrypting the grant ten times a second while the authorization server
+    /// takes its time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_waiting_for_a_refresh_is_woken_by_it_rather_than_polling() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server =
+            RecordingServer::start_answering(vec![refresh_answer("refreshed").held(&gate)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        // A caller no other test uses: a refresh of the same grant id in a
+        // test running alongside would wake this one's waiting call.
+        let caller = "e".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "first", -60).await;
+        let counting = Arc::new(CountingVault {
+            inner: state
+                .delegation_vault_store
+                .clone()
+                .unwrap(),
+            reads: Default::default(),
+        });
+        state.delegation_vault_store = Some(counting.clone());
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut first = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let mut second = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let (one, two, reads_while_held) =
+            tokio::join!(send_with_grant(&state, &mut first), send_with_grant(&state, &mut second), async {
+                eventually(|| {
+                    authorization_server
+                        .requests()
+                        .len()
+                        == 1
+                })
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let before = counting
+                    .reads
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let reads = counting
+                    .reads
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    - before;
+                gate.add_permits(1);
+                reads
+            });
+        assert_eq!(one.unwrap(), reqwest::StatusCode::OK);
+        assert_eq!(two.unwrap(), reqwest::StatusCode::OK);
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed", "Bearer refreshed"]);
+        assert!(reads_while_held <= 4, "the waiting call read its grant {reads_while_held} times in 1.5 s");
+        assert_eq!(
+            authorization_server
+                .requests()
+                .len(),
+            1,
+            "one refresh"
+        );
+    }
+
+    /// Only the vendor rejecting the token removes a grant: a `401` with no
+    /// `Bearer` challenge, as a front proxy or a firewall answers, or with one
+    /// that names no error, which RFC 6750 keeps for a request that carried
+    /// no token, is not refreshed and keeps the grant; and a refresh after a
+    /// `401` that rejects the token (`invalid_token`) but fails for a local
+    /// reason, the client refused (`invalid_client`) or its secret not
+    /// resolved, keeps the grant with a wait before the next refresh. Each
+    /// answers `connector_unavailable`, and nothing is revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_vendor_rejecting_the_token_removes_a_grant() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = |answer: Answer| answer.with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        for (case, vendor_answer, token_answer, secret_missing, refreshed) in [
+            ("a 401 without a Bearer challenge", Answer::status(401), refresh_answer("unused"), false, false),
+            (
+                "a Bearer challenge that names no error",
+                Answer::status(401).with_header("WWW-Authenticate", r#"Bearer realm="vendor""#),
+                refresh_answer("unused"),
+                false,
+                false,
+            ),
+            (
+                "invalid_client",
+                challenge(Answer::status(401)),
+                Answer::json(401, json!({"error": "invalid_client"})),
+                false,
+                true,
+            ),
+            ("the client's secret unresolved", challenge(Answer::status(401)), refresh_answer("unused"), true, true),
+        ] {
+            let authorization_server = RecordingServer::start_answering(vec![token_answer]).await;
+            let vendor = RecordingServer::start_answering(vec![vendor_answer, Answer::status(200)]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            if secret_missing {
+                let providers = state
+                    .credential_provider_store
+                    .as_ref()
+                    .unwrap();
+                let mut provider = providers
+                    .get("fixture-vendor")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                provider.token_endpoint_auth_method =
+                    Some(crate::credential_providers::TokenEndpointAuthMethod::ClientSecretPost);
+                provider.client_secret_secret_ref = Some("missing-secret".into());
+                providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+            }
+            store_grant(&state, key.clone(), "first", 3600).await;
+            let surface = fixture_surface(&vendor, "owner", "mcp");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            let refused = send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "{case}");
+            assert_eq!(vendor_bearers(&vendor), ["Bearer first"], "{case}: not retried");
+            let kept = stored_grant(&state, &key)
+                .await
+                .unwrap_or_else(|| panic!("{case}: the grant is kept"));
+            assert_eq!(kept.access_token, "first", "{case}");
+            assert_eq!(kept.state() == "refresh_failed", refreshed, "{case}: a failed refresh waits");
+            assert_eq!(
+                authorization_server
+                    .requests()
+                    .iter()
+                    .any(|(head, _)| head.starts_with("POST /token ")),
+                refreshed && !secret_missing,
+                "{case}"
+            );
+            assert!(
+                authorization_server
+                    .revoked_tokens()
+                    .is_empty(),
+                "{case}: nothing is revoked"
+            );
+        }
+    }
+
+    /// Tokens a test refresh obtains.
+    fn obtained(access_token: &str) -> crate::delegation_vault::grants::ObtainedTokens {
+        crate::delegation_vault::grants::ObtainedTokens {
+            access_token: access_token.to_string(),
+            refresh_token: Some(format!("{access_token}-refresh")),
+            scopes: vec!["read".to_string()],
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        }
+    }
+
+    /// Wait, up to five seconds, until the grant of `key` holds `access_token`.
+    async fn eventually_stored(
+        state: &OutboundProxyState,
+        key: &crate::delegation_vault::grants::GrantKey,
+        access_token: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while stored_grant(state, key)
+                .await
+                .is_none_or(|grant| grant.access_token != access_token)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the grant holds {access_token} within five seconds"));
+    }
+
+    /// A refresh another call claimed is waited for, never taken for a dead
+    /// one, whatever that call's clock read when it claimed it: another
+    /// node's clock ahead of this one's, or a call on this node that read its
+    /// clock later but won the vault's lock first. The grant is neither
+    /// abandoned, nor removed or revoked, and the call uses the refreshed
+    /// token, whether its grant had expired or the vendor had just refused
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refresh_another_call_claimed_is_waited_for_whatever_its_clock() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let challenge = |answer: Answer| answer.with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#);
+        for (case, caller, expires_in, vendor_answers) in [
+            ("an expired grant", "1".repeat(64), -60, vec![Answer::status(200)]),
+            (
+                "a grant the vendor just refused",
+                "2".repeat(64),
+                3600,
+                vec![challenge(Answer::status(401)), Answer::status(200)],
+            ),
+        ] {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vendor_answers).await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+            store_grant(&state, key.clone(), "first", expires_in).await;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            let stored = stored_grant(&state, &key)
+                .await
+                .unwrap();
+            let claim = vault
+                .claim_grant_refresh(&stored, chrono::Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap();
+            let surface = fixture_surface(&vendor, "caller", "mcp");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let (sent, completed) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                vault
+                    .complete_grant_refresh(claim, obtained("refreshed"), chrono::Utc::now())
+                    .await
+            });
+            assert!(completed.is_ok(), "{case}: the other call's refresh is still its own");
+            assert_eq!(sent.unwrap(), reqwest::StatusCode::OK, "{case}");
+            assert_eq!(
+                vendor_bearers(&vendor)
+                    .last()
+                    .map(String::as_str),
+                Some("Bearer refreshed"),
+                "{case}"
+            );
+            let kept = stored_grant(&state, &key)
+                .await
+                .unwrap_or_else(|| panic!("{case}: the grant is kept"));
+            assert_eq!(kept.access_token, "refreshed", "{case}");
+            assert!(!kept.refresh_abandoned(), "{case}");
+            assert!(
+                authorization_server
+                    .requests()
+                    .is_empty(),
+                "{case}: nothing is refreshed twice or revoked"
+            );
+        }
+    }
+
+    /// A refresh whose tokens were written is used, and its tokens kept, even
+    /// when its claim cannot be cleared afterwards, as when the vault's disk
+    /// refuses the delete: the tokens just written are never revoked.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_written_refresh_is_used_when_its_claim_cannot_be_cleared() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        use std::os::unix::fs::PermissionsExt as _;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server =
+            RecordingServer::start_answering(vec![refresh_answer("refreshed").held(&gate), Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let caller = "3".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "first", -60).await;
+        let claims = directory
+            .path()
+            .join("vault")
+            .join(crate::delegation_vault::storage::GRANT_REFRESH_CLAIMS_DIRECTORY);
+        std::fs::create_dir_all(&claims).unwrap();
+        let read_only = || std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = || std::fs::set_permissions(&claims, std::fs::Permissions::from_mode(0o755)).unwrap();
+        read_only();
+        let as_root = std::fs::write(claims.join("probe"), b"").is_ok();
+        writable();
+        if as_root {
+            // Running as root: no delete is refused, so there is nothing to show.
+            return;
+        }
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let (sent, ()) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+            eventually(|| {
+                authorization_server
+                    .requests()
+                    .len()
+                    == 1
+            })
+            .await;
+            read_only();
+            gate.add_permits(1);
+        });
+        writable();
+        assert_eq!(sent.unwrap(), reqwest::StatusCode::OK);
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        assert_eq!(
+            stored_grant(&state, &key)
+                .await
+                .unwrap()
+                .access_token,
+            "refreshed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            authorization_server
+                .revoked_tokens()
+                .is_empty(),
+            "the tokens written are never revoked: {:?}",
+            authorization_server.revoked_tokens()
+        );
+    }
+
+    /// When a refresh's claim was taken over and the vault cannot read the
+    /// grant stored now, the refresh token the refresh was answered with is
+    /// not revoked: an authorization server that does not rotate refresh
+    /// tokens answers the grant's own, which revoking would end. The new
+    /// access token, which no grant holds, is revoked.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_token_the_grant_may_still_hold_is_never_revoked() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        use std::os::unix::fs::PermissionsExt as _;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let not_rotated = Answer::json(
+            200,
+            json!({"access_token": "refreshed", "token_type": "Bearer", "expires_in": 3600,
+                "refresh_token": "first-refresh", "scope": "read"}),
+        );
+        let authorization_server =
+            RecordingServer::start_answering(vec![not_rotated.held(&gate), Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let caller = "4".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "first", -60).await;
+        let file = directory
+            .path()
+            .join("vault/delegated_grants")
+            .join(format!("{}.json.enc", key.record_id()));
+        let vault = state
+            .delegation_vault_store
+            .clone()
+            .unwrap();
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let (sent, as_root) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+            eventually(|| {
+                authorization_server
+                    .requests()
+                    .len()
+                    == 1
+            })
+            .await;
+            // Another call abandons the grant, which ends this refresh's
+            // claim, and the vault then cannot read the grant.
+            let stored = vault
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            vault
+                .abandon_grant_refresh(&stored, chrono::Utc::now())
+                .await
+                .unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let as_root = std::fs::read(&file).is_ok();
+            gate.add_permits(1);
+            as_root
+        });
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if as_root {
+            // Running as root: no read fails, so there is nothing to show.
+            return;
+        }
+        assert!(sent.is_err(), "the grant cannot be read");
+        eventually(|| {
+            authorization_server
+                .revoked_tokens()
+                .contains(&"refreshed".to_string())
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(authorization_server.revoked_tokens(), ["refreshed"]);
+    }
+
+    /// A call dropped while its refresh waits for the authorization server,
+    /// as when its client gives up, does not take the refresh with it: the
+    /// refresh runs on and its tokens are written, so the claim is never left
+    /// behind to abandon the grant, and the next call uses them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_call_leaves_no_refresh_half_done() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server =
+            RecordingServer::start_answering(vec![refresh_answer("refreshed").held(&gate)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let caller = "5".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "first", -60).await;
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let call = tokio::spawn({
+            let state = state.clone();
+            let surface = surface.clone();
+            let caller = caller.clone();
+            async move {
+                let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+                send_with_grant(&state, &mut ctx)
+                    .await
+                    .is_ok()
+            }
+        });
+        eventually(|| {
+            authorization_server
+                .requests()
+                .len()
+                == 1
+        })
+        .await;
+        call.abort();
+        assert!(
+            call.await
+                .unwrap_err()
+                .is_cancelled()
+        );
+        gate.add_permits(1);
+        eventually_stored(&state, &key, "refreshed").await;
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(vendor_bearers(&vendor), ["Bearer refreshed"]);
+        assert_eq!(
+            authorization_server
+                .requests()
+                .len(),
+            1,
+            "one refresh"
+        );
+    }
+
+    /// A refresh that would widen the grant's scopes, answered after the
+    /// person connected again, leaves the call to the new connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_widened_refresh_answered_after_a_reconnect_uses_the_new_connection() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let authorization_server = RecordingServer::start_answering(vec![
+            Answer::json(
+                200,
+                json!({"access_token": "wide", "token_type": "Bearer", "refresh_token": "wide-refresh",
+                    "scope": "read admin"}),
+            )
+            .held(&gate),
+            Answer::status(200),
+        ])
+        .await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let caller = "6".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "first", -60).await;
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        let (sent, ()) = tokio::join!(send_with_grant(&state, &mut ctx), async {
+            eventually(|| {
+                authorization_server
+                    .requests()
+                    .len()
+                    == 1
+            })
+            .await;
+            store_grant(&state, key.clone(), "second", 3600).await;
+            gate.add_permits(1);
+        });
+        assert_eq!(sent.unwrap(), reqwest::StatusCode::OK);
+        assert_eq!(vendor_bearers(&vendor), ["Bearer second"]);
+        let kept = stored_grant(&state, &key)
+            .await
+            .unwrap();
+        assert_eq!(kept.access_token, "second");
+        assert!(!kept.refresh_abandoned());
+    }
+
+    /// A grant whose refresh the authorization server keeps refusing, by an
+    /// answer other than `invalid_grant`, answers `connect_required` once its
+    /// access token has expired and the refusals since its last refresh reach
+    /// gateway.json's `external_consent_refresh_refusals`: the person must
+    /// connect again. The grant is kept, and nothing revoked, until the daily
+    /// sweep removes it. A failure that says nothing of the grant, such as a
+    /// `503`, is no refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_whose_refresh_keeps_being_refused_needs_a_connect() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        async fn send(
+            state: &OutboundProxyState,
+            surface: &crate::config::agent_surface::AgentSurface,
+            caller: &str,
+        ) -> Option<GrantRefusal> {
+            let mut ctx = external_grant_context(surface, VENDOR_HOP, Some(caller));
+            grant_refusal(
+                &send_with_grant(state, &mut ctx)
+                    .await
+                    .unwrap_err(),
+            )
+            .cloned()
+        }
+        let refusing =
+            RecordingServer::start_answering(vec![Answer::json(400, json!({"error": "invalid_request"}))]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = fixture_grant_state(directory.path(), &refusing, &vendor).await;
+        Arc::make_mut(&mut state.network_config).external_consent_refresh_refusals = 2;
+        let caller = "7".repeat(64);
+        let key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
+        store_grant(&state, key.clone(), "expired", -60).await;
+        let surface = fixture_surface(&vendor, "caller", "mcp");
+        let connect = Some(GrantRefusal::ConnectRequired {
+            subject: crate::config::agent_surface::GrantSubject::Caller,
+            hint: Some(crate::delegation_vault::release::connect_hint(&caller)),
+        });
+
+        assert_eq!(send(&state, &surface, &caller).await, Some(GrantRefusal::ConnectorUnavailable), "one refusal");
+        let mut waited = stored_grant(&state, &key)
+            .await
+            .unwrap();
+        waited.refresh_retry_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store_grant(waited)
+            .await
+            .unwrap();
+        assert_eq!(send(&state, &surface, &caller).await, connect, "two refusals");
+        assert_eq!(send(&state, &surface, &caller).await, connect, "while the next refresh waits");
+        assert_eq!(refusing.requests().len(), 2, "no request but the two refreshes reached the authorization server");
+        let kept = stored_grant(&state, &key)
+            .await
+            .expect("the grant is kept");
+        assert_eq!(kept.refresh_refusals, 2);
+        assert!(vendor.requests().is_empty());
+
+        let unavailable = RecordingServer::start_answering(vec![Answer::status(503)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = fixture_grant_state(directory.path(), &unavailable, &vendor).await;
+        Arc::make_mut(&mut state.network_config).external_consent_refresh_refusals = 1;
+        store_grant(&state, key.clone(), "expired", -60).await;
+        assert_eq!(send(&state, &surface, &caller).await, Some(GrantRefusal::ConnectorUnavailable));
+        assert_eq!(
+            stored_grant(&state, &key)
+                .await
+                .unwrap()
+                .refresh_refusals,
+            0
+        );
+    }
+
+    /// A grant is released only within every binding the surface serves at
+    /// its Transit Point, as the connect and the sweep decide: a surface
+    /// stored outside the API that serves one Transit Point id in its base,
+    /// with `read`, and in a variant, with `read` and `write`, never releases
+    /// a grant asked for `write`, through either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_within_every_binding_of_its_transit_point() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let mut wider = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+        wider["transit_credentials"]["scopes"] = json!(["read", "write"]);
+        let surface = transit_surface(
+            json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]),
+            json!([{"id": "v-1", "alias": "wide", "name": "wide", "enabled": true,
+                "overrides": {"transit": {"points": [wider]}}}]),
+        );
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor");
+        let caller = "a".repeat(64);
+        for (scopes, released) in [(vec!["read", "write"], false), (vec!["read"], true)] {
+            let mut grant = crate::delegation_vault::grants::tests::grant(&key, "access");
+            grant.requested_scopes = Some(
+                scopes
+                    .iter()
+                    .map(|scope| scope.to_string())
+                    .collect(),
+            );
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .store_grant(grant)
+                .await
+                .unwrap();
+            for variant in [Some("wide"), None] {
+                let mut ctx = external_grant_variant_context(&surface, variant, VENDOR_HOP, Some(&caller));
+                let outcome = step_inject_credentials(&state, &mut ctx).await;
+                if released {
+                    outcome.unwrap_or_else(|error| panic!("{scopes:?} through {variant:?}: {error:?}"));
+                    assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+                } else {
+                    assert_eq!(
+                        grant_refusal(&outcome.unwrap_err()),
+                        Some(&GrantRefusal::ConnectRequired {
+                            subject: crate::config::agent_surface::GrantSubject::Owner,
+                            hint: None,
+                        }),
+                        "{scopes:?} through {variant:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The run-time lines of a grant by binding name the surface variant that
+    /// served the request: a failed refresh, a `2026-07-28` request, and the
+    /// removal of a grant that cannot be refreshed when the vendor rejects
+    /// its token. So do the revocations a request
+    /// starts in the background, after that removal and after a refresh that
+    /// would widen the grant's scopes: they run on a task that keeps the
+    /// request, so their audit records name it too. The runtime's worker
+    /// threads write to the same capture as the test's thread, since a task
+    /// spawned in the background may run on any of them.
+    #[test]
+    fn a_grant_by_bindings_run_time_lines_and_background_revocations_name_the_request_variant() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+
+        /// The log lines written on every thread that installed [`Self::capture`].
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Lines {
+            fn write(
+                &mut self,
+                bytes: &[u8],
+            ) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Lines {
+            fn capture(&self) -> tracing::subscriber::DefaultGuard {
+                use tracing_subscriber::layer::SubscriberExt;
+                let lines = self.clone();
+                crate::component_tests::helpers::thread_subscriber::set_thread_default(
+                    tracing_subscriber::registry().with(
+                        tracing_subscriber::fmt::layer()
+                            .event_format(crate::observability::SimpleFormat)
+                            .with_writer(move || lines.clone())
+                            .with_ansi(false),
+                    ),
+                )
+            }
+
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+            }
+
+            fn clear(&self) {
+                self.0.lock().unwrap().clear();
+            }
+        }
+
+        /// Runs `run` as a request that variant `beta` served.
+        async fn served_by_beta<T>(run: impl std::future::Future<Output = T>) -> T {
+            crate::observability::policy_audit::in_request(
+                crate::observability::policy_audit::RequestScope::fresh(),
+                async {
+                    crate::observability::policy_audit::set_request_variant("beta");
+                    run.await
+                },
+            )
+            .await
+        }
+
+        /// The lines captured once one names `message`, or after 5 s.
+        async fn written(
+            lines: &Lines,
+            message: &str,
+        ) -> String {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !lines.text().contains(message) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            lines.text()
+        }
+
+        let lines = Lines::default();
+        let on_workers = lines.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(move || std::mem::forget(on_workers.capture()))
+            .build()
+            .unwrap();
+        let _on_this_thread = lines.capture();
+        runtime.block_on(async {
+            let mut missing = Vec::new();
+            let mut expect_named = |text: &str, message: &str| {
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|line| line.contains(message))
+                    .collect();
+                if lines.is_empty() {
+                    missing.push(format!("no line `{message}` was written: {text}"));
+                }
+                missing.extend(
+                    lines
+                        .into_iter()
+                        .filter(|line| !line.contains("surface_variant=\"beta\""))
+                        .map(|line| format!("`{message}` names no variant: {line}")),
+                );
+            };
+            let caller = "a".repeat(64);
+            let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+            let revoked_line = "Revoked a delegated grant at its authorization server";
+
+            {
+                let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+                let rejecting = RecordingServer::start_answering(vec![
+                    Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#),
+                ])
+                .await;
+                let directory = tempfile::tempdir().unwrap();
+                let state = fixture_grant_state(directory.path(), &authorization_server, &rejecting).await;
+                let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&key, "first");
+                unrefreshable.refresh_token = None;
+                state
+                    .delegation_vault_store
+                    .as_ref()
+                    .unwrap()
+                    .store_grant(unrefreshable)
+                    .await
+                    .unwrap();
+                let surface = fixture_surface(&rejecting, "owner", "http");
+                lines.clear();
+                let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+                assert!(
+                    served_by_beta(send_with_grant(&state, &mut ctx))
+                        .await
+                        .is_err(),
+                    "a 401 that rejects a grant that cannot be refreshed removes it"
+                );
+                let text = written(&lines, revoked_line).await;
+                expect_named(&text, "Removed a delegated grant the vendor refused");
+                expect_named(&text, revoked_line);
+            }
+
+            {
+                let authorization_server = RecordingServer::start_answering(vec![
+                    Answer::json(
+                        200,
+                        json!({"access_token": "wide", "token_type": "Bearer", "refresh_token": "wide-refresh",
+                            "scope": "read admin"}),
+                    ),
+                    Answer::status(200),
+                ])
+                .await;
+                let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+                let directory = tempfile::tempdir().unwrap();
+                let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+                store_grant(&state, key.clone(), "expired", -60).await;
+                let surface = fixture_surface(&vendor, "owner", "mcp");
+                lines.clear();
+                let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+                assert!(
+                    served_by_beta(send_with_grant(&state, &mut ctx))
+                        .await
+                        .is_err(),
+                    "a refresh that widens the scopes is refused"
+                );
+                expect_named(&written(&lines, revoked_line).await, revoked_line);
+            }
+
+            {
+                let unavailable = RecordingServer::start_answering(vec![Answer::status(503)]).await;
+                let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+                let directory = tempfile::tempdir().unwrap();
+                let state = fixture_grant_state(directory.path(), &unavailable, &vendor).await;
+                store_grant(&state, key.clone(), "expired", -60).await;
+                let surface = fixture_surface(&vendor, "owner", "mcp");
+                lines.clear();
+                let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+                assert!(
+                    served_by_beta(send_with_grant(&state, &mut ctx))
+                        .await
+                        .is_err(),
+                    "an expired grant whose refresh failed is refused"
+                );
+                expect_named(&lines.text(), "A delegated grant's refresh failed; it is retried after a wait");
+            }
+
+            {
+                let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+                let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+                let directory = tempfile::tempdir().unwrap();
+                let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+                store_grant(&state, key.clone(), "owner-access", 3600).await;
+                let surface = fixture_surface(&vendor, "owner", "mcp");
+                lines.clear();
+                let mut modern = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+                modern.mcp_classification = Some(crate::mcp::request_validation::McpRequestClassification::Modern(
+                    Box::new(crate::mcp::request_validation::ValidatedModernMessage {
+                        protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                        client_capabilities: None,
+                        client_info: None,
+                        method: "tools/call".into(),
+                        id: Some(json!(5)),
+                        kind: crate::mcp::request_validation::McpMessageKind::Request,
+                        params: Some(json!({"name": "echo"})),
+                    }),
+                ));
+                assert!(
+                    served_by_beta(send_with_grant(&state, &mut modern))
+                        .await
+                        .is_err(),
+                    "a 2026-07-28 request is refused"
+                );
+                expect_named(
+                    &lines.text(),
+                    "A 2026-07-28 MCP request was sent to a Transit Point with external consent",
+                );
+            }
+
+            assert!(missing.is_empty(), "{missing:#?}");
+        });
+    }
+
+    /// A body larger than the retry buffer is not sent twice: its grant is
+    /// refreshed for the next call, and this one answered
+    /// `connector_unavailable`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_body_is_not_sent_again_after_a_401() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![refresh_answer("second")]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#),
+            Answer::status(200),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+        store_grant(&state, key.clone(), "first", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "http");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        ctx.body_bytes = Some(Bytes::from(vec![b'x'; crate::delegation_vault::release::RETRY_BODY_LIMIT + 1]));
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable));
+        assert_eq!(vendor.requests().len(), 1);
+        assert_eq!(
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "second"
+        );
+    }
+
+    /// A vendor's `403` with `insufficient_scope` answers `scope_insufficient`,
+    /// naming a plain scope and nothing else of the vendor's text, as a
+    /// JSON-RPC error on an MCP Transit Point; another `403` passes through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendors_insufficient_scope_is_answered_scope_insufficient() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(500)]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::status(403).with_header(
+                "WWW-Authenticate",
+                r#"Bearer error="insufficient_scope", scope="issues:write", error_description="see https://vendor.example/x""#,
+            ),
+            Answer::status(403).with_header("WWW-Authenticate", r#"Bearer error="insufficient_scope", scope="<b>""#),
+            Answer::status(403),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "first", 3600).await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let refused = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&GrantRefusal::ScopeInsufficient {
+                scope: Some("issues:write".into())
+            })
+        );
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["error"]["data"], json!({"reason": "scope_insufficient", "scope": "issues:write"}));
+        assert!(
+            !body
+                .to_string()
+                .contains("vendor.example")
+        );
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            grant_refusal(
+                &send_with_grant(&state, &mut ctx)
+                    .await
+                    .unwrap_err()
+            ),
+            Some(&GrantRefusal::ScopeInsufficient { scope: None }),
+            "a scope that is not plain scope tokens is left out"
+        );
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        assert_eq!(
+            send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        assert!(
+            authorization_server
+                .requests()
+                .is_empty(),
+            "a 403 never refreshes"
+        );
+    }
+
+    /// A missing caller grant is refused `connect_required` with the caller's
+    /// hint, as a JSON-RPC error with the request's id on an MCP Transit Point
+    /// and a problem JSON on an `http` one; an MCP Transit Point asks its
+    /// target for an uncompressed answer; a `2026-07-28` request is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_grant_is_refused_in_the_protocols_shape() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(500)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        let caller = "c".repeat(64);
+        let hint = crate::delegation_vault::release::connect_hint(&caller);
+        assert_eq!(hint.len(), 22, "16 bytes of base64url");
+
+        let mcp = fixture_surface(&vendor, "caller", "mcp");
+        let mut ctx = external_grant_context(&mcp, VENDOR_HOP, Some(&caller));
+        let response = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[axum::http::header::CACHE_CONTROL], "no-store");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["error"]["data"], json!({"reason": "connect_required", "subject": "caller", "hint": hint}));
+
+        let http = fixture_surface(&vendor, "caller", "http");
+        let mut ctx = external_grant_context(&http, VENDOR_HOP, Some(&caller));
+        let response = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "application/problem+json");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["reason"], "connect_required");
+        assert_eq!(body["hint"], json!(hint));
+        assert_eq!(body["type"], "https://affinidi.com/atg/errors/connect-required");
+        assert!(vendor.requests().is_empty());
+
+        let oid_caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "00000000-0000-0000-0000-0000000000aa".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
+                "oid": "00000000-0000-0000-0000-0000000000aa" }),
+        }
+        .principal_hash(None)
+        .unwrap();
+        let mut ctx = external_grant_context(&mcp, VENDOR_HOP, Some(&oid_caller));
+        let response = send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap_err()
+            .into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["error"]["data"]["hint"], "bjXra_R6O-9aJ7DUY5xpnA",
+            "an oid caller's hint is the contract's, from the hash with the claim's name"
+        );
+
+        let owner = fixture_surface(&vendor, "owner", "mcp");
+        store_grant(
+            &state,
+            crate::delegation_vault::grants::GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"),
+            "owner-access",
+            3600,
+        )
+        .await;
+        let mut modern = external_grant_context(&owner, VENDOR_HOP, Some(&caller));
+        modern.mcp_classification = Some(crate::mcp::request_validation::McpRequestClassification::Modern(Box::new(
+            crate::mcp::request_validation::ValidatedModernMessage {
+                protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                client_capabilities: None,
+                client_info: None,
+                method: "tools/call".into(),
+                id: Some(json!(5)),
+                kind: crate::mcp::request_validation::McpMessageKind::Request,
+                params: Some(json!({"name": "echo"})),
+            },
+        )));
+        let response = send_with_grant(&state, &mut modern)
+            .await
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], crate::mcp::errors::error_codes::UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(bearer(&modern), None, "a 2026-07-28 request never carries the grant");
+
+        let mut ctx = external_grant_context(&owner, VENDOR_HOP, Some(&caller));
+        ctx.original_headers
+            .insert(axum::http::header::ACCEPT_ENCODING, "gzip, br".parse().unwrap());
+        send_with_grant(&state, &mut ctx)
+            .await
+            .unwrap();
+        let (head, _) = vendor.requests()[0].clone();
+        assert!(head.contains("accept-encoding: identity"), "{head}");
+        assert!(!head.contains("gzip"), "{head}");
+    }
+
+    /// An owner grant is released, for a caller the transit token names, on
+    /// its own Transit Point only, without any managed agent identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owner_grant_is_released_on_its_own_transit_point_without_an_agent_identity() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(
+            json!([
+                vendor_transit_point(VENDOR_HOP, "vendor", "owner"),
+                vendor_transit_point("other-hop", "vendor", "owner")
+            ]),
+            json!([]),
+        );
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let caller = "a".repeat(64);
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let mut other_hop = external_grant_context(&surface, "other-hop", Some(&caller));
+        let refused = step_inject_credentials(&state, &mut other_hop)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectRequired {
+                subject: crate::config::agent_surface::GrantSubject::Owner,
+                hint: None,
+            }),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&other_hop), None, "another Transit Point of the surface never gets the grant");
+
+        let mut anonymous = external_grant_context(&surface, VENDOR_HOP, None);
+        let refused = step_inject_credentials(&state, &mut anonymous)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                }
+            ),
+            "a call that names no caller never acts as the owner: {refused:?}"
+        );
+        assert_eq!(bearer(&anonymous), None);
+    }
+
+    /// A caller grant is released only to the caller it was made for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_grant_is_released_only_to_its_caller() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "caller")]), json!([]));
+        let alice = "a".repeat(64);
+        let bob = "b".repeat(64);
+        store_grant(
+            &state,
+            GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "vendor", &alice).unwrap(),
+            "alice-access",
+            3600,
+        )
+        .await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&alice));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer alice-access"));
+
+        for (case, caller) in
+            [("another caller", bob.as_str()), ("a caller named without an identity hash", "sha256:user")]
+        {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(caller));
+            assert!(
+                step_inject_credentials(&state, &mut ctx)
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case} gets neither alice's nor the owner's grant");
+        }
+    }
+
+    /// Every case a grant by binding cannot be released is refused before the
+    /// request is forwarded, and none falls back to an agent-keyed token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_that_cannot_be_released_refuses_the_call() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", -60).await;
+        for provider in ["vendor-tenant-b", "agent-keyed"] {
+            store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, provider), "owner-access", 3600)
+                .await;
+        }
+
+        let expired = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let another_tenants =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-tenant-b", "owner")]), json!([]));
+        let without_issuer =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "agent-keyed", "owner")]), json!([]));
+        let mut with_outbound_credentials =
+            transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        with_outbound_credentials.outbound_credentials =
+            serde_json::from_value(json!([{"credential_provider_id": "agent-keyed"}])).unwrap();
+        let mut without_subject = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+        without_subject["transit_credentials"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subject");
+        let without_subject = transit_surface(json!([without_subject]), json!([]));
+
+        for (case, surface) in [
+            ("an expired grant", expired),
+            ("another tenant's provider", another_tenants),
+            ("a provider without an issuer", without_issuer),
+            ("a surface with outbound_credentials", with_outbound_credentials),
+            ("a binding without a subject", without_subject),
+        ] {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                grant_refusal(&refused),
+                Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+        }
+    }
+
+    /// A Transit Point's grant by binding is never released on a surface whose
+    /// Access Point accepts callers who name themselves, as DID Auth without
+    /// `allowed_dids` does: whoever mints a DID would get a transit token
+    /// naming it. With an allow-list it is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_released_beside_callers_who_name_themselves() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let authenticating = |allowed_dids: serde_json::Value| {
+            let mut surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+            surface.access_point = serde_json::from_value(json!({"listen_address": "https://gateway.example",
+                "route": "/mcp", "protocol": "mcp", "caller_authentication": {"methods": [{"type": "did_auth",
+                "extraction": {"source": "http_header", "field": "X-DID-Auth-Session"},
+                "allowed_dids": allowed_dids}]}}))
+            .unwrap();
+            surface
+        };
+
+        let listed = authenticating(json!(["did:example:alice"]));
+        let mut ctx = external_grant_context(&listed, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let open = authenticating(json!([]));
+        let mut ctx = external_grant_context(&open, VENDOR_HOP, Some(&caller));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&ctx), None);
+    }
+
+    /// A Transit Point's grant by binding is never released beside a
+    /// presentation of the agent, an identity VP or a workload binding, which
+    /// the save refuses, as on one edited by hand: it answers
+    /// `connector_unavailable`. Without one it is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_released_with_a_presentation_of_the_agent() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        let presenting = |field: Option<(&str, serde_json::Value)>| {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            if let Some((field, value)) = field {
+                point[field] = value;
+            }
+            transit_surface(json!([point]), json!([]))
+        };
+
+        let plain = presenting(Some(("workload_binding", json!({"enabled": false}))));
+        let mut ctx = external_grant_context(&plain, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        for (case, field, value) in [
+            ("an identity VP", "identity_injection", json!({"inject_vp": true})),
+            ("a managed identity of its own", "managed_identity", json!({"type": "static", "did": "did:example:a"})),
+            ("a workload binding", "workload_binding", json!({"enabled": true})),
+        ] {
+            let surface = presenting(Some((field, value)));
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                grant_refusal(&refused),
+                Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+        }
+    }
+
+    /// A caller's own grant on a Transit Point is never released on a surface
+    /// whose Access Point takes the gateway's resource access tokens: its
+    /// transit token names the caller by a subject the gateway's issuer
+    /// stated, without the identity provider that named it. The owner's grant
+    /// is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callers_grant_by_binding_is_never_released_beside_resource_tokens() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        store_grant(
+            &state,
+            GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "vendor", &caller).unwrap(),
+            "caller-access",
+            3600,
+        )
+        .await;
+        let with_resource_tokens = |subject: &str| {
+            let mut surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", subject)]), json!([]));
+            surface.mcp_http = Some(
+                serde_json::from_value(
+                    json!({"authorization": {"resource": "https://gateway.example/mcp", "scopes": ["read"]}}),
+                )
+                .unwrap(),
+            );
+            surface
+        };
+
+        let owner = with_resource_tokens("owner");
+        let mut ctx = external_grant_context(&owner, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"));
+
+        let callers = with_resource_tokens("caller");
+        let mut ctx = external_grant_context(&callers, VENDOR_HOP, Some(&caller));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "{refused:?}"
+        );
+        assert_eq!(bearer(&ctx), None);
+    }
+
+    /// The refusal of a grant by binding a pipeline error carries, if any.
+    fn grant_refusal(error: &OutboundPipelineError) -> Option<&crate::delegation_vault::release::GrantRefusal> {
+        match error {
+            OutboundPipelineError::GrantRefused { refusal, .. } => Some(refusal),
+            _ => None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_never_read_without_at_rest_encryption() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), false).await;
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor", "owner")]), json!([]));
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "{refused:?}"
+        );
+    }
+
+    /// An agent-keyed binding never releases a token for a provider with an
+    /// issuer, so such a provider's grants are reached only by binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_keyed_binding_refuses_a_provider_with_an_issuer() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("vendor"))]),
+            json!([]),
+        );
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "vendor-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": "sha256:user", "credential_provider_id": "vendor",
+                    "provider_id": "vendor", "access_token": "agent-keyed-access", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let mut ctx = legacy_delegation_context(resolved, point);
+        let refused = step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                ctx.body_bytes
+                    .as_deref()
+                    .unwrap()
+            )
+            .contains("agent-keyed-access")
+        );
+    }
+
+    /// At the wire: the vendor receives the grant of its own binding in place
+    /// of the `Authorization` the agent sent, and a Transit Point of the same
+    /// surface with no grant of its own never calls its target.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_vendor_receives_only_its_bindings_grant_in_place_of_the_agents_authorization() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "vendor-fixture", "name": "vendor-fixture", "provider_id": "vendor-fixture",
+                    "issuer": url::Url::parse(&target.url).unwrap().origin().ascii_serialization(),
+                    "resource": target.url,
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        state.egress_allowlist = Some(
+            url::Url::parse(&target.url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
+        let point = |id: &str| {
+            let mut point = vendor_transit_point(id, "vendor-fixture", "owner");
+            point["target_endpoint"] = json!(target.url);
+            point
+        };
+        let surface = transit_surface(json!([point(VENDOR_HOP), point("unconnected-hop")]), json!([]));
+        store_grant(
+            &state,
+            GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-fixture"),
+            "vendor-access",
+            3600,
+        )
+        .await;
+        let caller = "a".repeat(64);
+
+        let mut ctx = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        step_forward_request(&state, &mut ctx)
+            .await
+            .unwrap();
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(header_values(&received[0], "authorization"), vec!["Bearer vendor-access"]);
+        assert!(!format!("{:?}", received[0]).contains("agent-supplied-token"), "{:?}", received[0]);
+
+        let mut unconnected =
+            with_agent_supplied_credentials(external_grant_context(&surface, "unconnected-hop", Some(&caller)));
+        assert!(
+            step_inject_credentials(&state, &mut unconnected)
+                .await
+                .is_err()
+        );
+        assert_eq!(target.received().len(), 1, "the refused call never reaches the target");
+
+        state.egress_allowlist = None;
+        let mut unlisted = with_agent_supplied_credentials(external_grant_context(&surface, VENDOR_HOP, Some(&caller)));
+        assert!(
+            step_inject_credentials(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "an http loopback target is a vendor only for the test allow-list"
+        );
+        assert_eq!(bearer(&unlisted), None);
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// A grant by binding goes only to its provider's `resource` origin over
+    /// public `https`: a Transit Point repointed elsewhere, a variant reusing
+    /// its id with another target, an `http` target, a private address and a
+    /// Fabric route never receive it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_by_binding_is_sent_only_to_its_providers_resource() {
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let caller = "a".repeat(64);
+        for provider in ["vendor", "vendor-private"] {
+            store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, provider), "owner-access", 3600)
+                .await;
+        }
+        let at = |target: &str, provider: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, provider, "owner");
+            point["target_endpoint"] = json!(target);
+            point
+        };
+        let reaches = transit_surface(json!([at("https://vendor.example/other", "vendor")]), json!([]));
+        let mut ctx = external_grant_context(&reaches, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer owner-access"), "any path of the resource's origin");
+        assert_eq!(
+            ctx.grant_destination,
+            Some(
+                url::Url::parse("https://vendor.example")
+                    .unwrap()
+                    .origin()
+            )
+        );
+
+        let variant = transit_surface(
+            json!([at("https://vendor.example/mcp", "vendor")]),
+            json!([{"id": "v-1", "alias": "candidate", "name": "candidate", "enabled": true,
+                "overrides": {"transit": {"points": [at("https://attacker.example/mcp", "vendor")]}}}]),
+        );
+        let mut fabric = at("fabric://gateway-b/channel", "vendor");
+        let withheld = transit_surface(json!([fabric.clone()]), json!([]));
+        let mut ctx = external_grant_context(&withheld, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&ctx), None, "a Fabric route withholds delegated credentials");
+        fabric["fabric_delegated_credentials"] = json!(true);
+        for (case, surface, variant_alias) in [
+            (
+                "a repointed target",
+                transit_surface(json!([at("https://attacker.example/mcp", "vendor")]), json!([])),
+                None,
+            ),
+            ("a variant reusing the id", variant, Some("candidate")),
+            ("an http target", transit_surface(json!([at("http://vendor.example/mcp", "vendor")]), json!([])), None),
+            (
+                "a private address",
+                transit_surface(json!([at("https://10.0.0.5/mcp", "vendor-private")]), json!([])),
+                None,
+            ),
+            ("a Fabric route that sends delegated credentials", transit_surface(json!([fabric]), json!([])), None),
+        ] {
+            let mut ctx = external_grant_variant_context(&surface, variant_alias, VENDOR_HOP, Some(&caller));
+            let refused = step_inject_credentials(&state, &mut ctx)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{case} must be refused"));
+            assert_eq!(
+                grant_refusal(&refused),
+                Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(bearer(&ctx), None, "{case}");
+            assert_eq!(ctx.grant_destination, None, "{case}");
+        }
+    }
+
+    /// The forward of a request that carries a grant by binding re-checks its
+    /// destination: only the grant's origin, through Strict pinned egress, and
+    /// never over Fabric.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_carrying_a_grant_is_forwarded_only_to_its_origin_through_strict_egress() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let origin = url::Url::parse(&target.url)
+            .unwrap()
+            .origin();
+        let at = |endpoint: &str| {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["target_endpoint"] = json!(endpoint);
+            transit_surface(json!([point]), json!([]))
+        };
+        let carrying = |surface: &crate::config::agent_surface::AgentSurface, destination: url::Origin| {
+            let mut ctx = external_grant_context(surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            ctx.delegated_credential_headers
+                .insert(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer owner-access"
+                        .parse()
+                        .unwrap(),
+                );
+            ctx.grant_destination = Some(destination);
+            ctx
+        };
+
+        let mut unlisted = carrying(&at(&target.url), origin.clone());
+        assert!(
+            step_forward_request(&state, &mut unlisted)
+                .await
+                .is_err(),
+            "a loopback http target is refused by Strict egress"
+        );
+        let mut elsewhere = carrying(
+            &at(&target.url),
+            url::Url::parse("https://vendor.example")
+                .unwrap()
+                .origin(),
+        );
+        let mut listed_state = state.clone();
+        listed_state.egress_allowlist = Some(origin.ascii_serialization());
+        assert!(
+            step_forward_request(&listed_state, &mut elsewhere)
+                .await
+                .is_err(),
+            "a target outside the grant's origin is refused"
+        );
+        let mut fabric = carrying(&at("fabric://gateway-b/channel"), origin.clone());
+        let refused = step_forward_request(&listed_state, &mut fabric)
+            .await
+            .err()
+            .expect("a grant never crosses Fabric");
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable),
+            "refused before any Fabric forward: {refused:?}"
+        );
+        assert!(target.received().is_empty(), "no refused forward reaches the target");
+
+        let mut listed = carrying(&at(&target.url), origin);
+        step_forward_request(&listed_state, &mut listed)
+            .await
+            .unwrap();
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// Every `credential_delegation` line a Transit Point's delegated
+    /// credentials write while serving a request names the surface variant
+    /// that served it: the injection lines of an agent-keyed binding and of a
+    /// grant by binding, their refusals, a grant by binding that cannot be
+    /// released, an agent-keyed binding to a provider with an issuer, and a
+    /// forward that Strict egress refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_delegated_credential_line_of_a_transit_point_names_the_request_variant() {
+        use crate::delegation_vault::grants::GrantKey;
+
+        /// Runs `run` as a request that variant `beta` served, returning its
+        /// result and the log lines it wrote.
+        async fn served_by_beta<T>(run: impl std::future::Future<Output = T>) -> (T, String) {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let result = crate::observability::policy_audit::in_request(
+                crate::observability::policy_audit::RequestScope::fresh(),
+                async {
+                    crate::observability::policy_audit::set_request_variant("beta");
+                    run.await
+                },
+            )
+            .await;
+            (result, logs.text())
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = external_grant_state(directory.path(), true).await;
+        let agent_keyed_directory = tempfile::tempdir().unwrap();
+        let agent_keyed_state = delegation_state(agent_keyed_directory.path(), &[("provider", "transit-access")]).await;
+        let caller = "a".repeat(64);
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor"), "owner-access", 3600).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", "unprintable", "vendor"), "owner\u{1}access", 3600)
+            .await;
+        let by_binding = transit_surface(
+            json!([
+                vendor_transit_point(VENDOR_HOP, "vendor", "owner"),
+                vendor_transit_point("unprintable", "vendor", "owner"),
+                vendor_transit_point("no-grant", "vendor", "owner")
+            ]),
+            json!([]),
+        );
+        let agent_keyed = |provider: &str| {
+            let surface = transit_surface(
+                json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some(provider))]),
+                json!([]),
+            );
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            legacy_delegation_context(resolved, point)
+        };
+        let plain_http = {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["target_endpoint"] = json!("http://127.0.0.1:9/mcp");
+            let mut ctx =
+                external_grant_context(&transit_surface(json!([point]), json!([])), VENDOR_HOP, Some(&caller));
+            ctx.grant_destination = Some(
+                url::Url::parse("http://127.0.0.1:9")
+                    .unwrap()
+                    .origin(),
+            );
+            ctx
+        };
+
+        let mut missing = Vec::new();
+        let mut expect_named = |text: &str, message: &str| {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains(message))
+                .collect();
+            if lines.is_empty() {
+                missing.push(format!("no line `{message}` was written: {text}"));
+            }
+            missing.extend(
+                lines
+                    .into_iter()
+                    .filter(|line| !line.contains("surface_variant=\"beta\""))
+                    .map(|line| format!("`{message}` names no variant: {line}")),
+            );
+        };
+
+        let mut ctx = external_grant_context(&by_binding, VENDOR_HOP, Some(&caller));
+        let (released, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        released.expect("the owner grant is released");
+        expect_named(&text, "Injecting delegated credential header into outbound request");
+
+        let mut ctx = external_grant_context(&by_binding, "unprintable", Some(&caller));
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a grant that is not a valid header value is refused");
+        expect_named(&text, "Delegated credential is not a valid header - refusing the request");
+
+        let mut ctx = external_grant_context(&by_binding, "no-grant", Some(&caller));
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a binding with no grant is refused");
+        expect_named(&text, "grant by binding cannot be released - refusing the request");
+
+        let mut ctx = agent_keyed("vendor");
+        let (refused, text) = served_by_beta(step_inject_credentials(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "an agent-keyed binding never uses a provider with an issuer");
+        expect_named(&text, "A provider with an issuer serves only consent_mode external bindings");
+
+        let mut ctx = agent_keyed("provider");
+        let (released, text) = served_by_beta(step_inject_credentials(&agent_keyed_state, &mut ctx)).await;
+        released.expect("the agent-keyed token is released");
+        expect_named(&text, "Injecting delegated credential into outbound MCP metadata");
+
+        let mut ctx = agent_keyed("provider");
+        ctx.body_bytes = None;
+        let (refused, text) = served_by_beta(step_inject_credentials(&agent_keyed_state, &mut ctx)).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::MetadataInjectionFailed { .. })), "{refused:?}");
+        expect_named(&text, "outbound MCP metadata because body is unavailable");
+
+        let mut ctx = plain_http;
+        let (refused, text) = served_by_beta(step_forward_request(&state, &mut ctx)).await;
+        assert!(refused.is_err(), "a plain http target is refused by Strict egress");
+        expect_named(&text, "was refused by Strict egress");
+        expect_named(&text, "forward_refused_by_strict_egress");
+
+        assert!(missing.is_empty(), "{missing:#?}");
+    }
+
+    /// A caller the Transit Point's `source_auth` verified reaches only the
+    /// grant consented under how it was identified: the same subject from
+    /// another issuer, the same name from another method, the same caller on
+    /// another tenant's surface, and a token that names no subject get none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_grants_are_keyed_by_how_the_caller_was_identified() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: claims["sub"]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            claims,
+        };
+        let alice = jwt(json!({ "iss": "https://idp.example", "sub": "alice" }));
+        let store_grant = |id: &'static str, user_identity_hash: String, access_token: &'static str| {
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            async move {
+                vault
+                    .store(
+                        serde_json::from_value(json!({
+                            "id": id, "agent_did": "did:web:agent.example",
+                            "user_identity_hash": user_identity_hash, "credential_provider_id": "provider",
+                            "provider_id": "provider", "access_token": access_token,
+                            "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
+                            "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                            "consent_granted_at": "2026-09-01T00:00:00Z",
+                            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        store_grant(
+            "alice-token",
+            alice
+                .principal_hash(None)
+                .unwrap(),
+            "alice-access",
+        )
+        .await;
+        // A grant under the hash of the `<none>` subject placeholder, which no
+        // caller's identity hash is.
+        store_grant(
+            "no-subject-token",
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"<none>")),
+            "no-subject-access",
+        )
+        .await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            Arc::make_mut(&mut ctx.surface).tenant_id = tenant.map(str::to_string);
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(alice.clone(), None)).await, "alice-access");
+
+        let refused = async |identity: AuthenticatedIdentity, tenant: Option<&str>| {
+            step_inject_credentials(&state, &mut context(identity, tenant))
+                .await
+                .err()
+        };
+        for (case, identity, tenant) in [
+            (
+                "the same subject from another issuer",
+                jwt(json!({ "iss": "https://partner.example", "sub": "alice" })),
+                None,
+            ),
+            (
+                "an API key secret of the same name",
+                AuthenticatedIdentity::ApiKey {
+                    key_name: "alice".into(),
+                    provider_agent_id: None,
+                },
+                None,
+            ),
+            ("the same caller on another tenant's surface", alice.clone(), Some("tenant-b")),
+        ] {
+            assert!(
+                refused(identity, tenant)
+                    .await
+                    .is_some(),
+                "{case} must not get alice's grant"
+            );
+        }
+        let second_without_subject = jwt(json!({ "iss": "https://idp.example", "client_id": "second" }));
+        assert!(
+            matches!(
+                refused(second_without_subject, None).await,
+                Some(OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                })
+            ),
+            "a token that names no subject identifies no caller, so it gets no grant"
+        );
+    }
+
+    /// A strategy that names a principal claim keys a caller's grants by that
+    /// claim: the same person reached through two applications whose `sub`
+    /// differs finds one grant, and a grant is not found by another claim's
+    /// value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_grants_are_found_by_the_principal_claim_the_strategy_names() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let named_by = |principal_claim: &str, sub: &str| {
+            let claims = json!({ "iss": "https://idp.example", "sub": sub, "oid": "person-1" });
+            AuthenticatedIdentity::JwtBearer {
+                subject: claims[principal_claim]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                principal_claim: principal_claim.to_string(),
+                claims,
+            }
+        };
+        let by_oid = named_by("oid", "sub-in-the-first-app");
+        state
+            .delegation_vault_store
+            .clone()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "person-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": by_oid.principal_hash(None).unwrap(),
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": "person-access", "refresh_token": "person-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let context = |identity: AuthenticatedIdentity| {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            ctx.authenticated_identity = Some(identity);
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+
+        assert_eq!(injected_credential(&state, context(by_oid)).await, "person-access");
+        assert_eq!(
+            injected_credential(&state, context(named_by("oid", "sub-in-the-second-app"))).await,
+            "person-access",
+            "the same oid from another application is the same caller"
+        );
+        for other in [named_by("sub", "sub-in-the-first-app"), named_by("sub", "sub-in-the-second-app")] {
+            assert!(
+                step_inject_credentials(&state, &mut context(other))
+                    .await
+                    .is_err(),
+                "a caller named by `sub` is not the caller named by `oid`"
+            );
+        }
+        let without_oid = AuthenticatedIdentity::JwtBearer {
+            subject: "<none>".to_string(),
+            principal_claim: "oid".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
+        };
+        assert!(
+            step_inject_credentials(&state, &mut context(without_oid))
+                .await
+                .is_err(),
+            "a token without the strategy's claim names no caller, so the Transit Point gives no credential"
+        );
+    }
+
+    /// The `credential_delegation` lines that refuse a Transit Point call for
+    /// want of a caller or an agent to key its delegated credentials by, or
+    /// because it arrived over Fabric (with the Transit Point opted out, or
+    /// opted in with no caller the receiving surface verified), name the
+    /// surface variant that served it; a `source_auth` caller with no managed
+    /// agent identity takes the agent line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delegation_refusal_line_names_the_request_variant() {
+        use crate::observability::policy_audit::{RequestScope, in_request, set_request_variant};
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let no_caller = || {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = None;
+            ctx
+        };
+        let mut no_agent = no_caller();
+        no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "alice".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+        });
+        no_agent.authenticated_by = Some(SourceAuth);
+        no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        let over_fabric = || {
+            let mut ctx = no_caller();
+            ctx.transit_token_claims =
+                Some(fabric_claims(Some("did:web:agent.example"), "fabric-asserted", Some("sha256:user"), 2));
+            ctx
+        };
+        let mut over_fabric_opted_in = over_fabric();
+        over_fabric_opted_in
+            .virtual_channel
+            .delegated_credentials_for_fabric_callers = true;
+
+        for (mut ctx, expected, line) in [
+            (no_caller(), DelegationRefusal::CallerIdentityMissing, "identifies the caller - refusing the request"),
+            (no_agent, DelegationRefusal::AgentIdentityMissing, "No managed agent identity for delegated credentials"),
+            (
+                over_fabric(),
+                DelegationRefusal::CallerIdentityMissing,
+                "not released for requests that arrived over Fabric",
+            ),
+            (
+                over_fabric_opted_in,
+                DelegationRefusal::CallerIdentityMissing,
+                "verified no caller of the request that arrived over Fabric",
+            ),
+        ] {
+            let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+            let refused = in_request(RequestScope::fresh(), async {
+                set_request_variant("beta");
+                step_inject_credentials(&state, &mut ctx).await
+            })
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(refused, OutboundPipelineError::DelegationRefused { refusal, .. } if refusal == expected),
+                "{line}: {refused:?}"
+            );
+            let lines: Vec<String> = logs
+                .text()
+                .lines()
+                .filter(|text| text.contains(line))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(lines.len(), 1, "{line}: {lines:?}");
+            assert!(lines[0].contains("surface_variant=\"beta\""), "{}", lines[0]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fabric_transit_point_with_only_transit_credentials_follows_its_switch() {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
@@ -11619,6 +20167,511 @@ mod tests {
                 injected_credential(&state, legacy_delegation_context(resolved, peer)).await,
                 expected,
                 "opted_in={opted_in}"
+            );
+        }
+    }
+
+    /// A Fabric-issued token without a caller the receiving surface verified
+    /// keys no delegated credential, even one whose `user_identity_hash` names
+    /// a stored grant: a binding that applies refuses the call with 403. The
+    /// token decides the caller half of the key, as any transit token does, so
+    /// a client the Transit Point's own `source_auth` verified on the same call
+    /// does not key one either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_issued_token_is_released_no_delegated_credential() {
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
+        let alice = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "alice".to_string(),
+            provider_agent_id: None,
+        };
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "alice-token", "agent_did": "did:web:agent.example",
+                    "user_identity_hash": alice.principal_hash(None), "credential_provider_id": "provider",
+                    "provider_id": "provider", "access_token": "alice-access",
+                    "refresh_token": "alice-refresh", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-09-01T00:00:00Z",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(
+            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([]),
+        );
+        let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+        let fabric_token_call = || {
+            let mut ctx = legacy_delegation_context(resolved.clone(), point.clone());
+            ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", Some("sha256:user"), 2));
+            ctx
+        };
+
+        let refused = step_inject_credentials(&state, &mut fabric_token_call())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.status_code(), StatusCode::FORBIDDEN);
+
+        let mut verified_here = fabric_token_call();
+        verified_here.authenticated_identity = Some(alice);
+        verified_here.authenticated_by = Some(SourceAuth);
+        assert!(
+            matches!(
+                step_inject_credentials(&state, &mut verified_here).await,
+                Err(OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::CallerIdentityMissing,
+                    ..
+                })
+            ),
+            "the Fabric token, not the Transit Point's client, names the caller"
+        );
+    }
+
+    /// A Transit Point with `delegated_credentials_for_fabric_callers` releases
+    /// the grant of the caller the receiving surface verified on a Fabric
+    /// request, and only that caller's. Without the switch, or without a
+    /// caller the receiving surface verified, a binding that applies refuses
+    /// the call with 403 before any grant is looked up, however the peer named
+    /// its caller. The token decides the caller, so a client the Transit
+    /// Point's own `source_auth` verified on the same call keys no grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_credentials_reach_a_fabric_caller_only_as_the_receiving_surface_verified_it_on_opt_in() {
+        use crate::source_auth::AuthenticatedIdentity;
+        use crate::surface_context::TransitClientVerification::SourceAuth;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "unused-access")]).await;
+        let api_key = |name: &str| AuthenticatedIdentity::ApiKey {
+            key_name: name.to_string(),
+            provider_agent_id: None,
+        };
+        let peer_did = "did:web:asserted-user.example";
+        let did_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(peer_did.as_bytes()));
+        for (id, user_identity_hash, access_token) in [
+            (
+                "alice-token",
+                api_key("alice")
+                    .principal_hash(None)
+                    .unwrap(),
+                "alice-access",
+            ),
+            (
+                "bob-token",
+                api_key("bob")
+                    .principal_hash(None)
+                    .unwrap(),
+                "bob-access",
+            ),
+            ("did-token", did_hash.clone(), "asserted-did-access"),
+            ("raw-did-token", peer_did.to_string(), "raw-did-access"),
+        ] {
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .store(
+                    serde_json::from_value(json!({
+                        "id": id, "agent_did": "did:web:agent.example",
+                        "user_identity_hash": user_identity_hash, "credential_provider_id": "provider",
+                        "provider_id": "provider", "access_token": access_token,
+                        "refresh_token": format!("{id}-refresh"), "scopes": ["read"],
+                        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                        "consent_granted_at": "2026-09-01T00:00:00Z",
+                        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let alice_hash = api_key("alice")
+            .principal_hash(None)
+            .unwrap();
+        let call = |opted_in: bool, claims: crate::proxy::transit_token::TransitTokenClaims| {
+            let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"));
+            point["delegated_credentials_for_fabric_callers"] = json!(opted_in);
+            let surface = telling_users_apart(transit_surface(json!([point]), json!([])));
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = legacy_delegation_context(resolved, point);
+            ctx.transit_token_claims = Some(claims);
+            ctx
+        };
+        let refused = async |mut ctx: OutboundPipelineContext| {
+            let error = step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    OutboundPipelineError::DelegationRefused {
+                        refusal: DelegationRefusal::CallerIdentityMissing,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.status_code(), StatusCode::FORBIDDEN);
+        };
+
+        assert_eq!(
+            injected_credential(&state, call(true, verified_fabric_claims(Some(peer_did), &alice_hash))).await,
+            "alice-access",
+            "the caller the receiving surface verified keys its grant on a Transit Point that opts in"
+        );
+        refused(call(false, verified_fabric_claims(Some(peer_did), &alice_hash))).await;
+
+        // A surface stored with the switch and caller authentication that
+        // cannot tell a partner's users apart, here an API key, releases
+        // nothing, whatever principal the token carries.
+        let mut shared_key = call(true, verified_fabric_claims(Some(peer_did), &alice_hash));
+        let mut surface = (*shared_key.surface).clone();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(json!({ "methods": [{ "type": "api_key", "secret_id": "keys",
+                "extraction": { "source": "http_header", "field": "x-api-key" } }] }))
+            .unwrap(),
+        );
+        shared_key.surface = Arc::new(surface);
+        refused(shared_key).await;
+
+        // The peer's word about its caller never keys a grant: not its DID, not
+        // a top-level hash, whatever grants exist under them.
+        for top_level_hash in [alice_hash.as_str(), did_hash.as_str(), peer_did] {
+            refused(call(true, fabric_claims(Some(peer_did), "fabric-presentation", Some(top_level_hash), 2))).await;
+        }
+
+        // The token decides the caller half of the key, and the delegation
+        // audit names that caller. A caller the receiving surface verified is
+        // named ahead of the Transit Point's own `source_auth` client, so
+        // without the switch the call is refused before any grant is looked
+        // up, never served with the client's grant, and a Fabric token that
+        // names no verified caller is refused as well.
+        let with_transit_point_caller = |opted_in: bool, claims| {
+            let mut ctx = call(opted_in, claims);
+            ctx.authenticated_identity = Some(api_key("bob"));
+            ctx.authenticated_by = Some(SourceAuth);
+            ctx
+        };
+        let audited = async |ctx: OutboundPipelineContext| {
+            let (credential, events) = crate::audit::producer::capture(injected_credential(&state, ctx)).await;
+            let named: std::collections::BTreeSet<_> = events
+                .iter()
+                .map(|event| {
+                    (
+                        event
+                            .user_identity_hash
+                            .clone(),
+                        event
+                            .caller
+                            .as_ref()
+                            .map(|caller| caller.auth_method.clone()),
+                    )
+                })
+                .collect();
+            (credential, named)
+        };
+        let named = |hash: &str, auth_method: &str| {
+            std::collections::BTreeSet::from([(Some(hash.to_string()), Some(auth_method.to_string()))])
+        };
+
+        assert_eq!(
+            audited(with_transit_point_caller(true, verified_fabric_claims(None, &alice_hash))).await,
+            (json!("alice-access"), named(&alice_hash, "fabric_verified")),
+            "a verified token's caller keys the grant, as an Access Point's does"
+        );
+        let ((), events) = crate::audit::producer::capture(refused(with_transit_point_caller(
+            false,
+            verified_fabric_claims(Some(peer_did), &alice_hash),
+        )))
+        .await;
+        assert!(events.is_empty(), "refused before any grant is looked up: {events:?}");
+        for opted_in in [false, true] {
+            refused(with_transit_point_caller(opted_in, fabric_claims(Some(peer_did), "fabric-presentation", None, 2)))
+                .await;
+        }
+    }
+
+    /// Without a managed identity, the agent half of a delegated credential's
+    /// key, legacy or modern, is the DID an Access Point token carries, never
+    /// one a Fabric peer named.
+    #[test]
+    fn a_transit_points_grants_are_never_keyed_by_a_peers_did() {
+        let mut ctx = test_pipeline_context();
+        ctx.resolved_identity = ProtectedAgentIdentity::Anonymous;
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:agent.example"), "fabric-presentation", None, 1));
+        assert_eq!(delegation_agent_did(&ctx), None);
+
+        ctx.transit_token_claims =
+            Some(caller_claims(Some("did:web:agent.example"), Some("self-presented"), None, json!({})));
+        assert_eq!(delegation_agent_did(&ctx), Some("did:web:agent.example"));
+
+        ctx.resolved_identity = ProtectedAgentIdentity::Managed {
+            did: "did:web:managed.example".into(),
+            identity_fields: std::collections::HashMap::new(),
+        };
+        ctx.transit_token_claims = Some(fabric_claims(Some("did:web:agent.example"), "fabric-presentation", None, 1));
+        assert_eq!(delegation_agent_did(&ctx), Some("did:web:managed.example"));
+    }
+
+    /// A Transit Point's Fabric send carries one more crossing than the
+    /// Fabric-issued token it was called with records, or one with an Access
+    /// Point token or none, in place of a value the agent sent.
+    #[tokio::test]
+    async fn a_fabric_transit_point_sends_one_more_crossing_than_its_token_records() {
+        let state = test_outbound_state();
+        for (case, claims, expected) in [
+            ("a Fabric-issued token", Some(fabric_claims(None, "fabric-asserted", None, 3)), "4"),
+            (
+                "an Access Point token",
+                Some(caller_claims(None, Some("gateway-computed"), Some("abc123"), json!({}))),
+                "1",
+            ),
+            ("no token", None, "1"),
+        ] {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            ctx.original_headers
+                .insert("X-Gateway-Fabric-Hops", HeaderValue::from_static("1"));
+            ctx.transit_token_claims = claims;
+
+            let (buffered, streamed) = fabric_forward_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            let sent: Vec<_> = buffered
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("x-gateway-fabric-hops"))
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            assert_eq!(sent, [("X-GATEWAY-FABRIC-HOPS", expected)], "{case}");
+            assert_eq!(
+                streamed
+                    .get_all("x-gateway-fabric-hops")
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{case}"
+            );
+        }
+    }
+
+    /// A Transit Point whose target is over Fabric refuses a call whose
+    /// Fabric-issued token already records the most crossings a request may
+    /// make, with 508 in its protocol's error shape; one crossing fewer, or an
+    /// HTTP target, is not refused.
+    #[tokio::test]
+    async fn a_fabric_transit_point_refuses_a_call_at_the_hop_limit() {
+        let call = |target: &str, hops: u8, mcp: bool| {
+            let mut ctx = if mcp {
+                modern_pipeline_context("tools/call")
+            } else {
+                test_pipeline_context()
+            };
+            ctx.virtual_channel
+                .target_endpoint = target.into();
+            ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, hops));
+            step_check_fabric_hops(&ctx)
+        };
+
+        let refused = call("fabric://peer-gateway/peer-surface", 8, false).unwrap_err();
+        assert_eq!(refused.status_code(), StatusCode::LOOP_DETECTED);
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["detail"], "The request passed through too many gateways");
+
+        let response = call("fabric://peer-gateway/peer-surface", 8, true)
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["id"], "stream");
+        assert_eq!(body["error"]["message"], "The request passed through too many gateways");
+
+        assert!(call("fabric://peer-gateway/peer-surface", 7, false).is_ok());
+        assert!(call("https://partner.example/a2a", 8, false).is_ok(), "only Fabric crossings are counted");
+    }
+
+    /// A Transit Point records the call it refuses at the hop limit as a
+    /// `request_rejected` in the call's trace, with the JSON-RPC code an MCP
+    /// caller gets and the surface variant that served it, and records nothing
+    /// for a call it forwards.
+    #[tokio::test]
+    async fn a_fabric_transit_point_records_the_call_it_refuses_at_the_hop_limit() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        let rejections = |hops: u8, mcp: bool| async move {
+            let mut ctx = if mcp {
+                modern_pipeline_context("tools/call")
+            } else {
+                test_pipeline_context()
+            };
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            ctx.transit_token_claims = Some(fabric_claims(None, "fabric-asserted", None, hops));
+            let (_, events) = crate::audit::producer::capture(crate::observability::policy_audit::in_request(
+                crate::observability::policy_audit::RequestScope::fresh(),
+                async {
+                    crate::observability::policy_audit::set_request_variant("beta");
+                    step_check_fabric_hops(&ctx)
+                },
+            ))
+            .await;
+            events
+                .into_iter()
+                .filter_map(|event| match event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        requested_variant: None,
+                        ..
+                    } => Some((
+                        stage,
+                        reason,
+                        http_status,
+                        rpc_error_code,
+                        event.trace_id == Some(ctx.request_id.clone()),
+                        event.surface_id == Some(ctx.surface.surface_id.clone()),
+                        event.surface_variant == Some("beta".to_string()),
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rejections(8, false).await,
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), None, true, true, true)]
+        );
+        assert_eq!(
+            rejections(8, true).await,
+            [(RejectionStage::Forward, RejectionReason::FabricChainTooLong, Some(508), Some(-32603), true, true, true)]
+        );
+        assert!(
+            rejections(7, false)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The outbound pipeline refuses a Fabric Transit Point call at the hop
+    /// limit itself, before it forwards anything: one `request_rejected` at the
+    /// `forward` stage, which the send-time check does not write. A Transit
+    /// Point that does not require the token reads the count from one the agent
+    /// sends too.
+    #[tokio::test]
+    async fn the_outbound_pipeline_refuses_a_fabric_call_at_the_hop_limit_before_forwarding() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        use crate::proxy::transit_token::{TransitTokenIssuer, TransitTokenKey};
+
+        let issuer = TransitTokenIssuer::new(TransitTokenKey::generate().unwrap(), "gateway".into());
+        let refuse = |hops: u8, require_transit_token: bool| {
+            let issuer = issuer.clone();
+            async move {
+                let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+                    "surface_id": "fabric-surface", "name": "Fabric surface",
+                    "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+                    "target": {"endpoint": "http://127.0.0.1:1"},
+                    "transit": {"points": [{"alias": "partner", "protocol": "a2a",
+                        "require_transit_token": require_transit_token,
+                        "allow_unauthenticated_callers": !require_transit_token,
+                        "target_endpoint": "fabric://peer-gateway/peer-surface"}]}
+                }))
+                .unwrap();
+                let mut state = test_outbound_state();
+                state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+                state
+                    .channel_state
+                    .write()
+                    .unwrap()
+                    .surface = Arc::new(surface);
+                let mut claims = fabric_claims(None, "fabric-asserted", None, hops);
+                claims.iss = "gateway".into();
+                claims.surface_id = "fabric-surface".into();
+                claims.allowed_transit_points = vec!["partner".into()];
+                claims.iat = crate::proxy::credential_delegation::modern::now_secs().unwrap();
+                claims.exp = claims.iat + 200;
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/outbound/a2a/partner")
+                    .header("content-type", "application/json")
+                    .header("x-transit-token", issuer.sign(&claims).unwrap())
+                    .body(axum::body::Body::from(
+                        json!({"jsonrpc": "2.0", "id": 1, "method": "message/send"}).to_string(),
+                    ))
+                    .unwrap();
+                let (response, events) =
+                    crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+                        "127.0.0.1:12345"
+                            .parse()
+                            .unwrap(),
+                        state,
+                        request,
+                        crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    )))
+                    .await;
+                let rejections = events
+                    .into_iter()
+                    .filter_map(|event| match event.event {
+                        crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                            stage,
+                            reason,
+                            ..
+                        } => Some((stage, reason)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let status = match response {
+                    Ok(response) => response.status(),
+                    Err(error) => error.into_response().status(),
+                };
+                (status, rejections)
+            }
+        };
+
+        for require_transit_token in [true, false] {
+            assert_eq!(
+                refuse(8, require_transit_token).await,
+                (StatusCode::LOOP_DETECTED, vec![(RejectionStage::Forward, RejectionReason::FabricChainTooLong)]),
+                "require_transit_token: {require_transit_token}"
+            );
+            let (status, rejections) = refuse(7, require_transit_token).await;
+            assert_ne!(status, StatusCode::LOOP_DETECTED, "require_transit_token: {require_transit_token}");
+            assert!(
+                !rejections.contains(&(RejectionStage::Forward, RejectionReason::FabricChainTooLong)),
+                "require_transit_token: {require_transit_token}: {rejections:?}"
             );
         }
     }
@@ -11654,27 +20707,1733 @@ mod tests {
         }
     }
 
+    fn header_values<'a>(
+        headers: &'a HeaderMap,
+        name: &str,
+    ) -> Vec<&'a str> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect()
+    }
+
+    /// The managed agent's own credential headers on every request below.
+    fn with_agent_supplied_credentials(mut ctx: OutboundPipelineContext) -> OutboundPipelineContext {
+        for (name, value) in [
+            ("authorization", "Bearer agent-supplied-token"),
+            ("x-vendor-key", "agent-supplied-key"),
+            ("cookie", "agent_session=1"),
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x_forwarded_host", "agent.example"),
+            ("forwarded", "for=203.0.113.9"),
+            ("true-client-ip", "203.0.113.9"),
+        ] {
+            ctx.original_headers
+                .insert(name, HeaderValue::from_static(value));
+        }
+        ctx
+    }
+
+    /// A Transit Point context over [`delegation_state`] whose agent sends its
+    /// own credential and forwarding headers and `accept`, with `delegated` resolved for it and
+    /// a `target_auth` static key under `target_auth_header`, for `method` and
+    /// `path`.
+    async fn credential_header_case(
+        state: &OutboundProxyState,
+        target_auth_header: Option<&str>,
+        delegated: &[(&'static str, &'static str)],
+        method: Method,
+        path: &str,
+    ) -> OutboundPipelineContext {
+        if state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .get_by_secret_id("target-key")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            state
+                .secrets_store
+                .as_ref()
+                .unwrap()
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Target key".into(),
+                    secret_id: "target-key".into(),
+                    description: None,
+                    value: "target-static".into(),
+                    secret_type: "ApiKey".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let mut ctx = with_agent_supplied_credentials(test_pipeline_context());
+        ctx.original_headers
+            .insert("accept", HeaderValue::from_static("application/json"));
+        ctx.original_method = method;
+        ctx.request_path = path.to_string();
+        ctx.virtual_channel
+            .target_auth = target_auth_header.map(|header| {
+            serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": header, "header_format": "Key {value}"}}}))
+            .unwrap()
+        });
+        for (name, value) in delegated {
+            ctx.delegated_credential_headers
+                .insert(*name, HeaderValue::from_static(value));
+        }
+        ctx
+    }
+
+    fn sorted_headers(headers: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = headers.into_iter().collect();
+        headers.sort();
+        headers
+    }
+
+    fn header_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        sorted_headers(
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string())),
+        )
+    }
+
+    /// A case of the Transit Point header rule: its name, the `target_auth`
+    /// header, the delegated credential headers, the request's method and path,
+    /// and the headers the target receives, by lower-case name.
+    type CredentialHeaderCase = (
+        &'static str,
+        Option<&'static str>,
+        Vec<(&'static str, &'static str)>,
+        Method,
+        &'static str,
+        Vec<(&'static str, &'static str)>,
+    );
+
+    /// Every case the Transit Point header rule decides.
+    fn credential_header_rule_cases() -> Vec<CredentialHeaderCase> {
+        let call = "/outbound/surfaces/order/partner-a/message/send";
+        let discovery = "/outbound/surfaces/order/partner-a/.well-known/agent-card.json";
+        vec![
+            (
+                "a delegated credential in place of the agent's header",
+                None,
+                vec![("authorization", "Bearer delegated-access"), ("x-vendor-key", "Key delegated-access")],
+                Method::POST,
+                call,
+                vec![
+                    ("accept", "application/json"),
+                    ("authorization", "Bearer delegated-access"),
+                    ("x-vendor-key", "Key delegated-access"),
+                ],
+            ),
+            (
+                "target authentication in place of the agent's header",
+                Some("X-Vendor-Key"),
+                vec![],
+                Method::POST,
+                call,
+                vec![("accept", "application/json"), ("x-vendor-key", "Key target-static")],
+            ),
+            (
+                "the agent's header named like target authentication withheld on a discovery read",
+                Some("X-Vendor-Key"),
+                vec![],
+                Method::GET,
+                discovery,
+                vec![("accept", "application/json")],
+            ),
+            (
+                "a delegated credential in place of target authentication of the same name",
+                Some("Authorization"),
+                vec![("authorization", "Bearer delegated-access")],
+                Method::POST,
+                call,
+                vec![
+                    ("accept", "application/json"),
+                    ("authorization", "Bearer delegated-access"),
+                    ("x-vendor-key", "agent-supplied-key"),
+                ],
+            ),
+        ]
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_requests_get_no_delegated_credentials_after_variant_resolution_fails() {
+    async fn a_transit_point_credential_that_cannot_be_read_is_recorded_once_with_what_the_fallback_did() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage, TargetAuthOutcome};
         let directory = tempfile::tempdir().unwrap();
-        let state = delegation_state(directory.path(), &[("provider", "transit-access")]).await;
+        let state = delegation_state(directory.path(), &[]).await;
+        for (fallback, refused, outcome) in
+            [("reject", true, TargetAuthOutcome::Rejected), ("passthrough", false, TargetAuthOutcome::Passthrough)]
+        {
+            let mut ctx = credential_header_case(
+                &state,
+                None,
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/message/send",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_auth = Some(
+                serde_json::from_value(json!({
+                    "method": {"static_secret": {"secret_id": "absent", "header_name": "X-Vendor-Key"}},
+                    "fallback": fallback
+                }))
+                .unwrap(),
+            );
+            let request_id = ctx.request_id.clone();
+            let (sent, events) = crate::audit::producer::capture(transit_request_headers(&state, &mut ctx)).await;
+            assert_eq!(sent.is_err(), refused, "{fallback}");
+            let records: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        stage,
+                        reason,
+                        http_status,
+                        target_auth,
+                        ..
+                    } => Some((
+                        *stage,
+                        *reason,
+                        *http_status,
+                        target_auth
+                            .as_ref()
+                            .map(|detail| detail.outcome),
+                        event.trace_id.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                records,
+                vec![(
+                    RejectionStage::Forward,
+                    RejectionReason::TargetAuthFailed,
+                    refused.then_some(502),
+                    Some(outcome),
+                    Some(request_id)
+                )],
+                "{fallback}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_request_outside_its_base_path_is_recorded_as_rejected_on_either_leg_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (fallback, endpoint) in [
+            ("reject", "http://127.0.0.1:9/base"),
+            ("passthrough", "http://127.0.0.1:9/base"),
+            ("reject", "fabric://peer-gateway/partner"),
+            ("passthrough", "fabric://peer-gateway/partner"),
+        ] {
+            let mut ctx = credential_header_case(
+                &state,
+                None,
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/%2e%2e/admin",
+            )
+            .await;
+            ctx.virtual_channel
+                .target_endpoint = endpoint.to_string();
+            ctx.virtual_channel
+                .target_auth = Some(
+                serde_json::from_value(json!({
+                    "method": {"static_secret": {"secret_id": "target-key", "header_name": "X-Vendor-Key"}},
+                    "fallback": fallback
+                }))
+                .unwrap(),
+            );
+            let alias = ctx
+                .virtual_channel
+                .alias
+                .clone();
+            let (refused, events) = crate::audit::producer::capture(async {
+                if endpoint.starts_with("fabric://") {
+                    step_forward_request_fabric(&state, &mut ctx)
+                        .await
+                        .is_err()
+                } else {
+                    step_forward_request_http(&state, &mut ctx)
+                        .await
+                        .is_err()
+                }
+            })
+            .await;
+            assert!(refused, "{fallback} {endpoint}");
+            let records: Vec<_> = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(records, vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))], "{fallback} {endpoint}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_credential_that_cannot_be_sent_as_a_header_is_recorded_as_rejected_whatever_the_fallback()
+    {
+        use crate::audit::request_events::{RejectionReason, TargetAuthOutcome};
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let records = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| -> Vec<_> {
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                        reason: RejectionReason::TargetAuthFailed,
+                        http_status,
+                        target_auth: Some(detail),
+                        ..
+                    } => Some((*http_status, detail.outcome, detail.transit_point.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+        for fabric in [false, true] {
+            for fallback in ["reject", "passthrough"] {
+                let header_format = if fabric {
+                    "Key {value}\u{e9}"
+                } else {
+                    "Key {value}\u{7f}"
+                };
+                let mut ctx = credential_header_case(
+                    &state,
+                    Some("X-Vendor-Key"),
+                    &[],
+                    Method::POST,
+                    "/outbound/surfaces/order/partner-a/message/send",
+                )
+                .await;
+                if fabric {
+                    ctx.virtual_channel
+                        .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+                }
+                ctx.virtual_channel
+                    .target_auth = Some(
+                    serde_json::from_value(json!({
+                        "method": {"static_secret": {
+                            "secret_id": "target-key", "header_name": "X-Vendor-Key", "header_format": header_format}},
+                        "fallback": fallback
+                    }))
+                    .unwrap(),
+                );
+                let alias = ctx
+                    .virtual_channel
+                    .alias
+                    .clone();
+                let (refused, events) = crate::audit::producer::capture(async {
+                    if fabric {
+                        fabric_forward_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    } else {
+                        transit_request_headers(&state, &mut ctx)
+                            .await
+                            .is_err()
+                    }
+                })
+                .await;
+                assert!(refused, "{fallback} fabric={fabric}");
+                assert_eq!(
+                    records(&events),
+                    vec![(Some(502), TargetAuthOutcome::Rejected, Some(alias))],
+                    "{fallback} fabric={fabric}"
+                );
+            }
+
+            let mut ctx = credential_header_case(
+                &state,
+                Some("X-Vendor-Key"),
+                &[],
+                Method::POST,
+                "/outbound/surfaces/order/partner-a/message/send",
+            )
+            .await;
+            if fabric {
+                ctx.virtual_channel
+                    .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            }
+            let (sent, events) = crate::audit::producer::capture(async {
+                if fabric {
+                    fabric_forward_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                } else {
+                    transit_request_headers(&state, &mut ctx)
+                        .await
+                        .is_ok()
+                }
+            })
+            .await;
+            assert!(sent, "fabric={fabric}");
+            assert_eq!(records(&events), vec![], "a credential that can be sent writes no record, fabric={fabric}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transit_request_headers_send_one_value_of_each_credential_header_and_never_the_agents_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (case, target_auth_header, delegated, method, path, expected) in credential_header_rule_cases() {
+            let mut ctx = credential_header_case(&state, target_auth_header, &delegated, method, path).await;
+
+            let sent = transit_request_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sorted_headers(
+                    sent.iter()
+                        .map(|(name, value)| (
+                            name.to_string(),
+                            value
+                                .to_str()
+                                .unwrap()
+                                .to_string()
+                        ))
+                ),
+                header_pairs(&expected),
+                "{case}"
+            );
+        }
+    }
+
+    /// The Fabric leg hands the transport the headers of the Transit Point rule,
+    /// in its buffered and its streamed form: delegated credentials and target
+    /// authentication, never the agent's own `Authorization`, `Cookie` or a
+    /// header named like the `target_auth` one; and the Fabric crossings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_forward_carries_the_transit_point_credential_headers_and_no_agent_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        for (case, target_auth_header, delegated, method, path, expected) in credential_header_rule_cases() {
+            let mut ctx = credential_header_case(&state, target_auth_header, &delegated, method, path).await;
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            let expected = sorted_headers(
+                header_pairs(&expected)
+                    .into_iter()
+                    .chain([("x-gateway-fabric-hops".to_string(), "1".to_string())]),
+            );
+
+            let (buffered, streamed) = fabric_forward_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                sorted_headers(buffered),
+                sorted_headers(
+                    expected
+                        .clone()
+                        .into_iter()
+                        .map(|(name, value)| (name.to_uppercase(), value))
+                ),
+                "{case}: buffered"
+            );
+            assert_eq!(
+                sorted_headers(
+                    streamed
+                        .iter()
+                        .map(|(name, value)| (
+                            name.to_string(),
+                            value
+                                .to_str()
+                                .unwrap()
+                                .to_string()
+                        ))
+                ),
+                expected,
+                "{case}: streamed"
+            );
+        }
+    }
+
+    /// A Fabric peer's response reaches the managed agent without the target's
+    /// cookies and authentication challenges, on a buffered and on a streamed
+    /// `2026-07-28` MCP response.
+    #[tokio::test]
+    async fn a_fabric_transit_point_response_withholds_the_targets_cookies_and_challenges() {
+        let challenge_headers = || {
+            let mut headers = HeaderMap::new();
+            headers.append("set-cookie", HeaderValue::from_static("vendor_sid=one; HttpOnly"));
+            headers.insert("www-authenticate", HeaderValue::from_static("Bearer error=\"invalid_token\""));
+            headers.insert("content-type", HeaderValue::from_static("application/json"));
+            headers.insert("x-vendor-request-id", HeaderValue::from_static("vendor-9"));
+            headers
+        };
+        let state = test_outbound_state();
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        let buffered = step_process_response(
+            &state,
+            &mut ctx,
+            UpstreamResponse::Fabric {
+                status: StatusCode::UNAUTHORIZED,
+                headers: challenge_headers(),
+                body: Bytes::from_static(br#"{"error":"invalid_token"}"#),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut streamed_upstream = axum::response::Response::new(axum::body::Body::from(
+            json!({"jsonrpc": "2.0", "id": "stream", "result": {"resultType": "complete", "content": []}}).to_string(),
+        ));
+        *streamed_upstream.headers_mut() = challenge_headers();
+        let mut modern = modern_pipeline_context("tools/call");
+        modern
+            .virtual_channel
+            .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+        let streamed = process_modern_outbound_response(
+            test_outbound_state(),
+            modern,
+            UpstreamResponse::FabricStream(streamed_upstream),
+        )
+        .await
+        .unwrap();
+
+        for (case, response) in [("buffered", buffered), ("streamed", streamed)] {
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("set-cookie"),
+                "{case}"
+            );
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("www-authenticate"),
+                "{case}"
+            );
+            assert_eq!(response.headers()["x-vendor-request-id"], "vendor-9", "{case}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegated_credential_headers_reach_the_target_and_the_agent_cannot_supply_or_replace_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[("provider", "vendor-access")]).await;
+        state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Target key".into(),
+                secret_id: "target-key".into(),
+                description: None,
+                value: "target-static".into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let delegated = |alias: &str, inject_as: serde_json::Value| {
+            json!({"alias": alias, "target_endpoint": target.url, "transit_credentials":
+                {"credential_provider_id": "provider", "scopes": ["read"], "inject_as": inject_as}})
+        };
         let surface = transit_surface(
-            json!([meta_transit_point("partner", "https://partner.example/mcp", false, Some("provider"))]),
+            json!([
+                delegated("bearer", json!({"type": "bearer_header"})),
+                delegated("custom", json!({"type": "custom_header", "name": "X-Vendor-Key", "format": "Key {value}"})),
+                {"alias": "fixed", "target_endpoint": target.url, "target_auth": {"method": {"static_secret": {
+                    "secret_id": "target-key", "header_name": "Authorization", "header_format": "Bearer {value}"}}}}
+            ]),
             json!([]),
         );
 
-        for (error, expected) in [
-            (None, json!("transit-access")),
-            (
-                Some(crate::config::agent_surface_variants::VariantResolveError::UnknownAlias("missing".into())),
-                serde_json::Value::Null,
-            ),
+        for (alias, authorization, vendor_key) in [
+            ("bearer", vec!["Bearer vendor-access"], vec!["agent-supplied-key"]),
+            ("custom", vec![], vec!["Key vendor-access"]),
+            ("fixed", vec!["Bearer target-static"], vec!["agent-supplied-key"]),
         ] {
-            let (resolved, partner) = resolved_transit_point(&surface, None, "partner");
-            let mut ctx = legacy_delegation_context(resolved, partner);
-            let failed = error.is_some();
-            ctx.variant_resolution_error = error;
-            assert_eq!(injected_credential(&state, ctx).await, expected, "variant_resolution_failed={failed}");
+            let (resolved, point) = resolved_transit_point(&surface, None, alias);
+            let mut ctx = with_agent_supplied_credentials(legacy_delegation_context(resolved, point));
+
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .unwrap();
+            step_forward_request(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            let received = target.received();
+            let sent = received.last().unwrap();
+            assert_eq!(header_values(sent, "authorization"), authorization, "{alias}: {sent:?}");
+            assert_eq!(header_values(sent, "x-vendor-key"), vendor_key, "{alias}: {sent:?}");
+            for withheld in ["cookie", "x-forwarded-for", "x_forwarded_host", "forwarded", "true-client-ip"] {
+                assert!(header_values(sent, withheld).is_empty(), "{alias} sent {withheld}: {sent:?}");
+            }
         }
+        assert_eq!(target.received().len(), 3);
+    }
+
+    /// The Transit Point pipeline of a surface whose Transit Points, one per
+    /// `(alias, protocol, binding)`, forward to `target_url`, over the vault and
+    /// providers of [`delegation_state`], with the issuer whose tokens open them.
+    async fn delegation_pipeline(
+        directory: &std::path::Path,
+        target_url: &str,
+        points: &[(&str, &str, serde_json::Value)],
+    ) -> (OutboundProxyState, crate::proxy::transit_token::TransitTokenIssuer) {
+        let mut state = delegation_state(directory, &[("provider", "vendor-access")]).await;
+        let providers = state
+            .credential_provider_store
+            .clone()
+            .unwrap();
+        for provider in [
+            json!({"id": "no-endpoint", "name": "No endpoint", "provider_id": "no-endpoint"}),
+            json!({"id": "broken-key", "name": "Broken key", "provider_id": "broken-key",
+                "provider_type": "api_key", "api_key_secret_ref": "missing-secret"}),
+            json!({"id": "consent", "name": "Consent", "provider_id": "consent",
+                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id"}),
+        ] {
+            let mut provider = provider;
+            provider["created_at"] = json!("2026-10-01T00:00:00Z");
+            provider["updated_at"] = json!("2026-10-01T00:00:00Z");
+            providers
+                .create(serde_json::from_value(provider).unwrap())
+                .await
+                .unwrap();
+        }
+        state
+            .secrets_store
+            .as_ref()
+            .unwrap()
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: None,
+                name: "Client id".into(),
+                secret_id: "client-id".into(),
+                description: None,
+                value: "gateway-client".into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+        state
+            .delegation_vault_store
+            .as_ref()
+            .unwrap()
+            .store(
+                serde_json::from_value(json!({
+                    "id": "consented-elsewhere", "agent_did": "unknown", "user_identity_hash": "sha256:user",
+                    "credential_provider_id": "provider", "provider_id": "provider",
+                    "access_token": "grant-consented-on-another-surface", "scopes": ["read"],
+                    "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                    "consent_granted_at": "2026-10-01T00:00:00Z",
+                    "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let points: Vec<serde_json::Value> = points
+            .iter()
+            .map(|(alias, protocol, binding)| {
+                json!({"alias": alias, "protocol": protocol, "target_endpoint": target_url,
+                    "transit_credentials": binding})
+            })
+            .collect();
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(json!(points), json!([])));
+        let issuer = crate::proxy::transit_token::TransitTokenIssuer::new(
+            crate::proxy::transit_token::TransitTokenKey::generate().unwrap(),
+            "gateway".into(),
+        );
+        state.transit_token_issuer = Some(Arc::new(issuer.clone()));
+        (state, issuer)
+    }
+
+    async fn through_the_pipeline(
+        state: &OutboundProxyState,
+        alias: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/outbound/mcp/{alias}"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("x-transit-token", token)
+            .body(axum::body::Body::from(
+                json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "echo"}}).to_string(),
+            ))
+            .unwrap();
+        let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state.clone(),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response());
+        let status = response.status();
+        let body = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn binding(
+        provider: &str,
+        inject_as: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({"credential_provider_id": provider, "scopes": ["read"], "inject_as": inject_as})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_refuses_a_request_whose_delegated_credential_cannot_be_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let bearer = json!({"type": "bearer_header"});
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[
+                ("granted", "mcp", binding("provider", bearer.clone())),
+                ("gone", "mcp", binding("deleted-provider", bearer.clone())),
+                ("no-endpoint", "mcp", binding("no-endpoint", bearer.clone())),
+                ("broken-key", "mcp", binding("broken-key", bearer.clone())),
+                (
+                    "bad-header",
+                    "mcp",
+                    binding("provider", json!({"type": "custom_header", "name": "Bad Header", "format": "{value}"})),
+                ),
+                ("plain", "http", binding("deleted-provider", bearer.clone())),
+                ("untokened", "mcp", binding("provider", bearer.clone())),
+            ],
+        )
+        .await;
+        {
+            let mut channel_state = state
+                .channel_state
+                .write()
+                .unwrap();
+            let mut surface = (*channel_state.surface).clone();
+            for point in &mut surface
+                .transit
+                .as_mut()
+                .unwrap()
+                .points
+            {
+                point.require_transit_token = point.alias != "untokened";
+                point.allow_unauthenticated_callers = point.alias == "untokened";
+            }
+            channel_state.surface = Arc::new(surface);
+        }
+        let token = |user: Option<&str>, agent: Option<&str>| {
+            issuer
+                .issue("transit-fabric", agent, None, None, user, None, vec![])
+                .unwrap()
+        };
+        let authenticated = token(Some("sha256:user"), Some("did:web:agent.example"));
+        let mut without_stores = state.clone();
+        without_stores.delegation_vault_store = None;
+
+        for (case, state, alias, token, status, code) in [
+            ("anonymous caller", &state, "granted", token(None, Some("did:web:agent.example")), 403, -32001),
+            ("no transit token where none is required", &state, "untokened", String::new(), 403, -32001),
+            ("no agent identity", &state, "granted", token(Some("sha256:user"), None), 403, -32001),
+            ("provider deleted", &state, "gone", authenticated.clone(), 503, -32603),
+            ("no authorization endpoint", &state, "no-endpoint", authenticated.clone(), 503, -32603),
+            ("api key unresolvable", &state, "broken-key", authenticated.clone(), 503, -32603),
+            ("invalid credential header", &state, "bad-header", authenticated.clone(), 503, -32603),
+            ("stores unavailable", &without_stores, "granted", authenticated.clone(), 503, -32603),
+        ] {
+            let (actual, body) = through_the_pipeline(state, alias, &token).await;
+
+            assert_eq!(actual.as_u16(), status, "{case}: {body}");
+            assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
+            assert_eq!(body["id"], 7, "{case}: {body}");
+            assert_eq!(body["error"]["code"], code, "{case}: {body}");
+            assert!(target.received().is_empty(), "{case}: the target must not be called");
+        }
+
+        let (status, body) = through_the_pipeline(&state, "plain", &authenticated).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["detail"], "Delegated credentials unavailable", "{body}");
+        assert!(target.received().is_empty());
+
+        let (status, body) = through_the_pipeline(&state, "granted", &authenticated).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(header_values(&received[0], "authorization"), ["Bearer vendor-access"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_transit_point_refuses_a_delegated_credential_of_another_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let bearer = json!({"type": "bearer_header"});
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("shared", "mcp", binding("provider", bearer.clone())), ("foreign", "mcp", binding("foreign", bearer))],
+        )
+        .await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "foreign", "name": "foreign", "provider_id": "foreign", "tenant_id": "tenant-b",
+                    "resource": "https://provider.example/api",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        {
+            let mut channel_state = state
+                .channel_state
+                .write()
+                .unwrap();
+            let mut surface = (*channel_state.surface).clone();
+            surface.tenant_id = Some("tenant-a".into());
+            channel_state.surface = Arc::new(surface);
+        }
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "foreign", &token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], -32603, "{body}");
+        assert!(target.received().is_empty());
+
+        let (status, body) = through_the_pipeline(&state, "shared", &token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(target.received().len(), 1);
+    }
+
+    /// An opted-in Transit Point releases a Fabric caller's stored grant on a
+    /// tenant surface only from a credential provider of that tenant, as it does
+    /// for a caller an Access Point's token names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_transit_point_releases_a_fabric_callers_grant_only_from_its_own_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let (state, _) = delegation_pipeline(directory.path(), "https://partner.example/mcp", &[]).await;
+        let carol_hash = crate::source_auth::AuthenticatedIdentity::ApiKey {
+            key_name: "carol".to_string(),
+            provider_agent_id: None,
+        }
+        .principal_hash(Some("tenant-a"))
+        .unwrap();
+        let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: "dave".to_string(),
+            claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+        };
+        for (provider, tenant) in [("tenant-own", "tenant-a"), ("tenant-foreign", "tenant-b")] {
+            state
+                .credential_provider_store
+                .as_ref()
+                .unwrap()
+                .create(
+                    serde_json::from_value(json!({
+                        "id": provider, "name": provider, "provider_id": provider, "tenant_id": tenant,
+                        "authorization_endpoint": "https://provider.example/authorize",
+                        "client_id_secret_ref": "client-id",
+                        "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            state
+                .delegation_vault_store
+                .as_ref()
+                .unwrap()
+                .store(
+                    serde_json::from_value(json!({
+                        "id": format!("carol-{provider}"), "agent_did": "did:web:agent.example",
+                        "user_identity_hash": carol_hash, "credential_provider_id": provider,
+                        "provider_id": provider, "access_token": format!("{provider}-access"), "scopes": ["read"],
+                        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
+                        "consent_granted_at": "2026-10-01T00:00:00Z",
+                        "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let call = |provider: &str| {
+            let mut point = meta_transit_point("partner", "https://partner.example/mcp", false, Some(provider));
+            point["delegated_credentials_for_fabric_callers"] = json!(true);
+            let mut surface = telling_users_apart(transit_surface(json!([point]), json!([])));
+            surface.tenant_id = Some("tenant-a".into());
+            let (resolved, point) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = legacy_delegation_context(resolved, point);
+            ctx.transit_token_claims = Some(verified_fabric_claims(Some("did:web:asserted.example"), &carol_hash));
+            ctx.authenticated_identity = Some(direct_client.clone());
+            ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
+            ctx
+        };
+
+        assert_eq!(
+            injected_credential(&state, call("tenant-own")).await,
+            "tenant-own-access",
+            "a provider of the surface's tenant"
+        );
+
+        let mut foreign = call("tenant-foreign");
+        let refused = step_inject_credentials(&state, &mut foreign)
+            .await
+            .expect_err("another tenant's provider releases nothing");
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("tenant-foreign-access"),
+            "the refusal does not carry the grant"
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                foreign
+                    .body_bytes
+                    .as_ref()
+                    .unwrap()
+            )
+            .contains("tenant-foreign-access"),
+            "nothing was injected into the request"
+        );
+    }
+
+    /// A public discovery read needs no transit token and names no caller, so
+    /// it reaches the target without a delegated credential, as it does without
+    /// a target authentication one, rather than being refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_public_discovery_read_through_a_credentialed_transit_point_carries_no_credential() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, _) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("granted", "mcp", binding("provider", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/outbound/mcp/granted/.well-known/agent-card.json")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response());
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let received = target.received();
+        assert_eq!(received.len(), 1);
+        assert!(header_values(&received[0], "authorization").is_empty(), "{:?}", received[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_still_asks_for_consent_when_no_grant_is_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let (state, issuer) = delegation_pipeline(
+            directory.path(),
+            &target.url,
+            &[("consent", "mcp", binding("consent", json!({"type": "bearer_header"})))],
+        )
+        .await;
+        let token = issuer
+            .issue("transit-fabric", Some("did:web:agent.example"), None, None, Some("sha256:user"), None, vec![])
+            .unwrap();
+
+        let (status, body) = through_the_pipeline(&state, "consent", &token).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["type"], "https://affinidi.com/atg/errors/consent-required");
+        assert_eq!(body["consent_required"][0]["provider_name"], "Consent");
+        assert!(
+            body["consent_required"][0]["authorization_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("https://provider.example/authorize?"),
+            "{body}"
+        );
+        assert_eq!(
+            body.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["consent_required", "detail", "status", "title", "type"].into()
+        );
+        assert!(target.received().is_empty());
+    }
+
+    async fn send_through_the_pipeline(
+        state: &OutboundProxyState,
+        method: &str,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let response = Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state.clone(),
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        ))
+        .await
+        .unwrap_or_else(|error| error.into_response());
+        let status = response.status();
+        let body = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap(),
+        )
+        .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    fn protocol_request_body(protocol: &str) -> String {
+        match protocol {
+            "mcp" => json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "echo"}}),
+            "a2a" => json!({"jsonrpc": "2.0", "id": 7, "method": "message/send",
+                "params": {"message": {"role": "user", "parts": [], "messageId": "m1"}}}),
+            _ => json!({"ping": true}),
+        }
+        .to_string()
+    }
+
+    fn assert_refusal(
+        case: &str,
+        protocol: &str,
+        body: &serde_json::Value,
+        message: &str,
+    ) {
+        if protocol == "mcp" {
+            assert_eq!(body["jsonrpc"], "2.0", "{case}: {body}");
+            assert_eq!(body["id"], 7, "{case}: {body}");
+            assert_eq!(body["error"]["message"], message, "{case}: {body}");
+        } else {
+            assert_eq!(body["detail"], message, "{case}: {body}");
+        }
+    }
+
+    /// The policy, response policy and MCP tool gating of a Transit Point are
+    /// enforced as the base surface configures them, so a variant that changes
+    /// them is refused rather than served with the base surface's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_variant_that_changes_its_transit_points_enforced_policy_is_refused() {
+        for protocol in ["http", "mcp"] {
+            let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+            let point = |extra: serde_json::Value| {
+                let mut point = json!({"alias": "partner", "protocol": protocol, "require_transit_token": false,
+                    "allow_unauthenticated_callers": true,
+                    "target_endpoint": target.url});
+                for (key, value) in extra.as_object().unwrap() {
+                    point[key] = value.clone();
+                }
+                point
+            };
+            let variant = |alias: &str, extra: serde_json::Value| {
+                json!({"id": format!("variant-{alias}"), "alias": alias, "name": alias,
+                    "overrides": {"transit": {"points": [point(extra)]}}})
+            };
+            let state = test_outbound_state();
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([point(json!({}))]),
+                json!([
+                    variant(
+                        "gated",
+                        json!({"mcp_tool_gating": {"gates": [{"id": "g1", "name": "no admin",
+                        "action": {"effect": "deny", "patterns": ["^admin_"]}}]}})
+                    ),
+                    variant("policed", json!({"policy": {"policy_definition_id": "variant-policy"}})),
+                    variant("screened", json!({"response_policy": {"policy_definition_id": "variant-policy"}})),
+                    variant("same", json!({}))
+                ]),
+            ));
+
+            for alias in ["gated", "policed", "screened"] {
+                let (status, body) = send_through_the_pipeline(
+                    &state,
+                    "POST",
+                    &format!("/outbound/mcp${alias}/partner"),
+                    &protocol_request_body(protocol),
+                )
+                .await;
+
+                let case = format!("{protocol} {alias}");
+                assert_eq!(status, StatusCode::FORBIDDEN, "{case}: {body}");
+                assert_refusal(&case, protocol, &body, "This Transit Point variant is unavailable");
+            }
+            assert!(target.received().is_empty(), "{protocol}: the target must not be called");
+
+            let (status, body) = send_through_the_pipeline(
+                &state,
+                "POST",
+                "/outbound/mcp$same/partner",
+                &protocol_request_body(protocol),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{protocol} same: {body}");
+            assert_eq!(target.received().len(), 1, "{protocol} same");
+        }
+    }
+
+    /// An agent header named like the header of any of the Transit Point's
+    /// delegated credential bindings never reaches the target, every value of
+    /// it and whatever its case, even when no delegated credential is sent for
+    /// the request, so the agent cannot stand in for a withheld credential.
+    #[tokio::test]
+    async fn an_agent_header_named_like_a_delegated_credential_binding_never_reaches_the_target() {
+        let state = test_outbound_state();
+        let custom = |name: &str| json!({"type": "custom_header", "name": name, "format": "Key {value}"});
+        for (case, transit_credentials, outbound_credentials, delegated) in [
+            ("transit point binding", Some(custom("X-Vendor-Key")), json!([]), None),
+            ("binding in another case", Some(custom("X-VENDOR-KEY")), json!([]), None),
+            (
+                "surface binding for some tools only",
+                None,
+                json!([{"credential_provider_id": "provider", "required_for": {"tools": ["scoped_tool"]},
+                    "inject_as": custom("X-Vendor-Key")}]),
+                None,
+            ),
+            ("delegated credential sent", Some(custom("X-Vendor-Key")), json!([]), Some("Key delegated-access")),
+        ] {
+            let mut point = json!({"alias": "partner", "target_endpoint": "https://partner.example/api"});
+            if let Some(inject_as) = transit_credentials {
+                point["transit_credentials"] = json!({"credential_provider_id": "provider", "inject_as": inject_as});
+            }
+            let mut surface = transit_surface(json!([point]), json!([]));
+            surface.outbound_credentials = serde_json::from_value(outbound_credentials).unwrap();
+            let (resolved, partner) = resolved_transit_point(&surface, None, "partner");
+            let mut ctx = with_agent_supplied_credentials(test_pipeline_context());
+            ctx.surface = resolved;
+            ctx.virtual_channel = partner;
+            ctx.original_headers
+                .append("x-vendor-key", HeaderValue::from_static("agent-supplied-second-key"));
+            ctx.original_headers
+                .insert("x-agent-note", HeaderValue::from_static("kept"));
+            if let Some(value) = delegated {
+                ctx.delegated_credential_headers
+                    .insert("x-vendor-key", HeaderValue::from_static(value));
+            }
+
+            let sent = transit_request_headers(&state, &mut ctx)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                header_values(&sent, "x-vendor-key"),
+                delegated
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{case}"
+            );
+            assert!(header_values(&sent, "authorization").is_empty(), "{case}");
+            assert_eq!(header_values(&sent, "x-agent-note"), ["kept"], "{case}");
+        }
+    }
+
+    /// A Transit Point's credentials are configured as `target_auth` secrets
+    /// and delegated credentials, and either may hold bytes beyond ASCII.
+    async fn non_ascii_credential_context(state: &OutboundProxyState) -> OutboundPipelineContext {
+        let secrets = state
+            .secrets_store
+            .as_ref()
+            .unwrap();
+        if secrets
+            .get_by_secret_id("target-key")
+            .await
+            .unwrap()
+            .is_none()
+        {
+            secrets
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: None,
+                    name: "Target key".into(),
+                    secret_id: "target-key".into(),
+                    description: None,
+                    value: "clé-secrète".into(),
+                    secret_type: "ApiKey".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        let mut ctx = test_pipeline_context();
+        ctx.virtual_channel
+            .target_auth = Some(
+            serde_json::from_value(json!({"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "Key {value}"}}}))
+            .unwrap(),
+        );
+        ctx.delegated_credential_headers
+            .insert("x-vendor-key", HeaderValue::from_bytes("Key café".as_bytes()).unwrap());
+        ctx
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_headers_beyond_ascii_reach_an_http_target_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        let mut ctx = non_ascii_credential_context(&state).await;
+        ctx.virtual_channel
+            .target_endpoint = target.url.clone();
+
+        step_forward_request(&state, &mut ctx)
+            .await
+            .unwrap();
+
+        let received = target.received();
+        let sent = received.last().unwrap();
+        assert_eq!(sent["x-target-key"].as_bytes(), "Key clé-secrète".as_bytes());
+        assert_eq!(sent["x-vendor-key"].as_bytes(), "Key café".as_bytes());
+    }
+
+    /// The Fabric envelope carries header values as strings, so a credential
+    /// that is not one refuses the request rather than leaving it out; another
+    /// header that is not one is left out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fabric_forward_refuses_a_credential_header_it_cannot_carry() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = delegation_state(directory.path(), &[]).await;
+        let fabric = |mut ctx: OutboundPipelineContext| {
+            ctx.virtual_channel
+                .target_endpoint = "fabric://peer-gateway/peer-surface".into();
+            ctx
+        };
+
+        let mut delegated = fabric(non_ascii_credential_context(&state).await);
+        delegated
+            .virtual_channel
+            .target_auth = None;
+        let result = fabric_forward_headers(&state, &mut delegated).await;
+        assert!(
+            matches!(
+                result,
+                Err(OutboundPipelineError::DelegationRefused {
+                    refusal: DelegationRefusal::Unavailable,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+
+        let mut target_auth = fabric(non_ascii_credential_context(&state).await);
+        target_auth.delegated_credential_headers = HeaderMap::new();
+        let result = fabric_forward_headers(&state, &mut target_auth).await;
+        assert!(matches!(result, Err(OutboundPipelineError::TargetAuthUnavailable { .. })), "{result:?}");
+
+        let mut agent = fabric(test_pipeline_context());
+        agent
+            .original_headers
+            .insert("x-agent-note", HeaderValue::from_bytes("café".as_bytes()).unwrap());
+        agent
+            .original_headers
+            .insert("accept", HeaderValue::from_static("application/json"));
+        let (buffered, streamed) = fabric_forward_headers(&state, &mut agent)
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted_headers(buffered),
+            header_pairs(&[("ACCEPT", "application/json"), ("X-GATEWAY-FABRIC-HOPS", "1")])
+        );
+        assert!(!streamed.contains_key("x-agent-note"));
+    }
+
+    /// An MCP Transit Point answers a request whose target credential cannot
+    /// be resolved with a JSON-RPC error carrying the request's id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_transit_point_answers_an_unavailable_target_credential_with_a_json_rpc_error() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        for protocol in ["mcp", "http"] {
+            let state = test_outbound_state();
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": protocol, "require_transit_token": false,
+                    "allow_unauthenticated_callers": true,
+                    "target_endpoint": target.url, "target_auth": {"method": {"static_secret": {
+                        "secret_id": "missing", "header_name": "X-Target-Key", "header_format": "{value}"}}}}]),
+                json!([]),
+            ));
+
+            let (status, body) =
+                send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &protocol_request_body(protocol))
+                    .await;
+
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{protocol}: {body}");
+            assert_refusal(protocol, protocol, &body, "Target authentication credentials unavailable");
+        }
+        assert!(target.received().is_empty());
+    }
+
+    /// An MCP Transit Point answers a caller its `source_auth` refuses with a
+    /// JSON-RPC error; any other Transit Point with problem JSON.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_transit_point_answers_a_refused_caller_with_a_json_rpc_error() {
+        let target = crate::component_tests::helpers::RecordingTarget::start(StatusCode::OK, &[]).await;
+        for protocol in ["mcp", "http"] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = transit_caller_key_state(directory.path()).await;
+            state
+                .channel_state
+                .write()
+                .unwrap()
+                .surface = Arc::new(transit_surface(
+                json!([{"alias": "partner", "protocol": protocol, "require_transit_token": false,
+                    "target_endpoint": target.url, "source_auth": {"type": "api_key",
+                    "extraction": {"source": "http_header", "field": "X-API-Key"},
+                    "secret_id": "transit-caller-key"}}]),
+                json!([]),
+            ));
+
+            let (status, body) =
+                send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &protocol_request_body(protocol))
+                    .await;
+
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{protocol}: {body}");
+            if protocol == "mcp" {
+                assert_eq!(body["jsonrpc"], "2.0", "{body}");
+                assert_eq!(body["id"], serde_json::Value::Null, "{body}");
+                assert_eq!(body["error"]["code"], -32001, "{body}");
+                assert_eq!(body["error"]["message"], "Caller credential missing or invalid", "{body}");
+            } else {
+                assert_eq!(body["detail"], "Caller credential missing or invalid", "{body}");
+            }
+        }
+        assert!(target.received().is_empty());
+    }
+
+    async fn recorded_connection_statuses(
+        metrics: &crate::metrics::MetricsStore
+    ) -> Vec<crate::metrics::ConnectionStatus> {
+        for _ in 0..50 {
+            let connections = metrics
+                .get_recent_connections(10)
+                .await;
+            if !connections.is_empty() {
+                return connections
+                    .into_iter()
+                    .map(|connection| connection.status)
+                    .collect();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Vec::new()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_an_unreachable_target_as_a_failed_call() {
+        let unreachable = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_url = format!(
+            "http://{}",
+            unreachable
+                .local_addr()
+                .unwrap()
+        );
+        drop(unreachable);
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut state = test_outbound_state();
+        state.metrics_store = Some(metrics.clone());
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(transit_surface(
+            json!([{"alias": "partner", "protocol": "http", "require_transit_token": false,
+                "allow_unauthenticated_callers": true, "target_endpoint": target_url}]),
+            json!([]),
+        ));
+
+        let (status, body) =
+            send_through_the_pipeline(&state, "POST", "/outbound/mcp/partner", &protocol_request_body("http")).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(recorded_connection_statuses(&metrics).await, [crate::metrics::ConnectionStatus::Failed]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_modern_call_the_target_fails_as_a_failed_call() {
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut state = test_outbound_state();
+        state.metrics_store = Some(metrics.clone());
+        let upstream = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/json")
+                .body(reqwest::Body::from(
+                    json!({"jsonrpc": "2.0", "id": "stream", "error": {"code": -32603, "message": "target failed"}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        );
+
+        if let Ok(response) = process_modern_outbound_response(
+            state,
+            modern_pipeline_context("tools/call"),
+            UpstreamResponse::Http(upstream),
+        )
+        .await
+        {
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        }
+
+        assert_eq!(recorded_connection_statuses(&metrics).await, [crate::metrics::ConnectionStatus::Failed]);
+    }
+
+    type Rejections =
+        Vec<(crate::audit::request_events::RejectionStage, crate::audit::request_events::RejectionReason, Option<u16>)>;
+
+    fn rejections_of(events: Vec<crate::delegation_vault::audit::DelegationAuditEvent>) -> Rejections {
+        events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    ..
+                } => Some((stage, reason, http_status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A listener state serving one open Transit Point `/outbound/a2a/partner`
+    /// of `protocol`, whose request cap is `max_request_bytes`.
+    fn open_transit_point_state(
+        protocol: &str,
+        mcp_http: Option<serde_json::Value>,
+        max_request_bytes: usize,
+    ) -> OutboundProxyState {
+        let mut point = json!({"alias": "partner", "protocol": protocol, "require_transit_token": false,
+            "allow_unauthenticated_callers": true, "target_endpoint": "http://127.0.0.1:1"});
+        if let Some(mcp_http) = mcp_http {
+            point["mcp_http"] = mcp_http;
+        }
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "body-surface", "name": "Body surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/a2a", "protocol": "a2a"},
+            "target": {"endpoint": "http://127.0.0.1:1"},
+            "transit": {"points": [point]}
+        }))
+        .unwrap();
+        let mut state = test_outbound_state();
+        state.max_request_bytes = max_request_bytes;
+        state
+            .channel_state
+            .write()
+            .unwrap()
+            .surface = Arc::new(surface);
+        state
+    }
+
+    /// The answer of the listener with `state` to `request`, and the
+    /// `request_rejected` records it wrote.
+    async fn serve_transit_point(
+        state: OutboundProxyState,
+        request: Request<axum::body::Body>,
+    ) -> (Response, Rejections) {
+        let (response, events) = crate::audit::producer::capture(Box::pin(outbound_proxy_handler_with_mcp_versions(
+            "127.0.0.1:12345"
+                .parse()
+                .unwrap(),
+            state,
+            request,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+        )))
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        (response, rejections_of(events))
+    }
+
+    /// The status, body and `request_rejected` records of a call to an open
+    /// Transit Point of `protocol` with `body`, on a listener whose request cap
+    /// is `max_request_bytes`.
+    async fn transit_point_body_outcome(
+        protocol: &str,
+        mcp_http: Option<serde_json::Value>,
+        max_request_bytes: usize,
+        body: axum::body::Body,
+    ) -> (StatusCode, String, Rejections) {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/outbound/a2a/partner")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(body)
+            .unwrap();
+        let (response, rejections) =
+            serve_transit_point(open_transit_point_state(protocol, mcp_http, max_request_bytes), request).await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+    }
+
+    /// Through the shared-host hop, a chunked body over the cap still reaches
+    /// the Transit Point past its cap, whatever size its chunks, so the Transit
+    /// Point refuses it and records one `request_rejected` at admission, and
+    /// the caller gets 413.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transit_point_records_a_body_over_the_cap_sent_through_the_shared_host() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        const CAP: usize = 64 * 1024;
+
+        for chunk in [1024, 256 * 1024, 400 * 1024, 600 * 1024] {
+            let endless = axum::body::Body::from_stream(futures::stream::repeat_with(move || {
+                Ok::<_, std::io::Error>(Bytes::from(vec![b' '; chunk]))
+            }));
+            let request = Request::builder()
+                .method("POST")
+                .uri("/outbound/a2a/partner")
+                .header("content-type", "application/json")
+                .body(endless)
+                .unwrap();
+            let (status, body, rejections) =
+                through_the_shared_host(open_transit_point_state("a2a", None, CAP), CAP, request).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{chunk}: {body}");
+            assert!(body.contains(&format!("Request body too large (max: {CAP})")), "{chunk}: {body}");
+            assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))], "{chunk}");
+        }
+    }
+
+    /// Through the shared-host hop, a 2 MiB body to an MCP Transit Point with
+    /// the default `mcp_http` (1 MiB), declared or chunked, is refused by the
+    /// Transit Point with one `request_rejected` at admission. The caller gets
+    /// its JSON-RPC 413, or a 502 when the reset of the unread body overtakes
+    /// that answer at the hop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_transit_point_records_a_body_over_its_limit_sent_through_the_shared_host() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+        const BODY: usize = 2 * 1024 * 1024;
+        let cap = crate::config::A2aConfig::default().max_body_size;
+
+        for declared in [true, false] {
+            let body = if declared {
+                axum::body::Body::from(vec![b' '; BODY])
+            } else {
+                axum::body::Body::from_stream(futures::stream::iter(
+                    (0..BODY / (64 * 1024)).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b' '; 64 * 1024]))),
+                ))
+            };
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/outbound/a2a/partner")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", crate::mcp::MCP_LEGACY_VERSION);
+            if declared {
+                request = request.header("content-length", BODY);
+            }
+            let (status, body, rejections) =
+                through_the_shared_host(open_transit_point_state("mcp", None, cap), cap, request.body(body).unwrap())
+                    .await;
+
+            assert_eq!(
+                rejections,
+                [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))],
+                "declared: {declared}"
+            );
+            match status {
+                StatusCode::PAYLOAD_TOO_LARGE => {
+                    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["error"]["message"], "MCP request body exceeds the configured limit");
+                }
+                StatusCode::BAD_GATEWAY => {}
+                other => panic!("declared: {declared}: unexpected {other}: {body}"),
+            }
+        }
+    }
+
+    /// The status and body the shared-host hop, with a request cap of `cap`,
+    /// answers `request` with, and the `request_rejected` records of the one
+    /// request it forwards to a listener with `state`.
+    async fn through_the_shared_host(
+        state: OutboundProxyState,
+        cap: usize,
+        request: Request<axum::body::Body>,
+    ) -> (StatusCode, String, Rejections) {
+        let (recorded, mut records) = tokio::sync::mpsc::unbounded_channel();
+        let listener_app = axum::Router::new().fallback(move |request: Request<axum::body::Body>| {
+            let (state, recorded) = (state.clone(), recorded.clone());
+            async move {
+                let (response, rejections) = serve_transit_point(state, request).await;
+                let _ = recorded.send(rejections);
+                response
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let target = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, listener_app).await });
+        let hop = Arc::new(crate::proxy::server::SharedHostHop {
+            target,
+            client: crate::http_client::shared_host_hop(std::time::Duration::from_secs(30)).unwrap(),
+            forwarded_cert_header: "x-forwarded-client-cert".to_string(),
+            max_body_bytes: cap,
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::proxy::server::forward_shared_host_hop(hop, request),
+        )
+        .await
+        .expect("the hop must answer instead of forwarding the whole body");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        let rejections = tokio::time::timeout(std::time::Duration::from_secs(10), records.recv())
+            .await
+            .expect("the Transit Point must answer the forwarded request")
+            .unwrap();
+        assert!(records.try_recv().is_err(), "the hop forwarded more than one request");
+        (status, String::from_utf8_lossy(&body).into_owned(), rejections)
+    }
+
+    fn jsonrpc_body_of(length: usize) -> axum::body::Body {
+        let envelope = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"pad": ""}}).to_string();
+        let padded = envelope.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(length - envelope.len())));
+        assert_eq!(padded.len(), length);
+        axum::body::Body::from(padded)
+    }
+
+    /// A Transit Point without `mcp_http` refuses a body over the listener's
+    /// request cap with 413 and one `request_rejected` at admission, and reads
+    /// a body of exactly the cap.
+    #[tokio::test]
+    async fn a_transit_point_refuses_a_body_over_the_request_cap_with_413() {
+        use crate::audit::request_events::{RejectionReason, RejectionStage};
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, jsonrpc_body_of(1025)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        assert!(body.contains("Request body too large (max: 1024)"), "{body}");
+        assert_eq!(rejections, [(RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413))]);
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, jsonrpc_body_of(1024)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !rejections
+                .iter()
+                .any(|(_, reason, _)| *reason == RejectionReason::BodyTooLarge),
+            "{rejections:?}"
+        );
+    }
+
+    /// A body the caller fails to send is still a 400, not a 413, and is not
+    /// recorded as too large.
+    #[tokio::test]
+    async fn a_transit_point_answers_a_failed_body_read_with_400() {
+        let failing = axum::body::Body::from_stream(futures::stream::iter([
+            Ok(Bytes::from_static(b"{\"jsonrpc\":")),
+            Err(std::io::Error::other("caller reset the stream")),
+        ]));
+
+        let (status, body, rejections) = transit_point_body_outcome("a2a", None, 1024, failing).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("Failed to read request body"), "{body}");
+        assert!(rejections.is_empty(), "{rejections:?}");
+    }
+
+    /// An MCP Transit Point keeps its own `mcp_http.max_request_bytes` when it
+    /// is above the listener's request cap.
+    #[tokio::test]
+    async fn an_mcp_transit_point_keeps_its_own_request_limit() {
+        let tools_call = |length: usize| {
+            let envelope =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "echo", "pad": ""}})
+                    .to_string();
+            axum::body::Body::from(
+                envelope.replace(r#""pad":"""#, &format!(r#""pad":"{}""#, "x".repeat(length - envelope.len()))),
+            )
+        };
+        let larger = Some(json!({"max_request_bytes": 4096}));
+
+        let (status, body, rejections) =
+            transit_point_body_outcome("mcp", larger.clone(), 1024, tools_call(3000)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            !rejections
+                .iter()
+                .any(|(_, reason, _)| *reason == crate::audit::request_events::RejectionReason::BodyTooLarge),
+            "{rejections:?}"
+        );
+
+        let (status, body, rejections) = transit_point_body_outcome("mcp", larger, 1024, tools_call(4097)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"]["message"], "MCP request body exceeds the configured limit");
+        assert_eq!(
+            rejections,
+            [(
+                crate::audit::request_events::RejectionStage::Admission,
+                crate::audit::request_events::RejectionReason::BodyTooLarge,
+                Some(413)
+            )]
+        );
     }
 }

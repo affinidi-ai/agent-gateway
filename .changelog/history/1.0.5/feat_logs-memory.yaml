@@ -1,0 +1,43 @@
+branch: feat/logs-memory
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-02T22:25:00Z'
+      title: Stop dashboard log updates from reading the whole log file into memory
+      description: >-
+        A dashboard tab that asked for log entries after an old position, for example after
+        sitting in the background or reconnecting after a restart, made the gateway parse every
+        line from that position to the end of the log file before keeping only the newest entries.
+        On a large log this spiked memory by hundreds of MB and could get the container killed
+        for running out of memory. The gateway now finds the newest lines by scanning back from
+        the end of the file and reads only those, and never more than 8 MiB, however old the
+        position is.
+    - timestamp: '2026-11-02T23:30:00Z'
+      title: Show the full number of newest log lines in the dashboard when lines are long
+      description: >-
+        The log view's first page and its updates guessed where the newest lines began by
+        assuming 512 bytes per line, so logs with longer lines showed fewer lines than the view
+        asks for. The gateway now counts line breaks back from the end of the file and returns
+        the full number of newest lines, up to 8 MiB of log.
+    - timestamp: '2026-11-02T23:10:00Z'
+      title: Stop the dashboard log view showing a line twice after it loads
+      description: >-
+        When the gateway read the end of the log file and the read started inside a multi-byte
+        character, such as the `…` that marks a clipped value, the positions it gave each log line
+        were too small. The next update then sent the newest line again under its real position, so
+        the log view showed it twice and could bring back lines hidden by Clear. Positions are now
+        the real byte offsets of the lines.
+  removed: []
+  security:
+    - timestamp: '2026-11-02T23:45:00Z'
+      title: Show dashboard log lines only to callers with the logs.view permission
+      description: >-
+        The dashboard delta and stats endpoints and the dashboard WebSocket returned gateway log
+        lines to every signed-in caller, including roles and access tokens without `logs.view`.
+        The endpoints now leave log lines out, without reading the log file, unless the caller's
+        role and access-token scopes grant `logs.view`, and each WebSocket connection drops log
+        updates unless its session is still live and its user is Approved and holds `logs.view`,
+        checked on connect and on every keep-alive ping. Unauthenticated WebSocket connections and
+        gateways without an auth backend get no log lines.
+  breaking: []

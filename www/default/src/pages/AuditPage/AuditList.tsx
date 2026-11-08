@@ -1,6 +1,7 @@
 import React from 'react';
 import AuditListItem from './AuditListItem';
 import FieldHelp from '../../components/shared/FieldHelp';
+import type { UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
 interface AuditListProps {
@@ -11,6 +12,8 @@ interface AuditListProps {
   page: number;
   totalPages: number;
   onPageChange: (updater: number | ((p: number) => number)) => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /** Master list of governance events with loading skeleton, empty state, and pagination. */
@@ -22,6 +25,7 @@ const AuditList: React.FC<AuditListProps> = ({
   page,
   totalPages,
   onPageChange,
+  userName,
 }) => {
   if (isLoading) {
     return (
@@ -82,6 +86,7 @@ const AuditList: React.FC<AuditListProps> = ({
             idx={idx}
             isSelected={selectedIdx === idx}
             onSelect={() => onSelect(idx)}
+            userName={userName}
           />
         ))}
       </ul>

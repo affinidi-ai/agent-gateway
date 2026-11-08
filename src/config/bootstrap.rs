@@ -80,12 +80,6 @@ impl BootstrapConfig {
                     .to_string_lossy()
                     .to_string();
             }
-            if PathBuf::from(&config.config_files.x402_proxy).is_relative() {
-                config.config_files.x402_proxy = config_dir
-                    .join(&config.config_files.x402_proxy)
-                    .to_string_lossy()
-                    .to_string();
-            }
 
             // Resolve TLS certificate paths
             if config
@@ -327,6 +321,10 @@ impl BootstrapConfig {
                 anyhow::bail!("Invalid channel_config_source '{}'. Must be 'dynamodb', 'file', or 'local'", other);
             }
         }
+
+        self.credential_policy
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid [credential_policy] config: {e}"))?;
 
         // Validate A2A config (version, expires vs timeout, inflight limits, etc.)
         self.a2a
@@ -668,7 +666,7 @@ key_path = "key.pem"
         .unwrap();
 
         let config = BootstrapConfig::from_file(&path).expect("unknown top-level keys are ignored");
-        assert_eq!(config.backup_encryption_key, "unused");
+        assert_eq!(&*config.backup_encryption_key, "unused");
     }
 
     /// The storage paths of `config.toml` written to `<tempdir>/config` with `storage_paths`.

@@ -42,8 +42,8 @@ pub struct PolicyDecisionSummary {
     /// "access_point" | "transit_point" | "fabric" — which request flow produced
     /// the decision (ingress vs egress vs fabric-received).
     pub flow: &'static str,
-    /// Human-readable policy name. Operator-assigned definition name when set;
-    /// falls back to the Rego package name (e.g. "surface.policy").
+    /// Human-readable policy name: the operator-assigned definition name, else
+    /// the definition id, else a layer label such as "Surface policy".
     pub policy_name: String,
     /// Policy/definition identifier (e.g. the Rego package `gateway.policy` /
     /// `surface.policy`, or the definition id for response/MCP scopes).
@@ -97,6 +97,173 @@ tokio::task_local! {
     /// so a request's audit events + policy decisions share a `trace_id` even
     /// when no OTEL exporter is configured. Absent elsewhere (`try_with` errs).
     pub static REQUEST_TRACE_ID: String;
+
+    /// The gateway request being served, installed at each entry point
+    /// (Access Point, Transit Point, fabric receive, authenticated management
+    /// API request). Its id and variant are stamped on every audit record the
+    /// request produces.
+    static REQUEST: Arc<RequestScope>;
+}
+
+/// One gateway request: its id, minted here and never read from a header or
+/// token, and the surface variant routing resolved it to, set once routing
+/// knows it.
+#[derive(Debug)]
+pub struct RequestScope {
+    id: String,
+    variant: std::sync::OnceLock<String>,
+}
+
+impl RequestScope {
+    /// A request with id `id` and no variant yet.
+    pub fn new(id: String) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            variant: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// A request with a fresh id.
+    pub fn fresh() -> Arc<Self> {
+        Self::new(new_request_id())
+    }
+}
+
+/// A fresh request id: a W3C span id (16 lowercase hex characters, never all
+/// zero).
+fn new_request_id() -> String {
+    loop {
+        let bytes = rand::random::<[u8; 8]>();
+        if bytes != [0u8; 8] {
+            return hex::encode(bytes);
+        }
+    }
+}
+
+/// The id of the request being served, when an entry point scoped one.
+pub fn current_request_id() -> Option<String> {
+    REQUEST
+        .try_with(|scope| scope.id.clone())
+        .ok()
+}
+
+/// Records the surface variant the request being served resolved to, and
+/// stamps it on the current span as `surface.variant`. Only surface routing
+/// calls this, while the request span is current; the first value set is
+/// kept. Does nothing outside a request.
+pub fn set_request_variant(variant: &str) {
+    let first = REQUEST
+        .try_with(|scope| {
+            scope
+                .variant
+                .set(variant.to_string())
+                .is_ok()
+        })
+        .unwrap_or(false);
+    if first {
+        tracing::Span::current().record("surface.variant", variant);
+    }
+}
+
+/// The surface variant the request being served resolved to, when routing
+/// set one.
+pub fn current_request_variant() -> Option<String> {
+    REQUEST
+        .try_with(|scope| scope.variant.get().cloned())
+        .ok()
+        .flatten()
+}
+
+/// Runs `f` as a request that resolved to surface variant `variant`.
+#[cfg(test)]
+pub fn with_request_variant<R>(
+    variant: &str,
+    f: impl FnOnce() -> R,
+) -> R {
+    let scope = RequestScope::fresh();
+    let _ = scope
+        .variant
+        .set(variant.to_string());
+    REQUEST.sync_scope(scope, f)
+}
+
+/// Runs `future` as request `scope`: every audit record it writes carries
+/// the request's id and variant. An entry point serves its request through
+/// this and passes the response to [`response_in_request`].
+pub async fn in_request<F: std::future::Future>(
+    scope: Arc<RequestScope>,
+    future: F,
+) -> F::Output {
+    REQUEST
+        .scope(scope, future)
+        .await
+}
+
+/// `response` with a streamed body read and dropped as request `scope`. A
+/// streamed body (an SSE stream) is read after its handler returned, outside
+/// the handler's scope, so the records written per event, and those its
+/// observers write when a client disconnects and the body is dropped, would
+/// otherwise lose the request. A body of known length is left as it is.
+pub fn response_in_request(
+    scope: Arc<RequestScope>,
+    response: axum::response::Response,
+) -> axum::response::Response {
+    use axum::body::HttpBody;
+    use futures::StreamExt;
+
+    if response
+        .body()
+        .size_hint()
+        .exact()
+        .is_some()
+    {
+        return response;
+    }
+    response.map(|body| {
+        let mut guard = DroppedInRequest {
+            data: Some(body.into_data_stream()),
+            scope,
+        };
+        axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| {
+            let DroppedInRequest { data, scope } = &mut guard;
+            REQUEST.sync_scope(Arc::clone(scope), || match data.as_mut() {
+                Some(data) => data.poll_next_unpin(cx),
+                None => std::task::Poll::Ready(None),
+            })
+        }))
+    })
+}
+
+/// A streamed body that is dropped inside its request's scope, wherever the
+/// drop happens.
+struct DroppedInRequest<S> {
+    data: Option<S>,
+    scope: Arc<RequestScope>,
+}
+
+impl<S> Drop for DroppedInRequest<S> {
+    fn drop(&mut self) {
+        // Entering the scope can panic, and a panic while unwinding aborts.
+        if std::thread::panicking() {
+            return;
+        }
+        let data = self.data.take();
+        REQUEST.sync_scope(Arc::clone(&self.scope), move || drop(data));
+    }
+}
+
+/// Spawns `future` as the request being served, so the audit records it
+/// writes carry the request's id and variant, as the task-local does not
+/// cross a spawn.
+pub fn spawn_in_request<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match REQUEST.try_with(Arc::clone) {
+        Ok(scope) => tokio::spawn(REQUEST.scope(scope, future)),
+        Err(_) => tokio::spawn(future),
+    }
 }
 
 /// Push a decision into the per-request collector (no-op when no scope is active).
@@ -203,7 +370,7 @@ impl PolicyFlow {
 fn caller_fields(identity: &AuthenticatedIdentity) -> (&'static str, String, Option<String>) {
     match identity {
         AuthenticatedIdentity::JwtBearer { subject, .. } => ("jwt_bearer", subject.clone(), None),
-        AuthenticatedIdentity::ApiKey { key_name } => ("api_key", key_name.clone(), None),
+        AuthenticatedIdentity::ApiKey { key_name, .. } => ("api_key", key_name.clone(), None),
         AuthenticatedIdentity::DidAuth { did } => ("did_auth", did.clone(), Some(did.clone())),
         AuthenticatedIdentity::Mtls { principal, .. } => ("mtls", principal.clone(), None),
     }
@@ -262,10 +429,13 @@ pub struct PolicyDecisionEvent<'a> {
     /// policy record. `None` for the built-in allow-all default (no definition).
     pub policy_definition_id: Option<&'a str>,
     /// Human-readable policy name (e.g. the operator-assigned definition name).
-    /// When `None`, falls back to `policy_id` in the VP `policyDecisions` array.
+    /// When `None`, the recorded name falls back to the definition id, then to a
+    /// label for the policy layer.
     pub policy_name: Option<&'a str>,
     /// Surface/channel identifier the decision applies to.
     pub surface_id: Option<&'a str>,
+    /// Name of the surface the decision applies to, recorded as `channel_name`.
+    pub surface_name: Option<&'a str>,
     /// Per-request trace identifier for log/trace correlation.
     pub trace_id: Option<&'a str>,
     /// HTTP method of the request under evaluation.
@@ -319,6 +489,32 @@ pub fn record_tools_list_filtering(
         removed_tools: Some(&removed),
         ..context
     });
+}
+
+/// The best name the gateway knows for the policy that decided: the
+/// operator's definition name, else the definition id, else a readable label
+/// for the layer. A tool policy that matched no definition keeps the tool name.
+fn decision_policy_name(event: &PolicyDecisionEvent<'_>) -> String {
+    fn known(value: Option<&str>) -> Option<&str> {
+        value.filter(|v| !v.is_empty())
+    }
+    if let Some(name) = known(event.policy_name).or(known(event.policy_definition_id)) {
+        return name.to_string();
+    }
+    match known(event.policy_id) {
+        Some(crate::policies::GATEWAY_POLICY_PACKAGE) => "Gateway policy",
+        Some(crate::policies::SURFACE_POLICY_PACKAGE) => "Surface policy",
+        Some("mcp_tool_gating") => "MCP tool gating",
+        Some(other) => other,
+        None => match event.scope {
+            PolicyScope::Gateway => "Gateway policy",
+            PolicyScope::Surface => "Surface policy",
+            PolicyScope::McpTool => "MCP tool policy",
+            PolicyScope::Response => "Response policy",
+            PolicyScope::McpToolList => "MCP tool list filter",
+        },
+    }
+    .to_string()
 }
 
 pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
@@ -379,6 +575,8 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     let policy_content_hash = event
         .policy_content_hash
         .unwrap_or_default();
+    let policy_name = decision_policy_name(&event);
+    let surface_variant = current_request_variant();
 
     if allowed {
         tracing::debug!(
@@ -390,6 +588,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -412,6 +611,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             policy_definition_id = policy_definition_id,
             deny_reason = reason,
             surface_id = surface_id,
+            surface_variant = surface_variant.as_deref(),
             gateway_did = gateway_did,
             actor_did = caller_did.as_str(),
             caller_auth_method = auth_method,
@@ -433,7 +633,7 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             scope,
             decision,
             policy_id,
-            event.policy_name,
+            Some(policy_name.as_str()),
             event.policy_definition_id,
             if allowed {
                 None
@@ -445,6 +645,9 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
             } else {
                 Some(surface_id)
             },
+            event
+                .surface_name
+                .filter(|name| !name.is_empty()),
             if caller_did.is_empty() {
                 None
             } else {
@@ -473,17 +676,11 @@ pub fn record_policy_decision(event: PolicyDecisionEvent<'_>) {
     // populated when a scope is active and is never embedded in a minted VP.
     let deny_reason_val = (!allowed && !reason.is_empty()).then(|| reason.to_string());
     let id = compute_decision_id(scope, policy_id, decision, deny_reason_val.as_deref(), resolved_trace_id.as_deref());
-    // Use the operator-assigned definition name when available; fall back to the Rego package name.
-    let policy_name_val = event
-        .policy_name
-        .filter(|n| !n.is_empty())
-        .unwrap_or(policy_id)
-        .to_string();
     push_policy_decision(PolicyDecisionSummary {
         id,
         scope: event.scope.as_str(),
         flow,
-        policy_name: policy_name_val,
+        policy_name,
         policy_id: if policy_id.is_empty() {
             None
         } else {
@@ -535,8 +732,211 @@ mod tests {
     }
 
     #[test]
+    fn a_new_request_id_is_a_w3c_span_id() {
+        let ids: Vec<String> = (0..64)
+            .map(|_| new_request_id())
+            .collect();
+        for id in &ids {
+            assert_eq!(id.len(), 16, "{id}");
+            assert!(
+                id.chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{id}"
+            );
+            assert_ne!(id, "0000000000000000");
+        }
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len());
+        let thirteenth: std::collections::HashSet<char> = ids
+            .iter()
+            .filter_map(|id| id.chars().nth(12))
+            .collect();
+        assert!(thirteenth.len() > 1, "every character is random, none fixed by a UUID version");
+    }
+
+    fn request(id: &str) -> Arc<RequestScope> {
+        RequestScope::new(id.to_string())
+    }
+
+    #[tokio::test]
+    async fn the_current_request_id_is_the_scoped_one_and_none_outside() {
+        assert_eq!(current_request_id(), None);
+        in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_id().as_deref(), Some("0123456789abcdef"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_variant_set_in_a_request_is_read_back() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            assert_eq!(current_request_variant(), None, "routing has not set it yet");
+            set_request_variant("beta");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[tokio::test]
+    async fn a_second_variant_set_in_a_request_is_ignored() {
+        let variant = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            set_request_variant("_base_");
+            current_request_variant()
+        })
+        .await;
+
+        assert_eq!(variant.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn outside_a_request_there_is_no_variant() {
+        set_request_variant("beta");
+        assert_eq!(current_request_variant(), None);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_is_read_as_its_request() {
+        use futures::StreamExt;
+
+        let chunks = futures::stream::repeat_with(|| {
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from(format!(
+                "{}:{};",
+                current_request_id().unwrap_or_default(),
+                current_request_variant().unwrap_or_default()
+            )))
+        })
+        .take(2);
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+
+        let response = response_in_request(scope, response);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+
+        assert_eq!(body, "0123456789abcdef:beta;0123456789abcdef:beta;");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_dropped_before_its_end_is_dropped_as_its_request() {
+        use futures::StreamExt;
+        use http_body_util::BodyExt;
+
+        type Seen = Arc<Mutex<Option<(Option<String>, Option<String>)>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap() = Some((current_request_id(), current_request_variant()));
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::once(async { Ok::<_, std::convert::Infallible>(bytes::Bytes::from("event")) })
+            .chain(futures::stream::pending())
+            .map(move |chunk| {
+                let _ = &observer;
+                chunk
+            });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let mut body = response_in_request(scope, response).into_body();
+        let first = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.into_data().unwrap(), "event");
+
+        drop(body);
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some((Some("0123456789abcdef".to_string()), Some("beta".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_dropped_while_panicking_is_dropped_outside_its_request() {
+        use futures::StreamExt;
+
+        type Seen = Arc<Mutex<Option<Option<String>>>>;
+        struct RecordOnDrop(Seen);
+        impl Drop for RecordOnDrop {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(current_request_variant());
+            }
+        }
+        let seen = Seen::default();
+        let observer = RecordOnDrop(Arc::clone(&seen));
+        let chunks = futures::stream::pending::<Result<bytes::Bytes, std::convert::Infallible>>().map(move |chunk| {
+            let _ = &observer;
+            chunk
+        });
+        let response = axum::response::Response::new(axum::body::Body::from_stream(chunks));
+        let scope = request("0123456789abcdef");
+        in_request(scope.clone(), async { set_request_variant("beta") }).await;
+        let body = response_in_request(scope, response).into_body();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _body = body;
+            panic!("the request handler panics while holding its body");
+        }));
+
+        assert!(unwound.is_err(), "the panic is caught, not turned into an abort");
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            Some(None),
+            "a body dropped during unwinding never enters the request scope"
+        );
+    }
+
+    #[test]
+    fn a_body_of_known_length_is_left_as_it_is() {
+        use axum::body::HttpBody;
+
+        let response = axum::response::Response::new(axum::body::Body::from("{}"));
+        let response = response_in_request(request("0123456789abcdef"), response);
+
+        assert_eq!(
+            response
+                .body()
+                .size_hint()
+                .exact(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_spawned_in_a_request_keeps_its_id_and_variant() {
+        let spawned = in_request(request("0123456789abcdef"), async {
+            set_request_variant("beta");
+            spawn_in_request(async { (current_request_id(), current_request_variant()) })
+                .await
+                .unwrap()
+        })
+        .await;
+        let outside = spawn_in_request(async { (current_request_id(), current_request_variant()) })
+            .await
+            .unwrap();
+
+        assert_eq!(spawned, (Some("0123456789abcdef".to_string()), Some("beta".to_string())));
+        assert_eq!(outside, (None, None));
+    }
+
+    #[test]
     fn caller_fields_map_each_identity_variant() {
         let jwt = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "sub-123".to_string(),
             claims: serde_json::json!({}),
         };
@@ -545,7 +945,10 @@ mod tests {
         assert_eq!(principal, "sub-123");
         assert_eq!(did, None);
 
-        let api = AuthenticatedIdentity::ApiKey { key_name: "key-a".to_string() };
+        let api = AuthenticatedIdentity::ApiKey {
+            key_name: "key-a".to_string(),
+            provider_agent_id: None,
+        };
         let (method, principal, did) = caller_fields(&api);
         assert_eq!(method, "api_key");
         assert_eq!(principal, "key-a");
@@ -563,10 +966,12 @@ mod tests {
     #[test]
     fn decision_caller_prefers_the_authenticated_identity_over_a_carried_caller() {
         let identity = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
         };
         let carried = crate::delegation_vault::audit::AuditCallerContext {
+            principal: None,
             auth_method: "transit_token".to_string(),
             iss: None,
             aud: None,
@@ -580,6 +985,8 @@ mod tests {
             mtls_subject_dn: None,
             mtls_issuer_dn: None,
             mtls_source: None,
+            user_identity_hash: None,
+            peer_gateway: None,
         };
 
         let authenticated = decision_caller(&PolicyDecisionEvent {
@@ -651,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summary_policy_name_falls_back_to_id_when_unset() {
+    async fn summary_policy_name_falls_back_to_the_layer_label_when_unset() {
         let collector = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         POLICY_DECISION_COLLECTOR
             .scope(collector.clone(), async {
@@ -674,8 +1081,7 @@ mod tests {
                 .as_deref(),
             Some("gateway.policy")
         );
-        // With no operator name, the summary name falls back to the policy id.
-        assert_eq!(decisions[0].policy_name, "gateway.policy");
+        assert_eq!(decisions[0].policy_name, "Gateway policy");
     }
 
     use std::sync::{Arc, Mutex};
@@ -759,27 +1165,31 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let identity = AuthenticatedIdentity::ApiKey {
                 key_name: "alpha-key".to_string(),
+                provider_agent_id: None,
             };
-            record_policy_decision(PolicyDecisionEvent {
-                scope: PolicyScope::Surface,
-                allow: false,
-                reason: Some("trust check failed"),
-                policy_id: Some("pol-7"),
-                policy_definition_id: Some("def-uuid-7"),
-                policy_name: None,
-                surface_id: Some("surface-a"),
-                trace_id: Some("trace-xyz"),
-                http_method: Some("POST"),
-                path: Some("/v1/agent"),
-                identity: Some(&identity),
-                actor_did: Some("did:example:agent"),
-                gateway_did: Some("did:web:gw1"),
-                flow: PolicyFlow::TransitPoint,
-                policy_version: Some(3),
-                policy_content_hash: Some("sha256:abc123"),
-                caller: None,
-                error: None,
-                removed_tools: None,
+            with_request_variant("beta", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Surface,
+                    allow: false,
+                    reason: Some("trust check failed"),
+                    policy_id: Some("pol-7"),
+                    policy_definition_id: Some("def-uuid-7"),
+                    policy_name: None,
+                    surface_id: Some("surface-a"),
+                    surface_name: Some("Surface A"),
+                    trace_id: Some("trace-xyz"),
+                    http_method: Some("POST"),
+                    path: Some("/v1/agent"),
+                    identity: Some(&identity),
+                    actor_did: Some("did:example:agent"),
+                    gateway_did: Some("did:web:gw1"),
+                    flow: PolicyFlow::TransitPoint,
+                    policy_version: Some(3),
+                    policy_content_hash: Some("sha256:abc123"),
+                    caller: None,
+                    error: None,
+                    removed_tools: None,
+                })
             });
         });
 
@@ -790,6 +1200,7 @@ mod tests {
             .expect("policy decision event not captured");
 
         assert_eq!(ev.level, "WARN");
+        assert_eq!(field(ev, "surface_variant"), Some("beta"));
         assert_eq!(field(ev, "policy_decision"), Some("deny"));
         assert_eq!(field(ev, "policy_flow"), Some("transit_point"));
         assert_eq!(field(ev, "deny_reason"), Some("trust check failed"));
@@ -878,6 +1289,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_decision_names_its_policy_by_the_best_name_known() {
+        let name = |scope, policy_name, policy_definition_id, policy_id| {
+            decision_policy_name(&PolicyDecisionEvent {
+                scope,
+                policy_name,
+                policy_definition_id,
+                policy_id,
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            name(
+                PolicyScope::Surface,
+                Some("Partner policy"),
+                Some("def-1"),
+                Some(crate::policies::SURFACE_POLICY_PACKAGE)
+            ),
+            "Partner policy"
+        );
+        assert_eq!(
+            name(PolicyScope::Surface, Some(""), Some("def-1"), Some(crate::policies::SURFACE_POLICY_PACKAGE)),
+            "def-1"
+        );
+        for (scope, policy_id, label) in [
+            (PolicyScope::Gateway, Some(crate::policies::GATEWAY_POLICY_PACKAGE), "Gateway policy"),
+            (PolicyScope::Surface, Some(crate::policies::SURFACE_POLICY_PACKAGE), "Surface policy"),
+            (PolicyScope::McpTool, Some("mcp_tool_gating"), "MCP tool gating"),
+            (PolicyScope::McpTool, Some("delete_repo"), "delete_repo"),
+            (PolicyScope::McpTool, None, "MCP tool policy"),
+            (PolicyScope::McpTool, Some(""), "MCP tool policy"),
+            (PolicyScope::Response, None, "Response policy"),
+            (PolicyScope::McpToolList, None, "MCP tool list filter"),
+            (PolicyScope::Gateway, None, "Gateway policy"),
+            (PolicyScope::Surface, None, "Surface policy"),
+        ] {
+            assert_eq!(name(scope, None, None, policy_id), label, "{scope:?} {policy_id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_decision_record_carries_a_policy_name() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: false,
+                policy_id: Some(crate::policies::GATEWAY_POLICY_PACKAGE),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::McpTool,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        let names: Vec<Option<String>> = events
+            .iter()
+            .map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::PolicyDecision { policy_name, .. } => {
+                    policy_name.clone()
+                }
+                other => panic!("expected a policy decision, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, [Some("Gateway policy".to_string()), Some("MCP tool policy".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_decision_record_names_its_surface() {
+        let ((), events) = crate::audit::producer::capture(async {
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Surface,
+                allow: false,
+                surface_id: Some("0b6f7a52-surface-uuid"),
+                surface_name: Some("Payments"),
+                ..Default::default()
+            });
+            record_policy_decision(PolicyDecisionEvent {
+                scope: PolicyScope::Gateway,
+                allow: true,
+                ..Default::default()
+            });
+        })
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]
+                .channel_name
+                .as_deref(),
+            Some("Payments")
+        );
+        assert_eq!(
+            events[0]
+                .surface_id
+                .as_deref(),
+            Some("0b6f7a52-surface-uuid")
+        );
+        assert_eq!(events[1].channel_name, None, "no surface, no name");
+    }
+
     #[tokio::test]
     async fn a_tools_list_with_nothing_removed_is_not_recorded() {
         let ((), events) = crate::audit::producer::capture(async {
@@ -956,6 +1470,31 @@ mod tests {
 
         assert_eq!(ev.level, "DEBUG");
         assert_eq!(field(ev, "policy_decision"), Some("allow"));
+        assert_eq!(field(ev, "surface_variant"), None, "outside a request there is no variant");
+    }
+
+    #[test]
+    fn an_allow_line_names_the_request_variant() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CapturingLayer { events: events.clone() });
+
+        tracing::subscriber::with_default(subscriber, || {
+            with_request_variant("_base_", || {
+                record_policy_decision(PolicyDecisionEvent {
+                    scope: PolicyScope::Gateway,
+                    allow: true,
+                    surface_id: Some("surface-b"),
+                    ..Default::default()
+                })
+            });
+        });
+
+        let captured = events.lock().unwrap();
+        let ev = captured
+            .iter()
+            .find(|e| field(e, "policy_scope") == Some("gateway"))
+            .expect("allow decision event not captured");
+        assert_eq!(field(ev, "surface_variant"), Some("_base_"));
     }
 
     #[test]

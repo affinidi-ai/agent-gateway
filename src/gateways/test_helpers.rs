@@ -83,5 +83,6 @@ pub(crate) async fn test_listener(instance_id: &str) -> ListenerInfo {
         client: DIDCommClient::new(connection_point_did, Vec::new(), None, None)
             .await
             .unwrap(),
+        inbound_acl: crate::mediators::utils::InboundAcl::Open,
     }
 }

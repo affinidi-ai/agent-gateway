@@ -131,7 +131,7 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "payment",
         "Payment Event",
-        "An x402 or MPP payment lifecycle event (challenge, verification, settlement)",
+        "An agent-pay payment event (challenge, paid, held for review, rejected, unavailable); legacy x402/MPP settlement records may still appear",
         Payments,
     ),
     event(
@@ -155,7 +155,8 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "rate_limited",
         "Rate Limited",
-        "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
+        "A request was refused because a surface rate limit, a Transit Point's per-caller rate limit, SSE session cap \
+         or Fabric stream capacity was reached",
         Requests,
     ),
     event(
@@ -163,6 +164,45 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "Request Rejected",
         "A request was refused at routing, admission or forwarding before it reached the target",
         Requests,
+    ),
+    event("policy_created", "Policy Created", "A policy definition was created", Policies),
+    event("policy_updated", "Policy Updated", "A policy definition was changed, or its owner was reassigned", Policies),
+    event("policy_deleted", "Policy Deleted", "A policy definition was deleted", Policies),
+    event(
+        "policy_attached",
+        "Policy Attached",
+        "A policy was added to a surface, gateway or appliance-wide plane",
+        Policies,
+    ),
+    event(
+        "policy_detached",
+        "Policy Detached",
+        "A policy was removed from a surface, gateway or appliance-wide plane",
+        Policies,
+    ),
+    event(
+        "policy_attachment_changed",
+        "Policy Attachment Changed",
+        "An attached policy was switched between enforced and monitor-only, or enabled and disabled",
+        Policies,
+    ),
+    event(
+        "policy_change_refused",
+        "Policy Change Refused",
+        "A change to a policy, or to where a policy applies, was refused",
+        Policies,
+    ),
+    event(
+        "target_auth_changed",
+        "Target Authentication Changed",
+        "The credential a surface sends to its Target or a Transit Point was added, changed or removed",
+        Auth,
+    ),
+    event(
+        "secret_force_deleted",
+        "Secret Force-Deleted",
+        "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
+        Auth,
     ),
 ];
 
@@ -225,12 +265,25 @@ mod tests {
                 .find(|event| event.category == category)
                 .map(|event| event.group)
         };
-        assert_eq!(group_of("policy_decision"), Some(AuditEventGroup::Policies));
+        for policies in [
+            "policy_decision",
+            "policy_created",
+            "policy_updated",
+            "policy_deleted",
+            "policy_attached",
+            "policy_detached",
+            "policy_attachment_changed",
+            "policy_change_refused",
+        ] {
+            assert_eq!(group_of(policies), Some(AuditEventGroup::Policies), "{policies}");
+        }
         assert_eq!(group_of("trust_check"), Some(AuditEventGroup::Trust));
         assert_eq!(group_of("vp_injected"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("trace_terminated"), Some(AuditEventGroup::Trace));
         assert_eq!(group_of("payment"), Some(AuditEventGroup::Payments));
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("target_auth_changed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("secret_force_deleted"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
         for request in ["request_rejected", "rate_limited"] {

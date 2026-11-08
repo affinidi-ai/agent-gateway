@@ -9,6 +9,7 @@ use crate::auth_manager::pat::PatDelegationContext;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::identity::VCIssuer;
 use crate::identity::ssi::vc_issuer::VcSigner;
+use crate::observability::loggable;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
 use axum::{
@@ -43,6 +44,15 @@ pub struct DelegationVaultState {
     /// finish (set by orchestrator at startup; `None` only in test contexts).
     #[allow(dead_code)] // set on OAuth success paths; optional in tests
     pub vault_population_notifier: Option<SharedVaultPopulationNotifier>,
+
+    /// The test allow-list of authorization server and vendor fixtures the
+    /// connect API's token requests and revocations may reach; `None` in
+    /// production.
+    pub egress_allowlist: Option<String>,
+    /// gateway.json's `external_consent_resource_origins`.
+    pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
+    /// gateway.json's `external_consent_issuers`.
+    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 /// GET /api/v1/delegation-vault
@@ -256,9 +266,10 @@ pub async fn oauth_callback(
     Path(provider_id): Path<String>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> impl IntoResponse {
+    let logged_provider_id = loggable::untrusted(&provider_id);
     info!(
         target: "credential_delegation",
-        provider_id = %provider_id,
+        provider_id = %logged_provider_id,
         has_code = %query.code.is_some(),
         has_error = %query.error.is_some(),
         action = "oauth_callback",
@@ -273,9 +284,8 @@ pub async fn oauth_callback(
             .unwrap_or("Unknown error");
         warn!(
             target: "credential_delegation",
-            provider_id = %provider_id,
-            oauth_error = %error,
-            description = %desc,
+            provider_id = %logged_provider_id,
+            oauth_error = %oauth::oauth_error_code(error),
             "OAuth provider returned an error"
         );
         return Html(format!(
@@ -332,7 +342,7 @@ pub async fn oauth_callback(
         Err(e) => {
             warn!(
                 target: "credential_delegation",
-                provider_id = %provider_id,
+                provider_id = %logged_provider_id,
                 error = %e,
                 "Failed to decode OAuth state"
             );
@@ -350,6 +360,26 @@ pub async fn oauth_callback(
         }
     };
 
+    if oauth_state.provider_id != provider_id {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %logged_provider_id,
+            state_provider_id = %oauth_state.provider_id,
+            "OAuth callback path names another provider than its state"
+        );
+        return Html(
+            r#"<!DOCTYPE html>
+<html><head><title>Authorization Failed</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h2>Authorization Failed</h2>
+<p>This authorization link does not match its provider.</p>
+<p>Please try again from the original application.</p>
+</body></html>"#
+                .to_string(),
+        )
+        .into_response();
+    }
+
     // Load the credential provider
     let provider = match state
         .provider_store
@@ -360,7 +390,7 @@ pub async fn oauth_callback(
         Ok(None) => {
             error!(
                 target: "credential_delegation",
-                provider_id = %provider_id,
+                provider_id = %logged_provider_id,
                 credential_provider_id = %oauth_state.credential_provider_id,
                 "Credential provider not found during callback"
             );
@@ -410,7 +440,7 @@ pub async fn oauth_callback(
         Err(e) => {
             warn!(
                 target: "credential_delegation",
-                provider_id = %provider_id,
+                provider_id = %logged_provider_id,
                 error = %e,
                 "Token exchange failed during callback"
             );
@@ -514,7 +544,7 @@ pub async fn oauth_callback(
     if !oauth::claim_oauth_state(&oauth_state).await {
         warn!(
             target: "credential_delegation",
-            provider_id = %provider_id,
+            provider_id = %logged_provider_id,
             "OAuth state was already used"
         );
         return Html(
@@ -539,7 +569,7 @@ pub async fn oauth_callback(
             let delegation_token_id_for_audit = stored_token.id;
             info!(
                 target: "credential_delegation",
-                provider_id = %provider_id,
+                provider_id = %logged_provider_id,
                 agent_did = %oauth_state.agent_did,
                 user_hash = %oauth_state.user_identity_hash,
                 scopes = ?granted_scopes,
@@ -555,7 +585,7 @@ pub async fn oauth_callback(
                     super::audit::DelegationAuditAction::ConsentGranted,
                     Some(&oauth_state.agent_did),
                     Some(&oauth_state.user_identity_hash),
-                    Some(&provider_id),
+                    Some(&oauth_state.provider_id),
                     Some(&oauth_state.surface_id),
                 );
                 evt.scopes = Some(granted_scopes.clone());
@@ -641,7 +671,7 @@ pub async fn oauth_callback(
                                 warn!(
                                     target: "credential_delegation",
                                     agent_did = %oauth_state.agent_did,
-                                    provider_id = %provider_id,
+                                    provider_id = %logged_provider_id,
                                     error = %e,
                                     "Failed to mint consent_granted workload-binding VP for audit log"
                                 );
@@ -662,7 +692,7 @@ pub async fn oauth_callback(
             // be populated by the MCP elicitation flow.
             if let Some(notifier) = &state.vault_population_notifier {
                 notifier
-                    .notify(&oauth_state.agent_did, &oauth_state.user_identity_hash, &provider_id)
+                    .notify(&oauth_state.agent_did, &oauth_state.user_identity_hash, &oauth_state.provider_id)
                     .await;
             }
         }

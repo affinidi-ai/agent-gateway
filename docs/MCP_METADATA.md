@@ -67,15 +67,41 @@ not standard legacy MCP.
 ## Modern MCP Admission
 
 After the HTTP security and size checks below, every MCP endpoint admits
-`2026-07-28` alongside `2024-11-05` on direct Access Points, gateway-owned
-Proxies, Transit Points and, as framed streams, both Fabric paths. There is no
+`2026-07-28` alongside the session revisions `2024-11-05`, `2025-03-26`,
+`2025-06-18` and `2025-11-25` on direct Access Points, gateway-owned Proxies,
+Transit Points and, as framed streams, both Fabric paths. There is no
 per-endpoint opt-out. No initialize exchange, session identifier, or
 metadata-output preference changes which revisions an endpoint admits.
+
+The session revisions all open a session with `initialize` and carry it in
+`Mcp-Session-Id`, so a request whose `MCP-Protocol-Version` header names one is
+forwarded as legacy traffic with the header unchanged, even when it also sends
+`Mcp-Method` or `Mcp-Name`, as long as its `params._meta` carries no modern keys.
+An `initialize` with no `MCP-Protocol-Version` header is a legacy session opening
+on the same terms. Those headers must still be well formed, with `Mcp-Method`
+naming the request's method and `Mcp-Name` matching `params.name` on
+`tools/call` and `prompts/get` or `params.uri` on `resources/read`. Its `params.protocolVersion` reaches the upstream unchanged when it
+names a session revision, so the upstream negotiates it. A gateway-owned MCP
+Proxy answers every `initialize` with `2024-11-05`.
 
 The gateway forwards an admitted modern request and validates the answer as a
 modern result, which needs `resultType` and, for lists, cache hints. A
 legacy-only upstream's answer fails that check, so the modern caller gets HTTP
 `502`, while `2024-11-05` callers on the same endpoint are unaffected.
+
+An upstream that serves only session revisions refuses a request without
+`Mcp-Session-Id` before reading its id, with HTTP `400` and `-32000`,
+`"id": null` (TypeScript SDK) or `-32600` with a placeholder such as
+`"server-error"` (Python SDK). When a JSON answer has HTTP `400`, code `-32000`
+or `-32600`, and an id that is `null` or does not match the request's, the
+gateway answers HTTP `400` and `-32022` with the request's id, listing only the
+session revisions in `data.supported`, and logs the upstream's error code and
+message at `WARN`. Any other error whose id is `null` or another request's,
+such as a parse error, a crashed handler or a rate limit, is a `502`, as is a
+result with another id. SSE answers are never rewritten. The rewrite needs
+`Content-Type: application/json`, which both official SDKs send; a refusal with
+no or another Content-Type is a `502`. An error with the request's id, or with
+no id, passes through unchanged.
 
 **Compatibility note.** `mcp_protocol_mode` is no longer a setting. Stored
 records and API payloads for surfaces, Transit Points and MCP Proxies that
@@ -102,19 +128,24 @@ from a surface's Access Point and from each Transit Point, and a Transit Point
 or MCP Proxy that still carries it is served without it. Protect every endpoint
 that relies on it another way, or disable it, before downgrading.
 
-Admitted modern Transit requests do not use the legacy base-surface fallback
-when a requested variant is absent, disabled or has a broken default reference.
-Unknown aliases return a correlated `404`; disabled or misconfigured defaults
-return `503`, before Target work. Fabric Open likewise rejects a named alias
-that is absent even when the variant catalog is empty. Legacy resolution is
-unchanged.
-
-The Access Point router applies the same rule on an empty variant catalog,
-where generic resolution returns the base surface. Legacy requests keep that
-fallback; an admitted modern request carrying an unknown alias returns a
-correlated `404`, and a surface whose `default_variant_id` no longer matches a
-variant returns `503`, both before Target work. Non-empty catalogs keep their
-existing router-level alias and disabled-variant errors for both eras.
+No request, legacy or modern, falls back to the base surface or another variant
+when the variant it selects can't be resolved. The Access Point, the Transit
+Point and Fabric receive refuse it at routing, before MCP admission and before
+Target work, with one status per reason: `404` for an alias the surface doesn't
+have (including on an empty variant catalog) and for a disabled named or default
+variant, and `500` when `default_variant_id` names no variant. A modern MCP
+request (`MCP-Protocol-Version` other than `2024-11-05`, or `Mcp-Method`) to an
+MCP Access Point or an MCP Transit Point, whatever its method, is answered with
+a JSON-RPC error with code `-32603` carrying the request's `id`. Its body is read
+only to recover that `id`, within the smaller of the endpoint's
+`mcp_http.max_request_bytes` and 16 KiB, and within 2 seconds: the read runs
+before source authentication and rate limiting, so what an unauthenticated
+caller can make the gateway buffer for a refused request, and how long it can
+keep the refusal pending by trickling or stalling its body, are bounded. A body
+that can't be read (larger than that, not complete within 2 seconds, not JSON,
+or without an `id`, as a `GET` normally has none) gets the same error without
+one. Every other request gets a plain error response. Fabric Open refuses the
+same requests.
 
 Resolved Access Point, Transit Point and Fabric request snapshots retain the
 selected stable variant ID separately from the materialized surface, whose
@@ -157,7 +188,7 @@ Removing it takes a PATCH that sets `mcp_http.authorization` (or `mcp_http`) to
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `allowed_origins` | `[]` | Additional exact serialized HTTP(S) origins, without paths, wildcards or credentials. |
-| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. |
+| `max_request_bytes` | `1048576` | Maximum decoded request body size before protocol parsing. On a Transit Point reached through the `/outbound/...` hop of an inbound listener that shares its host name, a body is also bounded by `[a2a] max_body_size`; see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). |
 | `max_header_bytes` | `16384` | Sum of header-name bytes, value bytes and four framing bytes per field. |
 | `max_accept_ranges` | `32` | Maximum nonempty parsed Accept media ranges across repeated fields. |
 | `max_response_bytes` | `1048576` | Maximum modern JSON response or normalized SSE event bytes. |
@@ -316,9 +347,10 @@ These choices are deliberate and are not open questions.
 | --- | --- |
 | Top-level `_meta` reads | Retained indefinitely as an Affinidi compatibility extension, not MCP behavior. Canonical output still migrates the envelope. |
 | Unmarked requests | A request carrying no modern metadata and no mirrored method/name headers keeps the local compatibility path. That path is a retained Affinidi behavior; it is not evidence of an established legacy session, and it never makes an invalid modern request valid. |
-| Intermediate revisions | Only `2024-11-05` and `2026-07-28` are modelled. `2025-03-26`, `2025-06-18` and `2025-11-25` are rejected with `-32022` listing the versions actually supported; semantics are never inferred by comparing date strings. A legacy `initialize` that asks for a revision the endpoint does not serve (an intermediate revision, or `2026-07-28`, which has no handshake) is forwarded asking for the newest legacy revision the endpoint serves, `2024-11-05`, on direct Access Points, Transit Points and Fabric receive, so the upstream cannot settle a session whose later requests would be rejected. Gateway-owned MCP Proxies already answer `initialize` with `2024-11-05`. This applies to `2025-03-26` clients too, although that revision sends no `MCP-Protocol-Version` header and their later requests are never refused: the upstream answers `2024-11-05`, and such a client continues on it, without `2025-03-26` features, or ends the session. |
+| Intermediate revisions | `2025-03-26`, `2025-06-18` and `2025-11-25` are modelled as session revisions, like `2024-11-05`: they use `initialize` and `Mcp-Session-Id`, so they are forwarded as legacy traffic and their header and `initialize` revision reach the upstream unchanged. They are listed in `SESSION_VERSIONS` (`src/mcp/request_validation.rs`), never inferred by comparing date strings. Any other revision is rejected with `-32022` listing the versions actually supported. A legacy `initialize` that asks for a revision the endpoint does not serve (an unknown revision, or `2026-07-28`, which has no handshake) is forwarded asking for the oldest session revision the endpoint serves, `2024-11-05`, on direct Access Points, Transit Points and Fabric receive, so the upstream cannot settle a session whose later requests would be rejected. Gateway-owned MCP Proxies answer every `initialize` with `2024-11-05`, so their `server/discover` lists at most `2024-11-05` and `2026-07-28`, and only `2026-07-28` when the proxy has no legacy catalog. |
+| MCP session ownership | Accepted risk. The client capabilities recorded at `initialize`, the GET notification stream and pending `elicitation/create` prompts are keyed by surface and `Mcp-Session-Id`. The id is the upstream's when it sends one; the gateway mints a UUIDv4 only when it does not. Keying by surface stops one surface reading or overwriting another's session state, but sessions are not bound to the caller: GET, DELETE and the prompt-answer POST accept any presented id without checking who opened the session, and run before surface policy. Within one surface, isolation therefore relies on the upstream issuing unguessable session ids (the TypeScript and Python SDKs use random UUIDs). A caller holding another user's id can take over their stream, receive their consent prompt with its authorization URL, answer or cancel it, or drop the session. An upstream that returns an id already in use on the surface to a new `initialize` has elicitation turned off for that id, even after `DELETE` and until the gateway restarts, so the binding's `elicit_fallback` applies. The check covers only an `initialize` that sends no `Mcp-Session-Id`; one that sends the id the upstream returns is taken as the caller re-initializing its own session. Records are held in memory, so only sessions opened since the last restart are checked. A client that reconnects without `DELETE` and gets its previous id back, from an upstream that issues a stable id per user, counts as reuse: its own consent prompts fall back until the gateway restarts. Sending `DELETE` before reconnecting avoids this. |
 | OAuth roles | Per surface, the gateway is the Resource Server, and the Authorization Server only through the opt-in `sts.mcp_issuer` profile. No browser-facing authorization-code or PKCE endpoint is offered, so authorization server metadata advertises only the token-exchange and JWT-bearer ID-JAG grants the profile implements. |
-| Conformance scoring | The published MCP conformance suite is scored only against its frozen `2026-07-28` requirement set, matching the modelled revisions. The frozen `2025-11-25` set is permanently out of scope and is never a release gate. |
+| Conformance scoring | The published MCP conformance suite is scored only against its frozen `2026-07-28` requirement set, the only revision the gateway validates as modern. Session revisions are forwarded, not validated, so the frozen `2025-11-25` set is permanently out of scope and is never a release gate. |
 
 ## Ownership And Verification
 
@@ -553,7 +585,11 @@ with the registered catalogs, so an update that does not rebuild them (for
 example only `name`, `status` or `mcp_http`) still returns it; a rebuild that
 loads the legacy catalog clears it. Management tool discovery
 (`POST /v1/mcp-proxies/discover-tools`) lists tools from the modern catalog, so
-it works for such a Proxy too. Both catalogs are published as one snapshot after
+it works for such a Proxy too. Each listed tool carries its `name`, its
+`description` when it has one, and `read_only` from a remote server's
+`annotations.readOnlyHint` when that is a boolean. Discovery with `surface_id`
+lists the saved MCP surface's Target instead of a caller-supplied one; see
+[POLICY.md](POLICY.md#other-pinned-egress-sinks) for its egress rule. Both catalogs are published as one snapshot after
 a successful build; a failed reload keeps the previous snapshot and removal
 drops both. Tests cover conditional input constraints, nested component
 references, scoped local definitions, output constraints, truthful discovery and
@@ -591,7 +627,9 @@ fields remain unchanged. No network reference or icon fetching occurs.
 The supported versions a forwarded discovery result delivers to the client are
 remembered for its endpoint: the surface, the Access Point variant or Transit
 Point alias, and the Target. A `-32601` discovery error marks the endpoint as
-legacy-only; any other error, or a result the gateway rejects, records nothing.
+legacy-only, and a `-32022` error records the versions in its `data.supported`,
+including the session-only refusal described above; any other error, or a
+result the gateway rejects, records nothing.
 Entries replace earlier ones, expire after five minutes and are capped at 1024
 endpoints. A later `-32022` from that endpoint lists only the remembered
 versions, keeping the path's versions when nothing is remembered or nothing
@@ -816,64 +854,79 @@ and responses are protected inside the new consent ticket. Transparent paths
 without gateway consent continue to forward upstream state unchanged.
 
 Direct modern consent runs after current source authorization, managed identity,
-Trust Check and policy/tool gates, before local or delegated payment and Target
-dispatch. Legacy payment order is unchanged. Direct modern policy evaluation
-therefore precedes payment settlement and does not see a settled payment context.
-Continuation claims precede payment verification as well as Target calls. Direct
-and sending Access Points, and independent Fabric receive, inspect local payment
-requirements first: a ready
-continuation with no applicable payment credential returns the local challenge
-without claiming it or activating staged consent. Repeated unpaid checks leave
-the retry usable; a later paid retry still needs the atomic claim. Failed or
-ambiguous payment processing never rearms a claimed continuation. Delegated
-payment challenges and real payment-rail conformance are not verified. Both
-JSON and SSE use a separate
+Trust Check and policy/tool gates, and before payment and Target dispatch. Payment
+is the last step before the request is dispatched (see
+[Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment)), so a request
+refused for a reason that does not depend on payment is never charged, and direct
+modern policy evaluation does not see a settled payment: `input.payment` says only
+whether the request is chargeable. Continuation claims precede the payment call as
+well as Target calls. Direct and sending Access Points, and independent Fabric
+receive, check first whether a chargeable request carries a credential: a ready
+continuation that holds no payment evidence and arrives with no credential is
+answered with agent-pay's challenge without being claimed or activating staged
+consent. Repeated unpaid checks leave the retry usable; a later paid retry still
+needs the atomic claim. A payment that was refused, or whose outcome is unknown,
+never rearms a claimed continuation. Both JSON and SSE use a separate
 terminal-response finalizer for continuation wrapping/consumption; application
 enrichment remains complete-only, and subscription completion bypasses both.
 The direct handler test supplies explicit internal admission dependencies. It
 checks pending
 consent before unavailable delegated payment, changed-policy rejection,
 delegated-token injection without the caller bearer, JSON/SSE upstream-state
-restoration and one Target call under concurrent retries. A local x402 fixture
-also checks repeated HTTP 402 responses followed by one successful paid retry
-and one conflict, with exactly one Target invocation; it uses mock verification
-and no settlement and does not establish external payment-rail conformance.
+restoration and one Target call under concurrent retries. Its `agent_pay` rounds
+run against an in-process payment gate and check that a paid first round and its
+continuation make one payment call between them, that a replayed continuation is
+neither charged nor forwarded, and that two identical paid requests reach the
+Target once. They do not establish conformance of a payment rail or of agent-pay.
 
-Only the credential argument consumed by the active local paywall is excluded
-from the continuation's business-argument digest: `payment_signature` for x402
-or `payment_credential` for MPP. Other arguments, nested fields, and credentials
-for disabled, unmatched or delegated paywalls remain bound. Successful modern
-payment processing removes the consumed header and argument, including a second
-argument copy when a header supplied the credential. x402 receipts use the
-configured response header; MPP receipts use `Payment-Receipt`. Receipt absence
-does not undo successful credential consumption. Legacy processing is unchanged.
+The payment credential is excluded from the continuation's business-argument
+digest wherever the request carries it: the `payment_signature` /
+`payment_credential` tool argument and `_meta["org.paymentauth/credential"]`
+(see [Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment) for
+every placement). Other arguments and nested fields remain bound. The credential
+is removed from the request, from the header and from every argument or `_meta`
+copy, before the request is forwarded, whether or not it is charged. x402
+receipts come back as `PAYMENT-RESPONSE` and MPP receipts as `Payment-Receipt`.
 
-Successful local payment on a consent-enabled modern path is retained as
-authenticated evidence inside the encrypted continuation. Evidence records the
-payment rail, optional receipt, verification time and expiry; receipt bytes are
+A paid request on a consent-enabled modern path keeps its receipt as authenticated
+evidence inside the encrypted continuation: the rail, the receipt, the receipt
+credential's fingerprint, the verification time and the expiry. Receipt bytes are
 bounded to 16 KiB and validity to the continuation's maximum lifetime. A later
 round must validate the same authorization, surface, provider, route and
-business arguments and win its own atomic claim before reusing the evidence.
-The local processor rechecks expiry and rail and returns the original receipt
-without another payment verification or settlement. Evidence expiry is never
-extended by a new upstream round or renewed consent, and descendant state is
-also capped to the previous operation's remaining lifetime. Direct and isolated
-receiver JSON/SSE tests use a real local transaction store and mock verification
-to assert one payment record across two rounds, identical receipts, and no
-additional payment or Target call on replay. This is not external payment-rail,
-full two-gateway, or distributed payment-store conformance.
+business arguments and win its own atomic claim before reusing the evidence; it
+then makes no payment call, and the original receipt comes back in the response
+headers and in `result._meta`. Evidence of another rail, or expired evidence, is
+refused with `403`. Evidence expiry is never extended by a new upstream round or
+renewed consent, and descendant state is also capped to the previous operation's
+remaining lifetime. The direct and isolated receiver JSON/SSE tests run against
+an in-process payment gate and assert one payment call across two rounds,
+identical receipts, and no payment call and no Target call on replay. They do not
+establish agent-pay's own conformance or a distributed payment store.
 
-The delegated-payment hop strips an endpoint-bound Resource Server bearer as
-well as any configured source-auth credential; ingress authorization does not
-authorize a separate payment resource. Payment headers remain available to the
-delegate. For admitted modern requests, delegated HTTP 402 responses are
-`no-store`; the retired payment codes `-32042` and `-32043` are mapped to the
-gateway application codes `1001` (payment required) and `1002` (payment rejected)
-with the caller's request ID and preserved challenge data and headers. Unknown
-upstream codes and legacy response bodies remain unchanged. The existing remote
-allow/challenge/deny contract does not establish that a challenged or timed-out
-payment had no side effects, so a claimed delegated operation is never rearmed.
-Safe delegated retries and cross-round remote payment reuse are not provided.
+An `agent_pay` surface charges a chargeable modern request after consent
+preparation and every other refusal that does not depend on payment, on the direct
+and sending Access Points and on Fabric receive. The payment hop carries only the
+payment credential, `content-type`, `traceparent` and `x-request-id`, never the
+caller's body, Resource Server bearer or source-auth credential. A refusal is
+`no-store` and uses the caller's request ID: `1001` (payment required,
+`data.challenges` and `data.x402`), `1002` (payment or credential refused,
+`data.failure`; a credential that was already used is `data.failure.reason`
+`payment_already_used` with a fresh challenge) or `1003` (payment pending review,
+`data.case_id`). A caller on the legacy MCP revision gets the codes of the MPP MCP
+payment transport instead: `-32042` for a challenge and `-32043` for a refusal. A payment whose
+outcome is not known (`data.error` `payment_unconfirmed`, `Retry-After: 2`) or that is still being
+made (`payment_in_progress`, `409`) is `-32603` on either revision, and tells the client to retry
+the same request with the same credential within agent-pay's 120-second replay window. A
+paid request is forwarded without its credential header, `payment_signature` /
+`payment_credential` argument or `_meta["org.paymentauth/credential"]`, and its
+response carries the receipt as `PAYMENT-RESPONSE` (x402) or `Payment-Receipt`
+(MPP) and in `result._meta["org.paymentauth/receipt"]` of every result message,
+the final message of a streamed response included. A failure after payment still
+carries the receipt. On a consent-enabled path the paid receipt is kept as
+`agent_pay` evidence in the encrypted continuation (above). A claimed delegated
+operation is never rearmed after a refused or timed-out payment; a client retry
+with the same credential is deduplicated by agent-pay through the idempotency
+key, and a payment buys one forwarded request.
 
 Transit Point preparation runs at the existing post-policy credential step.
 It uses the independently verified endpoint resource token, resolved agent DID
@@ -889,26 +942,30 @@ authenticated Fabric delivery conformance remain required.
 
 Fabric receive uses the same preparation after receiver-owned resource
 authorization, verified agent-presentation admission and surface/tool policy
-checks. Modern payment follows consent preparation; legacy ordering stays
-unchanged. Its continuation binds the authenticated sending peer as well as
-the receiving surface, variant, principal and resource. Prepared credentials
-replace Target credentials only after caller-header filtering. Modern receiving
-payment uses the shared local processor with receiver-owned configuration and
-headers, including argument-carried credentials and case-insensitive header
-names. x402 and MPP receipt headers and continuation finalization are shared by
-JSON and SSE.
+checks. Payment follows it and every other refusal that does not depend on
+payment, and is the last step before dispatch. Its continuation binds the
+authenticated sending peer as well as the receiving surface, variant, principal
+and resource. Prepared credentials replace Target credentials only after
+caller-header filtering. The receiver charges with its own configuration: it reads
+the credential from the forwarded headers, each decoded on its own so one header
+it cannot read costs it none of the others, or from the request body, and relays
+the receipt on a response of any status, in the final message of a streamed
+response and on a failure after payment. Receipt headers and continuation
+finalization are shared by JSON and SSE.
 An isolated receiver regression uses a real signed agent presentation and
 receiver-issued resource token, rejects a token for the ingress resource,
 requires consent before Target calls, rejects a changed peer, and permits one
-Target call under concurrent retries. It also covers repeated unpaid challenges,
-header- and argument-carried x402 payment, receipt preservation and removal of
-consumed credentials before the Target, using mock verification without
-settlement. This fixture enters the receiver with
+Target call under concurrent retries. Against an in-process payment gate it also
+covers an unpaid challenge, a header-carried credential, receipt preservation and
+removal of the consumed credential before the Target, a replayed credential
+refused with a fresh challenge, two identical paid requests reaching the Target
+once, and a paid first round with its continuation making one payment call. This
+fixture enters the receiver with
 explicit test-local admission; it is not a managed-mediator or encrypted-frame
 delivery test.
 
 The sending Access Point also prepares modern consent after its Fabric policy
-and tool gates, before mirroring, local/delegated payment or remote dispatch.
+and tool gates, before mirroring, payment or remote dispatch.
 Its `fabric_send` continuation role binds the selected remote peer and is
 distinct from the receiver's `fabric` role. Prepared credentials are added
 after source-token stripping; they must authorize the receiving resource,
@@ -1051,7 +1108,9 @@ OAuth callback. When the continuation runtime, STS profile and existing
 source-auth verification stores are
 configured, `/mcp-consent/connect/{provider-id}` and
 `/mcp-consent/callback/{provider-id}` are registered. The provider references an
-existing JWT verification strategy through `consent_identity_strategy_id`.
+existing JWT verification strategy through `consent_identity_strategy_id`; its
+`principal_claim` names the person who signs in to consent, as it names callers
+on a surface.
 Create/update enforce provider type, HTTPS issuer/resource, tenant-compatible
 references and PAT resource scope; the reference participates in ownership
 impact and reassignment. Connect and callback reject changed surface, provider
@@ -1158,6 +1217,58 @@ The endpoint must be a numeric loopback HTTP address. The test uses fixture
 credentials, creates only its own `mcp-conformance-*` table, and removes that
 table on completion or assertion failure. It never provisions remote resources.
 
+### Choosing How an MCP Access Point Checks Tokens
+
+An MCP Access Point can require a bearer token in two ways, and one surface
+uses only one of them: `mcp_http.authorization` cannot be combined with caller
+authentication, so it cannot be combined with
+`caller_authentication.protected_resource` either.
+
+| | [Gateway STS](#mcp-resource-authorization) | [External authorization server](#authorization-server-discovery-for-caller-authentication) |
+| --- | --- | --- |
+| Setting | `mcp_http.authorization`, with `sts.mcp_issuer` in the network configuration | `access_point.caller_authentication.protected_resource` on a JWT Bearer caller authentication |
+| Who issues tokens | The gateway's STS profile | An authorization server you run, for example Ory Hydra, Auth0 or Microsoft Entra ID |
+| Clients | Pre-registered confidential clients that exchange tokens with the gateway STS (token exchange, ID-JAG redemption) | Standard MCP clients that discover the authorization server and sign in there |
+| Token check | EdDSA `at+jwt` from the profile issuer, audience equal to the resource, every configured scope required | The JWT verification strategy, audience equal to the resource; scopes are advertised, not required |
+| Refusal | `401`, or `403 insufficient_scope` for a missing scope, with a challenge | `401` with a challenge |
+| Metadata names | The gateway STS profile issuer | The configured authorization servers |
+
+Use the gateway STS when the callers are services that already exchange tokens
+with the gateway, for example agents acting for a user through delegation and
+consent. Its STS has no browser sign-in, so off-the-shelf MCP clients cannot
+get a token from it. Use an external authorization server when people or
+agents sign in at your own identity provider with a standard MCP client.
+
+Gateway STS, with `sts.mcp_issuer` configured as shown in the next section:
+
+```json
+{
+  "access_point": { "route": "/mcp/alpha", "protocol": "mcp" },
+  "mcp_http": {
+    "authorization": { "resource": "https://gateway.example/mcp/alpha", "scopes": ["tools"] }
+  }
+}
+```
+
+External authorization server:
+
+```json
+{
+  "access_point": {
+    "route": "/mcp/alpha",
+    "protocol": "mcp",
+    "caller_authentication": {
+      "methods": [{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] }],
+      "protected_resource": {
+        "resource": "https://gateway.example/mcp/alpha",
+        "authorization_servers": ["https://idp.example/realms/agents"],
+        "scopes": ["tools"]
+      }
+    }
+  }
+}
+```
+
 ### MCP Resource Authorization
 
 An opt-in `sts.mcp_issuer` in the network configuration adds an HTTPS issuer
@@ -1211,7 +1322,10 @@ profile policy inputs additionally expose `input.sts.resource` and
 time spent in asynchronous policy preparation.
 
 Profile subjects derived from external assertions are namespaced by the
-verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`.
+verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`,
+where the subject is the value of the verifying strategy's `principal_claim`
+(`sub` by default). A strategy that names another claim binds its name too,
+`SHA-256(JCS([iss,subject,claim]))`, so one value in two claims is two subjects.
 Two trusted issuers using the same `sub` therefore cannot share a resource or
 delegation identity. Already-local profile subjects remain stable through
 ID-JAG redemption. Existing DID-issued endpoints keep their original subject
@@ -1257,7 +1371,11 @@ that same canonical audience. Authentication and protected-resource metadata
 share this derivation; a token for the base resource cannot authorize a named
 variant. Access Point
 authorization is an alternative to legacy `source_auth`; combining them is
-rejected. Transit-token requirements remain independent. Protection applies
+rejected. On a Transit Point it is an alternative to the Transit Point's own
+`source_auth`: the admin API refuses one that sets both, and a stored one
+refuses every request with `503` (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-callers)). Transit-token
+requirements remain independent. Protection applies
 to all requests on the opted-in endpoint, not only modern-shaped requests,
 so removing modern metadata cannot bypass it. Unconfigured endpoints retain
 existing authentication behavior.
@@ -1287,6 +1405,182 @@ proves unavailable receiver authority cannot be bypassed. Complete positive
 Fabric authorization, distributed replay and lifecycle conformance are not
 verified. These opt-in OAuth settings do not change which revisions an
 endpoint admits.
+
+### Authorization Server Discovery for Caller Authentication
+
+An MCP Access Point whose caller authentication validates JWT Bearer tokens
+from an external authorization server can publish RFC 9728 protected
+resource metadata naming that server, so an MCP client finds where to get a
+token. It opts in with `caller_authentication.protected_resource`:
+
+```json
+{
+  "access_point": {
+    "route": "/mcp/alpha",
+    "protocol": "mcp",
+    "caller_authentication": {
+      "methods": [{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] }],
+      "protected_resource": {
+        "resource": "https://gateway.example/mcp/alpha",
+        "authorization_servers": ["https://idp.example/realms/agents"],
+        "scopes": ["tools"]
+      }
+    }
+  }
+}
+```
+
+The setting is valid only on an MCP Access Point whose first caller
+authentication method, the one enforced, is JWT Bearer reading the
+`Authorization` header with the `Bearer` scheme, without `forward_header` and
+with empty `audiences`, and it cannot be combined with `mcp_http.authorization`.
+The token audience is bound to the resource instead, as the MCP authorization
+specification requires (RFC 8707): a token is accepted only when its `aud`
+names the resource advertised for the route called, `resource` on the base
+route and `<resource>$<alias>` on a variant. A token the same authorization
+server issued for another resource or variant, or one without `aud`, is
+refused like any other invalid token. MCP forbids passing a
+client's token through to the upstream server, so the caller's `Authorization`
+header never reaches the Target; a stored surface that sets `forward_header`
+anyway, for example one edited on disk, answers `503`, audited as a blocking
+`setup_failed`, and publishes no document; so does any request whose stored
+setting the Access Point can no longer serve. `resource` follows the rules of
+`mcp_http.authorization.resource`: a canonical HTTPS URL on a public origin of
+the Access Point's listener with the route as its path, a distinct `$alias`
+resource for each enabled variant, and refused on save (`400`) when another
+stored surface or MCP Proxy already serves it. An Access Point at `/` publishes
+for itself only: `/$alias` reaches the Access Point, not the variant, so a save
+that leaves a variant of it enabled with the setting is refused. `authorization_servers` lists
+one to eight RFC 8414 issuer identifiers, checked with the issuer rules of
+[authorization server metadata discovery](SOURCE_AUTH.md#authorization-server-metadata-module-developer-reference)
+under the strict posture (HTTPS, a host, no credentials, query, fragment,
+whitespace or control character), printable ASCII, at most 2048 bytes each and
+advertised exactly as written, since clients compare them byte for byte with
+the issuer in the server's own metadata. Tokens are still validated by the JWT verification strategy, which
+trusts one issuer, so the list must be exactly its expected issuer: a save that
+lists another server, beside it or instead of it, is refused with `400`,
+because every token a client got from that server would be refused. The
+dashboard starts the list with that issuer.
+A request checks tokens against the strategy's current issuer, not against
+the advertised servers, so after a strategy's issuer changes, tokens from the
+new issuer are accepted while clients that follow the old metadata get tokens
+that are refused; update `authorization_servers` too, which a save of the
+surface requires until the two agree. A listener on which a configured prefix
+serves `/.well-known/oauth-protected-resource` itself publishes no documents,
+so discovery on its Access Points answers `503` and their settings are
+refused on save. `scopes` are advertised as
+`scopes_supported`. A variant that overrides `caller_authentication` carries
+its own setting or none.
+
+The document is served at `/.well-known/oauth-protected-resource<route>` and
+`/.well-known/oauth-protected-resource<route>$<alias>` (`%24` accepted) on
+the Access Point's listener, with `no-store`, and at the root form only for a
+surface mounted at `/`. Any origin may read it (`GET` and `HEAD`, CORS
+included), so a browser-based MCP client can fetch it; other methods keep the
+network configuration's `cors` allowlist. That CORS rule is layered on these
+routes only, and only on a listener where no channel or proxy route also
+receives them (see below), so a proxied Target's answers keep the allowlist. It holds `resource`, `authorization_servers`,
+`bearer_methods_supported: ["header"]` and `scopes_supported` when scopes are
+set. Only active surfaces and enabled variants publish. When the settings
+claiming a path no longer validate at request time, for example after the
+listener's public URLs changed, the path answers `503`. Documents are read
+from the live surface, so a surface saved through the API publishes without a
+restart. Each inbound listener answers only for the Access Points bound to
+it, so the same route on two listeners publishes each listener's own
+document. Inbound listeners route both well-known paths whether or not
+`sts.mcp_issuer` is configured: a path no caller authentication publishes
+falls to the gateway STS document when the profile is configured. Without it,
+the path still goes to the proxy handler, as before, when a channel or proxy
+route catch-all covers it, one with an empty prefix or at `/.well-known`, so a
+pass-through surface there keeps serving its Target's own metadata. Otherwise
+it is a plain `404`, not logged or audited as a request without a route,
+since MCP clients probe these paths during discovery. A listener whose
+channel, MCP Proxy or route
+prefix is `/.well-known/oauth-protected-resource` itself leaves the path to
+that prefix and publishes no documents, with a warning at startup.
+
+A request to such an Access Point whose bearer token is missing,
+malformed, expired or otherwise refused by the JWT verification strategy is
+answered before policy with `401`, `application/problem+json`, `no-store`
+and `WWW-Authenticate: Bearer resource_metadata="<absolute metadata URL>"`,
+plus `error="invalid_token"` once a token was presented and `scope` when
+scopes are set. The body's detail is fixed and never says why a token failed.
+The audit records the failure as blocking. A valid token issued for the
+resource is attributed as before, and its identity reaches policy. When the
+Access Point lists further caller authentication methods after the JWT Bearer
+method, a request that carries one of their credentials and none for the JWT
+Bearer method is checked by that method instead, and a failure is refused
+before policy with a plain `401`, without the challenge, so a bad credential
+gets no further than none; a request with no credential at all still gets the
+challenge. Over
+Fabric, the receiving gateway binds the token audience to the same resource,
+because both paths resolve the accepted audiences in
+`source_auth::middleware::resolve_surface_audience`. The variant whose
+`<resource>$<alias>` it binds is the one the sending route's `fabric://` Target
+pins (`fabric://<gateway>/<surface>$<alias>`), else the receiving surface's
+default variant or base route; the caller's own URL alias on the sending gateway
+never selects it (see
+[Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)).
+A pinned variant that does not resolve is refused with `404` (`unknown_variant`)
+before any token is read, never served by the default. The sending
+gateway strips the caller's own `Authorization` header, so only a credential
+it injects (target authentication or a delegated credential) issued for this
+resource can pass, and a missing or refused one gets a `401` before policy
+with `WWW-Authenticate: Bearer realm="agent-gateway"` (plus
+`error="invalid_token"`), without `resource_metadata`, which would only send
+the remote client to fetch a token that is stripped again.
+Server-side errors keep their behaviour, and requested scopes are advertised
+but not enforced.
+
+A PUT whose `caller_authentication` omits `protected_resource` keeps the
+stored setting while the Access Point would still serve it, so a client that
+does not know the setting cannot switch it off by accident. A PUT that changes
+the route or listen address the resource names is refused with `400`, which
+names the setting and asks for a new resource or `null`: dropping the setting
+would leave the JWT Bearer method, whose `audiences` stay empty, checking no
+audience at all. A PUT after which the setting itself no longer fits, one that
+switches the method, sets `forward_header` or `audiences`, or moves the
+protocol off MCP, drops it with a warning in the log instead of being refused
+over a setting the client did not send; the method then checks an audience
+only if the edit set `audiences`. `null` removes it, sent with PATCH, or with
+PUT in the same request as the rest of the edit, a route or listen address
+change included. A variant PUT
+(`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
+variant's own setting in the overrides it sends.
+
+The dashboard edits the setting in the Caller Context editor of an MCP surface
+whose method is JWT Bearer, for the surface and for each variant that overrides
+caller authentication. While discovery is on, the editor keeps `audiences`
+empty, `forward_header` off and the `Authorization` header with the `Bearer`
+scheme. A setting the operator switches off is sent as `null` in the PUT that
+saves the rest of the surface, so a save that fails leaves it in place.
+
+Releases before this one load `caller_authentication` with
+`deny_unknown_fields`, so they skip a surface that stores `protected_resource`
+and stop serving it. Before rolling back to such a release, PATCH
+`{"access_point": {"caller_authentication": {"protected_resource": null}}}`
+onto every surface that sets it, and `{"overrides": {"access_point":
+{"caller_authentication": {"protected_resource": null}}}}` onto every variant
+that sets its own, then protect those Access Points another way: without the
+setting, their JWT Bearer method checks no audience.
+
+`make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
+runs the flow end to end against Ory Hydra with a scripted client and the
+official MCP client SDK, and `--keep` leaves it running for MCP Inspector.
+Hydra ignores the RFC 8707 `resource` parameter MCP clients send, so its consent
+app must grant the resource as the access token audience, or every token is
+refused for its audience; the demo's consent app (`login-consent.mjs`, demo
+only) shows how. Hydra also checks each granted audience against the client's
+allowed audiences, so each client must list the resource there.
+
+The `fabric` CLI sends surface JSON to the gateway as it is, so it sets and
+removes the setting without CLI-specific flags. `--set` sends a JSON Merge
+Patch and `--unset` sends `null`:
+
+```sh
+fabric agent-gateway surfaces update <surface> --set 'access_point.caller_authentication.protected_resource={"resource":"https://gateway.example/mcp/alpha","authorization_servers":["https://idp.example/realms/agents"],"scopes":["tools"]}'
+fabric agent-gateway surfaces update <surface> --unset access_point.caller_authentication.protected_resource
+```
 
 ### Tool Parameter Headers
 
@@ -1419,7 +1713,7 @@ answer, further refusals go unanswered (see
 | Code | Refusal | Sender |
 | --- | --- | --- |
 | `stale_offer` | The Open names no live capability offer, for example after the receiver restarted or the offer expired | Drops its agreement, so the next request negotiates again |
-| `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing `2024-11-05` |
+| `legacy_only` | Sent by an older peer whose surface does not admit modern MCP | Answers the caller as a legacy-only endpoint would: `400` / `-32022` listing every session revision (`SESSION_VERSIONS`) |
 | `capacity_reached` | A full framed-stream cap, a full Open replay table or the peer's or its tenant's share of it, the peer's Open rate, or a listener already admitting 16 Opens | Keeps its agreement and answers `429` with `Retry-After: 5`. A 1.0.0 sender cannot parse this code and waits for its response deadline instead |
 | `unavailable` | Anything else: route, exposure, tenant, size limits, envelope times, admission timeout | Keeps its agreement and answers `502` |
 | Any other code | Sent by a newer peer | Treated as `unavailable` |
@@ -1793,7 +2087,7 @@ Point, whose stored record deliberately still carries the retired
 server directly, and the standalone and `proxy://` owned endpoints must return
 the fixture's text with equal results. In the modern phase every endpoint,
 `legacy-surface` included, must admit `2026-07-28`. In the legacy phase every
-endpoint must answer the unmodelled `2025-11-25` with HTTP `400`, `-32022`, a
+endpoint must answer the unmodelled `2099-01-01` with HTTP `400`, `-32022`, a
 `supported` list that includes `2024-11-05` and not the requested revision, and
 the request id echoed.
 
@@ -1837,15 +2131,15 @@ Engineering invariants for the modern MCP work, kept with the MCP contract.
 
 MCP policy builders carry optional `protocol_version`, `client_capabilities`, and `client_info` from the admitted modern classification through direct, Transit Point, Fabric, Trust Check and per-tool policy inputs. Legacy serialized input stays unchanged. Modern methods and raw params remain extensible; client declarations never establish authenticated identity. Modern context reaches policy only for admitted modern requests; explicit unit/component fixtures and the conformance harness described below exercise it. See `docs/MCP_METADATA.md` for the policy contract.
 
-Every MCP endpoint (Agent Surface, Transit Point, standalone MCP Proxy, Fabric framed stream) admits and advertises `2026-07-28` alongside `2024-11-05`; `mcp_legacy_metadata_output` remains independent. `mcp_protocol_mode` is retired: `RetiredSetting` (`src/config/types.rs`, used as `AgentSurface::_retired_protocol_mode`) accepts any stored or submitted value under `deny_unknown_fields`, discards it and never serializes it, and Transit Points and MCP Proxies ignore the field. `mcp_http`'s Origin, header and body limits apply to every MCP endpoint and every revision, except that buffered Fabric `ForwardRequest` receive skips the Origin allowlist check (`EndpointHttpPolicy::without_origin_check`) because the sending gateway already checked it; the forwarded Origin still counts toward the header budget. Records that do not set `mcp_http` save byte-identically to releases without it: `component_tests::mcp_record_compat` loads and re-saves surface, MCP Proxy, vault token and credential provider fixtures (`tests/fixtures/records/`) written by such a release. Before downgrading, PATCH `{"mcp_http": null}` onto every surface, even one whose GET shows neither field, because GET hides the retired `mcp_protocol_mode` and loading leaves it on disk; rewrite Transit Point arrays without `mcp_http`; then verify the persisted surface records, not GET, carry neither field: a release that predates either field skips a surface that carries it (`AgentSurface` is `deny_unknown_fields`) and silently ignores, then drops on save, the fields on Transit Points and MCP Proxies. No older binary enforces `mcp_http.authorization`: clearing `mcp_http` removes it from surfaces and Transit Points, and a Transit Point or MCP Proxy that keeps it is served without it, so protect or disable every endpoint that relies on it before downgrading (see `docs/MCP_METADATA.md`). Accepted/advertised revisions resolve **per transport path** (`McpPathKind` in `src/mcp/request_validation.rs`: `DirectAccessPoint`, `OwnedProxy`, `TransitPoint`, `FabricReceive`, `FabricSend`) via `runtime_policy_for`, not from one appliance-wide constant, so one path can be returned to legacy-only without affecting Fabric or any other path. Every path admits `2026-07-28`, the Fabric legs as framed streams only. The mounted Access Point router, outbound Transit listener and framed Fabric receive each use their own path policy. `admission_policy_for_target` narrows a `fabric://` Access Point or Transit Point Target to the `FabricSend` policy, so a modern request that leg cannot carry gets `400` / `-32022` at admission, before payment, OPA or consent. Buffered Fabric `ForwardRequest` receive is legacy-only; modern MCP crosses Fabric only as framed streams. Unit tests pin each path's posture, pin that a path never advertises a revision it will not admit, and pin that returning one path to legacy-only leaves the others admitting modern; tests that send `2026-07-28` through a live entry point branch on that path's `runtime_policy_for`, and tests that only need a rejected revision use the unmodelled `2025-11-25`. `no_mcp_surface_scenario_is_a_draft_while_modern_mcp_is_admitted` fails the unit tests if any `tests/features/surface/mcp_*.feature` file contains `@wip` while a path admits modern.
+Every MCP endpoint (Agent Surface, Transit Point, standalone MCP Proxy, Fabric framed stream) admits and advertises `2026-07-28` alongside the session revisions `2024-11-05`, `2025-03-26`, `2025-06-18` and `2025-11-25`, except that a gateway-owned MCP Proxy advertises at most `2024-11-05` and `2026-07-28`, because it answers `initialize` with `2024-11-05`; `mcp_legacy_metadata_output` remains independent. `mcp_protocol_mode` is retired: `RetiredSetting` (`src/config/types.rs`, used as `AgentSurface::_retired_protocol_mode`) accepts any stored or submitted value under `deny_unknown_fields`, discards it and never serializes it, and Transit Points and MCP Proxies ignore the field. `mcp_http`'s Origin, header and body limits apply to every MCP endpoint and every revision, except that buffered Fabric `ForwardRequest` receive skips the Origin allowlist check (`EndpointHttpPolicy::without_origin_check`) because the sending gateway already checked it; the forwarded Origin still counts toward the header budget. Records that do not set `mcp_http` save byte-identically to releases without it: `component_tests::mcp_record_compat` loads and re-saves surface, MCP Proxy, vault token and credential provider fixtures (`tests/fixtures/records/`) written by such a release. Before downgrading, PATCH `{"mcp_http": null}` onto every surface, even one whose GET shows neither field, because GET hides the retired `mcp_protocol_mode` and loading leaves it on disk; rewrite Transit Point arrays without `mcp_http`; then verify the persisted surface records, not GET, carry neither field: a release that predates either field skips a surface that carries it (`AgentSurface` is `deny_unknown_fields`) and silently ignores, then drops on save, the fields on Transit Points and MCP Proxies. No older binary enforces `mcp_http.authorization`: clearing `mcp_http` removes it from surfaces and Transit Points, and a Transit Point or MCP Proxy that keeps it is served without it, so protect or disable every endpoint that relies on it before downgrading (see `docs/MCP_METADATA.md`). Accepted/advertised revisions resolve **per transport path** (`McpPathKind` in `src/mcp/request_validation.rs`: `DirectAccessPoint`, `OwnedProxy`, `TransitPoint`, `FabricReceive`, `FabricSend`) via `runtime_policy_for`, not from one appliance-wide constant, so one path can be returned to legacy-only without affecting Fabric or any other path. Every path admits `2026-07-28`, the Fabric legs as framed streams only. The mounted Access Point router, outbound Transit listener and framed Fabric receive each use their own path policy. `admission_policy_for_target` narrows a `fabric://` Access Point or Transit Point Target to the `FabricSend` policy, so a modern request that leg cannot carry gets `400` / `-32022` at admission, before payment, OPA or consent. Buffered Fabric `ForwardRequest` receive is legacy-only; modern MCP crosses Fabric only as framed streams. Unit tests pin each path's posture, pin that a path never advertises a revision it will not admit, and pin that returning one path to legacy-only leaves the others admitting modern; tests that send `2026-07-28` through a live entry point branch on that path's `runtime_policy_for`, and tests that only need a rejected revision use the unmodelled `2099-01-01`. `no_mcp_surface_scenario_is_a_draft_while_modern_mcp_is_admitted` fails the unit tests if any `tests/features/surface/mcp_*.feature` file contains `@wip` while a path admits modern.
 
-The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2025-11-25` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
+The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`) runs the published suite (`@modelcontextprotocol/conformance`, pinned exactly by its lockfile, frozen `2026-07-28` requirement set) against the ordinary gateway binary, used for both phases: the pinned reference server directly, an Access Point and Transit Point forwarding to it, an owned MCP Proxy standalone and behind `proxy://` (`tools-list`, `tools-call-simple-text` and `caching` only), and a `fabric` target: `scripts/mcp-conformance/fabric.feature` through the g2g BDD runner (Docker mediator), an Access Point on gateway 1 targeting `fabric://` gateway 2, which forwards to the reference server; the suite runs from a step. Expected failures live in `scripts/mcp-conformance/expected-failures/*.yaml`, one `<scenario>:<check-id>` with a one-line reason each; the suite fails a run on an unlisted failure or warning and on a listed check that passes, so remove an entry in the change that fixes it and never list a gateway defect. `check-results.mjs` adds caching parity with the reference server, real owned tool results and result completeness; `compat.mjs` checks a `2024-11-05` session on every endpoint in both phases, `2026-07-28` admission on every endpoint (including `legacy-surface`, whose record still carries the retired `mcp_protocol_mode`) in the modern phase, and `-32022` for the unmodelled `2099-01-01` with a `supported` list offering `2024-11-05` on every endpoint in the legacy phase. Envs are generated under the ignored `target/mcp-conformance/` from `--generate-bootstrap`, a generated certificate and an `openssl rand` backup key held only in the gateway's environment; nothing is copied from `envs/`. The `test:mcp-conformance` CI job runs only when `MCP_CONFORMANCE` is `"true"`, passes the `build:rust` binary to both phases and tolerates only exit `3` (dependency fetch failure). Modern MCP crosses Fabric only as framed streams; the CI job leaves out the `fabric` target (no Docker daemon). See `docs/MCP_METADATA.md` (Conformance Harness).
 
 `mcp_http` holds endpoint-local `allowed_origins`, `max_request_bytes` (default 1 MiB), `max_header_bytes` (16 KiB), `max_accept_ranges` (32), the modern response bounds below, and an optional `authorization`. `mcp_http.authorization` (Resource Server tokens; see the STS section) and the Origin, size and response settings apply to every MCP endpoint and every revision; Origin and size checks run through `mcp::modern_http::EndpointHttpPolicy`. A public endpoint given as a bare listen address has no HTTP(S) origin and adds nothing to the Origin allowlist. Direct, Transit Point, standalone proxy POST, and independent Fabric receive paths use the shared admission wrapper. Origin authority comes only from configured public listener origins and exact allowlisted origins, never request forwarding headers or CORS; missing Origin is allowed, invalid present Origin is `403`. Body/header budgets return `413`/`431`. The existing wire validator precedes modern media checks and rejects every revision the path does not admit. Every admitted POST must then be one JSON-RPC object with no duplicate or case-variant keys (`tool_analyzer::single_object_refusal`), on every path including the standalone proxy. Standalone proxy raw-body validation runs before legacy session lookup. See `docs/MCP_METADATA.md` for defaults, errors and lifecycle semantics.
 
 GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy GET/DELETE without a body remain unchanged. PUT, PATCH and extension methods return `405` with the endpoint's `Allow` list (`EndpointHttpPolicy::non_post_response`), and on Access Points, Transit Points and Fabric receive a body on any method but POST returns `400` (`non_post_body_response`). Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
 
-Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The modern-only `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion and execution remain unchanged. Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
+Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion is unchanged, and a legacy `tools/call` without the Target credential still runs on `rmcp-openapi`'s client. A legacy `tools/call` that carries the Target credential runs through `modern_rest::call` instead: no redirects, the `mcp_http` limits, the tool resolved against the proxy's `base_url` with a trailing `/` added when missing, as `rmcp-openapi` resolves it, and each call vetted and pinned to the backend address as a modern call is (see `docs/PROTOCOLS.md`). Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
 
 `proxy::fabric_stream` is the additive framed Fabric transport that carries modern MCP between gateways: nonce-bound capability offers, authcrypt peer/recipient/Connection Point/listener-generation/thread binding, bounded bidirectional credits and reordering, Open replay protection and listener-owned receiving and outgoing tasks. Typed input preserves bytes, repeated headers and resolved variant snapshots through independent receiver admission. Direct and Transit senders use the negotiated transport after request gates; both ends reuse JSON/SSE and complete-result processing, including receiver-owned `proxy://` dispatch. Every frame observes its registered negotiated limits; dropping an HTTP body signals cancellation even while quiet, while normal EOF reports completion separately. Framed response sends require an exact peer-bound EndAck after sealing their final byte/sequence boundary, including empty responses; byte credit alone is not completion. Transport-owned metrics report only peer-acknowledged bytes and release connection guards on success, failure or drop. After a validated MCP final result, Direct and Transit adapters explicitly hand the response lease to the listener driver for a bounded End handshake; ordinary body drops still cancel. Peer consumption is not final HTTP-client delivery. Legacy ForwardRequest/ForwardResponse stay buffered. `a2a.fabric_stream_max_envelope_bytes` bounds actual encrypted payloads before sending; it is optional and range checked (64 KiB to 1 MiB, within `a2a.sdk_inbound_cache_bytes`) only when set, and `A2aConfig::stream_envelope_limit` otherwise uses 128 KiB capped at the SDK cache, so configs without it load whatever their cache size. `DidCommFrameSink` packs and sends every frame like `pack_and_send_message`, stamping `created_time`/`expires_time` so the receiver checks an Open's envelope times as it checks a `forward-request`'s (`envelope_replay::validate_envelope_times`); the Open's replay record is kept by the stream registry. Local capabilities advertise request streams and subscriptions; any active MCP surface admits a framed modern request; a `legacy_only` refusal comes only from older peers that do not admit modern MCP. The conformance harness `fabric` target covers the complete route over one Docker mediator; framed streams are not supported across mediator federation, where each gateway uses its own mediator. See `docs/MCP_METADATA.md`.
 
@@ -1859,13 +2153,13 @@ Modern admission validates optional request log levels and string/number progres
 
 ### Discovery, subscriptions and variants
 
-Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
+Modern MCP discovery and subscriptions run for admitted modern requests on Access Points, gateway-owned Proxies, Transit Points and Fabric framed streams. Forwarded discovery intersects endpoint versions and path capabilities, including the selected authenticated Fabric peer; changed results are private with zero TTL. `mcp::upstream_versions` remembers the versions each forwarded discovery delivered (legacy-only after `-32601`, the listed versions after `-32022`, nothing after other errors) per surface, Access Point variant or Transit Point alias, and Target, bounded to 1024 entries for 300 seconds; a later `-32022` from that endpoint advertises only the path's versions that are also remembered, keeping the full path list when nothing is remembered or none overlap, without changing admission or calling the upstream. Owned catalogs advertise tools-list changes and provide bounded, stream-local subscriptions. Acknowledgement precedes every requested notification, subscription IDs retain their string/integer type, and final subscription results bypass application enrichment. Resource updates match exact parsed URIs or hierarchical child/fragment relationships with unchanged scheme, authority and query; explicit fragments and opaque URIs require exact equality. Matching never grants resource access. Access changes end only the subscriptions on the changed surface or tenant, and appliance-wide changes (gateway and global policy, API keys, vault revocation, appliance-global resources) end all; request-entry revisions and verified JWT/Transit expiry bound access lifetime. Provider-specific opaque sub-resources, other credential revocation, changes to a connection's trusted or attested issuers, cross-process changes and full route/mediator authorization and lifecycle conformance are not verified. See `docs/MCP_METADATA.md`; do not treat helper tests as proof of those.
 
 JWT strategy mutations/reload, provider mutations and explicit vault revocation also invalidate local subscription lifetimes; vault invalidation remains inside the owned mutation task so cancellation cannot release it early. Reads do not invalidate access. Access Points, Transit Points and independent Fabric receivers capture the configured vault's durable revocation epoch before credential evaluation and recheck it every second through one shared watcher per vault, with a one-second read timeout even on quiet streams. A changed epoch closes streams started under an earlier one; corrupt or unavailable state closes every subscription on the vault; initial read failure returns correlated `503`. Separate-process local-filesystem tests cover revocation without a local signal. Remote-filesystem visibility, other credential kinds, cross-process configuration changes and full resource-policy conformance remain required.
 
-When a Transit Point requires a Transit token, admitted modern requests revalidate it after MCP admission: one header, configured validator, matching surface ID and permitted Transit Point, nonempty token ID, and strict issue/expiry times. Missing authority, duplicates, cross-surface tokens and expiry fail before identity or Target work. The subscription lifetime is capped to that token's expiry; reconnect must pass current checks. Legacy Transit-token validation is unchanged.
+When a Transit Point requires a Transit token, admitted modern requests revalidate it after MCP admission: one header, configured validator, the checks every Transit token passes (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)), and strict issue/expiry times with no clock leeway. Missing authority, duplicates, cross-surface tokens and expiry fail before identity or Target work. The subscription lifetime is capped to that token's expiry; reconnect must pass current checks.
 
-Resolved Access Point, Transit Point and Fabric requests retain their selected stable variant ID independently of the materialized surface's cleared catalog. Modern credential preparation and continuations use that retained ID, including defaults. Admitted modern Transit requests reject unknown, disabled and broken-default variants before Target work instead of using the legacy base fallback; Fabric Open also rejects absent named aliases in an empty catalog. The Access Point router carries an unresolved selection on an empty catalog and applies the same rule: legacy keeps the base fallback, while an admitted modern request returns `404` for an unknown alias or `503` for a broken `default_variant_id`. Named variant resource audiences remain distinct from base audiences. Outbound listeners retain the original catalog in shared state while compiling default identity engines, register named canonical and custom paths with `$alias` or `%24alias`, and strip variant routing syntax before forwarding. Custom Transit audiences append `$alias` to the configured resource path; authentication and metadata share the derivation. Real-listener and signed custom-path fixtures cover routing, metadata, audience rejection and quiet cancellation, but complete Access Point router and encrypted cross-gateway authorization still require conformance. Legacy resolution is unchanged.
+Resolved Access Point, Transit Point and Fabric requests retain their selected stable variant ID independently of the materialized surface's cleared catalog. Modern credential preparation and continuations use that retained ID, including defaults. Every path refuses unknown, disabled and broken-default variants at routing, before Target work, for legacy and modern requests alike: `404` for an unknown or disabled variant, `500` for a broken `default_variant_id`; Fabric Open refuses the same requests, including an alias on an empty catalog. Named variant resource audiences remain distinct from base audiences. Outbound listeners retain the original catalog in shared state while compiling default identity engines, register named canonical and custom paths with `$alias` or `%24alias`, and strip variant routing syntax before forwarding. Custom Transit audiences append `$alias` to the configured resource path; authentication and metadata share the derivation. Real-listener and signed custom-path fixtures cover routing, metadata, audience rejection and quiet cancellation, but complete Access Point router and encrypted cross-gateway authorization still require conformance.
 
 ### Resource Server, consent and credentials
 
@@ -1873,7 +2167,7 @@ The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `
 
 MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no gateway-hosted browser login, authorization-code grant or PKCE authorization endpoint. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
 
-The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before local/delegated payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Payment retry/idempotency, distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
+The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
 
 Fabric receive prepares modern consent after its own resource authorization, verified agent-presentation admission and policy gates, before payment and Target dispatch. Continuations additionally bind the authenticated sending peer; ingress-audience tokens do not authorize the receiver. An isolated signed-identity receiver test covers pending consent, delegated credential delivery, JSON/SSE upstream continuation restoration, cross-peer rejection and single-use concurrent retries. This does not establish encrypted-frame or managed-mediator conformance.
 
@@ -1883,8 +2177,8 @@ Modern credential preparation owns all configured bindings, including tool-filte
 
 Modern credential destinations must be unambiguous before fetching credentials or issuing consent: headers compare case-insensitively, metadata uses canonical key validation, and custom formats must contain `{value}`. Reject conflicting destinations, malformed values and credentials over 32 KiB instead of silently sanitizing or overwriting them. Prepared headers remain sensitive.
 
-Direct and sending Access Points and independent Fabric receive inspect local payment requirements before consuming a ready modern continuation. A no-credential challenge leaves the continuation and staged consent unclaimed; payment verification and Target dispatch still require the atomic claim. Failed or ambiguous payment processing never rearms an operation. Shared local processing uses each endpoint's own configuration and headers, removes consumed header and argument credentials, and preserves x402 versus MPP receipt names. Only the active local paywall's consumed argument is excluded from the continuation digest; business arguments, nested fields and other payment rails remain bound. Successful local payment on consent-enabled paths is retained as bounded, encrypted continuation evidence: later rounds revalidate authority and claim once before reusing the original receipt without another verification or settlement. Neither evidence nor descendant continuations extend the original expiry. Direct and isolated receiver JSON/SSE regressions assert one persisted mock x402 payment across rounds and no further work on replay. Delegated payment, external payment-rail and distributed payment-store conformance are not verified.
+Direct and sending Access Points and independent Fabric receive check whether a chargeable request carries a credential before consuming a ready modern continuation. A request with no credential and no payment evidence gets agent-pay's challenge and leaves the continuation and staged consent unclaimed; the payment call and Target dispatch still require the atomic claim. A refused or unknown payment outcome never rearms an operation. The consumed credential is removed from the request wherever it was carried, and only credential fields are excluded from the continuation digest; business arguments, nested fields and every other field remain bound. A paid request on consent-enabled paths is retained as bounded, encrypted continuation evidence: later rounds revalidate authority and claim once before reusing the original receipt without another payment call. Neither evidence nor descendant continuations extend the original expiry. Direct and isolated receiver JSON/SSE regressions run against an in-process payment gate and assert one payment call across rounds and no further work on replay. Payment-rail and agent-pay conformance are not verified.
 
-Delegated payment never forwards the ingress Resource Server bearer. Modern delegated HTTP 402 challenges force `no-store` and map only retired payment codes `-32042`/`-32043` to application codes `1001`/`1002`, retaining caller correlation and challenge data/headers. Unknown upstream errors and legacy bodies remain unchanged. The remote allow/challenge/deny contract does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
+The payment call never forwards the ingress Resource Server bearer: it carries only the credential, `content-type`, `traceparent` and `x-request-id`. Every payment refusal is `no-store`. agent-pay's answers map to codes by their reason, not by status alone: a challenge or an expired payment is `1001`; a malformed or refused credential, a rejected payment and a credential already used are `1002`; a payment held for review is `1003`; a status or reason that is not agent-pay's is `payment_unavailable` (`502` or `503`) and is not a rejection. A caller on the legacy MCP revision, a request with no MCP protocol version, gets `-32042` for a challenge and `-32043` for the other `402` answers, as the retired transport sent them, with the caller's correlation, the challenge data and its headers retained. The payment gateway's answer does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
 
 Vault mutations keep their acquired file lock in an owned task until filesystem work completes, even if the caller is cancelled; lock acquisition remains cancellable and provider network calls stay outside it. A cancelled mutation may have committed and must not be assumed absent. The shared atomic writer uses exclusive UUID temporary files, file flush/sync before rename and Unix directory sync after rename/deletion; a directory sync the filesystem reports as unsupported is logged once and skipped, while other sync failures propagate. Four-process local tests cover refresh claim races, revocation and abrupt owner death; paused-write tests cover cancellation. Real loopback DynamoDB-compatible tests race continuation claims and ID-JAG redemption across four processes. These checks do not prove remote-filesystem, deployed IAM, hardware power-loss or complete multi-host consent conformance.

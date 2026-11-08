@@ -115,6 +115,7 @@ export const accessPointDefinition: NodeDefinition = {
     // Assigned rather than deleted, so the canvas-blob overlay, which fills
     // only missing keys, cannot bring back a stale copy.
     c.a2a = undefined;
+    c.public = typeof slice?.public === 'boolean' ? slice.public : undefined;
     if (slice?.protocol === 'a2a' || slice?.protocol === 'ap2') {
       const a2a = slice?.a2a;
       // A block without versions comes from a dashboard payload whose base
@@ -199,6 +200,10 @@ export const accessPointDefinition: NodeDefinition = {
     }
     if (typeof c.name === 'string' && c.name.trim()) {
       ap.name = c.name.trim();
+    }
+    // Left out until set, so saving a surface stored without it keeps its rules.
+    if (typeof c.public === 'boolean') {
+      ap.public = c.public;
     }
     if (ap.protocol === 'a2a' || ap.protocol === 'ap2') {
       ap.a2a = a2aSettingsForPayload(

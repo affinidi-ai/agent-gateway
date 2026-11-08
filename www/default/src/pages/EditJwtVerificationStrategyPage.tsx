@@ -7,6 +7,8 @@ import { validateUrl } from '../utils/urlValidation';
 import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
 import { DOCS_URL } from '../config/docs';
+import { showToast } from '../utils/toaster';
+import { joinWarnings, parseWarningHeader } from '../utils/warningHeader';
 
 interface JwksSourceForm {
   type: 'remote' | 'static';
@@ -17,12 +19,14 @@ interface JwksSourceForm {
 interface JwtVerificationStrategyForm {
   name: string;
   expected_issuer: string;
+  principal_claim: string;
   jwks_source: JwksSourceForm;
 }
 
 const EMPTY_FORM: JwtVerificationStrategyForm = {
   name: '',
   expected_issuer: '',
+  principal_claim: '',
   jwks_source: {
     type: 'remote',
     jwks_uri: '',
@@ -67,6 +71,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
       setForm({
         name: data.name ?? '',
         expected_issuer: data.expected_issuer ?? '',
+        principal_claim: data.principal_claim ?? '',
         jwks_source: {
           type: src.type === 'static' ? 'static' : 'remote',
           jwks_uri: src.jwks_uri ?? '',
@@ -188,10 +193,12 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
     setSaving(true);
     setError(null);
 
+    const principalClaim = form.principal_claim.trim();
     const body = {
       name: form.name.trim(),
       expected_issuer: form.expected_issuer.trim(),
       jwks_source: jwksSourcePayload,
+      ...(isNew && principalClaim ? { principal_claim: principalClaim } : {}),
     };
 
     try {
@@ -211,6 +218,10 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
         throw new Error(formatApiError(response.status, text, response.statusText));
       }
 
+      const warnings = parseWarningHeader(response.headers?.get('Warning'));
+      if (warnings.length > 0) {
+        showToast('warning', joinWarnings(warnings), { autoRemove: false });
+      }
       navigate('/settings?tab=strategies');
     } catch (e: any) {
       setError(e.message ?? 'Save failed');
@@ -228,10 +239,11 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-jwt-strategy-editor">
       <div className="mb-3">
         <button
           className="btn btn-secondary btn-sm"
+          data-testid="jwt-strategy-editor-back-button"
           onClick={() => navigate('/settings?tab=strategies')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -304,6 +316,39 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               <small className="form-text text-muted">
                 If a token's issuer doesn't match exactly, it's rejected, even if the signature is
                 valid.
+              </small>
+            </div>
+
+            {/* Caller identity claim */}
+            <div className="mb-3">
+              <div className="field-label-with-help">
+                <label htmlFor="principal_claim" className="mb-0">
+                  Caller identity claim
+                </label>
+                <FieldHelp
+                  ariaLabel="About Caller identity claim"
+                  testId="field-help-principal-claim"
+                >
+                  The token claim whose value names the caller. It decides which delegated
+                  credentials a caller uses, so it cannot be changed after the strategy is created:
+                  create a new strategy to use another claim.
+                </FieldHelp>
+              </div>
+              <input
+                id="principal_claim"
+                data-testid="jwt-strategy-editor-principal-claim-input"
+                name="principal_claim"
+                type="text"
+                className="form-control"
+                value={form.principal_claim}
+                onChange={handleChange}
+                placeholder="sub"
+                disabled={!isNew}
+                maxLength={128}
+              />
+              <small className="form-text text-muted">
+                Leave empty to use <code>sub</code>. Use <code>oid</code> for Microsoft Entra, whose{' '}
+                <code>sub</code> differs for each application.
               </small>
             </div>
 
@@ -380,6 +425,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
                     <button
                       type="button"
                       className="btn btn-outline-secondary"
+                      data-testid="jwt-strategy-editor-check-jwks-button"
                       onClick={() => checkJwksUri()}
                       disabled={
                         jwksUriCheckState === 'checking' || !form.jwks_source.jwks_uri.trim()
@@ -445,7 +491,12 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
             <hr />
 
             <div className="d-flex">
-              <button type="submit" className="btn btn-primary me-2" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="jwt-strategy-editor-save-button"
+                className="btn btn-primary me-2"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span className="spinner-border spinner-border-sm me-1" /> Saving…
@@ -460,6 +511,7 @@ const EditJwtVerificationStrategyPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-secondary"
+                data-testid="jwt-strategy-editor-cancel-button"
                 onClick={() => navigate('/settings?tab=strategies')}
                 disabled={saving}
               >

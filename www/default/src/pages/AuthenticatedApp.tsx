@@ -6,7 +6,10 @@ import { PageTitleProvider } from '../context/PageTitleContext';
 
 // Load dashboard components - only when authenticated
 import Sidebar from '../components/Sidebar';
+import RedirectKeepingQuery from '../components/shared/RedirectKeepingQuery';
 import ProtectedRoute from '../components/ProtectedRoute';
+import AgentPayRoute from '../components/AgentPayRoute';
+import { connectionsPermissions, useAgentPayFlag } from '../utils/featureFlags';
 import ScrollToTop from '../components/ScrollToTop';
 import Header from '../components/Header';
 import Dashboard from './Dashboard';
@@ -70,6 +73,8 @@ const CreateGatewayConnectionPointWizardPage = lazy(
 );
 const AddGatewayViaOOBWizardPage = lazy(() => import('./AddGatewayViaOOBWizardPage'));
 const ApproveGatewayWizardPage = lazy(() => import('./ApproveGatewayWizardPage'));
+const AddPaymentGatewayWizardPage = lazy(() => import('./AddPaymentGatewayWizardPage'));
+const PaymentGatewayDetailPage = lazy(() => import('./PaymentGatewayDetailPage'));
 const AddMcpProxyWizardPage = lazy(() => import('./AddMcpProxyWizardPage'));
 const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
@@ -134,6 +139,7 @@ const ProxiesRouteAccess: React.FC = () => {
 const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
   const { state, actions } = useApp();
   const { loading: permissionsLoading } = usePermissions();
+  const { enabled: agentPayOn, loaded: agentPayLoaded } = useAgentPayFlag();
   const hasRefreshedCache = useRef<boolean>(false);
   const [version, setVersion] = useState('-.-.-');
   const [isInitializing, setIsInitializing] = useState(true);
@@ -148,10 +154,8 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
 
   // Connect WebSocket on mount ONCE
   useEffect(() => {
-    //console.log('[AuthenticatedApp] Mounting - connecting WebSocket');
     actions.connectWebSocket();
     return () => {
-      //console.log('[AuthenticatedApp] Unmounting - disconnecting WebSocket');
       actions.disconnectWebSocket();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -209,7 +213,6 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
               .fetch(`/api/v1/version`)
               .then(response => response.json())
               .then(data => {
-                console.info('version:', JSON.stringify(data));
                 setVersion(data.version);
               })
               .catch(error => {
@@ -313,9 +316,11 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                 <Route
                   path="/connections"
                   element={
-                    <ProtectedRoute permission="gateways.view">
-                      <ConnectionsPage />
-                    </ProtectedRoute>
+                    agentPayLoaded ? (
+                      <ProtectedRoute permission={connectionsPermissions(agentPayOn)}>
+                        <ConnectionsPage />
+                      </ProtectedRoute>
+                    ) : null
                   }
                 />
                 <Route
@@ -371,6 +376,36 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   element={
                     <ProtectedRoute permission="gateways.edit">
                       <EditGatewayPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways/connect"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.edit">
+                      <AgentPayRoute>
+                        <AddPaymentGatewayWizardPage />
+                      </AgentPayRoute>
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways/:id"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.view">
+                      <AgentPayRoute>
+                        <PaymentGatewayDetailPage />
+                      </AgentPayRoute>
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/payment-gateways"
+                  element={
+                    <ProtectedRoute permission="payment_gateways.view">
+                      <AgentPayRoute>
+                        <Navigate to="/connections?tab=payment-gateways" replace />
+                      </AgentPayRoute>
                     </ProtectedRoute>
                   }
                 />
@@ -557,13 +592,14 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   }
                 />
                 <Route
-                  path="/x402payments"
+                  path="/payments"
                   element={
                     <ProtectedRoute permission="payments.view">
                       <PaymentsPage />
                     </ProtectedRoute>
                   }
                 />
+                <Route path="/x402payments" element={<RedirectKeepingQuery to="/payments" />} />
                 <Route
                   path="/secrets"
                   element={

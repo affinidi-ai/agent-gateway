@@ -110,6 +110,9 @@ impl Default for RbacConfig {
         // Trust Registry Management - Admin only (gateway-wide trust source; HIGH severity finding H13)
         permissions.insert("trust_registries.edit".to_string(), "administrator".to_string());
         permissions.insert("trust_registries.delete".to_string(), "administrator".to_string());
+        // Payment Gateway Management - Admin only (decides where every surface's payments are taken)
+        permissions.insert("payment_gateways.edit".to_string(), "administrator".to_string());
+        permissions.insert("payment_gateways.delete".to_string(), "administrator".to_string());
         // Surface Management - Admin only (rewriting a surface redirects traffic and bypasses OPA / auth strategy; HIGH severity findings H1, H6, H16)
         permissions.insert("surfaces.edit".to_string(), "administrator".to_string());
         permissions.insert("surfaces.delete".to_string(), "administrator".to_string());
@@ -165,6 +168,7 @@ impl Default for RbacConfig {
         permissions.insert("gateways.view".to_string(), "user".to_string());
         permissions.insert("mediators.view".to_string(), "poweruser".to_string());
         permissions.insert("trust_registries.view".to_string(), "user".to_string());
+        permissions.insert("payment_gateways.view".to_string(), "user".to_string());
         permissions.insert("surfaces.view".to_string(), "user".to_string());
         // Secrets - Admin only for all operations. There is no per-record owner, so a
         // read grant is a read of every credential the appliance holds.
@@ -175,6 +179,9 @@ impl Default for RbacConfig {
         // every user's/agent's delegated OAuth grants gateway-wide, so both are admin-only.
         permissions.insert("delegation_vault.view".to_string(), "administrator".to_string());
         permissions.insert("delegation_vault.delete".to_string(), "administrator".to_string());
+        // Starting and completing external consent connects, and listing and removing grants by
+        // binding, for the surfaces a token may manage - Admin only.
+        permissions.insert("delegation_vault.connect".to_string(), "administrator".to_string());
         permissions.insert("notifications.view".to_string(), "user".to_string());
         permissions.insert("notifications.edit".to_string(), "poweruser".to_string());
         permissions.insert("notifications.delete".to_string(), "poweruser".to_string());
@@ -233,6 +240,11 @@ pub enum Feature {
     TrustRegistriesEdit,
     TrustRegistriesDelete,
 
+    // Payment Gateway Management
+    PaymentGatewaysView,
+    PaymentGatewaysEdit,
+    PaymentGatewaysDelete,
+
     // Vault Management
     SecretsView,
     SecretsEdit,
@@ -241,6 +253,8 @@ pub enum Feature {
     // Delegation Vault Management - admin only (enumerate / mass-revoke delegated OAuth grants)
     DelegationVaultView,
     DelegationVaultDelete,
+    /// Start and complete external consent connects, and list grants by binding.
+    DelegationVaultConnect,
 
     // Notification Management
     NotificationsView,
@@ -364,11 +378,15 @@ impl Feature {
             Feature::TrustRegistriesView => "trust_registries.view",
             Feature::TrustRegistriesEdit => "trust_registries.edit",
             Feature::TrustRegistriesDelete => "trust_registries.delete",
+            Feature::PaymentGatewaysView => "payment_gateways.view",
+            Feature::PaymentGatewaysEdit => "payment_gateways.edit",
+            Feature::PaymentGatewaysDelete => "payment_gateways.delete",
             Feature::SecretsView => "secrets.view",
             Feature::SecretsEdit => "secrets.edit",
             Feature::SecretsDelete => "secrets.delete",
             Feature::DelegationVaultView => "delegation_vault.view",
             Feature::DelegationVaultDelete => "delegation_vault.delete",
+            Feature::DelegationVaultConnect => "delegation_vault.connect",
             Feature::NotificationsView => "notifications.view",
             Feature::NotificationsEdit => "notifications.edit",
             Feature::NotificationsDelete => "notifications.delete",
@@ -564,6 +582,8 @@ mod tests {
             // H2, H8
             Feature::GatewaysEdit,
             Feature::GatewaysDelete,
+            Feature::PaymentGatewaysEdit,
+            Feature::PaymentGatewaysDelete,
             Feature::PaymentsEdit,
             Feature::PaymentsDelete,
             // H4
@@ -578,6 +598,7 @@ mod tests {
             // Delegation-vault enumerate + mass-revoke of delegated OAuth grants
             Feature::DelegationVaultView,
             Feature::DelegationVaultDelete,
+            Feature::DelegationVaultConnect,
             // H10, H11
             Feature::ApiKeysView,
             Feature::ApiKeysEdit,

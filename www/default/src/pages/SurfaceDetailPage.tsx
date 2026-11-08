@@ -1,7 +1,8 @@
-import React, { useEffect, useState, useCallback, useRef, useReducer } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import React, { useEffect, useState, useCallback, useRef, useReducer, useMemo } from 'react';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { AgentSurface, apiClient } from '../api';
 import { showToast } from '../utils/toaster';
+import SaveWarningsBanner from '../components/surface-builder/SaveWarningsBanner';
 import { usePermissions } from '../context/PermissionsContext';
 import { usePageTitle } from '../context/PageTitleContext';
 import { useApp } from '../context/AppContext';
@@ -11,15 +12,29 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol, SurfaceSigning } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
-import SurfaceFormShell from '../components/surface-builder/SurfaceFormShell';
+import SurfaceFormShell, {
+  type SurfaceFormView,
+} from '../components/surface-builder/SurfaceFormShell';
+import { dependencyErrorBlocker } from '../components/surface-builder/dependencyBlocker';
 import { useSurfacePolicyDefinitions } from '../components/surface-builder/hooks/useSurfacePolicyDefinitions';
 import { surfacePolicyBlockingReason } from '../components/surface-builder/elements/policy/status';
 import { withA2aValidationSettled } from '../components/surface-builder/elements/access-point/a2aSettings';
+import { withDroppedProtectedResourcesRemoved } from '../components/surface-builder/elements/caller-auth/protectedResource';
+import { withCallerAccessSettled } from '../components/surface-builder/elements/access-point/publicAccess';
+import {
+  accessPointStatus,
+  chooseAccessPointNotice,
+  savedAccessPointStatus,
+} from '../components/surface-builder/elements/access-point/readiness';
 import {
   DEFAULT_DIDWEBVH_CONFIG,
   type DidwebvhConfig,
@@ -34,6 +49,8 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
+import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
 interface DetailBuilderState {
@@ -103,17 +120,42 @@ const SurfaceDetailPage: React.FC = () => {
   const { getCurrentStats } = useApp();
 
   const [surface, setSurface] = useState<AgentSurface | null>(null);
+  const [saveCount, setSaveCount] = useState(0);
+  const savedHasVariants = (surface?.variants ?? []).some(v => v.enabled !== false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // `Warning` headers of the last save but the Access Point's, shown in the
+  // banner and on the Transit Points they name.
+  // A create that drew warnings sends them here in the route state. They are
+  // kept with the surface they are about, since this page stays mounted when
+  // the route moves to another surface.
+  const location = useLocation();
+  const [savedWarnings, setSavedWarnings] = useState<{
+    surfaceId: string | undefined;
+    warnings: readonly string[];
+  } | null>(() => {
+    const carried = (location.state as { saveWarnings?: unknown } | null)?.saveWarnings;
+    return Array.isArray(carried) && carried.every(w => typeof w === 'string') && carried.length
+      ? { surfaceId, warnings: carried as string[] }
+      : null;
+  });
+  const saveWarnings = savedWarnings?.surfaceId === surfaceId ? savedWarnings.warnings : null;
+  // The route state outlives the visit in `history.state`, so a refresh or a
+  // Back return would show the create's warnings again; it is read once.
+  useEffect(() => {
+    if (location.state != null) {
+      const { pathname, search, hash } = location;
+      navigate({ pathname, search, hash }, { replace: true, state: null });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [hasAttemptedSave, setHasAttemptedSave] = useState(false);
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
-  const [activeTab, setActiveTab] = useState<
-    'surface' | 'elements' | 'monitoring' | 'config' | 'editor'
-  >('surface');
+  const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
   const [editorTabNodeId, setEditorTabNodeId] = useState<string | null>(null);
 
   const handleOpenFullscreenEditor = useCallback((nodeId: string) => {
@@ -199,6 +241,12 @@ const SurfaceDetailPage: React.FC = () => {
   // inactive variant, but `handleSwitchVariant` is declared further
   // down. Bridge them via this ref so neither has to be hoisted.
   const switchVariantRef = useRef<((variantId: string) => void) | null>(null);
+  // Read by `handleSwitchVariant`, which is memoised: the current
+  // Save-blocking dependency error and the toast that reports it.
+  const variantSwitchBlockerRef = useRef<{ message: string; nodeId: string } | null>(null);
+  const showBlockingToastRef = useRef<
+    ((blocking: { message: string; nodeId?: string; variantId?: string }) => void) | null
+  >(null);
   // Page-level full-surface undo/redo ring buffer is hoisted above
   // the builder so its `canUndo` / `canRedo` flags can drive the
   // builder's toolbar override flags in the same render. The
@@ -267,6 +315,13 @@ const SurfaceDetailPage: React.FC = () => {
     buildVariantsWireSlice,
     getSnapshot: getVariantSnapshot,
   } = variantSnapshots;
+  const activeSnapshotId = variantSnapshots.activeVariantId ?? BASE_VARIANT_ID;
+  const otherVariantSnapshots = variantSnapshots.hasVariants
+    ? [BASE_VARIANT_ID, ...variantSnapshots.variants.map(v => v.id)]
+        .filter(id => id !== activeSnapshotId)
+        .map(id => getVariantSnapshot(id))
+        .filter(snapshot => snapshot !== undefined)
+    : [];
 
   // ---- Page-level full-surface undo / redo ring buffer ----------------
   //
@@ -820,13 +875,17 @@ const SurfaceDetailPage: React.FC = () => {
     );
     if (policyDefinitionsReason) return { message: policyDefinitionsReason };
     const firstIncomplete = builder.state.nodes.find(
-      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+      n => !n.configured || getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
     );
     if (firstIncomplete) {
       const def = registry.get(firstIncomplete.type);
       const reason =
-        getIncompleteReason(firstIncomplete.type, firstIncomplete.config, surfacePolicyIds) ||
-        'configuration is incomplete';
+        getIncompleteReason(
+          firstIncomplete.type,
+          firstIncomplete.config,
+          surfacePolicyIds,
+          firstIncomplete
+        ) || 'configuration is incomplete';
       return {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
@@ -836,14 +895,8 @@ const SurfaceDetailPage: React.FC = () => {
     // source auth on the surface). Block save so the runtime never
     // sees a half-wired surface — the marching-ants ring on the
     // canvas points the user at the offending node.
-    const firstDepErr = dependencyErrors[0];
-    if (firstDepErr) {
-      const def = registry.get(firstDepErr.nodeType);
-      return {
-        message: `${def?.label ?? firstDepErr.nodeType}: ${firstDepErr.message}`,
-        nodeId: firstDepErr.nodeId,
-      };
-    }
+    const dependencyBlocker = dependencyErrorBlocker(dependencyErrors);
+    if (dependencyBlocker) return dependencyBlocker;
     // Structural validation of the assembled payload — catches shape
     // problems that only surface once individual element slices are
     // stitched together (empty surface name, dangling parents, etc).
@@ -901,13 +954,17 @@ const SurfaceDetailPage: React.FC = () => {
             };
           }
           const incomplete = snapNodes.find(
-            n => getIncompleteReason(n.type, n.config, surfacePolicyIds) !== null
+            n => getIncompleteReason(n.type, n.config, surfacePolicyIds, n) !== null
           );
           if (incomplete) {
             const def = registry.get(incomplete.type);
             const reason =
-              getIncompleteReason(incomplete.type, incomplete.config, surfacePolicyIds) ||
-              'configuration is incomplete';
+              getIncompleteReason(
+                incomplete.type,
+                incomplete.config,
+                surfacePolicyIds,
+                incomplete
+              ) || 'configuration is incomplete';
             return {
               message: `Variant "${label}" — ${def?.label ?? incomplete.type}: ${reason}`,
               nodeId: incomplete.id,
@@ -977,8 +1034,15 @@ const SurfaceDetailPage: React.FC = () => {
    * target variant's payload (default + overrides) and rebuilds the
    * canvas nodes from it.
    */
+  variantSwitchBlockerRef.current = dependencyErrorBlocker(dependencyErrors);
+  showBlockingToastRef.current = showBlockingToast;
   const handleSwitchVariant = useCallback(
     (newVariantId: string) => {
+      const blocker = variantSwitchBlockerRef.current;
+      if (blocker) {
+        showBlockingToastRef.current?.(blocker);
+        return;
+      }
       const currentPayload = buildPayload({
         surface_id: surfaceId,
         name,
@@ -1233,8 +1297,24 @@ const SurfaceDetailPage: React.FC = () => {
       // both "use this agent" and "use the local key" resolved the appliance
       // default and the setting looked like it did nothing.
       payload.signing = signing;
-      const updated = await apiClient.updateSurface(surfaceId, payload);
+      // A PUT that leaves out a stored discovery setting keeps it, so one the
+      // operator removed is sent as null, removed only if the save succeeds.
+      payload = withDroppedProtectedResourcesRemoved(surface, payload);
+      payload = withCallerAccessSettled(payload);
+      let headerWarnings: string[] = [];
+      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(
+        surfaceId,
+        payload,
+        {
+          onWarnings: received => {
+            headerWarnings = received;
+          },
+        }
+      );
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(serverWarnings) });
       setSurface(updated);
+      setSaveCount(count => count + 1);
       setJsonOverride(null);
       setJsonError(null);
       // Re-hydrate the variant snapshot manager from the saved
@@ -1320,17 +1400,12 @@ const SurfaceDetailPage: React.FC = () => {
       // defaults" until the user re-clicks the node.
       bumpExternalRevision();
       if (hydration.didAutoLayout) bumpResetView();
-      showToast('success', `Agent Surface "${updated.name}" saved`);
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
-      // transit points without being prevented from saving. The toast
-      // helper only knows success/error/loading, so warnings reuse the
-      // error styling — they are real shape problems the user should
-      // see, just not severe enough to block the save itself.
-      const warnings = validateSurfacePayload(updated).filter(i => i.severity === 'warning');
-      for (const w of warnings.slice(0, 3)) {
-        showToast('error', `Warning: ${w.message}`, { autoRemove: true, duration: 8000 });
-      }
+      // transit points without being prevented from saving.
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
+        headerWarnings: serverWarnings,
+      });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1431,6 +1506,13 @@ const SurfaceDetailPage: React.FC = () => {
     !deleting &&
     baselineRef.current !== null &&
     baselineRef.current !== currentSignature;
+  const hasUnsavedConfig = useMemo(
+    () =>
+      isDirty &&
+      baselineRef.current !== null &&
+      withoutCanvasLayout(baselineRef.current) !== withoutCanvasLayout(currentSignature),
+    [isDirty, currentSignature]
+  );
   const { discard, popPendingRestore } = useDiscardWithUndo({
     dirty: isDirty,
     navigateTo: '/surfaces',
@@ -1579,6 +1661,16 @@ const SurfaceDetailPage: React.FC = () => {
     }
   })();
   const configEditorValue = jsonOverride ?? JSON.stringify(livePayloadWithVariants, null, 2);
+  // The saved state of the view on the canvas decides, so the notice clears
+  // once a save makes the Access Point ready; until then an unsaved fix says
+  // to save.
+  const accessPointNotice = chooseAccessPointNotice(
+    savedAccessPointStatus(surface, variantSnapshots.activeVariantId),
+    accessPointStatus(livePayload as Partial<AgentSurface>)
+  );
+  // Stored without `public`: Public access shows a legacy state, which the
+  // operator can close.
+  const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
 
   const policyDefinitionsSaveBlocker = surfacePolicyBlockingReason(
     builder.state.nodes,
@@ -1603,11 +1695,20 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error ? (
-            <div className="alert alert-danger surface-page-alert mb-2" role="alert">
-              <i className="fas fa-exclamation-circle me-2" />
-              {error}
-            </div>
+          error || (saveWarnings && saveWarnings.length > 0) ? (
+            <>
+              {error && (
+                <div
+                  className="alert alert-danger surface-page-alert mb-2"
+                  role="alert"
+                  data-testid="surface-error-alert"
+                >
+                  <i className="fas fa-exclamation-circle me-2" />
+                  {error}
+                </div>
+              )}
+              <SaveWarningsBanner warnings={saveWarnings} />
+            </>
           ) : null
         }
         meta={{
@@ -1647,7 +1748,15 @@ const SurfaceDetailPage: React.FC = () => {
         onApplyJsonPayload={applyJsonPayloadToCanvas}
         surfacePolicyLoadState={surfacePolicyLoadState}
         hasAttemptedSave={hasAttemptedSave}
+        saveError={error}
+        saveWarnings={saveWarnings}
+        isDirty={hasUnsavedConfig}
+        agentCardRefreshKey={saveCount}
+        hasVariants={savedHasVariants}
+        accessPointNotice={accessPointNotice}
+        legacyAccessPoint={legacyAccessPoint}
         surfaceId={surface?.surface_id}
+        tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={
           // Backend doesn't carry `last_activity` on the surface payload;
           // pull it from runtime channel_stats keyed by surface_id.
@@ -1659,6 +1768,7 @@ const SurfaceDetailPage: React.FC = () => {
         }
         activeVariantId={variantSnapshots.activeVariantId}
         onSwitchVariant={handleSwitchVariant}
+        otherVariantSnapshots={otherVariantSnapshots}
         onAddVariant={handleAddVariant}
         manageActions={
           <div className="d-flex gap-2">
@@ -1675,6 +1785,7 @@ const SurfaceDetailPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-primary btn-sm"
+                data-testid="surface-save-button"
                 onClick={handleSave}
                 disabled={saving || deleting}
                 title={saveDisabledReason || (saving ? 'Saving…' : 'Save changes')}

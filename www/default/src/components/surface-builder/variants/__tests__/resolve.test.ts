@@ -5,10 +5,31 @@ import {
 } from '../resolve';
 
 describe('computeOverridesFromPayload', () => {
-  it('emits an empty transit.points override when access_point/target/transit are absent', () => {
-    // Empty `points` is intentional — it ensures a variant whose
-    // user removed every TP overrides base instead of inheriting it.
-    expect(computeOverridesFromPayload({})).toEqual({ complete: true, transit: { points: [] } });
+  it('emits empty transit.points and outbound_credentials overrides when they are absent', () => {
+    // Empty lists are intentional — a variant whose user removed every
+    // TP or credential binding overrides base instead of inheriting it.
+    expect(computeOverridesFromPayload({})).toEqual({
+      complete: true,
+      transit: { points: [] },
+      outbound_credentials: [],
+    });
+  });
+
+  it('sends a variant without credential bindings an empty outbound_credentials, never none', () => {
+    // The gateway keeps the base surface's bindings for a variant that
+    // leaves the list out, while the dashboard shows it with none.
+    const binding = {
+      credential_provider_id: 'vendor',
+      consent_mode: 'external',
+      subject: 'owner',
+    };
+    expect(
+      computeOverridesFromPayload({ outbound_credentials: [binding] }).outbound_credentials
+    ).toEqual([binding]);
+    expect(computeOverridesFromPayload({ outbound_credentials: [] }).outbound_credentials).toEqual(
+      []
+    );
+    expect(computeOverridesFromPayload({}).outbound_credentials).toEqual([]);
   });
 
   it('extracts whitelisted access_point fields and skips unknown ones', () => {
@@ -41,8 +62,7 @@ describe('computeOverridesFromPayload', () => {
       target: {
         endpoint: 'https://upstream.example/api',
         auth: { kind: 'bearer', token: 'x' },
-        mpp_auto_pay: true,
-        mpp_auto_pay_max_amount: '0.10',
+        fabric_target_name: 'billing',
         // not in TARGET_FIELDS — should be ignored
         unknown_field: 42,
       },
@@ -50,8 +70,7 @@ describe('computeOverridesFromPayload', () => {
     expect(overrides.target).toEqual({
       endpoint: 'https://upstream.example/api',
       auth: { kind: 'bearer', token: 'x' },
-      mpp_auto_pay: true,
-      mpp_auto_pay_max_amount: '0.10',
+      fabric_target_name: 'billing',
     });
   });
 
@@ -59,12 +78,25 @@ describe('computeOverridesFromPayload', () => {
     const overrides = computeOverridesFromPayload({
       transit: {
         points: [{ name: 'tp1' }],
-        shared: { rate_limit: { rpm: 5 }, sign_requests: true },
+        shared: { rate_limit: { rpm: 5 } },
       },
     });
     expect(overrides.transit).toEqual({
       points: [{ name: 'tp1' }],
-      shared: { rate_limit: { rpm: 5 }, sign_requests: true },
+      shared: { rate_limit: { rpm: 5 } },
+    });
+  });
+
+  it('never carries transit_token_mode or sign_requests into a variant override', () => {
+    const overrides = computeOverridesFromPayload({
+      transit: {
+        points: [{ name: 'tp1' }],
+        shared: { rate_limit: { rpm: 5 }, transit_token_mode: 'reference', sign_requests: false },
+      },
+    });
+    expect(overrides.transit).toEqual({
+      points: [{ name: 'tp1' }],
+      shared: { rate_limit: { rpm: 5 } },
     });
   });
 
@@ -264,7 +296,7 @@ describe('resolveVariant', () => {
       target: { endpoint: 'https://base/x', auth: { kind: 'none' } },
       transit: {
         points: [{ name: 'baseTp' }],
-        shared: { rate_limit: { rpm: 1 }, sign_requests: false },
+        shared: { rate_limit: { rpm: 1 }, opa_policy_definition_id: 'base-policy' },
       },
     };
     const payload = {
@@ -279,7 +311,7 @@ describe('resolveVariant', () => {
       target: { endpoint: 'https://variant/y', auth: { kind: 'bearer', token: 'tok' } },
       transit: {
         points: [{ name: 'variantTp' }],
-        shared: { rate_limit: { rpm: 42 }, sign_requests: true },
+        shared: { rate_limit: { rpm: 42 }, opa_policy_definition_id: 'variant-policy' },
       },
     };
     const overrides = computeOverridesFromPayload(payload);
@@ -296,8 +328,65 @@ describe('resolveVariant', () => {
     expect(resolved.transit.points).toEqual([{ name: 'variantTp' }]);
     expect(resolved.transit.shared).toEqual({
       rate_limit: { rpm: 42 },
-      sign_requests: true,
+      opa_policy_definition_id: 'variant-policy',
     });
+  });
+});
+
+describe('per-caller rate limits on a variant', () => {
+  const limit = { requests: 5, window_secs: 60 };
+  const base = {
+    transit: {
+      points: [
+        {
+          alias: 'partner',
+          target_endpoint: 'https://partner.example',
+          per_caller_rate_limit: limit,
+        },
+        { alias: 'other', target_endpoint: 'https://other.example' },
+      ],
+    },
+  };
+
+  it("a variant never stores one, since the gateway enforces the base point's", () => {
+    const overrides = computeOverridesFromPayload({
+      transit: {
+        points: [
+          {
+            alias: 'partner',
+            target_endpoint: 'https://dev.example',
+            per_caller_rate_limit: { requests: 50, window_secs: 60 },
+          },
+        ],
+      },
+    });
+
+    expect(overrides.transit?.points).toEqual([
+      { alias: 'partner', target_endpoint: 'https://dev.example' },
+    ]);
+  });
+
+  it('a variant shows the limit of the base point of the same alias, and none where it has none', () => {
+    const resolved = resolveVariant(base, {
+      complete: true,
+      transit: {
+        points: [
+          {
+            alias: 'partner',
+            target_endpoint: 'https://dev.example',
+            per_caller_rate_limit: { requests: 50, window_secs: 60 },
+          },
+          {
+            alias: 'other',
+            target_endpoint: 'https://dev-other.example',
+            per_caller_rate_limit: limit,
+          },
+        ],
+      },
+    });
+
+    expect(resolved.transit.points[0].per_caller_rate_limit).toEqual(limit);
+    expect(resolved.transit.points[1].per_caller_rate_limit).toBeUndefined();
   });
 });
 

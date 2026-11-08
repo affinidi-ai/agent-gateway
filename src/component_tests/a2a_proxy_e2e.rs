@@ -31,12 +31,7 @@ allow if {
 "#;
 
 fn enable_local_a2a_dial_for_tests() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // SAFETY: set exactly once, before any A2A dial runs; only the A2A-proxy
-        // egress path reads this var and every test in this module wants it on.
-        unsafe { std::env::set_var("AG_ALLOW_LOCAL_A2A_PROXY", "1") };
-    });
+    crate::a2a_proxies::runtime::ALLOW_LOCAL_A2A_DIAL_IN_TESTS.store(true, Ordering::SeqCst);
 }
 
 struct FakeDirectLine {
@@ -1032,7 +1027,7 @@ async fn surface_api_settles_a2a_settings_on_a2a_proxy_surfaces() {
     let create = |route: &str, target: &str, variant_target: Option<&str>| {
         let mut body = json!({
             "name": route.trim_start_matches('/'), "status": "disabled",
-            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a"},
+            "access_point": {"listen_address": h.gateway_base, "route": route, "protocol": "a2a", "public": true},
             "target": {"endpoint": target}
         });
         if target.starts_with("a2a-proxy://") {
@@ -1211,15 +1206,27 @@ const SOURCE_API_KEY_SECRET_ID: &str = "a2a-proxy-source-key";
 const SOURCE_API_KEY: &str = "valid-caller-key";
 
 async fn start_a2a_proxy_harness_requiring_caller_auth(fake_direct_line: &FakeDirectLine) -> GatewayHarness {
+    start_a2a_proxy_harness_with_caller_auth(fake_direct_line, crate::config::agent_surface::OnFailure::Continue).await
+}
+
+async fn start_a2a_proxy_harness_with_caller_auth(
+    fake_direct_line: &FakeDirectLine,
+    on_failure: crate::config::agent_surface::OnFailure,
+) -> GatewayHarness {
     let direct_line_base_url = fake_direct_line
         .base_url
         .clone();
     GatewayHarness::start(move |temp_dir, gw_config, _| {
         let mut surface = helpers::build_minimal_channel();
         surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
+        if on_failure == crate::config::agent_surface::OnFailure::Reject {
+            surface.access_point.public = Some(false);
+        }
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
+            protected_resource: None,
+            on_failure,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
@@ -1297,6 +1304,43 @@ async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_sour
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_closed_a2a_proxy_access_point_refuses_a_failed_caller_before_the_proxy() {
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h =
+        start_a2a_proxy_harness_with_caller_auth(&fake_direct_line, crate::config::agent_surface::OnFailure::Reject)
+            .await;
+
+    for key in [None, Some("wrong-key")] {
+        let mut request = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("content-type", "application/json")
+            .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "Hello, worker!" })]));
+        if let Some(key) = key {
+            request = request.header("x-api-key", key);
+        }
+        let response = request
+            .send()
+            .await
+            .expect("send request through gateway");
+        assert_eq!(response.status(), 401, "{key:?}");
+        let body: Value = response
+            .json()
+            .await
+            .expect("problem JSON");
+        assert_eq!(body["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{body}");
+    }
+    assert!(
+        fake_direct_line
+            .requests()
+            .is_empty(),
+        "a refused caller never reaches the proxy"
+    );
+
+    let body = send_a2a_text(&h, SOURCE_API_KEY).await;
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "unexpected response {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller() {
     let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
     let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
@@ -1318,4 +1362,350 @@ async fn a2a_proxy_sends_the_direct_line_credential_for_an_authenticated_caller(
             request.path
         );
     }
+}
+
+/// An undeclared A2A-proxy create carrying a target Trust Check list is
+/// converted without making the omitted A2A settings look sent: its versions
+/// stay fixed at A2A 1.0.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undeclared_a2a_proxy_create_with_a_target_list_keeps_its_fixed_versions() {
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_a2a_proxy_fixtures(temp_dir, "http://127.0.0.1:9", "active", true, 5, 100, 3);
+        super::trust_check_e2e::write_trust_registry_fixture(temp_dir);
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.unwrap();
+    let response = client
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&json!({
+            "name": "proxy-with-checks", "status": "disabled",
+            "access_point": {"listen_address": h.gateway_base, "route": "/proxy-with-checks", "protocol": "a2a", "public": true,
+                             "a2a": {"validation": "envelope"}},
+            "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID,
+                       "trust_check_list": [super::trust_check_e2e::api_trust_check("proxy-target")]},
+            "transit": {"points": [{"alias": "partner", "target_endpoint": "https://partner.example/a2a"}]}
+        }))
+        .send()
+        .await
+        .expect("admin API request");
+    let status = response.status().as_u16();
+    let created: Value = response
+        .json()
+        .await
+        .expect("JSON response");
+
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["access_point"]["a2a"]["accepted_versions"], json!(["1.0"]));
+    assert_eq!(created["target"]["trust_check_list"][0]["id"], "proxy-target", "an A2A proxy runs its own list");
+    assert_eq!(created["transit"]["points"][0]["trust_check_list"][0]["id"], "proxy-target");
+    assert_eq!(created["trust_check_split"], json!(true));
+
+    let surface_url = format!(
+        "{}/api/v1/surfaces/{}",
+        h.gateway_base,
+        created["surface_id"]
+            .as_str()
+            .unwrap()
+    );
+    let put = |body: Value| {
+        let request = client
+            .put(&surface_url)
+            .json(&body);
+        async move {
+            let response = request
+                .send()
+                .await
+                .expect("admin API request");
+            let status = response.status().as_u16();
+            (
+                status,
+                response
+                    .json::<Value>()
+                    .await
+                    .unwrap_or(json!(null)),
+            )
+        }
+    };
+    let mut without_target_list = created.clone();
+    without_target_list
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_check_split");
+    without_target_list["target"]
+        .as_object_mut()
+        .unwrap()
+        .remove("trust_check_list");
+    let (status, kept) = put(without_target_list.clone()).await;
+    assert_eq!(status, 200, "{kept}");
+    assert_eq!(kept["target"]["trust_check_list"][0]["id"], "proxy-target", "a missing target list is kept");
+
+    let mut explicit_empty = without_target_list.clone();
+    explicit_empty["target"]["trust_check_list"] = json!([]);
+    let (status, body) = put(explicit_empty).await;
+    assert_eq!(status, 400, "an explicit empty target list on a split surface is refused: {body}");
+    assert!(
+        body.to_string()
+            .contains("send trust_check_split: true"),
+        "{body}"
+    );
+
+    let mut wrong_type = without_target_list;
+    wrong_type["name"] = json!(5);
+    let (status, _) = put(wrong_type).await;
+    assert_eq!(status, 422, "a body of the wrong shape is still rejected as before");
+}
+
+async fn start_charged_a2a_proxy_harness(
+    fake_direct_line: &FakeDirectLine,
+    status: &'static str,
+    write_proxy: bool,
+    gateway_id: &'static str,
+) -> GatewayHarness {
+    let direct_line_base_url = fake_direct_line
+        .base_url
+        .clone();
+    GatewayHarness::start(move |temp_dir, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
+        surface.target.a2a_proxy_id = Some(PROXY_ID.to_string());
+        surface.target.payment_policy = Some(
+            serde_json::from_value(json!({
+                "type": "agent_pay", "payment_gateway_id": gateway_id, "payment_surface_id": "pay-1",
+                "require_all": true
+            }))
+            .expect("payment policy"),
+        );
+        gw_config.surfaces = vec![surface];
+        write_a2a_proxy_fixtures(temp_dir, &direct_line_base_url, status, write_proxy, 5, 100, 3);
+    })
+    .await
+}
+
+async fn send_charged_a2a_text(
+    harness: &GatewayHarness,
+    credential: Option<&str>,
+) -> (u16, reqwest::header::HeaderMap, Value) {
+    let mut request = reqwest::Client::new()
+        .post(&harness.gateway_url)
+        .header("A2A-Version", "1.0")
+        .header("content-type", "application/json");
+    if let Some(credential) = credential {
+        request = request.header("PAYMENT-SIGNATURE", credential);
+    }
+    let response = request
+        .json(&a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]))
+        .send()
+        .await
+        .expect("send request through gateway");
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    (
+        status,
+        headers,
+        response
+            .json()
+            .await
+            .unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_charged_a2a_proxy_is_charged_once_and_only_when_it_will_be_reached() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "a2a-proxy-receipt")], json!({}))
+        .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+    install_test_transport("a2a-proxy-gate", gate.clone());
+
+    for (status, write_proxy, message) in
+        [("active", false, "A2A proxy not found"), ("disabled", true, "A2A proxy is disabled")]
+    {
+        let fake_direct_line = FakeDirectLine::start("should not be called").await;
+        let h = start_charged_a2a_proxy_harness(&fake_direct_line, status, write_proxy, "a2a-proxy-gate").await;
+
+        let (_, headers, body) = send_charged_a2a_text(&h, Some("refused-proxy-proof")).await;
+
+        assert_eq!(body["error"]["message"], message, "{body}");
+        assert!(!headers.contains_key("payment-response"));
+        assert_eq!(gate.calls(), 0, "{message}: a proxy that cannot be reached is not charged");
+        assert_eq!(
+            fake_direct_line
+                .request_count
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_charged_a2a_proxy_harness(&fake_direct_line, "active", true, "a2a-proxy-gate").await;
+
+    let (status, headers, body) = send_charged_a2a_text(&h, None).await;
+    assert_eq!(status, 402, "{body}");
+    assert_eq!(headers["payment-required"], "eyJ4IjoxfQ==");
+    assert_eq!(gate.calls(), 1);
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0,
+        "an unpaid request does not reach the backend"
+    );
+
+    let (status, headers, body) = send_charged_a2a_text(&h, Some("a2a-proxy-proof")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(headers["payment-response"], "a2a-proxy-receipt");
+    assert_eq!(body["result"]["parts"][0]["text"], "Hello from Copilot", "{body}");
+    assert_eq!(gate.calls(), 2);
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        3,
+        "the paid request reaches the backend once"
+    );
+    let reached = fake_direct_line.requests();
+    assert!(
+        reached
+            .iter()
+            .all(|request| !request
+                .headers
+                .contains_key("payment-signature")),
+        "the payment credential is not relayed: {reached:?}"
+    );
+
+    let (status, headers, body) = send_charged_a2a_text(&h, Some("a2a-proxy-proof")).await;
+    assert_eq!(status, 402, "{body}");
+    assert!(!headers.contains_key("payment-response"));
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        3,
+        "a used payment does not reach the backend again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_an_a2a_proxy_cannot_serve_is_refused_before_it_is_charged() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "never-taken")], json!({}))
+        .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+    install_test_transport("a2a-proxy-refusal-gate", gate.clone());
+    let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
+    let h = start_charged_a2a_proxy_harness(&fake_direct_line, "active", true, "a2a-proxy-refusal-gate").await;
+
+    let mut unsupported = a2a_text_request(vec![json!({ "kind": "text", "text": "hello" })]);
+    unsupported["method"] = json!("tasks/get");
+    let mut no_message = a2a_text_request(Vec::new());
+    no_message["params"] = json!({});
+    let cases = [
+        ("an unsupported method", unsupported, -32601),
+        ("no params.message", no_message, -32602),
+        ("no parts", a2a_text_request(Vec::new()), -32602),
+        ("no text part", a2a_text_request(vec![json!({ "kind": "file", "file": {} })]), -32602),
+    ];
+    for (label, body, code) in cases {
+        let response = reqwest::Client::new()
+            .post(&h.gateway_url)
+            .header("A2A-Version", "1.0")
+            .header("PAYMENT-SIGNATURE", "refused-before-payment")
+            .json(&body)
+            .send()
+            .await
+            .expect("send request through gateway");
+        assert!(
+            !response
+                .headers()
+                .contains_key("payment-response"),
+            "{label}"
+        );
+        let body: Value = response
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        assert_eq!(body["error"]["code"], code, "{label}: {body}");
+    }
+    assert_eq!(gate.calls(), 0, "nothing the proxy would refuse is charged");
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    let (status, _, body) = send_charged_a2a_text(&h, Some("paid-after-checks")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(gate.calls(), 1, "a request the proxy serves is charged once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_a2a_proxy_card_preview_has_the_generated_card_and_no_agent_card() {
+    let fake_direct_line = FakeDirectLine::start("should not be called").await;
+    let base_url = fake_direct_line
+        .base_url
+        .clone();
+    let mut client = None;
+    let h = GatewayHarness::start(|temp_dir, _, bootstrap| {
+        write_a2a_proxy_fixtures(temp_dir, &base_url, "active", true, 5, 100, 3);
+        client = Some(helpers::configure_admin_api(bootstrap));
+    })
+    .await;
+    let client = client.unwrap();
+    let listener = h
+        .gateway_base
+        .replace("127.0.0.1", "localhost");
+    let created: Value = client
+        .post(format!("{}/api/v1/surfaces", h.gateway_base))
+        .json(&json!({
+            "name": "proxy-card-preview", "status": "active",
+            "access_point": {"listen_address": listener, "route": "/proxy-card", "protocol": "a2a"},
+            "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let card_url = format!(
+        "{}/api/v1/surfaces/{}/agent-card",
+        h.gateway_base,
+        created["surface_id"]
+            .as_str()
+            .expect("created surface")
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let preview = loop {
+        let preview: Value = client
+            .get(&card_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if preview["unsupported_reason"] != "not_running" {
+            break preview;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "the surface never started running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(preview["fetch"]["status"], "ok", "{preview}");
+    assert_eq!(preview["generated"], true);
+    assert_eq!(preview["after"]["name"], PROXY_ID, "{preview}");
+    for field in ["before", "before_bytes", "source_url"] {
+        assert_eq!(preview[field], Value::Null, "a generated card has no {field}: {preview}");
+    }
+    assert_eq!(preview["auth"]["kind"], "none");
+    assert_eq!(
+        fake_direct_line
+            .request_count
+            .load(Ordering::SeqCst),
+        0
+    );
 }

@@ -9,6 +9,8 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
+use crate::audit::events::{PolicyChangeAction, PolicyChangeSource};
+use crate::audit::policy_changes;
 use crate::auth::storage::PasskeyStorage;
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
@@ -53,145 +55,16 @@ pub struct PolicyDefinitionsQuery {
     pub policy_type: Option<String>,
 }
 
-/// Returns `true` when `surface` references `policy_id` in any compiled
-/// policy slot (target, inbound, response, outbound, per-transit-point) —
-/// including per-variant overrides.
+/// Returns `true` when `surface` references `policy_id` in any policy slot
+/// ([`crate::policies::slots::policy_slots`]), including per-variant
+/// overrides, MCP tool policies and gate conditions.
 fn surface_references_policy(
     surface: &crate::config::agent_surface::AgentSurface,
     policy_id: &str,
 ) -> bool {
-    let matches = |id: Option<&str>| id == Some(policy_id);
-
-    // Base surface slots
-    if matches(
-        surface
-            .target
-            .policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .access_point
-            .inbound_policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .target
-            .response_policy
-            .as_ref()
-            .map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            }),
-    ) {
-        return true;
-    }
-    if matches(
-        surface
-            .transit
-            .as_ref()
-            .and_then(|t| {
-                t.shared
-                    .opa_policy_definition_id
-                    .as_deref()
-            }),
-    ) {
-        return true;
-    }
-
-    // Per-transit-point policies (request + response)
-    if let Some(ref transit) = surface.transit {
-        for tp in &transit.points {
-            if matches(tp.policy.as_ref().map(|p| {
-                p.policy_definition_id
-                    .as_str()
-            })) {
-                return true;
-            }
-            if matches(
-                tp.response_policy
-                    .as_ref()
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) {
-                return true;
-            }
-        }
-    }
-
-    // Variant-level overrides for all slots + transit points
-    surface
-        .variants
-        .iter()
-        .any(|v| {
-            let ov = &v.overrides;
-            matches(
-                ov.target
-                    .as_ref()
-                    .and_then(|t| t.policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.access_point
-                    .as_ref()
-                    .and_then(|ap| ap.inbound_policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.target
-                    .as_ref()
-                    .and_then(|t| t.response_policy.as_ref())
-                    .map(|p| {
-                        p.policy_definition_id
-                            .as_str()
-                    }),
-            ) || matches(
-                ov.transit
-                    .as_ref()
-                    .and_then(|t| t.shared.as_ref())
-                    .and_then(|s| {
-                        s.opa_policy_definition_id
-                            .as_deref()
-                    }),
-            ) || ov
-                .transit
-                .as_ref()
-                .and_then(|t| t.points.as_ref())
-                .is_some_and(|pts| {
-                    pts.iter().any(|tp| {
-                        matches(tp.policy.as_ref().map(|p| {
-                            p.policy_definition_id
-                                .as_str()
-                        })) || matches(
-                            tp.response_policy
-                                .as_ref()
-                                .map(|p| {
-                                    p.policy_definition_id
-                                        .as_str()
-                                }),
-                        )
-                    })
-                })
-        })
+    crate::policies::slots::policy_slots(surface)
+        .values()
+        .any(|slot| slot.policy_definition_id == policy_id)
 }
 
 fn get_policy_store(state: &IdentityApiState) -> Result<&FileSystemPolicyDefinitionStore, AppError> {
@@ -344,6 +217,14 @@ pub async fn create_policy_definition(
             error!("Failed to save policy definition: {}", e);
             AppError::InternalError(format!("Failed to save policy definition: {}", e))
         })?;
+    let created = store
+        .get(&response.id)
+        .await
+        .unwrap_or_else(|| response.clone());
+    policy_changes::record(
+        PolicyChangeAction::PolicyCreated,
+        policy_changes::of_definition(&created, PolicyChangeSource::Api),
+    );
 
     state
         .ws_state
@@ -368,6 +249,7 @@ pub async fn update_policy_definition(
         return Err(AppError::InvalidInput("Policy definition ID mismatch".to_string()));
     }
 
+    let change = store.lock_changes().await;
     let existing = store
         .get(&policy_id)
         .await
@@ -416,6 +298,14 @@ pub async fn update_policy_definition(
             error!("Failed to update policy definition: {}", e);
             AppError::InternalError(format!("Failed to update policy definition: {}", e))
         })?;
+    if let Some(updated) = store
+        .get(&policy_id)
+        .await
+        .and_then(|after| policy_changes::definition_updated(&existing, &after, PolicyChangeSource::Api))
+    {
+        policy_changes::record(PolicyChangeAction::PolicyUpdated, updated);
+    }
+    drop(change);
 
     // Recompile OPA engines for all surfaces that reference this policy definition
     // in any compiled slot (target, inbound, response, outbound, per-TP) or variant override.
@@ -541,15 +431,14 @@ pub async fn delete_policy_definition(
     // Prune global assignments before deleting the definition: if the prune
     // fails the definition still exists, so a retry reaches this step again.
     if let Some(gstore) = &state.global_policy_store {
-        let mut assignments = gstore.get().await;
-        if assignments.remove_policy(&policy_id) {
-            gstore
-                .save(assignments.clone())
-                .await
-                .map_err(|e| {
-                    error!("Failed to remove policy from global assignments: {}", e);
-                    AppError::InternalError(format!("Failed to update global assignments: {}", e))
-                })?;
+        let pruned = gstore
+            .update(|assignments| assignments.remove_policy(&policy_id), PolicyChangeSource::DefinitionDeleted)
+            .await
+            .map_err(|e| {
+                error!("Failed to remove policy from global assignments: {}", e);
+                AppError::InternalError(format!("Failed to update global assignments: {}", e))
+            })?;
+        if let Some(assignments) = pruned {
             if let Some(manager) = &state.global_policy_manager {
                 manager
                     .refresh(&assignments)
@@ -566,6 +455,10 @@ pub async fn delete_policy_definition(
             error!("Failed to delete policy definition: {}", e);
             AppError::InternalError(format!("Failed to delete policy definition: {}", e))
         })?;
+    policy_changes::record(
+        PolicyChangeAction::PolicyDeleted,
+        policy_changes::of_definition(&policy, PolicyChangeSource::Api),
+    );
 
     state
         .ws_state
@@ -1069,7 +962,13 @@ pub async fn update_policy_assignments(
         .as_ref()
         .ok_or_else(|| AppError::InternalError("Global policy store not initialized".to_string()))?;
     store
-        .save(body.clone())
+        .update(
+            |assignments| {
+                *assignments = body.clone();
+                true
+            },
+            PolicyChangeSource::Api,
+        )
         .await
         .map_err(|e| AppError::InternalError(format!("Failed to save global assignments: {}", e)))?;
     if let Some(mgr) = &state.global_policy_manager {
@@ -1414,6 +1313,69 @@ mod tests {
         }))
         .unwrap();
         assert!(surface_references_policy(&s, POL));
+    }
+
+    #[test]
+    fn mcp_tool_policy_and_gate_condition_match() {
+        let tool: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_policies": [{ "tool_name": "search", "policy_definition_id": POL }],
+            },
+        }))
+        .unwrap();
+        let gate: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [{
+                    "id": "g-1", "condition_policy_definition_id": POL,
+                    "action": { "effect": "deny", "patterns": ["*"] },
+                }]},
+            },
+        }))
+        .unwrap();
+
+        assert!(surface_references_policy(&tool, POL));
+        assert!(surface_references_policy(&gate, POL));
+    }
+
+    #[test]
+    fn a_gate_condition_shadowed_by_a_gate_of_the_same_id_matches() {
+        let gate = |policy: &str| {
+            serde_json::json!({
+                "id": "g-1", "condition_policy_definition_id": policy,
+                "action": { "effect": "deny", "patterns": ["*"] },
+            })
+        };
+        let repeated: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [gate("other"), gate(POL)] },
+            },
+        }))
+        .unwrap();
+        let on_a_point: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s-1", "name": "test",
+            "access_point": { "listen_address": AP, "route": "/test", "protocol": "mcp" },
+            "target": {
+                "endpoint": "https://upstream",
+                "mcp_tool_gating": { "gates": [gate(POL)] },
+            },
+            "transit": { "points": [{
+                "alias": "tp-1", "target_endpoint": "https://dest",
+                "mcp_tool_gating": { "gates": [gate("other")] },
+            }]},
+        }))
+        .unwrap();
+
+        assert!(surface_references_policy(&repeated, POL));
+        assert!(surface_references_policy(&on_a_point, POL));
     }
 
     #[test]

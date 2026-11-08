@@ -1,6 +1,6 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { Form } from 'react-bootstrap';
-import { apiClient } from '../../../../api';
+import FieldHelp from '../../../shared/FieldHelp';
 import type { ConfigPanelProps } from '../types';
 import TransitCredentialBindingSection, {
   transitCredentialsApiToForm,
@@ -12,29 +12,40 @@ import FabricDelegatedCredentialsSection, {
   hasOutboundCredentialBindings,
 } from '../_shared/FabricDelegatedCredentialsSection';
 import { AgentCardLocationHelp } from '../_shared/AgentCardLocationHelp';
+import TargetAuthProviderSelect from '../_shared/TargetAuthProviderSelect';
+import {
+  PROVIDER_TARGET_AUTH_DEFAULTS,
+  providerTargetAuthFromApi,
+} from '../_shared/providerTargetAuth';
+import TransitCallerSection from './TransitCallerSection';
 import { newTransitPointId, deriveTransitPointAlias } from './factory';
-import { filterSelectableGateways } from '../../../../utils/gateways';
-
-interface Gateway {
-  id: string;
-  name: string;
-  gateway_type: string;
-  creation_type: string;
-}
-
-interface GatewayChannel {
-  config_id: string;
-  name: string;
-  protocol: string;
-}
+import GatewaySurfacePicker from '../_shared/GatewaySurfacePicker';
+import {
+  loadFabricGateways,
+  parseFabricEndpoint,
+  surfaceMatchesProtocol,
+  useGatewaySurfaces,
+} from '../_shared/useGatewaySurfaces';
 
 type EndpointType = 'url' | 'gateway';
 
 const isFabricEndpoint = (endpoint: unknown): endpoint is string =>
   typeof endpoint === 'string' && endpoint.startsWith('fabric://');
 
-const inferEndpointType = (config: ConfigPanelProps['config']): EndpointType =>
+export const inferEndpointType = (config: ConfigPanelProps['config']): EndpointType =>
   config.endpoint_type || (isFabricEndpoint(config.target_endpoint) ? 'gateway' : 'url');
+
+/** The gateway and surface of a gateway route, read from the saved `fabric://` URL when the picker fields are absent. */
+export function transitPointGatewayRoute(config: ConfigPanelProps['config']): {
+  gatewayId: string;
+  surfaceId: string;
+} {
+  const fromUrl = parseFabricEndpoint(config.target_endpoint);
+  return {
+    gatewayId: config.gateway_id || fromUrl?.gatewayId || '',
+    surfaceId: config.gateway_channel || fromUrl?.surfaceId || '',
+  };
+}
 
 /** Extract the transit point protocol from its node type suffix. */
 export function transitPointProtocol(nodeType: string | undefined): string | null {
@@ -51,6 +62,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
   replaceCommit,
   hasAttemptedSave,
   allNodes,
+  errorByField,
 }) => {
   // Mint a stable hidden id on first render so backend, metrics, and
   // task monitor have something durable to key off even before the
@@ -78,6 +90,18 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
     }
     const ta = config.target_auth;
     if (!ta || typeof ta !== 'object') return;
+    const provider = providerTargetAuthFromApi(ta);
+    if (provider) {
+      authHydratedRef.current = true;
+      updateFields({
+        auth_type: 'credential_provider',
+        auth_provider_id: provider.providerId,
+        auth_header_name: provider.headerName,
+        auth_header_format: provider.headerFormat,
+        auth_fallback: provider.fallback,
+      });
+      return;
+    }
     const ss =
       (ta.method && typeof ta.method === 'object' && (ta.method as any).static_secret) ||
       (ta.method === 'static_secret' ? ta : null);
@@ -114,56 +138,48 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
     node?.type === 'transit-point-a2a' || node?.type === 'transit-point-ap2';
   const overrideAgentCard = !!config.override_agent_card_location || !!config.agent_card_path;
 
-  // ── Destination ─────────────────────────────────────────────────────────
-  const [gateways, setGateways] = useState<Gateway[]>([]);
-  const [gatewayChannels, setGatewayChannels] = useState<GatewayChannel[]>([]);
-  const [isLoadingChannels, setIsLoadingChannels] = useState(false);
-  const [endpointType, setEndpointType] = useState<EndpointType>(inferEndpointType(config));
-  const [selectedGatewayId, setSelectedGatewayId] = useState<string>(config.gateway_id || '');
-  const [selectedGatewayChannel, setSelectedGatewayChannel] = useState<string>(
-    config.gateway_channel || ''
+  const endpointType = inferEndpointType(config);
+  const { gatewayId, surfaceId } = transitPointGatewayRoute(config);
+  const gatewayState = useGatewaySurfaces({
+    enabled: endpointType === 'gateway',
+    gatewayId,
+    loadGateways: loadFabricGateways,
+  });
+
+  // HTTP transit points are protocol-agnostic pass-throughs, so they list every remote surface.
+  const filterProtocol = tpProtocol === 'http' ? null : tpProtocol;
+  const compatibleSurfaces = useMemo(
+    () => gatewayState.surfaces.filter(s => surfaceMatchesProtocol(s, filterProtocol)),
+    [gatewayState.surfaces, filterProtocol]
   );
 
-  useEffect(() => {
-    apiClient
-      .get('/gateways')
-      .then(res => {
-        setGateways(filterSelectableGateways(res.data));
-      })
-      .catch(() => {});
-  }, []);
+  const selectGateway = (id: string) => {
+    if (id === gatewayId) return;
+    updateFields({
+      gateway_id: id,
+      gateway_channel: '',
+      target_endpoint: '',
+      fabric_remote_gateway_name: undefined,
+      fabric_remote_channel_name: undefined,
+    });
+  };
 
-  useEffect(() => {
-    if (!selectedGatewayId || endpointType !== 'gateway') return;
-    setIsLoadingChannels(true);
-    apiClient
-      .get(`/gateways/${selectedGatewayId}/surfaces`)
-      .then(res => {
-        const data = res.data;
-        const channels = Array.isArray(data) ? data : data?.channels || [];
-        setGatewayChannels(channels);
-      })
-      .catch(() => setGatewayChannels([]))
-      .finally(() => setIsLoadingChannels(false));
-  }, [selectedGatewayId, endpointType]);
-
-  // HTTP transit points are protocol-agnostic pass-throughs — show all
-  // remote surfaces. For typed protocols, show only matching channels.
-  const compatibleChannels = useMemo(() => {
-    if (!tpProtocol || tpProtocol === 'http') return gatewayChannels;
-    return gatewayChannels.filter(ch => ch.protocol === tpProtocol);
-  }, [gatewayChannels, tpProtocol]);
+  const selectSurface = (id: string) => {
+    const surface = compatibleSurfaces.find(s => s.config_id === id);
+    const gateway = gatewayState.gateways.find(g => g.id === gatewayId);
+    updateFields({
+      gateway_id: gatewayId,
+      gateway_channel: id,
+      target_endpoint: id ? `fabric://${gatewayId}/${id}` : '',
+      fabric_remote_channel_name: surface?.name,
+      fabric_remote_gateway_name: config.fabric_remote_gateway_name || gateway?.name,
+    });
+  };
 
   const handleEndpointTypeChange = (newType: EndpointType) => {
     const directEndpoint = isFabricEndpoint(config.target_endpoint)
       ? ''
       : config.target_endpoint || '';
-
-    setEndpointType(newType);
-    setSelectedGatewayId('');
-    setSelectedGatewayChannel('');
-    setGatewayChannels([]);
-    setIsLoadingChannels(false);
 
     if (newType === 'url') {
       updateFields({
@@ -210,14 +226,33 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
       <div className="config-section">
         <label>Destination</label>
         <Form.Group className="mb-2">
-          <Form.Label className="small text-muted mb-1">Endpoint Type</Form.Label>
+          <div className="d-flex align-items-center gap-1 mb-1">
+            <Form.Label
+              htmlFor="transit-point-endpoint-type-select"
+              className="small text-muted mb-0"
+            >
+              Endpoint Type
+            </Form.Label>
+            <FieldHelp
+              testId="field-help-transit-point-endpoint-type"
+              ariaLabel="About Endpoint Type"
+            >
+              <p>Choose where this route sends the Managed Agent&apos;s outbound calls:</p>
+              <p>
+                <strong>Direct URL</strong>: type in the destination&apos;s own web address.
+              </p>
+              <p>
+                <strong>via Gateway Connection</strong>: reach an Agent Surface published by another
+                Agent Gateway you&apos;re connected to, over the Fabric.
+              </p>
+            </FieldHelp>
+          </div>
           <Form.Select
+            id="transit-point-endpoint-type-select"
             size="sm"
+            data-testid="transit-point-endpoint-type-select"
             value={endpointType}
-            onChange={e => {
-              const newType = e.target.value as EndpointType;
-              handleEndpointTypeChange(newType);
-            }}
+            onChange={e => handleEndpointTypeChange(e.target.value as EndpointType)}
           >
             <option value="url">Direct URL</option>
             <option value="gateway">via Gateway Connection</option>
@@ -226,125 +261,102 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
 
         {endpointType === 'url' && (
           <Form.Group className="mb-2">
-            <Form.Label className="small text-muted mb-1">Target Endpoint</Form.Label>
+            <Form.Label
+              htmlFor="transit-point-target-endpoint-input"
+              className="small text-muted mb-1"
+            >
+              Target Endpoint URL <span className="text-danger">*</span>
+            </Form.Label>
             <Form.Control
+              id="transit-point-target-endpoint-input"
               size="sm"
               type="text"
+              data-testid="transit-point-target-endpoint-input"
               value={config.target_endpoint || ''}
               onChange={e => updateField('target_endpoint', e.target.value)}
+              isInvalid={!!errorByField?.target_endpoint}
             />
-            <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-              Full URL such as https://api.example.com
-            </Form.Text>
+            {errorByField?.target_endpoint ? (
+              <Form.Control.Feedback type="invalid" style={{ fontSize: '10px' }}>
+                {errorByField.target_endpoint}
+              </Form.Control.Feedback>
+            ) : (
+              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
+                Full URL including protocol (http:// or https://)
+              </Form.Text>
+            )}
           </Form.Group>
         )}
 
         {endpointType === 'gateway' && (
-          <>
-            <Form.Group className="mb-2">
-              <Form.Label className="small text-muted mb-1">Gateway</Form.Label>
-              <Form.Select
-                size="sm"
-                value={selectedGatewayId}
-                onChange={e => {
-                  const gwId = e.target.value;
-                  setSelectedGatewayId(gwId);
-                  setSelectedGatewayChannel('');
-                  setGatewayChannels([]);
-                  updateField('gateway_id', gwId);
-                }}
-              >
-                <option value="">-- Select a Gateway --</option>
-                {gateways.map(gw => (
-                  <option key={gw.id} value={gw.id}>
-                    {gw.name}
-                  </option>
-                ))}
-              </Form.Select>
-            </Form.Group>
-            {selectedGatewayId && (
-              <Form.Group className="mb-2">
-                <Form.Label className="small text-muted mb-1">Agent Surface on Gateway</Form.Label>
-                <Form.Select
-                  size="sm"
-                  value={selectedGatewayChannel}
-                  onChange={e => {
-                    const chId = e.target.value;
-                    setSelectedGatewayChannel(chId);
-                    const ch = gatewayChannels.find(c => c.config_id === chId);
-                    const gw = gateways.find(g => g.id === selectedGatewayId);
-                    // Auto-populate the synth chain display names from
-                    // the real gateway/channel names so the canvas
-                    // reads sensibly straight away. Existing user
-                    // overrides are preserved.
-                    const patch: Record<string, any> = {
-                      gateway_channel: chId,
-                      target_endpoint: `fabric://${selectedGatewayId}/${chId}`,
-                    };
-                    if (!config.fabric_remote_channel_name && ch?.name) {
-                      patch.fabric_remote_channel_name = ch.name;
-                    }
-                    if (!config.fabric_remote_gateway_name && gw?.name) {
-                      patch.fabric_remote_gateway_name = gw.name;
-                    }
-                    updateFields(patch);
-                  }}
-                  disabled={isLoadingChannels || compatibleChannels.length === 0}
-                >
-                  <option value="">
-                    {isLoadingChannels
-                      ? '-- Loading Agent Surfaces... --'
-                      : '-- Select an Agent Surface --'}
-                  </option>
-                  {compatibleChannels.map(ch => (
-                    <option key={ch.config_id} value={ch.config_id}>
-                      {ch.name}
-                    </option>
-                  ))}
-                </Form.Select>
-                {!isLoadingChannels && selectedGatewayId && gatewayChannels.length === 0 && (
-                  <Form.Text className="text-danger" style={{ fontSize: '10px' }}>
-                    No Agent Surfaces published on this gateway
-                  </Form.Text>
-                )}
-                {!isLoadingChannels &&
-                  selectedGatewayId &&
-                  gatewayChannels.length > 0 &&
-                  compatibleChannels.length === 0 && (
-                    <Form.Text className="text-warning" style={{ fontSize: '10px' }}>
-                      No Agent Surfaces with {tpProtocol?.toUpperCase()} protocol on this gateway (
-                      {gatewayChannels.length} hidden)
-                    </Form.Text>
-                  )}
-              </Form.Group>
-            )}
-          </>
+          <GatewaySurfacePicker
+            testIdPrefix="transit-point"
+            state={gatewayState}
+            gatewayId={gatewayId}
+            surfaceId={surfaceId}
+            surfaces={compatibleSurfaces}
+            onGatewayChange={selectGateway}
+            onSurfaceChange={selectSurface}
+            gatewayLabel="Gateway"
+            gatewayPlaceholder="Select a gateway…"
+            gatewayHelp={
+              <p className="mb-0">
+                Pick the connected remote Agent Gateway that publishes the destination. After
+                picking one, choose the Agent Surface on it to route to.
+              </p>
+            }
+            noGatewayTitle="No connected gateway"
+            noGatewayText="Connect another Agent Gateway first, then select it here."
+            savedGatewayName={config.fabric_remote_gateway_name}
+            surfaceLabel="Agent Surface on Gateway"
+            surfacePlaceholder="Select an Agent Surface…"
+            surfaceHelp={
+              <p className="mb-0">
+                The Agent Surfaces this gateway publishes
+                {filterProtocol ? ` for ${filterProtocol.toUpperCase()}` : ''}, loaded live from it.
+                Refresh loads the list again.
+              </p>
+            }
+            emptySurfacesText="The remote gateway reported no published Agent Surfaces. Publish one there, then Refresh."
+            hiddenSurfacesText={
+              filterProtocol
+                ? `No ${filterProtocol.toUpperCase()} Agent Surfaces on this gateway (${gatewayState.surfaces.length} of other protocols hidden).`
+                : undefined
+            }
+          />
         )}
       </div>
 
-      {supportsAgentCard && (
+      {supportsAgentCard && endpointType === 'url' && !isFabricEndpoint(config.target_endpoint) && (
         <div className="config-section">
           <label>Agent Card</label>{' '}
-          <Form.Check
-            type="checkbox"
-            id="tp-override-agent-card"
-            label="Override Agent Card Location"
-            checked={overrideAgentCard}
-            onChange={e => {
-              const enabled = e.target.checked;
-              updateFields({
-                override_agent_card_location: enabled,
-                agent_card_path: enabled
-                  ? config.agent_card_path || '.well-known/agent-card.json'
-                  : '',
-              });
-            }}
-          />
-          <Form.Text className="text-muted d-block" style={{ fontSize: '10px' }}>
-            By default, the gateway fetches the agent card from the configured endpoint plus{' '}
-            <code>/.well-known/agent-card.json</code>. Enable this to fetch the card from a custom
-            path at that endpoint's origin.
-          </Form.Text>
+          <div className="d-flex align-items-center gap-1">
+            <Form.Check
+              type="checkbox"
+              id="tp-override-agent-card"
+              label="Override Agent Card Location"
+              checked={overrideAgentCard}
+              onChange={e => {
+                const enabled = e.target.checked;
+                updateFields({
+                  override_agent_card_location: enabled,
+                  agent_card_path: enabled
+                    ? config.agent_card_path || '.well-known/agent-card.json'
+                    : '',
+                });
+              }}
+            />
+            <FieldHelp
+              testId="field-help-transit-point-agent-card"
+              ariaLabel="About Override Agent Card Location"
+            >
+              <p className="mb-0">
+                By default, the gateway fetches the agent card from the configured endpoint plus{' '}
+                <code>/.well-known/agent-card.json</code>. Enable this to fetch the card from a
+                custom path at that endpoint&apos;s origin.
+              </p>
+            </FieldHelp>
+          </div>
           {overrideAgentCard && (
             <Form.Group className="mt-2">
               <Form.Label className="small text-muted mb-1">Agent Card Location</Form.Label>
@@ -370,6 +382,7 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         <label>Target Authentication</label>
         <Form.Select
           size="sm"
+          data-testid="transit-point-target-auth-type"
           value={config.auth_type || 'none'}
           onChange={e => updateField('auth_type', e.target.value)}
         >
@@ -377,20 +390,63 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
           <option value="bearer">Bearer Token</option>
           <option value="api_key">API Key Header</option>
           <option value="custom_header">Custom Header</option>
-          <option value="oauth_client_credentials">OAuth Client Credentials</option>
+          <option value="credential_provider">Credential Provider</option>
         </Form.Select>
-        {config.auth_type && config.auth_type !== 'none' && (
-          <Form.Group className="mt-2">
-            <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
-            <Form.Control
-              size="sm"
-              type="text"
-              placeholder="secret-name"
-              value={config.auth_secret || ''}
-              onChange={e => updateField('auth_secret', e.target.value)}
-            />
-          </Form.Group>
+        {config.auth_type === 'credential_provider' && (
+          <>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1" htmlFor="transit-point-auth-provider">
+                Credential Provider
+              </Form.Label>
+              <TargetAuthProviderSelect
+                id="transit-point-auth-provider"
+                testId="transit-point-target-auth-provider"
+                value={config.auth_provider_id || ''}
+                onChange={providerId => updateField('auth_provider_id', providerId)}
+                small
+              />
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Header Name</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                data-testid="transit-point-target-auth-provider-header-name"
+                placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerName}
+                value={config.auth_header_name || ''}
+                onChange={e => updateField('auth_header_name', e.target.value)}
+              />
+            </Form.Group>
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Header Format</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                data-testid="transit-point-target-auth-provider-header-format"
+                placeholder={PROVIDER_TARGET_AUTH_DEFAULTS.headerFormat}
+                value={config.auth_header_format || ''}
+                onChange={e => updateField('auth_header_format', e.target.value)}
+              />
+              <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
+                Use <code>{'{value}'}</code> as the placeholder for the provider's token.
+              </Form.Text>
+            </Form.Group>
+          </>
         )}
+        {config.auth_type &&
+          config.auth_type !== 'none' &&
+          config.auth_type !== 'credential_provider' && (
+            <Form.Group className="mt-2">
+              <Form.Label className="small text-muted mb-1">Secret Reference</Form.Label>
+              <Form.Control
+                size="sm"
+                type="text"
+                placeholder="secret-name"
+                value={config.auth_secret || ''}
+                onChange={e => updateField('auth_secret', e.target.value)}
+              />
+            </Form.Group>
+          )}
         {(config.auth_type === 'api_key' || config.auth_type === 'custom_header') && (
           <Form.Group className="mt-2">
             <Form.Label className="small text-muted mb-1">Header Name</Form.Label>
@@ -420,7 +476,9 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
         )}
         {config.auth_type && config.auth_type !== 'none' && (
           <Form.Group className="mt-2">
-            <Form.Label className="small text-muted mb-1">Fallback when secret missing</Form.Label>
+            <Form.Label className="small text-muted mb-1">
+              Fallback when the credential is missing
+            </Form.Label>
             <Form.Select
               size="sm"
               value={config.auth_fallback || 'reject'}
@@ -430,11 +488,6 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
               <option value="passthrough">Passthrough (no credential injected)</option>
             </Form.Select>
           </Form.Group>
-        )}
-        {config.auth_type === 'oauth_client_credentials' && (
-          <Form.Text className="text-warning" style={{ fontSize: '10px' }}>
-            Not yet wired through the proxy runtime — this selection will not be persisted on save.
-          </Form.Text>
         )}
       </div>
 
@@ -451,32 +504,20 @@ const TransitPointPanel: React.FC<ConfigPanelProps> = ({
             instanceKey={config.id}
             checked={config.fabric_delegated_credentials === true}
             peerName={
-              gateways.find(
-                g => g.id === fabricPeerGatewayId(config.target_endpoint, selectedGatewayId)
+              gatewayState.gateways.find(
+                g => g.id === fabricPeerGatewayId(config.target_endpoint, gatewayId)
               )?.name
             }
             onChange={next => updateField('fabric_delegated_credentials', next)}
           />
         )}
 
-      <div className="config-section">
-        <label>Security</label>
-        <Form.Group className="mb-2">
-          <Form.Check
-            type="switch"
-            id={`tp-require-transit-token-${config.id || 'new'}`}
-            label="Require transit token"
-            checked={config.require_transit_token !== false}
-            onChange={e => updateField('require_transit_token', e.target.checked)}
-          />
-          <Form.Text className="text-muted" style={{ fontSize: '10px' }}>
-            When enabled, every call to this transit point must carry a valid{' '}
-            <code>X-Transit-Token</code> header issued by the surface's Access Point. Disable only
-            for development or when the caller cannot carry the token — requests will then be
-            forwarded without caller-context enforcement.
-          </Form.Text>
-        </Form.Group>
-      </div>
+      <TransitCallerSection
+        config={config}
+        alias={alias}
+        updateField={updateField}
+        updateFields={updateFields}
+      />
     </>
   );
 };

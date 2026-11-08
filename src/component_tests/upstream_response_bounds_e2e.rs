@@ -99,13 +99,13 @@ fn transit_surface(point_networking: Option<NetworkingConfig>) -> AgentSurface {
         },
         "transit": {
             "outbound_listen_address": "outbound_port_placeholder",
-            "sign_requests": false,
             "points": [{
                 "alias": "target",
                 "target_endpoint": "outbound_target_placeholder",
                 "gateway_url": "outbound_gateway_url_placeholder",
                 "protocol": "mcp",
                 "require_transit_token": false,
+                "allow_unauthenticated_callers": true,
                 "networking": point_networking
             }]
         }

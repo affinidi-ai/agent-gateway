@@ -1528,8 +1528,7 @@ mod tests {
     #[tokio::test]
     async fn pairing_the_bootstrap_connection_resolves_the_did_from_the_block() {
         let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
-        let seed = "2a".repeat(32);
-        unsafe { std::env::set_var(var, &seed) };
+        let seed = std::env::var(var).expect("`.cargo/config.toml` [env] provides the test seed");
         let config = bootstrap_config(Some(&format!("env://{var}")));
         let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
         assert!(
@@ -1548,7 +1547,6 @@ mod tests {
             crate::vta::control_key_did(&seed).expect("derive"),
             "the DID shown must be the one the connector actually authenticates with"
         );
-        unsafe { std::env::remove_var(var) };
     }
 
     /// With no key source the gateway mints a fresh key every boot, so any DID

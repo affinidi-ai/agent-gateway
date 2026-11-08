@@ -28,7 +28,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{info, warn};
 use tracing_subscriber::Layer;
 
-use super::log_redact::{LogRedactor, RedactingSpanExporter};
+use super::log_redact::{LogRedactor, RedactingLogProcessor, RedactingSpanExporter};
+use crate::config::metrics_config::EVERY_LOG_TARGET;
 
 pub use crate::config::metrics_config::OtlpProtocol;
 
@@ -64,8 +65,82 @@ impl<P: opentelemetry_sdk::logs::LogProcessor> opentelemetry_sdk::logs::LogProce
         self.inner.force_flush()
     }
 
-    fn shutdown(&self) -> opentelemetry_sdk::error::OTelSdkResult {
-        self.inner.shutdown()
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner
+            .shutdown_with_timeout(timeout)
+    }
+
+    fn set_resource(
+        &mut self,
+        resource: &Resource,
+    ) {
+        self.inner
+            .set_resource(resource);
+    }
+}
+
+/// Log processor that passes on only the records whose target `targets` allows: an
+/// exact target, a module path that also covers its submodules, or
+/// [`EVERY_LOG_TARGET`].
+#[derive(Debug)]
+struct TargetFilteringLogProcessor<P> {
+    inner: P,
+    targets: Vec<String>,
+}
+
+impl<P> TargetFilteringLogProcessor<P> {
+    fn allows(
+        &self,
+        target: &str,
+    ) -> bool {
+        self.targets
+            .iter()
+            .any(|allowed| {
+                allowed == EVERY_LOG_TARGET
+                    || target
+                        .strip_prefix(allowed.as_str())
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+            })
+    }
+}
+
+impl<P: opentelemetry_sdk::logs::LogProcessor> opentelemetry_sdk::logs::LogProcessor
+    for TargetFilteringLogProcessor<P>
+{
+    fn emit(
+        &self,
+        record: &mut opentelemetry_sdk::logs::SdkLogRecord,
+        scope: &opentelemetry::InstrumentationScope,
+    ) {
+        let target = record
+            .target()
+            .map_or("", |target| &**target);
+        if self.allows(target) {
+            self.inner.emit(record, scope);
+        }
+    }
+
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn shutdown_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner
+            .shutdown_with_timeout(timeout)
+    }
+
+    fn set_resource(
+        &mut self,
+        resource: &Resource,
+    ) {
+        self.inner
+            .set_resource(resource);
     }
 }
 
@@ -89,7 +164,7 @@ pub type OtelReloadHandle = tracing_subscriber::reload::Handle<BoxedLayer, traci
 static TRACE_RELOAD: OnceLock<OtelReloadHandle> = OnceLock::new();
 static LOG_RELOAD: OnceLock<OtelReloadHandle> = OnceLock::new();
 
-/// Redactor captured at startup, reused when rebuilding the trace exporter on reload.
+/// Redactor captured at startup, reused when rebuilding the trace and log exporters on reload.
 static RELOAD_REDACTOR: OnceLock<Arc<LogRedactor>> = OnceLock::new();
 
 /// Live providers, kept alive so their batch processors keep exporting and shut
@@ -101,14 +176,21 @@ static CURRENT_LOGGER_PROVIDER: Mutex<Option<opentelemetry_sdk::logs::SdkLoggerP
 /// Serialises concurrent reloads so two config saves can't race.
 static RELOAD_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Capture the log redactor for reuse when the trace exporter is rebuilt on a
-/// later hot-reload. Call once at startup **regardless** of whether
+/// Capture the log redactor for reuse when the trace and log exporters are rebuilt
+/// on a later hot-reload. Call once at startup **regardless** of whether
 /// OpenTelemetry is initially enabled: if the process starts with OTEL disabled
 /// and an operator enables it via a live config save, the reload must apply the
-/// configured redaction rather than falling back to the default (which would
-/// export span attributes unredacted until the next restart).
+/// configured redaction rather than the built-in rules.
 pub fn set_reload_redactor(redactor: Arc<LogRedactor>) {
     let _ = RELOAD_REDACTOR.set(redactor);
+}
+
+/// The redactor captured at startup, or one with the built-in rules when none was.
+fn reload_redactor() -> Arc<LogRedactor> {
+    RELOAD_REDACTOR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| LogRedactor::from_config(&crate::config::types::LogRedactionConfig::default()))
 }
 
 /// Store the current provider, returning the previous one (for shutdown).
@@ -126,7 +208,7 @@ fn store_current<T>(
 /// Provides comprehensive configuration for OpenTelemetry tracing and metrics export.
 /// All settings can be tuned for production use based on traffic patterns and
 /// infrastructure capacity.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OtelConfig {
     /// Whether OpenTelemetry is enabled
     #[allow(dead_code)]
@@ -159,6 +241,8 @@ pub struct OtelConfig {
     /// Maximum export batch size
     #[allow(dead_code)]
     pub batch_max_export_size: usize,
+    /// Log targets exported over OTLP (`logs.targets` in metrics.json)
+    pub log_targets: Vec<String>,
 }
 
 impl Default for OtelConfig {
@@ -177,6 +261,7 @@ impl Default for OtelConfig {
             batch_max_queue_size: 2048,
             batch_scheduled_delay_ms: 5000,
             batch_max_export_size: 512,
+            log_targets: vec![EVERY_LOG_TARGET.to_string()],
         }
     }
 }
@@ -355,7 +440,7 @@ pub fn init_tracer(
 ) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
     info!(
         otel.component = "tracer",
-        otel.endpoint = %config.otlp_endpoint,
+        otel.endpoint = %crate::observability::loggable::url(&config.otlp_endpoint),
         otel.service = %config.service_name,
         otel.version = %config.service_version,
         otel.environment = %config.environment,
@@ -396,7 +481,8 @@ fn build_tracer_provider(
 
     // Create OTLP exporter for the configured protocol (gRPC or HTTP) with the
     // optional auth header attached.
-    let otlp_exporter = build_span_exporter(config).context(format!("OTLP endpoint: {}", config.otlp_endpoint))?;
+    let otlp_exporter = build_span_exporter(config)
+        .context(format!("OTLP endpoint: {}", crate::observability::loggable::url(&config.otlp_endpoint)))?;
 
     // Gate exports behind bounded exponential backoff (innermost), so a
     // unreachable collector produces one WARN per attempt instead of per-cycle
@@ -459,7 +545,7 @@ fn build_tracer_provider(
 pub fn init_metrics(config: &OtelConfig) -> Result<opentelemetry_sdk::metrics::SdkMeterProvider> {
     info!(
         otel.component = "metrics",
-        otel.endpoint = %config.otlp_endpoint,
+        otel.endpoint = %crate::observability::loggable::url(&config.otlp_endpoint),
         otel.export_interval_s = config.export_interval_seconds,
         "Initializing OpenTelemetry metrics"
     );
@@ -483,7 +569,8 @@ fn build_meter_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::metric
 
     // Create OTLP metrics exporter for the configured protocol with the
     // optional auth header attached.
-    let exporter = build_metric_exporter(config).context(format!("OTLP endpoint: {}", config.otlp_endpoint))?;
+    let exporter = build_metric_exporter(config)
+        .context(format!("OTLP endpoint: {}", crate::observability::loggable::url(&config.otlp_endpoint)))?;
 
     // Gate exports behind bounded exponential backoff and health tracking.
     let exporter = super::otlp_health::BackoffMetricExporter::new(
@@ -510,7 +597,8 @@ fn build_meter_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::metric
 /// The provider is registered globally and will be used for log export operations.
 ///
 /// # Arguments
-/// * `config` - OpenTelemetry configuration including endpoint and batch settings
+/// * `config` - OpenTelemetry configuration including endpoint, batch settings and log targets
+/// * `redactor` - Redaction applied to the body and attributes of every exported record
 ///
 /// # Returns
 /// * `Ok(LoggerProvider)` - Successfully initialized logger provider
@@ -520,15 +608,18 @@ fn build_meter_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::metric
 /// - Network connectivity issues to OTLP endpoint
 /// - Invalid configuration (malformed endpoint)
 /// - Resource exhaustion during initialization
-pub fn init_logs(config: &OtelConfig) -> Result<opentelemetry_sdk::logs::SdkLoggerProvider> {
+pub fn init_logs(
+    config: &OtelConfig,
+    redactor: Arc<LogRedactor>,
+) -> Result<opentelemetry_sdk::logs::SdkLoggerProvider> {
     info!(
         otel.component = "logs",
-        otel.endpoint = %config.otlp_endpoint,
+        otel.endpoint = %crate::observability::loggable::url(&config.otlp_endpoint),
         otel.service = %config.service_name,
         "Initializing OpenTelemetry logs"
     );
 
-    let provider = build_logger_provider(config)?;
+    let provider = build_logger_provider(config, redactor)?;
 
     // Store in global static for retrieval + a reload/shutdown handle.
     let _ = LOGGER_PROVIDER.set(provider.clone());
@@ -539,16 +630,20 @@ pub fn init_logs(config: &OtelConfig) -> Result<opentelemetry_sdk::logs::SdkLogg
     Ok(provider)
 }
 
-/// Build a logger provider (timestamp-fixing batch processor over the
-/// backoff-gated exporter) without registering any global. Shared by
-/// [`init_logs`] and [`reload_otel`].
-fn build_logger_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::logs::SdkLoggerProvider> {
+/// Build a logger provider (target filter → redact → timestamp fix → batch
+/// processor over the backoff-gated exporter) without registering any global.
+/// Shared by [`init_logs`] and [`reload_otel`].
+fn build_logger_provider(
+    config: &OtelConfig,
+    redactor: Arc<LogRedactor>,
+) -> Result<opentelemetry_sdk::logs::SdkLoggerProvider> {
     // Create resource with service information
     let resource = create_resource(config);
 
     // Create OTLP logs exporter for the configured protocol with the optional
     // auth header attached.
-    let exporter = build_log_exporter(config).context(format!("OTLP endpoint: {}", config.otlp_endpoint))?;
+    let exporter = build_log_exporter(config)
+        .context(format!("OTLP endpoint: {}", crate::observability::loggable::url(&config.otlp_endpoint)))?;
 
     // Gate exports behind bounded exponential backoff and health tracking.
     let exporter = super::otlp_health::BackoffLogExporter::new(
@@ -556,9 +651,8 @@ fn build_logger_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::logs:
         super::otlp_health::controller(super::otlp_health::OtlpSignal::Logs),
     );
 
-    // Build batch processor, wrap with timestamp fix, then build provider
     let batch = opentelemetry_sdk::logs::BatchLogProcessor::builder(exporter).build();
-    let processor = TimestampFixingLogProcessor { inner: batch };
+    let processor = log_processor_chain(batch, redactor, config.log_targets.clone());
 
     let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
         .with_resource(resource)
@@ -566,6 +660,19 @@ fn build_logger_provider(config: &OtelConfig) -> Result<opentelemetry_sdk::logs:
         .build();
 
     Ok(provider)
+}
+
+/// The processors a log record passes through before `exporting`: the `logs.targets`
+/// filter, redaction and the timestamp fix.
+fn log_processor_chain<P: opentelemetry_sdk::logs::LogProcessor>(
+    exporting: P,
+    redactor: Arc<LogRedactor>,
+    targets: Vec<String>,
+) -> impl opentelemetry_sdk::logs::LogProcessor {
+    TargetFilteringLogProcessor {
+        inner: RedactingLogProcessor::new(TimestampFixingLogProcessor { inner: exporting }, redactor),
+        targets,
+    }
 }
 
 /// Get the global logger provider if initialized
@@ -628,12 +735,13 @@ pub fn install_trace_reload(
 ///
 /// `max_level` mirrors the console/file log level (`config.logging.level`), so
 /// the OTLP log export carries the same verbosity as local logs. Only a level
-/// filter is applied — not the trace layer's `BusinessLogicFilter` allow-list —
+/// filter is applied here — not the trace layer's `BusinessLogicFilter` allow-list —
 /// because log events use custom targets (e.g. `policy_audit`,
-/// `trust_check_audit`) that an allow-list would wrongly drop. This keeps the
-/// noisy `TRACE`/`DEBUG` dependency logs (h2, hyper, reqwest, …) out of the OTLP
-/// export whenever the configured level excludes them, while preserving every
-/// application event at or above the configured level.
+/// `trust_check_audit`) that the trace allow-list would wrongly drop. The
+/// `logs.targets` allow-list is applied by the logger provider instead, so it
+/// follows hot reloads. This keeps the noisy `TRACE`/`DEBUG` dependency logs
+/// (h2, hyper, reqwest, …) out of the OTLP export whenever the configured level
+/// excludes them.
 pub fn install_log_reload(
     initial: BoxedLayer,
     max_level: tracing::Level,
@@ -683,11 +791,7 @@ pub async fn reload_otel(
     // ── Traces ──
     let tracer_to_flush = if let Some(handle) = TRACE_RELOAD.get() {
         if cfg.enabled {
-            let redactor = RELOAD_REDACTOR
-                .get()
-                .cloned()
-                .unwrap_or_else(|| LogRedactor::from_config(&crate::config::types::LogRedactionConfig::default()));
-            let provider = build_tracer_provider(&otel_config, redactor)?;
+            let provider = build_tracer_provider(&otel_config, reload_redactor())?;
             let layer = build_trace_layer_boxed(&provider, &otel_config.service_name);
             handle
                 .reload(layer)
@@ -714,7 +818,7 @@ pub async fn reload_otel(
     // ── Logs ──
     let logger_to_flush = if let Some(handle) = LOG_RELOAD.get() {
         if cfg.enabled && cfg.logs.enabled {
-            let provider = build_logger_provider(&otel_config)?;
+            let provider = build_logger_provider(&otel_config, reload_redactor())?;
             let layer = build_log_layer_boxed(&provider);
             handle
                 .reload(layer)
@@ -839,6 +943,7 @@ mod tests {
     fn test_otel_config_default() {
         let config = OtelConfig::default();
         assert!(!config.enabled);
+        assert_eq!(config.log_targets, vec![EVERY_LOG_TARGET.to_string()]);
         assert_eq!(config.service_name, env!("CARGO_PKG_NAME"));
         assert_eq!(config.sample_rate, 1.0);
         assert_eq!(config.export_interval_seconds, 60);
@@ -929,6 +1034,165 @@ mod tests {
         assert_eq!(
             http_signal_endpoint("https://collector.example.com/otlp", "metrics"),
             "https://collector.example.com/otlp/v1/metrics"
+        );
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct CapturingLogProcessor {
+        records: Arc<Mutex<Vec<opentelemetry_sdk::logs::SdkLogRecord>>>,
+        resource: Arc<Mutex<Option<Resource>>>,
+    }
+
+    impl opentelemetry_sdk::logs::LogProcessor for CapturingLogProcessor {
+        fn emit(
+            &self,
+            record: &mut opentelemetry_sdk::logs::SdkLogRecord,
+            _scope: &opentelemetry::InstrumentationScope,
+        ) {
+            self.records
+                .lock()
+                .unwrap()
+                .push(record.clone());
+        }
+
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+
+        fn set_resource(
+            &mut self,
+            resource: &Resource,
+        ) {
+            *self.resource.lock().unwrap() = Some(resource.clone());
+        }
+    }
+
+    /// Emits one record per target in `emitted` through the export processor chain
+    /// allowing `targets`, and returns what reached the exporting processor.
+    fn export_through_chain(
+        targets: &[&str],
+        emitted: &[(&'static str, &'static str)],
+    ) -> CapturingLogProcessor {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+
+        let capturing = CapturingLogProcessor::default();
+        let redactor = LogRedactor::from_config(&crate::config::types::LogRedactionConfig::default());
+        let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
+            .with_resource(
+                Resource::builder()
+                    .with_service_name("chain-test")
+                    .build(),
+            )
+            .with_log_processor(log_processor_chain(
+                capturing.clone(),
+                redactor,
+                targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ))
+            .build();
+        let logger = provider.logger("chain-test");
+        for (target, body) in emitted {
+            let mut record = logger.create_log_record();
+            record.set_target(*target);
+            record.set_body((*body).into());
+            logger.emit(record);
+        }
+        capturing
+    }
+
+    fn exported_targets(capturing: &CapturingLogProcessor) -> Vec<String> {
+        capturing
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| {
+                record
+                    .target()
+                    .map(ToString::to_string)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn log_targets_pass_an_exact_target_only() {
+        let capturing = export_through_chain(
+            &["policy_audit"],
+            &[("policy_audit", "allowed"), ("policy_audit_extra", "dropped"), ("agent_gateway::proxy", "dropped")],
+        );
+
+        assert_eq!(exported_targets(&capturing), vec!["policy_audit".to_string()]);
+    }
+
+    #[test]
+    fn log_targets_pass_a_module_path_and_its_submodules() {
+        let capturing = export_through_chain(
+            &["agent_gateway"],
+            &[
+                ("agent_gateway", "allowed"),
+                ("agent_gateway::proxy::handler", "allowed"),
+                ("agent_gateway_extra", "dropped"),
+                ("hyper::proto::h1", "dropped"),
+            ],
+        );
+
+        assert_eq!(
+            exported_targets(&capturing),
+            vec!["agent_gateway".to_string(), "agent_gateway::proxy::handler".to_string()]
+        );
+    }
+
+    #[test]
+    fn log_targets_wildcard_passes_every_target() {
+        let capturing = export_through_chain(
+            &[EVERY_LOG_TARGET],
+            &[("agent_gateway::proxy", "one"), ("policy_audit", "two"), ("h2::codec", "three")],
+        );
+
+        assert_eq!(
+            exported_targets(&capturing),
+            vec!["agent_gateway::proxy".to_string(), "policy_audit".to_string(), "h2::codec".to_string()]
+        );
+    }
+
+    #[test]
+    fn log_targets_empty_list_exports_nothing() {
+        let capturing = export_through_chain(&[], &[("agent_gateway::proxy", "dropped")]);
+
+        assert!(exported_targets(&capturing).is_empty());
+    }
+
+    #[test]
+    fn log_export_chain_redacts_stamps_and_forwards_the_resource() {
+        let capturing = export_through_chain(
+            &[EVERY_LOG_TARGET],
+            &[("agent_gateway::proxy", "forwarding with Authorization: Bearer sk-live-abc123")],
+        );
+
+        let records = capturing
+            .records
+            .lock()
+            .unwrap();
+        let body = format!("{:?}", records[0].body());
+        assert!(!body.contains("sk-live-abc123"), "{body}");
+        assert!(body.contains("Authorization: Bearer [REDACTED]"), "{body}");
+        assert!(
+            records[0]
+                .timestamp()
+                .is_some()
+        );
+        let resource = capturing
+            .resource
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("resource reaches the exporting processor");
+        assert_eq!(
+            resource.get(&opentelemetry::Key::from_static_str("service.name")),
+            Some(opentelemetry::Value::from("chain-test"))
         );
     }
 }

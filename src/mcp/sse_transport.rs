@@ -19,6 +19,8 @@ use std::convert::Infallible;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, warn};
 
+use crate::observability::loggable;
+
 /// Result of probing/sending to an upstream MCP endpoint.
 pub enum UpstreamMcpResponse {
     /// Upstream responded with JSON (non-streaming).
@@ -130,7 +132,10 @@ pub(crate) async fn send_mcp_request(
         }
     }
 
-    let response = req.send().await?;
+    let response = req
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
     let status = response.status();
     let headers = response.headers().clone();
 
@@ -235,7 +240,7 @@ pub fn create_sse_passthrough_response(
                 Err(e) => {
                     warn!(
                         channel = channel_name_clone,
-                        error = %e,
+                        error = %e.without_url(),
                         "Error reading upstream SSE stream"
                     );
                     break;
@@ -667,6 +672,12 @@ mod consume_sse_tests {
             .unwrap_err();
 
         assert!(matches!(error, SseConsumeError::Body(UpstreamBodyError::Read(_))), "{error:?}");
+        let SseConsumeError::Body(body_error) = &error else {
+            panic!("Expected a body error, got {error:?}");
+        };
+        let rendered = body_error.to_string();
+        assert!(rendered.starts_with("failed to read upstream response"), "{rendered}");
+        assert!(!rendered.contains("http://"), "{rendered}");
     }
 
     #[tokio::test]
@@ -808,14 +819,14 @@ impl UpstreamSseSession {
         use tokio::time::{Duration, timeout};
 
         let sse_url = format!("{}/sse", base_url.trim_end_matches('/'));
-        info!(channel = channel_name, "UpstreamSseSession: connecting to {}", sse_url);
+        info!(channel = channel_name, "UpstreamSseSession: connecting to {}", loggable::url(&sse_url));
 
         let response = client
             .get(&sse_url)
             .header(ACCEPT, CT_EVENT_STREAM)
             .send()
             .await
-            .map_err(|e| format!("SSE connect failed: {e}"))?;
+            .map_err(|e| format!("SSE connect failed: {}", e.without_url()))?;
 
         if !response.status().is_success() {
             return Err(format!("SSE endpoint returned {}", response.status()));
@@ -848,7 +859,7 @@ impl UpstreamSseSession {
                             }
                         }
                     }
-                    Err(e) => return Err(format!("SSE stream error: {e}")),
+                    Err(e) => return Err(format!("SSE stream error: {}", e.without_url())),
                 }
             }
             Err("SSE stream closed before endpoint event".to_string())
@@ -858,7 +869,7 @@ impl UpstreamSseSession {
 
         let post_url = resolve_session_post_url(&raw_endpoint, &sse_url)?;
 
-        info!(channel = channel_name, "UpstreamSseSession: post_url={}", post_url);
+        info!(channel = channel_name, "UpstreamSseSession: posting messages to {}", loggable::origin(&post_url));
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>> = Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -904,7 +915,7 @@ impl UpstreamSseSession {
                         }
                     }
                     Err(e) => {
-                        warn!(channel = ch_name, error = %e, "UpstreamSseSession: stream error");
+                        warn!(channel = ch_name, error = %e.without_url(), "UpstreamSseSession: stream error");
                         break;
                     }
                 }
@@ -949,7 +960,7 @@ impl UpstreamSseSession {
             .await
         {
             Ok(resp) => {
-                info!(channel = channel_name, "UpstreamSseSession: initialized upstream, response={}", resp);
+                info!(channel = channel_name, response_bytes = resp.len(), "UpstreamSseSession: initialized upstream");
             }
             Err(e) => {
                 session
@@ -1047,7 +1058,7 @@ impl UpstreamSseSession {
             .body(upstream_body)
             .send()
             .await
-            .map_err(|e| format!("POST failed: {e}"))?;
+            .map_err(|e| format!("POST failed: {}", e.without_url()))?;
 
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 202 {

@@ -67,15 +67,41 @@ function variantsEqual(a: VariantMeta[], b: VariantMeta[]): boolean {
  * fields realigns the route editor with the surface URL while leaving
  * variant-owned Access Point settings and node layout metadata intact.
  */
-export function patchAccessPointCanvasNode(canvas: any, identifiers: Record<string, unknown>): any {
+export function patchAccessPointCanvasNode(
+  canvas: any,
+  identifiers: Record<string, unknown>,
+  cleared: readonly string[] = []
+): any {
   if (!canvas || typeof canvas !== 'object' || !Array.isArray(canvas.nodes)) return canvas;
   let changed = false;
   const nodes = canvas.nodes.map((n: any) => {
     if (n?.id !== 'access-point' || !n.config || typeof n.config !== 'object') return n;
     changed = true;
-    return { ...n, config: { ...n.config, ...identifiers } };
+    return { ...n, config: withoutFields({ ...n.config, ...identifiers }, cleared) };
   });
   return changed ? { ...canvas, nodes } : canvas;
+}
+
+/**
+ * Identifier fields whose absence is a setting, mirrored like a value: an
+ * Access Point stored without `public` (legacy) whose Public access switch is
+ * off. Without this a `public: true` mirrored earlier would survive in the
+ * other snapshots and be saved while the switch shows off.
+ */
+const CLEARABLE_IDENTIFIER_FIELDS = ['public'] as const;
+
+function withoutFields<T extends Record<string, unknown>>(record: T, fields: readonly string[]): T {
+  if (fields.length === 0) return record;
+  const out: Record<string, unknown> = { ...record };
+  for (const f of fields) delete out[f];
+  return out as T;
+}
+
+function clearedFields(source: unknown): string[] {
+  if (!source || typeof source !== 'object') return [];
+  return CLEARABLE_IDENTIFIER_FIELDS.filter(
+    f => (source as Record<string, unknown>)[f] === undefined
+  );
 }
 
 /**
@@ -136,8 +162,10 @@ export function syncAccessPointIdentifiers(
       if (srcCanvasAp.config[f] !== undefined) canvasIdentifiers[f] = srcCanvasAp.config[f];
     }
   }
-  const hasSlice = Object.keys(identifiers).length > 0;
-  const hasCanvas = Object.keys(canvasIdentifiers).length > 0;
+  const cleared = clearedFields(srcAp);
+  const canvasCleared = clearedFields(srcCanvasAp?.config);
+  const hasSlice = Object.keys(identifiers).length > 0 || cleared.length > 0;
+  const hasCanvas = Object.keys(canvasIdentifiers).length > 0 || canvasCleared.length > 0;
   if (!hasSlice && !hasCanvas) return snapshots;
   const out: Record<string, any> = {};
   for (const [id, snap] of Object.entries(snapshots)) {
@@ -149,15 +177,22 @@ export function syncAccessPointIdentifiers(
     if (hasSlice && snap.access_point && typeof snap.access_point === 'object') {
       next = {
         ...next,
-        access_point: {
-          ...snap.access_point,
-          ...identifiers,
-          ...a2aKeepingVersions(snap.access_point.a2a, identifiers.a2a),
-        },
+        access_point: withoutFields(
+          {
+            ...snap.access_point,
+            ...identifiers,
+            ...a2aKeepingVersions(snap.access_point.a2a, identifiers.a2a),
+          },
+          cleared
+        ),
       };
     }
     if (hasCanvas) {
-      const patchedCanvas = patchAccessPointCanvasNode(next.canvas, canvasIdentifiers);
+      const patchedCanvas = patchAccessPointCanvasNode(
+        next.canvas,
+        canvasIdentifiers,
+        canvasCleared
+      );
       if (patchedCanvas !== next.canvas) {
         next = { ...next, canvas: patchedCanvas };
       }
@@ -328,11 +363,32 @@ export function baseSurfaceFromSnapshot(snapshot: any): BaseSurfaceView {
  * removes a variant there, `setCatalog` is called to register/drop
  * snapshots.
  */
+/**
+ * A stored variant without its own `outbound_credentials` keeps the base
+ * surface's bindings. While it still shows none and the base has none, the
+ * save leaves the list out so the variant keeps inheriting instead of
+ * pinning an empty list the operator never chose.
+ */
+function withoutUnchangedInheritedOutbound(
+  overrides: SurfaceOverrides,
+  inherits: boolean,
+  basePayload: any
+): SurfaceOverrides {
+  const own = overrides.outbound_credentials ?? [];
+  const base = Array.isArray(basePayload?.outbound_credentials)
+    ? basePayload.outbound_credentials
+    : [];
+  if (!inherits || own.length > 0 || base.length > 0) return overrides;
+  const { outbound_credentials: _omitted, ...rest } = overrides;
+  return rest;
+}
+
 export function useVariantSnapshots(): UseVariantSnapshotsResult {
   const [variants, setVariants] = useState<VariantMeta[]>([]);
   const [defaultVariantId, setDefaultVariantId] = useState<string | null>(null);
   const [activeVariantId, setActiveVariantId] = useState<string | null>(null);
   const snapshotsRef = useRef<Record<string, any>>({});
+  const inheritsOutboundRef = useRef<Set<string>>(new Set());
 
   const hydrateFromPayload = useCallback(
     (
@@ -358,6 +414,9 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
       for (const v of list) {
         snapshots[v.id] = resolveVariant(payload, (v.overrides ?? {}) as SurfaceOverrides);
       }
+      inheritsOutboundRef.current = new Set(
+        list.filter(v => v.overrides?.outbound_credentials === undefined).map(v => v.id)
+      );
       // Default variant id: the named one if the wire pins it, else
       // null (which means "base is the default").
       const namedDefault =
@@ -535,7 +594,11 @@ export function useVariantSnapshots(): UseVariantSnapshotsResult {
           name: v.name,
           ...(v.description ? { description: v.description } : {}),
           enabled: v.enabled !== false,
-          overrides: computeOverridesFromPayload(snapshot),
+          overrides: withoutUnchangedInheritedOutbound(
+            computeOverridesFromPayload(snapshot),
+            inheritsOutboundRef.current.has(v.id),
+            basePayload
+          ),
         };
       });
       // Backend allows `default_variant_id = null` even when variants[]

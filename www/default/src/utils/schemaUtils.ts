@@ -209,8 +209,6 @@ export const extractAgentIdentitySchema = (
   // Auto-detect protocol if not provided
   const detectedProtocol = protocol || detectProtocol(payload);
 
-  console.log(`[Schema Extraction] Protocol: ${detectedProtocol}, Field: ${fieldName}`);
-
   // Extract identity data based on protocol
   let identityData = null;
 
@@ -219,20 +217,14 @@ export const extractAgentIdentitySchema = (
     case 'ap2':
     case 'ucp':
       identityData = extractIdentityFromJsonRpcProtocol(payload, fieldName, detectedProtocol);
-      console.log(
-        `[Schema Extraction] ${detectedProtocol.toUpperCase()} - Identity found:`,
-        !!identityData
-      );
       break;
 
     case 'mcp':
       identityData = extractIdentityFromMcp(payload, fieldName);
-      console.log(`[Schema Extraction] MCP - Identity found:`, !!identityData);
       break;
 
     default:
       // Fallback: try generic extraction
-      console.log('[Schema Extraction] Unknown protocol - trying generic extraction');
       if (payload && typeof payload === 'object' && payload[fieldName]) {
         identityData = payload[fieldName];
       }

@@ -38,3 +38,15 @@ Runs the published MCP conformance suite and the legacy compatibility checks
 against the gateway. See
 [mcp-conformance/README.md](mcp-conformance/README.md) for options, outputs and
 baseline maintenance.
+
+## MCP authorization server discovery
+
+```bash
+make mcp-discovery
+make mcp-discovery ARGS="--keep"
+```
+
+Runs authorization server discovery for an MCP surface end to end against Ory
+Hydra in Docker, with a scripted client and the official MCP client SDK.
+`--keep` leaves it running for a check with MCP Inspector. See
+[mcp-discovery/README.md](mcp-discovery/README.md).

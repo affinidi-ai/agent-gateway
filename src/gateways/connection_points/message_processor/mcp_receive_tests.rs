@@ -77,6 +77,16 @@ async fn receive(message: &ReceivedMessage) -> (Value, Value) {
     (response_body, envelope)
 }
 
+/// A child process started to isolate globals runs one test; one that matched
+/// no test would also exit successfully.
+fn assert_ran_exactly_one_test(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "the isolated child did not run exactly one test:\n{stdout}"
+    );
+}
+
 #[test]
 fn fabric_policy_context_matches_direct_admission_without_changing_legacy_shape() {
     use crate::mcp::request_validation::{LegacySessionEvidence, validate_mcp_post};
@@ -349,6 +359,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
 
@@ -497,7 +508,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         if code == -32022 {
             assert_eq!(
                 envelope["error"]["data"],
-                json!({"requested": MCP_MODERN_VERSION, "supported": [MCP_LEGACY_VERSION]})
+                json!({"requested": MCP_MODERN_VERSION, "supported": crate::mcp::request_validation::SESSION_VERSIONS})
             );
         } else {
             assert!(
@@ -551,7 +562,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     // An initialize for a revision this receiver does not serve reaches the
     // Target asking for one it does, so the session it opens stays usable.
     let initialize = json!({"jsonrpc": "2.0", "id": "legacy-initialize", "method": "initialize", "params": {
-        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+        "protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
     }});
     let (forward_response, _) = receive(&forward_message(initialize.clone(), json!({}))).await;
     assert_eq!(forward_response["status"], 200);
@@ -563,6 +574,31 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     let mut expected = initialize;
     expected["params"]["protocolVersion"] = json!(MCP_LEGACY_VERSION);
     assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), expected);
+
+    // A session revision the receiver serves reaches the Target unchanged, so
+    // the Target negotiates it.
+    let session_initialize = json!({"jsonrpc": "2.0", "id": "session-initialize", "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "client", "version": "1"}
+    }});
+    let (forward_response, _) = receive(&forward_message(
+        session_initialize.clone(),
+        json!({"MCP-Protocol-Version": "2025-06-18", "Mcp-Method": "initialize"}),
+    ))
+    .await;
+    assert_eq!(forward_response["status"], 200);
+    let forwarded = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("initialize reached the Target");
+    assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), session_initialize);
+    assert_eq!(
+        forwarded
+            .headers
+            .get("mcp-protocol-version")
+            .map(String::as_str),
+        Some("2025-06-18")
+    );
 
     let caller_body = json!({
         "jsonrpc": "2.0", "id": "legacy-control", "method": "tools/list",
@@ -590,7 +626,7 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             target
                 .request_count
                 .load(Ordering::SeqCst),
-            index + 3
+            index + 4
         );
         let received = target
             .last_request_rx
@@ -735,10 +771,10 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
         assert_eq!(
             refusals,
             expected_refusal
-                .map(|reason| (reason, expected_status))
+                .map(|reason| (reason, None))
                 .into_iter()
                 .collect::<Vec<_>>(),
-            "recorded refusals for a {expected_status}"
+            "recorded refusals for a {expected_status}, with no HTTP status on Fabric"
         );
     }
     let mut unknown_surface = forward_message(legacy_body, json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION}));
@@ -975,8 +1011,12 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
                 headers,
                 body,
                 surface: configured.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
             crate::mcp::request_validation::LEGACY_ONLY_POLICY,
             None,
@@ -1002,14 +1042,14 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
             }
         );
     }
-    // Includes the capped initialize, the one envelope-replay delivery, the
-    // legacy request whose forwarded Origin is not rechecked, and the unmarked
-    // GET and DELETE without a body.
+    // Includes the capped and the session-revision initialize, the one
+    // envelope-replay delivery, the legacy request whose forwarded Origin is
+    // not rechecked, and the unmarked GET and DELETE without a body.
     assert_eq!(
         target
             .request_count
             .load(Ordering::SeqCst),
-        8
+        9
     );
 
     let mut guarded = surface.clone();
@@ -1043,6 +1083,53 @@ async fn fabric_mcp_requests_are_validated_on_receive() {
     );
 }
 
+/// The status and JSON-RPC body of a Fabric receive's answer, buffered or streamed.
+async fn decode(result: ProcessingResult) -> (u16, Value) {
+    use futures::TryStreamExt;
+
+    match result {
+        ProcessingResult::RequiresResponse { response_body, .. } => {
+            let text = response_body["body"]
+                .as_str()
+                .unwrap_or("");
+            (
+                response_body["status"]
+                    .as_u64()
+                    .unwrap() as u16,
+                if text.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_str(text).unwrap()
+                },
+            )
+        }
+        ProcessingResult::StreamingResponse { response } => {
+            let status = response.status().as_u16();
+            let sse = response
+                .headers()
+                .get("content-type")
+                .is_some_and(|value| value == "text/event-stream");
+            let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body = if sse {
+                let events: Vec<_> = crate::mcp::modern_sse::decode_events(
+                    futures::stream::iter([Ok::<_, std::io::Error>(bytes)]),
+                    crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
+                )
+                .try_collect()
+                .await
+                .unwrap();
+                serde_json::from_str(&events.last().unwrap().data).unwrap()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            (status, body)
+        }
+        other => panic!("unexpected Fabric result: {other:?}"),
+    }
+}
+
 #[test]
 fn fabric_consent_uses_receiver_authority_and_rejects_cross_peer_retries() {
     if std::env::var_os("ATG_MCP_CONSENT_RECEIVE_CHILD").is_none() {
@@ -1061,6 +1148,7 @@ fn fabric_consent_uses_receiver_authority_and_rejects_cross_peer_retries() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     std::thread::Builder::new()
@@ -1085,7 +1173,6 @@ async fn fabric_consent_flow() {
     use std::sync::Arc;
 
     use axum::{extract::State, http::HeaderMap, response::IntoResponse};
-    use futures::TryStreamExt;
     use sha2::{Digest, Sha256};
 
     use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
@@ -1112,50 +1199,6 @@ async fn fabric_consent_flow() {
         did_peer::DIDPeer::create_peer_did(&keys, None)
             .unwrap()
             .0
-    }
-
-    async fn decode(result: ProcessingResult) -> (u16, Value) {
-        match result {
-            ProcessingResult::RequiresResponse { response_body, .. } => {
-                let text = response_body["body"]
-                    .as_str()
-                    .unwrap_or("");
-                (
-                    response_body["status"]
-                        .as_u64()
-                        .unwrap() as u16,
-                    if text.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_str(text).unwrap()
-                    },
-                )
-            }
-            ProcessingResult::StreamingResponse { response } => {
-                let status = response.status().as_u16();
-                let sse = response
-                    .headers()
-                    .get("content-type")
-                    .is_some_and(|value| value == "text/event-stream");
-                let bytes = axum::body::to_bytes(response.into_body(), 65536)
-                    .await
-                    .unwrap();
-                let body = if sse {
-                    let events: Vec<_> = crate::mcp::modern_sse::decode_events(
-                        futures::stream::iter([Ok::<_, std::io::Error>(bytes)]),
-                        crate::mcp::modern_sse::SseLimits::from(&crate::config::McpHttpConfig::default()),
-                    )
-                    .try_collect()
-                    .await
-                    .unwrap();
-                    serde_json::from_str(&events.last().unwrap().data).unwrap()
-                } else {
-                    serde_json::from_slice(&bytes).unwrap()
-                };
-                (status, body)
-            }
-            other => panic!("unexpected Fabric result: {other:?}"),
-        }
     }
 
     type ObservedCalls = Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>;
@@ -1386,8 +1429,12 @@ async fn fabric_consent_flow() {
                     .unwrap()
                     .into(),
                 surface: surface.clone(),
-                variant_id: None,
+                variant: crate::config::agent_surface_variants::ForwardedVariant {
+                    id: None,
+                    recorded: "_base_".into(),
+                },
                 capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+                scope: crate::observability::policy_audit::RequestScope::fresh(),
             },
         )
     };
@@ -1471,7 +1518,9 @@ async fn fabric_consent_flow() {
     }
 
     vault.store(serde_json::from_value(json!({
-        "id": "verified-token", "agent_did": holder_did, "user_identity_hash": hex::encode(Sha256::digest(b"user")),
+        "id": "verified-token", "agent_did": holder_did,
+        "user_identity_hash": crate::source_auth::models::caller_identity_hash(
+            "jwt_bearer", "https://receiver.example/api/oauth2/mcp", surface.tenant_id.as_deref(), "user"),
         "credential_provider_id": "provider", "provider_id": "provider", "access_token": "verified-remote-credential", "scopes": ["read"],
         "consent_granted_at": "2026-09-01T00:00:00Z", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z",
         "consent_identity": {"principal": hex::encode(Sha256::digest(serde_json_canonicalizer::to_vec(&("https://receiver.example/api/oauth2/mcp", "user")).unwrap())),
@@ -1591,81 +1640,133 @@ async fn fabric_consent_flow() {
         .unwrap();
     assert!(binding.route == ContinuationRoute::Fabric { peer_did: sender_did.clone() });
     assert_eq!(binding.resource, "https://receiver.example/mcp");
-    for format in ["json", "sse"] {
-        surface.target.endpoint = format!("http://{target_address}/{format}");
+    surface.target.endpoint = format!("http://{target_address}/json");
+    surface.target.payment_policy =
+        Some(serde_json::from_value(json!({"type": "x402", "mcp_payment_triggers": {"mode": "all"}})).unwrap());
+    body["id"] = json!(20);
+    let before = calls.lock().await.len();
+    let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
+    let response = decode(
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            &message,
+            Some(stream),
+            versions,
+            Some(runtime.clone()),
+        ))
+        .await,
+    )
+    .await;
+    assert_eq!(response, (503, json!({"error": "payment_unavailable"})));
+    assert_eq!(calls.lock().await.len(), before, "a local payment surface never reaches the Target");
+    {
+        use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+        fn receipt_header(result: &ProcessingResult) -> Option<String> {
+            match result {
+                ProcessingResult::StreamingResponse { response } => response
+                    .headers()
+                    .get("payment-response")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string),
+                ProcessingResult::RequiresResponse { response_body, .. } => {
+                    response_body["headers"]["payment-response"]
+                        .as_str()
+                        .map(str::to_string)
+                }
+                _ => None,
+            }
+        }
+
+        let gate = MockGate::answering(200, &[("Payment-Receipt", "consent-flow-receipt")], json!({}))
+            .challenging(&[("payment-required", "eyJ4IjoxfQ==")], json!({"accepts": []}));
+        install_test_transport("consent-flow-gate", gate.clone());
         surface.target.payment_policy = Some(
             serde_json::from_value(json!({
-                "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
-                "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
+                "type": "agent_pay", "payment_gateway_id": "consent-flow-gate", "payment_surface_id": "pay-1",
                 "mcp_payment_triggers": {"mode": "all"}
             }))
             .unwrap(),
         );
-        body["id"] = json!(20);
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requestState");
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("inputResponses");
-        let original = crate::mcp::request_validation::ValidatedModernMessage {
-            protocol_version: MCP_MODERN_VERSION.into(),
-            client_capabilities: Some(json!({"elicitation": {"url": {}}})),
-            client_info: None,
-            method: "tools/call".into(),
-            params: Some(body["params"].clone()),
-            id: Some(body["id"].clone()),
-            kind: crate::mcp::request_validation::McpMessageKind::Request,
+        let request = |body: &Value, surface: &AgentSurface, signature: Option<&str>| {
+            let (mut message, mut stream) = make_request(body, surface, &sender_did, &bearer);
+            if let Some(signature) = signature {
+                stream
+                    .headers
+                    .insert("payment-signature", signature.parse().unwrap());
+                message.message_body["headers"]["PAYMENT-SIGNATURE"] = json!(signature);
+            }
+            (message, stream)
         };
-        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
-            subject: "user".into(),
-            claims: json!({"iss": "https://receiver.example/api/oauth2/mcp", "sub": "user", "scope": "read"}),
+        let fresh = |body: &mut Value, id: u64| {
+            body["id"] = json!(id);
+            for field in ["requestState", "inputResponses"] {
+                body["params"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+            }
         };
-        let binding = crate::mcp::continuations::delegation::make_binding(
-            "receiver",
-            &surface,
-            None,
-            ContinuationRoute::Fabric { peer_did: sender_did.clone() },
-            surface
-                .mcp_http
-                .as_ref()
-                .unwrap()
-                .authorization
-                .as_ref()
-                .unwrap(),
-            &provider,
-            vec!["read".into()],
-            &holder_did,
-            &identity,
-            &original,
-        )
-        .unwrap();
-        let response = runtime
-            .service
-            .wrap_upstream_response(
-                &original,
-                binding,
-                json!({"jsonrpc": "2.0", "id": 20, "result": {
-                    "resultType": "input_required", "requestState": "remote opaque state",
-                    "inputRequests": {"remote-input": {"method": "elicitation/create", "params": {
-                        "mode": "url", "url": "https://target.example/consent", "message": "Authorize"
-                    }}}
-                }}),
-                300,
-                now,
-            )
-            .await
-            .unwrap();
-        body["id"] = json!(21);
-        body["params"]["requestState"] = response["result"]["requestState"].clone();
-        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
-        let before = calls.lock().await.len();
-        for _attempt in 0..2 {
-            let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-            let response = decode(
+
+        for format in ["json", "sse"] {
+            surface.target.endpoint = format!("http://{target_address}/{format}");
+            fresh(&mut body, 30);
+            let signature = format!("consent-flow-{format}");
+            let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+            let (message, stream) = request(&body, &surface, Some(&signature));
+            let paid = Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await;
+            assert_eq!(receipt_header(&paid).as_deref(), Some("consent-flow-receipt"), "{format}");
+            let (status, paid) = decode(paid).await;
+            assert_eq!(status, 200, "{format}: {paid}");
+            assert_eq!(paid["result"]["resultType"], "input_required", "{format}");
+            assert_ne!(paid["result"]["requestState"], "remote opaque state", "{format}");
+            assert_eq!(gate.calls(), hops + 1, "{format}: the first round is charged once");
+            assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], signature);
+
+            body["id"] = json!(31);
+            body["params"]["requestState"] = paid["result"]["requestState"].clone();
+            body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
+            let (message, stream) = request(&body, &surface, None);
+            let continued = Box::pin(super::process_forward_request_with_mcp_runtime(
+                &message,
+                Some(stream),
+                versions,
+                Some(runtime.clone()),
+            ))
+            .await;
+            assert_eq!(
+                receipt_header(&continued).as_deref(),
+                Some("consent-flow-receipt"),
+                "{format}: the continuation carries the receipt it already holds"
+            );
+            let (status, continued) = decode(continued).await;
+            assert_eq!(status, 200, "{format}: {continued}");
+            assert_eq!(continued["result"]["resultType"], "complete", "{format}");
+            assert_eq!(continued["result"]["_meta"]["org.paymentauth/receipt"], "consent-flow-receipt", "{format}");
+            assert_eq!(gate.calls(), hops + 1, "{format}: a continuation round is not charged again");
+            {
+                let observed = calls.lock().await;
+                assert_eq!(observed.len(), forwarded + 2, "{format}");
+                for (headers, upstream) in &observed[forwarded..] {
+                    assert_eq!(headers["authorization"], "Bearer verified-remote-credential");
+                    assert!(!headers.contains_key("payment-signature"), "{format}: {headers:?}");
+                    assert!(
+                        upstream["params"]["arguments"]
+                            .get("payment_signature")
+                            .is_none()
+                    );
+                }
+                assert_eq!(observed[forwarded + 1].1["params"]["requestState"], "remote opaque state");
+            }
+
+            body["id"] = json!(32);
+            let (message, stream) = request(&body, &surface, None);
+            let replayed = decode(
                 Box::pin(super::process_forward_request_with_mcp_runtime(
                     &message,
                     Some(stream),
@@ -1675,34 +1776,16 @@ async fn fabric_consent_flow() {
                 .await,
             )
             .await;
-            assert_eq!(response.0, 402, "{:?}", response.1);
-            assert_eq!(calls.lock().await.len(), before);
+            assert_eq!(replayed.0, 409, "{format}: {:?}", replayed.1);
+            assert_eq!(gate.calls(), hops + 1, "{format}: a replayed continuation is not charged");
+            assert_eq!(calls.lock().await.len(), forwarded + 2, "{format}: nor forwarded");
         }
-        body["id"] = json!(22);
-        let signature = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&json!({
-                "x402Version": 2,
-                "resource": {"url": "https://receiver.example/mcp", "description": "test", "mimeType": "application/json"},
-                "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-                "payload": {"signature": "fixture-payment"}
-            })).unwrap());
-        let paid_request = || {
-            let mut paid_body = body.clone();
-            if format == "sse" {
-                paid_body["params"]["arguments"]["payment_signature"] = json!(signature);
-            }
-            let (mut message, mut stream) = make_request(&paid_body, &surface, &sender_did, &bearer);
-            if format == "json" {
-                stream
-                    .headers
-                    .insert("payment-signature", signature.parse().unwrap());
-                message.message_body["headers"]["pAyMeNt-SiGnAtUrE"] = json!(signature);
-            }
-            (message, stream)
-        };
-        let (first_message, first_stream) = paid_request();
-        let (second_message, second_stream) = paid_request();
+
+        surface.target.endpoint = format!("http://{target_address}/json");
+        fresh(&mut body, 40);
+        let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+        let (first_message, first_stream) = request(&body, &surface, Some("racing-consent-flow"));
+        let (second_message, second_stream) = request(&body, &surface, Some("racing-consent-flow"));
         let (first, second) = tokio::join!(
             Box::pin(super::process_forward_request_with_mcp_runtime(
                 &first_message,
@@ -1717,136 +1800,20 @@ async fn fabric_consent_flow() {
                 Some(runtime.clone()),
             )),
         );
-        for result in [&first, &second] {
-            if let ProcessingResult::StreamingResponse { response } = result {
-                let receipt = response
-                    .headers()
-                    .get("payment-response")
-                    .expect("receiver receipt");
-                let receipt =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, receipt.as_bytes()).unwrap();
-                let receipt: Value = serde_json::from_slice(&receipt).unwrap();
-                assert_eq!(receipt["verified"], true);
-                assert_eq!(receipt["settled"], false);
-            }
-        }
-        let first = decode(first).await;
-        let second = decode(second).await;
-        assert!(matches!((first.0, second.0), (200, 409) | (409, 200)), "{first:?}; {second:?}");
-        let observed = calls.lock().await;
-        assert_eq!(observed.len(), before + 1);
-        assert_eq!(observed[before].0["authorization"], "Bearer verified-remote-credential");
-        assert!(
-            !observed[before]
-                .0
-                .contains_key("payment-signature")
-        );
-        assert!(
-            observed[before].1["params"]["arguments"]
-                .get("payment_signature")
-                .is_none()
-        );
-        assert_eq!(observed[before].1["params"]["requestState"], "remote opaque state");
-    }
-    let transactions = Arc::new(
-        crate::x402::TransactionStore::new(
-            directory
-                .path()
-                .join("payments"),
-        )
-        .await
-        .unwrap(),
-    );
-    super::init_transaction_store(transactions.clone()).await;
-    for format in ["json", "sse"] {
-        surface.target.endpoint = format!("http://{target_address}/{format}");
-        body["id"] = json!(30);
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("requestState");
-        body["params"]
-            .as_object_mut()
-            .unwrap()
-            .remove("inputResponses");
-        let signature = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            serde_json::to_vec(&json!({
-                "x402Version": 2,
-                "accepted": {"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                    "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300},
-                "payload": {"signature": format!("receiver-round-{format}")}
-            }))
-            .unwrap(),
-        );
-        let (message, mut stream) = make_request(&body, &surface, &sender_did, &bearer);
-        stream
-            .headers
-            .insert("payment-signature", signature.parse().unwrap());
-        let calls_before = calls.lock().await.len();
-        let payments_before = transactions
-            .list_all()
-            .await
-            .len();
-        let response = Box::pin(super::process_forward_request_with_mcp_runtime(
-            &message,
-            Some(stream),
-            versions,
-            Some(runtime.clone()),
-        ))
-        .await;
-        let receipt = match &response {
-            ProcessingResult::StreamingResponse { response } => response
-                .headers()
-                .get("payment-response")
-                .unwrap()
-                .clone(),
-            other => panic!("expected paid streaming response: {other:?}"),
+        let (first, second) = (decode(first).await, decode(second).await);
+        let (paid, refused) = match (first.0, second.0) {
+            (200, 402) => (first, second),
+            (402, 200) => (second, first),
+            other => panic!("one payment pays for one call: {other:?}; {first:?}; {second:?}"),
         };
-        let (status, response) = decode(response).await;
-        assert_eq!(status, 200, "{response}");
-        assert_eq!(response["result"]["resultType"], "input_required");
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
-        );
-        body["id"] = json!(31);
-        body["params"]["requestState"] = response["result"]["requestState"].clone();
-        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
-        let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-        let response = Box::pin(super::process_forward_request_with_mcp_runtime(
-            &message,
-            Some(stream),
-            versions,
-            Some(runtime.clone()),
-        ))
-        .await;
-        match &response {
-            ProcessingResult::StreamingResponse { response } => assert_eq!(
-                response
-                    .headers()
-                    .get("payment-response"),
-                Some(&receipt)
-            ),
-            other => panic!("expected paid continuation response: {other:?}"),
-        }
-        let (status, response) = decode(response).await;
-        assert_eq!(status, 200, "{response}");
-        assert_eq!(response["result"]["resultType"], "complete");
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
-        );
-        assert_eq!(calls.lock().await.len(), calls_before + 2);
-        body["id"] = json!(32);
-        let (message, stream) = make_request(&body, &surface, &sender_did, &bearer);
-        let response = decode(
+        assert_eq!(paid.1["result"]["resultType"], "input_required");
+        assert_eq!(refused.1["error"]["code"], 1002, "{:?}", refused.1);
+        assert_eq!(refused.1["error"]["data"]["failure"]["reason"], "payment_already_used");
+        assert_eq!(calls.lock().await.len(), forwarded + 1, "the credential reaches the Target once");
+        assert_eq!(gate.calls(), hops + 3, "two payments, and the fresh challenge for the replayed one");
+
+        let (message, stream) = request(&body, &surface, Some("continuation-consent-flow"));
+        let paid = decode(
             Box::pin(super::process_forward_request_with_mcp_runtime(
                 &message,
                 Some(stream),
@@ -1856,15 +1823,31 @@ async fn fabric_consent_flow() {
             .await,
         )
         .await;
-        assert_eq!(response.0, 409, "{:?}", response.1);
-        assert_eq!(
-            transactions
-                .list_all()
-                .await
-                .len(),
-            payments_before + 1
+        assert_eq!(paid.0, 200, "{:?}", paid.1);
+        body["id"] = json!(41);
+        body["params"]["requestState"] = paid.1["result"]["requestState"].clone();
+        body["params"]["inputResponses"] = json!({"remote-input": {"action": "accept"}});
+        let (hops, forwarded) = (gate.calls(), calls.lock().await.len());
+        let (first_message, first_stream) = request(&body, &surface, None);
+        let (second_message, second_stream) = request(&body, &surface, None);
+        let (first, second) = tokio::join!(
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &first_message,
+                Some(first_stream),
+                versions,
+                Some(runtime.clone()),
+            )),
+            Box::pin(super::process_forward_request_with_mcp_runtime(
+                &second_message,
+                Some(second_stream),
+                versions,
+                Some(runtime.clone()),
+            )),
         );
-        assert_eq!(calls.lock().await.len(), calls_before + 2);
+        let (first, second) = (decode(first).await, decode(second).await);
+        assert!(matches!((first.0, second.0), (200, 409) | (409, 200)), "{first:?}; {second:?}");
+        assert_eq!(gate.calls(), hops, "neither continuation round reaches agent-pay");
+        assert_eq!(calls.lock().await.len(), forwarded + 1, "the continuation is forwarded once");
     }
     surface.target.payment_policy = None;
     for reject in [false, true] {
@@ -2011,7 +1994,10 @@ async fn fabric_consent_flow() {
             if let Some(alias) = alias {
                 message.message_body["virtual_channel_alias"] = json!(alias);
             }
-            stream.variant_id = Some("credential-variant".into());
+            stream.variant = crate::config::agent_surface_variants::ForwardedVariant {
+                id: Some("credential-variant".into()),
+                recorded: "candidate".into(),
+            };
             (message, stream)
         };
         let before = calls.lock().await.len();
@@ -2297,6 +2283,7 @@ fn fabric_policies_see_the_same_mcp_input_as_direct() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -2346,6 +2333,7 @@ allow if {
 "#,
         )
         .unwrap();
+    let credential_policies = policies.clone();
     super::init_policy_manager(policies).await;
     // The appliance-wide gateway policy reads `input.mcp` too, so the allowed
     // request passes only if the gateway policy seam also sees it.
@@ -2459,6 +2447,464 @@ allow if {
         "a request the policy rejects is refused: {response_body}"
     );
     assert_ne!(last_body(), Some(denied), "a request the policy rejects never reaches the Target");
+
+    // A payment credential in a tool argument or `_meta` is not in what the
+    // gateway and surface policies read.
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+    let gate = MockGate::answering(200, &[("Payment-Receipt", "policy-receipt")], json!({}));
+    install_test_transport("fabric-credential-gate", gate.clone());
+    let paying: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-credential-policy", "name": "Fabric credential policy",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": format!("http://{}", target.addr), "policy": {"policy_definition_id": "mcp-input"},
+            "payment_policy": {"type": "agent_pay", "payment_gateway_id": "fabric-credential-gate",
+                "payment_surface_id": "pay-1", "mcp_payment_triggers": {"mode": "all"}}}
+    }))
+    .unwrap();
+    store
+        .save(&paying)
+        .await
+        .unwrap();
+    credential_policies
+        .load_policy_text(
+            &paying.surface_id,
+            r#"package surface.policy
+
+default allow := false
+
+allow if {
+    input.mcp.tool_name == "echo"
+    not contains(json.marshal(input), "FABRIC-SECRET")
+}
+"#,
+        )
+        .unwrap();
+    let with_credential = json!({"jsonrpc": "2.0", "id": "call", "method": "tools/call",
+        "params": {"name": "echo", "arguments": {"value": 1, "payment_signature": "FABRIC-SECRET"},
+            "_meta": {"org.paymentauth/credential": "FABRIC-SECRET"}}});
+    let mut paying_message = message(&with_credential);
+    paying_message.message_body["channel_id"] = json!(paying.surface_id);
+    let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&paying_message)))
+        .await
+        .expect("Fabric receive handler timed out");
+    let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+        panic!("expected a ForwardResponse, got {result:?}");
+    };
+    assert_eq!(response_body["status"], 200, "the policies read the call without its credential: {response_body}");
+    assert_eq!(gate.calls(), 1, "the credential was still the one paid with");
+    assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], "FABRIC-SECRET");
+    let received = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(
+        !received
+            .body
+            .contains("FABRIC-SECRET"),
+        "the Target received a credential: {}",
+        received.body
+    );
+}
+
+/// Runs `flow` in a test process of its own. Fabric receive reads process-wide
+/// stores (surfaces, source auth) that the first gateway booted in a process
+/// owns, so a flow that installs its own would otherwise see another test's.
+fn run_in_own_process<F: std::future::Future<Output = ()>>(flow: impl FnOnce() -> F) {
+    if std::env::var_os("ATG_FABRIC_ISOLATED_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap()
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("ATG_FABRIC_ISOLATED_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated Fabric test {test_name} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(Box::pin(flow()));
+}
+
+#[test]
+fn fabric_receive_binds_tokens_to_the_routes_protected_resource() {
+    run_in_own_process(fabric_discovery_flow);
+}
+
+/// An MCP Access Point that publishes protected resource metadata binds a
+/// Fabric request's token to the resource of the route called, as on the
+/// direct path. The sending gateway strips the caller's own token, so the
+/// `Authorization` here stands for a credential the sender injects: a missing
+/// one, or one issued for another resource or variant, gets a 401 before
+/// policy without `resource_metadata`, and only one for the route's resource
+/// reaches the Target. A named alias that does not resolve is refused before
+/// any token is read, never served by the default.
+async fn fabric_discovery_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "fabric-discovery", "name": "Fabric discovery",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+            "caller_authentication": {
+                "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}],
+                "protected_resource": {"resource": "https://gateway.example/mcp",
+                    "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}
+            }},
+        "target": {"endpoint": format!("http://{}", target.addr)},
+        "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {}}]
+    }))
+    .unwrap();
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let token_for = |audience: &str| {
+        sign_jwt(
+            json!({"iss": fixture.issuer, "sub": "user-123", "aud": audience, "exp": now_secs() + 300}),
+            &fixture.kid,
+        )
+    };
+    let now = super::super::envelope_replay::now_secs();
+    let send = |alias: Option<&str>, token: Option<String>| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(token) = token {
+            headers["authorization"] = json!(format!("Bearer {token}"));
+        }
+        let mut body = json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers,
+            "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}});
+        if let Some(alias) = alias {
+            body["virtual_channel_alias"] = json!(alias);
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            body,
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    for (alias, token, invalid_token) in [
+        (None, None, false),
+        (None, Some(token_for("https://gateway.example/other")), true),
+        (None, Some(token_for("https://gateway.example/mcp$beta")), true),
+        (Some("beta"), Some(token_for("https://gateway.example/mcp")), true),
+    ] {
+        let response = send(alias, token).await;
+        assert_eq!(response["status"], 401, "{response}");
+        let challenge = response["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(challenge.starts_with("Bearer realm=\"agent-gateway\""), "{response}");
+        assert!(!challenge.contains("resource_metadata"), "{response}");
+        assert_eq!(challenge.contains("error=\"invalid_token\""), invalid_token, "{response}");
+        assert_eq!(reached(), 0, "a refused token never reaches the Target");
+    }
+
+    for (alias, audience) in [(None, "https://gateway.example/mcp"), (Some("beta"), "https://gateway.example/mcp$beta")]
+    {
+        let before = reached();
+        let response = send(alias, Some(token_for(audience))).await;
+        assert_eq!(response["status"], 200, "{response}");
+        assert_eq!(reached(), before + 1, "a token for the route's own resource reaches the Target");
+        let forwarded = target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .unwrap();
+        assert!(
+            !forwarded
+                .headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("authorization")),
+            "the caller's token never reaches the Target"
+        );
+    }
+
+    // A named alias that does not resolve is refused, whatever the token
+    // names, and never reaches the Target.
+    for audience in ["https://gateway.example/mcp", "https://gateway.example/mcp$ghost"] {
+        let before = reached();
+        let response = send(Some("ghost"), Some(token_for(audience))).await;
+        assert_eq!(response["status"], 404, "{response}");
+        assert_eq!(reached(), before, "an unresolved alias never reaches the Target");
+    }
+}
+
+#[test]
+fn fabric_receive_refuses_a_failed_caller_on_a_closed_access_point() {
+    run_in_own_process(closed_access_point_fabric_flow);
+}
+
+/// A closed Access Point refuses a Fabric caller without a valid credential
+/// before policy and the Target, in the caller's protocol shape, while a
+/// surface stored without `on_failure` still forwards it. A closed Access
+/// Point stored without caller authentication is not ready and refuses every
+/// caller with `503`.
+async fn closed_access_point_fabric_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "closed-idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    let surface = |id: &str, protocol: &str, on_failure: Option<&str>| {
+        let mut caller_authentication =
+            json!({"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}]});
+        if let Some(on_failure) = on_failure {
+            caller_authentication["on_failure"] = json!(on_failure);
+        }
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "caller_authentication": caller_authentication},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }))
+        .unwrap()
+    };
+    let not_ready = |id: &str, protocol: &str| {
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "public": false},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }))
+        .unwrap()
+    };
+    for stored in [
+        surface("closed-mcp", "mcp", Some("reject")),
+        surface("closed-a2a", "a2a", Some("reject")),
+        surface("legacy-mcp", "mcp", None),
+        not_ready("unready-mcp", "mcp"),
+        not_ready("unready-a2a", "a2a"),
+    ] {
+        store
+            .save(&stored)
+            .await
+            .unwrap();
+    }
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str, token: Option<String>| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        if let Some(token) = token {
+            headers["authorization"] = json!(format!("Bearer {token}"));
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": format!("/{channel_id}"), "headers": headers,
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let foreign_token =
+        sign_jwt(json!({"iss": "https://other.example", "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    let body = |response: &Value| -> Value {
+        serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+
+    for token in [None, Some(foreign_token.clone())] {
+        let refused = send("closed-mcp", token.clone()).await;
+        assert_eq!(refused["status"], 401, "{refused}");
+        assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
+        assert_eq!(
+            body(&refused),
+            json!({"jsonrpc": "2.0", "id": "call", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
+            }})
+        );
+
+        let refused = send("closed-a2a", token).await;
+        assert_eq!(refused["status"], 401, "{refused}");
+        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
+        assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+    }
+
+    let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    let admitted = send("closed-mcp", Some(valid)).await;
+    assert_eq!(admitted["status"], 200, "{admitted}");
+    assert_eq!(reached(), 1, "a valid caller reaches the Target");
+
+    let forwarded = send("legacy-mcp", Some(foreign_token)).await;
+    assert_eq!(forwarded["status"], 200, "{forwarded}");
+    assert_eq!(reached(), 2, "a surface stored without on_failure forwards a failed caller to policy");
+
+    let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
+    for token in [None, Some(valid)] {
+        let refused = send("unready-mcp", token.clone()).await;
+        assert_eq!(refused["status"], 503, "{refused}");
+        assert_eq!(
+            body(&refused),
+            json!({"jsonrpc": "2.0", "id": "call", "error": {
+                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                "message": crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE
+            }})
+        );
+
+        let refused = send("unready-a2a", token).await;
+        assert_eq!(refused["status"], 503, "{refused}");
+        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE);
+        assert_eq!(reached(), 2, "a not-ready Access Point never reaches the Target");
+    }
 }
 
 #[derive(Clone, Default)]
@@ -2509,6 +2955,7 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
 
@@ -2541,12 +2988,14 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
     let credentials = [
         ("authorization", "Bearer delegated-access-token"),
         ("proxy-authorization", "Basic proxy-credential"),
-        ("cookie", "session=cookie-credential"),
         ("x-api-key", "api-key-credential"),
-        ("x-transit-token", "transit-credential"),
         ("x-upstream-auth", "custom-header-credential"),
     ];
-    let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+    let mut headers = json!({
+        "MCP-Protocol-Version": MCP_LEGACY_VERSION,
+        "x-transit-token": "transit-credential",
+        "cookie": "session=cookie-credential"
+    });
     for (name, value) in credentials {
         headers[name] = json!(value);
     }
@@ -2598,6 +3047,20 @@ async fn fabric_receive_logs_forwarded_header_names_without_values() {
         assert!(logs.contains(&format!("Header: {name}\n")), "header name {name} was not logged:\n{logs}");
         assert!(!logs.contains(value), "credential value for {name} was logged:\n{logs}");
     }
+    assert!(
+        !forwarded
+            .headers
+            .contains_key("x-transit-token"),
+        "a transit token the peer sent never reaches the Target"
+    );
+    assert!(!logs.contains("transit-credential"), "the peer's transit token was logged:\n{logs}");
+    assert!(
+        !forwarded
+            .headers
+            .contains_key("cookie"),
+        "a cookie the peer sent never reaches the Target"
+    );
+    assert!(!logs.contains("cookie-credential"), "the peer's cookie was logged:\n{logs}");
 }
 
 #[test]
@@ -2618,6 +3081,7 @@ fn fabric_tool_call_batches_are_refused_before_tool_level_controls() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert_ran_exactly_one_test(&output);
         return;
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -2746,5 +3210,1458 @@ async fn fabric_tool_call_batch_flow() {
             0,
             "{body}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_paid_surface_reached_over_the_fabric_is_charged() {
+    use crate::proxy::handler::agent_pay_gate::{install_test_transport, tests::MockGate};
+
+    if std::env::var_os("AG_FABRIC_PAYMENT_CHILD").is_none() {
+        let test_name = std::thread::current()
+            .name()
+            .expect("test thread name")
+            .to_string();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("AG_FABRIC_PAYMENT_CHILD", "1")
+            .output()
+            .expect("run the fabric payment test with isolated globals");
+        assert!(
+            output.status.success(),
+            "isolated fabric payment test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_ran_exactly_one_test(&output);
+        return;
+    }
+
+    let target_response = json!({"jsonrpc": "2.0", "id": "paid", "result": {"content": []}});
+    let target = MockServer::start_with_response(target_response.to_string()).await;
+    let failing = MockServer::start_with_status(500, "application/json", r#"{"error":"boom"}"#).await;
+    let unreachable = crate::component_tests::helpers::closing_endpoint();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for (surface_id, address) in
+        [("fabric-paid", target.addr), ("fabric-paid-failing", failing.addr), ("fabric-paid-unreachable", unreachable)]
+    {
+        let surface: AgentSurface = serde_json::from_value(json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": format!("http://{address}"), "payment_policy": {
+                "type": "agent_pay", "payment_gateway_id": "fabric-receive-gate", "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+            }}
+        }))
+        .unwrap();
+        store
+            .save(&surface)
+            .await
+            .unwrap();
+    }
+    let gate =
+        MockGate::answering(200, &[("Payment-Receipt", "fabric-receipt"), ("Cache-Control", "no-store")], json!({}))
+            .challenging(
+                &[("payment-required", "eyJ4IjoxfQ=="), ("content-type", "application/json")],
+                json!({"accepts": []}),
+            );
+    install_test_transport("fabric-receive-gate", gate.clone());
+    let now_secs = super::super::envelope_replay::now_secs();
+    let forward_message = |surface_id: &str, path: &str, body: Value, headers: Value| {
+        ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now_secs + 60),
+            json!({"channel_id": surface_id, "method": "POST", "path": path, "headers": headers, "body": body}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path))
+    };
+    let call = |tool: &str| json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {"name": tool}});
+    let refusal = |result: ProcessingResult| {
+        let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+            panic!("expected a ForwardResponse, got {result:?}");
+        };
+        let envelope: Value = serde_json::from_str(
+            response_body["body"]
+                .as_str()
+                .unwrap_or("null"),
+        )
+        .unwrap_or(Value::Null);
+        (response_body, envelope)
+    };
+    let forwarded = |target: &MockServer| {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let legacy = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+
+    let (response, envelope) =
+        receive(&forward_message("fabric-paid", "/mcp", call("free_tool"), legacy.clone())).await;
+    assert_eq!(response["status"], 200);
+    assert_eq!(envelope, target_response);
+    assert_eq!(gate.calls(), 0, "a free call makes no payment hop");
+
+    let (response, envelope) = refusal(
+        Box::pin(process_forward_request(&forward_message("fabric-paid", "/mcp", call("paid_tool"), legacy.clone())))
+            .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(response["headers"]["payment-required"], "eyJ4IjoxfQ==");
+    assert_eq!(
+        envelope["error"]["code"], -32042,
+        "a legacy caller is answered with the MPP MCP transport's payment-required code"
+    );
+    assert_eq!(envelope["error"]["data"]["x402"], json!({"accepts": []}));
+    assert_eq!(gate.calls(), 1);
+    assert_eq!(forwarded(&target), 1, "an unpaid call never reaches the Target");
+
+    let modern_call = json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+        "name": "paid_tool", "_meta": {
+            "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }
+    }});
+    let modern = json!({
+        "MCP-Protocol-Version": MCP_MODERN_VERSION, "Mcp-Method": "tools/call", "Mcp-Name": "paid_tool",
+        "content-type": "application/json", "accept": "application/json, text/event-stream"
+    });
+    let (response, envelope) = refusal(
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            &forward_message("fabric-paid", "/mcp", modern_call, modern),
+            None,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+        .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(envelope["error"]["code"], 1001, "a modern caller gets the application code");
+    assert_eq!(forwarded(&target), 1);
+
+    // A header that cannot be read, whether its name or its value, does not cost the
+    // request its credential or its forward, and the query string is not sent to
+    // agent-pay.
+    let mut paid_headers = legacy.clone();
+    paid_headers["PAYMENT-SIGNATURE"] = json!("proof");
+    paid_headers["bad header"] = json!("a name with a space");
+    paid_headers["x-count"] = json!(5);
+    let path = "/mcp?api_key=query-secret";
+    let (response, envelope) =
+        receive(&forward_message("fabric-paid", path, call("paid_tool"), paid_headers.clone())).await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(response["headers"]["payment-response"], "fabric-receipt");
+    assert_eq!(response["headers"]["cache-control"], "no-store");
+    assert_eq!(envelope["result"]["_meta"]["org.paymentauth/receipt"], "fabric-receipt");
+    let sent = gate.last();
+    assert_eq!(sent.headers["PAYMENT-SIGNATURE"], "proof");
+    let wire = format!("{} {:?} {} {}", sent.path, sent.headers, sent.body, sent.payment_context);
+    assert!(!wire.contains("query-secret"), "the query string never reaches agent-pay: {wire}");
+    let upstream = target
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(
+        !upstream
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("payment-signature")),
+        "the consumed credential is stripped: {:?}",
+        upstream.headers
+    );
+    let (hops, reached) = (gate.calls(), forwarded(&target));
+
+    // The same payment on the same request is used up: refused with a fresh
+    // challenge, and never forwarded a second time.
+    let (response, envelope) = refusal(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-paid",
+            path,
+            call("paid_tool"),
+            paid_headers.clone(),
+        )))
+        .await,
+    );
+    assert_eq!(response["status"], 402, "{response}");
+    assert_eq!(response["headers"]["payment-required"], "eyJ4IjoxfQ==");
+    assert!(
+        response["headers"]
+            .get("payment-response")
+            .is_none()
+    );
+    assert_eq!(envelope["error"]["code"], -32043);
+    assert_eq!(envelope["error"]["data"]["failure"]["reason"], "payment_already_used");
+    assert_eq!(gate.calls(), hops + 2, "the replayed payment, then a request for a fresh challenge");
+    assert_eq!(forwarded(&target), reached, "a used payment is not forwarded again");
+
+    // The same credential on another tool is another request, so it is another key.
+    let (response, _) = receive(&forward_message("fabric-paid", path, call("paid_other"), paid_headers)).await;
+    assert_eq!(response["status"], 200, "{response}");
+    let keys: Vec<String> = gate
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|request| {
+            request.payment_context["correlation"]["idempotency_key"]
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert_eq!(keys[0], keys[1], "the replay is the same request");
+    assert_ne!(keys[0], keys[2], "another tool is another request");
+
+    // A paid call that then fails still carries its receipt, whether the Target
+    // answers with an error or cannot be reached.
+    for (surface_id, status) in [("fabric-paid-failing", 500), ("fabric-paid-unreachable", 502)] {
+        let mut headers = legacy.clone();
+        headers["PAYMENT-SIGNATURE"] = json!(format!("proof-{surface_id}"));
+        let hops = gate.calls();
+        let (response, _) = refusal(
+            Box::pin(process_forward_request(&forward_message(surface_id, "/mcp", call("paid_tool"), headers))).await,
+        );
+        assert_eq!(response["status"], status, "{surface_id}: {response}");
+        assert_eq!(response["headers"]["payment-response"], "fabric-receipt", "{surface_id}");
+        assert_eq!(gate.calls(), hops + 1, "{surface_id}");
+    }
+
+    // An MCP proxy Target is charged only once the proxy is found, its request is
+    // known to be servable and its breaker is closed, and what reaches the REST
+    // backend carries no credential.
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    let backend = MockServer::start_with_response(r#"{"ok": true}"#).await;
+    let proxy_directory = tempfile::tempdir().unwrap();
+    let proxy_store = std::sync::Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            proxy_directory
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap(),
+    );
+    let spec = json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+        "/echo": {"post": {"operationId": "paid_echo", "summary": "Echo",
+            "requestBody": {"required": true, "content": {"application/json": {"schema": {
+                "type": "object", "properties": {"payment_signature": {"type": "string"}, "q": {"type": "string"}}
+            }}}},
+            "responses": {"200": {"description": "OK"}}}}
+    }});
+    let mut proxy = crate::mcp_proxies::types::McpProxy::new(
+        "Echo".into(),
+        String::new(),
+        backend.url(),
+        spec.to_string(),
+        "/mcp".into(),
+        "/echo-proxy".into(),
+    );
+    proxy.flatten_post_params = true;
+    proxy_store
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::super::init_mcp_proxy_store(proxy_store).await;
+    let policies = std::sync::Arc::new(crate::policies::SurfacePolicyManager::new());
+    super::super::init_policy_manager(policies.clone()).await;
+    let proxy_surface = |surface_id: &str, proxy_id: &str, breaker: bool| -> AgentSurface {
+        let mut target = json!({"endpoint": format!("proxy://{proxy_id}"), "payment_policy": {
+            "type": "agent_pay", "payment_gateway_id": "fabric-receive-gate", "payment_surface_id": "pay-1",
+            "mcp_payment_triggers": {"mode": "match", "patterns": ["^paid_"]}
+        }});
+        if breaker {
+            target["networking"] = json!({
+                "circuit_breaker": {"failure_threshold": 1, "success_threshold": 1, "timeout_secs": 60, "window_secs": 60}
+            });
+        }
+        serde_json::from_value(json!({
+            "surface_id": surface_id, "name": surface_id,
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+            "target": target
+        }))
+        .unwrap()
+    };
+    for (surface_id, proxy_id, breaker) in [
+        ("fabric-proxy", proxy.id.as_str(), false),
+        ("fabric-proxy-missing", "no-such-proxy", false),
+        ("fabric-proxy-breaker", proxy.id.as_str(), true),
+    ] {
+        let surface = proxy_surface(surface_id, proxy_id, breaker);
+        policies
+            .update_channel_policy(&surface)
+            .await
+            .unwrap();
+        store
+            .save(&surface)
+            .await
+            .unwrap();
+    }
+    // The status and headers (as `{"status", "headers"}`) and the JSON body of any answer.
+    let flat = |result: ProcessingResult| async move {
+        match result {
+            ProcessingResult::RequiresResponse { response_body, .. } => {
+                let envelope = serde_json::from_str::<Value>(
+                    response_body["body"]
+                        .as_str()
+                        .unwrap_or("null"),
+                )
+                .unwrap_or(Value::Null);
+                (response_body, envelope)
+            }
+            ProcessingResult::StreamingResponse { response } => {
+                let headers: serde_json::Map<String, Value> = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), json!(value.to_str().unwrap())))
+                    .collect();
+                let status = response.status().as_u16();
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                (json!({"status": status, "headers": headers}), serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    };
+    let with_credential = |tool: &str| {
+        json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+            "name": tool, "arguments": {"q": "1", "payment_signature": "proxy-secret"}
+        }})
+    };
+    let hops = gate.calls();
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy",
+            "/mcp",
+            with_credential("paid_unknown"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert!(
+        envelope
+            .get("error")
+            .is_some(),
+        "{envelope}"
+    );
+    assert_eq!(gate.calls(), hops, "a tool the proxy does not have is refused before it is charged");
+
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy",
+            "/mcp",
+            with_credential("paid_echo"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert_eq!(response["status"], 200, "{response}");
+    assert_eq!(response["headers"]["payment-response"], "fabric-receipt", "{envelope}");
+    assert_eq!(gate.calls(), hops + 1);
+    assert_eq!(gate.last().headers["PAYMENT-SIGNATURE"], "proxy-secret");
+    let reached = backend
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("the backend was called");
+    assert!(reached.body.contains("\"q\""), "{reached:?}");
+    assert!(
+        !reached
+            .body
+            .contains("proxy-secret"),
+        "a legacy call reached the backend with its credential: {reached:?}"
+    );
+
+    let modern_call = |tool: &str| {
+        json!({"jsonrpc": "2.0", "id": "paid", "method": "tools/call", "params": {
+            "name": tool, "arguments": {"q": "2", "payment_signature": "modern-proxy-secret"}, "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MCP_MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }})
+    };
+    let modern_headers = |tool: &str| {
+        json!({
+            "MCP-Protocol-Version": MCP_MODERN_VERSION, "Mcp-Method": "tools/call", "Mcp-Name": tool,
+            "content-type": "application/json", "accept": "application/json, text/event-stream"
+        })
+    };
+    let hops = gate.calls();
+    let modern_receive = |surface_id: &str| {
+        let message = forward_message(surface_id, "/mcp", modern_call("paid_echo"), modern_headers("paid_echo"));
+        Box::pin(super::process_forward_request_with_mcp_runtime(
+            Box::leak(Box::new(message)),
+            None,
+            crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+            None,
+        ))
+    };
+    let (response, _) = flat(modern_receive("fabric-proxy-missing").await).await;
+    assert_eq!(response["status"], 404, "{response}");
+    assert_eq!(gate.calls(), hops, "a proxy that is not there is refused before it is charged");
+
+    let (response, envelope) = flat(modern_receive("fabric-proxy").await).await;
+    assert_eq!(response["status"], 200, "{response} {envelope}");
+    assert_eq!(gate.calls(), hops + 1);
+    let reached = backend
+        .last_request_rx
+        .borrow()
+        .clone()
+        .unwrap();
+    assert!(reached.body.contains("\"q\""), "{reached:?}");
+    assert!(
+        !reached
+            .body
+            .contains("modern-proxy-secret"),
+        "a modern call reached the backend with its credential: {reached:?}"
+    );
+
+    let breaker = policies
+        .get_circuit_breaker("fabric-proxy-breaker")
+        .await
+        .expect("the surface has a circuit breaker");
+    let _ = breaker
+        .call(async { Err::<(), &str>("backend down") })
+        .await;
+    assert!(
+        breaker
+            .refusing_for()
+            .await
+            .is_some()
+    );
+    let hops = gate.calls();
+    let (response, envelope) = flat(
+        Box::pin(process_forward_request(&forward_message(
+            "fabric-proxy-breaker",
+            "/mcp",
+            with_credential("paid_echo"),
+            legacy.clone(),
+        )))
+        .await,
+    )
+    .await;
+    assert!(
+        response["headers"]
+            .get("payment-response")
+            .is_none(),
+        "{response} {envelope}"
+    );
+    assert!(
+        envelope
+            .get("error")
+            .is_some(),
+        "{envelope}"
+    );
+    assert_eq!(gate.calls(), hops, "a Target whose circuit is open is refused before it is charged");
+}
+
+#[test]
+fn lenient_headers_keep_every_header_that_decodes() {
+    let headers = json!({
+        "PAYMENT-SIGNATURE": "proof", "x-big": "a".repeat(40_000), "bad header": "name", "x-count": 5,
+        "x-nested": {"a": 1}, "x-bad-value": "line\nbreak"
+    });
+    let decoded = super::lenient_headers(headers.as_object());
+    assert_eq!(decoded["payment-signature"], "proof");
+    assert_eq!(decoded["x-big"].len(), 40_000, "there is no size cliff");
+    let mut names: Vec<_> = decoded
+        .keys()
+        .map(|name| name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["payment-signature", "x-big"]);
+    assert!(super::lenient_headers(None).is_empty());
+}
+
+#[test]
+fn the_payment_variant_is_the_resolved_alias_and_never_the_peers_text() {
+    let surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "variants", "name": "variants",
+        "access_point": {"listen_address": "127.0.0.1:8080", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": "http://127.0.0.1:9"},
+        "variants": [
+            {"id": "vc-gold", "alias": "gold", "name": "Gold", "description": "", "enabled": true, "overrides": {}},
+            {"id": "vc-off", "alias": "off", "name": "Off", "description": "", "enabled": false, "overrides": {}}
+        ],
+        "default_variant_id": "vc-gold"
+    }))
+    .unwrap();
+
+    assert_eq!(super::resolved_variant_alias(&surface, Some("vc-gold"), None).as_deref(), Some("gold"));
+    assert_eq!(
+        super::resolved_variant_alias(&surface, Some("vc-off"), None),
+        None,
+        "a disabled variant selects nothing"
+    );
+    assert_eq!(super::resolved_variant_alias(&surface, Some("vc-unknown"), None), None);
+    assert_eq!(super::resolved_variant_alias(&surface, None, None), None);
+    assert_eq!(
+        super::resolved_variant_alias(&surface, None, Some("gold")).as_deref(),
+        Some("gold"),
+        "a stream carries the alias its open request named"
+    );
+}
+
+#[test]
+fn fabric_receive_selects_the_method_each_credential_belongs_to() {
+    run_in_own_process(fabric_multi_method_flow);
+}
+
+/// Fabric receive selects the caller authentication method as the direct path
+/// does. On a JWT + API key Access Point each credential alone is verified by
+/// its own method, a request carrying both fails as ambiguous, and an
+/// `Authorization` value in another scheme is not the JWT. Beside protected
+/// resource metadata a missing credential gets the discovery refusal and a
+/// failed API key a plain one, both before policy.
+async fn fabric_multi_method_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    const PARTNER_KEY: &str = "partner-key";
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "idp", "name": "IdP", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        FilesystemSecretsStore::new_async(
+            temp_dir
+                .path()
+                .join("secrets")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    secrets
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "partners".into(),
+            secret_id: "partners".into(),
+            description: None,
+            value: PARTNER_KEY.into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let methods = json!([
+        {"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []},
+        {"type": "api_key", "secret_id": "partners", "extraction": {"source": "http_header", "field": "x-api-key"}}
+    ]);
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for surface in [
+        json!({
+            "surface_id": "multi", "name": "multi",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/multi", "protocol": "mcp",
+                "caller_authentication": {"methods": methods, "on_failure": "reject"}},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }),
+        json!({
+            "surface_id": "multi-discovery", "name": "multi-discovery",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp",
+                "caller_authentication": {"methods": methods,
+                    "protected_resource": {"resource": "https://gateway.example/mcp",
+                        "authorization_servers": [crate::protocols::protected_resource::fixtures::ISSUER]}}},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }),
+    ] {
+        store
+            .save(&serde_json::from_value::<AgentSurface>(surface).unwrap())
+            .await
+            .unwrap();
+    }
+    super::init_mcp_auth_network(Arc::new(crate::protocols::protected_resource::fixtures::discovery_network()));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        strategies,
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        Some(secrets),
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str, path: &str, credentials: &[(&str, String)]| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        for (name, value) in credentials {
+            headers[*name] = json!(value);
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": path, "headers": headers,
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let body = |response: &Value| -> Value {
+        serde_json::from_str(
+            response["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let token = |audience: &str| {
+        format!(
+            "Bearer {}",
+            sign_jwt(
+                json!({"iss": fixture.issuer, "sub": "user-1", "aud": audience, "exp": now_secs() + 300}),
+                &fixture.kid
+            )
+        )
+    };
+    let key = || ("x-api-key", PARTNER_KEY.to_string());
+
+    let jwt = send("multi", "/multi", &[("authorization", token("any"))]).await;
+    assert_eq!(jwt["status"], 200, "a JWT caller is verified by the JWT method: {jwt}");
+    let partner = send("multi", "/multi", &[key()]).await;
+    assert_eq!(partner["status"], 200, "an API key caller is verified by the API key method: {partner}");
+    let payment = send("multi", "/multi", &[key(), ("authorization", "Payment cred".to_string())]).await;
+    assert_eq!(payment["status"], 200, "an Authorization value in another scheme is not the JWT: {payment}");
+    assert_eq!(reached(), 3);
+
+    let both = send("multi", "/multi", &[key(), ("authorization", token("any"))]).await;
+    assert_eq!(both["status"], 401, "a caller carrying two credentials fails as ambiguous: {both}");
+    assert_eq!(body(&both)["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{both}");
+    assert_eq!(reached(), 3, "an ambiguous caller never reaches the Target");
+
+    let missing = send("multi-discovery", "/mcp", &[]).await;
+    assert_eq!(missing["status"], 401, "{missing}");
+    assert!(
+        missing["headers"]["www-authenticate"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Bearer realm=\"agent-gateway\""),
+        "a missing credential gets the discovery refusal: {missing}"
+    );
+    assert_ne!(body(&missing)["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{missing}");
+    let wrong_key = send("multi-discovery", "/mcp", &[("x-api-key", "wrong".to_string())]).await;
+    assert_eq!(wrong_key["status"], 401, "a failed API key is refused before policy: {wrong_key}");
+    assert_eq!(
+        body(&wrong_key)["error"]["message"],
+        crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED,
+        "a failed API key gets the plain refusal, not the challenge: {wrong_key}"
+    );
+    assert_eq!(reached(), 3, "a refused caller never reaches the Target");
+
+    let discovery_key = send("multi-discovery", "/mcp", &[key()]).await;
+    assert_eq!(discovery_key["status"], 200, "{discovery_key}");
+    let discovery_jwt =
+        send("multi-discovery", "/mcp", &[("authorization", token("https://gateway.example/mcp"))]).await;
+    assert_eq!(discovery_jwt["status"], 200, "{discovery_jwt}");
+    assert_eq!(reached(), 5);
+}
+
+#[test]
+fn fabric_receive_sends_the_target_credential_only_for_a_caller_one_method_verified() {
+    run_in_own_process(multi_method_target_credential_flow);
+}
+
+/// On an Access Point with two API key methods, under `target_source_auth` `enforce`, a caller
+/// verified by either method gets the Target credential over Fabric receive, and its API key
+/// is not forwarded. A caller carrying both keys fails as ambiguous: it reaches the Target
+/// without the credential when failed callers go on to policy, and is refused when the Access
+/// Point rejects them.
+async fn multi_method_target_credential_flow() {
+    use std::sync::Arc;
+
+    use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, init_credential_policy};
+    use crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore;
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    const PARTNER_KEY: &str = "partner-key";
+    const AGENT_KEY: &str = "agent-key";
+
+    init_credential_policy(CredentialPolicyConfig {
+        target_source_auth: RuleMode::Enforce,
+        ..Default::default()
+    });
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    let secrets: Arc<dyn SecretsStore> = Arc::new(
+        FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    for (secret_id, value) in [("partners", PARTNER_KEY), ("agents", AGENT_KEY), ("target-key", "target-secret")] {
+        secrets
+            .create(CreateSecretRequest {
+                tenant_id: None,
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value: value.into(),
+                secret_type: "ApiKey".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
+    }
+    let surface = |id: &str, on_failure: &str| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": "mcp",
+                "public": true,
+                "caller_authentication": {"on_failure": on_failure, "methods": [
+                    {"type": "api_key", "secret_id": "partners",
+                     "extraction": {"source": "http_header", "field": "x-partner-key"}},
+                    {"type": "api_key", "secret_id": "agents",
+                     "extraction": {"source": "http_header", "field": "x-agent-key"}}
+                ]}},
+            "target": {"endpoint": format!("http://{}", target.addr), "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}}
+        }))
+        .unwrap()
+    };
+    let (forwarding, rejecting) = (surface("forwarding", "continue"), surface("rejecting", "reject"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&forwarding, &rejecting]).await;
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                temp_dir
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        ),
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        Some(secrets),
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let send = |surface: &AgentSurface, credentials: &[(&str, &str)]| {
+        let mut headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION});
+        for (name, value) in credentials {
+            headers[*name] = json!(value);
+        }
+        let mut message = forwarded_post(
+            surface,
+            &format!("/{}", surface.surface_id),
+            json!({"jsonrpc": "2.0", "id": "call", "method": "tools/list"}),
+            &storage_path,
+        )
+        .with_context("secrets_storage_path", json!(secrets_path));
+        message.message_body["headers"] = headers;
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let last_headers = || {
+        target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called")
+            .headers
+    };
+
+    for (caller, credential) in [("x-partner-key", PARTNER_KEY), ("x-agent-key", AGENT_KEY)] {
+        let (status, answered) = send(&forwarding, &[(caller, credential)]).await;
+        assert_eq!(status, 200, "{caller}: {answered}");
+        let headers = last_headers();
+        assert_eq!(
+            headers
+                .get("x-target-key")
+                .map(String::as_str),
+            Some("target-secret"),
+            "{caller}: {headers:?}"
+        );
+        assert!(!headers.contains_key(caller), "the caller's API key is not forwarded: {headers:?}");
+    }
+    assert_eq!(reached(), 2);
+
+    let both = [("x-partner-key", PARTNER_KEY), ("x-agent-key", AGENT_KEY)];
+    let (status, answered) = send(&forwarding, &both).await;
+    assert_eq!(status, 200, "an ambiguous caller goes on to policy: {answered}");
+    assert_eq!(reached(), 3);
+    let headers = last_headers();
+    assert!(!headers.contains_key("x-target-key"), "an ambiguous caller gets no Target credential: {headers:?}");
+    assert!(!headers.contains_key("x-partner-key") && !headers.contains_key("x-agent-key"), "{headers:?}");
+
+    let (status, answered) = send(&rejecting, &both).await;
+    assert_eq!(status, 401, "{answered}");
+    assert_eq!(reached(), 3, "a refused caller never reaches the Target");
+}
+
+#[test]
+fn a_legacy_mcp_proxy_tool_call_received_over_fabric_drops_a_token_its_backend_refuses_as_invalid() {
+    run_in_own_process(|| refused_mcp_proxy_token_flow(false));
+}
+
+#[test]
+fn a_modern_mcp_proxy_tool_call_received_over_fabric_drops_a_token_its_backend_refuses_as_invalid() {
+    run_in_own_process(|| refused_mcp_proxy_token_flow(true));
+}
+
+/// A `proxy://` surface reached over Fabric sends the Target credential from its client
+/// credentials provider, and drops the token the MCP proxy's backend refuses as
+/// `invalid_token` under the same limits as the direct path.
+async fn refused_mcp_proxy_token_flow(modern: bool) {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{
+        BackendAnswer, Fixture, assert_a_refused_token_is_dropped, echo_tool_call, mcp_proxy_answering, provider_auth,
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let fixture = Fixture::new(200).await;
+    let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+    let (proxy, mut surface, _backend) = mcp_proxy_answering(answer.clone()).await;
+    surface.target.auth = Some(provider_auth("machine"));
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            temp_dir
+                .path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap()
+        .save(&surface)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    super::init_credential_provider_store(fixture.providers.clone()).await;
+    super::init_delegation_vault_store(fixture.vault.clone()).await;
+
+    let call = || {
+        let (headers, body) = echo_tool_call(modern);
+        let headers = Value::Object(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), json!(value)))
+                .collect(),
+        );
+        let mut forwarded =
+            json!({"channel_id": surface.surface_id, "method": "POST", "path": "/mcp", "headers": headers});
+        if !modern {
+            forwarded["body"] = body.clone();
+        }
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(super::super::envelope_replay::now_secs() + 60),
+            forwarded,
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path))
+        .with_context("secrets_storage_path", json!(fixture.secrets_path()));
+        let stream = modern.then(|| super::FabricStreamRequest {
+            headers: crate::proxy::fabric_stream::wire::headers_from_json(Some(&headers)).unwrap(),
+            body: serde_json::to_vec(&body)
+                .unwrap()
+                .into(),
+            surface: surface.clone(),
+            variant: crate::config::agent_surface_variants::ForwardedVariant {
+                id: None,
+                recorded: "_base_".into(),
+            },
+            capabilities: crate::proxy::fabric_stream::peer::StreamCapabilities::local(true, true),
+            scope: crate::observability::policy_audit::RequestScope::fresh(),
+        });
+        let egress = fixture.egress.clone();
+        async move {
+            let received = egress
+                .scope(Box::pin(super::process_forward_request_with_mcp_runtime(
+                    &message,
+                    stream,
+                    crate::mcp::request_validation::MODERN_CAPABLE_POLICY,
+                    None,
+                )))
+                .await;
+            let (status, answered) = decode(received).await;
+            assert_eq!(status, 200, "modern: {modern}: {answered}");
+            answered["result"].clone()
+        }
+    };
+    assert_a_refused_token_is_dropped(&fixture, &answer, &format!("Fabric receive, modern: {modern}"), call).await;
+}
+
+#[test]
+fn an_mcp_proxy_tool_call_received_over_fabric_answers_an_unresolvable_target_credential_with_a_problem() {
+    run_in_own_process(unresolvable_mcp_proxy_credential_flow);
+}
+
+/// A `proxy://` surface reached over Fabric whose Target credential names a missing secret,
+/// with `fallback: reject`, is answered with the same problem as the forward path.
+async fn unresolvable_mcp_proxy_credential_flow() {
+    use std::sync::Arc;
+
+    use crate::mcp_proxies::filesystem::McpProxyStore;
+    use crate::proxy::handler::target_auth_tests::{BackendAnswer, echo_tool_call, mcp_proxy_answering};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let (proxy, mut surface, _backend) =
+        mcp_proxy_answering(BackendAnswer::new(std::sync::Mutex::new((200, None)))).await;
+    surface.target.auth = Some(
+        serde_json::from_value(
+            json!({"method": {"static_secret": {"secret_id": "missing", "header_name": "x-target-key"}},
+            "fallback": "reject"}),
+        )
+        .unwrap(),
+    );
+    let proxies = Arc::new(
+        crate::mcp_proxies::FileSystemMcpProxyStore::new(
+            temp_dir
+                .path()
+                .join("proxies"),
+        )
+        .await
+        .unwrap(),
+    );
+    proxies
+        .create(&proxy)
+        .await
+        .unwrap();
+    super::init_mcp_proxy_store(proxies).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    crate::secrets::FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let storage_path = saved_surfaces(temp_dir.path(), &[&surface]).await;
+    let message = forwarded_post(&surface, "/mcp", echo_tool_call(false).1, &storage_path)
+        .with_context("secrets_storage_path", json!(secrets_path));
+
+    let ProcessingResult::RequiresResponse { response_body, .. } = process_forward_request(&message).await else {
+        panic!("expected a buffered answer");
+    };
+
+    assert_eq!(response_body["status"], 502, "{response_body}");
+    assert_eq!(response_body["headers"]["content-type"], "application/problem+json", "{response_body}");
+    let problem: Value = serde_json::from_str(
+        response_body["body"]
+            .as_str()
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        problem,
+        json!({"type": "about:blank", "title": "Bad Gateway", "status": 502,
+            "detail": "Target authentication configuration error"}),
+        "{response_body}"
+    );
+}
+
+/// Saves `surfaces` to a surface store under `root` and returns its storage path.
+async fn saved_surfaces(
+    root: &std::path::Path,
+    surfaces: &[&AgentSurface],
+) -> std::path::PathBuf {
+    let storage_path = root.join("surfaces");
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for surface in surfaces {
+        store
+            .save(surface)
+            .await
+            .unwrap();
+    }
+    storage_path
+}
+
+/// A `POST` of `body` to `surface` as the sending Connection Point forwards it over Fabric.
+fn forwarded_post(
+    surface: &AgentSurface,
+    path: &str,
+    body: Value,
+    storage_path: &std::path::Path,
+) -> ReceivedMessage {
+    ReceivedMessage::new(
+        "receiver-connection".to_string(),
+        "receiver-gateway".to_string(),
+        MessageType::ForwardRequest.to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        None,
+        Some(SENDER_CONNECTION_POINT_DID.to_string()),
+        vec!["did:web:receiver.example".to_string()],
+        None,
+        Some(super::super::envelope_replay::now_secs() + 60),
+        json!({"channel_id": surface.surface_id, "method": "POST", "path": path,
+            "headers": {"content-type": "application/json"}, "body": body}),
+        MessageMetadata {
+            encrypted: true,
+            authenticated: true,
+            from_key: None,
+            extra: Value::Null,
+        },
+    )
+    .with_context("agent_surface_storage_path", json!(storage_path))
+}
+
+#[test]
+fn a_request_received_over_fabric_drops_a_token_its_http_target_refuses_as_invalid() {
+    run_in_own_process(refused_http_target_token_flow);
+}
+
+/// A surface whose Target is an http URL, reached over Fabric, sends the Target credential from
+/// its client credentials provider and drops the token the Target refuses as `invalid_token`
+/// under the same limits as the direct path.
+async fn refused_http_target_token_flow() {
+    use crate::proxy::handler::target_auth_tests::{
+        BackendAnswer, Fixture, assert_a_refused_token_is_dropped, backend_answering, provider_auth,
+    };
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let fixture = Fixture::new(200).await;
+    let answer = BackendAnswer::new(std::sync::Mutex::new((200, None)));
+    let (target_url, _target) =
+        backend_answering(answer.clone(), json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": []}})).await;
+    let mut surface: AgentSurface = serde_json::from_value(json!({
+        "surface_id": "http-target", "name": "HTTP Target",
+        "access_point": {"listen_address": "https://gateway.example", "route": "/mcp", "protocol": "mcp"},
+        "target": {"endpoint": target_url}
+    }))
+    .unwrap();
+    surface.target.auth = Some(provider_auth("machine"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&surface]).await;
+    super::init_credential_provider_store(fixture.providers.clone()).await;
+    super::init_delegation_vault_store(fixture.vault.clone()).await;
+
+    let call = || {
+        let message =
+            forwarded_post(&surface, "/mcp", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), &storage_path)
+                .with_context("secrets_storage_path", json!(fixture.secrets_path()));
+        let egress = fixture.egress.clone();
+        async move {
+            let received = egress
+                .scope(Box::pin(super::process_forward_request(&message)))
+                .await;
+            let (status, answered) = decode(received).await;
+            json!({"isError": status != 200, "status": status, "answered": answered})
+        }
+    };
+    assert_a_refused_token_is_dropped(&fixture, &answer, "Fabric receive HTTP forward", call).await;
+}
+
+#[test]
+fn only_an_a2a_or_ap2_surface_received_over_fabric_reaches_its_a2a_proxy() {
+    run_in_own_process(a2a_proxy_dispatch_flow);
+}
+
+/// No A2A proxy store is installed, so a request that reaches the A2A proxy is answered that its
+/// storage is unavailable. An MCP surface whose Target names an A2A proxy is not dispatched to
+/// it, as on the direct path, so its Direct Line credential is never sent for that surface.
+async fn a2a_proxy_dispatch_flow() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let surface = |id: &str, protocol: &str| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol},
+            "target": {"endpoint": "a2a-proxy://proxy-1"}
+        }))
+        .unwrap()
+    };
+    let (a2a, ap2, mcp) = (surface("a2a", "a2a"), surface("ap2", "ap2"), surface("mcp", "mcp"));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&a2a, &ap2, &mcp]).await;
+    let send = |surface: &AgentSurface, body: Value| {
+        let message = forwarded_post(surface, "/", body, &storage_path);
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let message_send = json!({"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
+        "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hi"}]
+    }}});
+
+    for dispatched in [&a2a, &ap2] {
+        let (status, answered) = send(dispatched, message_send.clone()).await;
+        assert_eq!(
+            (status, answered["error"]["message"].as_str()),
+            (200, Some("Failed to access A2A proxy storage")),
+            "{}: {answered}",
+            dispatched.surface_id
+        );
+    }
+    let (status, answered) = send(&mcp, json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})).await;
+    assert_ne!(status, 200, "{answered}");
+    assert!(
+        !answered
+            .to_string()
+            .contains("A2A proxy"),
+        "{status}: {answered}"
+    );
+}
+
+#[test]
+fn fabric_receive_refuses_a_surface_naming_another_tenants_provider_key_when_enforced() {
+    run_in_own_process(provider_key_fabric_flow);
+}
+
+/// Over Fabric, a surface stored naming another tenant's API Key Provider key is not ready
+/// under `tenant_credential_isolation: enforce` and refuses with `503` before the Target; one
+/// naming its own tenant's key is served. The verdict is taken on the first request, as no
+/// apply ran for the surfaces.
+async fn provider_key_fabric_flow() {
+    use std::sync::Arc;
+
+    use crate::api_keys::store::ApiKeyStore as _;
+    use crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore;
+
+    crate::config::credential_policy::init_credential_policy(
+        crate::config::credential_policy::CredentialPolicyConfig {
+            tenant_credential_isolation: crate::config::credential_policy::RuleMode::Enforce,
+            ..Default::default()
+        },
+    );
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let store = Arc::new(
+        FileSystemAgentSurfaceStore::new(storage_path.clone())
+            .await
+            .unwrap(),
+    );
+    let api_keys = Arc::new(
+        crate::api_keys::FileSystemApiKeyStore::new(
+            &temp_dir
+                .path()
+                .join("api_keys")
+                .to_string_lossy(),
+        )
+        .await
+        .unwrap(),
+    );
+    let surface = |id: &str, tenant: &str, key_id: Option<&str>| {
+        let mut surface = json!({
+            "surface_id": id, "name": id, "tenant_id": tenant,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": "mcp"},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        });
+        if let Some(key_id) = key_id {
+            surface["identity_slots"] = json!({"external": {"type": "from_api_key", "api_key_id": key_id}});
+        }
+        serde_json::from_value::<AgentSurface>(surface).unwrap()
+    };
+    for stored in [
+        surface("owner-a", "tenant-a", None),
+        surface("owner-b", "tenant-b", None),
+        surface("names-cross", "tenant-a", Some("atgk_fabric_b")),
+        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
+    ] {
+        store
+            .save(&stored)
+            .await
+            .unwrap();
+    }
+    for (owner, key_id) in [("owner-a", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
+        api_keys
+            .create_with_material(owner, key_id.to_string(), format!("atgs_{key_id}"), "client", None, "test")
+            .await
+            .unwrap();
+    }
+    crate::identity::provider_key_gate::gate().set_sources(Some(api_keys), Some(store));
+    super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+        Arc::new(crate::didauth::DidAuthSessionStore::new()),
+        Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                temp_dir
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        ),
+        Arc::new(crate::jwt_bearer::JwksClient::new()),
+        None,
+        Arc::new(dashmap::DashMap::new()),
+        None,
+        None,
+    )))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let send = |channel_id: &str| {
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": format!("/{channel_id}"),
+                "headers": {"MCP-Protocol-Version": MCP_LEGACY_VERSION},
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move { receive(&message).await.0 }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    let refused = send("names-cross").await;
+    assert_eq!(refused["status"], 503, "{refused}");
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            refused["body"]
+                .as_str()
+                .unwrap()
+        )
+        .unwrap()["error"]["message"],
+        crate::source_auth::errors::ACCESS_POINT_UNAVAILABLE
+    );
+    assert_eq!(reached(), 0, "a not-ready Access Point never reaches the Target");
+
+    let served = send("names-own").await;
+    assert_eq!(served["status"], 200, "{served}");
+    assert_eq!(reached(), 1);
+}
+
+#[test]
+fn fabric_receive_sends_the_target_credential_only_for_a_get_of_the_surfaces_card_location() {
+    run_in_own_process(card_location_target_credential_flow);
+}
+
+/// A surface that checks no caller, reached over Fabric, sends its Target credential only for a
+/// `GET` of exactly its card location, the sending gateway's own card fetch, in `warn` and under
+/// `target_source_auth` `enforce`. A `HEAD` of it, a query on it, and any other discovery read
+/// reach the Target without the credential.
+async fn card_location_target_credential_flow() {
+    use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, TEST_CREDENTIAL_POLICY};
+    use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore, SecretsStore};
+
+    let target = MockServer::start_with_response(json!({"name": "card"}).to_string()).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let secrets_path = temp_dir
+        .path()
+        .join("secrets");
+    FilesystemSecretsStore::new_async(secrets_path.to_str().unwrap())
+        .await
+        .unwrap()
+        .create(CreateSecretRequest {
+            tenant_id: None,
+            name: "target-key".into(),
+            secret_id: "target-key".into(),
+            description: None,
+            value: "target-secret".into(),
+            secret_type: "ApiKey".into(),
+            tags: vec![],
+        })
+        .await
+        .unwrap();
+    let surface = |id: &str, card_path: Option<&str>| -> AgentSurface {
+        serde_json::from_value(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"),
+                "protocol": "a2a", "public": true, "agent_card_path": card_path},
+            "target": {"endpoint": format!("http://{}", target.addr), "auth": {"method": {"static_secret": {
+                "secret_id": "target-key", "header_name": "X-Target-Key", "header_format": "{value}"
+            }}}}
+        }))
+        .unwrap()
+    };
+    let (default, custom) = (surface("default-card", None), surface("custom-card", Some("custom/card.json")));
+    let storage_path = saved_surfaces(temp_dir.path(), &[&default, &custom]).await;
+
+    let send = |surface: &AgentSurface, method: &str, path: &str| {
+        let mut message = forwarded_post(surface, path, Value::Null, &storage_path)
+            .with_context("secrets_storage_path", json!(secrets_path));
+        message.message_body["method"] = json!(method);
+        message.message_body["headers"] = json!({});
+        message
+            .message_body
+            .as_object_mut()
+            .unwrap()
+            .remove("body");
+        async move { decode(super::process_forward_request(&message).await).await }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+    let last = || {
+        target
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("the Target was called")
+    };
+
+    let enforced: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+        target_source_auth: RuleMode::Enforce,
+        ..Default::default()
+    }));
+    let warned: &'static CredentialPolicyConfig = Box::leak(Box::default());
+    for policy in [warned, enforced] {
+        TEST_CREDENTIAL_POLICY
+            .scope(policy, async {
+                let cases = [
+                    (&default, "GET", "/.well-known/agent-card.json", "/.well-known/agent-card.json", true),
+                    (&custom, "GET", "/custom/card.json", "/custom/card.json", true),
+                    (&custom, "GET", "/.well-known/agent-card.json", "/custom/card.json", true),
+                    (&default, "GET", "/discovery", "/discovery", false),
+                    (&default, "GET", "/.well-known/agent.json", "/.well-known/agent.json", false),
+                    (&default, "GET", "/a/.well-known/agent-card.json", "/a/.well-known/agent-card.json", false),
+                    (&default, "GET", "/.well-known/agent-card.json?x=1", "/.well-known/agent-card.json", false),
+                    (&default, "HEAD", "/.well-known/agent-card.json", "/.well-known/agent-card.json", false),
+                    (&custom, "GET", "/discovery", "/custom/card.json", false),
+                ];
+                for (surface, method, path, reached_path, credential) in cases {
+                    let before = reached();
+                    let (status, answered) = send(surface, method, path).await;
+                    let case = format!(
+                        "{:?} {} {method} {path}: {status} {answered}",
+                        policy.target_source_auth, surface.surface_id
+                    );
+                    assert_eq!(reached(), before + 1, "{case}");
+                    let request = last();
+                    assert_eq!((request.method.as_str(), request.path.as_str()), (method, reached_path), "{case}");
+                    assert_eq!(
+                        request
+                            .headers
+                            .get("x-target-key")
+                            .map(String::as_str),
+                        credential.then_some("target-secret"),
+                        "{case}: {:?}",
+                        request.headers
+                    );
+                }
+            })
+            .await;
     }
 }

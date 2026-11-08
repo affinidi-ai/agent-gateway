@@ -6,17 +6,15 @@ import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
 import { usePermissions } from '../context/PermissionsContext';
 import { apiClient } from '../api';
 import { formatDateTime } from '../utils/stringUtils';
-import {
-  ConnectionHealthBadge,
-  ConnectionRuntimeStatus,
-  errorCodeLabel,
-  reconnectAtLabel,
-} from '../utils/connectionHealth';
+import { ConnectionHealthBadge, ConnectionRuntimeStatus } from '../utils/connectionHealth';
+import type { GatewayListItem } from '../utils/gateways';
 import { AppButton } from '../components/shared/AppButton';
 import { Badge } from '../components/shared/Badge';
 import { DeleteButton } from '../components/shared/DeleteButton';
 import { EmptyState } from '../components/shared/EmptyState';
 import FieldHelp from '../components/shared/FieldHelp';
+import GatewayStatusCell from '../components/gateways/GatewayStatusCell';
+import UseAsPaymentGatewayButton from '../components/gateways/UseAsPaymentGatewayButton';
 import SearchInput from '../components/shared/SearchInput';
 import { DOCS_URL } from '../config/docs';
 
@@ -27,16 +25,7 @@ const LOADING_STYLE: React.CSSProperties = {
   minHeight: '60vh',
 };
 
-interface Gateway {
-  id: string;
-  name: string;
-  description: string;
-  did: string;
-  gateway_type: 'self' | 'remote';
-  status: 'active' | 'disabled' | 'pending' | 'failed' | 'awaiting-approval';
-  created_at: string;
-  updated_at: string;
-  runtime_status?: ConnectionRuntimeStatus;
+interface Gateway extends GatewayListItem {
   /** Remote gateways: the issuer DID the peer attested; null until established. */
   issuer_did?: string | null;
   trusted_issuer_dids?: string[];
@@ -58,6 +47,7 @@ interface ConnectionPoint {
   exposed_channels?: string[]; // List of channel config IDs to expose
   enabled?: boolean; // Whether the connection point is enabled
   did_method?: string;
+  runtime_status?: ConnectionRuntimeStatus;
 }
 
 interface Mediator {
@@ -282,17 +272,6 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
     [fetchConnectionPoints]
   );
 
-  // Tooltip for a FAILED gateway badge, taken from a broken connection point.
-  // Tooltip / reason for a FAILED gateway badge, from its derived runtime health.
-  const gatewayFailureTooltip = useCallback((gateway: Gateway): string | undefined => {
-    const rt = gateway.runtime_status;
-    if (!rt || rt.status === 'connected') return undefined;
-    const parts = [rt.error_message || errorCodeLabel(rt.error_code), reconnectAtLabel(rt)].filter(
-      Boolean
-    );
-    return parts.length ? parts.join('; ') : undefined;
-  }, []);
-
   const clearPingStatus = useCallback((id: string) => {
     setPingStatus(prev => {
       const next = { ...prev };
@@ -407,6 +386,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <AppButton
                     variant="primary"
                     size="md"
+                    data-testid="gateways-add-button"
                     onClick={e =>
                       guard('connections.gateways', () => navigate('/gateways/connect'), e)
                     }
@@ -451,6 +431,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <tbody>
                     {filteredGateways.map(gateway => (
                       <tr
+                        data-testid={`gateways-row-${gateway.id}`}
                         key={gateway.id}
                         onClick={() => {
                           if (
@@ -495,39 +476,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                           <small>{formatDateTime(gateway.updated_at, true)}</small>
                         </td>
                         <td>
-                          <span
-                            className={`badge ${
-                              gateway.status === 'active'
-                                ? 'text-bg-success'
-                                : gateway.status === 'failed'
-                                  ? 'text-bg-danger'
-                                  : gateway.status === 'awaiting-approval'
-                                    ? 'text-bg-warning'
-                                    : gateway.status === 'pending'
-                                      ? 'text-bg-warning'
-                                      : 'text-bg-secondary'
-                            }`}
-                            title={
-                              gateway.status === 'failed'
-                                ? gatewayFailureTooltip(gateway)
-                                : undefined
-                            }
-                          >
-                            {gateway.status === 'awaiting-approval'
-                              ? 'AWAITING APPROVAL'
-                              : gateway.status === 'pending'
-                                ? 'PENDING'
-                                : gateway.status.toUpperCase()}
-                          </span>
-                          {gateway.status === 'failed' && gateway.runtime_status && (
-                            <div className="text-muted" style={{ fontSize: '0.7rem' }}>
-                              {gateway.runtime_status.error_message ||
-                                errorCodeLabel(gateway.runtime_status.error_code)}
-                              {reconnectAtLabel(gateway.runtime_status)
-                                ? `; ${reconnectAtLabel(gateway.runtime_status)}`
-                                : ''}
-                            </div>
-                          )}
+                          <GatewayStatusCell gateway={gateway} />
                           {gateway.gateway_type === 'remote' &&
                             gateway.status === 'active' &&
                             !gateway.issuer_did &&
@@ -551,6 +500,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     size="sm"
                                     className="me-1"
                                     title="Approve Gateway Connection"
+                                    data-testid={`gateways-approve-button-${gateway.id}`}
                                     aria-label={`Approve gateway ${gateway.name}`}
                                     onClick={e => {
                                       e.stopPropagation();
@@ -578,6 +528,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                       size="sm"
                                       onClick={e => handlePingGateway(gateway.id, gateway.name, e)}
                                       disabled={pingStatus[gateway.id] === 'pinging'}
+                                      data-testid={`gateways-ping-button-${gateway.id}`}
                                       aria-label={`Ping gateway ${gateway.name}`}
                                     >
                                       {pingStatus[gateway.id] === 'pinging' ? (
@@ -603,6 +554,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                       style={{ marginLeft: '10px' }}
                                       title="Edit Gateway"
                                       className="me-1"
+                                      data-testid={`gateways-edit-button-${gateway.id}`}
                                       aria-label={`Edit gateway ${gateway.name}`}
                                       onClick={() => navigate(`/gateways/${gateway.id}`)}
                                     >
@@ -611,9 +563,17 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   )}
                               </>
                             )}
+                            <UseAsPaymentGatewayButton
+                              gateway={gateway}
+                              onError={setError}
+                              testId={`gateways-use-as-payment-button-${gateway.id}`}
+                              iconOnly
+                              className="me-1"
+                            />
                             {hasPermission('gateways.delete') &&
                               gateway.gateway_type !== 'self' && (
                                 <DeleteButton
+                                  data-testid={`gateways-delete-button-${gateway.id}`}
                                   onDelete={() => handleDeleteGateway(gateway.id)}
                                   className="btn-sm"
                                   title="Delete Gateway"
@@ -650,6 +610,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                   <AppButton
                     variant="primary"
                     size="md"
+                    data-testid="connection-points-add-button"
                     onClick={e =>
                       guard('connections.connectionpoints', () => navigate('/gateways/publish'), e)
                     }
@@ -714,6 +675,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
 
                       return (
                         <tr
+                          data-testid={`connection-points-row-${connectionPoint.id}`}
                           key={connectionPoint.id}
                           onClick={() => navigate(`/connection-points/${connectionPoint.id}`)}
                           style={{ cursor: 'pointer' }}
@@ -740,7 +702,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   e.stopPropagation();
                                   navigate('/connections?tab=mediators');
                                 }}
-                                className="p-0 align-baseline text-primary"
+                                className="p-0 align-baseline text-primary text-start"
                               >
                                 {mediator.name}
                               </AppButton>
@@ -779,7 +741,10 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                             )}
                           </td>
                           <td className="align-middle">
-                            <div className="d-flex flex-column flex-lg-row gap-2 align-items-start align-items-lg-center">
+                            <div
+                              className="d-flex flex-wrap gap-2 align-items-center"
+                              style={{ width: '6rem' }}
+                            >
                               {hasPermission('gateways.edit') && (
                                 <AppButton
                                   variant="outline-primary"
@@ -788,6 +753,7 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                     navigate(`/connection-points/${connectionPoint.id}`)
                                   }
                                   title="Edit Connection Point"
+                                  data-testid={`connection-points-edit-button-${connectionPoint.id}`}
                                   aria-label={`Edit connection point ${connectionPoint.name}`}
                                 >
                                   <i className="fas fa-edit" aria-hidden="true"></i>
@@ -799,11 +765,11 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                   <AppButton
                                     variant="outline-secondary"
                                     size="sm"
-                                    style={{ marginLeft: '10px' }}
                                     onClick={e =>
                                       handleReconnectConnectionPoint(connectionPoint.id, e)
                                     }
                                     title="Retry connection now"
+                                    data-testid={`connection-points-retry-button-${connectionPoint.id}`}
                                     aria-label={`Retry connection point ${connectionPoint.name}`}
                                   >
                                     <i className="fas fa-sync-alt" aria-hidden="true"></i>
@@ -812,9 +778,9 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               <AppButton
                                 variant="secondary"
                                 size="sm"
-                                style={{ marginLeft: '10px' }}
                                 onClick={() => handleCopyUrl(connectionPoint.oob_url)}
                                 title="Copy Connection Point Link"
+                                data-testid={`connection-points-copy-link-button-${connectionPoint.id}`}
                                 aria-label={`Copy link for ${connectionPoint.name}`}
                               >
                                 <i className="fas fa-link" aria-hidden="true"></i>
@@ -823,9 +789,9 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                                 <AppButton
                                   variant="secondary"
                                   size="sm"
-                                  style={{ marginLeft: '10px' }}
                                   onClick={() => handleCopySecret(connectionPoint.secret!)}
                                   title="Copy Connection Point Secret"
+                                  data-testid={`connection-points-copy-secret-button-${connectionPoint.id}`}
                                   aria-label={`Copy secret for ${connectionPoint.name}`}
                                 >
                                   <i className="fas fa-key" aria-hidden="true"></i>
@@ -833,10 +799,10 @@ const GatewaysPage: React.FC<GatewaysPageProps> = ({ externalSearchTerm, onCount
                               )}
                               {hasPermission('gateways.delete') && (
                                 <DeleteButton
+                                  data-testid={`connection-points-delete-button-${connectionPoint.id}`}
                                   onDelete={() => handleDeleteConnectionPoint(connectionPoint.id)}
                                   className="btn-sm"
                                   title="Delete connection point"
-                                  style={{ marginLeft: '10px' }}
                                 />
                               )}
                             </div>

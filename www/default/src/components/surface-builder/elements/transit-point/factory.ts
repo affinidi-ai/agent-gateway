@@ -2,17 +2,28 @@ import * as Cap from '../capabilities';
 import { registry } from '../registry';
 import { networkingConfigToWire } from '../networking/definition';
 import { rateLimitConfigToWire } from '../rate-limit/definition';
+import { perCallerRateLimitConfigToWire } from '../rate-limit/wire';
 import type { NodeDefinition, Protocol } from '../types';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
-import TransitPointPanel from './TransitPointPanel';
+import TransitPointPanel, {
+  inferEndpointType,
+  transitPointGatewayRoute,
+} from './TransitPointPanel';
 import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
+import { providerTargetAuthToApi } from '../_shared/providerTargetAuth';
 import { identityConfigToWire } from '../identity/definition';
 import { workloadBindingFormToApi } from '../workload-binding/config';
 import { getCachedOutboundListenAddresses } from '../access-point/defaults';
 import { headerMetadataMappingToWire } from '../metadata-extraction/definition';
 import { mcpToolGatingConfigToWire } from '../mcp-tool-gating/definition';
+import {
+  isMigratedTrustCheck,
+  readOnlyTrustCheckProtocol,
+  transitPointTrustCheckListToWire,
+} from '../trust-check/definition';
 import { DOCS_URL } from '../../../../config/docs';
+import { callerAuthProblems, callerAuthToWire } from './callerAuth';
 
 /**
  * Pattern that a transit point alias MUST match. Mirrors the backend
@@ -135,7 +146,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       Transit Point per outbound destination; the canvas can hold
       many.</p>
       <p>This variant speaks <strong>${label}</strong>. Each Transit
-      Point is its own mini-pipeline. You can drop Policy, Payment,
+      Point is its own mini-pipeline. You can drop Policy,
       Networking, Rate Limit, Metadata Extraction (A2A / AP2 header
       mapping only) or Trust Registry checks on its edges, and they
       apply just to that route rather than the main Target.</p>
@@ -154,9 +165,10 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
         presented to the destination.</li>
         <li><strong>Transit credentials</strong>: user-consented
         credential injection (OAuth-style) per provider.</li>
-        <li><strong>Require transit token</strong>: demand a signed
-        transit token from the caller before routing through this
-        route.</li>
+        <li><strong>Who can call this Transit Point</strong>: demand a
+        signed transit token from the caller, check a credential the
+        caller holds (API key or JWT), or mark the route open to any
+        caller. It must do one of them.</li>
         <li><strong>Listen address / path</strong>: choose the outbound
         listener for this route.</li>
       </ul>
@@ -167,7 +179,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       Cap.SURFACE_PERIMETER,
       Cap.MIDDLEWARE_SLOT,
       Cap.POLICY_TARGET,
-      Cap.PAYMENT_TARGET,
       Cap.NETWORKING_TARGET,
       Cap.CREDENTIAL_TARGET,
       ...(protocol === 'a2a' || protocol === 'ap2' ? [Cap.METADATA_TARGET] : []),
@@ -183,13 +194,23 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     requires: {},
     incompleteReason: config => {
       if (!config.listen_address) return 'Outbound listener address is required';
-      if (!config.target_endpoint) return 'Target endpoint is required';
+      if (inferEndpointType(config) === 'gateway') {
+        if (!transitPointGatewayRoute(config).gatewayId) return 'Select a gateway';
+        if (!config.target_endpoint) return 'Select an Agent Surface on the gateway';
+        return null;
+      }
+      if (!config.target_endpoint) return 'Target endpoint URL is required';
       return null;
     },
     validate: c => {
       const errs: Array<{ field?: string; message: string }> = [];
       const e = urlError('target_endpoint', c.target_endpoint, 'Target endpoint');
       if (e) errs.push(e);
+      // The gateway refuses a Transit Point that authenticates no caller and is
+      // not open to any, so the save is blocked here with its reason.
+      for (const message of callerAuthProblems(c)) {
+        errs.push({ field: 'caller_authentication', message });
+      }
       return errs;
     },
     // A transit point's listen address must be an actual outbound listener
@@ -229,12 +250,11 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
           'No outbound listener is configured. Add an outbound listener before using a transit point.',
       },
       {
-        description: 'OAuth Client Credentials auth is not yet wired through the proxy runtime',
-        condition: c => c?.auth_type === 'oauth_client_credentials',
-        check: () => false,
+        description: 'A credential provider target auth needs a provider',
+        condition: c => c?.auth_type === 'credential_provider',
+        check: c => typeof c?.auth_provider_id === 'string' && c.auth_provider_id.trim() !== '',
         severity: 'error',
-        message:
-          'OAuth Client Credentials is not yet supported. The selection will be dropped on save. Pick Bearer, API Key, or Custom Header.',
+        message: 'Pick the credential provider whose token authenticates this Transit Point.',
       },
     ],
     ConfigPanel: TransitPointPanel,
@@ -258,7 +278,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
           );
           if (transitNodes.length === 0) return undefined;
           const transit: any = {
-            sign_requests: true,
             transit_token_mode: 'embedded',
             points: (() => {
               // Pre-derive aliases with collision dedupe so the backend's
@@ -315,6 +334,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'rate-limit' && n.parentId === tp.id
                 );
                 const rateLimit = rateLimitConfigToWire(rateLimitNode?.config);
+                const perCallerRateLimit = perCallerRateLimitConfigToWire(rateLimitNode?.config);
                 // Per-TP managed identity (MA→TP request slot): the identity
                 // element parents to this TP and the TP factory owns the
                 // `managed_identity` slice. The identity element's own
@@ -339,6 +359,20 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'mcp-tool-gating' && n.parentId === tp.id
                 );
                 const mcpToolGating = mcpToolGatingConfigToWire(mcpToolGatingNode?.config);
+                // Per-TP target-leg Trust Check (MA→TP request slot). New ones
+                // are dropped only on A2A/AP2 Transit Points; on other
+                // protocols the node is a read-only stored copy, saved back
+                // exactly as loaded.
+                // The trust-check element's own buildPayload skips
+                // TP-parented nodes so this is the only writer.
+                const trustCheckNode = ctx.allNodes.find(
+                  n => n.type === 'trust-check' && n.parentId === tp.id
+                );
+                const trustCheckList = transitPointTrustCheckListToWire(
+                  trustCheckNode,
+                  !!trustCheckNode &&
+                    readOnlyTrustCheckProtocol(trustCheckNode, ctx.allNodes) !== null
+                );
                 const credentials = transitCredentialsToApi(c.transit_credentials);
                 const headerMetadataNode = ctx.allNodes.find(
                   n => n.type === 'metadata-extraction' && n.parentId === tp.id
@@ -381,6 +415,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     ? { header_metadata_mapping: headerMetadataMapping }
                     : {}),
                   require_transit_token: c.require_transit_token !== false,
+                  ...callerAuthToWire(c, ctx.surfaceMeta.surface_id),
                   ...(typeof c.target_endpoint === 'string' &&
                   c.target_endpoint.startsWith('fabric://') &&
                   c.fabric_delegated_credentials === true
@@ -390,13 +425,25 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     // Project the panel's auth_* fields onto the
                     // backend `TargetAuthConfig` shape (externally-tagged
                     // method enum). Empty / "none" auth is omitted so
-                    // the surface JSON stays clean. Today only
-                    // `static_secret` is wired through; the panel maps
-                    // its bearer / api_key / custom_header presets onto
+                    // the surface JSON stays clean. A credential provider
+                    // maps to `credential_provider`; the bearer / api_key /
+                    // custom_header presets map to `static_secret` with
                     // header_name + header_format pairs that the proxy
                     // injects verbatim.
                     const t = c.auth_type;
                     if (!t || t === 'none') return {};
+                    if (t === 'credential_provider') {
+                      const auth = providerTargetAuthToApi({
+                        providerId:
+                          typeof c.auth_provider_id === 'string' ? c.auth_provider_id : '',
+                        headerName:
+                          typeof c.auth_header_name === 'string' ? c.auth_header_name : '',
+                        headerFormat:
+                          typeof c.auth_header_format === 'string' ? c.auth_header_format : '',
+                        fallback: c.auth_fallback,
+                      });
+                      return auth ? { target_auth: auth } : {};
+                    }
                     const secretId = typeof c.auth_secret === 'string' ? c.auth_secret.trim() : '';
                     if (!secretId) return {};
                     let headerName: string;
@@ -428,9 +475,8 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                           '{value}';
                         break;
                       default:
-                        // Methods the runtime cannot inject yet (e.g.
-                        // oauth_client_credentials) are dropped here
-                        // rather than emitting an invalid wire shape.
+                        // An unknown preset is dropped here rather than
+                        // emitting an invalid wire shape.
                         return {};
                     }
                     return {
@@ -465,9 +511,18 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     : {}),
                   ...(networking ? { networking } : {}),
                   ...(rateLimit ? { rate_limit: rateLimit } : {}),
+                  ...(perCallerRateLimit ? { per_caller_rate_limit: perCallerRateLimit } : {}),
                   ...(managedIdentity ? { managed_identity: managedIdentity } : {}),
                   ...(workloadBinding ? { workload_binding: workloadBinding } : {}),
                   ...(mcpToolGating ? { mcp_tool_gating: mcpToolGating } : {}),
+                  ...(trustCheckList
+                    ? {
+                        trust_check_list: trustCheckList,
+                        ...(isMigratedTrustCheck(trustCheckNode?.config)
+                          ? { trust_check_migrated: true }
+                          : {}),
+                      }
+                    : {}),
                   ...(credentials ? { transit_credentials: credentials } : {}),
                 };
               });

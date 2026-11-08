@@ -9,6 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::a2a::methods::MethodEra as ReplyShape;
 use crate::egress::{EgressError, EgressPolicy, guarded_send_inner};
 use crate::proxy::handler::CallerAssertion;
+use crate::tenancy::SurfaceTenancy;
 
 use super::types::{A2aProxy, A2aProxyBackend, A2aProxyStatus, CopilotDirectLineBackend, DirectLineCredentialMode};
 
@@ -42,26 +43,36 @@ fn reply_shape(method: &str) -> ReplyShape {
     ReplyShape::of(method).unwrap_or(ReplyShape::V1_0)
 }
 
-pub async fn handle_a2a_proxy_request(
+/// A `message/send` request the proxy can serve: everything that can be refused
+/// without calling the backend has been checked.
+#[derive(Debug)]
+pub struct PreparedSend {
+    request_id: Option<Value>,
+    method: String,
+    context_id: Option<Value>,
+    text: String,
+}
+
+/// Checks a request the way [`send_prepared`] needs it: valid JSON, an enabled
+/// proxy, the one supported method, and a message with text. The error is the
+/// caller's response. Nothing is sent to the backend.
+pub fn prepare_request(
     proxy: &A2aProxy,
     body_bytes: &[u8],
-    secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
-    caller: CallerAssertion,
-) -> Response {
-    let allow_local = allow_local_a2a_dial();
+) -> Result<PreparedSend, Box<Response>> {
     let request = match serde_json::from_slice::<Value>(body_bytes) {
         Ok(request) => request,
         Err(e) => {
             warn!(channel = channel_name, proxy_id = %proxy.id, error = %e, "A2A proxy received invalid JSON");
-            return jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Parse error");
+            return Err(Box::new(jsonrpc_error(None, JSONRPC_PARSE_ERROR, "Parse error")));
         }
     };
     let request_id = request.get("id").cloned();
 
     if proxy.status == A2aProxyStatus::Disabled {
         warn!(channel = channel_name, proxy_id = %proxy.id, proxy_name = %proxy.name, "A2A proxy is disabled");
-        return jsonrpc_error(request_id, JSONRPC_TARGET_UNAVAILABLE, "A2A proxy is disabled");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_TARGET_UNAVAILABLE, "A2A proxy is disabled")));
     }
 
     let method = request
@@ -70,30 +81,49 @@ pub async fn handle_a2a_proxy_request(
         .unwrap_or_default();
     if !is_supported_proxy_method(method) {
         warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused an unsupported method");
-        return jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, "Unsupported A2A method");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_METHOD_NOT_FOUND, "Unsupported A2A method")));
     }
 
-    let message = match request
+    let Some(message) = request
         .get("params")
         .and_then(|params| params.get("message"))
-    {
-        Some(message) => message,
-        None => {
-            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused a request without params.message");
-            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message");
-        }
+    else {
+        warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), "A2A proxy refused a request without params.message");
+        return Err(Box::new(jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, "Missing params.message")));
     };
-    let context_id = message
-        .get("contextId")
-        .cloned();
     let text = match extract_text(message) {
         Ok(text) => text,
-        Err(message) => {
-            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), reason = message, "A2A proxy refused the message");
-            return jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, message);
+        Err(reason) => {
+            warn!(channel = channel_name, proxy_id = %proxy.id, method = ?crate::a2a::clip_for_log(method), reason, "A2A proxy refused the message");
+            return Err(Box::new(jsonrpc_error(request_id, JSONRPC_INVALID_PARAMS, reason)));
         }
     };
+    Ok(PreparedSend {
+        context_id: message
+            .get("contextId")
+            .cloned(),
+        method: method.to_string(),
+        request_id,
+        text,
+    })
+}
 
+/// Sends a prepared request to the proxy's backend and answers the caller.
+pub async fn send_prepared(
+    proxy: &A2aProxy,
+    prepared: PreparedSend,
+    secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
+    channel_name: &str,
+    caller: CallerAssertion,
+    tenancy: SurfaceTenancy<'_>,
+) -> Response {
+    let PreparedSend {
+        request_id,
+        method,
+        context_id,
+        text,
+    } = prepared;
+    let allow_local = allow_local_a2a_dial();
     match &proxy.backend {
         A2aProxyBackend::CopilotDirectLine(backend) => {
             let started = Instant::now();
@@ -107,7 +137,9 @@ pub async fn handle_a2a_proxy_request(
                 operation = "message/send",
                 "A2A proxy dispatch started"
             );
-            match send_via_direct_line(proxy, backend, &text, secrets_store, channel_name, caller, allow_local).await {
+            match send_via_direct_line(proxy, backend, &text, secrets_store, channel_name, caller, tenancy, allow_local)
+                .await
+            {
                 Ok(parts) => {
                     info!(
                         channel = channel_name,
@@ -119,7 +151,7 @@ pub async fn handle_a2a_proxy_request(
                         duration_ms = started.elapsed().as_millis(),
                         "A2A proxy dispatch completed"
                     );
-                    jsonrpc_success(request_id, context_id, parts, reply_shape(method))
+                    jsonrpc_success(request_id, context_id, parts, reply_shape(&method))
                 }
                 Err(A2aProxyRuntimeError::Timeout) => {
                     warn!(
@@ -176,7 +208,14 @@ enum A2aProxyRuntimeError {
 /// server. Cloud-metadata endpoints stay blocked and redirects are still
 /// re-validated even when the hatch is on. Default off; never set in production.
 fn allow_local_a2a_dial() -> bool {
-    let enabled = std::env::var("AG_ALLOW_LOCAL_A2A_PROXY")
+    let value = std::env::var("AG_ALLOW_LOCAL_A2A_PROXY").ok();
+    #[cfg(test)]
+    let value = value.or_else(|| {
+        ALLOW_LOCAL_A2A_DIAL_IN_TESTS
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| "1".to_string())
+    });
+    let enabled = value
         .map(|v| {
             matches!(
                 v.to_ascii_lowercase()
@@ -193,6 +232,12 @@ fn allow_local_a2a_dial() -> bool {
     }
     enabled
 }
+
+/// Turns the local dial hatch on for the rest of the test process, as
+/// `AG_ALLOW_LOCAL_A2A_PROXY=1` does, without changing the process environment.
+#[cfg(test)]
+pub(crate) static ALLOW_LOCAL_A2A_DIAL_IN_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Dial a Direct Line endpoint through the shared SSRF egress guard.
 ///
@@ -292,10 +337,12 @@ async fn send_via_direct_line(
     secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
     caller: CallerAssertion,
+    tenancy: SurfaceTenancy<'_>,
     allow_local: bool,
 ) -> Result<Vec<String>, A2aProxyRuntimeError> {
     let credential =
-        resolve_direct_line_credential(proxy, backend, secrets_store, channel_name, caller, allow_local).await?;
+        resolve_direct_line_credential(proxy, backend, secrets_store, channel_name, caller, tenancy, allow_local)
+            .await?;
     let credential = credential.as_deref();
     let base_url = backend
         .base_url
@@ -392,6 +439,7 @@ async fn resolve_direct_line_credential(
     secrets_store: Option<&Arc<dyn crate::secrets::SecretsStore>>,
     channel_name: &str,
     caller: CallerAssertion,
+    tenancy: SurfaceTenancy<'_>,
     allow_local: bool,
 ) -> Result<Option<String>, A2aProxyRuntimeError> {
     if !caller.permits_target_credential() {
@@ -405,6 +453,15 @@ async fn resolve_direct_line_credential(
         .await
         .map_err(|e| A2aProxyRuntimeError::Internal(format!("Failed to load Direct Line secret: {e}")))?
         .ok_or_else(|| A2aProxyRuntimeError::TargetUnavailable("Direct Line secret not found".to_string()))?;
+    let secret_tenant_id = secret.tenant_id.as_deref();
+    let proxy_tenant_id = proxy.tenant_id.as_deref();
+    if !crate::tenancy::can_reference_with_rule(proxy_tenant_id, secret_tenant_id, tenancy.mode) {
+        warn!(channel = channel_name, proxy_id = %proxy.id, surface_tenant_id = ?tenancy.tenant_id, secret_id = %backend.secret_id, "Refusing a Direct Line secret outside the A2A proxy's tenant");
+        return Err(A2aProxyRuntimeError::TargetUnavailable("Direct Line secret not found".to_string()));
+    }
+    if crate::tenancy::breaks_tenant_isolation(proxy_tenant_id, secret_tenant_id) {
+        warn!(channel = channel_name, proxy_id = %proxy.id, surface_tenant_id = ?tenancy.tenant_id, secret_id = %backend.secret_id, "A2A proxy uses an appliance-wide Direct Line secret; refused once tenant_credential_isolation is enforce");
+    }
 
     match backend.credential_mode {
         DirectLineCredentialMode::Secret => {
@@ -546,6 +603,7 @@ fn json_response(value: Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::credential_policy::RuleMode;
 
     #[test]
     fn accepts_the_send_method_in_either_era() {
@@ -860,25 +918,115 @@ mod tests {
         (proxy, backend)
     }
 
+    const NO_TENANT: SurfaceTenancy<'static> = SurfaceTenancy {
+        tenant_id: None,
+        mode: RuleMode::Warn,
+    };
+
     #[tokio::test]
     async fn an_unauthenticated_caller_gets_no_direct_line_credential() {
         let (proxy, backend) = direct_line_proxy();
 
-        let credential =
-            resolve_direct_line_credential(&proxy, &backend, None, "alpha", CallerAssertion::Unauthenticated, false)
-                .await
-                .unwrap();
+        let credential = resolve_direct_line_credential(
+            &proxy,
+            &backend,
+            None,
+            "alpha",
+            CallerAssertion::Unauthenticated,
+            NO_TENANT,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(credential, None);
+    }
+
+    async fn credential_for(
+        proxy_tenant: Option<&str>,
+        secret_id: &str,
+        tenancy: SurfaceTenancy<'_>,
+    ) -> Result<Option<String>, A2aProxyRuntimeError> {
+        let (mut proxy, mut backend) = direct_line_proxy();
+        proxy.tenant_id = proxy_tenant.map(str::to_string);
+        backend.secret_id = secret_id.to_string();
+        let secrets: Arc<dyn crate::secrets::SecretsStore> =
+            Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![
+                ("appliance-direct-line", None, "appliance-value"),
+                ("tenant-a-direct-line", Some("tenant-a"), "tenant-a-value"),
+                ("tenant-b-direct-line", Some("tenant-b"), "tenant-b-value"),
+            ]));
+        resolve_direct_line_credential(
+            &proxy,
+            &backend,
+            Some(&secrets),
+            "alpha",
+            CallerAssertion::Authenticated,
+            tenancy,
+            false,
+        )
+        .await
+    }
+
+    fn tenant_a(mode: RuleMode) -> SurfaceTenancy<'static> {
+        SurfaceTenancy {
+            tenant_id: Some("tenant-a"),
+            mode,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_proxys_appliance_wide_direct_line_secret_is_refused_when_enforced() {
+        let refused = credential_for(Some("tenant-a"), "appliance-direct-line", tenant_a(RuleMode::Enforce)).await;
+        assert!(
+            matches!(&refused, Err(A2aProxyRuntimeError::TargetUnavailable(message)) if message == "Direct Line secret not found"),
+            "an appliance-wide secret is refused when enforced"
+        );
+        assert_eq!(
+            credential_for(Some("tenant-a"), "appliance-direct-line", tenant_a(RuleMode::Warn))
+                .await
+                .unwrap(),
+            Some("appliance-value".to_string())
+        );
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let refused = credential_for(Some("tenant-a"), "tenant-b-direct-line", tenant_a(mode)).await;
+            assert!(matches!(refused, Err(A2aProxyRuntimeError::TargetUnavailable(_))), "{mode:?}");
+            assert_eq!(
+                credential_for(Some("tenant-a"), "tenant-a-direct-line", tenant_a(mode))
+                    .await
+                    .unwrap(),
+                Some("tenant-a-value".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operators_proxy_with_an_appliance_wide_secret_serves_a_tenant_surface_in_either_mode() {
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(
+                credential_for(None, "appliance-direct-line", tenant_a(mode))
+                    .await
+                    .unwrap(),
+                Some("appliance-value".to_string()),
+                "{mode:?}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn an_authenticated_caller_resolves_the_direct_line_credential() {
         let (proxy, backend) = direct_line_proxy();
 
-        let result =
-            resolve_direct_line_credential(&proxy, &backend, None, "alpha", CallerAssertion::Authenticated, false)
-                .await;
+        let result = resolve_direct_line_credential(
+            &proxy,
+            &backend,
+            None,
+            "alpha",
+            CallerAssertion::Authenticated,
+            NO_TENANT,
+            false,
+        )
+        .await;
 
         assert!(
             matches!(&result, Err(A2aProxyRuntimeError::Internal(message)) if message.contains("Secrets store")),

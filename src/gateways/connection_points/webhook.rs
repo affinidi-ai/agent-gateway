@@ -1,5 +1,5 @@
-//! Raises `connection_point.connected` when someone connects through a connection point with
-//! its secret.
+//! Raises `connection_point.connected` when another gateway pairs through a connection point's
+//! invitation with its secret.
 
 use std::collections::HashMap;
 

@@ -4,6 +4,7 @@
 //! including extension inspection, metadata injection, and utility functions.
 
 pub mod extensions;
+pub mod protected_resource;
 
 pub use extensions::{
     ExtensionInspectionContext, MetadataRuntimeContext, inspect_message_extensions, is_hop_by_hop_header,

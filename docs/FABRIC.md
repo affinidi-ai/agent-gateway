@@ -43,6 +43,10 @@ the duration of a callback, avoiding a manager-to-listener-to-manager strong-ref
 Each Connection Point maintains a persistent DIDComm connection through its mediator. The listener
 authenticates, registers the receive ACL, receives encrypted envelopes, decrypts them, and dispatches
 them by DIDComm message type. Applicable messages are persisted and connection metrics are updated.
+The metrics keep, in memory, when the paired peer gateway was last heard from: an authenticated
+message whose sender is the DID on the Connection Point's gateway, or a pong to a gateway ping.
+`GET /v1/gateways` reports the latest per gateway as `peer_last_seen_at`, absent until the peer
+has been heard from since the process started.
 A forwarded G2G request also emits a dashboard `PayloadCaptured` event through the payload-capture
 helper.
 
@@ -140,7 +144,17 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
 directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-facilitator always send directly.
+settle messages for stored payments always send directly. Delegated `agent_pay` payment
+requests are ordinary fabric forwards and are routed like any other send.
+
+The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
+answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
+`{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
+(`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
+whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify request, so
+an `x402/verify-response` is dropped without touching the transaction store. Settle responses to
+its own requests are still handled, and the settlement worker still drains x402 payments already
+in its transaction store.
 
 ## Peer issuer DIDs
 
@@ -190,6 +204,15 @@ continues with no caller identity, only the audit record for the unverified DID 
 written, and no weaker identity source is consulted for that request, neither the identity
 binding VP nor a raw identity extension.
 
+The presentation the receiving gateway signs for its agent's response, when the Target has a
+Workload Binding, names the caller as the user the agent acted for (`userIdentity`, with
+`delegated: true`) only when a presentation from one of the connection's issuers proved the
+caller's DID (`vp` below), the caller a transit token issued for the request carries (see
+[`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A payload pseudonym, a DID computed from the
+extension's fields, or any other identity the peer named is left out, so the presentation never
+attests a delegation the peer only claimed. A `vp` DID is still the peer's word: any paired
+gateway's issuer can sign a presentation for any DID.
+
 The `did` field is never a source of identity. A credential extension carrying only a
 `did` claim yields nothing, and a `did` field in the raw `agent-identity/v1` extension is
 ignored. The identity is instead computed from:
@@ -208,7 +231,14 @@ presented VP is rejected, a raw `agent-identity/v1` extension beside it yields n
 either. On that path no audit record is written, and a presentation it cannot verify
 because no verifier is configured counts as rejected. A surface-configured
 `inbound_identity`, meaning `static`, `from_mtls`, `from_api_key`, or `from_jwt_claim`,
-still applies, except on public discovery paths where none is resolved.
+still applies, except on public discovery paths where none is resolved. An inbound
+`from_api_key` replaces even a verified presentation with the presented key's DID. On a Fabric
+send it does so for `access_point.inbound_policy` only; `target.policy` keeps the target agent's
+card and the request body (see
+[`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)).
+
+The fabric receive path does not read an inbound `from_api_key`: there the presentation or
+the identity extension in the request body sets the caller.
 
 Policies read how the caller DID was established from
 `input.extension_identity.verification` and `input.agent.did_verification`.
@@ -217,8 +247,8 @@ Policies read how the caller DID was established from
 | --- | --- |
 | `vp` | Verified presentation from a connection issuer. Fabric path only. |
 | `vp_unanchored` | Verified presentation on the direct A2A path, where no authenticated sender vouches for the issuer. |
-| `source_auth` | DID bound to this request's authenticated source credential, meaning `from_jwt_claim`. |
-| `unverified` | Payload-derived pseudonyms, and surface-configured identities such as `static`, `from_mtls`, and `from_api_key`. |
+| `source_auth` | DID bound to this request's authenticated source credential: `from_jwt_claim`, or an API Key Provider key on an inbound `from_api_key` slot. |
+| `unverified` | Payload-derived pseudonyms, and surface-configured identities such as `static`, `from_mtls`, a stored-key `from_api_key`, and a plain API Key on an inbound `from_api_key` slot. |
 
 `input.extension_identity.verified` and `input.agent.did_verified` are the boolean
 projections: everything but `unverified` is verified.
@@ -233,11 +263,28 @@ Management API: `GET /v1/gateways/{id}` (`gateways.view`) exposes `issuer_did`,
 attested issuer; `POST /v1/gateways/{id}/trusted-issuers` and
 `DELETE /v1/gateways/{id}/trusted-issuers/{issuer_did}` manage operator trust.
 
+## Mediator account ACL
+
+Each listener sets its Connection Point's mediator account ACL on every connect
+(`mediators::utils::apply_inbound_acl`, chosen by `ws_listener::inbound_acl_for`). A paired
+Connection Point (OOB responder or acceptor) admits only its peer: the account is explicit-allow
+with anonymous receipt off, and its access list holds exactly the peer's DID. That DID is the secure
+DID recorded on the Connection Point at pairing (`acceptor_secure_did` or `inviter_secure_did`),
+else the DID on its remote gateway record, because a pairing's gateway record can still carry the
+peer's temporary DID when the listener starts; with neither, the account stays open to every
+sender and a warning names the Connection Point, so a pairing made before peer DIDs were recorded
+keeps working. Every other
+Connection Point (an invitation endpoint, a pairing's temporary listener, a legacy one) stays open
+to every sender, since it does not serve a single known peer. The mediator's own replies are not
+subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
+change is logged and the listener continues; the account check below restores it.
+
 ## Runtime health behavior
 
 After a Gateway Ping timeout, the Gateway checks its mediator account. It reauthenticates and
-reregisters if the account has disappeared, or restores the receive list when the account remains
-but its ACL has been reset.
+reregisters if the account has disappeared, or re-applies the Connection Point's ACL when the
+account remains but its access-list mode is not the one that ACL sets (explicit-allow for a paired
+Connection Point, explicit-deny for an open one).
 
 Every connected Connection Point also runs this check on its own account every 30 seconds. A
 mediator can lose accounts while the connections stay open, for example when its store is flushed
@@ -246,7 +293,7 @@ missing account with `e.p.delivery.refused`. Without the periodic check, a gatew
 receives would stay unreachable.
 
 Four Connection Points are checked at a time, so one slow mediator does not hold up the others.
-Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-opening a receive list up to
+Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-applying an ACL up to
 10 seconds; a repair that fails is tried again at the next check and logged at `warn`. An account
 that cannot be read changes nothing. When that happens on consecutive checks it is logged at
 `warn` on the second, then at doubling intervals, so a check that cannot reach its mediator is
@@ -269,6 +316,12 @@ reaches over Fabric ([`Gateway::exposes_surface`](../src/gateways/types.rs)):
 The same check applies to buffered `forward-request` traffic, framed-stream Opens, and the
 `get-channels` capability query, which lists only the surfaces the sender may reach. The tenant rule
 applies on top of every mode.
+
+A payment gateway (`role: payment`) is created with `none`, and turning a peer into one, by hand
+or by the startup migration, sets `none`; its exposure cannot be changed afterwards, because `/v1/gateways/{id}/exposed-surfaces`
+does not act on payment gateways. The `gateway-info` query
+(`https://affinidi.com/atm/client-actions/gateway-info`) asks agent-pay for its summary; this
+gateway, not being a payment gateway, answers one with `{"info": null}`.
 
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
@@ -354,19 +407,41 @@ request received by the destination gateway:
    whatever the request timeout says (see [Fabric envelope
    lifetime](CONFIGURATION_RELOAD.md#fabric-envelope-lifetime)), leaving 120 s of clock skew below the
    receiver's cap; the caller deadline (`deadline_ms`) keeps the full timeout.
-3. Resolve the destination surface from the legacy wire field `channel_id`.
-4. Run the destination surface's configured source authentication and MCP request-boundary
+3. Read the hop count (`X-Gateway-Fabric-Hops`) and remove it, and every `X-Transit-Token` the peer
+   sent, from the request, buffered or framed. A count that is not one integer from 1 to 255 is
+   refused with `400`, and one above the limit with `508`, before surface lookup. A framed stream
+   resolves its surface and variant when it opens, so one to a surface or variant that is not
+   available is refused for that before its hop count is read; see
+   [Chains across gateways](#chains-across-gateways).
+4. Resolve the destination surface from the legacy wire field `channel_id`.
+5. Run the destination surface's configured source authentication and MCP request-boundary
    validation. DIDComm authentication proves the sending Gateway; source authentication separately
-   evaluates caller evidence presented to the destination surface. There is no A2A counterpart:
+   evaluates caller evidence presented to the destination surface. On an MCP surface that
+   publishes protected resource metadata, a missing or refused token for its JWT Bearer method
+   is answered here with a `401` before policy, without `resource_metadata`, and a failed
+   credential of another method with a plain `401`: the sending Gateway strips the caller's
+   own `Authorization` header, so only a credential it injects, issued for this surface's
+   resource, can pass. There is no A2A counterpart:
    `A2A-Version` is negotiated and A2A requests are validated on the sending gateway, not here
    (see below).
-5. Build policy input containing the authenticated sending Gateway and any source-auth result. An
+6. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
-6. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
-   Check, surface policy, and MCP tool gating in that order where configured.
-7. Forward to the local surface Target.
-8. Apply response processing, including MCP tool-list filtering when configured, before packaging
+7. Run Gateway policy, caller identity extraction, MCP per-tool policy, Trust Check, surface
+   policy, and MCP tool gating in that order where configured.
+8. Take the payment of a chargeable request through agent-pay, last, once every refusal that does
+   not depend on payment has been made. Then forward to the local surface Target. When the surface
+   has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
+   this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
+   caller the surface's own source authentication verified, so the agent can call its own Transit
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
+   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
+   HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
+   vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
+   card location, the sending gateway's own card fetch; any other discovery read, the
+   `/.well-known/agent.json` fallback included, gets none (see
+   [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
+9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
@@ -390,7 +465,29 @@ one surface 32; only the total of 128 counts both. Past a cap on either gateway 
 with `Retry-After: 5`; the receiving gateway refuses with `capacity_reached`. The full list of limits is in
 [Framed Fabric limits](MCP_METADATA.md#framed-fabric-limits). A buffered `ForwardRequest` receiver
 does not recheck the caller's browser Origin against its own `mcp_http.allowed_origins`; it trusts
-the paired sending gateway's check, as it trusts that peer for every other forwarded header.
+the paired sending gateway's check, as it trusts that peer for every other forwarded header. The
+exception is the caller-info and `did:webvh` identity headers (`x-caller-did`,
+`x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `x-did-identity`,
+`x-did-signed-identity`): the receiving gateway drops every copy the peer sent, so the agent behind
+it never takes a peer's value for one.
+
+### Which variant serves a request over Fabric
+
+Each gateway picks its own surface variant. The sending gateway serves a request with the variant
+its URL names (`/route$beta`), else its default variant, else its base surface, and records that
+one. The URL's `$alias` stays on the sending gateway: it names a variant of the sending surface,
+not of the peer's.
+
+The receiving gateway serves the request with its own default variant, else its base surface,
+unless the sending route's `fabric://` Target pins one of its variants:
+`fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
+`active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
+`variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
+variant. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+one variant of the sending surface to a particular peer variant, override that variant's Target
+with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
+there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
+caller on a `ForwardRequest`, and answers `502` when a stream's `Open` is refused.
 
 ### Delegated credentials over Fabric
 
@@ -416,8 +513,8 @@ The setting applies to one route only. Another `fabric://` Target or Transit Poi
 gateway sends no delegated credential unless it opts in too. A Transit Point on a surface without
 `outbound_credentials` uses only its own `transit_credentials`, never another Transit Point's. A
 Target variant can override the setting, a variant's `transit.points` override sets it for that
-variant's Transit Points, and a variant with `complete: true` that omits the Target override turns
-it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
+variant's Transit Points, and a complete (`complete: true`) variant's Target override that omits
+it turns it off. A legacy request whose Transit Point variant fails to resolve carries no delegated
 credential.
 
 When the setting keeps bindings from a peer, the sending gateway logs `Delegated credentials
@@ -431,7 +528,77 @@ credentials over Fabric** switch on the Managed Agent or Transit Point panel, sh
 
 The receiving gateway applies its own surface's `outbound_credentials` toward its Target. Since it
 forwards only to that Target, a binding with `required_for.tools` applies there to a `tools/call`
-whose `params.name` it lists, read after admission has refused batches and ambiguous keys.
+whose `params.name` it lists, read after admission has refused batches and ambiguous keys. It keys
+the grant only by the receiving surface and the caller its own source authentication verified on
+the request: a pseudonym, DID, presentation or transit token the peer's request carries never
+selects stored credentials. A per-user grant reaches a legacy Fabric request only when the view
+that serves it sets `target.delegated_credentials_for_fabric_callers: true` (off by default) on an
+HTTP or HTTPS Target and its caller authentication tells a partner's users apart, such as a JWT
+that names an audience: the partner then forwards each person's own token, and the person's
+grant, made by connecting to the surface directly with a legacy request, is sent to the Target.
+The switch has no effect on a Target that is not an `http://` or `https://` URL exactly as
+written, with a lower-case scheme and nothing before it. A grant made
+through a `2026-07-28` MCP request is kept under the agent DID that request names and never
+reaches a partner's request. A variant can override the switch, and a complete variant's Target
+override that omits it turns it off. A partner's own `target_auth` credential names all of the
+partner's users alike: never pair the switch with a partner that presents a static `target_auth`
+JWT, which maps every one of its users to one grant. An Agent Gateway peer strips its caller's own
+token from a legacy Fabric send and presents only its `target_auth`, so two Agent Gateways cannot
+use the switch yet. Service-level credentials reach a request whose caller the surface
+verified, without the switch. The receiving gateway never starts consent for a legacy Fabric
+request. Each refusal is a `403` with a fixed reason (`delegation_not_enabled_for_partners`,
+`partner_caller_not_verified` or `consent_not_available_for_partners`), answered before the
+Target is called and recorded as a `request_rejected`; an agent card fetch is never refused for a
+binding (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)).
+A receiving surface whose Target is bound by external consent (`consent_mode: external`) refuses
+every request with `403`, public discovery reads included, before any payment is asked for or
+verified: the caller the peer asserts never keys a grant by binding, and a discovery read would
+carry the peer's headers to the vendor. Each refusal is recorded as a `request_rejected`
+(`consent_identity_required`)
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)).
+
+The gateway that receives a request applies these rules; the sending gateway's release does not
+matter. In a mixed-version fleet, a receiving node that predates them still keys its Target's
+grants by the caller the peer's request names, releases per-user grants to partners without the
+switch, and answers a missing grant with an authorization URL the partner sees. Such a node stays
+exposed until it is upgraded, so upgrade every node that receives Fabric requests before relying
+on these rules. A node that predates the Target's switch refuses to load a surface that sets it,
+on the Target or in a variant, rather than serve it without these rules, and a save through such
+a node that leaves the switch out, as that node's dashboard does, turns it off. Before moving a
+node back to such a release, turn the switch off on every surface and variant.
+
+When the agent behind the receiving surface then calls one of its own Transit Points with the
+transit token it got for the peer's request, that Transit Point releases a delegated per-user
+credential only when it sets `delegated_credentials_for_fabric_callers: true`, and only the grant
+of the caller the receiving surface's own source authentication verified on the request, carried
+as the token's `fabric.principal_hash`. What the peer says about its caller (a caller DID, a
+presentation, a payload identity) never keys a vault lookup. Otherwise a binding that applies
+refuses the call with `403`, and the Transit Point's target is not called; the log gives the
+reason. The token names the call's caller, so a client the Transit Point's own `source_auth`
+verified on the same call gets no grant either; static `target_auth` credentials are added as
+for any caller (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+
+What the agent serving a partner's request gets back from an opted-in Transit Point:
+
+- the caller's grant, injected as the binding says, when one is already stored under its
+  `fabric.principal_hash` and the Transit Point's managed identity, the same grant that user's
+  direct calls through that Transit Point use;
+- otherwise `403` with the fixed reason `consent_not_available_for_partners`, recorded as a
+  `request_rejected` audit event: a JSON-RPC error (`-32001`) on an MCP Transit Point, a problem
+  JSON otherwise. No consent is started for a Fabric caller and no authorization URL is sent,
+  since whoever completed one would bind their provider account to that user;
+- on a `2026-07-28` MCP call, whose grant is keyed by the Transit Point's resource-token
+  caller, the grant only when that caller is the one the receiving surface verified, otherwise
+  `403` (`-32001`); and with no grant, the same `consent_not_available_for_partners` refusal,
+  never `input_required`.
+
+A person therefore consents by connecting to this gateway directly, never through a partner:
+the user first calls the surface's Access Point directly, with the credential the receiving
+surface verifies (the same JWT issuer and `sub`), so the agent's call through the Transit Point
+for that request gets the consent answer and the user completes it. The partner's calls for that
+user, on a Transit Point that opts in, then use that grant. Tell partners to send their users to
+the gateway once before relying on delegated credentials through it.
 
 `make gw-e2e` verifies the Access Point Target case between two gateway binaries
 (`tests/features/g2g/mcp_credential_delegation_over_fabric.feature`). The sending gateway has
@@ -456,3 +623,138 @@ A2A version negotiation, JSON-RPC and A2A request-shape validation, and the
 surface's `access_point.a2a`, before a `fabric://` request is dispatched. The receive pipeline above
 does not run them again, so the receiving surface's A2A settings do not apply to fabric requests;
 see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap).
+
+## Chains across gateways
+
+A request can cross Fabric more than once: a caller reaches gateway A, which forwards it to
+gateway C, whose agent calls its Transit Point to gateway B. Every hop is a new request, each
+with its own deadline, so agents that call each other through their gateways could pass a
+request back and forth without end. A hop count bounds them.
+
+- Every Fabric send sets `X-Gateway-Fabric-Hops`, the number of Fabric crossings including this
+  one, in the buffered forward's headers and in a framed stream Open's headers: `1` from an
+  Access Point (its Target, an agent card fetch through it, a delegated payment), and from a
+  Transit Point one more than the Fabric-issued transit token its agent sent records, or `1`
+  with an Access Point token or none. No copy a caller, an agent or a peer sent is ever
+  forwarded, to an HTTP target or over Fabric.
+- The receiving gateway reads and removes it before anything else uses the request. Missing,
+  as from a sender that predates it, means `1`. It carries the count into the transit token it
+  issues (`fabric.hops`), signed, so an agent cannot lower the count in the token it was given.
+  An agent that still holds an older valid token, from an Access Point request or an earlier
+  Fabric request, can present that one instead, which records fewer crossings.
+- The limit is 8 crossings, so a chain reaches at most 9 gateways. A request past it is refused
+  with `508` and the message that it passed through too many gateways, recorded as a
+  `request_rejected` audit event (stage `routing`, reason `fabric_chain_too_long`; a malformed
+  count is `fabric_hops_invalid`, refused with `400`). A Transit Point whose next send would
+  pass the limit refuses the call itself with `508`, before anything is resolved or forwarded,
+  recorded as a `request_rejected` audit event (stage `forward`, reason
+  `fabric_chain_too_long`).
+- The trace continues along the chain: the receiving gateway's onward trace id rides in the
+  token, and the Transit Point sends it on the next hop, so caller to A to C to B is one trace
+  unless a surface sets `terminate_trace_id`. The hop count crosses a terminated trace too.
+
+Hops are counted only across Fabric. A chain through an `http` Transit Point into another
+gateway's Access Point, or an agent calling an Access Point directly, its own gateway's
+included, starts again at 1, and so does a call without a transit token through a Transit Point
+that does not require one (it reads the count from a token the agent sends), a call
+through a Transit Point of a gateway with no transit token issuer, which reads no token, and a
+discovery read (a `GET` or `HEAD` of an agent card or other discovery document directly below
+the Transit Point) through any Transit Point, which reads no token either. So does a chain through a gateway that predates the hop count,
+which neither reads nor sends it. A peer that does not follow these rules can reset the count.
+The gateway's own read of a `fabric://` Transit Point target's agent card, for its Trust Checks
+or a policy with `require_agent_context`, is a discovery read too: it goes straight over Fabric,
+not through the Transit Point, with a count of 1 and a trace id of its own. It reads
+`/.well-known/agent-card.json`, which the remote answers from its configured card location with
+its Target credential when it has one, and falls back to `/.well-known/agent.json`, which the
+remote reads as a public discovery read without that credential; a remote Target that serves its
+card only at the legacy path and requires its credential there is reported as
+`AGENT_CARD_UNAVAILABLE`. A `404` or `503` the remote gateway answers itself (an unknown or
+inactive surface) ends the read without the fallback. See [`POLICY.md`](POLICY.md) for which reads are
+cached. An Access Point with a `fabric://` Target gives its surface policy the card it serves,
+built in process: one read over Fabric at its card location, uncached, within
+`a2a.timeout_seconds` or the surface's shorter request timeout.
+The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
+the agent sending the token it was given each time; two agents that call each other's Access
+Points are not bounded by it, nor are agents that keep calling through any of the resets above.
+It is not an access control, and an agent can escape it.
+
+A Fabric-issued transit token, like an Access Point's, is a bearer token until it expires.
+Nothing records which token IDs were presented, so the agent, or anyone who obtains the token,
+can present it again on any call to a Transit Point it lists, and an agent holding several
+valid tokens can choose which one a Transit Point sees, with its `fabric.hops` and
+`fabric.caller_did`. The surface's [transit token
+lifetime](SOURCE_AUTH.md#transit-token-lifetime) bounds this. The receiving gateway logs each
+token it issues at `INFO`, with its token ID (`jti`), the peer's Remote gateway record and the
+hop count, so a token presented later can be traced to the request it was issued for.
+
+A managed agent serving a partner's request gets a transit token for every Transit Point of
+the surface that served it, as it does for a direct caller, so it can call onward through any of
+them. When a token should be issued and cannot be, the receiving gateway refuses the request with
+`503`, recorded as a `request_rejected` audit event (stage `forward`, reason
+`transit_token_unavailable`), rather than forwarding a partner's request as one with no token.
+Earlier releases opened only the Transit Points that set `allow_fabric_callers`; that setting is
+no longer read, a stored surface that has it still loads, and the next save drops it.
+
+A Transit Point that was set to `require_transit_token: false`, with
+`allow_unauthenticated_callers: true`, only so that agents serving partner requests could call
+it should require the token again and drop `allow_unauthenticated_callers`: those agents get a
+token, and while the Transit Point does not require it, an agent that sends none starts the hop
+count again.
+
+A create or update of a surface or of one of its variants is answered with a `Warning` header
+for each `fabric://` Transit Point, on the surface or in a variant, that does not require the
+transit token:
+
+```
+Warning: 299 - "Transit Point 'partner' sends to a peer gateway without requiring the transit token, so the Fabric hop limit holds through it only when the agent sends one; require the transit token"
+```
+
+`make gw-e2e` verifies a chain across three gateway binaries and the hop limit between two
+(`tests/features/g2g/transit_token_over_fabric.feature`): an agent serving a partner's request
+calls onward through its own Transit Point with the token it was given, in the caller's trace;
+without the token, or with one issued for another surface, the Transit Point answers `401`;
+two agents passing a request back and forth are stopped with `508` after 8 crossings; and a
+Transit Point policy on `input.transit.caller.fabric.peer_issuer_did` admits one partner
+gateway's requests and refuses another's with `403`.
+
+
+### Which Transit Points a partner can drive
+
+A partner gateway that reaches a surface can make that surface's managed agent call **every**
+Transit Point of the surface while it serves the partner's request, with the credentials each
+Transit Point sends, its static `target_auth` included. No per-Transit-Point setting limits this:
+the token the receiving gateway issues names every Transit Point of the surface, as the Access
+Point's token does for a direct caller. Partner reach is decided per surface, so decide, for each
+surface you expose, whether partner-driven calls to all its Transit Points are expected.
+
+- **Expose only the surfaces a partner should drive.** A Remote gateway record's exposure mode
+  decides which local surfaces that peer reaches ([Peer exposure](#peer-exposure)): `none` for a
+  newly paired peer, a `list`, or `all`. The dashboard sets it on the remote gateway's
+  **Publishing** tab. Prefer `list` to `all`: with `all`, every active surface, and every
+  Transit Point on it, is open to that partner's requests, surfaces created later included.
+- **Use a separate surface for partners.** To keep a Transit Point, such as one that sends an
+  administrator's credentials, away from partners, put it on a surface that no peer's exposure
+  includes, and give partners a surface of their own with only the Transit Points they may
+  drive. The same agent can sit behind both. A token opens only the Transit Points of the
+  surface it was issued for, so a partner's request through the partner surface never opens the
+  other surface's Transit Points.
+- **Refuse or narrow partner calls in a Transit Point's policy**, for finer control: a partner's
+  call carries `input.transit.caller.verification == "fabric_peer"` and names the peer in
+  `input.transit.caller.fabric` ([`POLICY.md`](POLICY.md#fabric-callers-on-a-transit-point)).
+  This holds only on a Transit Point that requires the transit token.
+
+Things that do not separate partners:
+
+- **Surface variants.** A peer's `fabric://` Target can pin any enabled variant
+  ([Which variant serves a request over Fabric](#which-variant-serves-a-request-over-fabric)).
+- **A Transit Point's Endpoint Type.** It decides where the Transit Point sends the call (a URL or
+  a peer gateway), not who may drive it.
+- **A policy that only checks the caller is not anonymous.** A partner's call is a `fabric_peer`
+  caller: a rule that refuses only anonymous callers admits it, and one that admits any
+  `verified` caller admits it whenever the receiving surface verified the partner's caller. Match
+  `verification` explicitly.
+
+After upgrading from a release that opened only the Transit Points that set
+`allow_fabric_callers`, review each Remote gateway record's exposure and the Transit Points of
+the surfaces it reaches. A peer migrated from a release before exposure modes keeps `all` when
+its list was empty.

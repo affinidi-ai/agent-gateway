@@ -62,3 +62,16 @@ export function getTemplateProtocolBadge(t: SurfaceTemplate): TemplateProtocolMe
   const key = getTemplateProtocol(t);
   return key ? (KNOWN_PROTOCOL_BADGES[key] ?? null) : null;
 }
+
+/** Whether applying `t` adds a Payment element or a surface payment policy. */
+export function templateTakesPayments(t: SurfaceTemplate): boolean {
+  if ((t.items ?? []).some(item => item.kind === 'payment')) return true;
+  const surface = t.surface;
+  if (surface?.target?.payment_policy) return true;
+  return Array.isArray(surface?.variants)
+    ? surface.variants.some(
+        (variant: { overrides?: { target?: { payment_policy?: unknown } } }) =>
+          !!variant?.overrides?.target?.payment_policy
+      )
+    : false;
+}

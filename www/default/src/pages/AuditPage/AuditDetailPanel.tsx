@@ -3,7 +3,7 @@ import { timeAgo } from '../../utils/stringUtils';
 import AuditEvidencePane from './AuditEvidencePane';
 import AuditQuickFilters from './AuditQuickFilters';
 import { callerDidOf, eventTypeName, policyDecision, surfaceIdOf } from './auditHelpers';
-import { describeEntry } from './eventNarrative';
+import { describeEntry, type UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
 interface AuditDetailPanelProps {
@@ -11,6 +11,8 @@ interface AuditDetailPanelProps {
   filteredEntries: AuditEntry[];
   onTitleClick: () => void;
   onQuickFilter: (term: string, cat?: string) => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /**
@@ -23,9 +25,10 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
   filteredEntries,
   onTitleClick,
   onQuickFilter,
+  userName,
 }) => {
   const open = entry != null;
-  const narrative = entry ? describeEntry(entry) : null;
+  const narrative = entry ? describeEntry(entry, userName) : null;
   const tone = narrative?.tone ?? 'neutral';
   const pd = entry ? policyDecision(entry) : null;
   const callerDid = entry ? callerDidOf(entry) : null;
@@ -40,6 +43,7 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
       role="region"
       aria-label="Event details"
       aria-hidden={!open}
+      tabIndex={-1}
       data-testid="audit-detail-panel"
       data-open={open}
     >
@@ -89,6 +93,7 @@ const AuditDetailPanel: React.FC<AuditDetailPanelProps> = ({
               entry={entry}
               filteredEntries={filteredEntries}
               onQuickFilter={onQuickFilter}
+              userName={userName}
             />
           </div>
         </>

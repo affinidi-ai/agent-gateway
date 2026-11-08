@@ -10,11 +10,13 @@
 //! when reading from disk.
 
 use crate::encryption::{EncryptionService, fingerprint, init::init_encryption_service};
+use crate::observability::loggable;
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde::{Serialize, de::DeserializeOwned};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -51,7 +53,7 @@ pub fn set_cache_refresh_interval_secs(secs: u64) {
     CACHE_REFRESH_INTERVAL_SECS.store(secs, Ordering::Relaxed);
 }
 
-fn cache_refresh_interval_secs() -> u64 {
+pub(crate) fn cache_refresh_interval_secs() -> u64 {
     CACHE_REFRESH_INTERVAL_SECS.load(Ordering::Relaxed)
 }
 
@@ -113,6 +115,16 @@ fn get_global_storage_config() -> StorageConfig {
         .unwrap_or_default()
 }
 
+/// Whether the stores created from now on encrypt what they write: at-rest
+/// encryption is enabled with a key from the environment, a file or KMS, not
+/// the development `local` key source, which writes plaintext.
+pub fn at_rest_encryption_active() -> bool {
+    get_global_storage_config()
+        .encryption_service
+        .as_ref()
+        .is_some_and(EncryptionService::encrypts_at_rest)
+}
+
 // ============================================================================
 // Core Traits
 // ============================================================================
@@ -126,6 +138,10 @@ pub trait StorableEntity: Serialize + DeserializeOwned + Clone + Send + Sync + '
     ///
     /// This ID will be used as the filename (with .json extension)
     fn id(&self) -> &str;
+
+    /// Whether the id is itself a credential, such as a session token. A secret id is
+    /// logged, and put into error messages, only as [`loggable::secret`] renders it.
+    const ID_IS_SECRET: bool = false;
 
     /// Optional hook called after loading from disk
     ///
@@ -431,13 +447,58 @@ fn get_raw_path(
     storage_dir.join(format!("{}.json", id))
 }
 
+/// `id` as it may appear in logs and errors: in full, or as [`loggable::secret`]
+/// renders it when [`StorableEntity::ID_IS_SECRET`] is set.
+pub(crate) fn loggable_id<T: StorableEntity>(id: &str) -> Cow<'_, str> {
+    if T::ID_IS_SECRET {
+        Cow::Owned(loggable::secret(id))
+    } else {
+        Cow::Borrowed(id)
+    }
+}
+
+/// The id that stores a record keyed by a bearer token, such as a session token: the
+/// token's SHA-256 in hex. Neither the file name nor the record holds the token, and a
+/// presented token finds its record by this hash.
+pub(crate) fn token_storage_id(token: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(token.as_bytes()))
+}
+
+/// `path`, the file of the record `id`, as it may appear in logs and errors. For a
+/// secret id the file name is rebuilt from [`loggable_id`] and the rest of the file
+/// name; a file name that does not start with `id` is redacted as by [`loggable::record_path`].
+fn loggable_path<T: StorableEntity>(
+    path: &Path,
+    id: &str,
+) -> PathBuf {
+    if !T::ID_IS_SECRET {
+        return path.to_path_buf();
+    }
+    let suffix = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|_| !id.is_empty())
+        .and_then(|name| name.strip_prefix(id));
+    match (path.parent(), suffix) {
+        (Some(directory), Some(suffix)) => directory.join(format!("{}{suffix}", loggable_id::<T>(id))),
+        _ => loggable::record_path(path),
+    }
+}
+
+/// Category and position of a failure to deserialize a stored record. The serde
+/// message is left out because it can quote the record's content.
+fn deserialize_error_kind(error: &serde_json::Error) -> String {
+    format!("{:?} error at line {} column {}", error.classify(), error.line(), error.column())
+}
+
 /// Deserialize a stored entity after running its [`StorableEntity::migrate_raw_json`]
 /// hook, as every load path must. Returns the entity and whether the migration
 /// changed it, in which case the caller persists the migrated entity.
 fn deserialize_migrated<T: StorableEntity>(json: &[u8]) -> std::result::Result<(T, bool), String> {
-    let mut value: serde_json::Value = serde_json::from_slice(json).map_err(|e| e.to_string())?;
+    let mut value: serde_json::Value = serde_json::from_slice(json).map_err(|e| deserialize_error_kind(&e))?;
     let migrated = T::migrate_raw_json(&mut value).map_err(|e| format!("migration failed: {e}"))?;
-    let entity = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let entity = serde_json::from_value(value).map_err(|e| deserialize_error_kind(&e))?;
     Ok((entity, migrated))
 }
 
@@ -449,9 +510,10 @@ async fn persist_migrated_entity<T: StorableEntity>(
     config: &StorageConfig,
     entity: &T,
 ) {
+    let logged_id = loggable_id::<T>(entity.id());
     match save_entity_to_disk(storage_dir, entity_name, config, entity).await {
-        Ok(()) => info!("Schema-migrated {} {}, persisted the updated record", entity_name, entity.id()),
-        Err(e) => warn!("Failed to persist schema-migrated {} {}: {}", entity_name, entity.id(), e),
+        Ok(()) => info!("Schema-migrated {} {}, persisted the updated record", entity_name, logged_id),
+        Err(e) => warn!("Failed to persist schema-migrated {} {}: {}", entity_name, logged_id, e),
     }
 }
 
@@ -470,17 +532,19 @@ async fn load_and_encrypt_raw_entity<T: StorableEntity>(
     let content = fs::read(raw_path)
         .await
         .context("Failed to read raw entity file")?;
+    let logged_id = loggable_id::<T>(id);
+    let logged_path = loggable_path::<T>(raw_path, id);
 
     // Parse JSON
     let (mut entity, migrated): (T, bool) = deserialize_migrated(&content).map_err(|serde_err| {
         error!(
             "Deserialization error for entity {}: {}. File: {:?}, Content length: {} bytes",
-            id,
+            logged_id,
             serde_err,
-            raw_path,
+            logged_path,
             content.len()
         );
-        anyhow::anyhow!("Failed to deserialize entity {} from {:?}: {}", id, raw_path, serde_err)
+        anyhow::anyhow!("Failed to deserialize entity {} from {:?}: {}", logged_id, logged_path, serde_err)
     })?;
 
     entity.on_load(); // Allow post-load processing
@@ -494,15 +558,15 @@ async fn load_and_encrypt_raw_entity<T: StorableEntity>(
             String::from_utf8(content.clone()).context("Failed to convert JSON content to string for encryption")?;
         let encrypted_path = get_encrypted_path(storage_dir, id);
         let encrypted_content = encryption_service
-            .encrypt_file(&encrypted_path, &json_str)
+            .encrypt_file(&loggable_path::<T>(&encrypted_path, id), &json_str)
             .context("Failed to encrypt entity for auto-migration")?;
         atomic_write_file(&encrypted_path, encrypted_content.as_bytes())
             .await
             .context("Failed to write encrypted entity during auto-migration")?;
-        info!("Auto-migrated entity {} from unencrypted to encrypted storage", id);
+        info!("Auto-migrated entity {} from unencrypted to encrypted storage", logged_id);
         // Encrypt-then-delete: the ciphertext is durably written, so the plaintext
         // original can be removed (no-op when raw-file retention is on).
-        remove_plaintext_sibling(storage_dir, entity_name, id, config).await;
+        remove_plaintext_sibling::<T>(storage_dir, entity_name, id, config).await;
     }
     if migrated {
         persist_migrated_entity(storage_dir, entity_name, config, &entity).await;
@@ -525,17 +589,18 @@ async fn rename_mismatched_entity_file<T: StorableEntity>(
     entity: &T,
     old_file_id: &str,
 ) -> bool {
-    let entity_id = entity.id();
+    let entity_id = loggable_id::<T>(entity.id());
+    let old_file_id_logged = loggable_id::<T>(old_file_id);
     warn!(
         "Filename mismatch for {}: file '{}' has id '{}'. Renaming to '{}.json'",
-        entity_name, old_file_id, entity_id, entity_id
+        entity_name, old_file_id_logged, entity_id, entity_id
     );
     if let Err(e) = save_entity_to_disk(storage_dir, entity_name, config, entity).await {
         error!("Failed to save renamed {} {}: {}", entity_name, entity_id, e);
         return false;
     }
-    if let Err(e) = delete_entity_from_disk(storage_dir, entity_name, old_file_id).await {
-        error!("Failed to remove old {} file '{}': {}", entity_name, old_file_id, e);
+    if let Err(e) = delete_entity_from_disk::<T>(storage_dir, entity_name, old_file_id).await {
+        error!("Failed to remove old {} file '{}': {}", entity_name, old_file_id_logged, e);
         return false;
     }
     true
@@ -587,7 +652,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                     .is_some()
                     && get_encrypted_path(storage_dir, &id).exists()
                 {
-                    remove_plaintext_sibling(storage_dir, entity_name, &id, config).await;
+                    remove_plaintext_sibling::<T>(storage_dir, entity_name, &id, config).await;
                     continue;
                 }
 
@@ -612,6 +677,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
             };
 
             if let Some(id) = processed {
+                let logged_id = loggable_id::<T>(&id).into_owned();
                 // Determine which file to load from
                 let file_to_load = if config
                     .encryption_service
@@ -621,6 +687,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                 } else {
                     get_raw_path(storage_dir, &id)
                 };
+                let logged_file_to_load = loggable_path::<T>(&file_to_load, &id);
 
                 // If the primary file doesn't exist and encryption is enabled,
                 // check if only the raw file exists and auto-migrate it
@@ -643,7 +710,10 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                 Err(e) => {
                                     error!(
                                         "Failed to auto-migrate raw {} {} from {:?}: {}",
-                                        entity_name, id, raw_path, e
+                                        entity_name,
+                                        logged_id,
+                                        loggable_path::<T>(&raw_path, &id),
+                                        e
                                     );
                                     error_count += 1;
                                     continue;
@@ -661,7 +731,9 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                 "{} {} exists only as an encrypted file ({:?}) but encryption at rest is \
                                  disabled; record skipped. Re-enable encryption or migrate this record \
                                  to plaintext JSON.",
-                                entity_name, id, encrypted_path
+                                entity_name,
+                                logged_id,
+                                loggable_path::<T>(&encrypted_path, &id)
                             );
                             error_count += 1;
                             crate::metrics::backends::prometheus::track_storage_load_error(
@@ -715,7 +787,10 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                 let encrypted_str = match String::from_utf8(content.clone()) {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        error!("Failed to convert encrypted {} {} to UTF-8: {}", entity_name, id, e);
+                                        error!(
+                                            "Failed to convert encrypted {} {} to UTF-8: {}",
+                                            entity_name, logged_id, e
+                                        );
                                         error_count += 1;
                                         decrypt_error_count += 1;
                                         crate::metrics::backends::prometheus::track_storage_load_error(
@@ -725,10 +800,13 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                         continue;
                                     }
                                 };
-                                match encryption_service.decrypt_file(&file_to_load, &encrypted_str) {
+                                match encryption_service.decrypt_file(&logged_file_to_load, &encrypted_str) {
                                     Ok(decrypted) => decrypted.into_bytes(),
                                     Err(e) => {
-                                        error!("Failed to decrypt {} from {:?}: {}", entity_name, file_to_load, e);
+                                        error!(
+                                            "Failed to decrypt {} from {:?}: {}",
+                                            entity_name, logged_file_to_load, e
+                                        );
                                         error_count += 1;
                                         decrypt_error_count += 1;
                                         crate::metrics::backends::prometheus::track_storage_load_error(
@@ -748,7 +826,12 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                         let mut json_value: serde_json::Value = match serde_json::from_slice(&json_content) {
                             Ok(v) => v,
                             Err(e) => {
-                                error!("Failed to parse {} from {:?}: {}", entity_name, file_to_load, e);
+                                error!(
+                                    "Failed to parse {} from {:?}: {}",
+                                    entity_name,
+                                    logged_file_to_load,
+                                    deserialize_error_kind(&e)
+                                );
                                 error_count += 1;
                                 processed_ids.insert(id);
                                 continue;
@@ -759,7 +842,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                         let schema_migrated = match T::migrate_raw_json(&mut json_value) {
                             Ok(migrated) => migrated,
                             Err(e) => {
-                                error!("Failed to migrate {} from {:?}: {}", entity_name, file_to_load, e);
+                                error!("Failed to migrate {} from {:?}: {}", entity_name, logged_file_to_load, e);
                                 error_count += 1;
                                 processed_ids.insert(id);
                                 continue;
@@ -782,7 +865,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                         fingerprint: content_fingerprint,
                                     },
                                 );
-                                debug!("Loaded {} from {:?}", entity_name, file_to_load);
+                                debug!("Loaded {} from {:?}", entity_name, logged_file_to_load);
 
                                 // If the filename doesn't match the entity's canonical id,
                                 // re-save under the correct name and remove the old file.
@@ -797,11 +880,17 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                 } else {
                                     // If schema migration changed the JSON, persist the migrated version
                                     if schema_migrated {
-                                        info!("Schema-migrated {} {}, persisting updated config", entity_name, id);
+                                        info!(
+                                            "Schema-migrated {} {}, persisting updated config",
+                                            entity_name, logged_id
+                                        );
                                         if let Err(e) =
                                             save_entity_to_disk(storage_dir, entity_name, config, &entity).await
                                         {
-                                            error!("Failed to persist schema-migrated {} {}: {}", entity_name, id, e);
+                                            error!(
+                                                "Failed to persist schema-migrated {} {}: {}",
+                                                entity_name, logged_id, e
+                                            );
                                             error_count += 1;
                                         }
                                     }
@@ -818,7 +907,7 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                             Err(e) => {
                                                 error!(
                                                     "Failed to convert {} {} content to string for encryption: {}",
-                                                    entity_name, id, e
+                                                    entity_name, logged_id, e
                                                 );
                                                 error_count += 1;
                                                 processed_ids.insert(id);
@@ -826,25 +915,27 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                             }
                                         };
                                         let encrypted_path = get_encrypted_path(storage_dir, &id);
-                                        match encryption_service.encrypt_file(&encrypted_path, &json_str) {
+                                        match encryption_service
+                                            .encrypt_file(&loggable_path::<T>(&encrypted_path, &id), &json_str)
+                                        {
                                             Ok(encrypted_content) => {
                                                 if let Err(e) = fs::write(&encrypted_path, encrypted_content).await {
                                                     error!(
                                                         "Failed to write encrypted {} {} during auto-migration: {}",
-                                                        entity_name, id, e
+                                                        entity_name, logged_id, e
                                                     );
                                                     error_count += 1;
                                                 } else {
                                                     info!(
                                                         "Auto-migrated {} {} from unencrypted to encrypted storage",
-                                                        entity_name, id
+                                                        entity_name, logged_id
                                                     );
                                                 }
                                             }
                                             Err(e) => {
                                                 error!(
                                                     "Failed to encrypt {} {} for auto-migration: {}",
-                                                    entity_name, id, e
+                                                    entity_name, logged_id, e
                                                 );
                                                 error_count += 1;
                                             }
@@ -853,13 +944,18 @@ async fn load_all_entities_from_disk<T: StorableEntity>(
                                 }
                             }
                             Err(e) => {
-                                error!("Failed to parse {} from {:?}: {}", entity_name, file_to_load, e);
+                                error!(
+                                    "Failed to parse {} from {:?}: {}",
+                                    entity_name,
+                                    logged_file_to_load,
+                                    deserialize_error_kind(&e)
+                                );
                                 error_count += 1;
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Failed to read {} from {:?}: {}", entity_name, file_to_load, e);
+                        error!("Failed to read {} from {:?}: {}", entity_name, logged_file_to_load, e);
                         error_count += 1;
                     }
                 }
@@ -1146,23 +1242,24 @@ async fn save_entity_to_disk<T: StorableEntity>(
     if let Some(ref encryption_service) = config.encryption_service {
         // Encrypted storage
         let encrypted_path = get_encrypted_path(storage_dir, id);
+        let logged_path = loggable_path::<T>(&encrypted_path, id);
         let encrypted_content = encryption_service
-            .encrypt_file(&encrypted_path, &json_content)
+            .encrypt_file(&logged_path, &json_content)
             .context("Failed to encrypt entity")?;
         fs::write(&encrypted_path, encrypted_content)
             .await
             .context("Failed to write encrypted entity to disk")?;
-        debug!("Saved encrypted {} {} to {:?}", entity_name, id, encrypted_path);
+        debug!("Saved encrypted {} {} to {:?}", entity_name, loggable_id::<T>(id), logged_path);
 
         // Remove any stale plaintext sibling left from before encryption was enabled.
-        remove_plaintext_sibling(storage_dir, entity_name, id, config).await;
+        remove_plaintext_sibling::<T>(storage_dir, entity_name, id, config).await;
     } else {
         // Plain storage
         let raw_path = get_raw_path(storage_dir, id);
         fs::write(&raw_path, json_content.as_bytes())
             .await
             .context("Failed to write entity to disk")?;
-        debug!("Saved {} {} to {:?}", entity_name, id, raw_path);
+        debug!("Saved {} {} to {:?}", entity_name, loggable_id::<T>(id), loggable_path::<T>(&raw_path, id));
     }
 
     Ok(())
@@ -1183,22 +1280,23 @@ async fn save_entity_to_disk_atomic<T: StorableEntity>(
 
     if let Some(ref encryption_service) = config.encryption_service {
         let encrypted_path = get_encrypted_path(storage_dir, id);
+        let logged_path = loggable_path::<T>(&encrypted_path, id);
         let encrypted_content = encryption_service
-            .encrypt_file(&encrypted_path, &json_content)
+            .encrypt_file(&logged_path, &json_content)
             .context("Failed to encrypt entity")?;
         atomic_write_file(&encrypted_path, encrypted_content.as_bytes())
             .await
             .context("Failed to write encrypted entity to disk")?;
-        debug!("Atomically saved encrypted {} {} to {:?}", entity_name, id, encrypted_path);
+        debug!("Atomically saved encrypted {} {} to {:?}", entity_name, loggable_id::<T>(id), logged_path);
 
         // Remove any stale plaintext sibling left from before encryption was enabled.
-        remove_plaintext_sibling(storage_dir, entity_name, id, config).await;
+        remove_plaintext_sibling::<T>(storage_dir, entity_name, id, config).await;
     } else {
         let raw_path = get_raw_path(storage_dir, id);
         atomic_write_file(&raw_path, json_content.as_bytes())
             .await
             .context("Failed to write entity to disk")?;
-        debug!("Atomically saved {} {} to {:?}", entity_name, id, raw_path);
+        debug!("Atomically saved {} {} to {:?}", entity_name, loggable_id::<T>(id), loggable_path::<T>(&raw_path, id));
     }
 
     Ok(())
@@ -1301,7 +1399,7 @@ pub(crate) async fn atomic_write_file_with_mode(
 }
 
 #[cfg(unix)]
-async fn sync_directory(directory: &Path) -> Result<()> {
+pub(crate) async fn sync_directory(directory: &Path) -> Result<()> {
     static UNSUPPORTED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     let handle = fs::File::open(directory)
@@ -1339,7 +1437,7 @@ fn directory_sync_unsupported(error: &std::io::Error) -> bool {
 /// No-op unless encryption is active. Failure is logged, not propagated: a
 /// read-only filesystem or a permissions error must not abort startup or a
 /// save — the record is already durably encrypted and loadable.
-async fn remove_plaintext_sibling(
+async fn remove_plaintext_sibling<T: StorableEntity>(
     storage_dir: &Path,
     entity_name: &str,
     id: &str,
@@ -1358,23 +1456,26 @@ async fn remove_plaintext_sibling(
         // plaintext unless its authoritative ciphertext sibling is actually on disk.
         // A missing `.enc` means the plaintext is the only readable copy, so keep it.
         let encrypted_path = get_encrypted_path(storage_dir, id);
+        let logged_raw_path = loggable_path::<T>(&raw_path, id);
         if !encrypted_path.exists() {
             crate::metrics::backends::prometheus::track_storage_plaintext_removal_failed(entity_name);
             error!(
                 "Refusing to delete plaintext {} file {:?}: its encrypted sibling {:?} is missing, so \
                  this is the only readable copy",
-                entity_name, raw_path, encrypted_path
+                entity_name,
+                logged_raw_path,
+                loggable_path::<T>(&encrypted_path, id)
             );
             return;
         }
         match fs::remove_file(&raw_path).await {
-            Ok(()) => info!("Removed plaintext {} file {:?} after encryption", entity_name, raw_path),
+            Ok(()) => info!("Removed plaintext {} file {:?} after encryption", entity_name, logged_raw_path),
             Err(e) => {
                 crate::metrics::backends::prometheus::track_storage_plaintext_removal_failed(entity_name);
                 error!(
                     "Failed to delete plaintext {} file {:?} after encryption; plaintext key material may \
                      remain on disk: {}",
-                    entity_name, raw_path, e
+                    entity_name, logged_raw_path, e
                 );
             }
         }
@@ -1384,7 +1485,7 @@ async fn remove_plaintext_sibling(
 /// Delete an entity's files from disk (encrypted and/or raw).
 ///
 /// Shared by all three storage backends.
-async fn delete_entity_from_disk(
+async fn delete_entity_from_disk<T: StorableEntity>(
     storage_dir: &Path,
     entity_name: &str,
     id: &str,
@@ -1399,7 +1500,7 @@ async fn delete_entity_from_disk(
             .await
             .context("Failed to delete encrypted entity file")?;
         removed = true;
-        debug!("Deleted encrypted {} file {:?}", entity_name, encrypted_path);
+        debug!("Deleted encrypted {} file {:?}", entity_name, loggable_path::<T>(&encrypted_path, id));
     }
 
     // Delete raw file if exists
@@ -1409,15 +1510,193 @@ async fn delete_entity_from_disk(
             .await
             .context("Failed to delete raw entity file")?;
         removed = true;
-        debug!("Deleted raw {} file {:?}", entity_name, raw_path);
+        debug!("Deleted raw {} file {:?}", entity_name, loggable_path::<T>(&raw_path, id));
     }
 
     if removed {
         #[cfg(unix)]
         sync_directory(storage_dir).await?;
     }
-    debug!("Deleted {} {}", entity_name, id);
+    debug!("Deleted {} {}", entity_name, loggable_id::<T>(id));
     Ok(())
+}
+
+/// Moves every record file in `source_dir` that loads as `T` into `target_dir`, keeping
+/// its file name, and leaves every other file where it is. Encrypted files are decrypted
+/// with the global storage config only to tell their type; a file that cannot be read
+/// stays in place. A file whose name `target_dir` already holds is removed, keeping the
+/// copy in `target_dir`. Returns the number of files moved.
+pub async fn move_entities_to_dir<T: StorableEntity>(
+    source_dir: &Path,
+    target_dir: &Path,
+    entity_name: &str,
+) -> Result<usize> {
+    if !source_dir.is_dir() {
+        return Ok(0);
+    }
+    let config = get_global_storage_config();
+    fs::create_dir_all(target_dir)
+        .await
+        .context("Failed to create storage directory")?;
+    let mut entries = fs::read_dir(source_dir)
+        .await
+        .context("Failed to read storage directory")?;
+
+    let mut moved = 0;
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let (id, encrypted) = match file_name.strip_suffix(".json.enc") {
+            Some(id) => (id, true),
+            None => match file_name.strip_suffix(".json") {
+                Some(id) => (id, false),
+                None => continue,
+            },
+        };
+        if !file_loads_as::<T>(&path, encrypted, &config).await {
+            continue;
+        }
+        let target = target_dir.join(file_name);
+        if fs::try_exists(&target)
+            .await
+            .unwrap_or(false)
+        {
+            match fs::remove_file(&path).await {
+                Ok(()) => {
+                    removed += 1;
+                    warn!(
+                        "Removed {} file {:?}: {} already holds that record",
+                        entity_name,
+                        loggable_path::<T>(&path, id),
+                        target_dir.display()
+                    );
+                }
+                Err(e) => warn!(
+                    "Failed to remove {} file {:?} that {} already holds: {}",
+                    entity_name,
+                    loggable_path::<T>(&path, id),
+                    target_dir.display(),
+                    e
+                ),
+            }
+            continue;
+        }
+        match fs::rename(&path, target).await {
+            Ok(()) => moved += 1,
+            Err(e) => warn!(
+                "Failed to move {} file {:?} to {}: {}",
+                entity_name,
+                loggable_path::<T>(&path, id),
+                target_dir.display(),
+                e
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    if moved + removed > 0 {
+        sync_directory(source_dir).await?;
+        sync_directory(target_dir).await?;
+    }
+    Ok(moved)
+}
+
+/// Removes every record file in `storage_dir` that holds a `T` under another name than
+/// its id, such as a record an earlier version named by a session token that is now
+/// stored under the token's hash. Encrypted files are decrypted with the global
+/// storage config only to read their id; a file that cannot be read stays in place.
+/// Returns the number of files removed.
+pub async fn remove_entities_not_named_by_id<T: StorableEntity>(
+    storage_dir: &Path,
+    entity_name: &str,
+) -> Result<usize> {
+    if !storage_dir.is_dir() {
+        return Ok(0);
+    }
+    let config = get_global_storage_config();
+    let mut entries = fs::read_dir(storage_dir)
+        .await
+        .context("Failed to read storage directory")?;
+
+    let mut removed = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let Some(file_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            continue;
+        };
+        let (id, encrypted) = match file_name.strip_suffix(".json.enc") {
+            Some(id) => (id, true),
+            None => match file_name.strip_suffix(".json") {
+                Some(id) => (id, false),
+                None => continue,
+            },
+        };
+        let Some(mut entity) = load_file_as::<T>(&path, encrypted, &config).await else {
+            continue;
+        };
+        entity.on_load();
+        if entity.id() == id {
+            continue;
+        }
+        match fs::remove_file(&path).await {
+            Ok(()) => removed += 1,
+            Err(e) => warn!(
+                "Failed to remove {} file {:?} not named by its id: {}",
+                entity_name,
+                loggable_path::<T>(&path, id),
+                e
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    if removed > 0 {
+        sync_directory(storage_dir).await?;
+    }
+    Ok(removed)
+}
+
+/// Whether the record file at `path` holds a `T`.
+async fn file_loads_as<T: StorableEntity>(
+    path: &Path,
+    encrypted: bool,
+    config: &StorageConfig,
+) -> bool {
+    load_file_as::<T>(path, encrypted, config)
+        .await
+        .is_some()
+}
+
+/// The `T` the record file at `path` holds, if it holds one.
+async fn load_file_as<T: StorableEntity>(
+    path: &Path,
+    encrypted: bool,
+    config: &StorageConfig,
+) -> Option<T> {
+    let content = fs::read(path).await.ok()?;
+    let json = if encrypted {
+        let envelope = String::from_utf8(content).ok()?;
+        config
+            .encryption_service
+            .as_ref()?
+            .decrypt_string(envelope)
+            .ok()?
+            .into_bytes()
+    } else {
+        content
+    };
+    deserialize_migrated::<T>(&json)
+        .ok()
+        .map(|(entity, _)| entity)
 }
 
 // ============================================================================
@@ -1682,7 +1961,7 @@ impl<T: StorableEntity> CachedFilesystemStorage<T> {
         &self,
         id: &str,
     ) -> Result<()> {
-        delete_entity_from_disk(&self.storage_dir, self.entity_name, id).await?;
+        delete_entity_from_disk::<T>(&self.storage_dir, self.entity_name, id).await?;
         let now = Instant::now();
         self.sweep_expired_tombstones(now);
         {
@@ -1797,6 +2076,28 @@ impl<T: StorableEntity> StorageBackend<T> for CachedFilesystemStorage<T> {
 // ============================================================================
 // Non-Cached Implementation (Always Read from Disk)
 // ============================================================================
+
+/// A stored record that cannot be read whenever it is asked again: it does not
+/// decrypt under the current key, or does not parse. Reading it failed because
+/// of the record, not because the disk or the key service failed, which the
+/// uncached store reports as other errors. Carries the failure's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct UnreadableRecord(pub String);
+
+/// The error for a record that failed to decrypt with `error`: the key
+/// service's unavailability stays so, with `message`; anything else is an
+/// [`UnreadableRecord`].
+fn decryption_failure(
+    error: &anyhow::Error,
+    message: String,
+) -> anyhow::Error {
+    if error.is::<crate::encryption::EncryptionUnavailable>() {
+        anyhow::Error::new(crate::encryption::EncryptionUnavailable(message))
+    } else {
+        anyhow::Error::new(UnreadableRecord(message))
+    }
+}
 
 /// Filesystem storage without caching - always reads from disk
 ///
@@ -1993,7 +2294,7 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                         "{} {} exists only as an encrypted file but encryption at rest is disabled; \
                          re-enable encryption or migrate this record to plaintext JSON",
                         self.entity_name,
-                        id
+                        loggable_id::<T>(id)
                     );
                 }
             }
@@ -2003,6 +2304,8 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
         let content = fs::read(&file_to_load)
             .await
             .context("Failed to read entity file")?;
+        let logged_id = loggable_id::<T>(id);
+        let logged_file_to_load = loggable_path::<T>(&file_to_load, id);
 
         // Track whether we loaded from a raw (unencrypted) file
         let loaded_from_raw = !file_to_load
@@ -2025,24 +2328,26 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 .context("File is encrypted but no encryptor available")?;
             {
                 // File was encrypted with encrypt_string, so read as UTF-8 string
-                let encrypted_str = String::from_utf8(content.clone()).context("Encrypted data is not valid UTF-8")?;
+                let encrypted_str = String::from_utf8(content.clone()).map_err(|_| {
+                    anyhow::Error::new(UnreadableRecord("Encrypted data is not valid UTF-8".to_string()))
+                })?;
                 encryption_service
-                    .decrypt_file(&file_to_load, &encrypted_str)
+                    .decrypt_file(&logged_file_to_load, &encrypted_str)
                     .map_err(|err| {
                         error!(
                             "Decryption error for {} {}: {}. File: {:?}, Content length: {} bytes",
                             self.entity_name,
-                            id,
+                            logged_id,
                             err,
-                            file_to_load,
+                            logged_file_to_load,
                             content.len(),
                         );
-                        anyhow::anyhow!(
-                            "Failed to decrypt entity {} {} from {:?}: {}",
-                            self.entity_name,
-                            id,
-                            file_to_load,
-                            err
+                        decryption_failure(
+                            &err,
+                            format!(
+                                "Failed to decrypt entity {} {} from {:?}: {}",
+                                self.entity_name, logged_id, logged_file_to_load, err
+                            ),
                         )
                     })?
                     .into_bytes()
@@ -2055,12 +2360,15 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
             error!(
                 "Deserialization error for {} {}: {}. File: {:?}, Content length: {} bytes",
                 self.entity_name,
-                id,
+                logged_id,
                 serde_err,
-                file_to_load,
+                logged_file_to_load,
                 json_content.len(),
             );
-            anyhow::anyhow!("Failed to deserialize {} {} from {:?}: {}", self.entity_name, id, file_to_load, serde_err)
+            anyhow::Error::new(UnreadableRecord(format!(
+                "Failed to deserialize {} {} from {:?}: {}",
+                self.entity_name, logged_id, logged_file_to_load, serde_err
+            )))
         })?;
 
         entity.on_load(); // Allow post-load processing
@@ -2078,13 +2386,13 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 .context("Failed to convert JSON content to string for encryption")?;
             let encrypted_path = self.get_encrypted_path(id);
             let encrypted_content = encryption_service
-                .encrypt_file(&encrypted_path, &json_str)
+                .encrypt_file(&loggable_path::<T>(&encrypted_path, id), &json_str)
                 .context("Failed to encrypt entity for auto-migration")?;
             atomic_write_file(&encrypted_path, encrypted_content.as_bytes())
                 .await
                 .context("Failed to write encrypted entity during auto-migration")?;
-            info!("Auto-migrated {} {} from unencrypted to encrypted storage", self.entity_name, id);
-            remove_plaintext_sibling(&self.storage_dir, self.entity_name, id, &self.config).await;
+            info!("Auto-migrated {} {} from unencrypted to encrypted storage", self.entity_name, logged_id);
+            remove_plaintext_sibling::<T>(&self.storage_dir, self.entity_name, id, &self.config).await;
         }
         if migrated {
             persist_migrated_entity(&self.storage_dir, self.entity_name, &self.config, &entity).await;
@@ -2102,18 +2410,26 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
         let content = fs::read(raw_path)
             .await
             .context("Failed to read raw entity file")?;
+        let logged_id = loggable_id::<T>(id);
+        let logged_path = loggable_path::<T>(raw_path, id);
 
         // Parse JSON
         let (mut entity, migrated): (T, bool) = deserialize_migrated(&content).map_err(|serde_err| {
             error!(
                 "Deserialization error for {} {}: {}. File: {:?}, Content length: {} bytes",
                 self.entity_name,
-                id,
+                logged_id,
                 serde_err,
-                raw_path,
+                logged_path,
                 content.len()
             );
-            anyhow::anyhow!("Failed to deserialize {} {} from {:?}: {}", self.entity_name, id, raw_path, serde_err)
+            anyhow::anyhow!(
+                "Failed to deserialize {} {} from {:?}: {}",
+                self.entity_name,
+                logged_id,
+                logged_path,
+                serde_err
+            )
         })?;
 
         entity.on_load(); // Allow post-load processing
@@ -2128,13 +2444,13 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 .context("Failed to convert JSON content to string for encryption")?;
             let encrypted_path = self.get_encrypted_path(id);
             let encrypted_content = encryption_service
-                .encrypt_file(&encrypted_path, &json_str)
+                .encrypt_file(&loggable_path::<T>(&encrypted_path, id), &json_str)
                 .context("Failed to encrypt entity for auto-migration")?;
             atomic_write_file(&encrypted_path, encrypted_content.as_bytes())
                 .await
                 .context("Failed to write encrypted entity during auto-migration")?;
-            info!("Auto-migrated {} {} from unencrypted to encrypted storage", self.entity_name, id);
-            remove_plaintext_sibling(&self.storage_dir, self.entity_name, id, &self.config).await;
+            info!("Auto-migrated {} {} from unencrypted to encrypted storage", self.entity_name, logged_id);
+            remove_plaintext_sibling::<T>(&self.storage_dir, self.entity_name, id, &self.config).await;
         }
         if migrated {
             persist_migrated_entity(&self.storage_dir, self.entity_name, &self.config, &entity).await;
@@ -2254,14 +2570,16 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
                 .get_encrypted_path(&id)
                 .exists()
             {
-                remove_plaintext_sibling(&self.storage_dir, self.entity_name, &id, &self.config).await;
+                remove_plaintext_sibling::<T>(&self.storage_dir, self.entity_name, &id, &self.config).await;
                 migrated += 1;
             } else {
                 match self.load_from_disk(&id).await {
                     Ok(_) => migrated += 1,
                     Err(e) => warn!(
                         "Failed to encrypt plaintext {} {} at rest during startup migration: {}",
-                        self.entity_name, id, e
+                        self.entity_name,
+                        loggable_id::<T>(&id),
+                        e
                     ),
                 }
             }
@@ -2279,7 +2597,7 @@ impl<T: StorableEntity> UncachedFilesystemStorage<T> {
         &self,
         id: &str,
     ) -> Result<()> {
-        delete_entity_from_disk(&self.storage_dir, self.entity_name, id).await
+        delete_entity_from_disk::<T>(&self.storage_dir, self.entity_name, id).await
     }
 
     /// Check if an entity exists
@@ -2517,7 +2835,7 @@ impl<T: StorableEntity> RwLockFilesystemStorage<T> {
         &self,
         id: &str,
     ) -> Result<()> {
-        delete_entity_from_disk(&self.storage_dir, self.entity_name, id).await?;
+        delete_entity_from_disk::<T>(&self.storage_dir, self.entity_name, id).await?;
 
         // Remove from cache
         let mut cache = self.cache.write().await;
@@ -2899,9 +3217,21 @@ pub async fn rwlock_storage_with_config<T: StorableEntity>(
 mod tests {
     use super::*;
     use crate::encryption::{KeyManager, KeySource};
-    use base64::Engine;
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
+
+    /// A record that fails to decrypt because the key service is unavailable
+    /// stays so; one that fails by itself is unreadable.
+    #[test]
+    fn only_a_record_that_fails_by_itself_is_unreadable() {
+        let unavailable = anyhow::Error::new(crate::encryption::EncryptionUnavailable("KMS throttled".into()));
+        let failure = decryption_failure(&unavailable, "Failed to decrypt entity".into());
+        assert!(failure.is::<crate::encryption::EncryptionUnavailable>());
+        assert!(!failure.is::<UnreadableRecord>());
+        assert_eq!(failure.to_string(), "Failed to decrypt entity");
+        let refused = decryption_failure(&anyhow::anyhow!("AES-256-GCM decrypt failed"), "Failed to decrypt".into());
+        assert!(refused.is::<UnreadableRecord>());
+    }
 
     /// Helper to create an EncryptionService from a random key for tests
     fn test_encryption_service() -> (EncryptionService, [u8; 32]) {
@@ -2922,6 +3252,407 @@ mod tests {
         fn id(&self) -> &str {
             &self.id
         }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    struct SecretIdEntity {
+        token: String,
+        owner: String,
+    }
+
+    impl StorableEntity for SecretIdEntity {
+        const ID_IS_SECRET: bool = true;
+
+        fn id(&self) -> &str {
+            &self.token
+        }
+    }
+
+    const SECRET_ID: &str = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+
+    fn secret_id_entity() -> SecretIdEntity {
+        SecretIdEntity {
+            token: SECRET_ID.to_string(),
+            owner: "user-1".to_string(),
+        }
+    }
+
+    fn set_test_storage_config(config: StorageConfig) {
+        TEST_STORAGE_CONFIG.with(|test_config| *test_config.borrow_mut() = Some(config));
+    }
+
+    #[test]
+    fn loggable_id_keeps_a_non_secret_id_in_full() {
+        assert_eq!(loggable_id::<TestEntity>("member-0123456789"), "member-0123456789");
+        assert_eq!(loggable_id::<TestEntity>("m1"), "m1");
+    }
+
+    #[test]
+    fn loggable_id_keeps_only_a_prefix_of_a_long_secret_id() {
+        assert_eq!(loggable_id::<SecretIdEntity>(SECRET_ID), "0f2c9d7e...");
+    }
+
+    #[test]
+    fn loggable_id_redacts_a_short_secret_id_whole() {
+        assert_eq!(loggable_id::<SecretIdEntity>("abcd1234"), loggable::REDACTED);
+        assert_eq!(loggable_id::<SecretIdEntity>(""), loggable::REDACTED);
+    }
+
+    #[test]
+    fn a_tokens_storage_id_is_its_sha256_in_hex() {
+        assert_eq!(token_storage_id("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_ne!(token_storage_id(SECRET_ID), token_storage_id("0f2c9d7e"));
+        assert!(!token_storage_id(SECRET_ID).contains(SECRET_ID));
+    }
+
+    #[test]
+    fn loggable_id_counts_characters_of_a_non_ascii_secret_id() {
+        assert_eq!(loggable_id::<SecretIdEntity>("ключ-ключ-ключ-ключ"), "ключ-клю...");
+        assert_eq!(loggable_id::<SecretIdEntity>("ключ-ключ"), loggable::REDACTED);
+    }
+
+    #[test]
+    fn loggable_path_keeps_a_non_secret_path_in_full() {
+        let path = get_raw_path(Path::new("/data/member"), "member-1");
+
+        assert_eq!(loggable_path::<TestEntity>(&path, "member-1"), path);
+    }
+
+    #[test]
+    fn loggable_path_rebuilds_the_file_name_from_the_secret_id_prefix() {
+        let directory = Path::new("/data/sessions");
+
+        let logged = loggable_path::<SecretIdEntity>(&get_encrypted_path(directory, SECRET_ID), SECRET_ID);
+
+        assert_eq!(logged, directory.join("0f2c9d7e....json.enc"));
+    }
+
+    #[test]
+    fn loggable_path_hides_a_secret_id_with_characters_debug_escapes() {
+        let id = "ab\"c\td-0123456789-tail";
+        let directory = Path::new("/data/sessions");
+
+        let logged = format!("{:?}", loggable_path::<SecretIdEntity>(&get_raw_path(directory, id), id));
+
+        assert_eq!(logged, format!("{:?}", directory.join("ab\"c\td-0....json")));
+        assert!(logged.contains(r#"ab\"c\td-0....json"#), "{logged}");
+        assert!(!logged.contains("0123456789-tail"), "{logged}");
+    }
+
+    #[test]
+    fn loggable_path_redacts_a_short_secret_id_whole() {
+        let directory = Path::new("/data/sessions");
+
+        let logged = loggable_path::<SecretIdEntity>(&get_raw_path(directory, "short-id"), "short-id");
+
+        assert_eq!(logged, directory.join("<redacted>.json"));
+    }
+
+    #[test]
+    fn loggable_path_redacts_a_file_name_not_built_from_the_secret_id() {
+        let path = Path::new("/data/sessions/other-0123456789-file.json");
+
+        assert_eq!(loggable_path::<SecretIdEntity>(path, SECRET_ID), Path::new("/data/sessions/<redacted>"));
+        assert_eq!(loggable_path::<SecretIdEntity>(path, ""), Path::new("/data/sessions/<redacted>"));
+    }
+
+    #[test]
+    fn deserialize_error_kind_reports_position_without_the_record_content() {
+        let error = serde_json::from_str::<TestEntity>(r#"{"id":"a","name":"b","value":"leaked-content"}"#)
+            .expect_err("value is not a number");
+
+        let kind = deserialize_error_kind(&error);
+
+        assert!(kind.starts_with("Data error at line 1 column"), "{kind}");
+        assert!(!kind.contains("leaked-content"), "{kind}");
+    }
+
+    #[tokio::test]
+    async fn a_startup_parse_error_logs_no_record_content() {
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join("member-1.json"),
+            r#"{"id":"member-1","name":"b","value":"leaked-content"}"#,
+        )
+        .unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let storage = CachedFilesystemStorage::<TestEntity>::new(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .list_all()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let text = logs.text();
+        assert!(text.contains("Failed to parse test_entity from"), "{text}");
+        assert!(text.contains("Data error"), "{text}");
+        assert!(!text.contains("leaked-content"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn secret_id_save_scan_and_delete_log_only_its_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let storage = RwLockFilesystemStorage::<SecretIdEntity>::new(temp_dir.path().to_path_buf(), "secret_entity")
+            .await
+            .unwrap();
+        storage
+            .save(&secret_id_entity())
+            .await
+            .unwrap();
+        let reloaded = RwLockFilesystemStorage::<SecretIdEntity>::new(temp_dir.path().to_path_buf(), "secret_entity")
+            .await
+            .unwrap();
+        reloaded
+            .delete(SECRET_ID)
+            .await
+            .unwrap();
+
+        let text = logs.text();
+        assert!(text.contains("Saved secret_entity 0f2c9d7e... to"), "{text}");
+        assert!(text.contains("Loaded secret_entity from"), "{text}");
+        assert!(text.contains("Deleted raw secret_entity file"), "{text}");
+        assert!(text.contains("0f2c9d7e....json"), "{text}");
+        assert!(!text.contains(SECRET_ID), "{text}");
+    }
+
+    #[tokio::test]
+    async fn secret_id_encrypted_save_and_plaintext_migration_log_only_its_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let entity = secret_id_entity();
+        std::fs::write(get_raw_path(temp_dir.path(), SECRET_ID), serde_json::to_vec(&entity).unwrap()).unwrap();
+        let (encryption_service, _) = test_encryption_service();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let storage = RwLockFilesystemStorage::<SecretIdEntity>::new_with_encryption(
+            temp_dir.path().to_path_buf(),
+            "secret_entity",
+            encryption_service,
+        )
+        .await
+        .unwrap();
+        storage
+            .save(&entity)
+            .await
+            .unwrap();
+
+        assert!(get_encrypted_path(temp_dir.path(), SECRET_ID).exists());
+        assert!(!get_raw_path(temp_dir.path(), SECRET_ID).exists());
+        let text = logs.text();
+        assert!(text.contains("Auto-migrated entity 0f2c9d7e... from unencrypted"), "{text}");
+        assert!(text.contains("Removed plaintext secret_entity file"), "{text}");
+        assert!(text.contains("Saved encrypted secret_entity 0f2c9d7e... to"), "{text}");
+        assert!(!text.contains(SECRET_ID), "{text}");
+    }
+
+    #[tokio::test]
+    async fn local_trace_names_a_secret_id_file_by_its_prefix() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RwLockFilesystemStorage::<SecretIdEntity>::new_with_encryption(
+            temp_dir.path().to_path_buf(),
+            "secret_entity",
+            EncryptionService::local_trace(),
+        )
+        .await
+        .unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        storage
+            .save(&secret_id_entity())
+            .await
+            .unwrap();
+
+        let text = logs.text();
+        let logged_path = temp_dir
+            .path()
+            .join("0f2c9d7e....json.enc");
+        assert!(text.contains(&format!("encrypted file={} fingerprint=", logged_path.display())), "{text}");
+        assert!(!text.contains(SECRET_ID), "{text}");
+    }
+
+    #[tokio::test]
+    async fn move_entities_to_dir_moves_only_records_of_the_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path();
+        let target = source.join("secret");
+        let (encryption_service, _) = test_encryption_service();
+        let config = StorageConfig::default().with_encryption_service(encryption_service);
+        set_test_storage_config(config.clone());
+        let other = TestEntity {
+            id: "member-1".to_string(),
+            name: "Member".to_string(),
+            value: 1,
+        };
+        let plaintext_secret = SecretIdEntity {
+            token: "1a2b3c4d-plaintext-secret-id-0001".to_string(),
+            owner: "user-2".to_string(),
+        };
+        save_entity_to_disk(source, "secret_entity", &config, &secret_id_entity())
+            .await
+            .unwrap();
+        save_entity_to_disk(source, "test_entity", &config, &other)
+            .await
+            .unwrap();
+        save_entity_to_disk(source, "secret_entity", &StorageConfig::default(), &plaintext_secret)
+            .await
+            .unwrap();
+        std::fs::write(source.join("unreadable.json.enc"), "not an envelope").unwrap();
+
+        let moved = move_entities_to_dir::<SecretIdEntity>(source, &target, "secret_entity")
+            .await
+            .unwrap();
+
+        assert_eq!(moved, 2);
+        assert!(get_encrypted_path(&target, SECRET_ID).exists());
+        assert!(!get_encrypted_path(source, SECRET_ID).exists());
+        assert!(get_raw_path(&target, &plaintext_secret.token).exists());
+        assert!(get_encrypted_path(source, "member-1").exists());
+        assert!(
+            source
+                .join("unreadable.json.enc")
+                .exists()
+        );
+        let storage = RwLockFilesystemStorage::<SecretIdEntity>::new_with_config(target, "secret_entity", config)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get(SECRET_ID)
+                .await
+                .unwrap(),
+            Some(secret_id_entity())
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_entities_not_named_by_id_removes_only_misnamed_records_of_the_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path();
+        let (encryption_service, _) = test_encryption_service();
+        let config = StorageConfig::default().with_encryption_service(encryption_service);
+        set_test_storage_config(config.clone());
+        let other = TestEntity {
+            id: "member-1".to_string(),
+            name: "Member".to_string(),
+            value: 1,
+        };
+        save_entity_to_disk(dir, "secret_entity", &config, &secret_id_entity())
+            .await
+            .unwrap();
+        save_entity_to_disk(dir, "test_entity", &config, &other)
+            .await
+            .unwrap();
+        let encrypted_misnamed = dir.join("misnamed-encrypted.json.enc");
+        std::fs::copy(get_encrypted_path(dir, SECRET_ID), &encrypted_misnamed).unwrap();
+        let plaintext_misnamed = dir.join("misnamed-plaintext.json");
+        std::fs::write(&plaintext_misnamed, serde_json::to_vec(&secret_id_entity()).unwrap()).unwrap();
+        let other_misnamed = dir.join("member-2.json");
+        std::fs::write(&other_misnamed, serde_json::to_vec(&other).unwrap()).unwrap();
+        std::fs::write(dir.join("unreadable.json.enc"), "not an envelope").unwrap();
+
+        let removed = remove_entities_not_named_by_id::<SecretIdEntity>(dir, "secret_entity")
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!encrypted_misnamed.exists());
+        assert!(!plaintext_misnamed.exists());
+        assert!(get_encrypted_path(dir, SECRET_ID).exists());
+        assert!(get_encrypted_path(dir, "member-1").exists());
+        assert!(other_misnamed.exists());
+        assert!(
+            dir.join("unreadable.json.enc")
+                .exists()
+        );
+        assert_eq!(
+            remove_entities_not_named_by_id::<SecretIdEntity>(&dir.join("missing"), "secret_entity")
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn move_entities_to_dir_without_a_source_directory_moves_nothing() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("secret");
+
+        let moved = move_entities_to_dir::<SecretIdEntity>(
+            &temp_dir
+                .path()
+                .join("missing"),
+            &target,
+            "secret_entity",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(moved, 0);
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn move_entities_to_dir_moves_nothing_on_a_second_run() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path();
+        let target = source.join("secret");
+        set_test_storage_config(StorageConfig::default());
+        save_entity_to_disk(source, "secret_entity", &StorageConfig::default(), &secret_id_entity())
+            .await
+            .unwrap();
+
+        let first = move_entities_to_dir::<SecretIdEntity>(source, &target, "secret_entity")
+            .await
+            .unwrap();
+        let second = move_entities_to_dir::<SecretIdEntity>(source, &target, "secret_entity")
+            .await
+            .unwrap();
+
+        assert_eq!((first, second), (1, 0));
+        assert!(get_raw_path(&target, SECRET_ID).exists());
+        assert!(!get_raw_path(source, SECRET_ID).exists());
+    }
+
+    #[tokio::test]
+    async fn move_entities_to_dir_keeps_the_target_copy_when_both_directories_hold_a_record() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path();
+        let target = source.join("secret");
+        set_test_storage_config(StorageConfig::default());
+        let current = secret_id_entity();
+        let stale = SecretIdEntity {
+            token: SECRET_ID.to_string(),
+            owner: "stale-owner".to_string(),
+        };
+        std::fs::create_dir_all(&target).unwrap();
+        save_entity_to_disk(&target, "secret_entity", &StorageConfig::default(), &current)
+            .await
+            .unwrap();
+        save_entity_to_disk(source, "secret_entity", &StorageConfig::default(), &stale)
+            .await
+            .unwrap();
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let moved = move_entities_to_dir::<SecretIdEntity>(source, &target, "secret_entity")
+            .await
+            .unwrap();
+
+        assert_eq!(moved, 0);
+        assert!(!get_raw_path(source, SECRET_ID).exists());
+        let kept: SecretIdEntity =
+            serde_json::from_slice(&std::fs::read(get_raw_path(&target, SECRET_ID)).unwrap()).unwrap();
+        assert_eq!(kept, current);
+        let text = logs.text();
+        assert!(text.contains("already holds that record"), "{text}");
+        assert!(!text.contains(SECRET_ID), "{text}");
     }
 
     #[tokio::test]
@@ -3473,7 +4204,7 @@ mod tests {
         save_entity_to_disk(&storage.storage_dir, storage.entity_name, &storage.config, &a_updated)
             .await
             .unwrap();
-        delete_entity_from_disk(&storage.storage_dir, storage.entity_name, "b")
+        delete_entity_from_disk::<TestEntity>(&storage.storage_dir, storage.entity_name, "b")
             .await
             .unwrap();
 
@@ -3588,7 +4319,7 @@ mod tests {
         assert_eq!(after, vec![a_updated.clone(), b]);
 
         // Externally delete `b`; a further refresh evicts it from the cache.
-        delete_entity_from_disk(&storage.storage_dir, storage.entity_name, "b")
+        delete_entity_from_disk::<TestEntity>(&storage.storage_dir, storage.entity_name, "b")
             .await
             .unwrap();
         RwLockFilesystemStorage::refresh_from_disk(&storage)
@@ -4130,7 +4861,7 @@ mod tests {
             .unwrap();
         drain_events(&mut rx);
 
-        delete_entity_from_disk(&storage.storage_dir, storage.entity_name, "b")
+        delete_entity_from_disk::<TestEntity>(&storage.storage_dir, storage.entity_name, "b")
             .await
             .unwrap();
         storage
@@ -5165,19 +5896,12 @@ mod tests {
 
     #[test]
     fn test_storage_config_with_valid_key() {
-        // Test creating StorageConfig with a valid encryption key from environment
-        use std::env;
-
-        // Generate a valid 32-byte key
-        let key: [u8; 32] = rand::random();
-        let key_str = base64::engine::general_purpose::STANDARD.encode(key);
-
-        unsafe { env::set_var("TEST_VALID_ENCRYPTION_KEY", &key_str) };
-
+        // Test creating StorageConfig with a valid encryption key from environment.
+        // `AG_TEST_ENCRYPTION_KEY` is set by `.cargo/config.toml` `[env]`.
         let encryption_config = crate::config::EncryptionConfig {
             enabled: true,
             key_source: crate::config::KeySourceConfig::Environment,
-            key_env_var: "TEST_VALID_ENCRYPTION_KEY".to_string(),
+            key_env_var: "AG_TEST_ENCRYPTION_KEY".to_string(),
             key_file: None,
             kms_key_id: None,
             kms_max_concurrent_ops: 16,
@@ -5190,25 +5914,18 @@ mod tests {
                 .encryption_service
                 .is_some()
         );
-
-        unsafe { env::remove_var("TEST_VALID_ENCRYPTION_KEY") };
     }
 
     #[test]
     fn test_storage_config_encryption_toggle() {
-        use std::env;
-
-        let key: [u8; 32] = rand::random();
-        let key_str = base64::engine::general_purpose::STANDARD.encode(key);
-        unsafe { env::set_var("TEST_MATRIX_ENCRYPTION_KEY", &key_str) };
-
+        // `AG_TEST_ENCRYPTION_KEY` is set by `.cargo/config.toml` `[env]`.
         let cases = [(false, false), (true, true)];
 
         for (enabled, should_encrypt_filesystem) in cases {
             let encryption_config = crate::config::EncryptionConfig {
                 enabled,
                 key_source: crate::config::KeySourceConfig::Environment,
-                key_env_var: "TEST_MATRIX_ENCRYPTION_KEY".to_string(),
+                key_env_var: "AG_TEST_ENCRYPTION_KEY".to_string(),
                 key_file: None,
                 kms_key_id: None,
                 kms_max_concurrent_ops: 16,
@@ -5224,8 +5941,6 @@ mod tests {
                 "enabled={enabled}"
             );
         }
-
-        unsafe { env::remove_var("TEST_MATRIX_ENCRYPTION_KEY") };
     }
 
     // ============================================================================

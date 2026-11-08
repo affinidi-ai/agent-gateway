@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::identity::state::IdentityApiState;
 
@@ -20,14 +20,18 @@ pub async fn didcomm_endpoint(
     // Try to parse as JSON first to see what we received
     match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(json) => {
-            debug!("DIDComm message JSON: {}", serde_json::to_string_pretty(&json).unwrap_or_default());
-
             // Log the message type if available
             if let Some(msg_type) = json
                 .get("type")
                 .and_then(|v| v.as_str())
             {
-                info!("DIDComm message type: {}", msg_type);
+                info!(
+                    "DIDComm message type: {}, id: {}",
+                    msg_type,
+                    json.get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<none>")
+                );
             }
 
             // For now, just acknowledge receipt

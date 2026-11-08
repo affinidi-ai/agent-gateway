@@ -1,5 +1,5 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Query, State},
 };
 use chrono::{DateTime, Utc};
@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::error;
 
+use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
+use crate::auth_manager::pat::PatContext;
 use crate::identity::IdentityStore;
-use crate::identity::display_name::{ManagedDisplayName, resolve_managed_display_name, surfaces_by_did};
+use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
 use crate::identity::filesystem::IdentityOrigin;
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
@@ -18,6 +20,9 @@ use crate::metrics::MetricsStore;
 use crate::observability::caller_names::{CallerNameService, DisplayNameSource};
 use crate::observability::identity_view::{
     CredentialPrincipal, PrincipalNames, credential_principal, naming_for, with_target_card_name,
+};
+use crate::trust_registry_verification::recorder_status::{
+    RecorderState, RecorderStatus, TrustRecorderStatusStore, global_store,
 };
 use crate::{config::GatewayConfig, observability::system_metrics::SystemInfo};
 
@@ -306,8 +311,21 @@ pub struct IdentityInfo {
     pub surface_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_principal: Option<CredentialPrincipal>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub name_conflict: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_surfaces: Vec<ManagedSurfaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder: Option<RecorderStatus>,
+    /// For a DID managed on several surfaces, the surface whose Trust Recorder outcome
+    /// `trust_recorder` shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
+}
+
+/// A live surface where a DID is the managed agent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedSurfaceInfo {
+    pub surface_id: String,
+    pub surface_name: String,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -369,6 +387,13 @@ pub struct SurfaceInfo {
     /// MPP payment configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mpp_policy: Option<crate::mpp::MppConfig>,
+    /// agent-pay payment configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_pay_policy: Option<crate::config::agent_surface::AgentPayPolicy>,
+    /// `unsupported_legacy` when the surface carries an enabled local x402 or
+    /// MPP policy, which makes every request answer 503.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_status: Option<String>,
     /// Supported A2A extensions (e.g., UCP)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supported_extensions: Vec<String>,
@@ -512,7 +537,8 @@ pub(crate) fn apply_tp_log_filter(
 
 /// Computes a full (unfiltered) dashboard delta for the WS broadcast.
 /// Delegates to `compute_dashboard_delta` with no filters so all sections
-/// (metrics, logs, channels, identities, tasks) are included.
+/// (metrics, logs, channels, identities, tasks) are included; each
+/// connection drops the log section unless its user holds `logs.view`.
 async fn compute_broadcast_delta(
     state: &DashboardState,
     since_epoch: Option<i64>,
@@ -532,7 +558,7 @@ async fn compute_broadcast_delta(
         transit_point: None,
         since_log_position,
     };
-    match compute_dashboard_delta(state, &query).await {
+    match compute_dashboard_delta(state, &query, true).await {
         Ok(delta) => delta,
         Err(e) => {
             tracing::warn!("Failed to compute broadcast delta: {}", e);
@@ -545,10 +571,12 @@ async fn compute_broadcast_delta(
 }
 
 /// Core logic for computing a dashboard delta. Used by the HTTP handler and
-/// the periodic WebSocket broadcast task.
+/// the periodic WebSocket broadcast task. The log file is read only when
+/// `include_logs` is set.
 pub async fn compute_dashboard_delta(
     state: &DashboardState,
     query: &DashboardQuery,
+    include_logs: bool,
 ) -> Result<DashboardDelta, String> {
     let now = Utc::now();
     let since_timestamp = query
@@ -786,88 +814,16 @@ pub async fn compute_dashboard_delta(
         },
     });
 
-    // Logs: prefer file_position-based delta over timestamp-based
-    // When filtering by channel, read more logs and filter them
-    let log_read_limit = if query.surface_id.is_some() {
-        2000
-    } else {
-        300
-    };
-
-    if let Some(since_pos) = query.since_log_position {
-        // Position-based delta: read entries after the given byte offset
-        let log_dir = state
+    changes.logs = delta_logs(
+        state
             .config
             .logging
             .log_directory
-            .clone();
-        let channel_filter = query.surface_id.clone();
-        let tp_filter_raw = query.transit_point.clone();
-
-        if let Ok(mut new_entries) =
-            tokio::task::spawn_blocking(move || read_log_entries_since(&log_dir, since_pos, log_read_limit)).await
-            && let Some(ref mut entries) = new_entries
-        {
-            // Filter logs by channel if channel_id is specified
-            if let Some(channel_id) = &channel_filter {
-                let channel_prefix = format!("[CHANNEL:{}]", channel_id);
-                entries.retain(|entry| {
-                    entry
-                        .message
-                        .contains(&channel_prefix)
-                });
-                if entries.len() > 300 {
-                    *entries = entries.split_off(entries.len() - 300);
-                }
-            }
-            // Surface transit-point slice on top of channel filter.
-            apply_tp_log_filter(entries, tp_filter_raw.as_deref());
-
-            if !entries.is_empty() {
-                changes.logs = Some(LogsDelta { new_entries: entries.clone() });
-            }
-        }
-    } else {
-        // No position available: read the last N entries from the end of the file.
-        // The frontend deduplicates by file_position so overlap is harmless.
-        let log_dir = state
-            .config
-            .logging
-            .log_directory
-            .clone();
-        let channel_filter = query.surface_id.clone();
-        let tp_filter_raw = query.transit_point.clone();
-
-        if let Ok(all_lines) = tokio::task::spawn_blocking(move || read_log_file(&log_dir, log_read_limit)).await {
-            let mut structured_logs: Vec<LogEntry> = all_lines
-                .iter()
-                .filter_map(|(offset, line)| {
-                    let mut entry = parse_log_entry(line)?;
-                    entry.file_position = *offset;
-                    Some(entry)
-                })
-                .collect();
-
-            // Filter logs by channel if channel_id is specified
-            if let Some(channel_id) = &channel_filter {
-                let channel_prefix = format!("[CHANNEL:{}]", channel_id);
-                structured_logs.retain(|entry| {
-                    entry
-                        .message
-                        .contains(&channel_prefix)
-                });
-                if structured_logs.len() > 300 {
-                    structured_logs = structured_logs.split_off(structured_logs.len() - 300);
-                }
-            }
-            // Surface transit-point slice on top of channel filter.
-            apply_tp_log_filter(&mut structured_logs, tp_filter_raw.as_deref());
-
-            if !structured_logs.is_empty() {
-                changes.logs = Some(LogsDelta { new_entries: structured_logs });
-            }
-        }
-    }
+            .clone(),
+        query,
+        include_logs,
+    )
+    .await;
 
     // Channels: Include only if any channel modified since 'since' timestamp
     let current_config = state
@@ -926,7 +882,16 @@ pub async fn compute_dashboard_delta(
             .changed_since(since)
             .into_iter()
             .collect();
-        let modified_identities = identities_changed_since(all_identities, since, &renamed, &renamed_surfaces);
+        let recorder_changed = match global_store() {
+            Some(recorder_status) => {
+                recorder_status
+                    .changed_dids_since(since)
+                    .await
+            }
+            None => std::collections::HashSet::new(),
+        };
+        let modified_identities =
+            identities_changed_since(all_identities, since, &renamed, &renamed_surfaces, &recorder_changed);
 
         if !modified_identities.is_empty() {
             changes.identities = Some(IdentitiesDelta {
@@ -1124,14 +1089,146 @@ pub async fn compute_dashboard_delta(
     })
 }
 
+/// The log section of a dashboard delta: the entries after
+/// `query.since_log_position`, or the newest entries when no position is
+/// given, filtered by the query's surface and transit point. `None` when
+/// `include_logs` is unset, without reading the log file, or when no entry
+/// matches.
+async fn delta_logs(
+    log_dir: Option<String>,
+    query: &DashboardQuery,
+    include_logs: bool,
+) -> Option<LogsDelta> {
+    if !include_logs {
+        return None;
+    }
+
+    // When filtering by channel, read more logs and filter them
+    let log_read_limit = if query.surface_id.is_some() {
+        2000
+    } else {
+        300
+    };
+    let mut entries = if let Some(since_pos) = query.since_log_position {
+        // Position-based delta: read entries after the given byte offset
+        tokio::task::spawn_blocking(move || read_log_entries_since(&log_dir, since_pos, log_read_limit))
+            .await
+            .ok()
+            .flatten()?
+    } else {
+        // No position available: read the last N entries from the end of the file.
+        // The frontend deduplicates by file_position so overlap is harmless.
+        let all_lines = tokio::task::spawn_blocking(move || read_log_file(&log_dir, log_read_limit))
+            .await
+            .ok()?;
+        all_lines
+            .iter()
+            .filter_map(|(offset, line)| {
+                let mut entry = parse_log_entry(line)?;
+                entry.file_position = *offset;
+                Some(entry)
+            })
+            .collect()
+    };
+    if let Some(channel_id) = &query.surface_id {
+        let channel_prefix = format!("[CHANNEL:{}]", channel_id);
+        entries.retain(|entry| {
+            entry
+                .message
+                .contains(&channel_prefix)
+        });
+        if entries.len() > 300 {
+            entries = entries.split_off(entries.len() - 300);
+        }
+    }
+    // Surface transit-point slice on top of channel filter.
+    apply_tp_log_filter(&mut entries, query.transit_point.as_deref());
+
+    (!entries.is_empty()).then_some(LogsDelta { new_entries: entries })
+}
+
+/// The newest log entries for the dashboard stats, filtered by the query's
+/// surface and transit point and capped at 300. Empty when `include_logs` is
+/// unset, without reading the log file.
+async fn stats_log_entries(
+    log_dir: Option<String>,
+    query: &DashboardQuery,
+    include_logs: bool,
+) -> Vec<LogEntry> {
+    if !include_logs {
+        return Vec::new();
+    }
+
+    // When the request scopes to a channel (or surface TP slice), read more
+    // lines so post-filter the user still sees a useful tail.
+    let log_read_limit = if query.surface_id.is_some() {
+        2000
+    } else {
+        300
+    };
+    let mut log_entries: Vec<LogEntry> = tokio::task::spawn_blocking(move || {
+        let log_lines = read_log_file(&log_dir, log_read_limit);
+        log_lines
+            .iter()
+            .filter_map(|(offset, line)| {
+                let mut entry = parse_log_entry(line)?;
+                entry.file_position = *offset;
+                Some(entry)
+            })
+            .collect::<Vec<LogEntry>>()
+    })
+    .await
+    .unwrap_or_else(|_| vec![]);
+    if let Some(channel_id) = &query.surface_id {
+        let channel_prefix = format!("[CHANNEL:{}]", channel_id);
+        log_entries.retain(|entry| {
+            entry
+                .message
+                .contains(&channel_prefix)
+        });
+    }
+    apply_tp_log_filter(&mut log_entries, query.transit_point.as_deref());
+    if log_entries.len() > 300 {
+        log_entries = log_entries.split_off(log_entries.len() - 300);
+    }
+    log_entries
+}
+
+/// Whether the caller of a dashboard request may read log lines
+/// (`logs.view`). A request without an RBAC guard or an authenticated user
+/// may not.
+async fn request_allows_logs(
+    guard: &Option<Extension<RbacGuard>>,
+    caller: &Option<Extension<AuthGuardOk>>,
+    pat: &Option<Extension<PatContext>>,
+) -> bool {
+    caller_allows(
+        guard
+            .as_ref()
+            .map(|Extension(guard)| guard),
+        caller
+            .as_ref()
+            .map(|Extension(AuthGuardOk(user_id))| user_id.as_str()),
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+        &crate::rbac::Feature::LogsView,
+    )
+    .await
+}
+
 /// API endpoint to get incremental dashboard updates (delta/changes only).
 /// Deprecated: deltas are now pushed via WebSocket. This endpoint remains
-/// for backward compatibility.
+/// for backward compatibility. Log lines are left out unless the caller
+/// holds `logs.view`.
 pub async fn get_dashboard_delta(
     State(state): State<DashboardState>,
+    guard: Option<Extension<RbacGuard>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    pat: Option<Extension<PatContext>>,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Json<DashboardDelta>, (axum::http::StatusCode, String)> {
-    compute_dashboard_delta(&state, &query)
+    let include_logs = request_allows_logs(&guard, &caller, &pat).await;
+    compute_dashboard_delta(&state, &query, include_logs)
         .await
         .map(Json)
         .map_err(|msg| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg))
@@ -1227,9 +1324,13 @@ pub fn init_dashboard_delta_broadcast(
     });
 }
 
-/// API endpoint to get dashboard statistics (full response - for compatibility)
+/// API endpoint to get dashboard statistics (full response - for compatibility).
+/// `proxy_info.log_entries` is empty unless the caller holds `logs.view`.
 pub async fn get_dashboard_stats(
     State(state): State<DashboardState>,
+    guard: Option<Extension<RbacGuard>>,
+    caller: Option<Extension<AuthGuardOk>>,
+    pat: Option<Extension<PatContext>>,
     Query(query): Query<DashboardQuery>,
 ) -> Result<Json<DashboardStats>, (axum::http::StatusCode, String)> {
     // Get all identities with full agent identity data
@@ -1429,6 +1530,10 @@ pub async fn get_dashboard_stats(
                     .publish_to_did_document,
                 payment_policy: r.x402_config().cloned(),
                 mpp_policy: r.mpp_config().cloned(),
+                agent_pay_policy: r.agent_pay_policy().cloned(),
+                payment_status: r
+                    .payment_policy_unsupported()
+                    .then(|| "unsupported_legacy".to_string()),
                 supported_extensions: r
                     .access_point
                     .supported_extensions
@@ -1441,7 +1546,10 @@ pub async fn get_dashboard_stats(
                 last_activity,
                 target_auth: r.target_auth().cloned(),
                 trust_recorder: r.trust_recorder().cloned(),
-                source_auth: r.source_auth().cloned(),
+                source_auth: r
+                    .source_auth_methods()
+                    .first()
+                    .cloned(),
                 managed_identity: r_managed_identity,
                 issuer_id: r.issuer_id.clone(),
                 outbound_listen_address: r
@@ -1672,47 +1780,16 @@ pub async fn get_dashboard_stats(
             })
         });
 
-    // Read last 300 lines of log file if configured - use spawn_blocking to avoid blocking executor.
-    // When the request scopes to a channel (or surface TP slice), read more
-    // lines so post-filter the user still sees a useful tail.
-    let log_read_limit = if query.surface_id.is_some() {
-        2000
-    } else {
-        300
-    };
-    let log_dir = state
-        .config
-        .logging
-        .log_directory
-        .clone();
-    let channel_filter = query.surface_id.clone();
-    let tp_filter_raw = query.transit_point.clone();
-    let log_entries: Vec<LogEntry> = tokio::task::spawn_blocking(move || {
-        let log_lines = read_log_file(&log_dir, log_read_limit);
-        log_lines
-            .iter()
-            .filter_map(|(offset, line)| {
-                let mut entry = parse_log_entry(line)?;
-                entry.file_position = *offset;
-                Some(entry)
-            })
-            .collect::<Vec<LogEntry>>()
-    })
-    .await
-    .unwrap_or_else(|_| vec![]);
-    let mut log_entries = log_entries;
-    if let Some(channel_id) = &channel_filter {
-        let channel_prefix = format!("[CHANNEL:{}]", channel_id);
-        log_entries.retain(|entry| {
-            entry
-                .message
-                .contains(&channel_prefix)
-        });
-    }
-    apply_tp_log_filter(&mut log_entries, tp_filter_raw.as_deref());
-    if log_entries.len() > 300 {
-        log_entries = log_entries.split_off(log_entries.len() - 300);
-    }
+    let log_entries = stats_log_entries(
+        state
+            .config
+            .logging
+            .log_directory
+            .clone(),
+        &query,
+        request_allows_logs(&guard, &caller, &pat).await,
+    )
+    .await;
 
     // Trust registry DID is now per-registry, no single shared DID to display
     let trust_registry_did: Option<String> = None;
@@ -1948,7 +2025,8 @@ fn format_uptime(seconds: u64) -> String {
     }
 }
 
-/// Identities created, last used, or whose caller or target Agent Card name changed after `since`.
+/// Identities created, last used, whose caller or target Agent Card name changed, or whose
+/// Trust Recorder status changed after `since`.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -1957,6 +2035,7 @@ pub(crate) fn identities_changed_since(
     since: DateTime<Utc>,
     renamed_dids: &std::collections::HashSet<String>,
     renamed_surfaces: &std::collections::HashSet<String>,
+    recorder_changed_dids: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
     identities
         .into_iter()
@@ -1966,6 +2045,7 @@ pub(crate) fn identities_changed_since(
                 .as_deref()
                 .unwrap_or(id.created_at.as_str());
             renamed_dids.contains(&id.did)
+                || (id.trust_recorder.is_some() && recorder_changed_dids.contains(&id.did))
                 || id
                     .surface_id
                     .as_ref()
@@ -1984,6 +2064,7 @@ async fn build_identity_list(
     metrics_store: &Arc<MetricsStore>,
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
+    let recorder_status = global_store();
     build_identity_list_with(
         identity_store,
         &current_config.surfaces,
@@ -1991,6 +2072,7 @@ async fn build_identity_list(
         agent_surface_store,
         CallerNameService::global(),
         TargetCardNameService::global(),
+        recorder_status.as_deref(),
     )
     .await
 }
@@ -2002,6 +2084,7 @@ pub(crate) async fn build_identity_list_with(
     agent_surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
     caller_names: &Arc<CallerNameService>,
     card_names: &Arc<TargetCardNameService>,
+    recorder_status: Option<&TrustRecorderStatusStore>,
 ) -> Result<Vec<IdentityInfo>, (axum::http::StatusCode, String)> {
     let records = identity_store
         .list_all()
@@ -2026,7 +2109,11 @@ pub(crate) async fn build_identity_list_with(
             .entry(s.surface_id.as_str())
             .or_insert(s);
     }
-    let managed_surfaces_by_did = surfaces_by_did(&records);
+    let managed_surfaces_by_did = managed_surfaces_by_did(&records, |id| {
+        surfaces_by_id
+            .get(id)
+            .copied()
+    });
 
     // Get metrics to compute actual usage counts and determine active channels
     let identity_stats = metrics_store
@@ -2078,19 +2165,41 @@ pub(crate) async fn build_identity_list_with(
             let channel_name = surface.map(|s| s.name.clone());
 
             let origin = r.effective_origin();
-            let managed_surface = surface.filter(|_| origin == Some(IdentityOrigin::Managed));
+            let is_managed = origin == Some(IdentityOrigin::Managed);
+            let managed_ids = managed_surfaces_by_did
+                .get(&r.did)
+                .filter(|_| is_managed)
+                .unwrap_or(&no_surfaces);
+            let mut managed_surfaces: Vec<ManagedSurfaceInfo> = managed_ids
+                .iter()
+                .filter_map(|id| surfaces_by_id.get(id.as_str()))
+                .map(|s| ManagedSurfaceInfo {
+                    surface_id: s.surface_id.clone(),
+                    surface_name: s.name.trim().to_string(),
+                })
+                .collect();
+            managed_surfaces.sort_by(|a, b| {
+                (a.surface_name.to_lowercase(), &a.surface_id).cmp(&(b.surface_name.to_lowercase(), &b.surface_id))
+            });
+            let managed_surface = match managed_surfaces.as_slice() {
+                [only] => surfaces_by_id
+                    .get(only.surface_id.as_str())
+                    .copied(),
+                _ => None,
+            };
             let card_name = managed_surface.and_then(|s| {
                 CardLocation::for_surface(s).and_then(|location| card_names.lookup_or_spawn(&s.surface_id, &location))
             });
-            let managed_name: Option<ManagedDisplayName> = managed_surface.map(|s| {
-                resolve_managed_display_name(
-                    s,
-                    managed_surfaces_by_did
-                        .get(&r.did)
-                        .unwrap_or(&no_surfaces),
-                    card_name.as_deref(),
-                )
-            });
+            let managed_name: Option<ManagedDisplayName> = match managed_surface {
+                Some(s) => Some(resolve_managed_display_name(s, managed_ids, card_name.as_deref())),
+                None if managed_ids.len() > 1 => Some(ManagedDisplayName::Shared {
+                    surface_ids: managed_ids
+                        .iter()
+                        .cloned()
+                        .collect(),
+                }),
+                None => None,
+            };
             let caller_lookup =
                 (origin == Some(IdentityOrigin::ExternalCaller)).then(|| caller_names.lookup_or_spawn(&r.did));
             let naming = with_target_card_name(
@@ -2098,10 +2207,7 @@ pub(crate) async fn build_identity_list_with(
                 origin,
                 card_name,
             );
-            let is_managed = origin == Some(IdentityOrigin::Managed);
-            let surface_id = channel_config_id
-                .clone()
-                .filter(|_| is_managed);
+            let surface_id = managed_surface.map(|s| s.surface_id.clone());
             let surface_name = managed_surface
                 .map(|s| s.name.trim().to_string())
                 .filter(|name| !name.is_empty());
@@ -2143,7 +2249,9 @@ pub(crate) async fn build_identity_list_with(
                 surface_id,
                 surface_name,
                 credential_principal: principal,
-                name_conflict: naming.name_conflict,
+                managed_surfaces,
+                trust_recorder: None,
+                trust_recorder_surface: None,
             }
         })
         .collect();
@@ -2163,7 +2271,66 @@ pub(crate) async fn build_identity_list_with(
             .take()
             .map(|p| principal_names.named(p));
     }
+    if let Some(recorder_status) = recorder_status {
+        for identity in &mut identities {
+            let Some((status, surface)) = recorder_status_for(identity, &surfaces_by_id, recorder_status).await else {
+                continue;
+            };
+            identity.trust_recorder = Some(status);
+            identity.trust_recorder_surface = (identity
+                .managed_surfaces
+                .len()
+                > 1)
+            .then_some(surface);
+        }
+    }
     Ok(identities)
+}
+
+/// Managed identities on a surface with a Trust Recorder carry its last known outcome, or
+/// `not_attempted` before the first one. A DID managed on several such surfaces carries the
+/// worst of their outcomes, with the surface it came from. Every other identity carries none.
+async fn recorder_status_for(
+    identity: &IdentityInfo,
+    surfaces_by_id: &std::collections::HashMap<&str, &crate::config::agent_surface::AgentSurface>,
+    recorder_status: &TrustRecorderStatusStore,
+) -> Option<(RecorderStatus, ManagedSurfaceInfo)> {
+    if identity.origin != Some(IdentityOrigin::Managed) {
+        return None;
+    }
+    let mut worst: Option<(RecorderStatus, ManagedSurfaceInfo)> = None;
+    for managed in &identity.managed_surfaces {
+        let Some(surface) = surfaces_by_id.get(managed.surface_id.as_str()) else {
+            continue;
+        };
+        if surface
+            .trust_recorder()
+            .is_none_or(|recorder| recorder.entries.is_empty())
+        {
+            continue;
+        }
+        let status = recorder_status
+            .status_for(&surface.surface_id, &identity.did)
+            .await
+            .unwrap_or_else(RecorderStatus::not_attempted);
+        if worst
+            .as_ref()
+            .is_none_or(|(w, _)| recorder_severity(status.state) > recorder_severity(w.state))
+        {
+            worst = Some((status, managed.clone()));
+        }
+    }
+    worst
+}
+
+fn recorder_severity(state: RecorderState) -> u8 {
+    match state {
+        RecorderState::Recorded => 0,
+        RecorderState::NotAttempted => 1,
+        RecorderState::Skipped => 2,
+        RecorderState::Partial => 3,
+        RecorderState::Failed => 4,
+    }
 }
 
 /// Helper function to build channel list
@@ -2285,6 +2452,10 @@ async fn build_channel_list(
                 .publish_to_did_document,
             payment_policy: r.x402_config().cloned(),
             mpp_policy: r.mpp_config().cloned(),
+            agent_pay_policy: r.agent_pay_policy().cloned(),
+            payment_status: r
+                .payment_policy_unsupported()
+                .then(|| "unsupported_legacy".to_string()),
             supported_extensions: r
                 .access_point
                 .supported_extensions
@@ -2297,7 +2468,10 @@ async fn build_channel_list(
             last_activity,
             target_auth: r.target_auth().cloned(),
             trust_recorder: r.trust_recorder().cloned(),
-            source_auth: r.source_auth().cloned(),
+            source_auth: r
+                .source_auth_methods()
+                .first()
+                .cloned(),
             managed_identity: r_managed_identity,
             issuer_id: r.issuer_id.clone(),
             outbound_listen_address: r
@@ -2314,18 +2488,92 @@ async fn build_channel_list(
     channel_infos
 }
 
+/// Size of each chunk read backwards while looking for the start of the log tail.
+const LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// Most bytes a tail read goes back from the end of the log file.
+const LOG_TAIL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Find where the last `max_lines` lines of a log begin.
+///
+/// Scans backwards from `file_len` in chunks, counting newlines, and never
+/// reads before `lower`. Returns the byte offset of the first of those lines,
+/// or `None` when fewer than `max_lines` lines start after `lower`.
+fn log_tail_line_start<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    file_len: u64,
+    lower: u64,
+    max_lines: usize,
+) -> std::io::Result<Option<u64>> {
+    use std::io::SeekFrom;
+
+    let mut buf = vec![0u8; LOG_TAIL_CHUNK_BYTES as usize];
+    let mut line_starts = 0;
+    let mut end = file_len;
+    while end > lower && max_lines > 0 {
+        let chunk_start = end
+            .saturating_sub(LOG_TAIL_CHUNK_BYTES)
+            .max(lower);
+        let chunk = &mut buf[..(end - chunk_start) as usize];
+        file.seek(SeekFrom::Start(chunk_start))?;
+        file.read_exact(chunk)?;
+        for (index, byte) in chunk.iter().enumerate().rev() {
+            let line_start = chunk_start + index as u64 + 1;
+            if *byte == b'\n' && line_start < file_len {
+                line_starts += 1;
+                if line_starts == max_lines {
+                    return Ok(Some(line_start));
+                }
+            }
+        }
+        end = chunk_start;
+    }
+    Ok(None)
+}
+
+/// Read the lines of a log from `start` to the end, as (byte_offset, line) pairs.
+///
+/// With `skip_first_line`, the bytes up to the first newline are skipped, for a
+/// `start` that may fall inside a line or names a line the caller already has.
+fn read_log_lines_from<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
+    start: u64,
+    skip_first_line: bool,
+) -> std::io::Result<Vec<(u64, String)>> {
+    use std::io::{BufRead, SeekFrom};
+
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut offset = start;
+    if skip_first_line {
+        offset += reader.read_until(b'\n', &mut Vec::new())? as u64;
+    }
+
+    let mut lines = Vec::new();
+    for content in reader
+        .lines()
+        .map_while(Result::ok)
+    {
+        let line_offset = offset;
+        offset += content.len() as u64 + 1;
+        lines.push((line_offset, content));
+    }
+    Ok(lines)
+}
+
 /// Read log entries after the given byte offset in the active log file.
 ///
-/// Seeks directly to `after_position`, skips to the next complete line,
-/// then reads all remaining entries. If more than `max_lines` entries exist,
-/// only the **last** (freshest) `max_lines` are returned so the UX always
-/// shows the end of the file.
+/// Reads only the last `max_lines` lines written after the line at
+/// `after_position`, found by scanning backwards from the end of the file, and
+/// never more than `LOG_TAIL_MAX_BYTES`. A position far behind the end of a
+/// large file therefore costs no more than a recent one. Only the **last**
+/// (freshest) `max_lines` entries are returned so the UX always shows the end
+/// of the file.
 fn read_log_entries_since(
     log_directory: &Option<String>,
     after_position: u64,
     max_lines: usize,
 ) -> Option<Vec<LogEntry>> {
-    use std::io::{BufRead, Seek, SeekFrom};
     use std::path::PathBuf;
 
     let log_dir = log_directory.as_ref()?;
@@ -2345,23 +2593,22 @@ fn read_log_entries_since(
         return None;
     }
 
-    // Seek and discard the (likely partial) first line
-    let _ = file.seek(SeekFrom::Start(after_position));
-    let mut reader = std::io::BufReader::new(&file);
-    let mut partial = String::new();
-    let partial_len = reader
-        .read_line(&mut partial)
-        .unwrap_or(0);
-    let mut offset = after_position + partial_len as u64;
+    let lower = after_position.max(file_len.saturating_sub(LOG_TAIL_MAX_BYTES));
+    // Below the byte cap, start one byte early so a line beginning exactly at
+    // `lower` is kept; at `after_position`, skip the line the caller has.
+    let fallback_start = if lower > after_position {
+        lower - 1
+    } else {
+        lower
+    };
+    let lines = match log_tail_line_start(&mut file, file_len, lower, max_lines).ok()? {
+        Some(start) => read_log_lines_from(&mut file, start, false),
+        None => read_log_lines_from(&mut file, fallback_start, true),
+    }
+    .ok()?;
 
     let mut entries = Vec::new();
-    for content in reader
-        .lines()
-        .map_while(Result::ok)
-    {
-        let line_offset = offset;
-        offset += content.len() as u64 + 1;
-
+    for (line_offset, content) in lines {
         if let Some(mut entry) = parse_log_entry(&content) {
             entry.file_position = line_offset;
             entries.push(entry);
@@ -2502,7 +2749,9 @@ mod tests {
         use chrono::Utc;
         use serde_json::{Value, json};
 
-        use super::super::{IdentityInfo, build_identity_list_with, identities_changed_since};
+        use super::super::{
+            IdentityInfo, ManagedSurfaceInfo, build_identity_list_with, identities_changed_since, recorder_severity,
+        };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
         use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
@@ -2543,11 +2792,7 @@ mod tests {
             id: &str,
             name: &str,
         ) -> AgentSurface {
-            AgentSurface {
-                surface_id: id.to_string(),
-                name: name.to_string(),
-                ..Default::default()
-            }
+            crate::identity::test_helpers::test_surface_with_managed_identity(id, name)
         }
 
         fn managed(
@@ -2589,6 +2834,7 @@ mod tests {
                 None,
                 caller_names,
                 &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+                None,
             )
             .await
             .unwrap()
@@ -2639,25 +2885,354 @@ mod tests {
             );
         }
 
+        fn surface_with_recorder(
+            id: &str,
+            name: &str,
+        ) -> AgentSurface {
+            let mut surface = surface(id, name);
+            surface
+                .access_point
+                .trust_recorder = Some(crate::config::types::TrustRecorderConfig {
+                entries: vec![crate::config::types::TrustRecorderEntry {
+                    trust_registry_id: "tr-1".into(),
+                    issuer_did: "did:example:issuer".into(),
+                    authority_did: "did:example:authority".into(),
+                    include_owned_agent: true,
+                    custom_resources: vec![],
+                }],
+            });
+            surface
+        }
+
+        async fn list_with_recorder(
+            records: Vec<AgentIdentityRecord>,
+            surfaces: &[AgentSurface],
+            recorder_status: &crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore,
+        ) -> HashMap<String, IdentityInfo> {
+            let store = MockIdentityStore::new();
+            for record in records {
+                store
+                    .create(record)
+                    .await
+                    .unwrap();
+            }
+            let store: Arc<dyn IdentityStore> = Arc::new(store);
+            build_identity_list_with(
+                &store,
+                surfaces,
+                &Arc::new(MetricsStore::new(10)),
+                None,
+                &names(),
+                &Arc::new(TargetCardNameService::new(Arc::new(NoTargetCards))),
+                Some(recorder_status),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.did.clone(), i))
+            .collect()
+        }
+
         #[tokio::test]
-        async fn test_conflicting_did_has_conflict_marker_and_no_name() {
+        async fn test_managed_identity_on_a_recorder_surface_is_not_attempted_before_any_outcome() {
+            use crate::trust_registry_verification::recorder_status::{RecorderState, TrustRecorderStatusStore};
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen")],
+                &[surface_with_recorder("oxygen", "OXYGEN")],
+                &status_store,
+            )
+            .await;
+
+            let status = rows["did:example:oxygen"]
+                .trust_recorder
+                .as_ref()
+                .expect("recorder status");
+            assert_eq!(status.state, RecorderState::NotAttempted);
+            let json = serde_json::to_value(&rows["did:example:oxygen"]).unwrap();
+            assert_eq!(json["trust_recorder"]["state"], json!("not_attempted"));
+            assert_eq!(json["trust_recorder"]["entries"], json!([]));
+        }
+
+        #[tokio::test]
+        async fn test_managed_identity_carries_the_recorded_outcome_of_its_own_surface_only() {
+            use crate::trust_registry_verification::recorder_status::{
+                EntryStatus, RecorderState, TrustRecorderStatusStore,
+            };
+            let status_store = TrustRecorderStatusStore::in_memory();
+            status_store
+                .record(
+                    "oxygen",
+                    "did:example:oxygen",
+                    vec![EntryStatus::from_counts("tr-1", 1, 1, 0, None)],
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            status_store
+                .record(
+                    "helium",
+                    "did:example:helium",
+                    vec![EntryStatus::from_counts("tr-1", 0, 0, 1, None)],
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .await
+                .unwrap();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen"), managed("did:example:helium", "helium")],
+                &[surface_with_recorder("oxygen", "OXYGEN"), surface_with_recorder("helium", "HELIUM")],
+                &status_store,
+            )
+            .await;
+
+            let oxygen = rows["did:example:oxygen"]
+                .trust_recorder
+                .as_ref()
+                .unwrap();
+            assert_eq!(oxygen.state, RecorderState::Recorded);
+            assert_eq!((oxygen.entries[0].created, oxygen.entries[0].already_existed), (1, 1));
+            assert!(
+                oxygen
+                    .last_attempt_at
+                    .is_some()
+            );
+            let helium = rows["did:example:helium"]
+                .trust_recorder
+                .as_ref()
+                .unwrap();
+            assert_eq!(helium.state, RecorderState::Failed);
+            for did in ["did:example:oxygen", "did:example:helium"] {
+                assert_eq!(rows[did].trust_recorder_surface, None, "a single-surface DID names no recorder surface");
+            }
+        }
+
+        #[tokio::test]
+        async fn test_shared_managed_did_carries_the_worst_outcome_of_its_recorder_surfaces() {
+            use crate::trust_registry_verification::recorder_status::{
+                EntryStatus, RecorderState, TrustRecorderStatusStore,
+            };
+            let status_store = TrustRecorderStatusStore::in_memory();
+            for (surface_id, failed) in [("oxygen", 0), ("helium", 1)] {
+                status_store
+                    .record(
+                        surface_id,
+                        "did:example:shared",
+                        vec![EntryStatus::from_counts("tr-1", 1 - failed, 0, failed, None)],
+                        Utc::now(),
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap();
+            }
             let mut record = managed("did:example:shared", "oxygen");
             record
                 .channel_usage
-                .push(crate::identity::filesystem::ChannelUsage {
-                    channel_config_id: "helium".to_string(),
-                    usage_count: 1,
-                    last_used_at: Utc::now(),
-                });
-            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("helium", "HELIUM")], &names()).await;
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::Managed));
+            let rows = list_with_recorder(
+                vec![record],
+                &[
+                    surface_with_recorder("oxygen", "OXYGEN"),
+                    surface_with_recorder("helium", "HELIUM"),
+                    surface("argon", "ARGON"),
+                ],
+                &status_store,
+            )
+            .await;
+
             let row = &rows["did:example:shared"];
-            assert!(row.name_conflict);
-            assert_eq!(row.display_name, None);
-            let json = serde_json::to_value(row).unwrap();
-            assert_eq!(json["name_conflict"], json!(true));
+            assert_eq!(row.surface_id, None);
+            assert_eq!(
+                row.trust_recorder
+                    .as_ref()
+                    .map(|status| status.state),
+                Some(RecorderState::Failed)
+            );
+            assert_eq!(
+                row.trust_recorder_surface,
+                Some(ManagedSurfaceInfo {
+                    surface_id: "helium".to_string(),
+                    surface_name: "HELIUM".to_string(),
+                })
+            );
+        }
+
+        #[test]
+        fn test_recorder_severity_ranks_every_state() {
+            use crate::trust_registry_verification::recorder_status::RecorderState;
+            let ranked = [
+                RecorderState::Recorded,
+                RecorderState::NotAttempted,
+                RecorderState::Skipped,
+                RecorderState::Partial,
+                RecorderState::Failed,
+            ];
+
+            for pair in ranked.windows(2) {
+                assert!(
+                    recorder_severity(pair[0]) < recorder_severity(pair[1]),
+                    "{:?} must rank below {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_identities_without_a_recorder_or_not_managed_carry_no_recorder_status() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = list_with_recorder(
+                vec![managed("did:example:plain", "plain"), caller(CALLER_DID)],
+                &[surface("plain", "PLAIN"), surface_with_recorder("oxygen", "OXYGEN")],
+                &status_store,
+            )
+            .await;
+
+            for did in ["did:example:plain", CALLER_DID] {
+                let json = serde_json::to_value(&rows[did]).unwrap();
+                assert!(
+                    json.get("trust_recorder")
+                        .is_none(),
+                    "{did} must not carry a recorder status: {json}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_a_surface_with_an_empty_recorder_has_no_recorder_status() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let mut empty = surface_with_recorder("oxygen", "OXYGEN");
+            empty
+                .access_point
+                .trust_recorder
+                .as_mut()
+                .unwrap()
+                .entries
+                .clear();
+            let rows = list_with_recorder(
+                vec![managed("did:example:oxygen", "oxygen")],
+                &[empty],
+                &TrustRecorderStatusStore::in_memory(),
+            )
+            .await;
             assert!(
-                json.get("display_name")
+                rows["did:example:oxygen"]
+                    .trust_recorder
                     .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_a_recorder_status_change_alone_puts_the_identity_in_the_delta() {
+            use crate::trust_registry_verification::recorder_status::TrustRecorderStatusStore;
+            let status_store = TrustRecorderStatusStore::in_memory();
+            let rows = || async {
+                let mut record = managed("did:example:oxygen", "oxygen");
+                record.last_used_at = Some(Utc::now() - chrono::Duration::hours(1));
+                list_with_recorder(vec![record], &[surface_with_recorder("oxygen", "OXYGEN")], &status_store)
+                    .await
+                    .into_values()
+                    .collect::<Vec<IdentityInfo>>()
+            };
+            let since = Utc::now() - chrono::Duration::minutes(1);
+
+            let unchanged =
+                identities_changed_since(rows().await, since, &HashSet::new(), &HashSet::new(), &HashSet::new());
+            assert!(unchanged.is_empty());
+
+            let changed = HashSet::from(["did:example:oxygen".to_string()]);
+            let delta = identities_changed_since(rows().await, since, &HashSet::new(), &HashSet::new(), &changed);
+            assert_eq!(delta.len(), 1);
+            assert_eq!(delta[0].did, "did:example:oxygen");
+        }
+
+        #[tokio::test]
+        async fn test_a_recorder_change_for_an_identity_without_a_recorder_is_not_pushed() {
+            let record = managed("did:example:plain", "plain");
+            let mut rows: Vec<IdentityInfo> = list(vec![record], &[surface("plain", "PLAIN")], &names())
+                .await
+                .into_values()
+                .collect();
+            rows[0].last_used_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+            let since = Utc::now() - chrono::Duration::minutes(1);
+
+            let changed = HashSet::from(["did:example:plain".to_string()]);
+            assert!(identities_changed_since(rows, since, &HashSet::new(), &HashSet::new(), &changed).is_empty());
+        }
+
+        fn usage(
+            surface_id: &str,
+            role: IdentityOrigin,
+        ) -> crate::identity::filesystem::ChannelUsage {
+            crate::identity::test_helpers::test_channel_usage(surface_id, Some(role))
+        }
+
+        #[tokio::test]
+        async fn test_shared_managed_did_lists_its_managed_surfaces_and_has_no_name() {
+            let mut record = managed("did:example:shared", "oxygen");
+            record
+                .channel_usage
+                .push(usage("helium", IdentityOrigin::Managed));
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            let surfaces = [surface("oxygen", "OXYGEN"), surface("helium", "HELIUM"), surface("argon", "ARGON")];
+            let rows = list(vec![record], &surfaces, &names()).await;
+            let row = &rows["did:example:shared"];
+            assert_eq!(row.display_name, None);
+            assert_eq!(row.surface_id, None);
+            assert_eq!(row.surface_name, None);
+            let json = serde_json::to_value(row).unwrap();
+            assert_eq!(
+                json["managed_surfaces"],
+                json!([
+                    { "surface_id": "helium", "surface_name": "HELIUM" },
+                    { "surface_id": "oxygen", "surface_name": "OXYGEN" }
+                ])
+            );
+            assert!(
+                json.get("name_conflict")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_seen_as_caller_elsewhere_is_named_after_its_managed_surface() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("argon", IdentityOrigin::ExternalCaller));
+            record.channel_config_id = Some("argon".to_string());
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN"), surface("argon", "ARGON")], &names()).await;
+            let row = &rows["did:example:oxygen"];
+            assert_eq!(row.display_name.as_deref(), Some("OXYGEN"));
+            assert_eq!(row.surface_id.as_deref(), Some("oxygen"));
+            assert_eq!(
+                row.managed_surfaces,
+                vec![crate::observability::dashboard::ManagedSurfaceInfo {
+                    surface_id: "oxygen".to_string(),
+                    surface_name: "OXYGEN".to_string()
+                }]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_did_whose_other_surface_was_deleted_is_named() {
+            let mut record = managed("did:example:oxygen", "oxygen");
+            record
+                .channel_usage
+                .push(usage("deleted", IdentityOrigin::Managed));
+            let rows = list(vec![record], &[surface("oxygen", "OXYGEN")], &names()).await;
+            assert_eq!(
+                rows["did:example:oxygen"]
+                    .display_name
+                    .as_deref(),
+                Some("OXYGEN")
             );
         }
 
@@ -2668,7 +3243,7 @@ mod tests {
             let first = serde_json::to_value(&rows[CALLER_DID]).unwrap();
             assert_eq!(first["origin"], json!("external_caller"));
             assert_eq!(first["display_name_pending"], json!(true));
-            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "name_conflict"] {
+            for absent in ["display_name", "surface_id", "surface_name", "credential_principal", "managed_surfaces"] {
                 assert!(first.get(absent).is_none(), "{absent} must be omitted for a caller row: {first}");
             }
 
@@ -2757,7 +3332,10 @@ mod tests {
             }))
             .unwrap();
             assert_eq!(info.origin, None);
-            assert!(!info.name_conflict);
+            assert!(
+                info.managed_surfaces
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
@@ -2776,7 +3354,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new()).is_empty());
+            assert!(identities_changed_since(rows, since, &renamed, &HashSet::new(), &HashSet::new()).is_empty());
 
             wait_for_caller_name(&caller_names).await;
             let rows: Vec<IdentityInfo> = list(vec![record], &[], &caller_names)
@@ -2787,7 +3365,7 @@ mod tests {
                 .changed_since(since)
                 .into_iter()
                 .collect();
-            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new());
+            let delta = identities_changed_since(rows, since, &renamed, &HashSet::new(), &HashSet::new());
             assert_eq!(delta.len(), 1);
             assert_eq!(
                 delta[0]
@@ -2833,6 +3411,401 @@ mod tests {
         assert_eq!(entry.level, "DEBUG");
         assert_eq!(entry.message, "request details");
     }
+
+    mod log_access {
+        use std::io::Write;
+        use std::sync::Arc;
+
+        use axum::Extension;
+
+        use super::super::{DashboardQuery, delta_logs, request_allows_logs, stats_log_entries};
+        use crate::auth::storage::{PasskeyStorage, UserData};
+        use crate::auth::types::{UserRole, UserStatus};
+        use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard};
+        use crate::auth_manager::pat::PatContext;
+
+        async fn guard_with(
+            role: UserRole,
+            dir: &tempfile::TempDir,
+        ) -> RbacGuard {
+            let storage = PasskeyStorage::new(
+                dir.path()
+                    .join("users")
+                    .to_string_lossy()
+                    .into_owned(),
+                dir.path()
+                    .join("avatars")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .unwrap();
+            let now = chrono::Utc::now();
+            storage
+                .save_user(&UserData {
+                    user_id: "user-1".to_string(),
+                    username: "user".to_string(),
+                    passkeys: Vec::new(),
+                    role,
+                    status: UserStatus::Approved,
+                    is_primary: false,
+                    first_name: None,
+                    last_name: None,
+                    email: None,
+                    department: None,
+                    job_title: None,
+                    avatar_path: None,
+                    created_at: now,
+                    updated_at: now,
+                    last_logged_in: None,
+                    saml_id: None,
+                })
+                .await
+                .unwrap();
+            let mut rbac = crate::rbac::RbacConfig::default();
+            rbac.permissions
+                .insert("logs.view".to_string(), "poweruser".to_string());
+            RbacGuard::new(Arc::new(storage), Arc::new(rbac))
+        }
+
+        async fn allows_logs(
+            guard: Option<&RbacGuard>,
+            user_id: Option<&str>,
+            scopes: Option<&[&str]>,
+        ) -> bool {
+            request_allows_logs(
+                &guard.map(|guard| Extension(guard.clone())),
+                &user_id.map(|user_id| Extension(AuthGuardOk(user_id.to_string()))),
+                &scopes.map(|scopes| {
+                    Extension(PatContext(Some(
+                        scopes
+                            .iter()
+                            .map(|scope| scope.to_string())
+                            .collect(),
+                    )))
+                }),
+            )
+            .await
+        }
+
+        fn log_dir_with_lines(lines: usize) -> (tempfile::TempDir, Option<String>) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut file = std::fs::File::create(
+                dir.path()
+                    .join("agent-gateway.log"),
+            )
+            .expect("log file");
+            for i in 0..lines {
+                writeln!(file, "2026-11-02T16:17:10.{i:06}Z  INFO secret line {i}").expect("log line");
+            }
+            let path = Some(
+                dir.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            (dir, path)
+        }
+
+        fn query(since_log_position: Option<u64>) -> DashboardQuery {
+            serde_json::from_value(serde_json::json!({ "since_log_position": since_log_position })).unwrap()
+        }
+
+        #[tokio::test]
+        async fn a_caller_whose_role_holds_logs_view_may_read_logs() {
+            let dir = tempfile::tempdir().unwrap();
+            let power_user = guard_with(UserRole::PowerUser, &dir).await;
+
+            assert!(allows_logs(Some(&power_user), Some("user-1"), None).await);
+        }
+
+        #[tokio::test]
+        async fn a_caller_whose_role_lacks_logs_view_may_not_read_logs() {
+            let dir = tempfile::tempdir().unwrap();
+            let user = guard_with(UserRole::User, &dir).await;
+
+            assert!(!allows_logs(Some(&user), Some("user-1"), None).await);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_caller_or_missing_guard_may_not_read_logs() {
+            let dir = tempfile::tempdir().unwrap();
+            let admin = guard_with(UserRole::Administrator, &dir).await;
+
+            assert!(!allows_logs(Some(&admin), Some("someone-else"), None).await);
+            assert!(!allows_logs(Some(&admin), None, None).await);
+            assert!(!allows_logs(None, Some("user-1"), None).await);
+        }
+
+        #[tokio::test]
+        async fn an_access_token_reads_logs_only_when_its_scopes_name_logs_view() {
+            let dir = tempfile::tempdir().unwrap();
+            let admin = guard_with(UserRole::Administrator, &dir).await;
+
+            assert!(!allows_logs(Some(&admin), Some("user-1"), Some(&["dashboard.view"])).await);
+            assert!(allows_logs(Some(&admin), Some("user-1"), Some(&["dashboard.view", "logs.view"])).await);
+        }
+
+        #[tokio::test]
+        async fn a_delta_with_logs_allowed_carries_the_newest_entries() {
+            let (_dir, log_dir) = log_dir_with_lines(5);
+
+            for (since, expected) in [(None, 5), (Some(0), 4)] {
+                let logs = delta_logs(log_dir.clone(), &query(since), true)
+                    .await
+                    .expect("log section");
+                assert_eq!(logs.new_entries.len(), expected, "since {since:?}");
+                assert_eq!(
+                    logs.new_entries
+                        .last()
+                        .expect("newest entry")
+                        .message,
+                    "secret line 4"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_delta_without_logs_allowed_has_no_log_section() {
+            let (_dir, log_dir) = log_dir_with_lines(5);
+
+            for since in [None, Some(0)] {
+                assert!(
+                    delta_logs(log_dir.clone(), &query(since), false)
+                        .await
+                        .is_none(),
+                    "since {since:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn stats_carry_log_entries_only_when_logs_are_allowed() {
+            let (_dir, log_dir) = log_dir_with_lines(5);
+
+            let allowed = stats_log_entries(log_dir.clone(), &query(None), true).await;
+            assert_eq!(allowed.len(), 5);
+            assert_eq!(allowed[0].message, "secret line 0");
+
+            assert!(
+                stats_log_entries(log_dir, &query(None), false)
+                    .await
+                    .is_empty()
+            );
+        }
+    }
+
+    mod log_delta {
+        use std::io::Write;
+
+        use super::super::{LOG_TAIL_MAX_BYTES, LogEntry, read_log_entries_since, read_log_file};
+
+        fn write_log(
+            lines: usize,
+            padding: &str,
+        ) -> (tempfile::TempDir, u64) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut file = std::fs::File::create(
+                dir.path()
+                    .join("agent-gateway.log"),
+            )
+            .expect("log file");
+            for i in 0..lines {
+                writeln!(file, "2026-11-02T16:17:10.{i:06}Z  INFO line {i:08} {padding}").expect("log line");
+            }
+            let len = file
+                .metadata()
+                .expect("log metadata")
+                .len();
+            (dir, len)
+        }
+
+        fn log_dir(dir: &tempfile::TempDir) -> Option<String> {
+            Some(
+                dir.path()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+
+        fn positions(entries: &[LogEntry]) -> Vec<u64> {
+            entries
+                .iter()
+                .map(|entry| entry.file_position)
+                .collect()
+        }
+
+        fn assert_line_start(
+            bytes: &[u8],
+            position: u64,
+        ) {
+            let position = position as usize;
+            assert!(position == 0 || bytes[position - 1] == b'\n', "{position} is not a line start");
+            assert!(bytes[position..].starts_with(b"2026-11-02T"), "{position} is not a log line");
+        }
+
+        #[test]
+        fn a_stale_position_returns_the_last_max_lines_entries() {
+            let (dir, _) = write_log(10_000, &"x".repeat(400));
+
+            let entries = read_log_entries_since(&log_dir(&dir), 0, 10).expect("tail entries");
+
+            assert_eq!(entries.len(), 10);
+            assert!(
+                entries[0]
+                    .message
+                    .starts_with("line 00009990 ")
+            );
+            assert!(
+                entries[9]
+                    .message
+                    .starts_with("line 00009999 ")
+            );
+        }
+
+        #[test]
+        fn long_lines_still_return_the_last_max_lines_entries() {
+            let (dir, _) = write_log(100, &"x".repeat(3_000));
+
+            let entries = read_log_entries_since(&log_dir(&dir), 0, 10).expect("tail entries");
+
+            assert_eq!(entries.len(), 10);
+            assert!(
+                entries[0]
+                    .message
+                    .starts_with("line 00000090 ")
+            );
+            assert!(
+                entries[9]
+                    .message
+                    .starts_with("line 00000099 ")
+            );
+        }
+
+        #[test]
+        fn a_stale_position_never_reads_more_than_the_byte_cap() {
+            let (dir, len) = write_log(12, &"x".repeat(1024 * 1024));
+
+            let entries = read_log_entries_since(&log_dir(&dir), 0, 10).expect("tail entries");
+
+            assert!(entries.len() < 10);
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.file_position >= len - LOG_TAIL_MAX_BYTES)
+            );
+            assert!(
+                entries
+                    .last()
+                    .expect("newest entry")
+                    .message
+                    .starts_with("line 00000011 ")
+            );
+        }
+
+        #[test]
+        fn a_line_starting_exactly_at_the_byte_cap_is_kept() {
+            let line_bytes: u64 = 1024 * 1024;
+            let (dir, len) = write_log(10, &"x".repeat(line_bytes as usize - 49));
+            assert_eq!(len - LOG_TAIL_MAX_BYTES, 2 * line_bytes, "the cap must fall on a line start");
+
+            let entries = read_log_entries_since(&log_dir(&dir), 0, 10).expect("tail entries");
+            assert_eq!(entries.len(), 8);
+            assert_eq!(entries[0].file_position, 2 * line_bytes);
+            assert!(
+                entries[0]
+                    .message
+                    .starts_with("line 00000002 ")
+            );
+
+            let lines = read_log_file(&log_dir(&dir), 10);
+            assert_eq!(lines.len(), 8);
+            assert_eq!(lines[0].0, 2 * line_bytes);
+            assert!(
+                lines[0]
+                    .1
+                    .contains("line 00000002 ")
+            );
+        }
+
+        #[test]
+        fn a_recent_position_returns_every_line_after_it_when_lines_are_long() {
+            let (dir, _) = write_log(20, &"x".repeat(1_000));
+            let all = read_log_entries_since(&log_dir(&dir), 0, 100).expect("all entries");
+
+            let entries = read_log_entries_since(&log_dir(&dir), all[10].file_position, 10).expect("newer entries");
+
+            assert_eq!(positions(&entries), positions(&all[11..]));
+        }
+
+        #[test]
+        fn the_initial_tail_returns_max_lines_when_lines_are_long() {
+            let (dir, _) = write_log(100, &"x".repeat(3_000));
+
+            let lines = read_log_file(&log_dir(&dir), 10);
+
+            assert_eq!(lines.len(), 10);
+            assert!(
+                lines[0]
+                    .1
+                    .contains("line 00000090 ")
+            );
+            assert!(
+                lines[9]
+                    .1
+                    .contains("line 00000099 ")
+            );
+        }
+
+        #[test]
+        fn a_stale_position_returns_the_byte_offset_of_each_line() {
+            let (dir, _) = write_log(1_000, &"…".repeat(150));
+            let bytes = std::fs::read(
+                dir.path()
+                    .join("agent-gateway.log"),
+            )
+            .expect("log bytes");
+
+            for max_lines in 1..=20 {
+                let entries = read_log_entries_since(&log_dir(&dir), 0, max_lines).expect("tail entries");
+                for position in positions(&entries) {
+                    assert_line_start(&bytes, position);
+                }
+            }
+        }
+
+        #[test]
+        fn the_initial_tail_returns_the_byte_offset_of_each_line() {
+            let (dir, _) = write_log(1_000, &"…".repeat(150));
+            let bytes = std::fs::read(
+                dir.path()
+                    .join("agent-gateway.log"),
+            )
+            .expect("log bytes");
+
+            for max_lines in 1..=20 {
+                for (position, _) in read_log_file(&log_dir(&dir), max_lines) {
+                    assert_line_start(&bytes, position);
+                }
+            }
+        }
+
+        #[test]
+        fn a_recent_position_returns_only_the_lines_after_it() {
+            let (dir, _) = write_log(20, &"x".repeat(400));
+            let all = read_log_entries_since(&log_dir(&dir), 0, 100).expect("all entries");
+
+            let entries = read_log_entries_since(&log_dir(&dir), all[16].file_position, 100).expect("newer entries");
+
+            assert_eq!(positions(&entries), positions(&all[17..]));
+        }
+
+        #[test]
+        fn a_position_at_the_end_of_the_file_returns_nothing() {
+            let (dir, len) = write_log(5, &"x".repeat(400));
+
+            assert!(read_log_entries_since(&log_dir(&dir), len, 10).is_none());
+        }
+    }
 }
 
 /// Read the last N lines from the log file, returning (byte_offset, line) pairs.
@@ -2840,7 +3813,6 @@ fn read_log_file(
     log_directory: &Option<String>,
     max_lines: usize,
 ) -> Vec<(u64, String)> {
-    use std::io::{BufRead, Read, Seek, SeekFrom};
     use std::path::PathBuf;
 
     let log_dir = match log_directory {
@@ -2858,54 +3830,24 @@ fn read_log_file(
 
     match std::fs::File::open(&log_path) {
         Ok(mut file) => {
-            // Read only the tail of the file to avoid loading hundreds of MB into memory.
-            // Seek backwards from the end, reading a chunk that is very likely to contain
-            // at least `max_lines` lines (assuming ~512 bytes per log line on average).
             let file_len = file
                 .metadata()
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let tail_bytes = (max_lines as u64) * 512;
+            let lower = file_len.saturating_sub(LOG_TAIL_MAX_BYTES);
+            let lines = log_tail_line_start(&mut file, file_len, lower, max_lines).and_then(|start| match start {
+                Some(start) => read_log_lines_from(&mut file, start, false),
+                None => read_log_lines_from(&mut file, lower.saturating_sub(1), lower > 0),
+            });
 
-            if file_len > tail_bytes {
-                let seek_pos = file_len - tail_bytes;
-                let _ = file.seek(SeekFrom::Start(seek_pos));
-                // Read and discard the first (likely partial) line after seeking
-                let mut reader = std::io::BufReader::new(&file);
-                let mut partial = String::new();
-                let partial_len = reader
-                    .read_line(&mut partial)
-                    .unwrap_or(0);
-                let mut offset = seek_pos + partial_len as u64;
-
-                let mut lines: Vec<(u64, String)> = Vec::new();
-                for content in reader
-                    .lines()
-                    .map_while(Result::ok)
-                {
-                    let line_offset = offset;
-                    offset += content.len() as u64 + 1;
-                    lines.push((line_offset, content));
+            match lines {
+                Ok(lines) => {
+                    let start = lines
+                        .len()
+                        .saturating_sub(max_lines);
+                    lines[start..].to_vec()
                 }
-
-                let start = lines
-                    .len()
-                    .saturating_sub(max_lines);
-                lines[start..].to_vec()
-            } else {
-                // File is small enough to read entirely
-                let mut content = String::new();
-                let _ = file.read_to_string(&mut content);
-                let mut offset: u64 = 0;
-                let mut lines: Vec<(u64, String)> = Vec::new();
-                for line_str in content.lines() {
-                    lines.push((offset, line_str.to_string()));
-                    offset += line_str.len() as u64 + 1;
-                }
-                let start = lines
-                    .len()
-                    .saturating_sub(max_lines);
-                lines[start..].to_vec()
+                Err(e) => vec![(0, format!("Failed to read log file: {}", e))],
             }
         }
         Err(e) => {

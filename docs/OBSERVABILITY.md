@@ -46,19 +46,93 @@ flowchart LR
     G -->|"4 response_payload"| C
 ```
 
-The event also carries validation status, an optional validation error, derived schema, and an
-optional surface-variant alias. Some producers do not have all four observations. Onboarding, for
+The event also carries validation status, an optional validation error, derived schema, and
+`surface_variant`: the variant of the surface request the payload belongs to, as its audit
+records name it (see _Surface variant_ below), absent outside a surface request. Earlier releases
+named it `variant_alias` and left it empty for the default variant and for a surface with no
+variants. Some producers do not have all four observations. Onboarding, for
 example, sets both intermediate fields to `None` because it does not forward the request.
 
 ## WebSocket flow
 
 For each dashboard connection, the handler subscribes to the broadcast channel and multiplexes
 outbound updates with periodic ping frames. An incoming JSON `subscribe` command replaces the set
-of dashboard sections included in subsequent `DashboardDelta` events. Any broadcast receive error,
-including lag, ends the connection; socket closure does likewise.
+of dashboard sections included in subsequent `DashboardDelta` events. A connection whose session
+has ended, or whose user lacks `logs.view` or is not Approved, also loses the `logs` section and
+every `LogEntry` update; it checks the session and the user's role and status on connect and on
+each keep-alive ping, and an unauthenticated connection never gets log lines (see [`RBAC.md`](RBAC.md#dashboard-log-lines)). Any broadcast
+receive error, including lag, ends the connection; socket closure does likewise.
 
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
+
+## Payment gate metrics
+
+`agent_gateway_payment_gate_requests_total{surface_id,outcome}` counts each call a surface's
+`agent_pay` payment gate makes to agent-pay, by outcome: `paid`, `challenge`, `held`,
+`rejected` (a refused credential or payment, or a credential already used for a request this
+gateway forwarded), `unconfirmed` (whether the payment was taken is not known, or agent-pay is
+still working on it, and the caller was told to retry the same request with the same credential)
+or `unavailable` (agent-pay unreachable, rate limiting, failing before it was given a credential,
+an open circuit breaker, or a misconfigured policy). A surface refused because it still carries a local
+x402 or MPP policy is counted as `unavailable` too, on every request, while its audit event and its
+`payment.unavailable` integration event are raised at most once a minute per surface.
+`agent_gateway_payment_gate_latency_ms{surface_id}` is the histogram of the round trip; a decision
+that made no request to agent-pay (an open breaker, a caller deadline too short, a misconfigured
+policy, a gateway that is not connected, a refused legacy policy) is counted but has no latency
+sample. A free request makes no call and is not counted. A request
+refused by payment is recorded in the connection metrics as failed, or as a gateway fault for a
+`5xx`.
+
+Both are also exported where the other backends have a place for them:
+
+| Backend | Series |
+| --- | --- |
+| Prometheus | The two metrics above |
+| OpenTelemetry | The counter `gateway.payment_gate.requests.total` (attributes `surface.id`, `outcome`) and the histogram `gateway.payment_gate.latency` (attribute `surface.id`), recorded as each call is made |
+| CloudWatch | Totals across surfaces: `PaymentGateRequestCount` with an `Outcome` dimension beside the configured ones, and `PaymentGateAverageLatency` with `PaymentGateLatencySampleCount`. Pushed with the other metrics, and also when only they changed. There is no per-surface series, since each surface and outcome would be a billable CloudWatch metric |
+| File | Totals across surfaces in `payment_gate_metrics.json` beside the metrics file: `requests_by_outcome`, `latency_sum_ms` and `latency_count`, rewritten with each persist (the metrics file keeps the dashboard's format, which has no place for gate calls). Per-surface rows are in the payments ledger |
+
+### Settlement, breaker and ledger metrics
+
+The gate's request counter also counts `authorized` for an answer that holds the funds until
+the Target delivers (`payment-authorization`). Further Prometheus counters:
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `agent_gateway_payment_settlements_total` | `action` (`capture`, `void`, `status`, `reconcile`), `status` (agent-pay's answer: `captured`, `voided`, `failed`, `unconfirmed`, `expired`, `authorized`, `paid`, `unknown`; `unavailable` or `rejected` when there was no usable answer; `failed` for `reconcile` when the reconciler gave up) | Each `payment-settle` and `payment-settlement-status` request |
+| `agent_gateway_payment_gate_breaker_transitions_total` | `payment_gateway_id`, `state` (`open`, `closed`) | Each time a payment gateway's circuit breaker opens or closes; each is also logged (`warn` on open, `info` on close) |
+| `agent_gateway_payment_ledger_unwritten_rows_total` | none | Ledger rows held in memory only, because the write queue was full or a synchronous write failed |
+
+The integration events `payment.authorized`, `payment.voided`, `payment.capture_failed` and
+`payment.reconcile_failed`, and audit `payment` events with the stages `authorized`, `voided`,
+`settled` and `settlement_failed`, record the same transitions. A delegated `payment` audit event
+whose receipt names another price than the manifest snapshot carries `price_mismatch: true` with
+`quoted_amount` and `quoted_currency`, and its `amount`/`currency` are the receipt's.
+
+### Payment outcome in the access log and span
+
+A request on a surface that charges through agent-pay names the gate's decision on the
+`agent_gateway::access` line that closes it, ` payment_outcome="<outcome>" payment_ledger_id="<row id>"`,
+and on its root `http.request` span as `payment.outcome` and `payment.ledger_id`. The outcome is
+the ledger's (`paid`, `challenge`, `held`, `rejected`, `unconfirmed`, `unavailable`,
+`authorized`), so a refused request reads as a payment refusal rather than a failed connection;
+look the row up with `GET /api/admin/payments/{id}`. A request refused for a leftover local
+x402/MPP policy logs `payment_outcome="unavailable"` with an empty ledger id. The fabric path,
+which has no HTTP access log line, is unchanged.
+
+### Payment credentials in the audit trail
+
+When `payment_receipt_vc` is on, a payment audit record carries the gateway-signed credential for
+its outcome (`PaymentReceiptCredential`, `PaymentRejectionCredential`, or for a delegated payment
+`PaymentAccessGrantCredential`) in `vp_jwt` and its `sha256:` fingerprint in `vp_fingerprint`.
+No code path accepts any of these as proof of access: they are dispute evidence only, never
+returned to the caller and never verified by a gateway to admit a request. They are still signed
+statements naming the trace, the payment and, for a rejection, the payer reference, so the full
+JWT stays in the local VP Audit Log (`delegation-audit.jsonl`), where the Audit page shows it as
+evidence, and goes nowhere else: governance audit integrations get `AUDIT_VP_JWT` empty and an
+`AUDIT_RECORD` without `vp_jwt` for a `payment` record, `GET /api/admin/payments/audit` strips it,
+and the ledger and payment integration events carry only fingerprints.
 
 ## A2A protocol version metric
 
@@ -67,9 +141,12 @@ counter incremented once for each A2A or AP2 request that reaches
 [version negotiation](PROTOCOLS.md#version-negotiation), whether its `A2A-Version` negotiates or is
 refused. A request answered before that step is not counted: for example agent-card discovery, and
 refusals by source authentication, rate limiting, gateway or appliance-wide policy, or the AP2 gate.
-A request later refused by delegated payment, the egress guard or the request-body size limit
-(HTTP `413`) is counted. A request to a `fabric://` target is negotiated and counted on the sending
-gateway; the receiving gateway does not count it again.
+A request body over `[a2a] max_body_size` is refused with HTTP `413` as it is read, before version
+negotiation, and is not counted. A request later refused by delegated payment or the egress guard
+is counted, and so is one whose body grows past the size limit only once the gateway changes it
+(an AP2 transformation or injected metadata) and is then refused with `413`. A request to a
+`fabric://` target is negotiated and counted on the sending gateway; the receiving gateway does not
+count it again.
 
 | Label | Value |
 | --- | --- |
@@ -83,6 +160,32 @@ stopped accepting `0.3`. Callers a surface refuses appear as `negotiated_version
 with `method_era` showing which method names they send. Requests later refused by JSON-RPC or
 request-shape validation are counted under their negotiated version. Fabric traffic is counted on
 the sending gateway only (see [Fabric coverage gap](PROTOCOLS.md#fabric-coverage-gap)).
+
+## Credential provider token request metric
+
+`agent_gateway_credential_provider_token_requests_total{provider_type,outcome}` is a Prometheus
+counter incremented once for each service token request the gateway sends to a credential
+provider's token endpoint: a client credentials, JWT Bearer or Client Credentials JWT grant for
+[target authentication](CREDENTIAL_DELEGATION.md) or for a delegated credential binding. A cached token served without a request, a
+request held back by the retry backoff, and a request refused before it is sent (a missing
+secret, an endpoint the egress policy or the https rule refuses, or whose host does not resolve in time) are not counted. Refreshes and
+code exchanges of delegated user tokens are not counted either.
+
+| Label | Value |
+| --- | --- |
+| `provider_type` | `oauth2_client_credentials`, `oauth2_jwt_bearer` or `oauth2_client_credentials_jwt_auth` |
+| `outcome` | `success`; `refused` (the endpoint answered with a non-2xx status, or the connection failed before any answer; a connection that times out is `timeout`); `timeout` (no complete answer within `token_request_timeout_secs`); `invalid_response` (an answer over 64 KiB, or a 2xx answer that is not valid JSON, lacks a Bearer token or a bounded `expires_in`, or grants scopes other than requested) |
+
+No label carries a URL, provider id, secret or tenant.
+
+## Transit Point call outcomes
+
+A Transit Point call that reaches the forward step is recorded in the dashboard's traffic as
+successful only when the target answers with a 2xx and, on a streamed MCP response, the stream
+completes. It is recorded as failed when the target answers with another status, the stream
+fails, the target cannot be reached or does not answer in time, or the gateway cannot read or
+process its response, as when a `2026-07-28` MCP response is not valid MCP. A streamed response that the managed agent stops reading before
+it ends is not recorded.
 
 ## Logging initialization
 
@@ -99,6 +202,24 @@ Structured call sites attach searchable fields such as surface identifiers, requ
 latency, and trace context. Some older field names still contain `channel`; treat those as legacy
 telemetry schema names rather than current domain terminology.
 
+Log redaction is on by default for every configuration source. Its rules live in `gateway.json`
+under `logging.redaction`, and `"enabled": false` turns it off. It masks stderr and file output,
+exported OTLP spans and exported OTLP log records. In OTLP exports, a span or log attribute whose
+name marks a credential, such as `authorization`, `cookie`, `token`, `session_id`, `password`,
+`secret` or `api_key`, becomes `<redacted>` whatever its value. `opentelemetry.logs.targets` in
+`metrics.json` limits which log targets are exported over OTLP and defaults to `["*"]`, every
+target. [Log redaction](CONFIGURATION_REFERENCE.md#log-redaction) lists the built-in rules and the
+exact credential names.
+
+### Token endpoint errors
+
+Log lines about a credential provider's token request (target `credential_delegation`, and the
+SAML Graph API token request) may carry the provider id, the surface id, the HTTP status and the
+OAuth `error` code, or `unrecognized_error` when the code is missing or not a valid RFC 6749 code
+of at most 64 bytes. They never carry a secret, a client assertion, a token, the response body or
+`error_description`. See
+[Logging token endpoint errors](CREDENTIAL_DELEGATION.md#logging-token-endpoint-errors).
+
 ## Request correlation
 
 HTTP tracing and policy auditing attach correlation data to request spans and structured events.
@@ -107,8 +228,81 @@ When configured, the root HTTP span can also record `caller.auth_method`, `calle
 decision, policy identity, deny reason, surface identity, and caller context; denials are WARN and
 allows are DEBUG.
 
+The request spans (`http.request` on the Access Point and Transit Point, `fabric.forward_request`
+on Fabric receive) record `surface.variant` once routing resolves the request's variant, so
+exported spans carry it. The `policy_audit`, `identity_binding_audit`, `trust_check_audit` and
+`credential_delegation` log lines carry `surface_variant` when the request has one, and leave it
+out otherwise. Both hold the value audit records do (see _Surface variant_ below).
+
+### Surface variant
+
+Every record and log line written while serving a surface request names the variant that served
+it, in one field: `surface_variant` on audit records, metrics, `PayloadCaptured` and log lines,
+`surface.variant` on spans, `AUDIT_SURFACE_VARIANT` for integrations. It holds a configured alias
+or one of two values the gateway writes itself, which start and end with `_` so they never clash
+with an alias:
+
+- the variant's alias: the alias in the URL, else the default variant's alias;
+- `_base_`: the base surface served the request (no alias, and no default variant);
+- `_unknown_`: the URL named a variant the surface doesn't have (`unknown_variant` refusals); the
+  alias asked for is only in the refusal's `requested_variant`.
+
+A `variant_disabled` refusal names the disabled alias, and a `misconfigured_default` refusal names
+none. `surface_variant` is a variant of the surface the record's `surface_id` names: across a
+Fabric hop each gateway records its own surface's variant, so the two hops of one request can name
+different ones, joined by `trace_id`. The sending gateway records the variant its URL selected; the
+receiving gateway records the variant the sending route's `fabric://` Target pins
+(`fabric://<gateway>/<surface>$<alias>`), else its own default variant's alias, else `_base_`. The
+caller's URL alias never selects the receiving gateway's variant (see
+[Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)). Records outside surface requests carry none: management API
+records, `consent_granted` (the OAuth callback), settlement-worker `payment` records, config
+reloads and traffic refused before a surface matched. A `policy_decision` of gateway scope on a
+surface request carries the variant it applied to; the policy itself is the same for every
+surface and variant. Records written before this field existed have none.
+
+Connection metrics (`ConnectionMetric` and its stored data points) and the `PayloadCaptured`
+WebSocket update read the same value from the request, so a metric never names a variant its audit
+records don't. Earlier releases named the field `variant_alias` and left it empty for the default
+variant and for a surface with no variants; it now holds the default variant's alias or `_base_`
+there. A metrics snapshot stored with `variant_alias` still loads into `surface_variant`, but
+points recorded before the upgrade keep their old values, so a per-variant series steps at the
+upgrade for one metrics retention window (6 hours by default).
+
 The gateway propagates `X-Gateway-Trace-Id` to a Target where the request path creates that trace
 identifier, allowing gateway and managed-agent logs to be correlated.
+
+## Access log
+
+[`access_log`](../src/observability/http_trace.rs) logs every inbound HTTP request to the
+`agent_gateway::access` target as two plain-text lines:
+
+| Line | Fields |
+| --- | --- |
+| `➡️  HTTP <method> <path>[?<query>]` | `host`, `accept`, `ua` (`User-Agent`), `origin`, `mcp_sid` (`mcp-session-id`), `xff` (`x-forwarded-for`), `xfp` (`x-forwarded-proto`) |
+| `⬅️  HTTP <method> <path> → <status> (<ms>ms)` | `content-type` of the response |
+
+Both lines are `INFO`, or `DEBUG` for static dashboard assets, `/api/` paths, `did.json` documents
+and dashboard page loads (a `GET` that accepts `text/html`). A field is empty when the request did
+not carry that header.
+
+Query strings keep their parameter names only: each value is logged as `<redacted>`, and a
+parameter sent without `=` is replaced by `<redacted>` whole, so an OAuth `code` or a token passed
+as a query parameter never reaches the log. The same redaction applies to `http.uri` on the
+`http.request` trace span and to `http.url` on the `http.client.send` span, which also drops any
+user name and password in the Target URL. Target and mirror endpoint URLs in other log lines are
+redacted the same way, and a failure to reach a Target or mirror is logged without its URL.
+
+MCP session ids appear only as a prefix: their first 8 characters followed by `...`, or
+`<redacted>` when the id is shorter than 16 characters. This covers `mcp_sid` here and the Legacy
+SSE and Streamable HTTP session ids in the proxy and MCP transport logs. Onboarding session ids in
+a path, the UUID after `/onboard/` or `/delete-temp-channel/`, are shortened the same way in both
+lines and in `http.uri` and `http.path`. With the default
+redaction rules, `mcp_sid` is masked entirely in console and file output, because a built-in
+session rule matches `sid=`.
+
+The `xff` field keeps the client address that the reverse proxy reported. It is personal data in
+many jurisdictions, so ship and retain the access log accordingly. [Log
+redaction](CONFIGURATION_REFERENCE.md#log-redaction) applies to these lines as well.
 
 ## Access token rotation events
 
@@ -136,6 +330,67 @@ missing or invalid credential, the `403` it returns to a PAT with a `resource_pa
 access-token routes are not a resource-scoped path family, a required header that does not
 match, or Terms the token owner has not accepted.
 
+## Agent card preview events
+
+Every card fetch an [agent card preview](PROTOCOLS.md#agent-card-preview) starts emits one
+`INFO` event on the `audit` target, a log event only like the rotation events above. An answer
+from the last preview, or a refused request, emits none.
+
+| Event | Fields |
+| --- | --- |
+| `agent_card.preview_fetch` | `request` (`read` or `refresh`), `caller_user_id`, `tenant_id` (the tenant token's tenant, empty otherwise), `surface_id`, `auth_kind`, `auth_result`, `auth_failure`, `fetch_status`, `cause` |
+
+The values are the preview's wire spellings, empty when absent. The event never carries a URL,
+a credential, a secret or provider id, or card content. A preview records no connection, gateway
+fault, rejected request or Trust Recorder write, so it leaves the dashboard metrics as they were.
+
+## Credential policy report
+
+At startup and on every configuration reload (including the reload that follows a surface
+change) the gateway logs one `WARN` line per credential provider or surface whose stored
+configuration breaks a [`credential_policy`](CONFIGURATION_REFERENCE.md) rule, so operators can
+find what to fix before the rules are enforced. The `jwt_subject` rule, which names a stored JWT Bearer provider without a subject, is report-only: it always warns and has no setting. A clean appliance logs one `INFO` line instead. A surface whose references cannot be collected
+(for example a variant that cannot be resolved) is not checked: it logs one `WARN` line naming
+its `id`, `tenant` and the `error`, and the `INFO` line then says the rest are clean and how many
+surfaces could not be inspected.
+Nothing else changes: the report writes no audit record and carries no secret value or token
+endpoint URL.
+
+| Field | Value |
+| --- | --- |
+| `subject` | `credential_provider` or `surface` |
+| `id` | The provider's `id` or the surface's `surface_id` |
+| `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
+| `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
+
+A surface that derives a DID from an API Key Provider key it may not use, or whose key or
+owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
+`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
+`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+is `true` when the surface is refused at runtime; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+
+An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
+requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
+provider sends no token request and is never reported for it. It breaks `tenant_credential_isolation` when it names a
+secret outside its own tenant: a tenant provider holding an appliance-wide or another tenant's secret, or an
+appliance-wide provider holding a tenant's secret. A surface breaks `tenant_credential_isolation` when it
+belongs to a tenant but sends an appliance-wide secret or credential provider upstream. A secret
+or provider that no longer exists is not reported.
+
+An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
+signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
+for this rule.
+A surface breaks `target_https` when its Target, or one of its Transit Points, sends a static secret
+or credential provider token to an endpoint that is not `https` (`http://`, `fabric://` and
+`a2a-proxy://` count as not https; a `proxy://` Target counts as its MCP proxy's `base_url`). It breaks `target_source_auth` when its Target sends a
+credential, or is an `a2a-proxy://` Target of an A2A or AP2 surface (its A2A proxy sends its
+Direct Line credential), and its Access Point has neither a source authentication method nor
+`mcp_http.authorization`, or a Transit Point sends one and requires no transit token and sets
+neither `mcp_http.authorization` nor its own `source_auth`. Both checks cover every surface
+variant as it resolves, and use the same predicates as the request path.
+
 ## Governance audit forwarding
 
 Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.jsonl`, read by
@@ -154,7 +409,19 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+**Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
+delegated credential events name the agent half of the credential's vault key as `agent_did`.
+For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving
+surface's id (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
+record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp_tool_name`, with
+the caller the receiving surface verified as `caller` and the paired gateway that sent the
+request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
+`vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
+agent its presentation is for as `agent_did`.
+
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
+at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
@@ -163,28 +430,127 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   resource authorization context). `blocking` is false when the failure was handed to policy
   (`input.source_auth.method == "failed"`) instead of refusing the request. `client_ip` is the
   resolved client address (forwarded headers only from `client_ip.trusted_proxies`); absent on
-  the fabric path, where the caller connected to the sending gateway.
+  the fabric path, where the caller connected to the sending gateway. A Transit Point's own
+  `source_auth` records it too, with `blocking: true` (it refuses the caller), the surface and
+  the request's trace id, and the TCP peer as `client_ip`, since the outbound listener does not
+  resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
-  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
-  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
-- `request_rejected`: the Access Point refused the request before or while forwarding it.
-  `http_status` is what the caller received and `rpc_error_code` the JSON-RPC error code, when
-  the refusal was one; legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error,
-  so read the two together. `stage` and `reason`:
+  rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target), `transit_point_caller` (a Transit Point's
+  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)) or
+  `transit_point_overflow` (the bucket that per-caller limit's callers share while it holds as
+  many buckets as it may). `retry_after_ms`
+  is the wait the caller is given, when there is one; the surface and per-caller limits also send
+  it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
+  (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
+  a request with no identified caller. A `transit_point_overflow` record names the Transit Point
+  and no caller.
+- `request_rejected`: the gateway refused the request before or while forwarding it.
+  `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
+  the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP
+  response is involved. `rpc_error_code` is the JSON-RPC error code, when the refusal was one;
+  legacy MCP refuses a malformed request with HTTP 200 and a JSON-RPC error, so read the two
+  together. `stage` and `reason`:
   - `routing`: `no_route` (no surface matches; recorded against surface `unknown`, with no trace
-    id on the direct path), `unknown_variant`, `variant_disabled`.
-  - `admission`: `body_too_large`, `protocol_mismatch` (an MCP body on an A2A Access Point or the
+    id on the direct path), and the three variant refusals, refused for the same reasons on the
+    Access Point, the Transit Point and Fabric receive, with these statuses on the HTTP paths:
+    - `unknown_variant` (404): the URL names a variant the surface doesn't have, including on a
+      surface with no variants. `requested_variant` holds the alias the URL named, cut to 32
+      characters; it is caller-chosen text and appears on no other record.
+    - `variant_disabled` (404): the named variant, or the default variant of an alias-less
+      request, is disabled.
+    - `misconfigured_default` (500): the request names no variant and the surface's
+      `default_variant_id` names no variant. On a surface with no variants the gateway drops
+      such a default at startup, with a warning, so its base surface serves those requests.
+
+    A request whose variant can't be resolved is refused, never served by the base surface or
+    another variant. A modern MCP request of any method on the Access Point or the Transit Point
+    is answered with a JSON-RPC error with code `-32603` carrying the request's `id` (the body is
+    read only to recover it, within the smaller of `mcp_http.max_request_bytes` and 16 KiB and
+    within 2 seconds, as the read runs before authentication and rate limiting; a body that can't
+    be read within those, or carries no `id`, gets the same error without one), and its record
+    carries `rpc_error_code` `-32603` on both HTTP paths. The record is written once, at routing,
+    whatever happens to the body.
+
+    On Fabric, the receiving gateway records the refusal (with its reason, and no `http_status`),
+    and the reason stays in that record: it does not cross the wire. What the sending gateway's
+    HTTP caller receives depends on the Fabric path:
+    - a stream: the receiver refuses the `Open` with the stream error `Unavailable`, which carries
+      no status or reason, and the sending gateway answers its caller `502 Bad Gateway`, as it
+      does any stream that could not be opened;
+    - a legacy `ForwardRequest`: the receiver answers with the refusal's status, and the sending
+      gateway passes the peer's `404` or `500` on to its caller.
+
+    On Fabric receive, `fabric_hops_invalid` (an `X-Gateway-Fabric-Hops` that is not one integer
+    from 1 to 255; the peer is answered `400`) and `fabric_chain_too_long` (a request past 8
+    Fabric crossings; `508`) are recorded against the surface id the peer addressed, before it is
+    looked up and before a variant is resolved, so with no `surface_variant`. A framed stream
+    resolves its surface and variant when it opens, so one to a surface or variant that is not
+    available is refused for that first; see [`FABRIC.md`](FABRIC.md#chains-across-gateways).
+  - `admission`: `body_too_large` (an Access Point or Transit Point request body over its limit,
+    MCP or not; the shared-host `/outbound` hop's own refusals, of a declared `Content-Length`
+    over `[a2a] max_body_size` and of a body above it for an MCP Transit Point with a larger
+    limit, are logged with the caller's address and not recorded, and a DID Auth challenge or
+    authenticate body over its 64 KiB limit is refused before any record is built),
+    `protocol_mismatch` (an MCP body on an A2A Access Point or the
     reverse), `invalid_envelope` (not JSON, or not a JSON-RPC request, on every protocol and MCP
     revision), `invalid_request_shape` (A2A fields), `version_unsupported` (A2A or MCP),
     `mcp_admission` (MCP transport rules: Origin, header size, mirrored method or protocol
     headers, HTTP method, per-request capabilities, `_meta`), `extension_rejected` (request
     extension rules, and an inbound identity that is missing or invalid),
-    `consent_identity_required` (credential delegation for an anonymous caller).
-  - `forward`: `ssrf_blocked` (egress policy refuses the target address).
+    `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
+    receive for a request whose caller the receiving surface did not verify),
+    `access_point_not_ready` (a closed Access Point without source authentication, logged with
+    `reason=no source authentication`, or a surface that derives a DID from an API key it may
+    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
+    over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
+    external consent refused before anything is sent `target_path_refused` (`400`, a path the
+    grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
+    rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
+    ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
+    and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
+    binding applies and the view that serves the request does not release its Target's grants
+    to partners) and `consent_not_available_for_partners` (the caller has no grant for a
+    per-user binding that applies); the peer is answered `403` with that reason (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
+    Transit Point records `consent_not_available_for_partners` too, against its surface with the
+    call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
+    and answers the agent `403` with that reason (see
+    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
+  - `forward`: `ssrf_blocked` (egress policy refuses the target address),
+    `fabric_chain_too_long` (`508`) from a Transit Point to a `fabric://` target whose call would
+    pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
+    receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
+    get a transit token for the request and it could not be issued.
+    `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
+    `target_auth`) was not sent, because it could not be obtained (a secret or provider that
+    cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`
+    withheld it, its stored `header_name` or `header_format` breaks a header rule (an invalid
+    or reserved header name, or a format without exactly one `{value}` or with CR, LF or NUL;
+    `outcome` follows the `fallback`), the request would have carried it outside the Target
+    base path, or a Transit
+    Point's resolved credential cannot be sent as a header (the last two always `rejected`,
+    whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
+    Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
+    fetch and its preview. The record carries the request's trace id, except on the gateway's
+    own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
+    fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
+    trace id. The record carries `provider_id` for a credential provider and a
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
+    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `transit_point` names the Transit Point by alias when the credential was a Transit Point's
+    `target_auth` (absent for the Target), and
+    `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the
+    code itself when RFC 6749 section 5.2 or RFC 6750 section 3.1 registers it
+    (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`,
+    `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`), otherwise
+    `other`, so a token endpoint cannot write its own text into the record. A token, an
+    assertion, a secret, the token endpoint's body and its `error_description` are never
+    recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
-  gateway faults (a misconfigured default variant, a failed egress check task) are not recorded.
+  gateway faults (a failed egress check task) are not recorded.
 - `identity_binding_verified` and `identity_binding_failed`: the outcome of checking the identity
   presentation (identity binding VP) a request carries, recorded wherever the gateway checks one:
   A2A requests on the direct path, MCP requests at admission, Transit Point MCP requests, and, on
@@ -196,6 +562,77 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     failed verification, including an issuer the receiving connection does not trust) or
     `untrusted` (it verified, but no trust anchor was available to vouch for its issuer).
     `error_detail` is a short diagnostic and never carries the presentation itself.
+
+**Policy change events.** Raised by management API requests that change a policy definition or
+where a policy applies (group Policies). Each record carries its body in the `event` variant, e.g.
+`"event": {"policy_attached": {...}}`, and every record one request writes shares that request's
+`request_id`. See [`POLICY.md`](POLICY.md#policy-change-audit) for what each covers.
+
+- `policy_created`, `policy_updated`, `policy_deleted`: a policy definition was created, changed
+  or deleted. `policy_updated` names the parts that changed in `changed` (`rego`, `name`,
+  `description`, `enabled`, `sample_input`, `owner`) with `previous_policy_version` and
+  `previous_policy_content_hash`; an update that changes nothing is not recorded.
+- `policy_attached`, `policy_detached`: a policy now applies, or no longer applies, at a slot of a
+  surface, a gateway or an appliance-wide plane. `target` is `{kind, id, name}` (`surface`,
+  `gateway` or `appliance`); `scope` is the decision scope the slot produces; `slot` is `target`,
+  `inbound`, `response`, `transit`, `transit_point`, `mcp_tool`, `mcp_tool_gate` or `plane`, with
+  `transit_point`, `mcp_tool_name`, `gate` or `plane` naming the place. On a surface target,
+  `surface_variant` is the slot written: the variant's alias, or `_base_` for a base slot, which
+  also applies to every variant that inherits it; gateway and appliance targets have none. Earlier
+  releases named it `variant`; stored records with that key still read, as `surface_variant`.
+  A replaced
+  policy is detached, then its successor attached. A surface target also sets the top-level
+  `surface_id` and `channel_name`.
+  A gateway's legacy inline Rego has no definition: its records carry `policy_name`
+  `Gateway policy` and the Rego's `policy_content_hash`, and a change to its text is a
+  `policy_updated` with `changed: ["rego"]` against the gateway.
+- `policy_attachment_changed`: an appliance-wide assignment switched between `enforced` and
+  `monitor_only` (`mode`, `previous_mode`), or a gateway's policy was enabled or disabled
+  (`enabled`, `previous_enabled`).
+- `policy_change_refused`: one of the changes above was refused with 400, 403, 404, 409 or 422,
+  on a route that only changes policies: the definition, assignment, gateway policy and
+  definition ownership routes. A refused surface or variant write, or a refused gateway delete,
+  is not recorded (see [`POLICY.md`](POLICY.md#policy-change-audit)).
+  `action` is the change attempted, `status` the HTTP status and `reason` one of `invalid`,
+  `forbidden`, `not_found` or `conflict`. The attempt is read from the route only: ids come from
+  the path, bounded to 128 id characters, and replacing the appliance-wide assignments or a
+  gateway's policy is recorded as an attempted `policy_attached` with no policy id.
+
+Every record names its `actor`: `{kind: "user", id}` for a signed-in user, `{kind: "pat", id,
+user_id}` for an access token (its id, never its value, and its owner's user id) or
+`{kind: "system", id: "gateway"}`. `source` is `api`, `ownership` (a definition's tenant was
+reassigned) or `definition_deleted` (deleting a definition pruned its appliance-wide
+assignments). Policy ids, versions and content hashes are those `policy_decision` records carry,
+so a change joins to the decisions it causes. No record carries the Rego text, the sample input
+or a request body. Writes made outside a management request (startup migrations, replication)
+record nothing, and neither do writes a configuration reload makes, though the reload is asked
+for through the management API: it is the gateway's own work, not the user's change.
+
+**Target authentication change events.** Raised by management API writes to a surface (group
+Auth); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-target-authentication-changes)
+for which writes.
+
+- `target_auth_changed`: the Target authentication of one leg was added, changed or removed, one
+  record per leg. `leg` is `target` or `transit_point`, with `transit_point_id` and
+  `transit_point` (its alias) for a Transit Point; `surface_variant` is the variant's alias, with
+  `variant_id`, or `_base_`. `previous_method` and `method` are `static_secret`,
+  `credential_provider`, `credential_lookup` or `none`; `previous_provider_id` and `provider_id`
+  name the credential provider on either side. `changed` lists the parts a change to an existing
+  setting replaced (`method`, `secret_id`, `provider_id`, `header_name`, `header_format`,
+  `scopes`, `fallback`, `target_identifier`), by name only. `actor` names the management caller
+  as on policy change events, and the top level carries `surface_id` and `channel_name`. No
+  record carries a secret id, header name, header format or value.
+
+**Secret force-delete events.** Raised by `DELETE /secrets/{id}?force=true` (group Auth); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-a-forced-secret-delete).
+
+- `secret_force_deleted`: a secret was deleted with force, with or without records still using
+  it. `secret_id` is the secret's id, `force` is `true`, and `referrers` lists each record that
+  used it as `{kind, id}` (`surface`, `credential_provider`, `a2a_proxy` or `sts_client`). `actor`
+  names the management caller as on policy change events. The record carries no secret value and
+  no record name, and sets no `surface_id`.
+
+A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
@@ -232,7 +669,15 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
 - *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
   It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
   addresses it to the sinks that select its event at that moment, and hands it to the journal
-  without waiting. Records a proxied request produces while credential delegation runs are held
+  without waiting. A record produced while the gateway serves a request also gets that
+  request's `request_id`: 16 lowercase hex characters (the W3C span-id format), minted afresh
+  when an Access Point request, a Transit Point request or a fabric-received request starts,
+  never read from a header or token. Every record of one request shares it, and an Access
+  Point request and the Transit Point requests its agent makes each have their own, linked by
+  `trace_id`; a sink counts requests by distinct `request_id`. A record of a surface request also
+  gets the request's `surface_variant` (see _Surface variant_ above). That includes the records a
+  streamed response writes per event while it is read (SSE on every path) and the payment
+  records an x402 or MPP request writes from background tasks. Records a proxied request produces while credential delegation runs are held
   until the request's identity VP is minted, then stamped with it; any still held when the
   request ends, on any path, are submitted without a VP. A selected record produced while the
   pipeline is not running is dropped and counted in
@@ -351,17 +796,28 @@ release the lock.
 `EVENT_SUMMARY` (the event's name, then whichever of the surface, decision, policy, reason and
 caller the record holds), `EVENT_DATA` (the same as `AUDIT_RECORD`), `APPLIANCE_ID`,
 `TIMESTAMP` (the record's own timestamp), `AUDIT_RECORD`, `AUDIT_CATEGORY`, `AUDIT_TRACE_ID`, `AUDIT_SURFACE_ID`, `AUDIT_SURFACE_NAME`,
-`AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
+`AUDIT_SURFACE_VARIANT` (the record's `surface_variant`: the variant's alias, `_base_`,
+`_unknown_` or a refused disabled alias; empty outside surface requests and on a misconfigured
+default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCIPAL`,
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
 `AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
-`/v1/audit` row shape. The principal variables come from the record's `caller` context:
-`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (JWT
-`sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
-carries), and all four are empty when the request had no caller context (no source auth, or a
-Transit Point whose token carries no caller). The policy variables describe the policy that made
-a `policy_decision` (`AUDIT_POLICY_NAME` falls back to the Rego package when the policy has no
-stored definition) and are empty for other records; see
+`/v1/audit` row shape. A `payment` record never carries its signed credential out of the appliance:
+`AUDIT_VP_JWT` is empty and `AUDIT_RECORD` has no `vp_jwt` for it, so integrations get only
+`AUDIT_VP_FINGERPRINT`; the full credential stays in the local VP Audit Log as dispute evidence
+(see [Payment credentials](#payment-credentials-in-the-audit-trail)). The principal variables come from the record's `caller` context:
+`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (for a
+JWT the value of its verification strategy's `principal_claim`, `sub` by default; the API key
+name, DID, mTLS principal, or on a Transit Point the caller the transit token carries), and all
+four are empty when the request had no caller context (no source auth, or a
+Transit Point whose token carries no caller). For a JWT caller that the Access Point's own
+source authentication verified through a strategy naming a claim other than `sub`, the `caller`
+context keeps the token's own `sub` in `sub`, so it matches the identity provider's logs, and
+adds the claim's value as `principal`. A Transit Point record takes its caller from the transit
+token, which carries no `principal`. The policy variables describe the policy that made
+a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
+for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
+policy") and are empty for other records; see
 [`POLICY.md`](POLICY.md#versioned-policy-definitions) for which decisions carry a revision. A
 string value that is exactly `${AUDIT_RECORD}` or `${EVENT_DATA}` is embedded as a JSON object
 for Webhook and Stream integrations; for Slack and Email, and inside other text, it is inserted

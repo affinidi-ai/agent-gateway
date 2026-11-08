@@ -20,15 +20,33 @@ pub trait IdentityStore: Send + Sync {
         record: filesystem::AgentIdentityRecord,
     ) -> Result<()>;
 
+    /// Create `record` unless a record already exists for its hash. Returns the
+    /// existing record when one does, `None` when `record` was created.
+    async fn create_if_absent(
+        &self,
+        record: filesystem::AgentIdentityRecord,
+    ) -> Result<Option<filesystem::AgentIdentityRecord>> {
+        if let Some(existing) = self
+            .find_by_hash(&record.identity_hash)
+            .await?
+        {
+            return Ok(Some(existing));
+        }
+        self.create(record).await?;
+        Ok(None)
+    }
+
     /// List all stored identities
     async fn list_all(&self) -> Result<Vec<filesystem::AgentIdentityRecord>>;
 
     /// Update usage tracking for an identity
-    /// If channel_config_id is provided, updates the last-used channel
+    /// If channel_config_id is provided, updates the last-used channel and records `role`,
+    /// whether the identity was the managed agent or a caller there
     async fn update_usage(
         &self,
         identity_hash: &str,
         channel_config_id: Option<String>,
+        role: Option<filesystem::IdentityOrigin>,
     ) -> Result<()>;
 
     /// Find an identity by DID
@@ -48,13 +66,15 @@ pub trait IdentityStore: Send + Sync {
         verified: bool,
     ) -> Result<()>;
 
-    /// Record how an identity entered the store. Stores without origin tracking ignore it.
+    /// Record how an identity entered the store, unless it already has an
+    /// origin: an origin, once set, never changes. Returns the record's origin
+    /// after the call; `None` from stores without origin tracking.
     async fn set_origin(
         &self,
         _identity_hash: &str,
         _origin: filesystem::IdentityOrigin,
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<Option<filesystem::IdentityOrigin>> {
+        Ok(None)
     }
 
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.

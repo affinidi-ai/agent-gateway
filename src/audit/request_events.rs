@@ -5,11 +5,11 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-pub use crate::audit::events::{RejectionReason, RejectionStage};
+pub use crate::audit::events::{RejectionReason, RejectionStage, TargetAuthOutcome};
 
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
-use crate::mcp::resource_server::ResourceTokenError;
+use crate::protocols::protected_resource::ResourceTokenError;
 use crate::source_auth::errors::SourceAuthError;
 use crate::source_auth::models::SourceAuthConfig;
 
@@ -81,12 +81,50 @@ pub fn rate_limited(
         facts.record(DelegationAuditAction::RateLimited {
             scope,
             retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            transit_point: None,
         })
     })
 }
 
-/// The Access Point refused the request. `http_status` and `rpc_error_code`
-/// are what the caller received.
+/// A Transit Point refused a request with 429 because its per-caller limit
+/// was reached. `caller_hash` is the identity hash of the caller the Transit
+/// Point identified, absent for a request with no identified caller. A refusal
+/// by the bucket callers share while the limit holds as many buckets as it may
+/// is recorded with scope `transit_point_overflow` and names no caller, since
+/// the caller did not spend an allowance of their own.
+pub fn transit_point_caller_rate_limited(
+    facts: &RequestFacts<'_>,
+    transit_point: &str,
+    caller_hash: Option<&str>,
+    refusal: crate::policies::CallerRefusal,
+) {
+    emit("rate_limited", || {
+        let mut event = facts.record(DelegationAuditAction::RateLimited {
+            scope: if refusal.overflow {
+                RateLimitScope::TransitPointOverflow
+            } else {
+                RateLimitScope::TransitPointCaller
+            },
+            retry_after_ms: Some(
+                u64::try_from(
+                    refusal
+                        .retry_after
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            ),
+            transit_point: Some(transit_point.to_string()),
+        });
+        event.user_identity_hash = caller_hash
+            .filter(|_| !refusal.overflow)
+            .map(str::to_string);
+        event
+    })
+}
+
+/// The gateway refused the request. `http_status` and `rpc_error_code` are
+/// what the caller received; a Fabric refusal records no HTTP status, as no
+/// HTTP response is involved.
 pub fn request_rejected(
     facts: &RequestFacts<'_>,
     stage: RejectionStage,
@@ -94,14 +132,176 @@ pub fn request_rejected(
     http_status: u16,
     rpc_error_code: Option<i64>,
 ) {
+    record_rejection(facts, stage, reason, http_status, rpc_error_code, None)
+}
+
+fn record_rejection(
+    facts: &RequestFacts<'_>,
+    stage: RejectionStage,
+    reason: RejectionReason,
+    http_status: u16,
+    rpc_error_code: Option<i64>,
+    requested_variant: Option<&str>,
+) {
     emit("request_rejected", || {
         facts.record(DelegationAuditAction::RequestRejected {
             stage,
             reason,
-            http_status,
+            http_status: (!facts.via_fabric).then_some(http_status),
             rpc_error_code,
+            requested_variant: requested_variant.map(str::to_string),
+            target_auth: None,
         })
     })
+}
+
+/// The Target credential was not sent: it could not be obtained, or a `[credential_policy]`
+/// rule in `enforce` withheld it. Recorded as a `forward` refusal with reason
+/// `target_auth_failed` whether `outcome` refused the request (`http_status` 502 on HTTP) or
+/// forwarded it without the credential (no `http_status`). `transit_point` names the Transit
+/// Point whose credential it was, absent for the Target; `provider_id` names the credential
+/// provider; `oauth_error` is the token endpoint's registered OAuth `error` code, or `other`,
+/// never its body.
+pub fn target_auth_failed(
+    facts: &RequestFacts<'_>,
+    transit_point: Option<&str>,
+    provider_id: Option<&str>,
+    outcome: TargetAuthOutcome,
+    oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
+) {
+    emit("request_rejected", || {
+        let mut record = facts.record(DelegationAuditAction::RequestRejected {
+            stage: RejectionStage::Forward,
+            reason: RejectionReason::TargetAuthFailed,
+            http_status: (outcome == TargetAuthOutcome::Rejected && !facts.via_fabric).then_some(502),
+            rpc_error_code: None,
+            requested_variant: None,
+            target_auth: Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(|code| code.to_string()),
+            }),
+        });
+        record.provider_id = provider_id.map(str::to_string);
+        record
+    })
+}
+
+/// A request refused at routing because the surface variant it selects can't
+/// be resolved. Only [`refuse_routing`] builds one, and it records the refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingRefusal {
+    reason: RejectionReason,
+    status: axum::http::StatusCode,
+    requested_variant: Option<String>,
+    /// On `variant_disabled`: the disabled variant's configured alias.
+    disabled_variant: Option<String>,
+}
+
+impl RoutingRefusal {
+    pub fn reason(&self) -> RejectionReason {
+        self.reason
+    }
+
+    pub fn status(&self) -> axum::http::StatusCode {
+        self.status
+    }
+
+    /// Logs the refusal of a request to `surface` from what was recorded:
+    /// the reason, the requested alias as cut for the record, on a disabled
+    /// variant its configured alias in full, and on a misconfigured default
+    /// the configured `default_variant_id`. The caller's raw alias is never
+    /// logged. The message carries the `[CHANNEL:<config_id>]` prefix the
+    /// dashboard's channel log filter matches.
+    pub fn warn(
+        &self,
+        surface: &crate::config::agent_surface::AgentSurface,
+    ) {
+        let default_variant_id = (self.reason() == RejectionReason::MisconfiguredDefault)
+            .then_some(
+                surface
+                    .default_variant_id
+                    .as_deref(),
+            )
+            .flatten();
+        let config_id = surface
+            .config_id()
+            .unwrap_or_default();
+        tracing::warn!(
+            config_id,
+            surface = %surface.name,
+            reason = ?self.reason(),
+            requested_variant = ?self.requested_variant(),
+            disabled_variant = ?self.disabled_variant.as_deref(),
+            default_variant_id = ?default_variant_id,
+            "[CHANNEL:{config_id}] Surface variant cannot be resolved"
+        );
+    }
+
+    pub fn requested_variant(&self) -> Option<&str> {
+        self.requested_variant
+            .as_deref()
+    }
+
+    /// What the caller is told. Both 404s say the same thing: nothing is
+    /// served at that URL.
+    pub fn message(&self) -> &'static str {
+        match self.reason {
+            RejectionReason::MisconfiguredDefault => "Surface variant configuration error",
+            _ => "No surface variant is served at this URL",
+        }
+    }
+}
+
+/// Records a routing refusal for `error` and returns how to answer it. The
+/// request's surface variant is set first: `_unknown_` for an unknown alias,
+/// the disabled variant's alias, or nothing for a misconfigured default. The
+/// alias the caller named goes only to `requested_variant`. `rpc_error_code`
+/// is the JSON-RPC error code the caller is answered with, when the refusal
+/// is one.
+pub fn refuse_routing(
+    facts: &RequestFacts<'_>,
+    error: &crate::config::agent_surface_variants::VariantResolveError,
+    rpc_error_code: Option<i64>,
+) -> RoutingRefusal {
+    use crate::config::agent_surface_variants::{SurfaceVariant, VariantResolveError};
+    use crate::observability::policy_audit::set_request_variant;
+    use axum::http::StatusCode;
+
+    match error {
+        VariantResolveError::UnknownAlias(_) => set_request_variant(SurfaceVariant::UNKNOWN),
+        VariantResolveError::DisabledVariant(alias) => set_request_variant(alias),
+        VariantResolveError::MisconfiguredDefault(_) => {}
+    }
+    let refusal = match error {
+        VariantResolveError::UnknownAlias(alias) => RoutingRefusal {
+            reason: RejectionReason::UnknownVariant,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: Some(SurfaceVariant::cut_alias(alias)),
+            disabled_variant: None,
+        },
+        VariantResolveError::DisabledVariant(alias) => RoutingRefusal {
+            reason: RejectionReason::VariantDisabled,
+            status: StatusCode::NOT_FOUND,
+            requested_variant: None,
+            disabled_variant: Some(alias.clone()),
+        },
+        VariantResolveError::MisconfiguredDefault(_) => RoutingRefusal {
+            reason: RejectionReason::MisconfiguredDefault,
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            requested_variant: None,
+            disabled_variant: None,
+        },
+    };
+    record_rejection(
+        facts,
+        RejectionStage::Routing,
+        refusal.reason,
+        refusal.status.as_u16(),
+        rpc_error_code,
+        refusal.requested_variant(),
+    );
+    refusal
 }
 
 /// The reason for an MCP transport refusal, from the HTTP status and JSON-RPC
@@ -203,6 +403,7 @@ pub fn source_auth_reason(error: &SourceAuthError) -> &'static str {
     match error {
         SourceAuthError::MissingCredential { .. } => "missing_credential",
         SourceAuthError::InvalidCredential { .. } => "invalid_credential",
+        SourceAuthError::AmbiguousCredentials => "ambiguous_credentials",
         SourceAuthError::ConfigNotFound { .. } => "config_not_found",
         SourceAuthError::Internal { .. } => "internal",
     }
@@ -272,7 +473,7 @@ mod tests {
         let recorded: Vec<_> = events
             .iter()
             .map(|event| match &event.event {
-                DelegationAuditAction::RateLimited { scope, retry_after_ms } => (*scope, *retry_after_ms),
+                DelegationAuditAction::RateLimited { scope, retry_after_ms, .. } => (*scope, *retry_after_ms),
                 other => panic!("expected RateLimited, got {other:?}"),
             })
             .collect();
@@ -285,9 +486,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_transit_point_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
+        use crate::audit::events::RateLimitScope;
+        let ((), events) = crate::audit::producer::capture(async {
+            let refusal = |overflow| crate::policies::CallerRefusal {
+                retry_after: std::time::Duration::from_millis(2500),
+                overflow,
+            };
+            transit_point_caller_rate_limited(&facts(), "partner", Some("caller-hash"), refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", None, refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", Some("newcomer-hash"), refusal(true));
+        })
+        .await;
+
+        assert_eq!(events.len(), 3);
+        match &events[0].event {
+            DelegationAuditAction::RateLimited {
+                scope,
+                retry_after_ms,
+                transit_point,
+            } => {
+                assert_eq!(*scope, RateLimitScope::TransitPointCaller);
+                assert_eq!(*retry_after_ms, Some(2500));
+                assert_eq!(transit_point.as_deref(), Some("partner"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[0]
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash")
+        );
+        assert_eq!(events[1].user_identity_hash, None, "a request with no identified caller names none");
+        match &events[2].event {
+            DelegationAuditAction::RateLimited { scope, .. } => {
+                assert_eq!(*scope, RateLimitScope::TransitPointOverflow)
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[2].user_identity_hash, None,
+            "an overflow refusal names no caller, who spent no allowance of their own"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[2]).unwrap()["event"]["rate_limited"]["scope"],
+            "transit_point_overflow"
+        );
+
+        let recorded = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(recorded["event"]["rate_limited"]["scope"], "transit_point_caller", "{recorded}");
+        let read_back: crate::delegation_vault::audit::DelegationAuditEvent = serde_json::from_value(recorded).unwrap();
+        assert_eq!(
+            read_back
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash"),
+            "the audit log reads the record back with its caller"
+        );
+    }
+
     fn rejected(
         events: &[crate::delegation_vault::audit::DelegationAuditEvent]
-    ) -> Vec<(RejectionStage, RejectionReason, u16, Option<i64>)> {
+    ) -> Vec<(RejectionStage, RejectionReason, Option<u16>, Option<i64>)> {
         events
             .iter()
             .map(|event| match &event.event {
@@ -296,6 +558,7 @@ mod tests {
                     reason,
                     http_status,
                     rpc_error_code,
+                    ..
                 } => (*stage, *reason, *http_status, *rpc_error_code),
                 other => panic!("expected RequestRejected, got {other:?}"),
             })
@@ -313,11 +576,210 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Forward, RejectionReason::SsrfBlocked, 403, None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Forward, RejectionReason::SsrfBlocked, Some(403), None),
             ]
         );
         assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+    }
+
+    #[tokio::test]
+    async fn a_fabric_refusal_records_no_http_status() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
+        let ((), events) = crate::audit::producer::capture(async {
+            request_rejected(&fabric, RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+            refuse_routing(&fabric, &VariantResolveError::UnknownAlias("typo".into()), None);
+            request_rejected(&facts(), RejectionStage::Admission, RejectionReason::BodyTooLarge, 413, None);
+        })
+        .await;
+
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, None, None),
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, None, None),
+                (RejectionStage::Admission, RejectionReason::BodyTooLarge, Some(413), None),
+            ]
+        );
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert!(
+            stored["event"]["request_rejected"]
+                .get("http_status")
+                .is_none(),
+            "{stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_the_provider_outcome_and_oauth_error_code() {
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("invalid_client")),
+            );
+            target_auth_failed(&facts(), Some("partner"), None, TargetAuthOutcome::Passthrough, None);
+            target_auth_failed(&fabric, None, Some("machine"), TargetAuthOutcome::Rejected, None);
+        })
+        .await;
+
+        let recorded: Vec<_> = events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    target_auth,
+                    ..
+                } => (*stage, *reason, *http_status, event.provider_id.clone(), target_auth.clone()),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect();
+        let detail = |outcome, transit_point: Option<&str>, oauth_error: Option<&str>| {
+            Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(str::to_string),
+            })
+        };
+        let forward = (RejectionStage::Forward, RejectionReason::TargetAuthFailed);
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    forward.0,
+                    forward.1,
+                    Some(502),
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, Some("invalid_client"))
+                ),
+                (forward.0, forward.1, None, None, detail(TargetAuthOutcome::Passthrough, Some("partner"), None)),
+                (
+                    forward.0,
+                    forward.1,
+                    None,
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, None)
+                ),
+            ]
+        );
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            stored["event"]["request_rejected"],
+            serde_json::json!({
+                "stage": "forward", "reason": "target_auth_failed", "http_status": 502,
+                "target_auth": {"outcome": "rejected", "oauth_error": "invalid_client"}
+            })
+        );
+        assert_eq!(stored["provider_id"], "machine");
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_an_unregistered_oauth_error_as_other() {
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("echoed client-id-12345")),
+            );
+        })
+        .await;
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(stored["event"]["request_rejected"]["target_auth"]["oauth_error"], "other");
+        assert!(
+            !stored
+                .to_string()
+                .contains("client-id-12345"),
+            "{stored}"
+        );
+    }
+
+    #[test]
+    fn a_stored_refusal_with_an_http_status_still_reads() {
+        let read: DelegationAuditAction = serde_json::from_value(serde_json::json!({"request_rejected": {
+            "stage": "routing", "reason": "unknown_variant", "http_status": 404, "requested_variant": "typo"
+        }}))
+        .unwrap();
+        match read {
+            DelegationAuditAction::RequestRejected { http_status, .. } => assert_eq!(http_status, Some(404)),
+            other => panic!("expected RequestRejected, got {other:?}"),
+        }
+    }
+
+    fn requested_variants(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected { requested_variant, .. } => requested_variant.clone(),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_routing_refusal_is_recorded_with_one_status_per_reason() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let errors = [
+            VariantResolveError::UnknownAlias("typo".into()),
+            VariantResolveError::DisabledVariant("beta".into()),
+            VariantResolveError::MisconfiguredDefault("removed".into()),
+        ];
+        let (refusals, events) = crate::audit::producer::capture(async {
+            errors
+                .iter()
+                .map(|error| refuse_routing(&facts(), error, None))
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let answered: Vec<_> = refusals
+            .iter()
+            .map(|refusal| (refusal.status().as_u16(), refusal.requested_variant()))
+            .collect();
+        assert_eq!(answered, vec![(404, Some("typo")), (404, None), (500, None),]);
+        assert_eq!(
+            rejected(&events),
+            vec![
+                (RejectionStage::Routing, RejectionReason::UnknownVariant, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::VariantDisabled, Some(404), None),
+                (RejectionStage::Routing, RejectionReason::MisconfiguredDefault, Some(500), None),
+            ]
+        );
+        assert_eq!(requested_variants(&events), vec![Some("typo".to_string()), None, None]);
+        assert_eq!(refusals[0].message(), refusals[1].message(), "both 404s tell the caller the same");
+        assert!(
+            !refusals[0]
+                .message()
+                .contains("typo"),
+            "the caller's alias is not echoed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_variant_is_cut_to_the_longest_alias() {
+        use crate::config::agent_surface_variants::VariantResolveError;
+        let long = "a".repeat(40);
+        let accented = "é".repeat(40);
+        let (_, events) = crate::audit::producer::capture(async {
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(long.clone()), None);
+            refuse_routing(&facts(), &VariantResolveError::UnknownAlias(accented.clone()), None);
+        })
+        .await;
+
+        assert_eq!(requested_variants(&events), vec![Some("a".repeat(32)), Some("é".repeat(32))]);
+    }
+
+    #[test]
+    fn a_misconfigured_default_is_stored_in_snake_case() {
+        assert_eq!(serde_json::to_value(RejectionReason::MisconfiguredDefault).unwrap(), "misconfigured_default");
     }
 
     #[tokio::test]
@@ -327,7 +789,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, 404, None)]);
+        assert_eq!(rejected(&events), vec![(RejectionStage::Routing, RejectionReason::NoRoute, Some(404), None)]);
         assert_eq!(
             events[0]
                 .surface_id
@@ -359,7 +821,7 @@ mod tests {
 
         assert_eq!(
             rejected(&events),
-            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, 400, Some(-32022))]
+            vec![(RejectionStage::Admission, RejectionReason::VersionUnsupported, Some(400), Some(-32022))]
         );
     }
 
@@ -377,10 +839,10 @@ mod tests {
         assert_eq!(
             rejected(&events),
             vec![
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32700)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 200, Some(-32600)),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 422, None),
-                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, 400, Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32700)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(200), Some(-32600)),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(422), None),
+                (RejectionStage::Admission, RejectionReason::InvalidEnvelope, Some(400), Some(-32600)),
             ]
         );
     }
@@ -402,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_resource_token_is_a_blocking_auth_failure() {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
         let ((), events) = crate::audit::producer::capture(async {
             resource_token_failed(&facts(), ResourceTokenError::InsufficientScope, None);
         })
@@ -452,13 +914,14 @@ mod tests {
             }),
             "invalid_credential"
         );
+        assert_eq!(reason(SourceAuthError::AmbiguousCredentials), "ambiguous_credentials");
         assert_eq!(reason(SourceAuthError::ConfigNotFound { id: "s".into() }), "config_not_found");
         assert_eq!(reason(SourceAuthError::Internal { reason: "x".into() }), "internal");
     }
 
     #[test]
     fn resource_token_errors_have_fixed_reason_codes() {
-        use crate::mcp::resource_server::ResourceTokenError;
+        use crate::protocols::protected_resource::ResourceTokenError;
         assert_eq!(resource_token_reason(ResourceTokenError::Missing), "missing_credential");
         assert_eq!(resource_token_reason(ResourceTokenError::Invalid), "invalid_credential");
         assert_eq!(resource_token_reason(ResourceTokenError::InsufficientScope), "insufficient_scope");

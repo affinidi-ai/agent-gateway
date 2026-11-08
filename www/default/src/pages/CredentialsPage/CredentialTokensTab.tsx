@@ -249,6 +249,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                   <React.Fragment key={token.id}>
                     <tr
                       style={{ cursor: 'pointer' }}
+                      data-testid={`credential-token-row-${token.id}`}
                       className={expandedTokenId === token.id ? 'table-active' : ''}
                       onClick={() =>
                         setExpandedTokenId(expandedTokenId === token.id ? null : token.id)
@@ -275,6 +276,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                             variant="link"
                             size="sm"
                             className="p-0 ms-1 border-0"
+                            data-testid={`credential-token-revoke-user-button-${token.id}`}
                             title="Revoke all for this user"
                             onClick={e => {
                               e.stopPropagation();
@@ -307,6 +309,7 @@ const CredentialTokensTab: React.FC<CredentialTokensTabProps> = ({
                       <td onClick={e => e.stopPropagation()}>
                         {canEditTokens && (
                           <DeleteButton
+                            data-testid={`credential-token-revoke-button-${token.id}`}
                             onDelete={() => handleRevokeToken(token)}
                             className="btn-sm"
                             title="Revoke delegation"

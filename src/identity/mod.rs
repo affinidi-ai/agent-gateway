@@ -11,6 +11,7 @@ pub mod filesystem;
 pub mod handlers;
 pub mod identity_hash;
 pub mod identity_selector;
+pub mod provider_key_gate;
 pub mod router;
 pub mod ssi;
 pub mod state;

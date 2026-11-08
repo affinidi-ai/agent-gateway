@@ -1,67 +1,30 @@
-//! x402 middleware for payment processing
+//! Which requests a payment policy charges (MCP tool triggers and A2A method
+//! filters), and the x402 payment requirements a surface issued.
 
-use std::sync::Arc;
+use crate::config::types::{McpPaymentTriggers, X402Config, X402PaymentRequirement};
 
-use super::{PaymentChallenge, PaymentError, PaymentPayload, create_payment_response, settle_payment, verify_payment};
-use crate::config::types::{
-    ChannelProtocol, McpPaymentTriggers, X402Config, X402PaymentRequirement, X402SettlementMode,
-};
-use crate::{channel_info, channel_warn};
-
-/// Fallback bound applied to Immediate-mode settlement when
-/// `X402Config.settlement_timeout_ms` is not configured.
-const IMMEDIATE_SETTLEMENT_TIMEOUT_MS: u64 = 60_000;
-
-/// Emit a `ChallengeIssued` payment audit event for a locally-enforced x402
-/// 402 (no credential presented, so no transaction exists yet). Mirrors
-/// MPP's `fire_challenge_issued_events`: captures the ambient request trace id
-/// synchronously (works on both the HTTP and fabric paths, no signature
-/// threading needed) and uses it as the event's `transaction_id` since there is
-/// no persisted correlation id at challenge time.
-fn emit_challenge_issued_audit(
-    channel_name: &str,
-    channel_id: &str,
-) {
-    use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage, record_payment_event};
-    let trace_id = crate::observability::policy_audit::current_span_trace_id();
-    record_payment_event(
-        PaymentEventDetails {
-            rail: PaymentRail::X402,
-            stage: PaymentStage::ChallengeIssued,
-            transaction_id: trace_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            amount: None,
-            currency: None,
-            method: None,
-            payer: None,
-            error: None,
-            delegated: false,
-            payment_gateway_id: None,
-            payment_surface_id: None,
-            remote_status: None,
-        },
-        Some(channel_id),
-        Some(channel_name),
-        trace_id.as_deref(),
-        false,
-        None,
-    );
+/// The `method` of a parsed JSON-RPC request, or an empty string.
+pub(crate) fn json_rpc_method(json: &serde_json::Value) -> String {
+    json.get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
-/// Shared MCP payment-trigger evaluation used by both x402 and MPP
-/// middlewares.
-///
-/// Uses the regex-based [`McpPaymentTriggers`] modes. When `triggers`
-/// is `None`, no `tools/call` request is charged on this channel.
-///
-/// `mcp_context` lets callers avoid re-parsing the JSON-RPC body when
-/// they have already done so. When absent, `body_bytes` is parsed.
-/// `tag` is a short label for log lines (e.g. "x402", "mpp").
-pub(crate) fn mcp_requires_payment(
+/// The `params.name` of a parsed JSON-RPC request.
+pub(crate) fn json_rpc_tool_name(json: &serde_json::Value) -> Option<String> {
+    json.get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(String::from)
+}
+
+/// Whether the MCP request `method` (with the tool it names) is charged under
+/// `triggers`.
+pub(crate) fn mcp_tool_requires_payment(
     triggers: Option<&McpPaymentTriggers>,
-    body_bytes: &[u8],
-    mcp_context: Option<&crate::surface_context::McpContext>,
+    method: &str,
+    tool_name: Option<&str>,
     tag: &str,
 ) -> bool {
     use tracing::info;
@@ -70,30 +33,8 @@ pub(crate) fn mcp_requires_payment(
         info!("[{tag}] MCP payment NOT required: mcp_payment_triggers not configured");
         return false;
     };
-
-    // Extract method + tool name from pre-parsed context or by parsing body.
-    let (method, tool_name) = if let Some(ctx) = mcp_context {
-        (ctx.method.clone(), ctx.tool_name.clone())
-    } else {
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-            info!("[{tag}] MCP payment check: failed to parse body");
-            return false;
-        };
-        let method = json
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let name = json
-            .get("params")
-            .and_then(|p| p.get("name"))
-            .and_then(|n| n.as_str())
-            .map(String::from);
-        (method, name)
-    };
-
     if method != "tools/call" {
-        info!("[{tag}] MCP method {:?} is not tools/call → no payment", crate::a2a::clip_for_log(&method));
+        info!("[{tag}] MCP method {:?} is not tools/call → no payment", crate::a2a::clip_for_log(method));
         return false;
     }
     let Some(name) = tool_name else {
@@ -101,303 +42,125 @@ pub(crate) fn mcp_requires_payment(
         return false;
     };
 
-    let requires = triggers.requires_payment(&name);
-    info!("[{tag}] MCP tool {:?} triggers={triggers:?} requires_payment={requires}", crate::a2a::clip_for_log(&name));
+    let requires = triggers.requires_payment(name);
+    info!("[{tag}] MCP tool {:?} triggers={triggers:?} requires_payment={requires}", crate::a2a::clip_for_log(name));
     requires
 }
 
-/// Check if payment is required for this specific request based on protocol-specific triggers.
-///
-/// `mcp_context` may be supplied by callers that have already parsed the
-/// JSON-RPC envelope (e.g. the inbound proxy handler). When `Some`, the
-/// MCP branch reads the method + tool_name from it directly instead of
-/// re-parsing `body_bytes`. Pass `None` when no pre-parsed context is
-/// available (the function then falls back to parsing `body_bytes`).
-pub fn should_require_payment(
-    config: &X402Config,
-    protocol: &ChannelProtocol,
-    body_bytes: &[u8],
-    mcp_context: Option<&crate::surface_context::McpContext>,
+/// Whether an A2A/AP2 request is charged under `filters` (`parsed` is `None`
+/// when the body is not JSON). With no filter, nothing is charged; a body the
+/// filters cannot be matched against is charged.
+pub(crate) fn a2a_requires_payment_parsed(
+    filters: &[crate::config::types::A2AMethodFilter],
+    body_is_empty: bool,
+    parsed: Option<&serde_json::Value>,
+    tag: &str,
 ) -> bool {
     use tracing::info;
 
-    info!("[x402] Payment check: enabled={}, protocol={:?}", config.enabled, protocol);
-
-    if !config.enabled {
-        info!("[x402] Payment NOT required: config.enabled=false");
+    if filters.is_empty() {
+        info!("[{tag}] A2A/AP2 payment NOT required: no method filters configured");
         return false;
     }
 
-    // When payment is delegated to a remote payment gateway (provider != local),
-    // local x402 enforcement is skipped — the delegation path forwards the whole
-    // request to the payment gateway instead of running the paywall here.
-    if config.provider != crate::config::types::X402Provider::Local {
-        info!("[x402] Payment delegated to remote gateway; skipping local enforcement");
-        return false;
-    }
-
-    match protocol {
-        ChannelProtocol::Mcp => mcp_requires_payment(
-            config
-                .mcp_payment_triggers
-                .as_ref(),
-            body_bytes,
-            mcp_context,
-            "x402",
-        ),
-        ChannelProtocol::A2a | ChannelProtocol::Ap2 => {
-            // For A2A/AP2 protocols:
-            // 1. Check if method filters are configured
-            // 2. Parse JSON-RPC request to extract method and message content
-            // 3. Match method and optionally message content patterns
-
-            // Use new a2a_method_filters if available, otherwise fall back to legacy a2a_methods
-            let method_filters = if let Some(ref filters) = config.a2a_method_filters {
-                if filters.is_empty() {
-                    info!("[x402] A2A/AP2 payment NOT required: a2a_method_filters is empty");
-                    return false;
-                }
-                Some(filters)
-            } else if let Some(ref methods) = config.a2a_methods {
-                // Backward compatibility: convert legacy a2a_methods to filters
-                if methods.is_empty() {
-                    info!("[x402] A2A/AP2 payment NOT required: a2a_methods is empty");
-                    return false;
-                }
-                info!("[x402] Using legacy a2a_methods (consider migrating to a2a_method_filters)");
-                // Convert to filters without message patterns
-                None // Will handle legacy path below
-            } else {
-                info!("[x402] A2A/AP2 payment NOT required: no method filtering configured");
-                return false;
-            };
-
-            let (json, method) = match a2a_filter_input(body_bytes) {
-                A2aFilterInput::Empty => {
-                    info!("[x402] A2A/AP2 payment NOT required: empty body (no method to match filters)");
-                    return false;
-                }
-                A2aFilterInput::Unmatchable(reason) => {
-                    info!("[x402] A2A/AP2 payment required: {reason}, so method filters cannot be matched");
-                    return true;
-                }
-                A2aFilterInput::Method { json, method } => (json, method),
-            };
-            let method = method.as_str();
-            let logged_method = crate::a2a::clip_for_log(method);
-
-            info!("[x402] A2A/AP2 JSON-RPC method: {:?}", logged_method);
-
-            // Normalize method name to support both JSON-RPC and gRPC variants
-            // JSON-RPC: message/send, message/stream, tasks/cancel
-            // gRPC: SendMessage, SendStreamingMessage, CancelTask
-            let normalized_method = normalize_a2a_method(method);
-            info!("[x402] A2A/AP2 normalized method: {:?}", crate::a2a::clip_for_log(&normalized_method));
-
-            // Handle new method filters
-            if let Some(filters) = method_filters {
-                for filter in filters {
-                    let filter_normalized = normalize_a2a_method(&filter.method);
-                    if filter_normalized != normalized_method {
-                        continue; // Method doesn't match
-                    }
-
-                    // Method matches - now check message patterns if any
-                    if filter
-                        .message_patterns
-                        .is_empty()
-                    {
-                        // No patterns means match all requests for this method
-                        info!(
-                            "[x402] A2A/AP2 payment required: method {:?} matches (no message patterns)",
-                            logged_method
-                        );
-                        return true;
-                    }
-
-                    // Check if this method has message content to match against
-                    let message_content = if normalized_method == "message/send"
-                        || normalized_method == "message/stream"
-                    {
-                        // Extract message text from params.message.parts[].text
-                        let content = extract_a2a_message_text(&json);
-                        if let Some(ref text) = content {
-                            info!(
-                                "[x402] A2A/AP2 extracted message content for method {:?} (length: {} chars)",
-                                logged_method,
-                                text.len()
-                            );
-                        } else {
-                            info!("[x402] A2A/AP2 failed to extract message content for method {:?}", logged_method);
-                        }
-                        content
-                    } else {
-                        // Other methods don't have message content to filter on
-                        info!(
-                            "[x402] A2A/AP2 payment required: method {:?} matches (no message content to filter)",
-                            logged_method
-                        );
-                        return true;
-                    };
-
-                    let Some(content) = message_content else {
-                        // No message content found, require payment to be safe
-                        info!(
-                            "[x402] A2A/AP2 payment required: method {:?} matches but no message content found",
-                            logged_method
-                        );
-                        return true;
-                    };
-
-                    // Check if message content matches any pattern
-                    for pattern in &filter.message_patterns {
-                        info!("[x402] A2A/AP2 checking pattern '{}' against message content", pattern);
-                        // Escape pattern to treat it as literal text match
-                        let escaped_pattern = regex::escape(pattern);
-                        match regex::Regex::new(&escaped_pattern) {
-                            Ok(re) => {
-                                if re.is_match(&content) {
-                                    info!(
-                                        "[x402] A2A/AP2 payment required: method {:?} and message matches pattern '{}'",
-                                        logged_method, pattern
-                                    );
-                                    return true;
-                                } else {
-                                    info!("[x402] A2A/AP2 pattern '{}' did NOT match message content", pattern);
-                                }
-                            }
-                            Err(e) => {
-                                info!(
-                                    "[x402] A2A/AP2 invalid regex pattern '{}': {} (treating as non-match)",
-                                    pattern, e
-                                );
-                            }
-                        }
-                    }
-
-                    info!(
-                        "[x402] A2A/AP2 payment NOT required: method {:?} matches but message doesn't match any pattern",
-                        logged_method
-                    );
-                    return false; // Method matches but message doesn't match any pattern
-                }
-
-                // No filter matched
-                info!("[x402] A2A/AP2 payment NOT required: method {:?} not in configured filters", logged_method);
-                return false;
-            }
-
-            // Handle legacy a2a_methods
-            if let Some(ref methods) = config.a2a_methods {
-                let requires_payment = methods
-                    .iter()
-                    .any(|m| normalize_a2a_method(m) == normalized_method);
-                info!(
-                    "[x402] A2A/AP2 payment required={}: method {:?} (legacy mode, configured methods: {:?})",
-                    requires_payment, logged_method, methods
-                );
-                return requires_payment;
-            }
-
-            // Should not reach here
-            false
+    let (json, method) = match (body_is_empty, parsed) {
+        (true, _) => {
+            info!("[{tag}] A2A/AP2 payment NOT required: empty body (no method to match filters)");
+            return false;
         }
-        _ => {
-            // For other protocols, require payment for all requests
-            true
+        (false, None) => {
+            info!("[{tag}] A2A/AP2 payment required: body is not JSON, so method filters cannot be matched");
+            return true;
         }
-    }
-}
-
-/// Process x402 payment for a request. Without a signature the request is
-/// refused with the challenge to pay.
-pub async fn process_payment(
-    payment_signature: Option<String>,
-    config: &X402Config,
-    channel_name: &str,
-    channel_id: &str,
-    resource_url: &str,
-    listener_manager: Option<std::sync::Arc<crate::gateways::ConnectionPointListenerManager>>,
-    transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-) -> Result<Option<String>, PaymentError> {
-    if !config.enabled {
-        // Payments not required for this channel
-        return Ok(None);
-    }
-
-    match payment_signature {
-        Some(sig) => {
-            // Verify the payment
-            match verify_payment(
-                &sig,
-                config,
-                channel_name,
-                channel_id,
-                resource_url,
-                listener_manager,
-                transaction_store.clone(),
-                None,
-            )
-            .await
-            {
-                Ok((payload, correlation_id)) => {
-                    channel_info!(
-                        channel_id,
-                        "Payment verified successfully correlation_id={} network={:?} amount={:?}",
-                        correlation_id,
-                        crate::a2a::clip_for_log(payload.network()),
-                        crate::a2a::clip_for_log(payload.amount())
-                    );
-
-                    // Settlement gating is driven by X402SettlementMode — see
-                    // [`dispatch_settlement`] for per-mode semantics.
-                    let settled = dispatch_settlement(
-                        &payload,
-                        config,
-                        channel_name,
-                        channel_id,
-                        transaction_store,
-                        &correlation_id,
-                    )
-                    .await?;
-
-                    // Create payment response header
-                    match create_payment_response(&payload, true, settled) {
-                        Ok(response_header) => Ok(Some(response_header)),
-                        Err(e) => {
-                            tracing::warn!(
-                                channel = channel_name,
-                                error = ?e.to_string(),
-                                "Failed to create payment response"
-                            );
-                            Ok(None)
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Payment verification failed
-                    Err(PaymentError::Invalid(e))
-                }
+        (false, Some(json)) => match json
+            .get("method")
+            .and_then(|method| method.as_str())
+        {
+            Some(method) => (json, method),
+            None => {
+                info!("[{tag}] A2A/AP2 payment required: no string method, so method filters cannot be matched");
+                return true;
             }
-        }
-        None => Err(PaymentError::Required(challenge(config, channel_name, channel_id, resource_url).await)),
-    }
-}
-
-/// The challenge for a request that presented no signature, recording that
-/// it was issued.
-pub async fn challenge(
-    config: &X402Config,
-    channel_name: &str,
-    channel_id: &str,
-    resource_url: &str,
-) -> PaymentChallenge {
-    let challenge = PaymentChallenge {
-        resource_url: resource_url.to_string(),
-        accepts: issued_payment_requirements(config).await,
+        },
     };
-    emit_challenge_issued_audit(channel_name, channel_id);
-    challenge
+    let logged_method = crate::a2a::clip_for_log(method);
+
+    info!("[{tag}] A2A/AP2 JSON-RPC method: {:?}", logged_method);
+
+    // Normalize method name to support both JSON-RPC and gRPC variants
+    // JSON-RPC: message/send, message/stream, tasks/cancel
+    // gRPC: SendMessage, SendStreamingMessage, CancelTask
+    let normalized_method = normalize_a2a_method(method);
+    info!("[{tag}] A2A/AP2 normalized method: {:?}", crate::a2a::clip_for_log(&normalized_method));
+
+    for filter in filters {
+        let filter_normalized = normalize_a2a_method(&filter.method);
+        if filter_normalized != normalized_method {
+            continue; // Method doesn't match
+        }
+
+        // Method matches - now check message patterns if any
+        if filter
+            .message_patterns
+            .is_empty()
+        {
+            // No patterns means match all requests for this method
+            info!("[{tag}] A2A/AP2 payment required: method {:?} matches (no message patterns)", logged_method);
+            return true;
+        }
+
+        // Check if this method has message content to match against
+        let message_content = if normalized_method == "message/send" || normalized_method == "message/stream" {
+            // Extract message text from params.message.parts[].text
+            let content = extract_a2a_message_text(json);
+            if let Some(ref text) = content {
+                info!(
+                    "[{tag}] A2A/AP2 extracted message content for method {:?} (length: {} chars)",
+                    logged_method,
+                    text.len()
+                );
+            } else {
+                info!("[{tag}] A2A/AP2 failed to extract message content for method {:?}", logged_method);
+            }
+            content
+        } else {
+            // Other methods don't have message content to filter on
+            info!(
+                "[{tag}] A2A/AP2 payment required: method {:?} matches (no message content to filter)",
+                logged_method
+            );
+            return true;
+        };
+
+        let Some(content) = message_content else {
+            // No message content found, require payment to be safe
+            info!("[{tag}] A2A/AP2 payment required: method {:?} matches but no message content found", logged_method);
+            return true;
+        };
+
+        // Check if message content matches any pattern
+        for pattern in &filter.message_patterns {
+            info!("[{tag}] A2A/AP2 checking pattern '{}' against message content", pattern);
+            // A pattern is literal text the message must contain.
+            if content.contains(pattern.as_str()) {
+                info!(
+                    "[{tag}] A2A/AP2 payment required: method {:?} and message matches pattern '{}'",
+                    logged_method, pattern
+                );
+                return true;
+            }
+            info!("[{tag}] A2A/AP2 pattern '{}' did NOT match message content", pattern);
+        }
+
+        info!(
+            "[{tag}] A2A/AP2 payment NOT required: method {:?} matches but message doesn't match any pattern",
+            logged_method
+        );
+        return false; // Method matches but message doesn't match any pattern
+    }
+
+    info!("[{tag}] A2A/AP2 payment NOT required: method {:?} not in configured filters", logged_method);
+    false
 }
 
 /// Lowercase the asset and recipient of an EVM (`eip155:*`) requirement; EVM hex addresses are
@@ -524,122 +287,6 @@ pub(crate) async fn issued_payment_requirements(config: &X402Config) -> Vec<X402
         .collect()
 }
 
-/// Run the post-verification settlement step according to
-/// `config.settlement_mode`:
-///
-/// - `Immediate` awaits `settle_payment` inline, bounded by
-///   `settlement_timeout_ms` (default [`IMMEDIATE_SETTLEMENT_TIMEOUT_MS`]).
-///   Any settlement error or timeout becomes an invalid payment so the
-///   caller never grants on an unsettled payment.
-/// - `Deferred` spawns settlement in the background and returns `Ok(false)`
-///   immediately, preserving grant-before-settle latency.
-/// - `None` is a no-op (verification-only mode).
-async fn dispatch_settlement(
-    payload: &PaymentPayload,
-    config: &X402Config,
-    channel_name: &str,
-    channel_id: &str,
-    transaction_store: Option<Arc<crate::x402::TransactionStore>>,
-    correlation_id: &str,
-) -> Result<bool, PaymentError> {
-    match config.settlement_mode {
-        X402SettlementMode::Immediate => {
-            let timeout_ms = config
-                .settlement_timeout_ms
-                .unwrap_or(IMMEDIATE_SETTLEMENT_TIMEOUT_MS);
-            let settle_future = settle_payment(
-                payload,
-                config,
-                channel_name,
-                channel_id,
-                transaction_store.as_ref(),
-                None, // confirmations captured during verification
-                Some(correlation_id.to_string()),
-            );
-
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), settle_future).await {
-                Ok(Ok(())) => Ok(true),
-                Ok(Err(e)) => {
-                    channel_warn!(
-                        channel_id,
-                        "Immediate settlement failed correlation_id={} error={:?}",
-                        correlation_id,
-                        e.to_string()
-                    );
-                    Err(PaymentError::Invalid(format!("Payment settlement failed: {e}")))
-                }
-                Err(_) => {
-                    channel_warn!(
-                        channel_id,
-                        "Immediate settlement timed out after {}ms correlation_id={}",
-                        timeout_ms,
-                        correlation_id
-                    );
-                    Err(PaymentError::Invalid(format!("Payment settlement timed out after {timeout_ms}ms")))
-                }
-            }
-        }
-        X402SettlementMode::Deferred => {
-            let config_clone = config.clone();
-            let channel_name_clone = channel_name.to_string();
-            let channel_id_clone = channel_id.to_string();
-            let payload_clone = payload.clone();
-            let correlation_id_clone = correlation_id.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = settle_payment(
-                    &payload_clone,
-                    &config_clone,
-                    &channel_name_clone,
-                    &channel_id_clone,
-                    transaction_store.as_ref(),
-                    None,
-                    Some(correlation_id_clone),
-                )
-                .await
-                {
-                    channel_warn!(&channel_id_clone, "Deferred settlement failed error={:?}", e.to_string());
-                }
-            });
-            Ok(false)
-        }
-        X402SettlementMode::None => Ok(false),
-    }
-}
-
-/// What an A2A request body gives x402 and MPP method filters to match.
-#[derive(Debug)]
-pub enum A2aFilterInput {
-    /// No body, as on a GET: there is no method, and nothing is charged.
-    Empty,
-    /// A body the filters cannot be matched against, charged rather than let
-    /// through free: on the inbound path only when the surface's A2A validation
-    /// is `off`, and on the fabric receiving gateway, which checks payment
-    /// without an envelope check, at any level.
-    Unmatchable(&'static str),
-    /// A JSON-RPC request with a string `method`.
-    Method { json: serde_json::Value, method: String },
-}
-
-/// Classify an A2A request body for x402 and MPP method filters.
-pub fn a2a_filter_input(body_bytes: &[u8]) -> A2aFilterInput {
-    if body_bytes.is_empty() {
-        return A2aFilterInput::Empty;
-    }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) else {
-        return A2aFilterInput::Unmatchable("body is not JSON");
-    };
-    match json
-        .get("method")
-        .and_then(|method| method.as_str())
-    {
-        Some(method) => {
-            let method = method.to_string();
-            A2aFilterInput::Method { json, method }
-        }
-        None => A2aFilterInput::Unmatchable("no string method"),
-    }
-}
-
 /// Normalize A2A method names to support both JSON-RPC and gRPC variants
 /// JSON-RPC: message/send, message/stream, tasks/cancel
 /// gRPC: SendMessage, SendStreamingMessage, CancelTask
@@ -694,349 +341,80 @@ pub fn extract_a2a_message_text(json: &serde_json::Value) -> Option<String> {
 }
 
 #[cfg(test)]
-mod settlement_gating_tests {
-    use super::*;
-    use crate::config::types::{X402SettlementMode, X402VerificationMode};
-    use crate::x402::{PaymentResponse, TransactionStore, config_cache};
-    use base64::Engine;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    fn configured_requirement() -> X402PaymentRequirement {
-        X402PaymentRequirement {
-            scheme: "exact".to_string(),
-            network: "eip155:1".to_string(),
-            amount: "1000".to_string(),
-            asset: "0x123".to_string(),
-            recipient_id: String::new(),
-            pay_to: "0x456".to_string(),
-            max_timeout_seconds: 300,
-            extra: None,
-        }
-    }
-
-    fn payment_header(nonce_suffix: &str) -> String {
-        payment_header_paying("0x456", nonce_suffix)
-    }
-
-    fn payment_header_paying(
-        pay_to: &str,
-        nonce_suffix: &str,
-    ) -> String {
-        let payload_json = format!(
-            r#"{{
-                "x402Version": 2,
-                "resource": {{"url": "/test", "description": "test", "mimeType": "application/json"}},
-                "accepted": {{
-                    "scheme": "exact",
-                    "network": "eip155:1",
-                    "amount": "1000",
-                    "asset": "0x123",
-                    "payTo": "{pay_to}",
-                    "maxTimeoutSeconds": 300
-                }},
-                "payload": {{
-                    "authorization": {{
-                        "from": "0xabc",
-                        "to": "{pay_to}",
-                        "value": "1000",
-                        "validAfter": "0",
-                        "validBefore": "999999999",
-                        "nonce": "0x{nonce_suffix}"
-                    }},
-                    "signature": "0xsig"
-                }}
-            }}"#
-        );
-
-        base64::engine::general_purpose::STANDARD.encode(payload_json.as_bytes())
-    }
-
-    fn decode_payment_response(header: &str) -> PaymentResponse {
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(header)
-            .expect("PAYMENT-RESPONSE must be base64 encoded");
-        serde_json::from_slice(&decoded).expect("PAYMENT-RESPONSE must decode to JSON")
-    }
-
-    fn assert_payment_response(
-        header: &str,
-        verified: bool,
-        settled: bool,
-    ) {
-        let response = decode_payment_response(header);
-
-        assert_eq!(response.verified, verified, "unexpected verified flag");
-        assert_eq!(response.settled, settled, "unexpected settled flag");
-    }
-
-    #[tokio::test]
-    async fn immediate_mode_rejects_grant_when_settlement_fails() {
-        config_cache::clear_x402_config_cache().await;
-
-        let tmp = tempdir().unwrap();
-        let store = Arc::new(
-            TransactionStore::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let config = X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            settlement_mode: X402SettlementMode::Immediate,
-            facilitator_private_keys: None,
-            payment_requirements: vec![configured_requirement()],
-            ..Default::default()
-        };
-        let result = process_payment(
-            Some(payment_header("aa")),
-            &config,
-            "Test Channel",
-            "channel-immediate-fail",
-            "/test",
-            None,
-            Some(store),
-        )
-        .await;
-
-        match result {
-            Err(PaymentError::Invalid(message)) => {
-                assert!(message.starts_with("Payment settlement failed"), "{message}")
-            }
-            other => panic!("expected an invalid payment when immediate settlement fails, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn deferred_mode_grants_synchronously_after_verification() {
-        let tmp = tempdir().unwrap();
-        let store = Arc::new(
-            TransactionStore::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let config = X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            settlement_mode: X402SettlementMode::Deferred,
-            payment_requirements: vec![configured_requirement()],
-            ..Default::default()
-        };
-        let result = process_payment(
-            Some(payment_header("bb")),
-            &config,
-            "Test Channel",
-            "channel-deferred",
-            "/test",
-            None,
-            Some(store),
-        )
-        .await;
-
-        let header = result
-            .expect("deferred mode must grant after verification")
-            .expect("expected PAYMENT-RESPONSE header in deferred mode");
-        assert_payment_response(&header, true, false);
-    }
-
-    #[tokio::test]
-    async fn none_mode_grants_without_attempting_settlement() {
-        let tmp = tempdir().unwrap();
-        let store = Arc::new(
-            TransactionStore::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let config = X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            settlement_mode: X402SettlementMode::None,
-            payment_requirements: vec![configured_requirement()],
-            ..Default::default()
-        };
-        let result = process_payment(
-            Some(payment_header("cc")),
-            &config,
-            "Test Channel",
-            "channel-none",
-            "/test",
-            None,
-            Some(store),
-        )
-        .await;
-
-        let header = result
-            .expect("none mode must grant after verification")
-            .expect("expected PAYMENT-RESPONSE header in none mode");
-        assert_payment_response(&header, true, false);
-    }
-
-    #[tokio::test]
-    async fn rejects_payment_to_a_recipient_the_surface_did_not_issue() {
-        let tmp = tempdir().unwrap();
-        let store = Arc::new(
-            TransactionStore::new(tmp.path().to_path_buf())
-                .await
-                .unwrap(),
-        );
-        let config = X402Config {
-            verification_mode: X402VerificationMode::Mock,
-            settlement_mode: X402SettlementMode::Deferred,
-            payment_requirements: vec![configured_requirement()],
-            ..Default::default()
-        };
-
-        let result = process_payment(
-            Some(payment_header_paying("0xbad", "dd")),
-            &config,
-            "Test Channel",
-            "channel-self-payment",
-            "/test",
-            None,
-            Some(Arc::clone(&store)),
-        )
-        .await;
-
-        match result.expect_err("self-payment must not be granted") {
-            PaymentError::Invalid(message) => {
-                assert_eq!(message, "Payment does not match any payment requirement issued for this resource")
-            }
-            other => panic!("expected an invalid payment, got {other:?}"),
-        }
-        let transactions = store.list_all().await;
-        assert_eq!(transactions.len(), 1);
-        assert!(
-            transactions[0]
-                .settlement
-                .is_none(),
-            "settlement must not start"
-        );
-    }
-}
-
-#[cfg(test)]
 mod a2a_method_gating_tests {
     use super::*;
-
-    #[test]
-    fn a2a_filter_input_classifies_each_kind_of_body() {
-        assert!(matches!(a2a_filter_input(b""), A2aFilterInput::Empty));
-        assert!(matches!(a2a_filter_input(b"not json"), A2aFilterInput::Unmatchable("body is not JSON")));
-        for unmatchable in [
-            r#"[{"jsonrpc":"2.0","id":1,"method":"message/send"}]"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":7}"#,
-            r#"{"jsonrpc":"2.0","id":1}"#,
-        ] {
-            assert!(
-                matches!(a2a_filter_input(unmatchable.as_bytes()), A2aFilterInput::Unmatchable("no string method")),
-                "{unmatchable}"
-            );
-        }
-        match a2a_filter_input(br#"{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{}}"#) {
-            A2aFilterInput::Method { json, method } => {
-                assert_eq!(method, "SendMessage");
-                assert_eq!(json["params"], serde_json::json!({}));
-            }
-            other => panic!("expected a method, got {other:?}"),
-        }
-    }
     use crate::config::types::A2AMethodFilter;
 
-    fn legacy_config(methods: &[&str]) -> X402Config {
-        X402Config {
-            a2a_methods: Some(
-                methods
-                    .iter()
-                    .map(|m| m.to_string())
-                    .collect(),
-            ),
-            ..Default::default()
+    fn charged(
+        filters: &[A2AMethodFilter],
+        body: &[u8],
+    ) -> bool {
+        a2a_requires_payment_parsed(
+            filters,
+            body.is_empty(),
+            serde_json::from_slice(body)
+                .ok()
+                .as_ref(),
+            "test",
+        )
+    }
+
+    fn filter(
+        method: &str,
+        patterns: &[&str],
+    ) -> A2AMethodFilter {
+        A2AMethodFilter {
+            method: method.to_string(),
+            message_patterns: patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect(),
         }
     }
 
-    fn a2a_body(method: &str) -> Vec<u8> {
+    fn message(
+        method: &str,
+        text: &str,
+    ) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": method,
-            "params": {"message": {"role": "user", "parts": [{"text": "hello"}]}}
+            "params": {"message": {"role": "user", "parts": [{"text": text}]}}
         }))
         .unwrap()
     }
 
-    fn requires(
-        config: &X402Config,
-        method: &str,
-    ) -> bool {
-        should_require_payment(config, &ChannelProtocol::A2a, &a2a_body(method), None)
+    #[test]
+    fn a_filter_charges_its_method_in_either_spelling() {
+        assert!(charged(&[filter("message/send", &[])], &message("SendMessage", "hello")));
+        assert!(charged(&[filter("SendMessage", &[])], &message("message/send", "hello")));
+        assert!(!charged(&[filter("message/send", &[])], &message("tasks/get", "hello")));
+        assert!(!charged(&[], &message("message/send", "hello")), "no filter charges nothing");
     }
 
     #[test]
-    fn legacy_slash_form_config_charges_pascal_case_caller() {
-        assert!(requires(&legacy_config(&["message/send"]), "SendMessage"));
-    }
-
-    #[test]
-    fn legacy_pascal_case_config_charges_slash_form_caller() {
-        assert!(requires(&legacy_config(&["SendMessage"]), "message/send"));
-    }
-
-    #[test]
-    fn legacy_config_still_charges_identical_spelling() {
-        assert!(requires(&legacy_config(&["message/send"]), "message/send"));
-        assert!(requires(&legacy_config(&["SendMessage"]), "SendMessage"));
-    }
-
-    #[test]
-    fn legacy_config_does_not_charge_unlisted_method_in_either_spelling() {
-        let config = legacy_config(&["message/send"]);
-        assert!(!requires(&config, "tasks/get"));
-        assert!(!requires(&config, "GetTask"));
-    }
-
-    #[test]
-    fn legacy_config_matches_unknown_method_verbatim_only() {
+    fn an_unknown_method_matches_verbatim_only() {
         assert_eq!(normalize_a2a_method("custom/charge"), "custom/charge");
-        let config = legacy_config(&["custom/charge"]);
-        assert!(requires(&config, "custom/charge"));
-        assert!(!requires(&config, "custom/Charge"));
-        assert!(!requires(&config, "message/send"));
+        assert!(charged(&[filter("custom/charge", &[])], &message("custom/charge", "hello")));
+        assert!(!charged(&[filter("custom/charge", &[])], &message("custom/Charge", "hello")));
     }
 
     #[test]
     fn message_pattern_filter_handles_multibyte_message_longer_than_log_limit() {
-        let config = X402Config {
-            a2a_method_filters: Some(vec![A2AMethodFilter {
-                method: "SendMessage".to_string(),
-                message_patterns: vec!["premium".to_string()],
-            }]),
-            ..Default::default()
-        };
+        let filters = [filter("SendMessage", &["premium"])];
         let text = format!("a{} premium", "é".repeat(150));
-        let body = |text: &str| {
-            serde_json::to_vec(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "message/send",
-                "params": {"message": {"role": "user", "parts": [{"text": text}]}}
-            }))
-            .unwrap()
-        };
-        assert!(should_require_payment(&config, &ChannelProtocol::A2a, &body(&text), None));
+        assert!(charged(&filters, &message("message/send", &text)));
         let free = format!("a{}", "é".repeat(150));
-        assert!(!should_require_payment(&config, &ChannelProtocol::A2a, &body(&free), None));
+        assert!(!charged(&filters, &message("message/send", &free)));
     }
 
-    /// With A2A method filters configured, a body the filters cannot be matched
-    /// against is charged instead of let through free; a request without a body
-    /// is still not charged.
+    /// A body the filters cannot be matched against is charged instead of let
+    /// through free; a request without a body is still not charged.
     #[test]
     fn a2a_method_filters_charge_a_body_without_a_string_method() {
-        let config = X402Config {
-            a2a_method_filters: Some(vec![A2AMethodFilter {
-                method: "CancelTask".to_string(),
-                message_patterns: vec![],
-            }]),
-            ..Default::default()
-        };
-        let requires = |body: &[u8]| should_require_payment(&config, &ChannelProtocol::A2a, body, None);
+        let filters = [filter("CancelTask", &[])];
+        let requires = |body: &[u8]| charged(&filters, body);
 
         assert!(requires(br#"[{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}]"#), "a batch");
         assert!(requires(br#"{"jsonrpc":"2.0","id":1,"method":7}"#), "a non-string method");

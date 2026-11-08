@@ -42,8 +42,12 @@ pub struct IdentityApiState {
     pub certificate_store: Option<Arc<dyn crate::certificates::CertificateStore>>,
     pub jwt_verification_strategy_store: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
     pub credential_provider_store: Option<Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>>,
+    /// The vault whose grants by binding a surface change that removes their
+    /// binding revokes and deletes.
+    pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
     pub sts_client_store: Option<Arc<dyn crate::sts::store::StsClientStorage>>,
     pub vta_connection_store: Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>>,
+    pub api_key_store: Option<Arc<dyn crate::api_keys::store::ApiKeyStore>>,
     /// Pre-resolved per-variant surface snapshots. Phase C scaffolding —
     /// kept in lockstep with `agent_surface_store` writes by
     /// `crate::identity::handlers::surfaces::apply_surface_change`. Phase

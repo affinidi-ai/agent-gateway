@@ -969,7 +969,7 @@ mod tests {
             extensions: None,
         };
         store
-            .create_transaction(
+            .insert(X402Transaction::new(
                 "correlation-1".to_string(),
                 "surface-1".to_string(),
                 "Surface".to_string(),
@@ -977,9 +977,8 @@ mod tests {
                 payload.clone(),
                 "ExternalFacilitator".to_string(),
                 None,
-            )
-            .await
-            .unwrap();
+            ))
+            .await;
         // External facilitator settlement with no facilitator URL configured.
         let config = X402Config {
             settlement_mode: X402SettlementMode::Immediate,

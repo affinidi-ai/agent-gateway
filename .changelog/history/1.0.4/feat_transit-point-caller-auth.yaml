@@ -1,0 +1,113 @@
+branch: feat/transit-point-caller-auth
+changes:
+  added:
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: ⭐ Let a Transit Point authenticate its callers with an API key, JWT or mTLS
+      description: >-
+        A caller that cannot carry a transit token, such as a cloud-hosted agent, had no way to
+        prove who it was to a Transit Point, so operators turned the token off and served
+        anyone who reached it. A Transit Point now takes its own `source_auth`, checked by the
+        same source authentication as an Access Point before anything is forwarded: `api_key`
+        or `api_key_provider` read from a header, `jwt_bearer`, or `mtls` from the outbound
+        listener's TLS handshake or a trusted proxy; an inbound listener that passes `/outbound`
+        requests on now drops the forwarded-client-cert header, so no certificate reaches a Transit
+        Point that way unverified. A missing or refused credential is refused
+        with `401` that says only that it is missing or invalid, and recorded as an
+        `auth_failed` audit event, and the credential is never sent to the target. The admitted
+        caller is named on the Transit Point's policy and delegation audit records. The verified
+        caller reaches the Transit Point's policy input as
+        `input.transit.client` with `verification: source_auth`, apart from the end user a
+        transit token names in `input.transit.caller`, so a policy can allow only named callers, and keys per-caller delegated credentials on legacy MCP, A2A and HTTP requests by the same identity hash the
+        Access Point uses. The secrets, strategies, API-key parents and certificates it names
+        are checked on save as an Access Point's are, so a tenant access token can name only its
+        own or appliance-wide ones. A `jwt_bearer` must name an audience, and a save answers
+        with a `Warning` header when it accepts the Access Point's own tokens (the same
+        strategy and a shared audience, such as the resource an MCP Access Point's protected
+        resource metadata names for the base surface or a variant), or when its strategy names
+        the same issuer as another
+        strategy the surface accepts, as callers verified through either share delegated
+        credentials. A `PUT` of the surface or of one variant that omits a Transit Point's
+        `source_auth`, as a dashboard save does, keeps it; `"source_auth": null` removes it,
+        and a Transit Point that is then left authenticating no caller is refused with `400`.
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: Warn when an open Transit Point is reachable from other hosts
+      description: >-
+        A Transit Point that serves callers it does not authenticate gives anyone who reaches
+        it its target credentials. When other hosts can reach one, because its outbound
+        listener, or an inbound listener that shares a host name with it and passes `/outbound`
+        requests on, binds an address other than loopback or has an external URL that is not
+        this host's own (private addresses included), the admin API answers the save of its
+        surface with a `Warning` header naming it and those addresses, and the outbound listener
+        logs it at `WARN`. Every open Transit Point is logged at `WARN` when it is mounted. The
+        dashboard does not show the header.
+  changed:
+    - timestamp: '2026-10-30T06:00:00.000Z'
+      title: Send a delegated payment only the headers an Access Point forwards
+      description: >-
+        A surface that delegates its payment (`agent_pay`) now sends the payment gateway the
+        caller's headers that the Access Point forwards to its own Target, and `Authorization`
+        only when it carries a `Payment` credential that neither the surface's `source_auth`
+        nor its Resource Server reads. Other `Authorization` values, `Proxy-Authorization` and
+        other hop-by-hop headers, caller-info headers, mapped headers the surface strips and
+        `X-Transit-Token` stay on this gateway.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-29T20:30:00.000Z'
+      title: Pass caller-info and DID identity headers only as the gateway sets them
+      description: >-
+        The Access Point and Fabric receive pass a managed agent `x-caller-did`,
+        `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `X-DID-Identity` and
+        `X-DID-Signed-Identity` only as the gateway sets them, so the agent can rely on them
+        to know who is calling, and a Transit Point sends its target none of them. A request
+        that carries its own copy of one of these headers is forwarded without it.
+    - timestamp: '2026-10-29T21:00:00.000Z'
+      title: Key delegated credentials by how the caller was identified
+      description: >-
+        The caller's identity hash, which keys delegated credentials and travels in the
+        transit token as `user_identity_hash`, is now the SHA-256 of the authentication
+        method, its issuer, the surface's tenant and the principal. The Workload Binding
+        `user_hash` for `caller_source: did` follows the same rule. A JWT without a `sub` has
+        no identity hash, so an Access Point or Transit Point that would give its caller a
+        delegated credential answers it with `403`. Users who connected an account before
+        this release connect it again, and policies that compare `user_identity_hash` need the
+        new value. The delegated credentials stored before the upgrade are no longer used but
+        keep their tokens until removed: revoke them through the delegation vault API or the
+        dashboard's Credential Tokens tab, as `docs/CREDENTIAL_DELEGATION.md` describes.
+  breaking:
+    - timestamp: '2026-10-29T12:00:00.000Z'
+      title: ⭐ Refuse a Transit Point that authenticates no caller unless it is marked open
+      description: >-
+        A Transit Point with `require_transit_token: false` and neither `mcp_http.authorization`
+        nor `source_auth` served anyone who reached it, through this gateway and with its
+        `target_auth` credential. Such a Transit Point must now be marked
+        `allow_unauthenticated_callers: true`. The admin API refuses one that is not, on the
+        surface or in a variant, with `400`, and also refuses `allow_unauthenticated_callers`
+        on a Transit Point that authenticates its callers, `source_auth` beside
+        `mcp_http.authorization`, and a `source_auth` a Transit Point does not support
+        (`did_auth`, a `jwt_bearer` that forwards the token or names no audience, or a key read
+        from anything but a header). A stored surface with such a Transit Point still loads, with a warning in the
+        log, but that Transit Point refuses every request with `503` until it is fixed. A save
+        that leaves such a stored Transit Point exactly as it is is still accepted, so a
+        dashboard save of the surface works; one that changes it, or adds another, is refused.
+        After upgrading, set `allow_unauthenticated_callers: true` on every Transit Point that
+        should stay open, or give it `source_auth`, with an admin API `PUT` of the surface or
+        in the dashboard; do not set the flag before upgrading, because a release before this
+        one drops it when it saves the surface.
+    - timestamp: '2026-10-29T21:30:00.000Z'
+      title: ⭐ Mark surfaces whose Transit Points use source_auth so older releases skip them
+      description: >-
+        A release before this one ignores a Transit Point's `source_auth`. After a rollback, or
+        on an older node sharing storage during a rolling upgrade or in an Active/Standby pair,
+        it would serve such a Transit Point to anyone who reaches it, with its `target_auth`
+        credential, when the transit token is off. A surface with a Transit Point that uses
+        `source_auth`, on the base or in a variant, is now stored with
+        `transit_point_source_auth: true`, which a release before this one refuses, so it skips
+        the whole surface instead of serving it open. Upgrade every node that shares storage
+        before giving a Transit Point `source_auth`, and do not roll back below this release
+        while one uses it: first remove `source_auth` from each such Transit Point and turn its
+        transit token back on, or delete the surface, then check no surface carries
+        `transit_point_source_auth`. A Surface Template's surface is marked the same way, so an
+        older release's admin API refuses a surface created from it; the dashboard rebuilds a
+        template's surface without the mark, so remove `source_auth` from such templates too
+        before rolling back, or back them up before upgrading.

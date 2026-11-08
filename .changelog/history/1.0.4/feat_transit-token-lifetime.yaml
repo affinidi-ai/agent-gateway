@@ -1,0 +1,44 @@
+branch: feat/transit-token-lifetime
+changes:
+  added:
+    - timestamp: '2026-10-29T06:36:45.000Z'
+      title: Set how long a surface's transit tokens live, up to an operator ceiling
+      description: >-
+        Transit tokens always lived 300 seconds, so a managed agent's turn that ran longer,
+        such as a long tool call, lost its Transit Points part way. A surface's
+        `transit.transit_token_lifetime_secs` now sets how long the tokens its Access Point
+        issues live, from 30 seconds to the appliance's longest lifetime; unset means 300, or
+        the longest when that is below 300. The longest is `transit_token_max_lifetime_secs` in
+        `gateway.json`: 300 seconds unless set, from 30 to 900. It is read once, when the
+        gateway starts: anything but a whole number from 30 to 900 stops it from starting, a
+        change takes a restart, and a reload keeps the startup value, never fails on it, and
+        logs a warning while `gateway.json` holds another value. The Access Point issues tokens
+        for a stored lifetime above the longest, or below 30, held to the bound, with a warning
+        per surface at startup and on reload; neither stops the gateway. A Transit Point checks
+        a token, after checking it was issued for that surface, against the lifetime its surface
+        sets when the token is presented, held to 30 to 900 seconds and independent of any
+        instance's settings, so instances accept each other's tokens; shortening the lifetime
+        refuses the tokens already issued for longer while it is in force, and lengthening it
+        never extends a token already issued. Shortening is not revocation: rotate the transit
+        token key to revoke issued tokens. A `PUT` that omits the lifetime, as a dashboard save
+        does, keeps the stored value, also when it omits a stored base `transit` block with no
+        Transit Points, and a merge `PATCH` with `null` resets it. The admin API refuses a new
+        lifetime outside the bounds, naming the setting, or one set in a variant, but accepts a
+        save that keeps the stored value.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-10-30T12:00:00.000Z'
+      title: Let operators cap how long transit tokens live, 300 seconds by default
+      description: >-
+        Whoever holds a transit token can call its surface's Transit Points as the caller, with
+        the credentials they inject, until it expires, so a longer lifetime widens the window in
+        which a leaked token can be replayed. A surface writer can lengthen it only up to the
+        appliance's `transit_token_max_lifetime_secs`, 300 seconds unless an operator raises it,
+        to at most 900. Upgrade every instance that shares surface storage, a Standby included,
+        before raising the ceiling above 300 or setting any surface's lifetime: an earlier
+        release refuses tokens living longer than 300 seconds, so its requests get an
+        intermittent 401, and drops a stored lifetime the next time it saves the surface,
+        which sets the lifetime back to 300 seconds.
+  breaking: []

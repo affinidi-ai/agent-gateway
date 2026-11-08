@@ -53,8 +53,16 @@ pub fn scope_allows(
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PathScope {
-    EnforceId { kind: ResourceKind, id: String },
+    EnforceId {
+        kind: ResourceKind,
+        id: String,
+    },
     HandlerEnforced,
+    /// The handler enforces the resource for a tenant's token. A write by a
+    /// resource-scoped token without a tenant is refused, as for
+    /// [`PathScope::Unscoped`]: such a token is no operator, and these routes
+    /// would otherwise treat it as one.
+    HandlerEnforcedForTenants,
     DenyScoped,
     Unscoped,
 }
@@ -77,6 +85,13 @@ fn classify_special_family(
         | ("api-keys", [_, _])
         | ("api-keys", [_, _, "revoke" | "rotate"]) => Some(PathScope::HandlerEnforced),
         ("secrets" | "certificates" | "api-keys", _) => Some(PathScope::DenyScoped),
+        ("delegation-vault", ["connects"]) | ("delegation-vault", ["connects", _, "complete"]) => {
+            Some(PathScope::HandlerEnforced)
+        }
+        ("delegation-vault", ["grants"]) | ("delegation-vault", ["grants", _]) => {
+            Some(PathScope::HandlerEnforcedForTenants)
+        }
+        ("delegation-vault", _) => Some(PathScope::Unscoped),
         _ => None,
     }
 }
@@ -99,6 +114,8 @@ fn is_handler_enforced_nested_action(
     matches!(
         (kind, tail),
         (ResourceKind::Surfaces, ["variants"])
+            | (ResourceKind::Surfaces, ["trust-recorder-status" | "agent-card"])
+            | (ResourceKind::Surfaces, ["agent-card", "refresh"])
             | (ResourceKind::Surfaces, ["variants", _])
             | (ResourceKind::Surfaces, ["variants", _, "promote-to-default" | "resolved"])
             | (ResourceKind::SurfaceTemplates, ["export"])
@@ -233,8 +250,57 @@ mod tests {
             }
         );
         assert_eq!(classify_resource_path("/v1/trust-registries/id/future-action"), PathScope::DenyScoped);
+        assert_eq!(
+            classify_resource_path("/v1/surfaces/surface%2Fa/trust-recorder-status"),
+            PathScope::EnforceId {
+                kind: ResourceKind::Surfaces,
+                id: "surface/a".into(),
+            }
+        );
+        assert_eq!(classify_resource_path("/v1/surfaces/id/trust-recorder-status/future"), PathScope::DenyScoped);
+        for action in ["agent-card", "agent-card/refresh"] {
+            assert_eq!(
+                classify_resource_path(&format!("/v1/surfaces/surface%2Fa/{action}")),
+                PathScope::EnforceId {
+                    kind: ResourceKind::Surfaces,
+                    id: "surface/a".into(),
+                },
+                "{action}"
+            );
+        }
+        assert_eq!(classify_resource_path("/v1/surfaces/id/agent-card/future"), PathScope::DenyScoped);
+        assert_eq!(classify_resource_path("/v1/surfaces/id/agent-card/refresh/future"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/sts/clients/id/future-action"), PathScope::DenyScoped);
         assert_eq!(classify_resource_path("/v1/gateways/id/connection-points/future-action"), PathScope::DenyScoped);
+    }
+
+    /// The connect API and the grants by binding are a family a tenant's token
+    /// may use, each handler enforcing the surface; the vault's other routes
+    /// stay closed to a resource-scoped token for writes, as before. The
+    /// removal routes stay closed to a resource-scoped token without a tenant,
+    /// which is no operator.
+    #[test]
+    fn the_connect_and_grant_routes_are_handler_enforced_and_the_rest_of_the_vault_is_unchanged() {
+        for path in ["/api/v1/delegation-vault/connects", "/api/v1/delegation-vault/connects/connect-1/complete"] {
+            assert_eq!(classify_resource_path(path), PathScope::HandlerEnforced, "{path}");
+        }
+        for path in [
+            "/api/v1/delegation-vault/grants",
+            "/api/v1/delegation-vault/grants/grant-1",
+            "/v1/delegation-vault/grants",
+        ] {
+            assert_eq!(classify_resource_path(path), PathScope::HandlerEnforcedForTenants, "{path}");
+        }
+        for path in [
+            "/api/v1/delegation-vault",
+            "/api/v1/delegation-vault/token-id",
+            "/api/v1/delegation-vault/by-user/hash",
+            "/api/v1/delegation-vault/connects/connect-1",
+            "/api/v1/delegation-vault/grants/grant-1/other",
+        ] {
+            assert_eq!(classify_resource_path(path), PathScope::Unscoped, "{path}");
+        }
+        assert_eq!(ResourceKind::from_path_family("delegation-vault"), Some(ResourceKind::DelegationVault));
     }
 
     #[test]

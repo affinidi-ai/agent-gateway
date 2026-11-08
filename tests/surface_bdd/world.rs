@@ -98,6 +98,7 @@ pub struct SurfaceWorld {
     pub infra: Option<ScenarioInfra>,
     pub surface_config: SurfaceConfigBuilder,
     pub sent_body: Option<serde_json::Value>,
+    pub sent_headers: Vec<(String, String)>,
     pub caller_response: Option<RecordedResponse>,
     pub admin_client: Option<AdminApiClient>,
     pub created_surface_id: Option<String>,
@@ -126,6 +127,12 @@ pub struct SurfaceWorld {
     pub captured_mcp_identity_schema: Option<serde_json::Value>,
     pub sse_endpoint_path: Option<String>,
     pub sse_responses: Vec<serde_json::Value>,
+    /// The JSON-RPC response to an MCP tool call sent without the Target credential, kept for
+    /// comparison with the same call sent with it.
+    pub mcp_tool_response_without_target_credential: Option<serde_json::Value>,
+    /// Collaborators a step said are reached over plain http; the gateway start checks the
+    /// URL it writes for each.
+    pub plain_http_collaborators: Vec<String>,
     /// A modern MCP response read incrementally by later steps.
     pub mcp_stream: Option<reqwest::Response>,
     pub mcp_stream_buffer: String,
@@ -140,6 +147,12 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// The transit token the managed agent sends on its Transit Point calls.
+    pub transit_token: Option<String>,
+    /// A surface the operator is about to save through the admin API.
+    pub surface_draft: Option<serde_json::Value>,
+    /// A client presenting the personal access token an operator minted in the scenario.
+    pub personal_access_token_client: Option<reqwest::Client>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -158,6 +171,7 @@ impl SurfaceWorld {
             infra: None,
             surface_config: SurfaceConfigBuilder::default(),
             sent_body: None,
+            sent_headers: Vec::new(),
             caller_response: None,
             admin_client: None,
             created_surface_id: None,
@@ -195,6 +209,8 @@ impl SurfaceWorld {
             captured_mcp_identity_schema: None,
             sse_endpoint_path: None,
             sse_responses: Vec::new(),
+            mcp_tool_response_without_target_credential: None,
+            plain_http_collaborators: Vec::new(),
             mcp_stream: None,
             mcp_stream_buffer: String::new(),
             mcp_stream_progress: None,
@@ -203,6 +219,9 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            transit_token: None,
+            surface_draft: None,
+            personal_access_token_client: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),
@@ -283,6 +302,23 @@ impl SurfaceWorld {
             .unwrap_or(false)
     }
 
+    pub(crate) fn transit_point_collaborator_key(
+        &self,
+        alias: &str,
+    ) -> &str {
+        let destination = self
+            .actors
+            .transit_point(alias)
+            .and_then(|transit_point| {
+                transit_point
+                    .target_binding
+                    .as_deref()
+            })
+            .unwrap_or_else(|| panic!("Transit Point '{alias}' has no destination"));
+        self.actors
+            .target_collaborator_key(destination)
+    }
+
     pub(crate) fn mock_for_target(
         &self,
         actor_name: &str,
@@ -300,7 +336,12 @@ impl SurfaceWorld {
                 .replacement_mock
                 .as_ref()
                 .expect("replacement mock must exist before configuring a secondary target"),
-            other => panic!("no mock server registered for collaborator key '{}' (actor '{}')", other, actor_name),
+            other => infra
+                .transit_point_mocks
+                .get(other)
+                .unwrap_or_else(|| {
+                    panic!("no mock server registered for collaborator key '{}' (actor '{}')", other, actor_name)
+                }),
         }
     }
 
@@ -309,6 +350,16 @@ impl SurfaceWorld {
         observations: TargetObservations,
     ) {
         self.collaborator_mut(PRIMARY_COLLABORATOR_KEY)
+            .target
+            .observations = Some(observations);
+    }
+
+    pub(crate) fn record_observations(
+        &mut self,
+        key: &str,
+        observations: TargetObservations,
+    ) {
+        self.collaborator_mut(key)
             .target
             .observations = Some(observations);
     }
@@ -336,7 +387,7 @@ impl SurfaceWorld {
         }
     }
 
-    fn register_collaborator(
+    pub(crate) fn register_collaborator(
         &mut self,
         key: &str,
         name: &str,
@@ -452,6 +503,10 @@ pub struct ScenarioInfra {
     pub gateway: GatewayProcess,
     pub mock: MockServer,
     pub replacement_mock: Option<MockServer>,
+    /// The token endpoint of the Target's credential provider.
+    pub target_token_endpoint: Option<MockServer>,
+    /// Destinations of the second and later Transit Points, by collaborator key.
+    pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,
     pub gateway_port: u16,

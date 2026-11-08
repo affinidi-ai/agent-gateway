@@ -111,6 +111,8 @@ pub struct CredentialProviderFixture {
     pub callback_url: Option<String>,
     pub token_refresh_enabled: bool,
     pub api_key_secret_ref: Option<String>,
+    /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
+    pub jwt_settings: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -499,6 +501,11 @@ fn write_credential_provider_fixture(
     }
     if let Some(secret_ref) = &provider.api_key_secret_ref {
         value["api_key_secret_ref"] = serde_json::json!(secret_ref);
+    }
+    if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
+        for (name, setting) in settings {
+            value[name] = setting.clone();
+        }
     }
     std::fs::write(dir.join(format!("{}.json", provider.id)), serde_json::to_string_pretty(&value).unwrap()).unwrap();
 }

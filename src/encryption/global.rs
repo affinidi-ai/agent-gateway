@@ -163,12 +163,10 @@ mod tests {
 
     #[test]
     fn build_backup_decryption_service_decrypts_when_at_rest_disabled() {
-        // A value encrypted while encryption-at-rest was enabled.
-        unsafe {
-            std::env::set_var("GLOBAL_BACKUP_MEK", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
-        }
+        // A value encrypted while encryption-at-rest was enabled. `AG_TEST_MASTER_KEY`
+        // is set by `.cargo/config.toml` `[env]`.
         let writer = EncryptionService::new(crate::encryption::KeySource::Environment {
-            var_name: "GLOBAL_BACKUP_MEK".to_string(),
+            var_name: "AG_TEST_MASTER_KEY".to_string(),
         })
         .unwrap();
         let ciphertext = writer
@@ -179,7 +177,7 @@ mod tests {
         // Encryption-at-rest is now disabled, but the key source is still configured.
         let config = crate::config::EncryptionConfig {
             enabled: false,
-            key_env_var: "GLOBAL_BACKUP_MEK".to_string(),
+            key_env_var: "AG_TEST_MASTER_KEY".to_string(),
             ..Default::default()
         };
         set_test_encryption(config, EncryptionService::disabled());
@@ -202,7 +200,5 @@ mod tests {
                 .unwrap(),
             "s3cr3t"
         );
-
-        unsafe { std::env::remove_var("GLOBAL_BACKUP_MEK") };
     }
 }

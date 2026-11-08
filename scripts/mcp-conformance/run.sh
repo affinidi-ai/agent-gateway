@@ -600,7 +600,7 @@ if [[ "${RUN_LEGACY}" == true ]]; then
         build_step "legacy: build" "${LOGS}/build.log" gateway_cargo build
     fi
     start_gateway legacy "${BINARY}" "${LEGACY_INBOUND_PORT}" "${LEGACY_OUTBOUND_PORT}"
-    check "legacy: compat rejected (every endpoint -32022 for 2025-11-25)" "${LOGS}/compat-rejected-legacy.log" \
+    check "legacy: compat rejected (every endpoint -32022 for 2099-01-01)" "${LOGS}/compat-rejected-legacy.log" \
         node "${HERE}/compat.mjs" rejected --targets "${TARGETS_FILE}"
     check "legacy: compat legacy session (2024-11-05)" "${LOGS}/compat-legacy-legacy.log" \
         node "${HERE}/compat.mjs" legacy --targets "${TARGETS_FILE}"

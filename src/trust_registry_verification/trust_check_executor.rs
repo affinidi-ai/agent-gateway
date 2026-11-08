@@ -17,7 +17,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::observability::trust_check_audit::{TrustCheckAuditEvent, record_trust_check};
+use crate::observability::trust_check_audit::{TrustCheckAuditEvent, TrustCheckOrigin, record_trust_check};
 use crate::trust_registry_verification::template::{self, TemplateError};
 use crate::trust_registry_verification::trqp_adapter::{RECOGNITION_DEFAULT_ACTION, RECOGNITION_DEFAULT_RESOURCE};
 use crate::trust_registry_verification::trust_check_element::{
@@ -199,22 +199,22 @@ pub struct ExecutionContext<'a> {
 ///
 /// Audit + Prometheus sampling fire once per element from inside this
 /// function — the caller installs nothing.
-pub async fn execute_list<C: TrqpClient + ?Sized>(
-    surface_id: &str,
+pub async fn execute_list<'o, C: TrqpClient + ?Sized>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
     leg: TrustCheckLeg,
     elements: &[TrustCheckElement],
     ctx: &ExecutionContext<'_>,
     client: &C,
 ) -> Vec<TrustCheckResult> {
-    let surface_id = surface_id.to_string();
+    let origin = origin.into();
     let futures = elements
         .iter()
-        .map(|elem| execute_one(surface_id.clone(), leg, elem, ctx, client));
+        .map(|elem| execute_one(origin, leg, elem, ctx, client));
     join_all(futures).await
 }
 
 async fn execute_one<C: TrqpClient + ?Sized>(
-    surface_id: String,
+    origin: TrustCheckOrigin<'_>,
     leg: TrustCheckLeg,
     elem: &TrustCheckElement,
     ctx: &ExecutionContext<'_>,
@@ -226,7 +226,8 @@ async fn execute_one<C: TrqpClient + ?Sized>(
             let detail = err.to_string();
             let result = stage_failure(elem, TEMPLATE_RESOLUTION_FAILED, detail.clone());
             record_trust_check(TrustCheckAuditEvent {
-                surface_id: &surface_id,
+                surface_id: origin.surface_id,
+                transit_point: origin.transit_point,
                 leg,
                 element_id: &elem.id,
                 element_name: elem.name.as_deref(),
@@ -308,7 +309,8 @@ async fn execute_one<C: TrqpClient + ?Sized>(
         .as_ref()
         .map(|e| e.message.as_str());
     record_trust_check(TrustCheckAuditEvent {
-        surface_id: &surface_id,
+        surface_id: origin.surface_id,
+        transit_point: origin.transit_point,
         leg,
         element_id: &elem.id,
         element_name: elem.name.as_deref(),
@@ -409,17 +411,19 @@ fn resolved_failure(
 /// checked at all (e.g. its agent card is unavailable), recording each one
 /// like an executed check. The two "unavailable" codes omit `authority_id` /
 /// `entity_id`, whose raw template strings would be noise.
-pub fn synthesize_unavailable_target(
-    surface_id: &str,
+pub fn synthesize_unavailable_target<'o>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
     elements: &[TrustCheckElement],
     code: &'static str,
     detail: &'static str,
 ) -> Vec<TrustCheckResult> {
+    let origin = origin.into();
     elements
         .iter()
         .map(|elem| {
             record_trust_check(TrustCheckAuditEvent {
-                surface_id,
+                surface_id: origin.surface_id,
+                transit_point: origin.transit_point,
                 leg: TrustCheckLeg::Target,
                 element_id: &elem.id,
                 element_name: elem.name.as_deref(),
@@ -975,6 +979,34 @@ mod tests {
         );
         assert_eq!(results[0].action, "invoke");
         assert_eq!(results[0].resource, "tool:payments.transfer");
+    }
+
+    #[tokio::test]
+    async fn audit_records_carry_the_transit_point_from_the_origin() {
+        let elements = [elem_with_action_resource("e1", "tr-a")];
+        let origin = TrustCheckOrigin {
+            surface_id: "surface-9",
+            transit_point: Some("partner-a"),
+        };
+        let (_, routed) = crate::audit::producer::capture(async {
+            synthesize_unavailable_target(origin, &elements, AGENT_CARD_UNAVAILABLE, "card unavailable")
+        })
+        .await;
+        let (_, unrouted) = crate::audit::producer::capture(async {
+            synthesize_unavailable_target("surface-9", &elements, AGENT_CARD_UNAVAILABLE, "card unavailable")
+        })
+        .await;
+
+        let transit_point = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| match &events[0].event {
+            crate::delegation_vault::audit::DelegationAuditAction::TrustCheck { transit_point, .. } => {
+                transit_point.clone()
+            }
+            other => panic!("expected a trust check, got {other:?}"),
+        };
+        assert_eq!(routed.len(), 1);
+        assert_eq!(transit_point(&routed), Some("partner-a".to_string()));
+        assert_eq!(unrouted.len(), 1);
+        assert_eq!(transit_point(&unrouted), None);
     }
 
     #[tokio::test]

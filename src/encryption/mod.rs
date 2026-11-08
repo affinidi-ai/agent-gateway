@@ -48,6 +48,15 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 use std::sync::Arc;
 
+/// A value could not be decrypted because the key service could not recover
+/// its data key, for a reason that says nothing of the value: AWS KMS
+/// unreachable, throttling, a disabled key, or no runtime to call it from. The
+/// same value may decrypt a moment later, so it must never be taken for an
+/// unreadable one. Carries the failure's own message.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct EncryptionUnavailable(pub String);
+
 /// Field-encryption backend selected by `key_source`.
 ///
 /// `LocalMek` writes/reads `version = 1` envelopes with a process-held MEK
@@ -199,6 +208,13 @@ impl EncryptionService {
         self.enabled
     }
 
+    /// Whether what this service writes is encrypted: enabled with a key, from
+    /// the environment, a file or KMS. The development `local` key source is
+    /// enabled but writes plaintext, so it is not.
+    pub fn encrypts_at_rest(&self) -> bool {
+        self.enabled && !matches!(self.cipher, FieldCipher::LocalTrace(_))
+    }
+
     /// Encrypt a string value (for field-level encryption)
     pub fn encrypt_field(
         &self,
@@ -215,10 +231,10 @@ impl EncryptionService {
         self.decrypt_value(None, encrypted)
     }
 
-    /// Encrypt the content of the storage file at `path` (whole-file encryption).
+    /// Encrypt the content of a storage file (whole-file encryption).
     ///
-    /// Identical to [`Self::encrypt_string`] except that the tracing backend can
-    /// name the file in its log line.
+    /// Identical to [`Self::encrypt_string`] except that the tracing backend names
+    /// the file as `path` in its log line, so `path` must be safe to log.
     pub fn encrypt_file(
         &self,
         path: &Path,
@@ -227,10 +243,10 @@ impl EncryptionService {
         self.encrypt_value(Some(path), plaintext)
     }
 
-    /// Decrypt the content read from the storage file at `path`.
+    /// Decrypt the content read from a storage file.
     ///
-    /// Identical to [`Self::decrypt_string`] except that the tracing backend can
-    /// name the file in its log line.
+    /// Identical to [`Self::decrypt_string`] except that the tracing backend names
+    /// the file as `path` in its log line, so `path` must be safe to log.
     pub fn decrypt_file(
         &self,
         path: &Path,

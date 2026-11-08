@@ -33,6 +33,20 @@ export interface TrustCheckData {
   error_code?: string | null;
 }
 
+/** A request the gateway refused. */
+export interface RequestRejectedData {
+  /** `routing`, `admission` or `forward`. */
+  stage: string;
+  /** e.g. `no_route`, `unknown_variant`, `variant_disabled`, `misconfigured_default`. */
+  reason: string;
+  /** The HTTP status the caller received; absent on Fabric, where no HTTP response is involved. */
+  http_status?: number | null;
+  /** The JSON-RPC error code the caller received, when the refusal was one. */
+  rpc_error_code?: number | null;
+  /** On `unknown_variant` only: the alias the URL named. Caller-chosen text. */
+  requested_variant?: string | null;
+}
+
 export interface TraceTerminatedData {
   /** This gateway's own trace for the request (its audit + caller-facing leg). */
   own_trace_id: string;
@@ -42,11 +56,74 @@ export interface TraceTerminatedData {
   flow: string;
 }
 
+/** The audit events a management change to a policy, or to where one applies, records. */
+export const POLICY_CHANGE_EVENTS = [
+  'policy_created',
+  'policy_updated',
+  'policy_deleted',
+  'policy_attached',
+  'policy_detached',
+  'policy_attachment_changed',
+  'policy_change_refused',
+] as const;
+
+export type PolicyChangeEvent = (typeof POLICY_CHANGE_EVENTS)[number];
+
+export interface PolicyChangeActor {
+  kind: 'user' | 'pat' | 'system';
+  /** The user id, the access token's id, or `gateway`. */
+  id: string;
+  /** For an access token, the id of the user it belongs to. */
+  user_id?: string | null;
+}
+
+export interface PolicyChangeTarget {
+  kind: 'surface' | 'gateway' | 'appliance';
+  id?: string | null;
+  name?: string | null;
+}
+
+/** The body every policy change event shares. Never carries Rego text. */
+export interface PolicyChangeData {
+  policy_definition_id?: string | null;
+  policy_name?: string | null;
+  policy_type?: string | null;
+  policy_version?: number | null;
+  policy_content_hash?: string | null;
+  previous_policy_version?: number | null;
+  previous_policy_content_hash?: string | null;
+  changed?: string[];
+  target?: PolicyChangeTarget | null;
+  scope?: string | null;
+  slot?: string | null;
+  /** The variant whose slot was written, or `_base_` for a base slot. */
+  surface_variant?: string | null;
+  /** `surface_variant` on records written before the rename; read through `policyChange`. */
+  variant?: string | null;
+  transit_point?: string | null;
+  mcp_tool_name?: string | null;
+  gate?: string | null;
+  plane?: string | null;
+  mode?: string | null;
+  previous_mode?: string | null;
+  enabled?: boolean | null;
+  previous_enabled?: boolean | null;
+  actor: PolicyChangeActor;
+  /** `api`, `ownership` or `definition_deleted`. */
+  source: string;
+  /** On a refusal: the change that was attempted. */
+  action?: PolicyChangeEvent | null;
+  status?: number | null;
+  reason?: string | null;
+}
+
 export type AuditEventField =
   | string
   | { policy_decision: PolicyDecisionData }
   | { trust_check: TrustCheckData }
   | { trace_terminated: TraceTerminatedData }
+  | { request_rejected: RequestRejectedData }
+  | Partial<Record<PolicyChangeEvent, PolicyChangeData>>
   | Record<string, unknown>;
 
 export interface AuditCaller {
@@ -68,6 +145,11 @@ export interface AuditEntry {
   surface_id?: string | null;
   /** Human-readable surface/channel name */
   channel_name?: string | null;
+  /**
+   * The variant of the surface that served the request: its alias, `_base_` when the base
+   * surface served it, or `_unknown_` when the URL named a variant the surface doesn't have.
+   */
+  surface_variant?: string | null;
   /** Credential provider machine id */
   provider_id?: string | null;
   /** Human-readable credential provider name */

@@ -26,6 +26,12 @@ use crate::config::types::{ClientIpConfig, LoginThrottleConfig};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
+/// Marks a request whose connecting peer is in `client_ip.trusted_proxies`, inserted by
+/// [`resolve_client_ip_layer`] beside [`ClientIp`], so a handler can tell when other forwarded
+/// headers come from such a proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FromTrustedProxy;
+
 /// Middleware that inserts [`ClientIp`] for every request that carries `ConnectInfo`. Install
 /// with `axum::middleware::from_fn_with_state(Arc::new(client_ip_cfg), resolve_client_ip_layer)`
 /// on a server built with `into_make_service_with_connect_info`. Without `ConnectInfo` nothing is
@@ -43,6 +49,10 @@ pub async fn resolve_client_ip_layer(
         let client_ip = resolve_client_ip(peer, req.headers(), &config.trusted_proxies);
         req.extensions_mut()
             .insert(ClientIp(client_ip));
+        if ip_in_any(&peer, &config.trusted_proxies) {
+            req.extensions_mut()
+                .insert(FromTrustedProxy);
+        }
     }
     next.run(req).await
 }
@@ -77,18 +87,21 @@ pub fn warn_if_login_throttle_shares_one_limit(
 /// The client address for a request that arrived from `peer`. Forwarded headers are ignored
 /// unless `peer` is a trusted proxy. Walking from the right, a hop that cannot be parsed stops
 /// the walk and the last trusted address wins; when every hop is trusted, the leftmost one wins.
+/// An IPv4-mapped IPv6 address, as an IPv4 caller of a dual-stack listener shows, resolves to
+/// its IPv4 form.
 pub fn resolve_client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
     trusted_proxies: &[IpNet],
 ) -> IpAddr {
+    let peer = peer.to_canonical();
     if !ip_in_any(&peer, trusted_proxies) {
         return peer;
     }
     let hops = forwarded_hops(headers);
     let mut resolved = peer;
     for hop in hops.iter().rev() {
-        match parse_hop(hop) {
+        match parse_hop(hop).map(|ip| ip.to_canonical()) {
             Some(ip) if ip_in_any(&ip, trusted_proxies) => resolved = ip,
             Some(ip) => return ip,
             None => return resolved,
@@ -248,6 +261,18 @@ mod tests {
         let forwarded = headers(&[("x-forwarded-for", &format!("{INNER_PROXY}, 10.1.1.1"))]);
 
         assert_eq!(resolve_client_ip(ip(PROXY), &forwarded, &trusted()), ip(INNER_PROXY));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_address_resolves_to_its_ipv4_form() {
+        assert_eq!(resolve_client_ip(ip("::ffff:1.2.3.4"), &HeaderMap::new(), &trusted()), ip("1.2.3.4"));
+        assert_eq!(resolve_client_ip(ip("::ffff:10.0.0.5"), &HeaderMap::new(), &trusted()), ip(PROXY));
+
+        let forwarded = headers(&[("x-forwarded-for", &format!("::ffff:{CLIENT}, ::ffff:{INNER_PROXY}"))]);
+        assert_eq!(resolve_client_ip(ip("::ffff:10.0.0.5"), &forwarded, &trusted()), ip(CLIENT));
+        let forwarded = headers(&[("x-forwarded-for", &format!("{CLIENT}, garbage, ::ffff:{INNER_PROXY}"))]);
+        assert_eq!(resolve_client_ip(ip(PROXY), &forwarded, &trusted()), ip(INNER_PROXY));
+        assert_eq!(resolve_client_ip(ip("2001:db8::1"), &HeaderMap::new(), &trusted()), ip("2001:db8::1"));
     }
 
     #[test]

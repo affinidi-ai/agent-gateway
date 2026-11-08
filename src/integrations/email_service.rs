@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for SMTP email sending
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SmtpConfig {
     pub smtp_host: String,
     pub smtp_port: u16,
@@ -18,6 +18,26 @@ pub struct SmtpConfig {
     pub use_starttls: Option<bool>,
     pub cc: Option<Vec<String>>,
     pub bcc: Option<Vec<String>>,
+}
+
+impl std::fmt::Debug for SmtpConfig {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("SmtpConfig")
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_username", &self.smtp_username)
+            .field("smtp_password", &crate::observability::loggable::REDACTED)
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("use_tls", &self.use_tls)
+            .field("use_starttls", &self.use_starttls)
+            .field("cc", &self.cc)
+            .field("bcc", &self.bcc)
+            .finish()
+    }
 }
 
 impl SmtpConfig {
@@ -52,7 +72,6 @@ impl SmtpConfig {
             .as_str()
             .context("Missing from address")?
             .to_string();
-        debug!("From address: {}", from);
 
         let to = config["to"]
             .as_array()
@@ -63,7 +82,7 @@ impl SmtpConfig {
                     .map(|s| s.to_string())
             })
             .collect::<Vec<_>>();
-        debug!("To addresses: {:?}", to);
+        debug!("To addresses: {}", to.len());
 
         if to.is_empty() {
             anyhow::bail!("At least one recipient email is required");
@@ -89,7 +108,7 @@ impl SmtpConfig {
                     .collect::<Vec<_>>()
             });
         if let Some(ref cc_list) = cc {
-            debug!("CC addresses: {:?}", cc_list);
+            debug!("CC addresses: {}", cc_list.len());
         }
 
         let bcc = config
@@ -104,7 +123,7 @@ impl SmtpConfig {
                     .collect::<Vec<_>>()
             });
         if let Some(ref bcc_list) = bcc {
-            debug!("BCC addresses: {:?}", bcc_list);
+            debug!("BCC addresses: {}", bcc_list.len());
         }
 
         info!("SMTP configuration parsed successfully");
@@ -122,6 +141,19 @@ impl SmtpConfig {
             bcc,
         })
     }
+
+    /// Number of To, CC and BCC recipients, logged in place of their addresses.
+    fn recipient_count(&self) -> usize {
+        self.to.len()
+            + self
+                .cc
+                .as_ref()
+                .map_or(0, Vec::len)
+            + self
+                .bcc
+                .as_ref()
+                .map_or(0, Vec::len)
+    }
 }
 
 /// Send an email notification
@@ -131,10 +163,14 @@ pub async fn send_email(
     body: &str,
     is_html: bool,
 ) -> Result<()> {
-    info!("Starting email send to {:?} via SMTP {}:{}", config.to, config.smtp_host, config.smtp_port);
+    info!(
+        "Starting email send to {} recipient(s) via SMTP {}:{}",
+        config.recipient_count(),
+        config.smtp_host,
+        config.smtp_port
+    );
 
     // Build the email message
-    debug!("Building email message with from: {}", config.from);
     let mut email_builder = Message::builder().from(
         config
             .from
@@ -144,7 +180,6 @@ pub async fn send_email(
 
     // Add primary recipients
     for recipient in &config.to {
-        debug!("Adding recipient: {}", recipient);
         email_builder = email_builder.to(recipient
             .parse()
             .context("Invalid to address")?);
@@ -153,7 +188,6 @@ pub async fn send_email(
     // Add CC recipients
     if let Some(cc_list) = &config.cc {
         for cc_addr in cc_list {
-            debug!("Adding CC: {}", cc_addr);
             email_builder = email_builder.cc(cc_addr
                 .parse()
                 .context("Invalid cc address")?);
@@ -163,7 +197,6 @@ pub async fn send_email(
     // Add BCC recipients
     if let Some(bcc_list) = &config.bcc {
         for bcc_addr in bcc_list {
-            debug!("Adding BCC: {}", bcc_addr);
             email_builder = email_builder.bcc(
                 bcc_addr
                     .parse()
@@ -173,7 +206,7 @@ pub async fn send_email(
     }
 
     email_builder = email_builder.subject(subject);
-    debug!("Email subject: {}", subject);
+    debug!("Email subject: {} bytes", subject.len());
 
     // Create the email with HTML or plain text body
     debug!("Building email body (is_html: {})", is_html);
@@ -244,7 +277,7 @@ pub async fn send_email(
     // Send the email
     match mailer.send(&email) {
         Ok(_) => {
-            info!("Email sent successfully to {:?} with subject: {}", config.to, subject);
+            info!("Email sent successfully to {} recipient(s)", config.recipient_count());
             Ok(())
         }
         Err(e) => {
@@ -261,9 +294,9 @@ pub async fn send_email_batch(
     messages: Vec<(String, String, bool)>, // (subject, body, is_html)
 ) -> Result<Vec<Result<()>>> {
     info!(
-        "Starting batch email send ({} messages) to {:?} via SMTP {}:{}",
+        "Starting batch email send ({} messages) to {} recipient(s) via SMTP {}:{}",
         messages.len(),
-        config.to,
+        config.recipient_count(),
         config.smtp_host,
         config.smtp_port
     );
@@ -361,7 +394,7 @@ pub async fn send_email_batch(
         // Send using the shared connection
         match mailer.send(&email) {
             Ok(_) => {
-                debug!("Batch email sent successfully: {}", subject);
+                debug!("Batch email sent successfully");
                 results.push(Ok(()));
             }
             Err(e) => {
@@ -435,5 +468,46 @@ mod tests {
         assert_eq!(config.to.len(), 1);
         assert!(!config.use_tls);
         assert_eq!(config.use_starttls, Some(true));
+    }
+
+    #[test]
+    fn smtp_config_parsing_logs_recipient_counts_not_addresses() {
+        let config_json = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_username": "sender",
+            "smtp_password": "app-password",
+            "from": "gateway.marker@example.com",
+            "to": ["first.marker@example.com", "second.marker@example.com"],
+            "cc": ["copy.marker@example.com"],
+            "bcc": ["hidden.marker@example.com"]
+        });
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let config = SmtpConfig::from_json(&config_json).unwrap();
+
+        let text = logs.text();
+        assert_eq!(config.recipient_count(), 4);
+        assert!(text.contains("To addresses: 2"), "{text}");
+        assert!(text.contains("BCC addresses: 1"), "{text}");
+        assert!(!text.contains("marker@example.com"), "{text}");
+    }
+
+    #[test]
+    fn smtp_config_debug_hides_the_password() {
+        let config = SmtpConfig::from_json(&serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "smtp_username": "sender",
+            "smtp_password": "app-password",
+            "from": "gateway@example.com",
+            "to": ["ops@example.com"]
+        }))
+        .unwrap();
+
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains(r#"smtp_host: "smtp.example.com""#), "{rendered}");
+        assert!(rendered.contains("smtp_password: \"<redacted>\""), "{rendered}");
+        assert!(!rendered.contains("app-password"), "{rendered}");
     }
 }

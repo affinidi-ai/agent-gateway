@@ -4,7 +4,7 @@
 //             binary answers -32022
 //   admitted  every endpoint admits 2026-07-28, including the surface whose
 //             record still carries the retired mcp_protocol_mode
-//   rejected  every endpoint rejects the unmodelled 2025-11-25 with -32022,
+//   rejected  every endpoint rejects the unmodelled 2099-01-01 with -32022,
 //             a supported list that offers 2024-11-05, and the request id echoed
 //   legacy    a 2024-11-05 client session (initialize, notifications/initialized,
 //             tools/list, tools/call) gives the same results through the gateway
@@ -16,7 +16,7 @@ import { SIMPLE_TEXT } from './fixture.mjs';
 const MODERN = '2026-07-28';
 const LEGACY = '2024-11-05';
 const CLIENT_INFO = { name: 'trust-gateway-compat', version: '1.0.0' };
-const UNMODELLED = '2025-11-25';
+const UNMODELLED = '2099-01-01';
 const ENDPOINTS = ['access-point', 'transit', 'owned-proxy', 'proxy-surface', 'legacy-surface'];
 const FORWARDING = ['access-point', 'transit', 'legacy-surface'];
 const OWNED = ['owned-proxy', 'proxy-surface'];

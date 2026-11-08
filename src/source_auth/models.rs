@@ -91,8 +91,9 @@ pub struct DidAuthAuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_ttl_seconds: Option<u64>,
 
-    /// Session lifetime in seconds. `None` (default) uses 86400s (24h).
-    /// Rejected at validation time when `Some(0)`.
+    /// Session lifetime in seconds. `None` (default) uses 86400s (24h), also
+    /// the longest. Rejected at validation time when `Some(0)` or greater
+    /// than 86400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ttl_seconds: Option<u64>,
 
@@ -123,6 +124,11 @@ impl DidAuthAuthConfig {
     /// replay window without a real use-case.
     pub const MAX_CHALLENGE_TTL_SECONDS: u64 = 3_600;
 
+    /// Upper bound for `session_ttl_seconds`, 24 hours, the default: a
+    /// session is a bearer token, and no session authenticates longer than
+    /// this after it was minted.
+    pub const MAX_SESSION_TTL_SECONDS: u64 = 86_400;
+
     /// Every `alg` value the JWS verifier recognises. Config values outside
     /// this set are rejected at validation time.
     pub const SUPPORTED_ALGORITHMS: &'static [&'static str] = &["EdDSA", "ES256"];
@@ -133,10 +139,12 @@ impl DidAuthAuthConfig {
             .unwrap_or(Self::DEFAULT_CHALLENGE_TTL_SECONDS)
     }
 
-    /// Effective session TTL, applying the default when unset.
+    /// Effective session TTL, applying the default when unset, and never
+    /// longer than [`Self::MAX_SESSION_TTL_SECONDS`].
     pub fn effective_session_ttl_seconds(&self) -> u64 {
         self.session_ttl_seconds
             .unwrap_or(Self::DEFAULT_SESSION_TTL_SECONDS)
+            .min(Self::MAX_SESSION_TTL_SECONDS)
     }
 
     /// Effective algorithm allow-list, applying the `["EdDSA"]` default when
@@ -243,20 +251,120 @@ impl SourceAuthConfig {
     /// from, if any. Used to strip the header before forwarding upstream — the
     /// source credential is consumed by the gateway and must not leak.
     pub fn credential_header_name(&self) -> Option<&str> {
+        match self.credential_source() {
+            CredentialSource::Header(name) => Some(name),
+            CredentialSource::McpMeta | CredentialSource::A2aExtension | CredentialSource::ClientCertificate => None,
+        }
+    }
+
+    /// Where this method reads the caller's credential.
+    pub fn credential_source(&self) -> CredentialSource<'_> {
         match self {
-            SourceAuthConfig::JwtBearer(c) => Some(c.token_header.as_str()),
-            SourceAuthConfig::ApiKey(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::ApiKeyProvider(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::DidAuth(c) => extraction_header(&c.extraction),
-            SourceAuthConfig::Mtls(_) => None,
+            SourceAuthConfig::JwtBearer(c) => CredentialSource::Header(c.token_header.as_str()),
+            SourceAuthConfig::ApiKey(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::ApiKeyProvider(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::DidAuth(c) => CredentialSource::from_extraction(&c.extraction),
+            SourceAuthConfig::Mtls(_) => CredentialSource::ClientCertificate,
+        }
+    }
+
+    /// Whether the request carries this method's credential: a non-empty
+    /// header, or a client certificate. A JWT bearer header counts only when it
+    /// holds a token in the method's scheme, as its verifier reads it, so
+    /// another scheme on the same header, such as an MPP `Authorization:
+    /// Payment` credential, is not taken for the JWT.
+    pub(crate) fn is_presented(
+        &self,
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> bool {
+        if let SourceAuthConfig::JwtBearer(config) = self {
+            let header_value = headers
+                .get(config.token_header.as_str())
+                .and_then(|value| value.to_str().ok());
+            return crate::jwt_bearer::validator::extract_bearer_with_scheme(header_value, &config.token_scheme)
+                .is_ok();
+        }
+        match self.credential_source() {
+            CredentialSource::Header(name) => headers
+                .get(name)
+                .is_some_and(|value| {
+                    !value
+                        .as_bytes()
+                        .trim_ascii()
+                        .is_empty()
+                }),
+            CredentialSource::ClientCertificate => has_client_certificate,
+            CredentialSource::McpMeta | CredentialSource::A2aExtension => false,
         }
     }
 }
 
-fn extraction_header(extraction: &CredentialExtraction) -> Option<&str> {
-    match extraction {
-        CredentialExtraction::HttpHeader { field } => Some(field.as_str()),
-        CredentialExtraction::McpMeta | CredentialExtraction::A2aExtension => None,
+/// Where a caller authentication method reads the caller's credential.
+#[derive(Debug, Clone, Copy)]
+pub enum CredentialSource<'a> {
+    Header(&'a str),
+    McpMeta,
+    A2aExtension,
+    ClientCertificate,
+}
+
+impl CredentialSource<'_> {
+    fn from_extraction(extraction: &CredentialExtraction) -> CredentialSource<'_> {
+        match extraction {
+            CredentialExtraction::HttpHeader { field } => CredentialSource::Header(field.as_str()),
+            CredentialExtraction::McpMeta => CredentialSource::McpMeta,
+            CredentialExtraction::A2aExtension => CredentialSource::A2aExtension,
+        }
+    }
+
+    /// Header names compare case-insensitively, as HTTP does.
+    pub fn same_as(
+        &self,
+        other: &CredentialSource<'_>,
+    ) -> bool {
+        match (self, other) {
+            (CredentialSource::Header(a), CredentialSource::Header(b)) => a.eq_ignore_ascii_case(b),
+            (CredentialSource::McpMeta, CredentialSource::McpMeta)
+            | (CredentialSource::A2aExtension, CredentialSource::A2aExtension)
+            | (CredentialSource::ClientCertificate, CredentialSource::ClientCertificate) => true,
+            _ => false,
+        }
+    }
+}
+
+/// The caller authentication method chosen for one request.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceAuthSelection<'a> {
+    /// The method whose credential the request carries, or the primary
+    /// (first) method when the request carries none or several.
+    pub method: &'a SourceAuthConfig,
+    /// The request carries credentials for more than one method. It then
+    /// fails without any method being verified.
+    pub ambiguous: bool,
+}
+
+/// Chooses the caller authentication method that verifies a request: the
+/// method whose credential the request carries, or the primary (first) method
+/// when it carries none. A request carrying credentials for several methods is
+/// ambiguous, so the caller can't pick the identity the gateway asserts. Only
+/// the chosen method is verified; a failure never falls through to another.
+pub fn select_source_auth_method<'a>(
+    methods: &'a [SourceAuthConfig],
+    headers: &axum::http::HeaderMap,
+    has_client_certificate: bool,
+) -> Option<SourceAuthSelection<'a>> {
+    let mut presented = methods
+        .iter()
+        .filter(|method| method.is_presented(headers, has_client_certificate));
+    match (presented.next(), presented.next()) {
+        (Some(method), None) => Some(SourceAuthSelection { method, ambiguous: false }),
+        (Some(_), Some(_)) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: true }),
+        (None, _) => methods
+            .first()
+            .map(|method| SourceAuthSelection { method, ambiguous: false }),
     }
 }
 
@@ -286,16 +394,22 @@ pub enum CredentialExtraction {
 pub enum AuthenticatedIdentity {
     /// JWT Bearer authentication succeeded.
     JwtBearer {
-        /// The `sub` claim from the token.
+        /// The value of the principal claim in the token.
         subject: String,
+        /// The claim `subject` was read from: the strategy's principal claim.
+        principal_claim: String,
         /// All decoded claims.
         claims: Value,
     },
 
     /// API Key authentication succeeded.
     ApiKey {
-        /// The human-readable name of the validated key.
+        /// The human-readable name of the validated key: the `secret_id` for
+        /// `api_key`, the key's id for `api_key_provider`.
         key_name: String,
+        /// The API Key Provider agent that issued the key; `None` for a key
+        /// held in a secret (`api_key`).
+        provider_agent_id: Option<String>,
     },
 
     /// DID Auth session authentication succeeded.
@@ -316,7 +430,12 @@ pub enum AuthenticatedIdentity {
         /// Subject DN as an RFC 4514 string.
         subject_dn: String,
         /// Issuer DN. Empty for [`MtlsTrust::Pinned`] (no chain verified).
+        /// For display and audit only: it is a name the certificate states.
         issuer_dn: String,
+        /// Lowercase hex SHA-256 of the subject and public key of the CA its
+        /// verified chain ends at, so renewing a CA with the same subject and
+        /// key keeps it; for [`MtlsTrust::Pinned`] the pinned certificate's SHA-256.
+        trust_anchor_fingerprint: String,
         /// SANs captured from the leaf, for audit / OPA visibility even
         /// when they are not used as the principal.
         sans: MtlsSans,
@@ -338,16 +457,139 @@ impl AuthenticatedIdentity {
         }
     }
 
+    /// The claim a JWT caller's verification strategy names it by; `None` for
+    /// any other mode.
+    pub fn jwt_principal_claim(&self) -> Option<&str> {
+        match self {
+            AuthenticatedIdentity::JwtBearer { principal_claim, .. } => Some(principal_claim),
+            _ => None,
+        }
+    }
+
+    /// The caller's name as the credential states it: the value of the JWT
+    /// strategy's principal claim (`sub` by default), the API key name, the
+    /// DID, or the mTLS principal.
+    pub fn principal(&self) -> &str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { subject, .. } => subject,
+            AuthenticatedIdentity::ApiKey { key_name, .. } => key_name,
+            AuthenticatedIdentity::DidAuth { did } => did,
+            AuthenticatedIdentity::Mtls { principal, .. } => principal,
+        }
+    }
+
+    /// This caller's `user_identity_hash` on a surface of `tenant_id`: the
+    /// [`caller_identity_hash`] of the method, the issuer (the JWT `iss`, the
+    /// API Key Provider agent, a hash of the subject and key of the CA an mTLS
+    /// client certificate was verified against) and the principal, with a JWT
+    /// strategy's principal claim when it is not `sub`
+    /// ([`jwt_caller_identity_hash`]). The transit token, policy input and
+    /// delegated credentials key callers by it. `None` when the credential names
+    /// no subject, such as a JWT without a string in its principal claim: such a
+    /// caller has no delegated credentials.
+    pub fn principal_hash(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Option<String> {
+        let (method, issuer, subject) = match self {
+            AuthenticatedIdentity::JwtBearer {
+                subject,
+                principal_claim,
+                claims,
+            } => {
+                let issuer = claims
+                    .get("iss")
+                    .and_then(Value::as_str)
+                    .filter(|issuer| !issuer.is_empty())?;
+                let named = claims
+                    .get(principal_claim.as_str())
+                    .and_then(Value::as_str)?;
+                if named != subject || subject.is_empty() {
+                    return None;
+                }
+                return jwt_caller_identity_hash(issuer, tenant_id, subject, principal_claim);
+            }
+            AuthenticatedIdentity::ApiKey {
+                key_name,
+                provider_agent_id: None,
+            } => ("api_key", "", key_name.as_str()),
+            AuthenticatedIdentity::ApiKey {
+                key_name,
+                provider_agent_id: Some(agent_id),
+            } => ("api_key_provider", agent_id.as_str(), key_name.as_str()),
+            AuthenticatedIdentity::DidAuth { did } => ("did_auth", "", did.as_str()),
+            AuthenticatedIdentity::Mtls {
+                principal,
+                trust_anchor_fingerprint,
+                ..
+            } => ("mtls", trust_anchor_fingerprint.as_str(), principal.as_str()),
+        };
+        if subject.is_empty() {
+            return None;
+        }
+        caller_identity_hash(method, issuer, tenant_id, subject)
+    }
+
+    /// The source-auth method that produced this identity, as policy input
+    /// names it (`input.source_auth.method`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            AuthenticatedIdentity::JwtBearer { .. } => "jwt_bearer",
+            AuthenticatedIdentity::ApiKey { .. } => "api_key",
+            AuthenticatedIdentity::DidAuth { .. } => "did_auth",
+            AuthenticatedIdentity::Mtls { .. } => "mtls",
+        }
+    }
+
     /// A stable key for the authenticated caller, distinct across auth modes,
-    /// for per-caller limits.
+    /// for per-caller limits. A JWT caller is keyed by its identity hash, so its
+    /// issuer and principal claim tell it apart as they do for its grants; one
+    /// that names no caller is `jwt:<none>`.
     pub fn principal_key(&self) -> String {
         match self {
-            AuthenticatedIdentity::JwtBearer { subject, .. } => format!("jwt:{subject}"),
-            AuthenticatedIdentity::ApiKey { key_name } => format!("api-key:{key_name}"),
+            AuthenticatedIdentity::JwtBearer { .. } => self
+                .principal_hash(None)
+                .map_or_else(|| "jwt:<none>".to_string(), |hash| format!("jwt:{hash}")),
+            AuthenticatedIdentity::ApiKey { key_name, .. } => format!("api-key:{key_name}"),
             AuthenticatedIdentity::DidAuth { did } => format!("did-auth:{did}"),
             AuthenticatedIdentity::Mtls { principal, .. } => format!("mtls:{principal}"),
         }
     }
+}
+
+/// The identity hash of a caller: lowercase hex SHA-256 of the canonical JSON
+/// array `[method, issuer, tenant, subject]` (RFC 8785; a surface with no tenant
+/// gives `null`). The same subject named by another method, issuer, key
+/// provider or tenant is another caller.
+pub fn caller_identity_hash(
+    method: &str,
+    issuer: &str,
+    tenant_id: Option<&str>,
+    subject: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let encoded = serde_json_canonicalizer::to_vec(&(method, issuer, tenant_id, subject)).ok()?;
+    Some(hex::encode(Sha256::digest(encoded)))
+}
+
+/// The identity hash of a JWT caller whose verification strategy names it by
+/// `principal_claim`: the [`caller_identity_hash`] for `sub`, and for any other
+/// claim the same array with the claim's name appended,
+/// `[method, issuer, tenant, subject, claim]`. So one value in two claims, such
+/// as a `sub` and another person's `preferred_username`, is two callers.
+pub fn jwt_caller_identity_hash(
+    issuer: &str,
+    tenant_id: Option<&str>,
+    subject: &str,
+    principal_claim: &str,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM {
+        return caller_identity_hash("jwt_bearer", issuer, tenant_id, subject);
+    }
+    let encoded =
+        serde_json_canonicalizer::to_vec(&("jwt_bearer", issuer, tenant_id, subject, principal_claim)).ok()?;
+    Some(hex::encode(Sha256::digest(encoded)))
 }
 
 /// SubjectAltName values lifted off a verified leaf certificate.
@@ -437,11 +679,12 @@ pub enum ManagedIdentityConfig {
     #[serde(alias = "from_payload")]
     PayloadExtraction(PayloadExtractionConfig),
 
-    /// Use an API key (presented by the caller or bound to the surface)
-    /// to look up the upstream agent identity.
+    /// Derive the agent identity from a stored API key.
     FromApiKey {
-        /// API key identifier (matches a stored key in the secret store).
-        api_key_id: String,
+        /// Stored key identifier: a secret id or an `atgk_` provider key id.
+        /// The stored-credential resolver refuses `FromApiKey` without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_id: Option<String>,
     },
 
     /// Take the upstream agent identity from the TLS client certificate.
@@ -587,7 +830,7 @@ mod tests {
                 certificate_id: "cert-1".to_string(),
             },
             ManagedIdentityConfig::FromApiKey {
-                api_key_id: "key-1".to_string(),
+                api_key_id: Some("key-1".to_string()),
             },
         ] {
             assert_eq!(configured.caller_verification(), IdentityVerification::Unverified, "{configured:?}");
@@ -688,6 +931,7 @@ mod tests {
     #[test]
     fn authenticated_identity_jwt_claims_accessor() {
         let id = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "agent-1".to_string(),
             claims: serde_json::json!({"oid": "abc", "tid": "tenant-1"}),
         };
@@ -701,8 +945,271 @@ mod tests {
             Some("abc")
         );
 
-        let other = AuthenticatedIdentity::ApiKey { key_name: "k".to_string() };
+        let other = AuthenticatedIdentity::ApiKey {
+            key_name: "k".to_string(),
+            provider_agent_id: None,
+        };
         assert!(other.jwt_claims().is_none());
+    }
+
+    fn jwt_named_by(
+        principal_claim: &str,
+        claims: serde_json::Value,
+    ) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::JwtBearer {
+            subject: claims[principal_claim]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            principal_claim: principal_claim.to_string(),
+            claims,
+        }
+    }
+
+    #[test]
+    fn the_identity_hash_follows_the_principal_claim() {
+        let claims = || {
+            serde_json::json!({
+                "iss": "https://login.example.com",
+                "sub": "pairwise-sub",
+                "oid": "00000000-0000-0000-0000-0000000000aa",
+                "email": "alice@example.com",
+                "tid": 7
+            })
+        };
+        let by_oid = jwt_named_by("oid", claims());
+        assert_eq!(
+            by_oid
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            jwt_caller_identity_hash(
+                "https://login.example.com",
+                Some("tenant-1"),
+                "00000000-0000-0000-0000-0000000000aa",
+                "oid"
+            )
+            .as_deref()
+        );
+        let oid_hash = by_oid
+            .principal_hash(None)
+            .unwrap();
+        assert_eq!(oid_hash, "37a52b25adcb2d469f5c33df9a69cb443149cac11316ac04b38e88fdf7cbe36f");
+        assert_eq!(crate::delegation_vault::release::connect_hint(&oid_hash), "bjXra_R6O-9aJ7DUY5xpnA");
+        assert_ne!(
+            by_oid.principal_hash(None),
+            jwt_named_by("sub", claims()).principal_hash(None),
+            "the claim chosen decides the caller"
+        );
+        assert_ne!(by_oid.principal_hash(None), jwt_named_by("email", claims()).principal_hash(None));
+        let other_app = serde_json::json!({
+            "iss": "https://login.example.com",
+            "sub": "another-pairwise-sub",
+            "oid": "00000000-0000-0000-0000-0000000000aa"
+        });
+        assert_eq!(
+            by_oid.principal_hash(None),
+            jwt_named_by("oid", other_app).principal_hash(None),
+            "the same oid from another application is the same caller"
+        );
+    }
+
+    /// Two strategies for one issuer that name different claims can see one
+    /// value in both: one person's `sub` and another's `preferred_username`.
+    /// The claim's name keeps them two callers.
+    #[test]
+    fn one_value_in_two_claims_is_two_callers() {
+        let alice = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        let mallory = jwt_named_by(
+            "preferred_username",
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "m-1", "preferred_username": "alice" }),
+        );
+        assert_ne!(alice.principal_hash(Some("tenant-1")), mallory.principal_hash(Some("tenant-1")));
+        assert_eq!(
+            alice
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f"),
+            "sub keeps the hash it always had"
+        );
+    }
+
+    /// Per-caller limits key a JWT caller as its grants do: one value in two
+    /// claims, or from two issuers, is two callers.
+    #[test]
+    fn a_jwt_callers_limit_key_follows_its_issuer_and_principal_claim() {
+        let alice = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        let by_username = jwt_named_by(
+            "preferred_username",
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "m-1", "preferred_username": "alice" }),
+        );
+        let other_issuer =
+            jwt_named_by("sub", serde_json::json!({ "iss": "https://other.example.com", "sub": "alice" }));
+        assert_ne!(alice.principal_key(), by_username.principal_key());
+        assert_ne!(alice.principal_key(), other_issuer.principal_key());
+        assert_eq!(
+            alice.principal_key(),
+            format!(
+                "jwt:{}",
+                alice
+                    .principal_hash(None)
+                    .unwrap()
+            )
+        );
+        let nobody = jwt_named_by("oid", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        assert_eq!(nobody.principal_key(), "jwt:<none>");
+    }
+
+    #[test]
+    fn a_token_without_a_usable_principal_claim_names_no_caller() {
+        for claims in [
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": "" }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": 42 }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": ["a"] }),
+            serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": null }),
+        ] {
+            assert_eq!(jwt_named_by("oid", claims).principal_hash(None), None);
+        }
+    }
+
+    #[test]
+    fn an_identity_whose_subject_is_not_its_principal_claims_value_has_no_hash() {
+        let claims = serde_json::json!({ "iss": "https://login.example.com", "sub": "alice", "oid": "o-1" });
+        let forged = AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            principal_claim: "oid".to_string(),
+            claims,
+        };
+        assert_eq!(forged.principal_hash(None), None);
+    }
+
+    #[test]
+    fn the_default_principal_claim_keeps_the_hashes_it_always_had() {
+        let identity = jwt_named_by("sub", serde_json::json!({ "iss": "https://login.example.com", "sub": "alice" }));
+        assert_eq!(
+            identity
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f")
+        );
+    }
+
+    #[test]
+    fn the_identity_hash_has_fixed_values_for_known_callers() {
+        let jwt_subject = |subject: &str| AuthenticatedIdentity::JwtBearer {
+            subject: subject.to_string(),
+            principal_claim: "sub".to_string(),
+            claims: serde_json::json!({"iss": "https://login.example.com", "sub": subject}),
+        };
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(None)
+                .as_deref(),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f")
+        );
+        assert_eq!(
+            jwt_subject("alice")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738")
+        );
+        assert_eq!(
+            jwt_subject("a\"b\\c\u{e9}\n")
+                .principal_hash(Some("tenant-1"))
+                .as_deref(),
+            Some("37dd94b7e0f0a61a89b39d4d2794129d7d0111b709fe0de494786c6c1af5a353")
+        );
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "partner-key".to_string(),
+            provider_agent_id: None,
+        };
+        assert_eq!(
+            api_key
+                .principal_hash(None)
+                .as_deref(),
+            Some("67275e0a53fe45efca324e6d40d55cb40f103b0d2774429c61f32a80f773b2db")
+        );
+    }
+
+    #[test]
+    fn the_identity_hash_of_a_jwt_is_the_function_of_its_issuer_tenant_and_subject_alone() {
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", None, "alice"),
+            Some("42628a381c35947c51d560b24315c5590c6f3c217701fcabd95f9fd9697bcd3f".to_string())
+        );
+        assert_eq!(
+            caller_identity_hash("jwt_bearer", "https://login.example.com", Some("tenant-1"), "alice"),
+            Some("88710eb7ec7b0a9bd06ab2201d049690db79712dec6f0a41cd26deb1cd003738".to_string())
+        );
+    }
+
+    /// The identity hash is the SHA-256 of `[method, issuer, tenant, subject]`,
+    /// so a caller is told apart by each, and a JWT that names no subject has no
+    /// hash at all.
+    #[test]
+    fn the_identity_hash_tells_callers_apart_by_method_issuer_and_tenant() {
+        use sha2::{Digest, Sha256};
+        let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
+            subject: claims["sub"]
+                .as_str()
+                .unwrap_or("<none>")
+                .to_string(),
+            claims,
+        };
+        let api_key = |name: &str, provider: Option<&str>| AuthenticatedIdentity::ApiKey {
+            key_name: name.to_string(),
+            provider_agent_id: provider.map(str::to_string),
+        };
+        let alice = jwt(serde_json::json!({"iss": "https://idp.example", "sub": "alice"}));
+
+        assert_eq!(
+            alice.principal_hash(Some("tenant-a")),
+            Some(hex::encode(Sha256::digest(br#"["jwt_bearer","https://idp.example","tenant-a","alice"]"#)))
+        );
+        assert_eq!(
+            alice.principal_hash(None),
+            Some(hex::encode(Sha256::digest(br#"["jwt_bearer","https://idp.example",null,"alice"]"#)))
+        );
+        let hashes = [
+            alice.principal_hash(None),
+            alice.principal_hash(Some("tenant-a")),
+            jwt(serde_json::json!({"iss": "https://partner.example", "sub": "alice"})).principal_hash(None),
+            api_key("alice", None).principal_hash(None),
+            api_key("alice", Some("agent-1")).principal_hash(None),
+            api_key("alice", Some("agent-2")).principal_hash(None),
+            AuthenticatedIdentity::DidAuth { did: "alice".into() }.principal_hash(None),
+        ];
+        let distinct: std::collections::HashSet<_> = hashes
+            .iter()
+            .map(|hash| {
+                hash.clone()
+                    .expect("each names a subject")
+            })
+            .collect();
+        assert_eq!(distinct.len(), hashes.len(), "{hashes:?}");
+        assert_ne!(
+            alice.principal_hash(None),
+            Some(hex::encode(Sha256::digest(b"alice"))),
+            "the subject alone is no longer the hash"
+        );
+
+        for (case, identity) in [
+            ("no sub", jwt(serde_json::json!({"iss": "https://idp.example"}))),
+            ("empty sub", jwt(serde_json::json!({"iss": "https://idp.example", "sub": ""}))),
+            ("no iss", jwt(serde_json::json!({"sub": "alice"}))),
+            (
+                "a subject the claims do not carry",
+                AuthenticatedIdentity::JwtBearer {
+                    principal_claim: "sub".to_string(),
+                    subject: "alice".into(),
+                    claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
+                },
+            ),
+            ("an empty key name", api_key("", None)),
+        ] {
+            assert_eq!(identity.principal_hash(None), None, "{case}");
+        }
     }
 
     #[test]
@@ -773,6 +1280,16 @@ mod tests {
         assert_eq!(custom.effective_challenge_ttl_seconds(), 60);
         assert_eq!(custom.effective_session_ttl_seconds(), 120);
         assert_eq!(custom.effective_allowed_algorithms(), vec!["ES256".to_string()]);
+
+        let unchecked = DidAuthAuthConfig {
+            session_ttl_seconds: Some(30 * 86_400),
+            ..custom
+        };
+        assert_eq!(
+            unchecked.effective_session_ttl_seconds(),
+            DidAuthAuthConfig::MAX_SESSION_TTL_SECONDS,
+            "a lifetime over the longest, from a configuration never validated, is cut to the longest"
+        );
     }
 
     #[test]
@@ -913,12 +1430,33 @@ mod tests {
     #[test]
     fn managed_identity_from_api_key_roundtrip() {
         let config = ManagedIdentityConfig::FromApiKey {
-            api_key_id: "key-1".to_string(),
+            api_key_id: Some("key-1".to_string()),
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"type\":\"from_api_key\""));
         let back: ManagedIdentityConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn managed_identity_from_api_key_with_id_keeps_id_on_the_wire() {
+        let wire = serde_json::json!({ "type": "from_api_key", "api_key_id": "x" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            config,
+            ManagedIdentityConfig::FromApiKey {
+                api_key_id: Some("x".to_string())
+            }
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
+    }
+
+    #[test]
+    fn managed_identity_from_api_key_without_id_omits_it_on_the_wire() {
+        let wire = serde_json::json!({ "type": "from_api_key" });
+        let config: ManagedIdentityConfig = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(config, ManagedIdentityConfig::FromApiKey { api_key_id: None });
+        assert_eq!(serde_json::to_value(&config).unwrap(), wire);
     }
 
     #[test]
@@ -985,5 +1523,126 @@ mod tests {
         assert!(!json.contains("\"json_schema\""));
         let back: PayloadExtractionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    fn method(value: serde_json::Value) -> SourceAuthConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn jwt_and_api_key() -> Vec<SourceAuthConfig> {
+        vec![
+            method(
+                serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": []}),
+            ),
+            method(serde_json::json!({
+                "type": "api_key",
+                "extraction": {"source": "http_header", "field": "X-API-Key"},
+                "secret_id": "keys"
+            })),
+        ]
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value))
+            })
+            .collect()
+    }
+
+    fn selected_tag(
+        methods: &[SourceAuthConfig],
+        headers: &axum::http::HeaderMap,
+        has_client_certificate: bool,
+    ) -> (&'static str, bool) {
+        let selection = select_source_auth_method(methods, headers, has_client_certificate).unwrap();
+        (selection.method.method_tag(), selection.ambiguous)
+    }
+
+    #[test]
+    fn selection_picks_the_method_whose_credential_the_request_carries() {
+        let methods = jwt_and_api_key();
+
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("authorization", "Bearer t")]), false), ("jwt_bearer", false));
+    }
+
+    #[test]
+    fn selection_is_ambiguous_on_the_primary_method_when_several_credentials_are_present() {
+        let methods = jwt_and_api_key();
+        let both = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+
+        assert_eq!(selected_tag(&methods, &both, false), ("jwt_bearer", true));
+
+        let reversed: Vec<_> = methods
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(selected_tag(&reversed, &both, false), ("api_key", true));
+    }
+
+    #[test]
+    fn selection_counts_a_jwt_header_only_in_the_methods_scheme() {
+        let methods: Vec<_> = jwt_and_api_key()
+            .into_iter()
+            .rev()
+            .collect();
+        for other_scheme in ["Payment cred", "bearer t", "Bearer "] {
+            let request = headers(&[("x-api-key", "k"), ("authorization", other_scheme)]);
+            assert_eq!(selected_tag(&methods, &request, false), ("api_key", false), "{other_scheme}");
+        }
+        let request = headers(&[("x-api-key", "k"), ("authorization", "Bearer t")]);
+        assert_eq!(selected_tag(&methods, &request, false), ("api_key", true));
+
+        let empty_key = headers(&[("x-api-key", " "), ("authorization", "Bearer t")]);
+        assert_eq!(
+            selected_tag(&methods, &empty_key, false),
+            ("jwt_bearer", false),
+            "an empty header is no credential"
+        );
+
+        let any_scheme = method(serde_json::json!({
+            "type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1", "audiences": [], "token_scheme": ""
+        }));
+        assert!(
+            any_scheme.is_presented(&headers(&[("authorization", "Payment cred")]), false),
+            "a method without a scheme reads any value"
+        );
+    }
+
+    #[test]
+    fn selection_falls_back_to_the_primary_method_when_no_credential_is_present() {
+        let methods = jwt_and_api_key();
+        assert_eq!(selected_tag(&methods, &headers(&[("x-other", "v")]), false), ("jwt_bearer", false));
+    }
+
+    #[test]
+    fn selection_counts_a_client_certificate_as_the_mtls_credential() {
+        let methods = vec![
+            jwt_and_api_key().remove(1),
+            method(serde_json::json!({
+                "type": "mtls",
+                "trust": {"type": "pinned", "certificate_ids": ["c1"]},
+                "identity_binding": {"type": "fingerprint"}
+            })),
+        ];
+        assert_eq!(selected_tag(&methods, &headers(&[]), true), ("mtls", false));
+        assert_eq!(selected_tag(&methods, &headers(&[]), false), ("api_key", false));
+        assert_eq!(selected_tag(&methods, &headers(&[("x-api-key", "k")]), true), ("api_key", true));
+    }
+
+    #[test]
+    fn selection_is_none_without_methods() {
+        assert!(select_source_auth_method(&[], &headers(&[("authorization", "Bearer t")]), true).is_none());
+    }
+
+    #[test]
+    fn credential_sources_compare_header_names_case_insensitively() {
+        assert!(CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("x-api-key")));
+        assert!(!CredentialSource::Header("X-API-Key").same_as(&CredentialSource::Header("Authorization")));
+        assert!(CredentialSource::McpMeta.same_as(&CredentialSource::McpMeta));
+        assert!(!CredentialSource::McpMeta.same_as(&CredentialSource::A2aExtension));
+        assert!(!CredentialSource::ClientCertificate.same_as(&CredentialSource::Header("Authorization")));
     }
 }

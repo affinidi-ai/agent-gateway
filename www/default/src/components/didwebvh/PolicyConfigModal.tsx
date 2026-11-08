@@ -156,21 +156,17 @@ export const PolicyConfigModal: React.FC<PolicyConfigModalProps> = ({
       const identityId = identity?.id || identity?.uuid;
 
       if (!show || !identityId) {
-        console.log('[PolicyConfigModal] Modal not shown or no identity ID');
         return;
       }
 
-      console.log('[PolicyConfigModal] Fetching policy for identity:', identityId);
       setLoading(true);
       setLoadError(null);
 
       try {
         const response = await apiClient.fetch(`/api/v1/identities/${identityId}/policy`);
-        console.log('[PolicyConfigModal] Policy fetch response status:', response.status);
 
         if (response.ok) {
           const data = await response.json();
-          console.log('[PolicyConfigModal] Loaded policy config:', data);
           if (data.config) {
             setConfig(data.config);
             setSelectedTemplate('Custom');
@@ -178,7 +174,6 @@ export const PolicyConfigModal: React.FC<PolicyConfigModalProps> = ({
           }
         } else if (response.status === 404) {
           // No existing policy, use default
-          console.log('[PolicyConfigModal] No existing policy, using Standard template');
           setConfig(TEMPLATES[0].config);
           setSelectedTemplate('Standard');
           setModified(false);
@@ -240,9 +235,6 @@ export const PolicyConfigModal: React.FC<PolicyConfigModalProps> = ({
   };
 
   const testPolicy = (): { allowed: boolean; checks: any[] } => {
-    console.log('[PolicyConfigModal] testPolicy called for identity:', identity?.did);
-    console.log('[PolicyConfigModal] Current config:', JSON.stringify(config, null, 2));
-
     // Validate policy configuration locally
     const result = {
       allowed: true,
@@ -281,22 +273,14 @@ export const PolicyConfigModal: React.FC<PolicyConfigModalProps> = ({
     };
     result.allowed = result.checks.every(c => c.passed);
 
-    console.log(
-      '[PolicyConfigModal] Test result:',
-      result.allowed ? 'ALLOWED' : 'DENIED',
-      'checks:',
-      result.checks.length
-    );
     setTestResult(result);
     return result;
   };
 
   const handleSave = async () => {
-    console.log('[PolicyConfigModal] handleSave called');
     setSaving(true);
     try {
       await onSave(config);
-      console.log('[PolicyConfigModal] Save successful');
       setModified(false);
       onHide();
     } catch (error) {
@@ -307,24 +291,14 @@ export const PolicyConfigModal: React.FC<PolicyConfigModalProps> = ({
   };
 
   const handleTestAndSave = async () => {
-    console.log('[PolicyConfigModal] handleTestAndSave called');
     // Run test synchronously and get result directly (not from stale state)
     const result = testPolicy();
 
     // Show test results briefly before saving
     if (result.allowed) {
-      console.log('[PolicyConfigModal] Test passed, proceeding to save');
       // Small delay to show test results visually
       await new Promise(resolve => setTimeout(resolve, 500));
       await handleSave();
-    } else {
-      console.log(
-        '[PolicyConfigModal] Test failed, not saving. Failed checks:',
-        result.checks
-          .filter((c: any) => !c.passed)
-          .map((c: any) => c.name)
-          .join(', ')
-      );
     }
   };
 

@@ -99,7 +99,7 @@ const initialDashboardStore: DashboardStateStore = {
   currentBucketSeconds: null,
 };
 
-const initialState: AppState = {
+export const initialState: AppState = {
   theme: 'light',
   sidebarCollapsed: localStorage.getItem('dashboard-sidebar-collapsed') === 'true',
   globalState: { ...initialDashboardStore },
@@ -120,7 +120,7 @@ const initialState: AppState = {
   error: null,
 };
 
-function appReducer(state: AppState, action: AppAction): AppState {
+export function appReducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
     case 'SET_THEME':
       return { ...state, theme: action.payload };
@@ -522,6 +522,21 @@ interface AppContextType {
 export const AppContext = createContext<AppContextType | undefined>(undefined);
 AppContext.displayName = 'AppContext';
 
+/** Used when the settings cannot be loaded: every feature flag reads off. */
+export const FALLBACK_SETTINGS: Settings = {
+  badge_threshold: 5,
+  metrics_retention: 6,
+  task_activity_window: 60,
+  connections_window: 60,
+  latency_window: 60,
+  onboarding_channel_ttl_seconds: 30,
+  refresh_interval_seconds: 5,
+  log_timestamp_format: 'local',
+  bucket_seconds: 30,
+  payments_min_display: 10,
+  feature_flags: {},
+};
+
 export const useApp = (): AppContextType => {
   const context = useContext(AppContext);
   if (!context) {
@@ -825,7 +840,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
   const connectWebSocket = React.useCallback(() => {
     if (wsRef.current) {
-      //console.debug('[WebSocket] Already connected, skipping connection attempt');
       return; // Already connected
     }
 
@@ -833,7 +847,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const isOnSignInPage = window.location.pathname === '/login';
 
     if (isOnSignInPage) {
-      //console.debug('[WebSocket] Skipping connection on sign-in page');
       return;
     }
 
@@ -843,7 +856,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsBase = process.env.REACT_APP_WS_URL ?? `${protocol}//${window.location.host}/api/ws`;
 
-    ////console.log('[WebSocket] Attempting to connect to:', wsBase);
     const ws = new WebSocket(wsBase);
     // Set ref immediately so the guard at the top prevents a second
     // connection when React StrictMode double-mounts.
@@ -855,7 +867,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         ws.close();
         return;
       }
-      ////console.log('[WebSocket] ✓ Connected successfully');
       // Clear any pending disconnect/reconnect timeouts
       if (disconnectTimeoutRef.current) {
         clearTimeout(disconnectTimeoutRef.current);
@@ -927,51 +938,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
             // Server-pushed pre-computed delta – apply directly without an HTTP round-trip.
             // Also derive a filtered delta for the filtered view when filters are active.
             if (message.delta) {
-              const d = message.delta;
-              const c = d.changes || {};
-              const parts: string[] = [];
-              if (c.metrics) {
-                const m = c.metrics;
-                const tsPts = m.new_time_series_points?.length || 0;
-                const latPts = m.new_latency_points?.length || 0;
-                parts.push(
-                  `metrics(ts=${tsPts}, lat=${latPts}, conns=${m.total_connections ?? '-'}, avgLat=${m.avg_latency ?? '-'}ms, chans=${m.channel_stats?.length ?? 0})`
-                );
-              }
-              if (c.logs?.new_entries?.length) parts.push(`logs(+${c.logs.new_entries.length})`);
-              if (c.channels) {
-                const ch = c.channels;
-                parts.push(
-                  `channels(+${ch.added?.length || 0} ~${ch.updated?.length || 0} -${ch.removed?.length || 0})`
-                );
-              }
-              if (c.identities) {
-                const id = c.identities;
-                parts.push(`identities(+${id.added?.length || 0} ~${id.updated?.length || 0})`);
-              }
-              if (c.tasks) {
-                const t = c.tasks;
-                const taskCount = t.tasks?.tasks?.length || 0;
-                const cpTasks = t.connection_point_tasks
-                  ? Object.keys(t.connection_point_tasks).length
-                  : 0;
-                const mcpTasks = t.mcp_proxy_tasks ? Object.keys(t.mcp_proxy_tasks).length : 0;
-                parts.push(`tasks(${taskCount}, cp=${cpTasks}, mcp=${mcpTasks})`);
-              }
-              if (c.unread_count !== undefined) parts.push(`unread=${c.unread_count}`);
-              const sizeKb = (new Blob([event.data]).size / 1024).toFixed(2);
-              const localTime = new Date(d.timestamp * 1000).toLocaleString();
-              // Simple hash of the payload for dedup/debugging
-              let hash = 0;
-              for (let i = 0; i < event.data.length; i++) {
-                hash = ((hash << 5) - hash + event.data.charCodeAt(i)) | 0;
-              }
-              const hashHex = (hash >>> 0).toString(16).padStart(8, '0');
-              console.log(
-                `[WS delta] ${localTime} | ${sizeKb} KB | #${hashHex} | ${parts.length ? parts.join(', ') : 'empty'}`
-              );
-              // console.log(`[WS delta] message: ${JSON.stringify(message, null, 2)}`);
-
               dispatch({
                 type: 'APPLY_DASHBOARD_DELTA',
                 payload: { delta: message.delta, view: 'global' },
@@ -1090,14 +1056,12 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     ws.onclose = event => {
       // If this socket was already superseded, don't touch state or reconnect
       if (wsRef.current !== ws) return;
-      //console.log(`[WebSocket] Connection closed - Code: ${event.code}, Reason: ${event.reason || 'none'}, Clean: ${event.wasClean}`);
       dispatch({ type: 'SET_WS_CONNECTION', payload: null });
       wsRef.current = null;
 
       // Check if close was due to authentication failure (code 1008 = policy violation, often used for auth failures)
       // or code 4401 (custom unauthorized code some servers use)
       if (event.code === 1008 || event.code === 4401 || event.code === 1002) {
-        //console.error('[WebSocket] Closed due to authentication failure - redirecting to sign in');
         intentionalDisconnectRef.current = true;
         sessionManager.expireSession();
         return;
@@ -1105,64 +1069,51 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
 
       // If this was an intentional disconnect, don't try to reconnect
       if (intentionalDisconnectRef.current) {
-        ////console.log('[WebSocket] Intentional disconnect - will not reconnect');
         dispatch({ type: 'SET_WS_STATUS', payload: 'DISCONNECTED' });
         return;
       }
-
-      //console.log('[WebSocket] Checking session validity before reconnect...');
 
       // Check if session is still valid with the server (async operation)
       apiClient
         .fetch('/api/auth/check')
         .then(response => {
           if (response.status === 404) {
-            //console.log('[WebSocket] Auth endpoint not found - passkey auth disabled, allowing reconnect');
             // Auth endpoint doesn't exist - passkey auth is disabled, allow reconnect
             return { authenticated: true };
           }
           if (response.status === 401) {
-            //console.warn('[WebSocket] Session invalid (401) - logging out');
             // Session is invalid - return auth failure
             return { authenticated: false };
           }
           if (!response.ok) {
             // Server error (500, 502, etc.) - not an auth issue, server might be restarting
-            //console.log(`[WebSocket] Server error ${response.status} - will retry connection`);
             throw new Error(`Server error: ${response.status}`);
           }
           return response.json();
         })
         .then(data => {
           if (!data.authenticated) {
-            //console.warn('[WebSocket] Session no longer valid - redirecting to login');
             sessionManager.expireSession();
             return;
           }
-          //console.log('[WebSocket] Session valid, scheduling reconnect...');
           // Session is valid, proceed with reconnection logic
           scheduleReconnect();
         })
-        .catch(error => {
-          //console.error('[WebSocket] Error checking session validity:', error);
+        .catch(() => {
           // If we can't reach the server, it might be down/restarting
           // Don't clear the session - just try to reconnect later
-          //console.log('[WebSocket] Server unreachable, will retry connection...');
           scheduleReconnect();
         });
     };
 
     // Helper function to schedule reconnection
     const scheduleReconnect = () => {
-      //console.log('[WebSocket] Scheduling reconnect...');
-
       // Only set the "show modal" timeout if not already set
       // This prevents the modal from flickering when multiple reconnection attempts happen
       if (!disconnectTimeoutRef.current) {
         // Wait 3 seconds before showing the reconnecting modal
         disconnectTimeoutRef.current = setTimeout(() => {
           if (!wsRef.current) {
-            //console.log('[WebSocket] Still disconnected after 3s, showing reconnecting modal');
             dispatch({ type: 'SET_SHOW_RECONNECTING_MODAL', payload: true });
           }
           disconnectTimeoutRef.current = null;
@@ -1174,7 +1125,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
         // Set timeout to eventually hide modal and show disconnected if still not reconnected after extended period
         fullDisconnectTimeoutRef.current = setTimeout(() => {
           if (!wsRef.current) {
-            //console.warn('[WebSocket] Still disconnected after 30s, hiding modal');
             dispatch({ type: 'SET_SHOW_RECONNECTING_MODAL', payload: false });
             dispatch({ type: 'SET_WS_STATUS', payload: 'DISCONNECTED' });
           }
@@ -1191,7 +1141,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       // Attempt to reconnect after 1 second (faster reconnection for channel updates)
       reconnectTimeoutRef.current = setTimeout(() => {
         if (!wsRef.current) {
-          //console.log('[WebSocket] Attempting reconnect now...');
           connectWebSocket();
         }
         reconnectTimeoutRef.current = null;
@@ -1207,7 +1156,6 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
   }, [loadDashboardStats]);
 
   const disconnectWebSocket = React.useCallback(() => {
-    //console.log('[WebSocket] Intentionally disconnecting...');
     // Set flag to prevent automatic reconnection
     intentionalDisconnectRef.current = true;
 
@@ -1300,22 +1248,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
           payload: error instanceof Error ? error.message : 'Failed to load settings',
         });
         // Set default settings to prevent app crash
-        dispatch({
-          type: 'SET_SETTINGS',
-          payload: {
-            badge_threshold: 5,
-            metrics_retention: 6,
-            task_activity_window: 60,
-            connections_window: 60,
-            latency_window: 60,
-            onboarding_channel_ttl_seconds: 30,
-            refresh_interval_seconds: 5,
-            log_timestamp_format: 'local',
-            bucket_seconds: 30,
-            payments_min_display: 10,
-            feature_flags: {},
-          },
-        });
+        dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }
@@ -1410,15 +1343,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
       wsKeepAliveRef.current = keep;
     },
     setWsSubscription: (sections: string[]) => {
-      const label = sections.length ? sections.join(', ') : 'all';
-      const prev = wsSubscriptionRef.current.length ? wsSubscriptionRef.current.join(', ') : 'all';
       wsSubscriptionRef.current = sections;
       // Send to the server immediately if connected
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'subscribe', sections }));
-        console.log(`[WS] subscription changed: [${prev}] → [${label}]`);
-      } else {
-        console.log(`[WS] subscription queued (not connected): [${prev}] → [${label}]`);
       }
     },
   };
@@ -1448,6 +1376,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
           type: 'SET_ERROR',
           payload: error instanceof Error ? error.message : 'Failed to load settings',
         });
+        // Every flag reads off, and pages waiting for the settings render.
+        dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }
@@ -1483,13 +1413,10 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
     const handleVisibilityChange = () => {
       if (document.hidden) {
         if (wsKeepAliveRef.current) {
-          console.log('[WebSocket] Tab hidden — keeping connection alive (wsKeepAlive)');
           return;
         }
-        console.log('[WebSocket] Tab hidden — disconnecting to save server resources');
         disconnectWebSocket();
       } else {
-        console.log('[WebSocket] Tab visible — reconnecting');
         connectWebSocket();
         // Force full refresh after returning to the tab so we don't miss anything
         loadDashboardStats(true);

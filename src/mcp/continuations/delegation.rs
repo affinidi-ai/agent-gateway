@@ -21,7 +21,10 @@ pub fn make_binding(
     identity: &AuthenticatedIdentity,
     request: &ValidatedModernMessage,
 ) -> Result<ContinuationBinding, ContinuationError> {
-    let (principal, user_identity_hash) = verified_principal(identity)?;
+    let principal = verified_principal(identity)?;
+    let user_identity_hash = identity
+        .principal_hash(surface.tenant_id.as_deref())
+        .ok_or(ContinuationError::BindingMismatch)?;
     let binding = ContinuationBinding {
         deployment: deployment.into(),
         principal,
@@ -42,8 +45,13 @@ pub fn make_binding(
     Ok(binding)
 }
 
-fn verified_principal(identity: &AuthenticatedIdentity) -> Result<(String, String), ContinuationError> {
-    let AuthenticatedIdentity::JwtBearer { subject, claims } = identity else {
+fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, ContinuationError> {
+    let AuthenticatedIdentity::JwtBearer {
+        subject,
+        principal_claim,
+        claims,
+    } = identity
+    else {
         return Err(ContinuationError::BindingMismatch);
     };
     let issuer = claims
@@ -53,13 +61,13 @@ fn verified_principal(identity: &AuthenticatedIdentity) -> Result<(String, Strin
         .ok_or(ContinuationError::BindingMismatch)?;
     if subject.is_empty()
         || claims
-            .get("sub")
+            .get(principal_claim.as_str())
             .and_then(Value::as_str)
             != Some(subject)
     {
         return Err(ContinuationError::BindingMismatch);
     }
-    Ok((hex::encode(digest(&(issuer, subject))?), hex::encode(Sha256::digest(subject.as_bytes()))))
+    Ok(hex::encode(digest(&(issuer, subject))?))
 }
 
 fn authorization_digest(
@@ -80,7 +88,7 @@ fn authorization_digest(
     scopes.dedup();
     digest(&json!({
         "surface": surface, "provider": provider,
-        "principal": verified_principal(identity)?.0,
+        "principal": verified_principal(identity)?,
         "scopes": scopes, "actor": claims.get("act"), "client_id": claims.get("client_id")
     }))
 }
@@ -111,12 +119,16 @@ pub fn validate_consent_identity(
     provider: &CredentialProvider,
     identity: &AuthenticatedIdentity,
 ) -> Result<(), ContinuationError> {
-    let (principal, user_identity_hash) = verified_principal(identity)?;
+    let principal = verified_principal(identity)?;
+    let user_identity_hash = identity.principal_hash(surface.tenant_id.as_deref());
     if principal != ticket.binding.principal
-        || user_identity_hash
-            != ticket
-                .binding
-                .user_identity_hash
+        || user_identity_hash.as_deref()
+            != Some(
+                ticket
+                    .binding
+                    .user_identity_hash
+                    .as_str(),
+            )
         || surface.surface_id != ticket.binding.surface_id
         || surface.tenant_id != ticket.binding.tenant_id
         || surface.status != crate::config::agent_surface::SurfaceStatus::Active
@@ -148,6 +160,7 @@ mod tests {
             "id": "provider", "name": "Provider", "provider_id": "provider", "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         })).unwrap();
         let identity = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/oauth2/mcp", "sub": "user", "scope": "write read", "act": {"sub": "client"}, "exp": 100}),
         };

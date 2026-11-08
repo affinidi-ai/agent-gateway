@@ -31,8 +31,9 @@ leaves a secret out keeps it, and one that sends it as `null` clears it. A secre
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
 resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
-secret that an endpoint references is refused with `409` naming the endpoints; change or
-delete those endpoints first. Changing the secret's value is allowed, and the next delivery
+secret that an endpoint references is refused with `409` naming the endpoints, even with
+`?force=true`, which overrides only references from surfaces, credential providers, A2A proxies
+and STS clients; change or delete those endpoints first. Changing the secret's value is allowed, and the next delivery
 uses it. Only appliance-wide secrets resolve; a tenant-owned one never does. No `secrets.*`
 permission is checked when a reference is saved or resolved, so `integrations.edit` can use, and
 therefore read, every appliance-wide secret: pointing an endpoint that holds a reference at a
@@ -107,16 +108,70 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | --- | --- |
 | Gateway | `gateway.created`, `updated`, `deleted`, `status_changed`, `accessed` |
 | User | `user.created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
-| Connection point | `connection_point.connected`: someone connected through a connection point with its secret |
+| Connection point | `connection_point.created`, `updated`, `deleted`, `connected` |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
+| Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
+
+This gateway verifies no x402 or MPP payment itself, so `x402.verification.failed` and the three
+`mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
+The other x402 events come from settling and pruning x402 payments recorded before.
 
 A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+The connection point management API raises `connection_point.created`, `updated` and `deleted`,
+as the gateway API raises the gateway events. `updated` is raised when a save changes the name,
+description, enabled state or exposed surfaces; a save that changes none of them raises nothing,
+and so does a reconnect. Connection points the gateway creates or removes itself, such as those
+of a pairing or an expired invitation, raise none of them. `connection_point.connected` is
+raised when another gateway pairs through a connection point's invitation with its secret; a
+failed attempt raises nothing ([`connection_point_integration_triggers.rs`](../src/integrations/connection_point_integration_triggers.rs),
+[`webhook.rs`](../src/gateways/connection_points/webhook.rs)).
+
+These integration events are separate from the [event hook](#event-hook) calls of the same
+names. The event hook's `created` and `deleted` also report the connection points the gateway
+creates and removes itself, and its `connected` reports a listener's first mediator connection,
+not a pairing.
+### Delegated payment events
+
+The payment gate raises one `payment.*` event per call to a connected agent-pay gateway
+([`payment_gate_integration_triggers.rs`](../src/integrations/payment_gate_integration_triggers.rs)).
+They go to every active integration whose event set holds the event.
+
+| Event | Meaning |
+| --- | --- |
+| `payment.challenge_issued` | The payment gateway answered with a payment challenge |
+| `payment.paid` | The payment gateway accepted the payment |
+| `payment.held` | The payment gateway held the payment for review |
+| `payment.rejected` | The payment gateway rejected the payment, or the credential had already been used for a request this gateway forwarded |
+| `payment.unconfirmed` | The payment gateway did not say whether the payment was taken, or is still working on it; the caller was told to retry the same request with the same credential within 120 seconds |
+| `payment.authorized` | The payment gateway held the funds until the Target delivers |
+| `payment.voided` | Held funds were released because the Target did not deliver |
+| `payment.capture_failed` | The Target delivered but capturing the held funds failed |
+| `payment.reconcile_failed` | A held or unconfirmed payment could not be settled before its deadline |
+| `payment.unavailable` | The payment gateway could not be reached or gave no usable answer, or the surface still carries an unsupported local x402 or MPP policy |
+
+Each carries `SURFACE_ID`, `VARIANT`, `PAYMENT_GATEWAY_ID`, `PAYMENT_SURFACE_ID`, `RESOURCE`,
+`RAIL` (`x402` or `mpp`, empty when the request carried no credential and the payment surface offers both), `AMOUNT`, `CURRENCY`, `CASE_ID` (a held payment's review case),
+`REMOTE_STATUS` (the payment gateway's HTTP status), `TRACE_ID`, `AUTHORIZATION_ID` (agent-pay's
+authorization of funds held until delivery), `RECEIPT_REFERENCE` (the MPP receipt reference or x402
+settlement transaction hash), `QUOTED_AMOUNT` and `QUOTED_CURRENCY` (the manifest price, set only
+when the receipt charged another), `PRICE_MISMATCH` (`true` or `false`), `REASON` (why the payment
+was refused, failed or released, as the ledger row keeps it: clipped to 200 characters with
+credential-shaped words redacted), and `SEVERITY` (`info` for
+`paid`, `challenge_issued`, `held`, `authorized` and `voided`, `warning` for `rejected` and `unconfirmed`, `error` for `unavailable`, `capture_failed` and `reconcile_failed`),
+alongside `EVENT_TYPE` and `TIMESTAMP`. A value that is absent is an empty string. No payer
+identity or credential is included. The governance audit forwarding of a `payment` record carries
+only the fingerprint of its signed credential (`AUDIT_VP_FINGERPRINT`); `AUDIT_VP_JWT` is empty
+for it (see [`OBSERVABILITY.md`](OBSERVABILITY.md#payment-credentials-in-the-audit-trail)).
+
+A surface that still carries a local x402 or MPP policy raises
+`payment.unavailable` at most once a minute, whatever the request rate.
 
 ## Templates
 
@@ -143,10 +198,20 @@ Every event fills these variables, plus its own:
 
 The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
 `APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
-event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`, and
-`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events also
-carry `OLD_STATE` and `NEW_STATE`: the resource before and after the change as JSON, empty for a
-create or a delete respectively.
+event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
+`GATEWAY_ROLE` (`Peer` or `Payment`) and `GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
+the connection point `created`, `updated` and `deleted` events, also carry `OLD_STATE` and
+`NEW_STATE`: the resource before and after the change as JSON, empty for a create or a delete
+respectively. A connection point's state leaves out its invitation (`oob_id`, `oob_url`,
+`oob_message`) and its secret, since whoever holds them can connect.
+
+Audit events carry the `AUDIT_*` variables listed in
+[`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding). Among them,
+`AUDIT_SURFACE_VARIANT` (**Surface Variant**) is the variant the request resolved to: the
+variant's alias, `_base_` when the base surface served it, `_unknown_` on an unknown-variant
+refusal, or the disabled alias on a disabled-variant refusal. It is empty outside surface requests
+and when the surface's default variant is misconfigured. A template can send it as, for example,
+`"audit_surface_variant": "${AUDIT_SURFACE_VARIANT}"`.
 
 A user's `OLD_STATE` and `NEW_STATE` carry only `user_id`, `role`, `status`, `is_primary`,
 `created_at`, and `updated_at`
@@ -172,6 +237,26 @@ The placeholder syntax is `integration.variable_pattern` in `gateway.json`, fixe
 ([`runtime_variables.rs`](../src/integrations/runtime_variables.rs)); a pattern that is not a
 valid regular expression stops the gateway from starting.
 
+### Example: policy decisions to Agent Watch
+
+Agent Watch's Enforcement insights read the gateway's policy decisions, and the policy changes
+behind them, from Kafka:
+
+- an endpoint of type `stream`, platform Kafka, on the topic Agent Watch consumes;
+- an event set holding `audit.policy_decision` and the policy change events
+  `audit.policy_created`, `audit.policy_updated`, `audit.policy_deleted`,
+  `audit.policy_attached`, `audit.policy_detached`, `audit.policy_attachment_changed` and
+  `audit.policy_change_refused`;
+- an integration joining the two with this template, so `record` is the full audit record:
+
+  ```json
+  {"event_type":"${EVENT_TYPE}","timestamp":"${TIMESTAMP}","appliance_id":"${APPLIANCE_ID}","record":"${EVENT_DATA}"}
+  ```
+
+Set the **Appliance ID** to the gateway's appliance id in Agent Watch, and bind the topic in
+Agent Watch with the `integration_json` format for that appliance. Agent Watch counts a record
+delivered again once by its `event_id`, and counts requests by `request_id`.
+
 ## Publishers
 
 | Type | Sends to | Configuration |
@@ -193,11 +278,11 @@ and reject replays.
 
 Webhook and Slack URLs are checked with `validate_resolved_webhook_url`
 ([`src/url_validation.rs`](../src/url_validation.rs)), which resolves the host and rejects
-cloud metadata addresses, loopback and unspecified addresses, the RFC 1918 private ranges,
-IPv4 and IPv6 link-local, IPv6 unique-local, and IPv4-mapped forms of all of these. This is
-stricter than the forward legs, which allow loopback and RFC 1918 for same-host and
-same-network targets. A DNS failure is an error. The request is then sent through the shared
-external client ([`src/http_client.rs`](../src/http_client.rs)), which has a 30-second
+cloud metadata addresses, loopback and unspecified addresses, the RFC 1918 private ranges, IPv4
+and IPv6 link-local, IPv6 unique-local, and the IPv4-mapped, 6to4 and NAT64 forms of all of
+these. This is stricter than the forward legs, which allow loopback and RFC 1918 for same-host
+and same-network targets. A DNS failure is an error. The request is then sent through the
+shared external client ([`src/http_client.rs`](../src/http_client.rs)), which has a 30-second
 timeout and redirects disabled, so a redirect cannot lead to an internal address.
 
 These sinks do not use the pin-once primitive in [`src/egress.rs`](../src/egress.rs) that
@@ -234,7 +319,7 @@ addresses are blocked, the resolved address is pinned and redirects are not foll
 - the permanent Connection Point the inviter stores when it approves a pairing;
 - the DID the gateway generates for a stored Trust Registry, with `id` the Trust Registry id and empty `gateway_id` and `mediator_id`. It is announced when the registry is added and `deleted` when the registry is deleted.
 
-Each is announced before the gateway first contacts the mediator and followed by `created` or `creation_failed`. A Trust Registry reconnect that creates a new DID reports `created` for the new DID and then `deleted` for the old one under the same `id`, so key the events by `did`; the old DID's `deleted` is sent only after the record naming the new DID is saved. A reconnect that reuses the same DID, as a `did:web` registry does, sends nothing. The first-call repeat for these DIDs needs the directory to list the mediator already: while it has not answered yet, a refused first call fails at once, unlike a Connection Point on a provided mediator. The deletion of a Connection Point record, whether the pairing is deleted, the temporary Connection Point is cleaned up or it expires, sends `deleted`. Not announced are Connection Points stored before `mediator_did` was recorded (there is no backfill, so deleting one sends nothing), the ephemeral DID the gateway makes to query a public Trust Registry it has no stored entry for, and any DID after a restart that interrupts its creation or deletion.
+Each is announced before the gateway first contacts the mediator and followed by `created` or `creation_failed`; a Trust Registry deleted before its record naming the DID is saved reports `creation_failed`. Reconnecting a Trust Registry rebuilds its connection from its stored keys and keeps its DID, so it sends nothing; only a registry that never finished connecting accepts its OOB invitation again, and its new DID is announced as on creation. The first-call repeat for these DIDs needs the directory to list the mediator already: while it has not answered yet, a refused first call fails at once, unlike a Connection Point on a provided mediator. The deletion of a Connection Point record, whether the pairing is deleted, the temporary Connection Point is cleaned up or it expires, sends `deleted`. Not announced are Connection Points stored before `mediator_did` was recorded (there is no backfill, so deleting one sends nothing), the ephemeral DID the gateway makes to query a public Trust Registry it has no stored entry for, and any DID after a restart that interrupts its creation or deletion.
 
 | `event` | Fires |
 | --- | --- |
@@ -242,7 +327,7 @@ Each is announced before the gateway first contacts the mediator and followed by
 | `connection_point.created` | Right after the Connection Point record is saved, before its listener starts. |
 | `connection_point.creation_failed` | When creation ends without a saved record after `creation_started`: an error, a panic, or the request being cancelled (for example the client disconnecting). Every `creation_started` is followed by exactly one of `created` or `creation_failed`. Both exist only once the DID is minted: a request that fails validation earlier emits nothing, and `creation_failed` carries no reason. |
 | `connection_point.connected` | After the Connection Point's listener makes its first successful mediator connection, each time the listener starts (boot, promotion to Active). The payload is read from the stored record at that moment, so a rename made while the listener connected is reflected, and nothing is sent when the record was deleted meanwhile. Reconnects after a dropped socket do not repeat it, and every restart re-announces all live Connection Points. |
-| `connection_point.deleted` | After a Connection Point record has actually been deleted through the Connection Point store: the API delete, expiry cleanup, and the cleanup of a pairing's temporary Connection Point. Deleting a Trust Registry sends it too, once the registry is deleted, and so does reconnecting one through its OOB invitation when that creates a new DID, for the old DID. Deleting a gateway does not delete its User Connection Points, so it emits nothing for them. A record removed by hand from storage is not reported, and neither is a deletion whose record could not be read just before it: the event cannot be built without the record, so the gateway logs a `warn` naming the Connection Point id and the delete still succeeds. |
+| `connection_point.deleted` | After a Connection Point record has actually been deleted through the Connection Point store: the API delete, expiry cleanup, and the cleanup of a pairing's temporary Connection Point. Deleting a Trust Registry sends it too, once the registry is deleted. Deleting a gateway does not delete its User Connection Points, so it emits nothing for them. A record removed by hand from storage is not reported, and neither is a deletion whose record could not be read just before it: the event cannot be built without the record, so the gateway logs a `warn` naming the Connection Point id and the delete still succeeds. |
 
 ```json
 {
@@ -373,8 +458,9 @@ most one). The settings are read from the environment the first time a Connectio
 The request is not answered until the sequence ends, and the gateway sets no request timeout of its own. Keep the idle timeout of any proxy or load balancer in front of the management API above the cap plus the rest of the handler (the 60 second default of an AWS ALB is enough), or a client sees a gateway timeout while the Connection Point is still created and a retry creates a second one.
 
 **Log lines.** All logs are plain text at the target `agent_gateway::event_hook`; the
-`did` field is logged like any DID and masked by the global log redactor. The URL, the secret and
-the signature are never logged.
+`did` field is logged in full, like any DID, and is masked only when an operator configures a
+[`logging.redaction`](CONFIGURATION_REFERENCE.md#log-redaction) rule that matches DIDs. The URL, the
+secret and the signature are never logged.
 
 | Level | Line |
 | --- | --- |
@@ -581,13 +667,18 @@ logged.
 Separate from integrations, the gateway keeps notifications for dashboard users, shown in
 the top bar.
 
-| Route | Purpose |
-| --- | --- |
-| `GET`, `POST /v1/notifications` | List and create |
-| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one |
-| `GET /v1/notifications/unread/count` | The badge count |
-| `POST /v1/notifications/send-welcome` | Send the welcome message |
-| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template |
+| Route | Purpose | Permission |
+| --- | --- | --- |
+| `GET`, `POST /v1/notifications` | List and create | Session |
+| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one | Session |
+| `GET /v1/notifications/unread/count` | The badge count | Session |
+| `POST /v1/notifications/send-welcome` | Send the welcome message | `users.approve` |
+| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template | `users.approve` |
+
+The session routes act on the caller's own notifications. The welcome routes need
+`users.approve`, which the built-in defaults grant to `administrator` only, and refuse every
+request with `403` when no auth backend is configured; `send-welcome` sends to the user named in
+the request. See [`RBAC.md`](RBAC.md#maintenance-and-welcome-routes).
 
 Welcome messages for administrators and users start from the templates
 [`admin_welcome.json`](../src/integrations/admin_welcome.json) and
@@ -607,6 +698,7 @@ endpoint, an event set and an integration, all three with the old integration's 
 - **Event set:** the events it actually received. That means:
   - the event types of its gateway and user attachments (an empty list meant all of them);
   - every x402 or MPP event for those categories;
+  - every `payment.*` event for an appliance-wide `payment` integration;
   - `connection_point.connected` when a connection point named it;
   - for an appliance-wide `audit` integration, the audit records the previous version
     forwarded, including the three the VP Audit Log settings gated.
@@ -614,7 +706,7 @@ endpoint, an event set and an integration, all three with the old integration's 
   limits of 7 days and 20 attempts, since unset means retried forever.
 - **Endpoint only:** an integration that received nothing keeps only its endpoint, so its
   destination is not lost. This covers `surface`, `identity` and unattached
-  `general`/`connection_point` integrations, and tenant-owned `audit` ones.
+  `general`/`connection_point` integrations, and tenant-owned `audit` and `payment` ones.
 
 **What changes, for each integration the report names:**
 - **Scope:** an integration attached to some gateways or connection points now receives the

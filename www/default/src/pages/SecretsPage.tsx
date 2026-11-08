@@ -352,12 +352,13 @@ const SecretsPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-secrets">
       <div className="d-sm-flex align-items-center justify-content-between mb-4">
         <div className="d-flex align-items-center">
           <SearchInput
             value={searchTerm}
             onChange={setSearchTerm}
+            data-testid="secrets-search-input"
             placeholder="Filter Secrets, API Keys, Access Tokens (PAT), Certificates..."
             width="384px"
           />
@@ -381,6 +382,7 @@ const SecretsPage: React.FC = () => {
       >
         <Tab
           eventKey="secrets"
+          tabAttrs={{ 'data-testid': 'secrets-secrets-tab-trigger' }}
           title={
             <>
               <i className="fas fa-key"></i> Secrets {tabBadge(filteredSecrets.length)}
@@ -402,6 +404,7 @@ const SecretsPage: React.FC = () => {
                 variant="primary"
                 size="md"
                 className="shadow-sm"
+                data-testid="secrets-add-button"
                 onClick={e => guard('secrets.secret', () => navigate('/secrets/new'), e)}
                 iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
               >
@@ -457,6 +460,7 @@ const SecretsPage: React.FC = () => {
                     <tbody>
                       {pagedSecrets.map(secret => (
                         <tr
+                          data-testid={`secrets-row-${secret.id}`}
                           key={secret.id}
                           style={{ cursor: 'pointer' }}
                           onClick={() => navigate(`/secrets/${secret.id}`)}
@@ -471,7 +475,10 @@ const SecretsPage: React.FC = () => {
                           <td>
                             {secret.tags.length > 0 ? (
                               secret.tags.map(tag => (
-                                <span key={tag} className="badge text-bg-secondary me-1">
+                                <span
+                                  key={tag}
+                                  className="badge text-wrap text-break text-bg-secondary me-1"
+                                >
                                   {tag}
                                 </span>
                               ))
@@ -492,6 +499,7 @@ const SecretsPage: React.FC = () => {
                           </td>
                           <td>
                             <DeleteButton
+                              data-testid={`secrets-delete-button-${secret.id}`}
                               onDelete={() => handleDelete(secret.id)}
                               className="btn-sm"
                               title="Delete secret"
@@ -514,6 +522,7 @@ const SecretsPage: React.FC = () => {
 
         <Tab
           eventKey="api-keys"
+          tabAttrs={{ 'data-testid': 'secrets-api-keys-tab-trigger' }}
           title={
             <>
               <i className="fas fa-key"></i> API Keys {tabBadge(filteredApiKeys.length)}
@@ -536,6 +545,7 @@ const SecretsPage: React.FC = () => {
                 variant="primary"
                 size="md"
                 className="shadow-sm"
+                data-testid="api-keys-add-button"
                 onClick={() => setShowCreateModal(true)}
                 iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
               >
@@ -575,6 +585,7 @@ const SecretsPage: React.FC = () => {
                     <tbody>
                       {filteredApiKeys.map(apiKey => (
                         <tr
+                          data-testid={`api-keys-row-${apiKey.key_id}`}
                           key={apiKey.key_id}
                           style={{ cursor: 'pointer' }}
                           onClick={() => navigate(`/api-keys/${apiKey.agent_id}/${apiKey.key_id}`)}
@@ -605,6 +616,7 @@ const SecretsPage: React.FC = () => {
                                   className="me-1"
                                   title="Revoke"
                                   aria-label={`Revoke API key ${apiKey.key_id}`}
+                                  data-testid={`api-keys-revoke-button-${apiKey.key_id}`}
                                   onClick={() => handleRevokeApiKey(apiKey.agent_id, apiKey.key_id)}
                                 >
                                   <i className="fas fa-ban" aria-hidden="true"></i>
@@ -615,6 +627,7 @@ const SecretsPage: React.FC = () => {
                                   className="me-1"
                                   title="Rotate"
                                   aria-label={`Rotate API key ${apiKey.key_id}`}
+                                  data-testid={`api-keys-rotate-button-${apiKey.key_id}`}
                                   onClick={() => handleRotateApiKey(apiKey.agent_id, apiKey.key_id)}
                                 >
                                   <i className="fas fa-sync-alt" aria-hidden="true"></i>
@@ -622,6 +635,7 @@ const SecretsPage: React.FC = () => {
                               </>
                             )}
                             <DeleteButton
+                              data-testid={`api-keys-delete-button-${apiKey.key_id}`}
                               onDelete={() => handleDeleteApiKey(apiKey.agent_id, apiKey.key_id)}
                               className="btn-sm"
                               title="Delete API key"
@@ -798,6 +812,7 @@ const SecretsPage: React.FC = () => {
 
         <Tab
           eventKey="certificates"
+          tabAttrs={{ 'data-testid': 'secrets-certificates-tab-trigger' }}
           title={
             <>
               <i className="fas fa-certificate"></i> Certificates{' '}
@@ -829,6 +844,7 @@ const SecretsPage: React.FC = () => {
                   id="cert-kind-filter"
                   className="form-select form-select-sm"
                   style={{ width: 'auto' }}
+                  data-testid="certificates-kind-filter"
                   value={certKindFilter}
                   onChange={e => {
                     const next = e.target.value as 'all' | CertificateKind;
@@ -848,6 +864,7 @@ const SecretsPage: React.FC = () => {
                   size="md"
                   className="shadow-sm"
                   style={{ marginLeft: '16px' }}
+                  data-testid="certificates-add-button"
                   onClick={() => navigate('/certificates/new')}
                   iconStart={<i className="fas fa-plus fa-sm me-1" aria-hidden="true" />}
                 >
@@ -890,6 +907,7 @@ const SecretsPage: React.FC = () => {
                     <tbody>
                       {pagedCertificates.map(cert => (
                         <tr
+                          data-testid={`certificates-row-${cert.id}`}
                           key={cert.id}
                           style={{ cursor: 'pointer' }}
                           onClick={() => navigate(`/certificates/${cert.id}`)}
@@ -909,7 +927,10 @@ const SecretsPage: React.FC = () => {
                           <td>
                             {cert.tags.length > 0 ? (
                               cert.tags.map(tag => (
-                                <span key={tag} className="badge text-bg-secondary me-1">
+                                <span
+                                  key={tag}
+                                  className="badge text-wrap text-break text-bg-secondary me-1"
+                                >
                                   {tag}
                                 </span>
                               ))
@@ -936,6 +957,7 @@ const SecretsPage: React.FC = () => {
                           </td>
                           <td>
                             <DeleteButton
+                              data-testid={`certificates-delete-button-${cert.id}`}
                               onDelete={() => handleDeleteCertificate(cert.id)}
                               className="btn-sm"
                               title="Delete certificate"
@@ -959,6 +981,7 @@ const SecretsPage: React.FC = () => {
         {hasPermission('access_tokens.view') && (
           <Tab
             eventKey="access-tokens"
+            tabAttrs={{ 'data-testid': 'secrets-access-tokens-tab-trigger' }}
             title={
               <span data-testid="access-tokens-tab-trigger">
                 <i className="fas fa-user-lock" aria-hidden="true" /> Access Tokens (PAT)

@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -226,6 +226,31 @@ impl AdminApiClient {
         recorded_response(response).await
     }
 
+    /// Mints a personal access token as this operator from `request` and returns a client that
+    /// presents it as its bearer credential, sending `headers` on every request.
+    pub async fn personal_access_token_client(
+        &self,
+        request: &Value,
+        mut headers: header::HeaderMap,
+    ) -> Client {
+        let created = self
+            .send_recorded_json(Method::POST, "/v1/access-tokens", Some(request))
+            .await
+            .expect("creating the access token");
+        assert!(matches!(created.status, 200 | 201), "creating the access token: {}", created.body);
+        let token = created.body["token"]
+            .as_str()
+            .expect("the access token is returned once");
+        let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}")).expect("a bearer header");
+        authorization.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, authorization);
+        Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .build()
+            .expect("an HTTP client")
+    }
+
     pub async fn create_surface_recorded(
         &self,
         surface: &Value,
@@ -446,9 +471,24 @@ impl AdminApiClient {
     }
 }
 
+/// Collects the headers of an admin API response, keeping every `Warning` header a save
+/// answers with, one per line, where a plain collection keeps only the last.
+fn collect_admin_headers(headers: &reqwest::header::HeaderMap) -> HashMap<String, String> {
+    let mut collected = collect_headers(headers);
+    let warnings: Vec<&str> = headers
+        .get_all(reqwest::header::WARNING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    if !warnings.is_empty() {
+        collected.insert(reqwest::header::WARNING.to_string(), warnings.join("\n"));
+    }
+    collected
+}
+
 pub async fn recorded_response(response: reqwest::Response) -> Result<RecordedResponse> {
     let status = response.status().as_u16();
-    let headers = collect_headers(response.headers());
+    let headers = collect_admin_headers(response.headers());
     let body = response
         .json()
         .await
@@ -461,7 +501,7 @@ pub async fn recorded_response(response: reqwest::Response) -> Result<RecordedRe
 /// error) as a JSON string instead of dropping it.
 pub async fn recorded_response_keeping_text(response: reqwest::Response) -> Result<RecordedResponse> {
     let status = response.status().as_u16();
-    let headers = collect_headers(response.headers());
+    let headers = collect_admin_headers(response.headers());
     let text = response.text().await?;
     let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
 

@@ -113,7 +113,13 @@ impl Default for TestAuthConfig {
 impl TestAuthConfig {
     /// Create configuration from environment variables
     pub fn from_env() -> Self {
-        let mut enabled = std::env::var("AG_TEST_MODE")
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Create configuration from variables read through `lookup`, so tests can
+    /// supply them without changing the process environment.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mut enabled = lookup("AG_TEST_MODE")
             .map(|v| v.to_lowercase() == "true" || v == "1")
             .unwrap_or(false);
 
@@ -121,7 +127,7 @@ impl TestAuthConfig {
             warn!("⚠️  TEST MODE ENABLED - Test authentication endpoint is active. Do NOT use in production!");
         }
 
-        let test_token = std::env::var("AG_TEST_TOKEN").unwrap_or_default();
+        let test_token = lookup("AG_TEST_TOKEN").unwrap_or_default();
         if enabled && !is_strong_test_token(&test_token) {
             warn!(
                 "⚠️  TEST MODE DISABLED - AG_TEST_TOKEN must be explicitly set to a non-default token with at least {} characters",
@@ -133,17 +139,13 @@ impl TestAuthConfig {
         Self {
             enabled,
             test_token,
-            allow_role_override: parse_env_bool("AG_TEST_ALLOW_ROLE_OVERRIDE"),
-            test_username: std::env::var("AG_TEST_USERNAME").unwrap_or_else(|_| "test-user".to_string()),
-            test_user_id: std::env::var("AG_TEST_USER_ID").unwrap_or_else(|_| "test-user-001".to_string()),
+            allow_role_override: lookup("AG_TEST_ALLOW_ROLE_OVERRIDE")
+                .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+                .unwrap_or(false),
+            test_username: lookup("AG_TEST_USERNAME").unwrap_or_else(|| "test-user".to_string()),
+            test_user_id: lookup("AG_TEST_USER_ID").unwrap_or_else(|| "test-user-001".to_string()),
         }
     }
-}
-
-fn parse_env_bool(name: &str) -> bool {
-    std::env::var(name)
-        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
-        .unwrap_or(false)
 }
 
 fn is_strong_test_token(token: &str) -> bool {
@@ -447,33 +449,21 @@ pub async fn test_login(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use lazy_static::lazy_static;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     use super::*;
 
-    // required as each test modifies environment variables,
-    // which impacts other tests so we use a global mutex
-    // to serialize them
-    lazy_static! {
-        pub(crate) static ref TEST_LOCK: Mutex<bool> = Mutex::new(true);
+    fn config_from(vars: &[(&str, &str)]) -> TestAuthConfig {
+        TestAuthConfig::from_lookup(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        })
     }
 
     #[test]
     fn test_config_default_disabled() {
-        let _unused = TEST_LOCK.lock();
-
-        // Clear env vars for clean test
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-            std::env::remove_var("AG_TEST_TOKEN");
-            std::env::remove_var("AG_TEST_USERNAME");
-            std::env::remove_var("AG_TEST_USER_ID");
-            std::env::remove_var("AG_TEST_ALLOW_ROLE_OVERRIDE");
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[]);
         assert!(!config.enabled);
         assert_eq!(config.test_token, "");
         assert_eq!(config.test_username, "test-user");
@@ -482,80 +472,34 @@ pub(crate) mod tests {
 
     #[test]
     fn test_config_enabled_from_env() {
-        let _unused = TEST_LOCK.lock();
-
-        unsafe {
-            std::env::set_var("AG_TEST_MODE", "true");
-            std::env::set_var("AG_TEST_TOKEN", "custom-token-value-with-32-plus-chars");
-            std::env::set_var("AG_TEST_USERNAME", "custom-user");
-            std::env::set_var("AG_TEST_USER_ID", "custom-id");
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[
+            ("AG_TEST_MODE", "true"),
+            ("AG_TEST_TOKEN", "custom-token-value-with-32-plus-chars"),
+            ("AG_TEST_USERNAME", "custom-user"),
+            ("AG_TEST_USER_ID", "custom-id"),
+        ]);
         assert!(config.enabled);
         assert_eq!(config.test_token, "custom-token-value-with-32-plus-chars");
         assert_eq!(config.test_username, "custom-user");
         assert_eq!(config.test_user_id, "custom-id");
-
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-            std::env::remove_var("AG_TEST_TOKEN");
-            std::env::remove_var("AG_TEST_USERNAME");
-            std::env::remove_var("AG_TEST_USER_ID");
-        }
     }
 
     #[test]
     fn test_config_enabled_with_1() {
-        let _unused = TEST_LOCK.lock();
-
-        unsafe {
-            std::env::set_var("AG_TEST_MODE", "1");
-            std::env::set_var("AG_TEST_TOKEN", "custom-token-value-with-32-plus-chars");
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[("AG_TEST_MODE", "1"), ("AG_TEST_TOKEN", "custom-token-value-with-32-plus-chars")]);
         assert!(config.enabled);
-
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-            std::env::remove_var("AG_TEST_TOKEN");
-        }
     }
 
     #[test]
     fn test_config_disables_test_mode_without_explicit_strong_token() {
-        let _unused = TEST_LOCK.lock();
-
-        unsafe {
-            std::env::set_var("AG_TEST_MODE", "true");
-            std::env::remove_var("AG_TEST_TOKEN");
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[("AG_TEST_MODE", "true")]);
         assert!(!config.enabled);
-
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-        }
     }
 
     #[test]
     fn test_config_rejects_legacy_default_token() {
-        let _unused = TEST_LOCK.lock();
-
-        unsafe {
-            std::env::set_var("AG_TEST_MODE", "true");
-            std::env::set_var("AG_TEST_TOKEN", LEGACY_DEFAULT_TEST_TOKEN);
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[("AG_TEST_MODE", "true"), ("AG_TEST_TOKEN", LEGACY_DEFAULT_TEST_TOKEN)]);
         assert!(!config.enabled);
-
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-            std::env::remove_var("AG_TEST_TOKEN");
-        }
     }
 
     #[test]
@@ -580,24 +524,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_config_disabled_with_false() {
-        let _unused = TEST_LOCK.lock();
-
-        unsafe {
-            std::env::set_var("AG_TEST_MODE", "false");
-        }
-
-        let config = TestAuthConfig::from_env();
+        let config = config_from(&[("AG_TEST_MODE", "false")]);
         assert!(!config.enabled);
-
-        unsafe {
-            std::env::remove_var("AG_TEST_MODE");
-        }
     }
 
     #[tokio::test]
     async fn test_rejects_test_login_after_failed_attempt_window_is_full() {
-        let _unused = TEST_LOCK.lock();
-
         let temp_dir = tempdir().unwrap();
         let storage_path = temp_dir.path().join("users");
         let avatars_path = temp_dir
@@ -640,8 +572,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_ensure_test_user_creates_approved_administrator() {
-        let _unused = TEST_LOCK.lock();
-
         let temp_dir = tempdir().unwrap();
         let storage_path = temp_dir.path().join("users");
         let avatars_path = temp_dir
@@ -687,8 +617,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_ensure_test_user_upgrades_existing_user() {
-        let _unused = TEST_LOCK.lock();
-
         let temp_dir = tempdir().unwrap();
         let storage_path = temp_dir.path().join("users");
         let avatars_path = temp_dir

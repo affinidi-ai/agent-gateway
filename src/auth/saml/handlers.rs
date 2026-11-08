@@ -16,6 +16,7 @@ use crate::auth::session_finalizer::{
     AuthenticatedPrincipal, SessionFinalizationError, SessionFinalizer, SessionManagerFinalizer,
 };
 use crate::auth::storage::PasskeyStorage;
+use crate::observability::loggable;
 use crate::source_auth::client_ip::ClientIp;
 use crate::sts::throttle::TokenEndpointThrottle;
 
@@ -54,11 +55,23 @@ pub struct SamlLoginForm {
 }
 
 /// Response for successful SAML login
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[allow(dead_code)]
 pub struct SamlLoginResponse {
     pub session_token: String,
     pub user: SamlUserInfo,
+}
+
+impl std::fmt::Debug for SamlLoginResponse {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("SamlLoginResponse")
+            .field("session_token", &loggable::secret(&self.session_token))
+            .field("user", &self.user)
+            .finish()
+    }
 }
 
 /// User information from SAML
@@ -398,13 +411,7 @@ pub async fn saml_check_auth(
             StatusCode::UNAUTHORIZED.into_response()
         })?;
 
-    tracing::debug!(
-        "Auth check: Validating session token {}...",
-        session_token
-            .chars()
-            .take(8)
-            .collect::<String>()
-    );
+    tracing::debug!("Auth check: Validating session token {}", loggable::secret(&session_token));
 
     // Validate session
     match session_manager
@@ -421,7 +428,7 @@ pub async fn saml_check_auth(
             } else {
                 false
             };
-            tracing::info!("Auth check: Session valid for user {} ({})", session.username, session.user_id);
+            tracing::info!("Auth check: Session valid for user_id {}", session.user_id);
             Ok(Json(serde_json::json!({
                 "authenticated": true,
                 "username": session.username,
@@ -430,13 +437,7 @@ pub async fn saml_check_auth(
             })))
         }
         None => {
-            tracing::warn!(
-                "Auth check: Session validation failed for token {}...",
-                session_token
-                    .chars()
-                    .take(8)
-                    .collect::<String>()
-            );
+            tracing::warn!("Auth check: Session validation failed for token {}", loggable::secret(&session_token));
             Err(StatusCode::UNAUTHORIZED.into_response())
         }
     }
@@ -994,5 +995,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(acs_return_target(&state.saml_service, Some(&key)), "/");
+    }
+
+    fn bearer_headers(token: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn auth_check_logs_the_user_id_and_a_token_prefix_only() {
+        let sessions = Arc::new(SessionManager::new());
+        let terms = Arc::new(crate::terms::TermsManager::disabled());
+        let token = sessions
+            .create_session("alice@example.com".into(), "user-1".into())
+            .await;
+        let unknown_token = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        let valid =
+            saml_check_auth(bearer_headers(&token), Extension(sessions.clone()), Extension(terms.clone())).await;
+        let invalid = saml_check_auth(bearer_headers(unknown_token), Extension(sessions), Extension(terms)).await;
+
+        assert_eq!(valid.unwrap().0["user_id"], "user-1");
+        assert_eq!(invalid.unwrap_err().status(), StatusCode::UNAUTHORIZED);
+        let text = logs.text();
+        assert!(text.contains("Auth check: Session valid for user_id user-1"), "{text}");
+        assert!(text.contains(&format!("Auth check: Validating session token {}", loggable::secret(&token))), "{text}");
+        assert!(text.contains("Auth check: Session validation failed for token 0f2c9d7e..."), "{text}");
+        assert!(!text.contains("alice@example.com"), "{text}");
+        assert!(!text.contains(&token), "{text}");
+        assert!(!text.contains(unknown_token), "{text}");
     }
 }

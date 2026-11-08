@@ -2,7 +2,9 @@ import type { SurfaceNodeType } from './nodeTypes';
 
 export function shouldShowDependencyWarnings(
   type: SurfaceNodeType,
-  hasAttemptedSave: boolean
+  hasAttemptedSave: boolean,
+  config?: Record<string, unknown>
 ): boolean {
-  return type !== 'payment' || hasAttemptedSave;
+  if (type !== 'payment') return true;
+  return hasAttemptedSave || !!config?.unsupported_legacy;
 }

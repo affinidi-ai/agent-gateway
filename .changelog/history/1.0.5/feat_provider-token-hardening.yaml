@@ -1,0 +1,263 @@
+branch: feat/provider-token-hardening
+changes:
+  added:
+    - timestamp: '2026-10-30T23:00:00Z'
+      title: Accept a Google service account JSON key as a provider signing key
+      description: >-
+        The signing-key secret of an oauth2_jwt_bearer or oauth2_client_credentials_jwt_auth
+        provider may now hold the whole service account key file, up to 16 KiB. The gateway
+        signs with its private_key and sends its private_key_id as the kid header unless
+        Key ID is set, so the downloaded file no longer needs to be taken apart.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: ⭐ Show the managed agent's card next to the served card in Surface Builder
+      description: >-
+        A2A and AP2 surfaces get an Agent Cards view that compares the managed agent's own
+        card with the card the gateway serves, marks what the gateway changed, shows the
+        fetch result and the Target Authentication used, and refreshes the card on demand.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Show the agent card fetch status on the Managed Agent panel
+      description: >-
+        The Managed Agent panel shows whether the gateway can fetch the agent's card and why
+        not, with a link to the Agent Cards view.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Add agent card preview and refresh endpoints to the surface management API
+      description: >-
+        GET /api/v1/surfaces/{id}/agent-card (surfaces.view) and POST
+        .../agent-card/refresh (surfaces.edit) report the card the base route serves beside
+        the managed agent's own card, how the gateway's fetch went and whether Target
+        Authentication was sent, as a 200 for every fetch result. The fetch is pinned,
+        records no metric, is audited as agent_card.preview_fetch without URL, secret or
+        card, and is limited to 10 a minute per user and per surface; past the limit a read
+        answers with the last preview and a refresh gets 429. A failed fetch keeps showing
+        the last good card of the same running surface for up to 10 minutes.
+    - timestamp: '2026-11-02T06:56:00Z'
+      title: Let operators set the credential provider token request timeout
+      description: >-
+        The bootstrap [credential_policy] section accepts token_request_timeout_secs, from 1
+        to 120 seconds and 30 by default; 0 or a larger value fails startup. It bounds the
+        token requests of service grants and their refreshes, the legacy delegated refresh,
+        the legacy code exchange and the modern consent exchange; a grant's connect code
+        exchange and refresh keep a fixed 30 seconds. A service token request that runs past
+        it fails and starts the retry backoff. Changing it needs a restart.
+  changed:
+    - timestamp: '2026-10-30T22:45:00Z'
+      title: Report providers and surfaces that break the credential rules at startup
+      description: >-
+        At startup and on every configuration reload the gateway logs one warning per
+        credential provider or surface whose stored configuration breaks the https token
+        endpoint or tenant credential isolation rule, with its id, tenant and the rule, so
+        operators can fix them before setting the rules to enforce.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Offer tenant surfaces only their own providers and secrets in the dashboard
+      description: >-
+        The Surface Builder and the credential provider editor list only the credential
+        providers and secrets of the surface's or provider's own tenant, plus the
+        appliance-wide authorization code providers a tenant surface may keep using. A stored
+        choice outside that tenant stays visible: an appliance-wide one is labelled as
+        stopping to work once tenant isolation is enforced, and one of another tenant as
+        already refused by the gateway. The Token Endpoint field shows an inline error for an
+        http URL and points to the bootstrap credential_policy.insecure_token_endpoints list.
+    - timestamp: '2026-11-02T15:30:00Z'
+      title: Add audit detail values and shorter token failure texts for grants
+      description: >-
+        Delegation audit details gain the values insecure_token_endpoint, appliance_wide_credential and the _stale suffix on a grant, and a refused token request, refresh, code exchange or SAML Graph API token request now logs, returns and audits only the OAuth error code, so consumers that parse audit details or token failure texts must accept the new values and the shorter texts.
+  fixed:
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Stop reusing a service token after its provider or a secret it sends changes
+      description: >-
+        Service tokens for client credentials, JWT bearer and private_key_jwt providers are
+        now cached under a key that covers the provider's settings, the sorted scopes and
+        the id, tenant and updated_at of each secret the provider's type sends, read by id.
+        Editing a provider, rotating one of those secrets or moving one to another tenant
+        requests a new token instead of reusing the old one, including on legacy bindings,
+        which reused one token per provider before. A deleted secret the type sends, a
+        secrets store error or an enforced tenant rule stops a cached token at once. A
+        reference left from another type, such as an API key kept after a provider became
+        client credentials, is neither read nor part of the key, so deleting or rotating its
+        secret no longer fails requests or renews the token. Expired service tokens of the same provider are removed from
+        the vault in the same step that stores a new one, which reads the vault once.
+        Upgrade note: each binding and target
+        authentication requests one new token after the upgrade.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Send one token request per credential at a time
+      description: >-
+        Requests that need the same service token, for the same surface, provider, scopes
+        and secret versions, now wait for one token request on each replica and reuse its
+        token from the vault, instead of each sending its own request to the credential
+        provider when the cache is empty or expired.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Back off token requests to a failing credential provider for up to 60 s
+      description: >-
+        After a service token request fails or returns other scopes than requested, the next
+        request for the same surface, provider, scopes and secret versions waits 1 s from the end
+        of the failed request, doubling to 60 s, and callers meanwhile fail at once without contacting the provider. A success
+        clears the wait. Missing secrets, store errors and refused token endpoints never start
+        one, and a secret that cannot be read is now reported as unavailable rather than as a
+        failed token request.
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Keep using a valid service token when its renewal fails
+      description: >-
+        A cached service token is now renewed half its lifetime before it expires, at most
+        5 minutes and at least 60 seconds early, while other requests keep using it. When
+        the renewal fails at the token endpoint or is held back by the retry backoff, the
+        cached token is still injected, marked stale, until 60 seconds before it expires,
+        so a short outage of the credential provider no longer fails proxied requests. A
+        changed provider, a missing secret, a secrets store error or a refused token
+        endpoint never serves the stale token. Legacy delegation audit details gain the
+        value <grant>_stale, for example client_credentials_stale.
+    - timestamp: '2026-11-02T13:10:00Z'
+      title: Keep local token grant failures out of the token backoff
+      description: >-
+        A malformed or missing signing key, a missing token endpoint or client, or another unusable provider setting no longer starts the token retry backoff or serves a cached token as stale; only failures caused by the token endpoint do. The API status and audit text are unchanged.
+    - timestamp: '2026-11-02T13:11:00Z'
+      title: Warn once per token grant about an out-of-tenant secret
+      description: >-
+        In warn mode the out-of-tenant secret warning is now logged once when a token is granted instead of on every cache hit and twice on a fresh grant; the tenant check is one shared predicate.
+    - timestamp: '2026-11-02T13:12:00Z'
+      title: Fail startup on a malformed insecure token endpoint entry
+      description: >-
+        credential_policy.insecure_token_endpoints entries that do not parse, are not http, or carry a user name or password now fail startup with the entry named, instead of being silently ignored.
+    - timestamp: '2026-11-02T13:13:00Z'
+      title: Report every provider secret that sits outside the provider tenant
+      description: >-
+        The credential policy report now flags a tenant provider holding another tenant's secret and an appliance-wide provider holding a tenant secret, not only a tenant provider holding an appliance-wide secret. It counts every secret reference a provider stores, including one its type does not send.
+    - timestamp: '2026-11-02T13:14:00Z'
+      title: Report surfaces the credential policy check could not inspect
+      description: >-
+        A surface whose references cannot be collected now logs a warning naming its id, tenant and error, and the clean line says how many surfaces could not be inspected instead of claiming nothing breaks a rule.
+    - timestamp: '2026-11-02T13:15:00Z'
+      title: Tell a refused agent card fetch the real wait
+      description: >-
+        The agent card preview limit is a burst of 10 then one fetch every 6 seconds; a 429 now carries a Retry-After of 1 to 6 seconds instead of a fixed 60, and the docs and dashboard toast say so.
+    - timestamp: '2026-11-02T13:16:00Z'
+      title: Warn instead of erroring on an http token endpoint in the dashboard
+      description: >-
+        The credential provider editor now shows a warning, not an invalid-field error, for an http token endpoint, explaining that new or changed ones need an exact entry in credential_policy.insecure_token_endpoints and that an unchanged stored one is still accepted in warn mode.
+    - timestamp: '2026-11-02T13:20:00Z'
+      title: Report a preview target that does not resolve as unreachable
+      description: >-
+        An agent card preview of a host that does not resolve now reports unreachable (502) instead of blocked_by_egress (403), as the served card route does when it fetches without Target authentication. A served card fetched with Target authentication and the proxy forward still answer 403 blocked by egress for such a host. The event hook and mediator directory reasons, JWKS fetch errors and x402 facilitator construction errors now name a failed host lookup as such.
+    - timestamp: '2026-11-02T15:20:00Z'
+      title: Read credential provider secrets by id instead of listing the secrets store
+      description: >-
+        A service token grant and an API key read now look up each secret they send by its secret id instead of listing the secrets store. The filesystem store reads every secret file only to rebuild its id index when asked for an id it does not know, such as a deleted secret or one another replica wrote. The tenant check, its warning and the errors are unchanged.
+    - timestamp: '2026-11-02T15:22:00Z'
+      title: Keep a service token request's slot while a caller holds it
+      description: >-
+        The per-key single-flight and retry backoff slots are released only when no caller holds them and no failure is remembered. With many keys in use, a second request for the same key therefore waits for the one in flight instead of sending its own. A failure count is forgotten ten minutes after its retry time.
+  removed: []
+  security:
+    - timestamp: '2026-10-30T23:00:04Z'
+      title: Refuse tenant card previews that would use appliance-wide credentials
+      description: >-
+        A tenant token that reads the agent card preview of an appliance-wide surface gets
+        unsupported_reason operator_only with nothing fetched, and its refresh is 403,
+        because the fetch would use the appliance's Target credential. Another tenant's
+        surface is 404 to both.
+    - timestamp: '2026-10-30T20:30:00Z'
+      title: Pin credential provider token requests to the vetted address
+      description: >-
+        Client Credentials, JWT Bearer and private_key_jwt grants, refreshes and authorization-code exchanges, including the 2026-07-28 consent exchange, now connect only to the address the token endpoint resolved to when it was checked, closing a DNS-rebinding gap when no HTTP proxy is configured (with HTTPS_PROXY, HTTP_PROXY or ALL_PROXY set, the proxy resolves the host itself). Redirects stay off, and a token endpoint resolving to loopback, an unspecified address or cloud metadata is refused before any request and reported as refused by egress policy.
+    - timestamp: '2026-10-30T21:30:00Z'
+      title: Warn about http token endpoints unless credential_policy enforces https
+      description: >-
+        A credential provider whose stored token endpoint is plain http keeps working while
+        credential_policy token_endpoint_https is warn, the default, but every use logs a warning and legacy delegation audit details gain
+        insecure_token_endpoint. Setting credential_policy token_endpoint_https to enforce
+        refuses such providers before any secret is read, including cached service tokens.
+        Upgrade note: move token endpoints to https, or list a deliberate internal http
+        endpoint in insecure_token_endpoints, before setting enforce.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Warn when tenants use appliance-wide credentials unless isolation is enforced
+      description: >-
+        A credential provider that reads a secret outside its own tenant keeps working while
+        credential_policy tenant_credential_isolation is warn, the default, but each token
+        request or API key read that uses the secret logs a warning. Setting it to enforce
+        refuses the secret before its value is used, so no token request is sent. A tenant surface that sends an appliance-wide
+        secret or credential provider on its Target, Transit Point, Fabric receive or
+        delegation legs also logs a warning and notes appliance_wide_credential in the
+        delegation audit, and enforce refuses it; another tenant's secret or provider is
+        always refused. Upgrade note: move the secrets and providers into the tenant before
+        setting enforce.
+    - timestamp: '2026-11-02T07:05:47Z'
+      title: Log only the OAuth error code from credential provider token endpoints
+      description: >-
+        A refused token request, refresh, code exchange or SAML Graph API token request now
+        logs, returns and audits only the OAuth error code of the response, or
+        unrecognized_error when the code is missing, longer than 64 bytes or outside the
+        RFC 6749 character set. error_description, error_uri and the rest of the body, which a
+        provider can fill with echoed request values, no longer reach logs, error text or
+        delegation audit details. The authorization callback logs the provider's error code
+        the same way and no longer logs its description.
+    - timestamp: '2026-11-02T13:21:00Z'
+      title: Hold custom metadata secrets to the tenant of the surface that sends them
+      description: >-
+        On a tenant surface, a $SECRET: reference in the Target's custom metadata, in either response custom metadata or in the shared Transit Point custom metadata resolves only a secret of the surface's own tenant, or an appliance-wide one in warn mode. Another tenant's secret and a new appliance-wide secret are refused on save with 400, and so is a reference to a secret that does not exist, whether new or already stored. A reassignment that would create such a reference answers 409, and the request path refuses them at runtime. A stored appliance-wide reference is kept only in warn mode and only on the destination that already sent it: the endpoint of its Target or Transit Point for request metadata and Target authentication, and the caller for response metadata, so moving a secret into response metadata is refused. Only enabled metadata counts as sent. A surface with no tenant is unchanged.
+    - timestamp: '2026-11-02T15:10:00Z'
+      title: Refuse appliance-wide secrets in a tenant's MCP tool discovery
+      description: >-
+        POST /v1/mcp-proxies/discover-tools with a tenant token may now use only that tenant's own static secret. Before, it could load an appliance-wide secret and send its value to an endpoint the caller chose. Such a request is refused with 400 'Target auth secret is not accessible' whatever tenant_credential_isolation says, because discovery stores nothing that the stricter rule would break. Operator sessions and appliance-wide tokens are unchanged.
+    - timestamp: '2026-11-02T15:11:00Z'
+      title: Hold a tenant A2A Proxy's Direct Line secret to the proxy's tenant
+      description: >-
+        Saving a tenant A2A Proxy that names another tenant's secret, or a new appliance-wide one, is refused with 400 'A2A proxy secret is not accessible'. Before, a tenant could send the appliance's Direct Line secret to a base URL it picked. An update that keeps the stored appliance-wide secret and base URL is saved with a warning in warn mode and refused in enforce mode, where a request through such a proxy also fails as target unavailable before the secret's value is used. A tenant reassignment that would give a tenant A2A Proxy an appliance-wide Direct Line secret answers 409, whether the proxy moves into a tenant or its secret becomes appliance-wide. An operator's appliance-wide A2A Proxy stays usable by tenant surfaces as a shared bot.
+    - timestamp: '2026-11-02T15:12:00Z'
+      title: Refuse a tenant provider holding an outside secret on a new surface leg
+      description: >-
+        A tenant credential provider that sends the gateway's own credential and still holds a secret outside its tenant now follows the appliance-wide provider rule on a tenant surface. In warn mode it is kept only on the legs that already sent it at the same endpoint; on a new or redirected Target, Transit Point or outbound_credentials leg it is refused with 400; in enforce mode it is refused everywhere. This stops a token minted with the appliance's OAuth client from reaching an endpoint the tenant chose. Changing a provider's default_scopes now drops its kept secret references, and the startup credential policy report names surfaces that bind such a provider.
+  breaking:
+    - timestamp: '2026-10-30T21:30:00Z'
+      title: Refuse new http token endpoints when saving a credential provider
+      description: >-
+        Creating a credential provider, changing its token endpoint, or turning an API key
+        provider into an OAuth type now answers 400 "token_endpoint must be an https URL"
+        unless the endpoint is https or listed exactly in credential_policy
+        insecure_token_endpoints, and the Validate check refuses such an endpoint without
+        contacting it. Saving a stored provider that keeps its http endpoint still works
+        while credential_policy token_endpoint_https is warn. Upgrade note: provisioning that creates or changes a provider with an internal http:// token endpoint now gets 400; use https, or list the exact URL in credential_policy.insecure_token_endpoints.
+    - timestamp: '2026-10-30T22:00:00Z'
+      title: Refuse new credential provider references to another tenant's secrets
+      description: >-
+        Creating a credential provider, or changing a secret reference, now answers 400
+        "Secret reference is not accessible" unless the secret belongs to the provider's own
+        tenant; an appliance-wide secret no longer counts for a tenant provider. Validate
+        applies the same rule to a signing key or certificate. While credential_policy
+        tenant_credential_isolation is warn, a stored reference is kept only in the field that
+        holds it and while the provider's type, token and authorization endpoints, resource,
+        additional parameters, default scopes and JWT issuer, subject and audience are
+        unchanged, so a tenant cannot redirect an appliance-wide secret or signing key to its
+        own endpoint. A provider with an issuer never keeps a secret outside its own tenant,
+        even in warn mode. Upgrade note: provisioning that gives a tenant provider an appliance-wide or another tenant's secret now gets 400; create the secret in the tenant first.
+    - timestamp: '2026-10-30T22:30:00Z'
+      title: Refuse new appliance-wide credentials on tenant surfaces when saving
+      description: >-
+        Saving a tenant surface that newly names an appliance-wide secret for static secret
+        Target authentication, or an appliance-wide API key, client credentials or JWT
+        bearer provider, is refused with 400, and a tenant reassignment that would create
+        such a reference answers 409. While credential_policy tenant_credential_isolation is
+        warn, a stored appliance-wide reference is kept only at the destination that already
+        received it: the endpoint of its Target or Transit Point, or the caller for response
+        metadata. A reference to a secret that does not exist is refused even when stored, and
+        a tenant provider that holds a secret outside its tenant is refused on a new or
+        redirected leg. Upgrade note: provisioning that names an appliance-wide secret or provider on a tenant surface, or adds a tenant provider holding an outside secret to a new leg, now gets 400, and a tenant reassignment that would create such a reference gets 409; move the credential into the tenant first.
+    - timestamp: '2026-11-02T13:21:00Z'
+      title: Refuse every save of a tenant surface that names a missing secret
+      description: >-
+        A tenant surface whose stored custom metadata names a $SECRET: with no existing secret
+        now answers 400 "Secret reference is not accessible" on every save, in warn mode too,
+        even when the edit leaves the metadata alone. Upgrade note: delete or fix the
+        reference, or create the secret in the surface's tenant, before saving such a surface.
+    - timestamp: '2026-11-02T15:11:00Z'
+      title: Refuse tenant A2A Proxies whose Direct Line secret is outside their tenant
+      description: >-
+        Creating a tenant A2A Proxy, or changing its secret or base URL, with an appliance-wide
+        or another tenant's Direct Line secret now answers 400 "A2A proxy secret is not
+        accessible", in warn mode too. Upgrade note: create the Direct Line secret in the
+        proxy's tenant, or publish the proxy appliance-wide as an operator.
+    - timestamp: '2026-11-02T15:10:00Z'
+      title: Refuse appliance-wide secrets in a tenant token's MCP tool discovery
+      description: >-
+        POST /v1/mcp-proxies/discover-tools with a tenant token and an appliance-wide secret
+        now answers 400 "Target auth secret is not accessible", whatever
+        tenant_credential_isolation says. Upgrade note: run discovery with a secret of the
+        token's own tenant, or with an operator session or appliance-wide token.

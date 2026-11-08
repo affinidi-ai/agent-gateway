@@ -5,18 +5,21 @@ import AuditFieldList from './AuditFieldList';
 import AuditJourney from './AuditJourney';
 import AuditProvenance from './AuditProvenance';
 import AuditTrustChain from './AuditTrustChain';
-import { extractEmbeddedDecisions, policyDecision, trustCheck } from './auditHelpers';
+import { extractEmbeddedDecisions, policyChange, policyDecision, trustCheck } from './auditHelpers';
 import { signedVpEntry, traceSiblings } from './evidence';
 import { fieldGroups } from './fieldGroups';
 import { buildJourney } from './journey';
 import { buildTrustChain } from './trustChain';
 import { useDidNames } from './useDidNames';
+import type { UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
 
 interface AuditEvidencePaneProps {
   entry: AuditEntry;
   filteredEntries: AuditEntry[];
   onQuickFilter: (term: string, cat?: string) => void;
+  /** Names the users policy changes were made by. */
+  userName?: UserNameResolver;
 }
 
 /**
@@ -30,10 +33,22 @@ const AuditEvidencePane: React.FC<AuditEvidencePaneProps> = ({
   entry,
   filteredEntries,
   onQuickFilter,
+  userName,
 }) => {
   const resolveName = useDidNames();
   const pd = policyDecision(entry);
   const tc = trustCheck(entry);
+
+  if (policyChange(entry)) {
+    return (
+      <div className="audit-evidence" data-testid="audit-evidence">
+        <section className="audit-evidence-block">
+          <div className="audit-evidence-label">Details</div>
+          <AuditFieldList groups={fieldGroups(entry, null, null, userName)} />
+        </section>
+      </div>
+    );
+  }
 
   const siblings = traceSiblings(filteredEntries, entry);
   const journey = buildJourney(siblings);

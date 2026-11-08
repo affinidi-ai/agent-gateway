@@ -2,6 +2,7 @@ use crate::auth::session::{SessionManager, TermsSessionGate};
 use crate::auth::session_cookie;
 use crate::auth::storage::PasskeyStorage;
 use crate::auth::types::UserStatus;
+use crate::observability::loggable;
 use axum::{
     Extension, Json,
     extract::{Request, State},
@@ -72,18 +73,18 @@ fn is_public_path(path: &str) -> bool {
 }
 
 /// Extract session token from the request's Authorization header or cookies.
-/// Priority: Authorization Bearer header > `session_token` cookie.
+/// Priority: Authorization Bearer header > `__Host-session_token` cookie.
 fn extract_session_token(request: &Request) -> Option<String> {
     extract_session_token_from_headers(request.headers())
 }
 
 /// Public helper: extract session token from request headers only.
-/// Priority: Authorization Bearer header > `session_token` cookie.
+/// Priority: Authorization Bearer header > `__Host-session_token` cookie.
 ///
 /// Tokens are deliberately never read from the URL query string: a token in the
 /// URL leaks into access logs, `Referer` headers, browser history, and proxy
 /// caches. Callers must supply the token via the `Authorization` header or the
-/// HttpOnly `session_token` cookie.
+/// HttpOnly `__Host-session_token` cookie.
 pub fn extract_session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     // 1. Try Authorization header first (preferred — avoids token leaking into logs/URLs)
     if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION)
@@ -96,22 +97,8 @@ pub fn extract_session_token_from_headers(headers: &axum::http::HeaderMap) -> Op
         }
     }
 
-    // 2. Fall back to cookie (SAML mode sets HttpOnly session_token cookie)
-    if let Some(cookie_header) = headers.get(axum::http::header::COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        for cookie in cookie_str.split(';') {
-            let parts: Vec<&str> = cookie
-                .trim()
-                .splitn(2, '=')
-                .collect();
-            if parts.len() == 2 && parts[0] == "session_token" && !parts[1].is_empty() {
-                return Some(parts[1].to_string());
-            }
-        }
-    }
-
-    None
+    // 2. Fall back to cookie (SAML mode sets HttpOnly __Host-session_token cookie)
+    session_cookie::session_cookie_value(headers).map(str::to_string)
 }
 
 /// Combined state required by the global session-auth middleware.
@@ -189,12 +176,12 @@ fn terms_required_response() -> Response {
 /// Global middleware that requires a valid session for all non-public API routes.
 /// Public paths (auth flows, health, DIDComm, onboarding, etc.) are exempt.
 /// Must be applied via `axum::middleware::from_fn_with_state(AuthGuardState, require_session_auth)`.
-#[allow(clippy::result_large_err)] // FIXME: Response is not an error
+/// A refusal is a response like any other, so it is returned, not raised.
 pub async fn require_session_auth(
     State(state): State<AuthGuardState>,
     request: Request,
     next: Next,
-) -> Result<Response, Response> {
+) -> Response {
     let path = request
         .uri()
         .path()
@@ -204,14 +191,14 @@ pub async fn require_session_auth(
 
     if is_public_path(&path) {
         debug!("require_session_auth: public path {}, skipping auth", path);
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     let session_token = match supplied_session_token {
         Some(token) => token,
         None => {
             warn!("require_session_auth: no session_token for protected path {}", path);
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
     };
 
@@ -225,43 +212,54 @@ pub async fn require_session_auth(
             && !user_is_approved(storage, &user_id).await
         {
             warn!("require_session_auth: session valid but user_id={} is not Approved — rejecting {}", user_id, path);
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        if session.terms_gate == TermsSessionGate::ConsentPending && !CONSENT_PENDING_PATHS.contains(&path.as_str()) {
-            let status = state
-                .terms_manager
-                .status(&user_id, crate::terms::AcceptanceContext::Login)
-                .await
-                .map_err(IntoResponse::into_response)?;
-            if status.consent_required {
-                return Err(terms_required_response());
+        // Everything from here runs as the user, with a request id of its
+        // own, so a refusal below is recorded with the id its route's
+        // refusals carry.
+        let actor = crate::audit::events::Actor::user(user_id.clone());
+        return crate::audit::context::in_management_request(actor.clone(), async move {
+            if session.terms_gate == TermsSessionGate::ConsentPending && !CONSENT_PENDING_PATHS.contains(&path.as_str())
+            {
+                let status = match state
+                    .terms_manager
+                    .status(&user_id, crate::terms::AcceptanceContext::Login)
+                    .await
+                {
+                    Ok(status) => status,
+                    Err(error) => return error.into_response(),
+                };
+                if status.consent_required {
+                    return record_refusal(&request, &actor, terms_required_response());
+                }
             }
-        }
 
-        let mut request = request;
-        request
-            .extensions_mut()
-            .insert(AuthGuardOk(user_id));
-        if let Some(storage) = state.user_storage.clone() {
+            let mut request = request;
             request
                 .extensions_mut()
-                .insert(storage);
-        }
-        let mut response = next.run(request).await;
-        if let Ok(value) = session_cookie::build_session_cookie(
-            &session_token,
-            state
-                .session_manager
-                .timeout_seconds(),
-        )
-        .parse()
-        {
+                .insert(AuthGuardOk(user_id));
+            if let Some(storage) = state.user_storage.clone() {
+                request
+                    .extensions_mut()
+                    .insert(storage);
+            }
+            let mut response = next.run(request).await;
+            if let Ok(value) = session_cookie::build_session_cookie(
+                &session_token,
+                state
+                    .session_manager
+                    .timeout_seconds(),
+            )
+            .parse()
+            {
+                response
+                    .headers_mut()
+                    .append(SET_COOKIE, value);
+            }
             response
-                .headers_mut()
-                .append(SET_COOKIE, value);
-        }
-        return Ok(response);
+        })
+        .await;
     }
 
     if let Some(authenticator) = state
@@ -278,157 +276,197 @@ pub async fn require_session_auth(
                 "require_session_auth: access token valid but bound user_id={} is not Approved — rejecting {}",
                 principal.user_id, path
             );
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return StatusCode::UNAUTHORIZED.into_response();
         }
 
-        let status = state
-            .terms_manager
-            .status(&principal.user_id, crate::terms::AcceptanceContext::Login)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        if status.consent_required {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "code": "TERMS_ACCEPTANCE_REQUIRED",
-                    "message": "Sign in to Agent Gateway as this access token's owner, accept the required Terms and Conditions, then retry."
-                })),
-            ).into_response());
-        }
-
-        let resource_scoped = principal
-            .resource_scope
-            .is_some();
-        let scope_evaluation = match principal
-            .resource_scope
-            .as_ref()
-        {
-            Some(scope) if !TOKEN_SELF_INSPECTION_PATHS.contains(&path.as_str()) => {
-                match scope.evaluate(request.headers()) {
-                    Ok(scope) => scope,
-                    Err(rejection) => {
-                        warn!(
-                            token_id = %principal.token_id,
-                            path = %path,
-                            reason = %rejection.message(),
-                            "Access-token resource scope rejected request"
-                        );
-                        return Err(StatusCode::FORBIDDEN.into_response());
-                    }
-                }
-            }
-            _ => crate::auth_manager::resource_scope::ScopeEvaluation { pattern: None, tenant_id: None },
-        };
-
-        // Fail closed for an already-issued broad (multi-valued) tenant selector
-        // unless a trusted, edge-authenticated proxy owns the header. A broad
-        // selector lets the bearer pick the tenant per request; header presence
-        // alone is not trust. An exact selector is always permitted — its
-        // anchored regex admits only one value.
-        if let Some(selector) = principal
-            .resource_scope
-            .as_ref()
-            .and_then(|scope| scope.tenant_selector())
-            && !crate::tenancy::header_derived_tenant_permitted(
-                selector,
-                state
-                    .trusted_tenant_header
-                    .as_deref(),
-            )
-        {
-            warn!(
-                token_id = %principal.token_id,
-                path = %path,
-                header = %selector.header_name,
-                "PAT tenant selector is broad and no trusted edge is configured — failing closed"
-            );
-            return Err(StatusCode::FORBIDDEN.into_response());
-        }
-
-        if let Some(tenant_id) = scope_evaluation
-            .tenant_id
-            .as_deref()
-            && crate::tenancy::validate_tenant_id(tenant_id).is_err()
-        {
-            return Err(StatusCode::FORBIDDEN.into_response());
-        }
-
-        let tenant_context = scope_evaluation
-            .tenant_id
-            .as_ref()
-            .map(|tenant_id| crate::tenancy::PatTenantContext {
-                token_id: principal.token_id.clone(),
-                tenant_id: tenant_id.clone(),
-            });
-
-        if let Some(regex) = scope_evaluation
-            .pattern
-            .as_ref()
-        {
-            use crate::auth_manager::pat::{PathScope, classify_resource_path};
-
-            let is_read = matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-            match classify_resource_path(&path) {
-                PathScope::EnforceId { kind, id }
-                    if !crate::tenancy::scope_allows_resource(
-                        Some(&crate::auth_manager::pat::PatResourceScope(regex.clone())),
-                        tenant_context.as_ref(),
-                        kind,
-                        &id,
-                    ) =>
-                {
-                    return Err(if is_read {
-                        StatusCode::NOT_FOUND.into_response()
-                    } else {
-                        StatusCode::FORBIDDEN.into_response()
-                    });
-                }
-                PathScope::Unscoped if !is_read => return Err(StatusCode::FORBIDDEN.into_response()),
-                PathScope::DenyScoped => {
-                    return Err(if is_read {
-                        StatusCode::NOT_FOUND.into_response()
-                    } else {
-                        StatusCode::FORBIDDEN.into_response()
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let mut request = request;
-        request
-            .extensions_mut()
-            .insert(AuthGuardOk(principal.user_id));
-        request
-            .extensions_mut()
-            .insert(crate::auth_manager::pat::PatContext(principal.scopes));
-        request
-            .extensions_mut()
-            .insert(crate::auth_manager::pat::PatDelegationContext {
-                token_id: principal.token_id,
-                delegation_depth: principal.delegation_depth,
-                resource_scoped,
-            });
-        if let Some(tenant_context) = tenant_context {
-            request
-                .extensions_mut()
-                .insert(tenant_context);
-        }
-        if let Some(regex) = scope_evaluation.pattern {
-            request
-                .extensions_mut()
-                .insert(crate::auth_manager::pat::PatResourceScope(regex));
-        }
-        if let Some(storage) = state.user_storage.clone() {
-            request
-                .extensions_mut()
-                .insert(storage);
-        }
-        return Ok(next.run(request).await);
+        let actor = crate::audit::events::Actor::pat(principal.token_id.clone(), principal.user_id.clone());
+        return crate::audit::context::in_management_request(
+            actor.clone(),
+            access_token_request(&state, principal, actor, request, path, next),
+        )
+        .await;
     }
 
     warn!("require_session_auth: invalid/expired session for {}", path);
-    Err(StatusCode::UNAUTHORIZED.into_response())
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
+/// The rest of [`require_session_auth`] for a request authenticated by an
+/// access token, run as `actor` with a request id of its own. A write this
+/// token may not make is refused here, before any route layer runs, so a
+/// refused policy change is recorded here too, with the request id its
+/// route's refusals carry.
+async fn access_token_request(
+    state: &AuthGuardState,
+    principal: crate::auth_manager::pat::PatPrincipal,
+    actor: crate::audit::events::Actor,
+    request: Request,
+    path: String,
+    next: Next,
+) -> Response {
+    let status = match state
+        .terms_manager
+        .status(&principal.user_id, crate::terms::AcceptanceContext::Login)
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => return error.into_response(),
+    };
+    if status.consent_required {
+        let response = (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "TERMS_ACCEPTANCE_REQUIRED",
+                "message": "Sign in to Agent Gateway as this access token's owner, accept the required Terms and Conditions, then retry."
+            })),
+        )
+            .into_response();
+        return record_refusal(&request, &actor, response);
+    }
+
+    let refused = |status: StatusCode| record_refusal(&request, &actor, status.into_response());
+    let resource_scoped = principal
+        .resource_scope
+        .is_some();
+    let scope_evaluation = match principal
+        .resource_scope
+        .as_ref()
+    {
+        Some(scope) if !TOKEN_SELF_INSPECTION_PATHS.contains(&path.as_str()) => match scope.evaluate(request.headers())
+        {
+            Ok(scope) => scope,
+            Err(rejection) => {
+                warn!(
+                    token_id = %principal.token_id,
+                    path = %path,
+                    reason = %rejection.message(),
+                    "Access-token resource scope rejected request"
+                );
+                return refused(StatusCode::FORBIDDEN);
+            }
+        },
+        _ => crate::auth_manager::resource_scope::ScopeEvaluation { pattern: None, tenant_id: None },
+    };
+
+    // Fail closed for an already-issued broad (multi-valued) tenant selector
+    // unless a trusted, edge-authenticated proxy owns the header. A broad
+    // selector lets the bearer pick the tenant per request; header presence
+    // alone is not trust. An exact selector is always permitted — its
+    // anchored regex admits only one value.
+    if let Some(selector) = principal
+        .resource_scope
+        .as_ref()
+        .and_then(|scope| scope.tenant_selector())
+        && !crate::tenancy::header_derived_tenant_permitted(
+            selector,
+            state
+                .trusted_tenant_header
+                .as_deref(),
+        )
+    {
+        warn!(
+            token_id = %principal.token_id,
+            path = %path,
+            header = %selector.header_name,
+            "PAT tenant selector is broad and no trusted edge is configured — failing closed"
+        );
+        return refused(StatusCode::FORBIDDEN);
+    }
+
+    if let Some(tenant_id) = scope_evaluation
+        .tenant_id
+        .as_deref()
+        && crate::tenancy::validate_tenant_id(tenant_id).is_err()
+    {
+        return refused(StatusCode::FORBIDDEN);
+    }
+
+    let tenant_context = scope_evaluation
+        .tenant_id
+        .as_ref()
+        .map(|tenant_id| crate::tenancy::PatTenantContext {
+            token_id: principal.token_id.clone(),
+            tenant_id: tenant_id.clone(),
+        });
+
+    if let Some(regex) = scope_evaluation
+        .pattern
+        .as_ref()
+    {
+        use crate::auth_manager::pat::{PathScope, classify_resource_path};
+
+        let is_read = matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+        match classify_resource_path(&path) {
+            PathScope::EnforceId { kind, id }
+                if !crate::tenancy::scope_allows_resource(
+                    Some(&crate::auth_manager::pat::PatResourceScope(regex.clone())),
+                    tenant_context.as_ref(),
+                    kind,
+                    &id,
+                ) =>
+            {
+                return if is_read {
+                    StatusCode::NOT_FOUND.into_response()
+                } else {
+                    refused(StatusCode::FORBIDDEN)
+                };
+            }
+            PathScope::Unscoped if !is_read => return refused(StatusCode::FORBIDDEN),
+            PathScope::HandlerEnforcedForTenants if !is_read && tenant_context.is_none() => {
+                return refused(StatusCode::FORBIDDEN);
+            }
+            PathScope::DenyScoped => {
+                return if is_read {
+                    StatusCode::NOT_FOUND.into_response()
+                } else {
+                    refused(StatusCode::FORBIDDEN)
+                };
+            }
+            _ => {}
+        }
+    }
+
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(AuthGuardOk(principal.user_id));
+    request
+        .extensions_mut()
+        .insert(crate::auth_manager::pat::PatContext(principal.scopes));
+    request
+        .extensions_mut()
+        .insert(crate::auth_manager::pat::PatDelegationContext {
+            token_id: principal.token_id,
+            delegation_depth: principal.delegation_depth,
+            resource_scoped,
+        });
+    if let Some(tenant_context) = tenant_context {
+        request
+            .extensions_mut()
+            .insert(tenant_context);
+    }
+    if let Some(regex) = scope_evaluation.pattern {
+        request
+            .extensions_mut()
+            .insert(crate::auth_manager::pat::PatResourceScope(regex));
+    }
+    if let Some(storage) = state.user_storage.clone() {
+        request
+            .extensions_mut()
+            .insert(storage);
+    }
+    next.run(request).await
+}
+
+/// Records `response` as the refusal of `request` when it refuses a policy
+/// change, and returns it unchanged.
+fn record_refusal(
+    request: &Request,
+    actor: &crate::audit::events::Actor,
+    response: Response,
+) -> Response {
+    crate::audit::policy_refusals::record_refused(request, response.status(), actor.clone());
+    response
 }
 
 /// Middleware that extracts user_id from session token and adds it as an Extension.
@@ -451,7 +489,7 @@ pub async fn extract_user_id(
         // Extract session token using the shared helper (header > query param > cookie)
         let session_token = extract_session_token(&request).ok_or(StatusCode::UNAUTHORIZED)?;
 
-        debug!("extract_user_id Validating session token: {}...", &session_token[..session_token.len().min(8)]);
+        debug!("extract_user_id Validating session token: {}", loggable::secret(&session_token));
         let (_username, user_id) = session_manager
             .validate_session(&session_token)
             .await
@@ -649,6 +687,50 @@ impl RbacGuard {
     {
         mr.layer(require_feature(self.storage.clone(), self.rbac_config.clone(), feature))
     }
+
+    /// Whether `user_id` holds `feature` under its role and, for a request
+    /// made with an access token, under the token's scopes. An unknown user,
+    /// a user who is not Approved, or a failed lookup counts as no.
+    pub async fn allows(
+        &self,
+        user_id: &str,
+        pat: Option<&crate::auth_manager::pat::PatContext>,
+        feature: &crate::rbac::Feature,
+    ) -> bool {
+        match self
+            .storage
+            .load_user_by_id(user_id)
+            .await
+        {
+            Ok(Some(user)) => {
+                user.status == UserStatus::Approved
+                    && self
+                        .rbac_config
+                        .has_permission(&user.role, feature)
+                    && pat_scope_allows(pat, feature)
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!(user_id = %user_id, feature = ?feature, error = %e, "RbacGuard::allows: failed to load user");
+                false
+            }
+        }
+    }
+}
+
+/// Whether the caller holds `feature`. A missing guard or caller counts as no.
+pub(crate) async fn caller_allows(
+    guard: Option<&RbacGuard>,
+    user_id: Option<&str>,
+    pat: Option<&crate::auth_manager::pat::PatContext>,
+    feature: &crate::rbac::Feature,
+) -> bool {
+    let (Some(guard), Some(user_id)) = (guard, user_id) else {
+        return false;
+    };
+    guard
+        .allows(user_id, pat, feature)
+        .await
 }
 
 /// Refuses every request to a protected route that was mounted without an RBAC
@@ -973,7 +1055,7 @@ mod tests {
     // Tokens in the URL leak into access logs, Referer headers, browser
     // history, and proxy caches, so the query-string path is not honoured even
     // when the token is otherwise valid. Tokens must arrive via the
-    // Authorization header or the HttpOnly session_token cookie.
+    // Authorization header or the HttpOnly __Host-session_token cookie.
 
     #[tokio::test]
     async fn protected_endpoints_reject_valid_token_in_query_param() {
@@ -1057,7 +1139,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri("/v1/settings")
-            .header(axum::http::header::COOKIE, format!("session_token={token}"))
+            .header(axum::http::header::COOKIE, format!("lb=sticky; __Host-session_token={token}"))
             .body(Body::empty())
             .unwrap();
         let resp = app
@@ -1066,6 +1148,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200, "Cookie-based session should be accepted");
+    }
+
+    #[tokio::test]
+    async fn protected_endpoint_refuses_the_unprefixed_session_cookie() {
+        let sess_mgr = Arc::new(crate::auth::session::SessionManager::new());
+        let token = sess_mgr
+            .create_session("test-user".into(), "user-001".into())
+            .await;
+        let app = test_app(sess_mgr);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/settings")
+            .header(axum::http::header::COOKIE, format!("session_token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "a cookie without the __Host- prefix is not a session");
     }
 
     // ── Session token via Authorization Bearer header should work ──
@@ -1244,6 +1347,310 @@ mod tests {
         assert_eq!(status, 200, "Approved user with valid session must pass");
     }
 
+    #[tokio::test]
+    async fn rbac_guard_allows_only_an_approved_user() {
+        for (status, expected) in
+            [(UserStatus::Approved, true), (UserStatus::New, false), (UserStatus::Disabled, false)]
+        {
+            let (storage, _tmp) = make_storage_with_user(mk_user_data("user-1", "alice", status)).await;
+            let guard = RbacGuard::new(storage, Arc::new(crate::rbac::RbacConfig::default()));
+
+            assert_eq!(
+                guard
+                    .allows("user-1", None, &crate::rbac::Feature::LogsView)
+                    .await,
+                expected
+            );
+        }
+    }
+
+    async fn audit_context_handler() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "actor": crate::audit::context::current_actor(),
+            "request_id": crate::observability::policy_audit::current_request_id(),
+        }))
+    }
+
+    async fn audit_context_of(
+        app: &Router,
+        bearer: &str,
+    ) -> serde_json::Value {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/policy-definitions")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_request_runs_as_its_actor_with_a_request_id_of_its_own() {
+        let sessions = Arc::new(SessionManager::new());
+        let app = Router::new()
+            .route("/v1/policy-definitions", get(audit_context_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions.clone(), None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(TermsTestPat))),
+                require_session_auth,
+            ));
+        let token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+
+        let first = audit_context_of(&app, &token).await;
+        let second = audit_context_of(&app, &token).await;
+        let by_pat = audit_context_of(&app, "terms-test-pat").await;
+
+        assert_eq!(first["actor"], serde_json::json!({"kind": "user", "id": "user-1"}));
+        assert_eq!(by_pat["actor"], serde_json::json!({"kind": "pat", "id": "test-token", "user_id": "user-1"}));
+        let request_id = first["request_id"]
+            .as_str()
+            .expect("a request id");
+        assert_eq!(request_id.len(), 16);
+        assert!(
+            request_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_ne!(first["request_id"], second["request_id"]);
+        assert_ne!(first["request_id"], by_pat["request_id"]);
+    }
+
+    struct ScopedPat;
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for ScopedPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            (token == "scoped-pat").then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "scoped-token".to_string(),
+                delegation_depth: 0,
+                resource_scope: Some(Arc::new(
+                    crate::auth_manager::resource_scope::compile(
+                        Some("TENANT:${x-tenant}:policy-definitions:allowed"),
+                        &[crate::auth_manager::resource_scope::RequiredHeader {
+                            name: "x-tenant".to_string(),
+                            pattern: "tenant-a".to_string(),
+                        }],
+                    )
+                    .unwrap(),
+                )),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_policy_change_outside_an_access_tokens_scope_is_refused_and_recorded() {
+        let app = Router::new()
+            .route("/v1/policy-definitions/{policy_id}", axum::routing::put(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(
+                    Arc::new(SessionManager::new()),
+                    None,
+                    Arc::new(crate::terms::TermsManager::disabled()),
+                )
+                .with_pat_authenticator(Some(Arc::new(ScopedPat))),
+                require_session_auth,
+            ));
+
+        let (response, records) = crate::audit::producer::capture(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(Method::PUT)
+                    .uri("/v1/policy-definitions/deny-pii")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer scoped-pat")
+                    .header("x-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .request_id
+                .is_some(),
+            "joinable with the route layer's refusals"
+        );
+        let refused = &serde_json::to_value(&records[0].event).unwrap()["policy_change_refused"];
+        assert_eq!(refused["action"], "policy_updated");
+        assert_eq!(refused["policy_definition_id"], "deny-pii");
+        assert_eq!(refused["actor"], serde_json::json!({"kind": "pat", "id": "scoped-token", "user_id": "user-1"}));
+        assert_eq!(refused["reason"], "forbidden");
+    }
+
+    /// An access token whose scope names `pattern`, for `tenant` when one is
+    /// given (`x-tenant` must then name it).
+    struct PatternPat {
+        pattern: &'static str,
+        tenant: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for PatternPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            let headers = if self.tenant {
+                vec![crate::auth_manager::resource_scope::RequiredHeader {
+                    name: "x-tenant".to_string(),
+                    pattern: "tenant-a".to_string(),
+                }]
+            } else {
+                Vec::new()
+            };
+            let scope = if self.tenant {
+                crate::auth_manager::resource_scope::compile(Some(self.pattern), &headers).unwrap()
+            } else {
+                crate::auth_manager::resource_scope::CompiledResourceScope::untenanted_for_tests(self.pattern)
+            };
+            (token == "pattern-pat").then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "pattern-token".to_string(),
+                delegation_depth: 0,
+                resource_scope: Some(Arc::new(scope)),
+            })
+        }
+    }
+
+    /// A resource-scoped token without a tenant is no operator: it removes no
+    /// grant by binding, by id or by binding, as before the connect API, and
+    /// may still read. A tenant's token reaches the handler, which enforces
+    /// its tenant and pattern.
+    #[tokio::test]
+    async fn only_a_tenants_scoped_token_reaches_the_removal_of_grants_by_binding() {
+        let app = |pat: PatternPat| {
+            Router::new()
+                .route("/api/v1/delegation-vault/grants", axum::routing::get(ok_handler).delete(ok_handler))
+                .route("/api/v1/delegation-vault/grants/{grant_id}", axum::routing::delete(ok_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    AuthGuardState::new(
+                        Arc::new(SessionManager::new()),
+                        None,
+                        Arc::new(crate::terms::TermsManager::disabled()),
+                    )
+                    .with_pat_authenticator(Some(Arc::new(pat))),
+                    require_session_auth,
+                ))
+        };
+        let send = |app: Router, method: Method, uri: &'static str| async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(axum::http::header::AUTHORIZATION, "Bearer pattern-pat")
+                    .header("x-tenant", "tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        let untenanted = || PatternPat {
+            pattern: "^surface-a$",
+            tenant: false,
+        };
+        let tenanted = || PatternPat {
+            pattern: "TENANT:${x-tenant}:delegation-vault:surface-a",
+            tenant: true,
+        };
+        for uri in ["/api/v1/delegation-vault/grants/grant-1", "/api/v1/delegation-vault/grants?surface_id=surface-a"] {
+            assert_eq!(send(app(untenanted()), Method::DELETE, uri).await, StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(send(app(tenanted()), Method::DELETE, uri).await, StatusCode::OK, "{uri}");
+        }
+        assert_eq!(
+            send(app(untenanted()), Method::GET, "/api/v1/delegation-vault/grants?surface_id=surface-a").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_change_refused_until_the_terms_are_accepted_is_recorded() {
+        use crate::terms::*;
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TermsManager::open(
+                true,
+                "appliance".into(),
+                temp.path().into(),
+                Some(TermsVersion {
+                    terms_type: TermsType::Affinidi,
+                    document_id: AFFINIDI_TERMS_DOCUMENT_ID.into(),
+                    version_id: "1".into(),
+                    version: "1".into(),
+                    title: "Terms".into(),
+                    url: "https://example.com/terms".into(),
+                    requires_reconsent: true,
+                    published_at: chrono::Utc::now(),
+                    published_by: None,
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let sessions = Arc::new(SessionManager::new());
+        let app = Router::new()
+            .route("/v1/policy-definitions/{policy_id}", axum::routing::put(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions.clone(), None, manager)
+                    .with_pat_authenticator(Some(Arc::new(TermsTestPat))),
+                require_session_auth,
+            ));
+        let session = sessions
+            .create_session_with_terms_gate("alice".into(), "user-1".into(), TermsSessionGate::ConsentPending)
+            .await;
+
+        for (bearer, actor) in [
+            (session.as_str(), serde_json::json!({"kind": "user", "id": "user-1"})),
+            ("terms-test-pat", serde_json::json!({"kind": "pat", "id": "test-token", "user_id": "user-1"})),
+        ] {
+            let (response, records) = crate::audit::producer::capture(
+                app.clone().oneshot(
+                    axum::http::Request::builder()
+                        .method(Method::PUT)
+                        .uri("/v1/policy-definitions/deny-pii")
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            )
+            .await;
+
+            assert_eq!(response.unwrap().status(), StatusCode::FORBIDDEN);
+            assert_eq!(records.len(), 1, "{actor}");
+            assert!(
+                records[0]
+                    .request_id
+                    .is_some()
+            );
+            let refused = &serde_json::to_value(&records[0].event).unwrap()["policy_change_refused"];
+            assert_eq!(refused["status"], 403);
+            assert_eq!(refused["actor"], actor);
+        }
+    }
+
     struct TermsTestPat;
 
     #[async_trait::async_trait]
@@ -1275,6 +1682,59 @@ mod tests {
                 AuthGuardState::new(sessions, None, manager).with_pat_authenticator(Some(Arc::new(TermsTestPat))),
                 require_session_auth,
             ))
+    }
+
+    const ACCESS_TOKEN: &str = "agpat_K7xQ2mZp9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4kM9q";
+
+    struct AccessTokenTestPat;
+
+    #[async_trait::async_trait]
+    impl crate::auth_manager::pat::PatAuthenticator for AccessTokenTestPat {
+        async fn authenticate(
+            &self,
+            token: &str,
+        ) -> Option<crate::auth_manager::pat::PatPrincipal> {
+            (token == ACCESS_TOKEN).then(|| crate::auth_manager::pat::PatPrincipal {
+                user_id: "user-1".to_string(),
+                scopes: None,
+                token_id: "agat_test".to_string(),
+                delegation_depth: 0,
+                resource_scope: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_access_token_is_not_looked_up_as_a_session() {
+        let sessions = Arc::new(SessionManager::new());
+        let session_token = sessions
+            .create_session("alice".into(), "user-1".into())
+            .await;
+        let app = Router::new()
+            .route("/v1/settings", get(ok_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthGuardState::new(sessions, None, Arc::new(crate::terms::TermsManager::disabled()))
+                    .with_pat_authenticator(Some(Arc::new(AccessTokenTestPat))),
+                require_session_auth,
+            ));
+        let unknown_access_token = "agpat_Unknown9vR4tY8wB3nL6cF1hJ5dS0gA2eU7iO4kM9q";
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", ACCESS_TOKEN).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", unknown_access_token).await, 401);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", &session_token).await, 200);
+        assert_eq!(get_status_with_bearer(&app, "/v1/settings", "0f2c9d7e-unknown-session-token").await, 401);
+
+        let text = logs.text();
+        assert!(text.contains("Session token 0f2c9d7e... not found"), "{text}");
+        assert_eq!(
+            text.matches("not found")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("require_session_auth: invalid/expired session for /v1/settings"), "{text}");
+        assert!(!text.contains("agpat_"), "{text}");
     }
 
     #[tokio::test]

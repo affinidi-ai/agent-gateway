@@ -28,7 +28,7 @@
 
 use serde_json::Value;
 
-use crate::observability::trust_check_audit::{TrustCheckAuditEvent, record_trust_check};
+use crate::observability::trust_check_audit::{TrustCheckAuditEvent, TrustCheckOrigin, record_trust_check};
 use crate::trust_registry_verification::template::{self, TemplateError};
 use crate::trust_registry_verification::trust_check_element::{TrustCheckElement, TrustCheckLeg, TrustCheckResult};
 use crate::trust_registry_verification::trust_check_executor::{
@@ -133,12 +133,13 @@ pub fn element_needs_missing_tr_metadata(
 /// is parallel to `elements` (same length; `None` slots correspond to
 /// runnable elements). `runnable` is the sublist the caller should send
 /// through the TRQP executor.
-pub fn synthesize_metadata_gate_failures(
-    surface_id: &str,
+pub fn synthesize_metadata_gate_failures<'o>(
+    origin: impl Into<TrustCheckOrigin<'o>>,
     leg: TrustCheckLeg,
     elements: &[TrustCheckElement],
     wrapped_input: &Value,
 ) -> (Vec<Option<TrustCheckResult>>, Vec<TrustCheckElement>) {
+    let origin = origin.into();
     let mut synthesized: Vec<Option<TrustCheckResult>> = Vec::with_capacity(elements.len());
     let mut runnable: Vec<TrustCheckElement> = Vec::new();
     for elem in elements {
@@ -147,7 +148,8 @@ pub fn synthesize_metadata_gate_failures(
                 let msg = build_missing_metadata_message(leg, &fields);
                 let result = synthesize_failure(elem, TRUST_REGISTRY_METADATA_UNAVAILABLE, msg.clone());
                 record_trust_check(TrustCheckAuditEvent {
-                    surface_id,
+                    surface_id: origin.surface_id,
+                    transit_point: origin.transit_point,
                     leg,
                     element_id: elem.id.as_str(),
                     element_name: elem.name.as_deref(),

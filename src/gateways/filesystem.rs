@@ -4,8 +4,17 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::types::{Gateway, GatewayType};
+use super::types::{ExposureMode, Gateway, GatewayRole, GatewayType};
 use crate::storage::filesystem::{StorageBackend, cached_storage};
+
+/// What [`FileSystemGatewayStore::migrate_payment_roles`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentRoleMigration {
+    /// Peers made payment gateways.
+    pub migrated: usize,
+    /// Peers left peers because a surface routes to them over `fabric://`.
+    pub skipped: usize,
+}
 
 /// Filesystem-based implementation of GatewayStore with in-memory cache
 ///
@@ -13,6 +22,11 @@ use crate::storage::filesystem::{StorageBackend, cached_storage};
 /// file operations and caching, eliminating code duplication.
 pub struct FileSystemGatewayStore {
     storage: Box<dyn StorageBackend<Gateway>>,
+    /// Held from reading a gateway before a write until the write's policy
+    /// changes are recorded, so they and the write's stream revocations are
+    /// relative to the record it replaced, and the records of concurrent
+    /// writes come in write order.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl FileSystemGatewayStore {
@@ -22,7 +36,10 @@ impl FileSystemGatewayStore {
         proxy_did: Option<String>,
     ) -> Result<Self> {
         let storage = cached_storage(storage_dir, "gateway").await?;
-        let store = Self { storage };
+        let store = Self {
+            storage,
+            writes: tokio::sync::Mutex::new(()),
+        };
 
         let all_gateways = store.list_all().await?;
         if all_gateways.is_empty() {
@@ -67,6 +84,71 @@ impl FileSystemGatewayStore {
         Ok(migrated)
     }
 
+    /// Makes a payment gateway reaching no local surface of every remote peer
+    /// that an `agent_pay` policy of a surface it may serve names, so those
+    /// surfaces keep charging through it. Like turning a peer into a payment
+    /// gateway through the API, a peer that a surface routes to over `fabric://`
+    /// is left a peer with a warning; the payment gate refuses the surfaces
+    /// charging through it until it is made a payment gateway.
+    pub async fn migrate_payment_roles(
+        &self,
+        surfaces: &[crate::config::agent_surface::AgentSurface],
+    ) -> Result<PaymentRoleMigration> {
+        let mut migration = PaymentRoleMigration::default();
+        for mut gateway in self.list_all().await? {
+            if gateway.gateway_type != GatewayType::Remote || gateway.role != GatewayRole::Peer {
+                continue;
+            }
+            let named = surfaces
+                .iter()
+                .filter(|surface| {
+                    crate::tenancy::can_reference(surface.tenant_id.as_deref(), gateway.tenant_id.as_deref())
+                })
+                .any(|surface| {
+                    surface
+                        .payment_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                });
+            if !named {
+                continue;
+            }
+            let fabric_routes = surfaces
+                .iter()
+                .filter(|surface| {
+                    surface
+                        .fabric_gateway_ids()
+                        .contains(&gateway.id.as_str())
+                })
+                .count();
+            if fabric_routes > 0 {
+                tracing::warn!(
+                    gateway_id = %gateway.id,
+                    gateway_name = %gateway.name,
+                    fabric_routes,
+                    "Not migrating a gateway that takes payments to a payment gateway: {fabric_routes} surface(s) \
+                     route to it over fabric://. The surfaces charging through it answer 503 payment_unavailable \
+                     until those routes point elsewhere and it is turned into a payment gateway (Use as payment \
+                     gateway, which needs the agent_pay_delegation feature flag)"
+                );
+                migration.skipped += 1;
+                continue;
+            }
+            tracing::info!(
+                gateway_id = %gateway.id,
+                exposure_mode = ?gateway.exposure_mode,
+                "Migrating a gateway that takes payments to a payment gateway reaching no local surface"
+            );
+            gateway.role = GatewayRole::Payment;
+            gateway.exposure_mode = Some(ExposureMode::None);
+            gateway
+                .exposed_channels
+                .clear();
+            self.update(&gateway).await?;
+            migration.migrated += 1;
+        }
+        Ok(migration)
+    }
+
     /// Reconcile the in-memory cache with the shared-storage directory, so a
     /// node promoted from standby recompiles gateway OPA from the active
     /// writer's latest gateway records rather than a stale boot snapshot.
@@ -108,6 +190,7 @@ impl FileSystemGatewayStore {
         &self,
         gateway: &Gateway,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self
             .storage
             .get(&gateway.id)
@@ -115,6 +198,15 @@ impl FileSystemGatewayStore {
         self.storage
             .save(gateway)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            Some(gateway),
+        )
+        .await;
+        drop(write);
         self.revoke_change(previous, Some(gateway))
             .await;
         Ok(())
@@ -179,10 +271,20 @@ impl GatewayStore for FileSystemGatewayStore {
         &self,
         id: &str,
     ) -> Result<()> {
+        let write = self.writes.lock().await;
         let previous = self.storage.get(id).await;
         self.storage
             .delete(id)
             .await?;
+        crate::audit::policy_changes::gateway_written(
+            previous
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref),
+            None,
+        )
+        .await;
+        drop(write);
         self.revoke_change(previous, None)
             .await;
         Ok(())
@@ -214,6 +316,286 @@ pub async fn get_local_gateway_id(store: &Arc<dyn GatewayStore>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn surface(
+        tenant_id: Option<&str>,
+        endpoint: &str,
+        payment_gateway_id: &str,
+    ) -> crate::config::agent_surface::AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": format!("{payment_gateway_id}-{endpoint}"),
+            "name": payment_gateway_id,
+            "tenant_id": tenant_id,
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/x", "protocol": "mcp"},
+            "target": {
+                "endpoint": endpoint,
+                "payment_policy": {
+                    "type": "agent_pay",
+                    "payment_gateway_id": payment_gateway_id,
+                    "payment_surface_id": "pay-1",
+                },
+            },
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrate_payment_roles_turns_only_named_remote_peers_into_payment_gateways() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), Some("did:web:self.example".into()))
+            .await
+            .expect("store");
+        let remote = |id: &str, tenant_id: Option<&str>, exposure_mode: ExposureMode| {
+            let mut gateway =
+                Gateway::new(id.into(), String::new(), format!("did:web:{id}.example"), GatewayType::Remote);
+            gateway.id = id.into();
+            gateway.tenant_id = tenant_id.map(str::to_string);
+            gateway.exposure_mode = Some(exposure_mode);
+            gateway
+        };
+        let mut agent_pay = remote("agent-pay", None, ExposureMode::None);
+        agent_pay.exposed_channels = vec!["s1".to_string()];
+        for gateway in [
+            agent_pay,
+            remote("exposed", None, ExposureMode::List),
+            remote("routed", None, ExposureMode::None),
+            remote("tenant-b", Some("b"), ExposureMode::None),
+            remote("routing-peer", None, ExposureMode::None),
+        ] {
+            store
+                .create(&gateway)
+                .await
+                .expect("create");
+        }
+        let self_id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::SelfGateway)
+            .unwrap()
+            .id;
+        let surfaces = [
+            surface(Some("a"), "https://up.example", "agent-pay"),
+            surface(None, "https://up.example", "exposed"),
+            surface(None, "https://up.example", "routed"),
+            surface(None, "fabric://routed/s", "gone"),
+            surface(Some("a"), "https://up.example", "tenant-b"),
+            surface(None, "https://up.example", &self_id),
+        ];
+
+        assert_eq!(
+            store
+                .migrate_payment_roles(&surfaces)
+                .await
+                .unwrap(),
+            PaymentRoleMigration { migrated: 2, skipped: 1 }
+        );
+        let role_of = |id: String| {
+            let store = &store;
+            async move {
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .role
+            }
+        };
+        for id in ["agent-pay", "exposed"] {
+            let migrated = store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(migrated.role, GatewayRole::Payment, "{id}");
+            assert_eq!(migrated.exposure_mode, Some(ExposureMode::None), "{id} reaches no local surface");
+            assert!(
+                migrated
+                    .exposed_channels
+                    .is_empty(),
+                "{id}"
+            );
+        }
+        for (id, why) in [
+            ("routed", "a fabric:// route stays a peer"),
+            ("tenant-b", "another tenant's surface cannot name it"),
+            ("routing-peer", "no surface names it"),
+        ] {
+            assert_eq!(role_of(id.into()).await, GatewayRole::Peer, "{why}");
+        }
+        assert_eq!(role_of(self_id).await, GatewayRole::Peer);
+        assert_eq!(
+            store
+                .migrate_payment_roles(&surfaces)
+                .await
+                .unwrap(),
+            PaymentRoleMigration { migrated: 0, skipped: 1 },
+            "a migrated gateway is not migrated again, and a skipped one is reported every time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_management_request_records_the_gateway_policies_its_writes_attach_and_detach() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::delegation_vault::audit::action_category;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let mut peer = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        store
+            .create(&peer)
+            .await
+            .expect("create");
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+                enabled: true,
+                policy_definition_id: Some("p".to_string()),
+                ..Default::default()
+            });
+            store
+                .update(&peer)
+                .await
+                .expect("update");
+            store
+                .delete(&peer.id)
+                .await
+                .expect("delete");
+        }))
+        .await;
+
+        let categories: Vec<_> = records
+            .iter()
+            .map(|record| action_category(&record.event))
+            .collect();
+        assert_eq!(categories, vec!["policy_attached", "policy_detached"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_one_gateway_record_a_chain_of_changes() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+            .await
+            .expect("store");
+        let (a, b, c) = (with_policy("a"), with_policy("b"), with_policy("c"));
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .create(&a)
+                .await
+                .expect("create");
+            let (first, second) = tokio::join!(store.update(&b), store.update(&c));
+            first.expect("update");
+            second.expect("update");
+        }))
+        .await;
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_writes_to_one_gateway_record_their_changes_in_write_order() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::{capture, capture_spawned};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            FileSystemGatewayStore::new(dir.path().to_path_buf(), None)
+                .await
+                .expect("store"),
+        );
+        let ((), mut records) = capture(in_management_request(Actor::user("u-1"), async {
+            store
+                .create(&with_policy("a"))
+                .await
+                .expect("create");
+        }))
+        .await;
+
+        let write = |policy: &'static str| {
+            let store = store.clone();
+            in_management_request(Actor::user("u-1"), async move {
+                store
+                    .update(&with_policy(policy))
+                    .await
+                    .expect("update");
+            })
+        };
+        records.extend(capture_spawned(vec![write("b"), write("c")]).await);
+
+        assert_recorded_in_write_order(&records);
+    }
+
+    /// Gateway `gw-1` naming the policy definition `id`.
+    fn with_policy(id: &str) -> Gateway {
+        let mut peer = Gateway::new("peer".into(), String::new(), "did:web:peer.example".into(), GatewayType::Remote);
+        peer.id = "gw-1".to_string();
+        peer.opa_policy_config = Some(super::super::types::GatewayOpaPolicyConfig {
+            enabled: true,
+            policy_definition_id: Some(id.to_string()),
+            ..Default::default()
+        });
+        peer
+    }
+
+    /// `records` are those of creating a gateway naming policy `a`, then two
+    /// writes naming `b` and `c` in either order. Each write's records come
+    /// together, in write order, and its detach names the policy the write
+    /// before it attached. Within one write, records are in policy id order.
+    fn assert_recorded_in_write_order(records: &[crate::delegation_vault::audit::DelegationAuditEvent]) {
+        use crate::delegation_vault::audit::action_category;
+        use std::collections::BTreeSet;
+
+        let changes: Vec<(&str, String)> = records
+            .iter()
+            .map(|record| {
+                let category = action_category(&record.event);
+                let id = serde_json::to_value(&record.event).unwrap()[category]["policy_definition_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                (category, id)
+            })
+            .collect();
+        assert_eq!(changes.len(), 5, "{changes:?}");
+        assert_eq!(changes[0], ("policy_attached", "a".to_string()));
+        let write = |range: std::ops::Range<usize>| -> BTreeSet<(&str, String)> {
+            changes[range]
+                .iter()
+                .cloned()
+                .collect()
+        };
+        let second = write(1..3)
+            .into_iter()
+            .find(|(category, _)| *category == "policy_attached")
+            .map(|(_, id)| id)
+            .expect("the second write attaches a policy");
+        let third = if second == "b" {
+            "c"
+        } else {
+            "b"
+        };
+        assert_eq!(
+            write(1..3),
+            BTreeSet::from([("policy_detached", "a".to_string()), ("policy_attached", second.clone())]),
+            "{changes:?}"
+        );
+        assert_eq!(
+            write(3..5),
+            BTreeSet::from([("policy_detached", second), ("policy_attached", third.to_string())]),
+            "{changes:?}"
+        );
+    }
 
     #[tokio::test]
     async fn filesystem_store_get_by_did_returns_issuer_did() {

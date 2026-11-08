@@ -40,46 +40,6 @@ pub fn build_target_url(
     }
 }
 
-/// Read an agent card's primary endpoint URL, tolerating **either** protocol era.
-///
-/// A2A v1.0 removed the top-level `url` field and collapsed the transports into an
-/// ordered `supportedInterfaces[]` whose **first entry is the preferred one**, so a
-/// pure-1.0 card has no `url` at all. This prefers the 1.0 shape and falls back to
-/// the v0.3 fields, which keeps readers working across both eras rather than
-/// silently seeing nothing for a 1.0 upstream.
-///
-/// Both key spellings are accepted because cards transcoded from the protobuf
-/// definition use snake_case while the JSON spec uses camelCase.
-pub fn primary_endpoint_url(agent_card: &serde_json::Value) -> Option<&str> {
-    // A2A v1.0 — first interface wins (order encodes preference).
-    for key in ["supportedInterfaces", "supported_interfaces"] {
-        if let Some(url) = agent_card
-            .get(key)
-            .and_then(|i| i.as_array())
-            .and_then(|i| i.first())
-            .and_then(|iface| iface.get("url"))
-            .and_then(|u| u.as_str())
-        {
-            return Some(url);
-        }
-    }
-    // A2A v0.3 fallbacks.
-    for key in ["url", "endpoint"] {
-        if let Some(url) = agent_card
-            .get(key)
-            .and_then(|u| u.as_str())
-        {
-            return Some(url);
-        }
-    }
-    agent_card
-        .get("endpoints")
-        .and_then(|e| e.as_array())
-        .and_then(|e| e.first())
-        .and_then(|ep| ep.get("url"))
-        .and_then(|u| u.as_str())
-}
-
 /// Rewrite URLs in an agent card to point to the proxy endpoint
 fn rewrite_urls_in_agent_card(
     agent_card: &mut serde_json::Value,
@@ -128,7 +88,6 @@ fn rewrite_urls_in_agent_card(
         }
     }
 
-    // (see `primary_endpoint_url` for the read-side counterpart of these fields)
     // Interface arrays that carry endpoint URLs:
     //   - A2A v1.0: `supportedInterfaces[].url` (AgentCard.supportedInterfaces →
     //     AgentInterface.url)
@@ -292,7 +251,7 @@ fn build_proxy_endpoint(
 /// the same precedence used at route registration in `surface_manager`:
 /// TP `listen_address` → channel-wide `transit.outbound_listen_address` →
 /// access point `listen_address`. Path is the TP's `listen_path` when set,
-/// otherwise the derived `/outgoing<route>/<alias>` route.
+/// otherwise the derived `/outbound<route>/<alias>` route.
 pub(crate) fn build_transit_point_proxy_endpoint(
     surface: &crate::config::agent_surface::AgentSurface,
     tp: &crate::config::agent_surface::TransitPoint,
@@ -321,7 +280,8 @@ pub(crate) fn build_transit_point_proxy_endpoint(
         Some(p) => p,
         None => {
             derived_path = format!(
-                "/outgoing{}/{}",
+                "{}{}/{}",
+                crate::proxy::outbound_handler::TP_OUTBOUND_PATH_PREFIX,
                 surface
                     .access_point
                     .route
@@ -608,7 +568,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROXY_URL: &str = "https://gw.internal:9000/outgoing/channels/order/partner-a";
+    const PROXY_URL: &str = "https://gw.internal:9000/outbound/channels/order/partner-a";
 
     // ── rewrite_urls_in_agent_card ───────────────────────────────────────
 
@@ -652,42 +612,6 @@ mod tests {
         let result = rewrite_urls_in_agent_card(&mut card, PROXY_URL, "test");
         assert!(result);
         assert_eq!(card["supportedInterfaces"][0]["url"], PROXY_URL);
-    }
-
-    #[test]
-    fn primary_endpoint_reads_either_era() {
-        // Pure v1.0 card: no top-level `url` at all — the first interface wins.
-        let v1 = json!({
-            "protocolVersion": "1.0",
-            "supportedInterfaces": [
-                { "url": "https://agent.example.com/a2a",  "protocolBinding": "JSONRPC" },
-                { "url": "https://agent.example.com/grpc", "protocolBinding": "GRPC" }
-            ]
-        });
-        assert_eq!(primary_endpoint_url(&v1), Some("https://agent.example.com/a2a"));
-
-        // Pure v0.3 card.
-        let v0_3 = json!({ "protocolVersion": "0.3", "url": "https://legacy.example.com/a2a" });
-        assert_eq!(primary_endpoint_url(&v0_3), Some("https://legacy.example.com/a2a"));
-
-        // Dual-emitted card: the 1.0 shape is preferred over the legacy field.
-        let dual = json!({
-            "url": "https://legacy.example.com/a2a",
-            "supportedInterfaces": [{ "url": "https://new.example.com/a2a" }]
-        });
-        assert_eq!(primary_endpoint_url(&dual), Some("https://new.example.com/a2a"));
-
-        // snake_case (protobuf-transcoded) and the other v0.x spellings.
-        let snake = json!({ "supported_interfaces": [{ "url": "https://snake.example.com/a2a" }] });
-        assert_eq!(primary_endpoint_url(&snake), Some("https://snake.example.com/a2a"));
-        let endpoint = json!({ "endpoint": "https://ep.example.com/a2a" });
-        assert_eq!(primary_endpoint_url(&endpoint), Some("https://ep.example.com/a2a"));
-        let endpoints = json!({ "endpoints": [{ "url": "https://eps.example.com/a2a" }] });
-        assert_eq!(primary_endpoint_url(&endpoints), Some("https://eps.example.com/a2a"));
-
-        // Nothing to read.
-        assert_eq!(primary_endpoint_url(&json!({ "name": "no endpoint" })), None);
-        assert_eq!(primary_endpoint_url(&json!({ "supportedInterfaces": [] })), None);
     }
 
     #[test]
@@ -1247,7 +1171,7 @@ mod tests {
 
     /// No TP override → fall through to channel-wide
     /// `transit.outbound_listen_address`; no `listen_path` →
-    /// `/outgoing<route>/<alias>` is derived.
+    /// `/outbound<route>/<alias>`, the route the Transit Point is mounted on, is derived.
     #[test]
     fn tp_proxy_endpoint_falls_back_to_outbound_listen_and_derived_path() {
         let net = make_network_config(json!([
@@ -1274,7 +1198,7 @@ mod tests {
             .points[0];
         assert_eq!(
             build_transit_point_proxy_endpoint(&surface, tp, &net),
-            "https://localhost:9000/outgoing/agents/a2a/buyer/tp-seller"
+            "https://localhost:9000/outbound/agents/a2a/buyer/tp-seller"
         );
     }
 
@@ -1299,7 +1223,7 @@ mod tests {
             .points[0];
         assert_eq!(
             build_transit_point_proxy_endpoint(&surface, tp, &net),
-            "http://localhost:8080/outgoing/agents/a2a/buyer/tp-seller"
+            "http://localhost:8080/outbound/agents/a2a/buyer/tp-seller"
         );
     }
 

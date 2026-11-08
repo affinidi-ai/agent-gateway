@@ -74,6 +74,15 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
             <strong>Consent Granted</strong> (<code>consent_granted</code>): a user completed the
             OAuth consent flow and a delegation token was stored.
           </li>
+          <li>
+            <strong>Policy changes</strong> (<code>policy_created</code>,{' '}
+            <code>policy_updated</code>, <code>policy_deleted</code>, <code>policy_attached</code>,{' '}
+            <code>policy_detached</code>, <code>policy_attachment_changed</code>,{' '}
+            <code>policy_change_refused</code>): who created, changed or deleted a policy
+            definition, added it to or removed it from a surface, gateway or appliance-wide plane,
+            switched it between enforced and monitor-only, or was refused one of these changes. They
+            name the user or access token by id and never hold the Rego itself.
+          </li>
         </ul>
 
         <p className="mb-1 mt-2 fw-semibold">Policy decision markers</p>

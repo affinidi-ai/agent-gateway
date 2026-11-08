@@ -6,6 +6,7 @@ use tracing::info;
 
 use super::types::GatewayConnectionPoint;
 use crate::storage::filesystem::{StorageBackend, cached_storage};
+use crate::storage::id_locks::{IdLockGuard, IdLocks};
 
 /// File system implementation of ConnectionPointStore with in-memory cache
 ///
@@ -15,21 +16,7 @@ pub struct FileSystemConnectionPointStore {
     base_path: PathBuf,
     storage: Box<dyn StorageBackend<GatewayConnectionPoint>>,
     event_hook: std::sync::OnceLock<std::sync::Arc<crate::event_hook::EventHook>>,
-    id_locks: dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-}
-
-struct IdLockGuard<'a> {
-    locks: &'a dashmap::DashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    id: &'a str,
-    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
-impl Drop for IdLockGuard<'_> {
-    fn drop(&mut self) {
-        self.guard.take();
-        self.locks
-            .remove_if(self.id, |_, lock| std::sync::Arc::strong_count(lock) == 1);
-    }
+    id_locks: IdLocks,
 }
 
 impl FileSystemConnectionPointStore {
@@ -47,7 +34,7 @@ impl FileSystemConnectionPointStore {
             base_path,
             storage,
             event_hook: std::sync::OnceLock::new(),
-            id_locks: dashmap::DashMap::new(),
+            id_locks: IdLocks::default(),
         })
     }
 
@@ -55,18 +42,7 @@ impl FileSystemConnectionPointStore {
         &'a self,
         id: &'a str,
     ) -> IdLockGuard<'a> {
-        let mut guard = IdLockGuard {
-            locks: &self.id_locks,
-            id,
-            guard: None,
-        };
-        let lock = self
-            .id_locks
-            .entry(id.to_string())
-            .or_default()
-            .clone();
-        guard.guard = Some(lock.lock_owned().await);
-        guard
+        self.id_locks.lock(id).await
     }
 
     pub fn set_event_hook(
@@ -781,7 +757,7 @@ mod tests {
             base_path: cps,
             storage: Box::new(UnreadableStorage(inner.storage)),
             event_hook: std::sync::OnceLock::new(),
-            id_locks: dashmap::DashMap::new(),
+            id_locks: IdLocks::default(),
         };
         store.set_event_hook(hook_for(url));
 
@@ -899,50 +875,6 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-    }
-
-    #[tokio::test]
-    async fn a_held_lock_on_one_id_does_not_block_another_and_is_released_afterwards() {
-        let dir = TempDir::new().unwrap();
-        let store = FileSystemConnectionPointStore::new(dir.path().join("cps"))
-            .await
-            .unwrap();
-        let held = store.lock_id("a").await;
-        let other = tokio::time::timeout(std::time::Duration::from_secs(2), store.lock_id("b"))
-            .await
-            .expect("an unrelated id is not blocked");
-        assert_eq!(store.id_locks.len(), 2);
-        drop(other);
-        drop(held);
-        assert!(store.id_locks.is_empty(), "idle locks are removed");
-    }
-
-    #[tokio::test]
-    async fn a_lock_future_dropped_while_waiting_leaves_no_entry() {
-        let dir = TempDir::new().unwrap();
-        let store = std::sync::Arc::new(
-            FileSystemConnectionPointStore::new(dir.path().join("cps"))
-                .await
-                .unwrap(),
-        );
-        let held = store.lock_id("a").await;
-
-        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(50), store.lock_id("a")).await;
-        assert!(timed_out.is_err());
-
-        let waiter = {
-            let store = store.clone();
-            tokio::spawn(async move {
-                let _guard = store.lock_id("a").await;
-            })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        waiter.abort();
-        let _ = waiter.await;
-
-        assert_eq!(store.id_locks.len(), 1, "the entry still held is kept");
-        drop(held);
-        assert!(store.id_locks.is_empty());
     }
 
     #[tokio::test]

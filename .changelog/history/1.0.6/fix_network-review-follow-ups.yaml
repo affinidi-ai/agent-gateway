@@ -1,0 +1,78 @@
+branch: fix/network-review-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-03T20:40:00Z'
+      title: Warn when a listener's external URL has no host that parses
+      description: >-
+        An external URL that does not parse, such as one with an out-of-range port, quietly
+        stopped its listener sharing the outbound proxy with another listener of the same host.
+        Startup now logs one warning for each such URL, naming the listener's id and the URL's
+        position in its list, never the URL, so a credential in it stays out of the log.
+  removed: []
+  security:
+    - timestamp: '2026-11-03T20:30:00Z'
+      title: Stop Transit Points passing a caller's client address, host and path headers
+      description: >-
+        A Transit Point dropped a caller's Forwarded, X-Real-IP and X-Forwarded headers but passed
+        the other headers proxies and CDNs use to claim the client's address, host, path or scheme,
+        such as True-Client-IP, CF-Connecting-IP, X-Client-IP, WL-Proxy-Client-IP,
+        X-Envoy-External-Address, X-Original-Host and X-Original-URL, so a target that trusts the gateway as its proxy could still take the caller's claim. It
+        now drops those too, in any letter case and with underscores for dashes, and the docs
+        list every header.
+    - timestamp: '2026-11-03T20:35:00Z'
+      title: Bound and escape the caller's path on the log lines of a matched route
+      description: >-
+        A request to a served route, before any caller authentication, logged its whole path at
+        INFO when the route matched, and again on the route matching and rewriting lines and when
+        the surface's handler took it, so a long or crafted path could flood the log or show a
+        capability id in full. Those lines now carry the path, its tail and its alias escaped,
+        cut to 256 characters and with capability ids shortened, like the unknown path line, and
+        three lines that only repeated others are gone. The onboarding handler's line does the
+        same.
+    - timestamp: '2026-11-03T22:10:00Z'
+      title: Escape the provider id on the OAuth consent callback's log lines
+      description: >-
+        The OAuth consent callback, which needs no authentication, logged the provider id from its
+        path as-is on every line, so a caller could put a line break in it and forge log lines. It
+        is now escaped and cut to 256 characters.
+    - timestamp: '2026-11-05T09:15:00Z'
+      title: Refuse an OAuth consent callback whose path names another provider
+      description: >-
+        The OAuth consent callback took the provider id from its path for its audit event and to
+        wake the tool calls waiting on the consent, though the state it carries names the
+        provider. A valid code and state replayed to another provider's callback path stored the
+        right token but recorded the wrong provider and woke no waiting call. Such a callback is
+        now refused before the code exchange, without using up its state.
+    - timestamp: '2026-11-04T09:00:00Z'
+      title: Forward a caller's JWT to the Target only after it verified
+      description: >-
+        With forward_header on a JWT bearer Access Point, a token that failed verification, such
+        as an expired one or one from another issuer, was still sent on to the Target whenever
+        policy let the failed caller through. The token now reaches the Target only when it passed
+        verification, and a public discovery read, which verifies no caller, forwards none. A
+        Target that checks tokens itself no longer gets one the method's strategy rejects: make
+        the strategy and audiences accept the tokens it needs, or give the Target its credential
+        through target authentication instead.
+    - timestamp: '2026-11-05T09:20:00Z'
+      title: Refuse a JWT bearer caller that sends more than one bearer token
+      description: >-
+        JWT bearer verification read only the first value of the token header, while
+        forward_header sent every value on, so a second token could ride along with a valid one.
+        A request whose token header carries more than one value in the method's scheme now fails
+        verification, on an Access Point, a Transit Point and over Fabric, with or without
+        forward_header: a closed or reject surface answers 401, and policy sees a failed caller
+        otherwise. A value in another scheme, such as an MPP Payment credential beside the Bearer
+        token, does not count.
+    - timestamp: '2026-11-04T09:30:00Z'
+      title: Check a tenant connection's audience owner on every STS grant
+      description: >-
+        A tenant's STS connection was checked against the tenant that serves the requested
+        resource only when minting MCP resource tokens. Token exchange, ID-JAG issuance and
+        jwt-bearer redemption outside the MCP profile ran only the connection's audience
+        allowlist, so with an empty list, or one saved before another tenant's surface declared
+        the resource, a connection could mint a token for a resource another tenant's surface or
+        MCP Proxy declares. Every grant now refuses such an audience; the gateway's own issuer,
+        third-party audiences and appliance-wide connections work as before.
+  breaking: []

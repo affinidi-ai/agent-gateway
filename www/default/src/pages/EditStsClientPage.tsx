@@ -239,10 +239,11 @@ const EditStsClientPage: React.FC = () => {
   }
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-sts-client-editor">
       <div className="mb-3">
         <button
           className="btn btn-secondary btn-sm"
+          data-testid="sts-client-editor-back-button"
           onClick={() => navigate('/credentials?tab=sts-clients')}
         >
           <i className="fas fa-arrow-left"></i>
@@ -507,7 +508,12 @@ const EditStsClientPage: React.FC = () => {
             </div>
 
             <div className="d-flex gap-2">
-              <button type="submit" className="btn btn-primary" disabled={saving}>
+              <button
+                type="submit"
+                data-testid="sts-client-editor-save-button"
+                className="btn btn-primary"
+                disabled={saving}
+              >
                 {saving ? (
                   <>
                     <span className="spinner-border spinner-border-sm me-2" />
@@ -522,6 +528,7 @@ const EditStsClientPage: React.FC = () => {
               <button
                 type="button"
                 className="btn btn-outline-secondary"
+                data-testid="sts-client-editor-cancel-button"
                 onClick={() => navigate('/credentials?tab=sts-clients')}
                 disabled={saving}
               >

@@ -10,6 +10,8 @@ describe('deepLinks', () => {
     expect(deepLinks.authority).toBe('/authorities/new');
     expect(deepLinks.mediator).toBe('/mediators/wizard');
     expect(deepLinks.integration).toBe('/integrations/new');
+    expect(deepLinks.remoteGateway).toBe('/gateways/connect');
+    expect(deepLinks.paymentGateway).toBe('/payment-gateways/connect');
   });
 
   it('encodes the certificate kind filter when supplied', () => {

@@ -182,6 +182,7 @@ const EditA2aProxyPage: React.FC = () => {
             >
               <Tab
                 eventKey="overview"
+                tabAttrs={{ 'data-testid': 'a2a-proxy-editor-overview-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-info-circle" /> Overview
@@ -192,6 +193,7 @@ const EditA2aProxyPage: React.FC = () => {
               </Tab>
               <Tab
                 eventKey="backend"
+                tabAttrs={{ 'data-testid': 'a2a-proxy-editor-backend-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-server" /> Backend
@@ -206,6 +208,7 @@ const EditA2aProxyPage: React.FC = () => {
               </Tab>
               <Tab
                 eventKey="agent-card"
+                tabAttrs={{ 'data-testid': 'a2a-proxy-editor-agent-card-tab-trigger' }}
                 title={
                   <>
                     <i className="fas fa-id-card" /> Agent Card

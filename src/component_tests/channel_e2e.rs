@@ -95,7 +95,7 @@ async fn inbound_request_forwarded_to_target() {
 }
 
 /// A `POST` through the outbound listener is forwarded to the external mock target.
-/// The route pattern is `/outgoing/<channel-route>/<alias>/<path>`.
+/// The route pattern is `/outbound/<channel-route>/<alias>/<path>`.
 #[tokio::test(flavor = "multi_thread")]
 async fn outbound_request_forwarded_to_target() {
     //
@@ -132,6 +132,105 @@ async fn outbound_request_forwarded_to_target() {
 
     assert_response(resp).await;
     assert_forwarded_request(&h.mock, body);
+}
+
+/// The machine's address on its default route, which is not a loopback
+/// address, or `None` on a machine without one. Finding it sends nothing.
+fn non_loopback_local_address() -> Option<std::net::IpAddr> {
+    let local = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    local
+        .connect("192.0.2.1:9")
+        .ok()?;
+    let address = local.local_addr().ok()?.ip();
+    (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+/// An inbound listener whose `bind_address` is the loopback address binds there
+/// alone: it answers on `127.0.0.1` and refuses the machine's other address,
+/// when the machine has one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inbound_listener_binds_its_configured_address() {
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        let path = &bootstrap.config_files.gateway;
+        let mut network: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        network["listeners"][0]["bind_address"] = json!("127.0.0.1");
+        std::fs::write(path, serde_json::to_vec(&network).unwrap()).unwrap();
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+    let port: u16 = h
+        .gateway_base
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let on_loopback = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+        .send()
+        .await
+        .expect("the listener answers on its bind address");
+    assert_response(on_loopback).await;
+
+    let Some(other_address) = non_loopback_local_address() else {
+        eprintln!("skipped the check that other addresses are refused: this machine has no non-loopback address");
+        return;
+    };
+    let elsewhere =
+        tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect((other_address, port)))
+            .await;
+    assert!(!matches!(elsewhere, Ok(Ok(_))), "the listener must not accept on {other_address}:{port}");
+}
+
+/// Two inbound listeners that share a port with different `bind_address`
+/// values are both served: the gateway answers on `127.0.0.1` and on `::1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_listeners_sharing_a_port_are_each_served_on_their_address() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        eprintln!("skipped: this host has no IPv6 loopback address");
+        return;
+    }
+    let h = GatewayHarness::start(|_, gw_config, bootstrap| {
+        let path = &bootstrap.config_files.gateway;
+        let mut network: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        network["listeners"][0]["bind_address"] = json!("127.0.0.1");
+        let mut on_ipv6 = network["listeners"][0].clone();
+        on_ipv6["id"] = json!("smoke-test-ipv6");
+        on_ipv6["bind_address"] = json!("::1");
+        network["listeners"]
+            .as_array_mut()
+            .unwrap()
+            .push(on_ipv6);
+        std::fs::write(path, serde_json::to_vec(&network).unwrap()).unwrap();
+        gw_config.surfaces = vec![helpers::build_minimal_channel()];
+    })
+    .await;
+    let path = h
+        .gateway_url
+        .strip_prefix(&h.gateway_base)
+        .unwrap()
+        .to_string();
+    let port = h
+        .gateway_base
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_string();
+
+    for base in [format!("http://127.0.0.1:{port}"), format!("http://[::1]:{port}")] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("the listener on {base} must answer: {error}"));
+        assert_response(response).await;
+    }
 }
 
 /// A channel with `source_auth` (JWT Bearer) no longer blocks requests without a
@@ -242,6 +341,126 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
     );
 }
 
+/// With `forward_header`, the caller's token reaches the target only when it
+/// verified; an expired token, one from another issuer, or a second token
+/// beside a valid one is still forwarded with no policy denying it, but
+/// without any token.
+#[tokio::test(flavor = "multi_thread")]
+async fn forward_header_passes_on_only_a_verified_token() {
+    let fixture = JwksFixture::start().await;
+
+    let h = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(&fixture, temp_dir, gw_config);
+        if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt)) = gw_config.surfaces[0]
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .and_then(|caller| caller.methods.first_mut())
+        {
+            jwt.forward_header = true;
+        }
+    })
+    .await;
+
+    let client = reqwest::Client::new();
+    let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
+    let sign = |issuer: &str, exp: u64| {
+        sign_jwt(json!({"iss": issuer, "sub": "user-e2e", "aud": "any", "exp": exp, "iat": now_secs()}), &fixture.kid)
+    };
+
+    let valid = sign(&fixture.issuer, now_secs() + 300);
+    let expired = sign(&fixture.issuer, now_secs() - 3600);
+    for (case, tokens, forwarded) in [
+        ("valid", vec![valid.clone()], true),
+        ("expired", vec![expired.clone()], false),
+        ("another issuer", vec![sign("https://other-issuer.example", now_secs() + 300)], false),
+        ("valid then expired", vec![valid, expired], false),
+    ] {
+        let resp = tokens
+            .iter()
+            .fold(client.post(&h.gateway_url), |request, token| {
+                request.header("authorization", format!("Bearer {token}"))
+            })
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_response(resp).await;
+        assert_forwarded_request(&h.mock, body);
+        let received = h
+            .mock
+            .last_request_rx
+            .borrow()
+            .clone()
+            .expect("mock did not receive a request");
+        assert_eq!(
+            received
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            forwarded
+                .then(|| format!("Bearer {}", tokens[0]))
+                .as_deref(),
+            "{case}"
+        );
+    }
+}
+
+/// The managed agent learns who is calling only from the caller-info and DID
+/// identity headers the gateway sets: a caller's own copies, in any case, are
+/// dropped, so the agent gets the gateway's one value of each it sets and none
+/// of the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_agent_receives_the_caller_info_headers_only_as_the_gateway_sets_them() {
+    let target = helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let target_url = target.url.clone();
+    let h = GatewayHarness::start(move |_, gw_config, _| {
+        let mut surface = helpers::build_minimal_channel();
+        surface.target.endpoint = target_url;
+        gw_config.surfaces = vec![surface];
+    })
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(&h.gateway_url)
+        .header("content-type", "application/json")
+        .header("x-caller-did", "did:web:caller-sent.example")
+        .header("X-Caller-Identity-Source", "verified-presentation")
+        .header("x-caller-dna-uai", "uai:caller-sent")
+        .header("X-Gateway-DID", "did:web:caller-sent-gateway.example")
+        .header("X-DID-Identity", "did:web:caller-sent-surface.example")
+        .header("x-did-signed-identity", r#"{"id":"did:web:caller-sent-surface.example"}"#)
+        .header("x-caller-context", "kept")
+        .body(r#"{"jsonrpc":"2.0","method":"test","id":1}"#)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(response.status(), 200);
+
+    let received = target.received();
+    assert_eq!(received.len(), 1);
+    let values = |name: &str| -> Vec<String> {
+        received[0]
+            .get_all(name)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(values("x-caller-did"), ["anonymous"]);
+    assert_eq!(values("x-caller-identity-source"), ["gateway-computed"]);
+    for unset in ["x-caller-dna-uai", "x-gateway-did", "x-did-identity", "x-did-signed-identity"] {
+        assert!(values(unset).is_empty(), "{unset}: {:?}", values(unset));
+    }
+    assert_eq!(values("x-caller-context"), ["kept"], "headers that are not caller-info headers still pass");
+}
+
 // ── Surface variant URL routing (plan §2.3) ─────────────────────────────────
 
 /// Plan §2.3: a request whose URL matches `/route$alias[/rest]` selects the
@@ -309,10 +528,7 @@ async fn inbound_with_percent_encoded_alias_routes() {
     assert_eq!(received.path, "/rpc", "percent-encoded alias suffix should be stripped");
 }
 
-/// Plan §4: an unknown variant alias is rejected before any forwarding occurs.
-/// Today the inbound handler returns 400; the spec calls for 404 once
-/// surface-side variants land. Either is acceptable here — what matters is
-/// that the mock target never receives the request.
+/// An unknown variant alias is refused with 404 before any forwarding occurs.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_with_unknown_alias_is_rejected() {
     let h = GatewayHarness::start(|_, gw_config, _| {
@@ -331,8 +547,7 @@ async fn inbound_with_unknown_alias_is_rejected() {
         .await
         .expect("request failed");
 
-    let status = resp.status().as_u16();
-    assert!(matches!(status, 400 | 404), "expected 400 or 404 for unknown alias, got {status}");
+    assert_eq!(resp.status(), 404, "unknown alias is refused with 404");
 
     // Mock must NOT have seen the request.
     assert!(
@@ -344,12 +559,10 @@ async fn inbound_with_unknown_alias_is_rejected() {
     );
 }
 
-/// Plan §4.5: a disabled variant returns 503 ("listener temporarily
-/// unavailable") and is never forwarded. The route exists and is
-/// recognised — an operator has intentionally switched it off — so 404
-/// (which means "no such variant") would be misleading.
+/// A disabled variant is refused with 404, the same answer as an unknown
+/// alias: nothing is served at that URL. It is never forwarded.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_with_disabled_variant_returns_503() {
+async fn inbound_with_disabled_variant_returns_404() {
     let h = GatewayHarness::start(|_, gw_config, _| {
         gw_config.surfaces = vec![helpers::build_channel_with_disabled_variant()];
     })
@@ -366,7 +579,7 @@ async fn inbound_with_disabled_variant_returns_503() {
         .await
         .expect("request failed");
 
-    assert_eq!(resp.status(), 503, "disabled variant should return 503");
+    assert_eq!(resp.status(), 404, "disabled variant is refused with 404");
 
     assert!(
         h.mock

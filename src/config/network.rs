@@ -56,6 +56,37 @@ pub struct NetworkConfig {
     #[serde(default = "default_oauth_callback_route")]
     pub oauth_callback_route: String,
 
+    /// The resource origins permitted, beyond the issuer's own host and its
+    /// subdomains, for the credential providers of external consent of each
+    /// issuer: an issuer origin, such as `https://accounts.google.com`, maps to
+    /// the resource origins its providers may name, such as
+    /// `https://www.googleapis.com`. Only this file sets it; no tenant or API
+    /// caller can add to it. An entry that is not an `https` origin permits
+    /// nothing and is named at startup.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub external_consent_resource_origins: HashMap<String, Vec<String>>,
+
+    /// The only issuers the credential providers of external consent may name,
+    /// when set: each issuer identifier, compared exactly, maps to the origins
+    /// its authorization, token and revocation endpoints and its `jwks_uri` may
+    /// use beyond the issuer's own host, such as
+    /// `{"https://accounts.google.com": ["https://oauth2.googleapis.com"]}`.
+    /// Unset, any issuer whose metadata the provider matches is permitted. Only
+    /// this file sets it; no tenant or API caller can add to it. An entry that
+    /// is not a plain `https` issuer or origin permits nothing and is named at
+    /// startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_consent_issuers: Option<HashMap<String, Vec<String>>>,
+
+    /// How many refreshes of a grant by binding the authorization server may
+    /// refuse, by an answer other than `invalid_grant`, since the last that
+    /// succeeded, before a call whose grant cannot be used answers
+    /// `connect_required` rather than `connector_unavailable`. The grant is
+    /// kept. From 1 to 20; a value outside is taken as the nearer bound; 3 when
+    /// unset.
+    #[serde(default = "default_external_consent_refresh_refusals")]
+    pub external_consent_refresh_refusals: u32,
+
     /// Logging overrides (only redaction rules are used from gateway.json;
     /// level/json/log_directory come from config.toml)
     #[serde(default)]
@@ -72,6 +103,44 @@ pub struct NetworkConfig {
     /// Proxies trusted to report the caller's address for per-client-IP limits.
     #[serde(default)]
     pub client_ip: crate::config::types::ClientIpConfig,
+
+    /// The longest lifetime, in seconds, a surface may set for its transit
+    /// tokens (`transit.transit_token_lifetime_secs`), and the longest the
+    /// Access Point issues, from 30 to 900; 300 when unset. The shortest, 30,
+    /// is fixed. Read and checked once, when the gateway starts
+    /// (`BootstrapConfig::pin_transit_token_max_lifetime`); a reload keeps that
+    /// value, so a load reads a value that is not a whole number as 300 rather
+    /// than failing.
+    #[serde(
+        default = "default_transit_token_max_lifetime_secs",
+        deserialize_with = "deserialize_transit_token_max_lifetime_secs"
+    )]
+    pub transit_token_max_lifetime_secs: u64,
+
+    /// The delegated payment gate's circuit breaker thresholds.
+    #[serde(default)]
+    pub payment_gate: crate::config::types::PaymentGateConfig,
+
+    /// How long and how large the delegated payments ledger is kept.
+    #[serde(default)]
+    pub payment_ledger: crate::config::types::PaymentLedgerConfig,
+}
+
+fn default_external_consent_refresh_refusals() -> u32 {
+    3
+}
+
+fn default_transit_token_max_lifetime_secs() -> u64 {
+    crate::config::agent_surface::DEFAULT_TRANSIT_TOKEN_MAX_LIFETIME_SECS
+}
+
+fn deserialize_transit_token_max_lifetime_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_u64()
+        .unwrap_or_else(default_transit_token_max_lifetime_secs))
 }
 
 /// DID configuration
@@ -126,6 +195,22 @@ pub struct Listener {
     pub listener_type: String,
 }
 
+const LISTENER_TYPES: [&str; 2] = ["inbound", "outbound"];
+
+/// The IP address of a listener `bind_address`: an IPv4 or IPv6 address, the
+/// IPv6 one optionally in brackets (`[::1]`). Host names are not accepted.
+pub(crate) fn parse_bind_address(bind_address: &str) -> Result<std::net::IpAddr, std::net::AddrParseError> {
+    match bind_address
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(inner) => inner
+            .parse::<std::net::Ipv6Addr>()
+            .map(std::net::IpAddr::V6),
+        None => bind_address.parse(),
+    }
+}
+
 /// A channel prefix configuration for proxy routes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelPrefix {
@@ -135,7 +220,7 @@ pub struct ChannelPrefix {
     /// Human-readable name (displayed in UI dropdown)
     pub name: String,
 
-    /// Route prefix (e.g., "/agents", "/payments")
+    /// Route prefix (e.g., "/agents", "/billing")
     pub prefix: String,
 }
 
@@ -181,7 +266,32 @@ pub struct RouteCategory {
 }
 
 impl NetworkConfig {
+    /// The route prefixes this configuration serves through the proxy: every
+    /// channel prefix and every route of type `proxy`. These are what must not
+    /// shadow a dashboard page.
+    pub fn proxy_prefixes(&self) -> Vec<&str> {
+        self.channels
+            .iter()
+            .map(|channel| channel.prefix.as_str())
+            .chain(
+                self.routes
+                    .values()
+                    .filter(|route| matches!(route.route_type, RouteType::Proxy))
+                    .map(|route| route.prefix.as_str()),
+            )
+            .collect()
+    }
+
     /// Load network configuration from a JSON file
+    /// `transit_token_max_lifetime_secs` exactly as the file at `path` holds
+    /// it, whatever its type, or `None` when the file does not set it.
+    pub fn transit_token_max_lifetime_in_file(path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let mut file: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        Ok(file
+            .get_mut("transit_token_max_lifetime_secs")
+            .map(serde_json::Value::take))
+    }
+
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: NetworkConfig = serde_json::from_str(&contents)?;
@@ -217,12 +327,17 @@ impl NetworkConfig {
         validate_affinidi_terms_url(url, cfg!(debug_assertions))
     }
 
-    /// Get all unique ports that should be bound
+    /// Get all unique ports that should be bound, in listener order. Listeners
+    /// sharing a port are served by one listener task, which binds each of
+    /// their addresses.
     pub fn get_ports(&self) -> Vec<u16> {
-        self.listeners
-            .iter()
-            .map(|l| l.port)
-            .collect()
+        let mut ports = Vec::new();
+        for listener in &self.listeners {
+            if !ports.contains(&listener.port) {
+                ports.push(listener.port);
+            }
+        }
+        ports
     }
 
     /// Get listener by port
@@ -403,11 +518,27 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
         if !ids.insert(l.id.as_str()) {
             anyhow::bail!("Invalid network config: duplicate listener id '{}'", l.id);
         }
+        if !LISTENER_TYPES.contains(&l.listener_type.as_str()) {
+            anyhow::bail!(
+                "Invalid network config: listener '{}' listener_type '{}' is not one of {}",
+                l.id,
+                l.listener_type,
+                LISTENER_TYPES.join(", ")
+            );
+        }
     }
 
-    let mut sockets: HashSet<(&str, u16)> = HashSet::new();
+    let mut sockets: HashSet<(std::net::IpAddr, u16)> = HashSet::new();
     for l in listeners {
-        if !sockets.insert((l.bind_address.as_str(), l.port)) {
+        let Ok(ip) = parse_bind_address(&l.bind_address) else {
+            anyhow::bail!(
+                "Invalid network config: listener '{}' bind_address '{}' is not an IP address (IPv6 may be \
+                 written in brackets; host names are not accepted)",
+                l.id,
+                l.bind_address
+            );
+        };
+        if !sockets.insert((ip, l.port)) {
             anyhow::bail!(
                 "Invalid network config: duplicate listener bind address {}:{} (listener id '{}')",
                 l.bind_address,
@@ -418,6 +549,27 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Warns about each listener external URL with no host that parses, through
+/// which no listener shares `/outbound`, naming it by its listener and
+/// position, never its value, which may hold a credential. Listeners change
+/// only on a restart, so startup calls this once.
+pub(crate) fn warn_about_unparsed_external_urls(listeners: &[Listener]) {
+    for l in listeners {
+        for (index, _) in l
+            .external_urls
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| !Url::parse(url).is_ok_and(|url| url.has_host()))
+        {
+            tracing::warn!(
+                listener = %l.id,
+                external_url_index = index,
+                "Listener external URL has no host that parses, so no listener shares /outbound through it"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +601,35 @@ mod listener_validation_tests {
     }
 
     #[test]
+    fn an_external_url_without_a_host_is_named_by_its_position_not_its_value() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut outbound = listener("outbound-http", "0.0.0.0", 9000);
+        outbound.external_urls = vec![
+            "https://shared.example.com".into(),
+            "https://secret-user:secret-pass@shared.example.com:99999".into(),
+            "no-scheme".into(),
+        ];
+
+        warn_about_unparsed_external_urls(&[listener("inbound-http", "0.0.0.0", 8080), outbound]);
+
+        let text = logs.text();
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Listener external URL has no host that parses"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{text}");
+        assert!(
+            warnings
+                .iter()
+                .all(|line| line.contains("outbound-http")),
+            "{text}"
+        );
+        assert!(warnings[0].contains("external_url_index=1"), "{}", warnings[0]);
+        assert!(warnings[1].contains("external_url_index=2"), "{}", warnings[1]);
+        assert!(!text.contains("secret-pass"), "a log holds the URL: {text}");
+    }
+
+    #[test]
     fn duplicate_id_is_rejected() {
         let err = validate_listener_set(&[listener("same", "0.0.0.0", 8080), listener("same", "0.0.0.0", 9090)])
             .unwrap_err()
@@ -464,6 +645,61 @@ mod listener_validation_tests {
     #[test]
     fn same_port_on_different_bind_addresses_passes() {
         validate_listener_set(&[listener("a", "127.0.0.1", 8080), listener("b", "10.0.0.1", 8080)]).unwrap();
+    }
+
+    #[test]
+    fn a_bind_address_that_is_not_an_ip_address_is_rejected() {
+        for bind in ["localhost", "", "0.0.0.0:8080", "gateway.internal"] {
+            let err = validate_listener_set(&[listener("a", bind, 8080)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("is not an IP address"), "{bind}: {err}");
+        }
+        validate_listener_set(&[listener("a", "::1", 8080), listener("b", "127.0.0.1", 8081)]).unwrap();
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_bind_address_is_accepted() {
+        validate_listener_set(&[listener("a", "[::1]", 8080), listener("b", "[::]", 8081)]).unwrap();
+        assert_eq!(parse_bind_address("[::1]"), Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        assert_eq!(parse_bind_address("::1"), Ok(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn a_bracketed_non_ipv6_bind_address_is_rejected() {
+        for bind in ["[1.2.3.4]", "[localhost]", "[[::1]]", "[::1", "::1]", "localhost"] {
+            let err = validate_listener_set(&[listener("a", bind, 8080)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("bind_address '{bind}' is not an IP address")), "{bind}: {err}");
+            assert!(err.contains("host names are not accepted"), "{bind}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_bracketed_and_bare_forms_of_one_address_are_one_socket() {
+        let err = validate_listener_set(&[listener("a", "[::1]", 8080), listener("b", "::1", 8080)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate listener bind address ::1:8080"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_listener_type_is_rejected() {
+        for listener_type in ["Outbound", "INBOUND", "", "egress"] {
+            let mut unknown = listener("a", "0.0.0.0", 8080);
+            unknown.listener_type = listener_type.to_string();
+            let err = validate_listener_set(&[unknown])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("listener 'a' listener_type '{listener_type}' is not one of inbound, outbound")),
+                "{listener_type}: {err}"
+            );
+        }
+        let mut outbound = listener("b", "127.0.0.1", 9000);
+        outbound.listener_type = "outbound".to_string();
+        validate_listener_set(&[listener("a", "0.0.0.0", 8080), outbound]).unwrap();
     }
 }
 
@@ -521,6 +757,55 @@ mod url_mapping_tests {
                 .trusted_proxies
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_payment_gate_breaker_defaults_to_five_failures_and_thirty_seconds_and_reads_its_overrides() {
+        let defaults = cfg_with_listeners(serde_json::json!([]));
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_failures(),
+            5
+        );
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(30)
+        );
+
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+            "payment_gate": { "breaker_failures": 3, "breaker_open_secs": 90 },
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_failures(),
+            3
+        );
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(90)
+        );
+
+        let clamped = crate::config::types::PaymentGateConfig {
+            breaker_failures: Some(0),
+            breaker_open_secs: Some(86_400),
+        };
+        assert_eq!(clamped.breaker_failures(), 1);
+        assert_eq!(clamped.breaker_open_for(), std::time::Duration::from_secs(3600));
+
+        let unknown = serde_json::from_value::<crate::config::types::PaymentGateConfig>(
+            serde_json::json!({ "breaker_threshold": 3 }),
+        );
+        assert!(unknown.is_err(), "a misspelt key is refused");
     }
 
     #[test]
@@ -722,5 +1007,90 @@ mod url_mapping_tests {
         .expect("network config without mcp_proxies should deserialize");
 
         assert!(cfg.mcp_proxies.is_none());
+    }
+
+    fn load_with_max_lifetime(max_secs: Option<serde_json::Value>) -> anyhow::Result<NetworkConfig> {
+        let mut cfg = serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+        });
+        if let Some(max_secs) = max_secs {
+            cfg["transit_token_max_lifetime_secs"] = max_secs;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("gateway.json");
+        std::fs::write(&path, cfg.to_string()).unwrap();
+        NetworkConfig::load_from_file(path.to_str().unwrap())
+    }
+
+    #[test]
+    fn the_longest_transit_token_lifetime_defaults_to_300_seconds_and_gateway_json_may_set_it() {
+        assert_eq!(
+            load_with_max_lifetime(None)
+                .unwrap()
+                .transit_token_max_lifetime_secs,
+            300
+        );
+        for max_secs in [30, 600, 900] {
+            assert_eq!(
+                load_with_max_lifetime(Some(serde_json::json!(max_secs)))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                max_secs
+            );
+        }
+    }
+
+    /// A load does not judge the longest lifetime: only the startup pin does
+    /// (`BootstrapConfig::pin_transit_token_max_lifetime`), so a reload never
+    /// fails on it, and reads a value that is not a whole number as 300.
+    #[test]
+    fn a_load_never_fails_on_the_longest_transit_token_lifetime() {
+        for max_secs in [0, 901] {
+            assert_eq!(
+                load_with_max_lifetime(Some(serde_json::json!(max_secs)))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                max_secs
+            );
+        }
+        for not_whole in
+            [serde_json::json!("ten"), serde_json::json!(-1), serde_json::json!(60.5), serde_json::Value::Null]
+        {
+            assert_eq!(
+                load_with_max_lifetime(Some(not_whole.clone()))
+                    .unwrap()
+                    .transit_token_max_lifetime_secs,
+                300,
+                "{not_whole}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_prefixes_are_the_channel_prefixes_and_the_proxy_routes_only() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/mcp" }],
+            "routes": {
+                "channels": { "type": "proxy", "prefix": "/svc" },
+                "api": { "type": "identity_api", "prefix": "/api" },
+                "dashboard": { "type": "static", "prefix": "/", "path": "www", "fallback": true }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        let mut prefixes = cfg.proxy_prefixes();
+        prefixes.sort_unstable();
+        assert_eq!(prefixes, vec!["/agents", "/svc"]);
     }
 }

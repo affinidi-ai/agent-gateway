@@ -31,10 +31,6 @@ pub struct ExtensionInspectionContext<'a> {
     pub source_authenticated: bool,
     pub metrics_store: &'a Option<Arc<crate::metrics::MetricsStore>>,
     pub ws_state: &'a Option<Arc<crate::server::WsState>>,
-    /// Active surface variant alias. Threaded into payload-capture
-    /// broadcasts so dashboard consumers can attribute traffic to the
-    /// variant.
-    pub variant_alias: Option<&'a str>,
 }
 
 /// Context for response extension inspection operations
@@ -46,10 +42,35 @@ pub struct ResponseExtensionInspectionContext<'a> {
     pub metrics_store: &'a Option<Arc<crate::metrics::MetricsStore>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+/// What the custom-metadata helpers of a request resolve against. Production code builds it
+/// only with [`Self::for_surface`], so every injection site holds `$SECRET:` helpers to the
+/// surface's tenant.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(Default))]
 pub struct MetadataRuntimeContext<'a> {
-    pub request_id: Option<&'a str>,
-    pub surface_id: Option<&'a str>,
+    request_id: Option<&'a str>,
+    surface_id: Option<&'a str>,
+    tenancy: crate::tenancy::SurfaceTenancy<'a>,
+}
+
+impl<'a> MetadataRuntimeContext<'a> {
+    /// The context of request `request_id` on `surface`, held to the surface's tenant under the
+    /// configured `tenant_credential_isolation` mode.
+    pub fn for_surface(
+        surface: &'a crate::config::agent_surface::AgentSurface,
+        request_id: Option<&'a str>,
+    ) -> Self {
+        Self {
+            request_id,
+            surface_id: Some(surface.surface_id.as_str()),
+            tenancy: crate::tenancy::SurfaceTenancy::configured(surface.tenant_id.as_deref()),
+        }
+    }
+}
+
+/// The secret id a whole-string `$SECRET:<id>` custom-metadata helper names.
+pub(crate) fn secret_helper_id(value: &str) -> Option<&str> {
+    value.strip_prefix("$SECRET:")
 }
 
 /// Recursively resolve custom-metadata value helpers in a JSON value.
@@ -68,34 +89,38 @@ pub fn resolve_metadata_references<'a>(
     Box::pin(async move {
         match value {
             JsonValue::String(s) => {
-                if s.starts_with("$SECRET:") {
-                    let secret_id_ref = s
-                        .strip_prefix("$SECRET:")
-                        .unwrap();
-
+                if let Some(secret_id_ref) = secret_helper_id(s) {
                     let store = secrets_store
                         .as_ref()
                         .ok_or_else(|| {
                             anyhow::anyhow!("Secret reference {} found but secrets store is not configured", s)
                         })?;
-
-                    let secrets = store.list_all().await?;
-                    let secret_uuid = secrets
-                        .iter()
-                        .find(|sec| sec.secret_id == secret_id_ref)
-                        .map(|sec| sec.id.clone())
-                        .ok_or_else(|| anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id_ref))?;
-
+                    let not_found = || anyhow::anyhow!("Secret with secret_id '{}' not found", secret_id_ref);
                     let secret = store
-                        .get(&secret_uuid)
+                        .get_by_secret_id(secret_id_ref)
                         .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Secret with secret_id '{}' (UUID: {}) was deleted",
-                                secret_id_ref,
-                                secret_uuid
-                            )
-                        })?;
+                        .ok_or_else(not_found)?;
+
+                    let tenancy = runtime.tenancy;
+                    let secret_tenant = secret.tenant_id.as_deref();
+                    if tenancy.tenant_id.is_some()
+                        && !crate::tenancy::can_reference_with_rule(tenancy.tenant_id, secret_tenant, tenancy.mode)
+                    {
+                        warn!(
+                            channel = channel_name,
+                            secret_id = secret_id_ref,
+                            "Refusing custom metadata secret outside the surface's tenant"
+                        );
+                        return Err(not_found());
+                    }
+                    if crate::tenancy::breaks_tenant_isolation(tenancy.tenant_id, secret_tenant) {
+                        warn!(
+                            channel = channel_name,
+                            secret_id = secret_id_ref,
+                            tenant_id = ?tenancy.tenant_id,
+                            "Custom metadata secret is appliance-wide on a tenant surface; refused once tenant_credential_isolation is enforce"
+                        );
+                    }
 
                     debug!(channel = channel_name, secret_id = secret_id_ref, "Resolved secret reference");
 
@@ -138,16 +163,6 @@ pub fn resolve_metadata_references<'a>(
     })
 }
 
-/// Backwards-compatible resolver for callers that only need secret references.
-#[allow(dead_code)]
-pub fn resolve_secret_references<'a>(
-    value: &'a JsonValue,
-    secrets_store: &'a Option<Arc<dyn crate::secrets::SecretsStore>>,
-    channel_name: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<JsonValue>> + Send + 'a>> {
-    resolve_metadata_references(value, secrets_store, channel_name, MetadataRuntimeContext::default())
-}
-
 /// Inspect extensions in message body for multiple protocols (A2A, MCP, UCP, ACP, etc.)
 /// Returns Ok(Some(IdentityResult)) if validation passes and agent identity is resolved (hash + DID),
 /// Ok(None) if validation passes without identity,
@@ -164,16 +179,7 @@ pub async fn inspect_message_extensions(
     // Try to parse as JSON
     let body_json: JsonValue = match serde_json::from_slice::<JsonValue>(body_bytes) {
         Ok(json) => {
-            debug!(channel = ctx.channel_name, "Successfully parsed body as JSON");
-            // Log first 500 chars of JSON for debugging
-            let json_str = serde_json::to_string(&json).unwrap_or_default();
-            let preview = if json_str.len() > 500 {
-                format!("{}...", &json_str[..500])
-            } else {
-                json_str.clone()
-            };
-            debug!(channel = ctx.channel_name, body_preview = %preview, "JSON body preview");
-
+            debug!(channel = ctx.channel_name, body_bytes = body_bytes.len(), "Successfully parsed body as JSON");
             json
         }
         Err(e) => {
@@ -195,7 +201,6 @@ pub async fn inspect_message_extensions(
                     "Non-JSON Body",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             }
@@ -268,7 +273,6 @@ pub async fn inspect_message_extensions(
                     "Failed Validation",
                     Some(error_msg.clone()),
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -289,7 +293,6 @@ pub async fn inspect_message_extensions(
                     "MCP Inspection",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             } else {
@@ -304,7 +307,6 @@ pub async fn inspect_message_extensions(
                     "MCP No Meta",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
             }
@@ -363,7 +365,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -401,7 +402,6 @@ pub async fn inspect_message_extensions(
                             "Failed Validation",
                             Some(error_msg.clone()),
                             None,
-                            ctx.variant_alias,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -452,7 +452,6 @@ pub async fn inspect_message_extensions(
                                 "success",
                                 None,
                                 Some(result.hash.clone()),
-                                ctx.variant_alias,
                             )
                             .await;
                             return Ok(Some(result));
@@ -474,7 +473,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -503,7 +501,6 @@ pub async fn inspect_message_extensions(
                     "success",
                     None,
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Ok(None);
@@ -522,7 +519,6 @@ pub async fn inspect_message_extensions(
                 "MCP No Meta",
                 None,
                 None,
-                ctx.variant_alias,
             )
             .await;
         }
@@ -553,7 +549,6 @@ pub async fn inspect_message_extensions(
                 "Failed Validation",
                 Some(error_msg.clone()),
                 None,
-                ctx.variant_alias,
             )
             .await;
             return Err(crate::a2a::create_identity_error_response(
@@ -612,7 +607,6 @@ pub async fn inspect_message_extensions(
             "Failed Validation",
             Some(error_msg.clone()),
             None,
-            ctx.variant_alias,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -679,7 +673,6 @@ pub async fn inspect_message_extensions(
                     "Failed Validation",
                     Some(error_msg.clone()),
                     None,
-                    ctx.variant_alias,
                 )
                 .await;
                 return Err(crate::a2a::create_identity_error_response(
@@ -701,7 +694,6 @@ pub async fn inspect_message_extensions(
                 "No Extensions",
                 None,
                 None,
-                ctx.variant_alias,
             )
             .await;
             return Ok(None);
@@ -818,7 +810,6 @@ pub async fn inspect_message_extensions(
                                 identity_result
                                     .as_ref()
                                     .map(|r| r.hash.clone()),
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::errors::create_error_response(StatusCode::FORBIDDEN, &error_msg));
@@ -895,7 +886,6 @@ pub async fn inspect_message_extensions(
                             "Failed Validation",
                             Some(error_msg.clone()),
                             None,
-                            ctx.variant_alias,
                         )
                         .await;
                         return Err(crate::a2a::create_identity_error_response(
@@ -966,7 +956,6 @@ pub async fn inspect_message_extensions(
                                 "Failed Validation",
                                 Some(error_msg.clone()),
                                 None,
-                                ctx.variant_alias,
                             )
                             .await;
                             return Err(crate::a2a::create_identity_error_response(
@@ -1029,7 +1018,6 @@ pub async fn inspect_message_extensions(
             identity_result
                 .as_ref()
                 .map(|r| r.hash.clone()),
-            ctx.variant_alias,
         )
         .await;
         return Err(crate::a2a::create_identity_error_response(
@@ -1598,9 +1586,18 @@ pub fn is_hop_by_hop_header(name: &str) -> bool {
 ///   and the later Transit Point call. It authorizes the outbound hop on the issuing
 ///   gateway only and must never be forwarded to the upstream or to a remote gateway
 ///   (GW2); the cross-gateway trust artifact is the signed workload-binding VP.
+/// - `x-gateway-fabric-hops`: the Fabric crossings a request has made. Every Fabric
+///   send sets its own, so a copy a caller, agent or peer sent never passes.
+/// - `cookie`: the caller's cookies belong to the host it called, which can be
+///   the gateway's own dashboard, never to the target.
 pub fn should_forward_request_header(name: &str) -> bool {
     let lower = name.to_lowercase();
-    !is_hop_by_hop_header(&lower) && lower != "content-length" && lower != "host" && lower != "x-transit-token"
+    !is_hop_by_hop_header(&lower)
+        && lower != "content-length"
+        && lower != "host"
+        && lower != "cookie"
+        && lower != "x-transit-token"
+        && lower != crate::proxy::fabric_hops::FABRIC_HOPS_HEADER
 }
 
 #[cfg(test)]
@@ -1760,6 +1757,28 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn a_surface_context_holds_secrets_to_the_surfaces_tenant_under_the_configured_mode() {
+        use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode, TEST_CREDENTIAL_POLICY};
+        let surface = crate::config::agent_surface::AgentSurface {
+            surface_id: "surface-456".into(),
+            tenant_id: Some("tenant-a".into()),
+            ..Default::default()
+        };
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let policy: &'static CredentialPolicyConfig = Box::leak(Box::new(CredentialPolicyConfig {
+                tenant_credential_isolation: mode,
+                ..Default::default()
+            }));
+            let context = TEST_CREDENTIAL_POLICY
+                .sync_scope(policy, || MetadataRuntimeContext::for_surface(&surface, Some("trace-123")));
+            assert_eq!(context.request_id, Some("trace-123"));
+            assert_eq!(context.surface_id, Some("surface-456"));
+            assert_eq!(context.tenancy.tenant_id, Some("tenant-a"));
+            assert_eq!(context.tenancy.mode, mode);
+        }
+    }
+
     #[tokio::test]
     async fn metadata_runtime_helpers_resolve_supported_values() {
         let input = json!({
@@ -1775,6 +1794,7 @@ mod tests {
             MetadataRuntimeContext {
                 request_id: Some("trace-123"),
                 surface_id: Some("surface-456"),
+                ..Default::default()
             },
         )
         .await
@@ -1791,6 +1811,79 @@ mod tests {
         assert_eq!(resolved["literal"], "$CALLER_DID");
     }
 
+    async fn resolve_secret(
+        store: &Option<Arc<dyn crate::secrets::SecretsStore>>,
+        tenant_id: Option<&str>,
+        mode: crate::config::credential_policy::RuleMode,
+        secret_id: &str,
+    ) -> Result<JsonValue, String> {
+        resolve_metadata_references(
+            &json!({"nested": [{"key": format!("$SECRET:{secret_id}")}]}),
+            store,
+            "test-surface",
+            MetadataRuntimeContext {
+                tenancy: crate::tenancy::SurfaceTenancy { tenant_id, mode },
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|resolved| resolved["nested"][0]["key"].clone())
+        .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_metadata_secret_resolves_only_within_the_surfaces_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = crate::secrets::test_support::tenant_secrets().await;
+
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(resolve_secret(&store, Some("tenant-a"), mode, "own").await, Ok(json!("own-value")));
+            assert_eq!(
+                resolve_secret(&store, Some("tenant-a"), mode, "other").await,
+                Err("Secret with secret_id 'other' not found".to_string()),
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve_secret(&store, Some("tenant-a"), mode, "missing").await,
+                Err("Secret with secret_id 'missing' not found".to_string()),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_surface_with_no_tenant_resolves_a_metadata_secret_of_any_tenant() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = crate::secrets::test_support::tenant_secrets().await;
+
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            for secret_id in ["own", "wide", "other"] {
+                assert_eq!(
+                    resolve_secret(&store, None, mode, secret_id).await,
+                    Ok(json!(format!("{secret_id}-value"))),
+                    "{mode:?}"
+                );
+            }
+            assert_eq!(
+                resolve_secret(&store, None, mode, "missing").await,
+                Err("Secret with secret_id 'missing' not found".to_string()),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_metadata_secret_resolves_on_a_tenant_surface_only_in_warn_mode() {
+        use crate::config::credential_policy::RuleMode;
+        let (_dir, store) = crate::secrets::test_support::tenant_secrets().await;
+
+        assert_eq!(resolve_secret(&store, Some("tenant-a"), RuleMode::Warn, "wide").await, Ok(json!("wide-value")));
+        assert_eq!(
+            resolve_secret(&store, Some("tenant-a"), RuleMode::Enforce, "wide").await,
+            Err("Secret with secret_id 'wide' not found".to_string())
+        );
+    }
+
     #[test]
     fn transit_token_and_authorization_are_never_forwarded() {
         // GW1-local headers must not cross to the upstream or to GW2.
@@ -1800,6 +1893,20 @@ mod tests {
         // Ordinary headers still forward.
         assert!(should_forward_request_header("Content-Type"));
         assert!(should_forward_request_header("X-Custom-Trace"));
+    }
+
+    #[test]
+    fn the_callers_cookies_are_never_forwarded() {
+        assert!(!should_forward_request_header("Cookie"));
+        assert!(!should_forward_request_header("cookie"));
+        assert!(should_forward_request_header("Cookie-Policy"));
+    }
+
+    #[test]
+    fn a_fabric_hop_count_is_never_forwarded_as_its_sender_sent_it() {
+        // Every Fabric send sets its own; a caller's, agent's or peer's never passes.
+        assert!(!should_forward_request_header("X-Gateway-Fabric-Hops"));
+        assert!(!should_forward_request_header("x-gateway-fabric-hops"));
     }
 
     // ── Identity binding issuer trust ────────────────────────────────────────

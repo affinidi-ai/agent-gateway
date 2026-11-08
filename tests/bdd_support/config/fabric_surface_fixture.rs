@@ -44,6 +44,11 @@ pub struct TransitPointSpec {
     pub target_endpoint: String,
     pub header_metadata_mapping: TransitPointHeaderMetadataMappingSpec,
     pub managed_identity_fields: Option<Vec<String>>,
+    /// The Transit Point requires the transit token its gateway gave the managed
+    /// agent; otherwise it is open to any caller unless it has `source_auth`.
+    pub require_transit_token: bool,
+    /// The Transit Point's own caller authentication.
+    pub source_auth: Option<SourceAuthSpec>,
 }
 
 impl TransitPointSpec {
@@ -58,6 +63,8 @@ impl TransitPointSpec {
             target_endpoint: target_endpoint.into(),
             header_metadata_mapping: Default::default(),
             managed_identity_fields: None,
+            require_transit_token: false,
+            source_auth: None,
         }
     }
 }

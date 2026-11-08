@@ -121,12 +121,12 @@ const surfaces = [
           identity_injection: { inject_vp: false },
           listen_path: '/transit/conformance-mcp',
           require_transit_token: false,
+          allow_unauthenticated_callers: true,
           ...mcpHttp(outbound),
         },
       ],
       outbound_listen_address: outbound,
       transit_token_mode: 'embedded',
-      sign_requests: false,
     },
   },
   {

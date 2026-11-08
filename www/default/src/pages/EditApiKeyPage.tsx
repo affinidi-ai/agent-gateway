@@ -105,10 +105,11 @@ const EditApiKeyPage: React.FC = () => {
   };
 
   return (
-    <div className="container-fluid">
+    <div className="container-fluid" data-testid="page-api-key-editor">
       <div className="mb-3">
         <button
           className="btn btn-sm btn-secondary"
+          data-testid="api-key-editor-back-button"
           onClick={() => navigate('/secrets')}
           disabled={isSaving}
         >
@@ -127,6 +128,7 @@ const EditApiKeyPage: React.FC = () => {
           <div>
             <button
               className="btn btn-sm btn-primary me-2"
+              data-testid="api-key-editor-create-button"
               onClick={handleSubmit as any}
               disabled={isSaving || !formData.agent_id.trim() || !formData.client_id.trim()}
             >
@@ -303,6 +305,7 @@ const EditApiKeyPage: React.FC = () => {
                   <div className="d-flex justify-content-between align-items-center">
                     <div>
                       <button
+                        data-testid="api-key-editor-submit-button"
                         type="submit"
                         className="btn btn-primary"
                         disabled={
@@ -328,6 +331,7 @@ const EditApiKeyPage: React.FC = () => {
                       <button
                         type="button"
                         className="btn btn-secondary ms-2"
+                        data-testid="api-key-editor-cancel-button"
                         onClick={() => navigate('/secrets')}
                       >
                         Cancel

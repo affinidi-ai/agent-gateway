@@ -104,7 +104,6 @@ rbac = "rbac.json"
 limits = "limits.json"
 saml = "saml.json"
 x402 = "x402.json"
-x402_proxy = "x402-proxy.json"
 agent_surface_templates_dir = "agent_surface_templates"
 
 # Storage paths
@@ -173,8 +172,8 @@ enable_sse = true
 enable_stdio = false
 fabric_gateway_timeout_ms = 5000
 
-# Reconnect policy for connection-point DIDComm links.
-# A broken connection is retried with exponential backoff up to
+# Reconnect policy for connection-point DIDComm links and trust registry
+# connections. A broken connection is retried with exponential backoff up to
 # max_backoff_seconds, then keeps retrying at that fixed interval.
 [reconnect_policy]
 # Initial delay after the first failed attempt (default: 30).
@@ -231,6 +230,7 @@ sdk_inbound_cache_bytes = 104857600  # 100 MiB
 level = "info"  # trace, debug, info, warn, error
 json = false    # Set to true for JSON-formatted logs
 log_directory = "../_storage/logs"  # Directory to write log files (logs to stdout only if not set)
+# Log redaction is set in gateway.json `logging.redaction`, not here. It is on by default.
 
 # Extension Inspection Configuration (optional)
 [extension_inspection]

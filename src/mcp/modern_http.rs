@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 
 use super::request_validation::{
     LegacySessionEvidence, McpMessageKind, McpRequestClassification, McpRequestValidationError, McpVersionPolicy,
-    recover_request_id, validate_mcp_post,
+    request_id_from_bytes, validate_mcp_post,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -169,16 +169,24 @@ impl EndpointHttpPolicy {
         &self,
         error: axum::Error,
     ) -> Box<McpRequestValidationError> {
-        if std::error::Error::source(&error).is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) {
+        if crate::proxy::exceeds_length_limit(&error) {
             BODY_TOO_LARGE.into_validation_error(None)
         } else {
-            HttpAdmissionError {
-                status: StatusCode::BAD_REQUEST,
-                message: "Failed to read MCP request body",
-            }
-            .into_validation_error(None)
+            BODY_READ_FAILED.into_validation_error(None)
         }
     }
+}
+
+/// The JSON-RPC error, with no id, an MCP endpoint answers a request body over
+/// its limit with.
+pub fn body_too_large_response() -> axum::response::Response {
+    BODY_TOO_LARGE.into_response(None)
+}
+
+/// The JSON-RPC error, with no id, an MCP endpoint answers a request body it
+/// could not read with.
+pub fn body_read_failed_response() -> axum::response::Response {
+    BODY_READ_FAILED.into_response(None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +241,10 @@ const BODY_TOO_LARGE: HttpAdmissionError = HttpAdmissionError {
     status: StatusCode::PAYLOAD_TOO_LARGE,
     message: "MCP request body exceeds the configured limit",
 };
+const BODY_READ_FAILED: HttpAdmissionError = HttpAdmissionError {
+    status: StatusCode::BAD_REQUEST,
+    message: "Failed to read MCP request body",
+};
 
 const NON_POST_BODY: HttpAdmissionError = HttpAdmissionError {
     status: StatusCode::BAD_REQUEST,
@@ -269,13 +281,8 @@ fn admit_post(
 ) -> Result<McpRequestClassification, Box<McpRequestValidationError>> {
     let transport_error = |error: HttpAdmissionError| {
         let id = (body.len() <= limits.max_request_bytes.get())
-            .then(|| serde_json::from_slice::<serde_json::Value>(body).ok())
-            .flatten()
-            .and_then(|value| {
-                value
-                    .as_object()
-                    .and_then(recover_request_id)
-            });
+            .then(|| request_id_from_bytes(body))
+            .flatten();
         error.into_validation_error(id)
     };
     validate_header_budget(headers, limits).map_err(transport_error)?;
@@ -833,12 +840,14 @@ mod tests {
         };
 
         assert_eq!(
-            policy.cap_legacy_initialize(initialize("2025-11-25"), &opening, "config", None),
+            policy.cap_legacy_initialize(initialize("2099-01-01"), &opening, "config", None),
             initialize(super::super::MCP_LEGACY_VERSION)
         );
 
-        let served = initialize(super::super::MCP_LEGACY_VERSION);
-        assert_eq!(policy.cap_legacy_initialize(served.clone(), &opening, "config", None), served);
+        for version in super::super::request_validation::SESSION_VERSIONS {
+            let served = initialize(version);
+            assert_eq!(policy.cap_legacy_initialize(served.clone(), &opening, "config", None), served);
+        }
 
         let session = McpRequestClassification::Legacy(LegacyRequestKind::Session);
         let tools_list = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#);
@@ -1190,7 +1199,7 @@ mod tests {
         assert_eq!(
             error.data,
             Some(
-                serde_json::json!({"requested": super::super::MCP_MODERN_VERSION, "supported": [super::super::MCP_LEGACY_VERSION]})
+                serde_json::json!({"requested": super::super::MCP_MODERN_VERSION, "supported": super::super::request_validation::SESSION_VERSIONS})
             )
         );
     }

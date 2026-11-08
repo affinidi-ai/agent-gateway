@@ -15,6 +15,10 @@ use tracing::{debug, warn};
 
 /// Input document passed to the response OPA policy.
 /// The Rego policy sees this as `input.*`.
+///
+/// Built with [`ResponsePolicyInput::new`], plus
+/// [`ResponsePolicyInput::for_transit_point`] on a Transit Point leg, so every
+/// call site gets a field added here.
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsePolicyInput {
     /// The upstream response body (JSON).
@@ -26,6 +30,46 @@ pub struct ResponsePolicyInput {
     /// Optional metadata carried forward from the request pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, Value>>,
+    /// The caller of a Transit Point call, as its request policies see it.
+    /// Set only for a Transit Point's response policy; undefined on the
+    /// inbound legs, where a negated rule on it is always true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transit: Option<crate::surface_context::TransitContext>,
+    /// The identity the Transit Point itself verified, as its request
+    /// policies see it. Set only for a Transit Point's response policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_auth: Option<crate::surface_context::SourceAuthContext>,
+}
+
+impl ResponsePolicyInput {
+    /// Input for a response policy on an inbound leg: no `transit` or
+    /// `source_auth`.
+    pub fn new(
+        response: ResponseContext,
+        caller: CallerContext,
+        surface: SurfaceContext,
+    ) -> Self {
+        Self {
+            response,
+            caller,
+            surface,
+            metadata: None,
+            transit: None,
+            source_auth: None,
+        }
+    }
+
+    /// Adds what a Transit Point's request policies see as `input.transit`
+    /// and `input.source_auth`.
+    pub fn for_transit_point(
+        mut self,
+        transit: crate::surface_context::TransitContext,
+        source_auth: Option<crate::surface_context::SourceAuthContext>,
+    ) -> Self {
+        self.transit = Some(transit);
+        self.source_auth = source_auth;
+        self
+    }
 }
 
 /// Response body context visible to the policy.
@@ -156,8 +200,8 @@ mod tests {
 
     #[test]
     fn test_response_policy_input_serializes() {
-        let input = ResponsePolicyInput {
-            response: ResponseContext {
+        let input = ResponsePolicyInput::new(
+            ResponseContext {
                 status_code: 200,
                 body: Some(serde_json::json!({
                     "jsonrpc": "2.0",
@@ -168,46 +212,80 @@ mod tests {
                 is_error: false,
                 method: Some("tools/list".to_string()),
             },
-            caller: CallerContext {
+            CallerContext {
                 did: Some("did:example:caller".to_string()),
                 identity_source: Some("gateway_computed".to_string()),
                 dna_uai: None,
             },
-            surface: SurfaceContext {
+            SurfaceContext {
                 id: "surf-001".to_string(),
                 name: "research-agent".to_string(),
                 protocol: "mcp".to_string(),
             },
-            metadata: None,
-        };
+        );
 
         let json = serde_json::to_value(&input).unwrap();
         assert_eq!(json["response"]["status_code"], 200);
         assert_eq!(json["caller"]["did"], "did:example:caller");
         assert_eq!(json["surface"]["protocol"], "mcp");
+        assert!(json.get("transit").is_none(), "an inbound leg has no input.transit");
+        assert!(
+            json.get("source_auth")
+                .is_none()
+        );
     }
 
     fn minimal_input() -> ResponsePolicyInput {
-        ResponsePolicyInput {
-            response: ResponseContext {
+        ResponsePolicyInput::new(
+            ResponseContext {
                 status_code: 200,
                 body: None,
                 content_type: None,
                 is_error: false,
                 method: None,
             },
-            caller: CallerContext {
+            CallerContext {
                 did: None,
                 identity_source: None,
                 dna_uai: None,
             },
-            surface: SurfaceContext {
+            SurfaceContext {
                 id: "surf-001".to_string(),
                 name: "research-agent".to_string(),
                 protocol: "mcp".to_string(),
             },
-            metadata: None,
-        }
+        )
+    }
+
+    #[test]
+    fn a_negated_transit_rule_is_true_on_an_inbound_leg() {
+        // Documents why `not input.transit.caller.verified` must not be used
+        // in a response policy shared with the inbound legs.
+        let manager = crate::policies::SurfacePolicyManager::new();
+        manager
+            .load_policy_text(
+                "response:surf-001",
+                "package surface.policy\n\ndefault allow := false\n\nallow if {\n    not input.transit.caller.verified\n}\n",
+            )
+            .unwrap();
+
+        let decision = evaluate_response_policy(&manager, "response:surf-001", minimal_input());
+
+        assert!(decision.allow);
+    }
+
+    #[test]
+    fn a_transit_point_input_carries_transit() {
+        let input = minimal_input().for_transit_point(
+            crate::surface_context::TransitContext {
+                caller: crate::surface_context::TransitCallerContext::anonymous(),
+                client: None,
+            },
+            None,
+        );
+
+        let json = serde_json::to_value(&input).unwrap();
+        assert_eq!(json["transit"]["caller"]["verified"], false);
     }
 
     #[test]

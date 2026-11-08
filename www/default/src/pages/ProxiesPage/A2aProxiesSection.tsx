@@ -150,6 +150,7 @@ const A2aProxiesSection: React.FC<A2aProxiesSectionProps> = ({
                         )}
                         {canDelete && (
                           <DeleteButton
+                            data-testid={`a2a-proxy-delete-button-${proxy.id}`}
                             onDelete={() => onDelete(proxy.id)}
                             className="btn-sm"
                             title="Delete A2A Proxy"

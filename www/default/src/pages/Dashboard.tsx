@@ -18,6 +18,7 @@ import {
   BarElement,
 } from 'chart.js';
 import { useApp } from '../context/AppContext';
+import { usePermissions } from '../context/PermissionsContext';
 import StatCard from '../components/StatCard';
 import ChartCard from '../components/ChartCard';
 import IdentityDetailsModal from '../components/IdentityDetailsModal';
@@ -100,6 +101,7 @@ ChartJS.register(
 
 const Dashboard: React.FC = () => {
   const { state, actions, getCurrentStats } = useApp();
+  const { hasPermission } = usePermissions();
   const navigate = useNavigate();
   const [showDidModal, setShowDidModal] = useState(false);
   const [didDocument, setDidDocument] = useState<any>(null);
@@ -200,15 +202,6 @@ const Dashboard: React.FC = () => {
     }
   };
 
-  // Debug: Log when dashboard stats change
-  useEffect(() => {
-    // console.log('Dashboard stats updated:', {
-    //   totalConnections: stats?.metrics?.total_connections,
-    //   timeSeriesLength: stats?.metrics?.time_series?.length,
-    //   latestPoint: stats?.metrics?.time_series?.[stats.metrics.time_series.length - 1]
-    // });
-  }, [stats?.metrics]);
-
   // Prepare connections chart data - memoized to avoid recalculating on every render
   const connectionsChartData = useMemo(() => {
     if (!stats?.metrics?.time_series) {
@@ -285,7 +278,6 @@ const Dashboard: React.FC = () => {
   // Prepare channel distribution chart data
   const getChannelDistributionData = () => {
     if (!stats?.channels || stats.channels.length === 0) {
-      //console.log('Channel Distribution: No channels data', { hasStats: !!stats, channelsLength: stats?.channels?.length });
       return { labels: [], datasets: [] };
     }
 
@@ -311,14 +303,6 @@ const Dashboard: React.FC = () => {
       .filter(ch => ch.activityValue > 0) // Only show channels with data
       .sort((a, b) => b.activityValue - a.activityValue) // Most active first
       .slice(0, 10); // Maximum 10 channels
-
-    // console.log('Channel Distribution Data:', {
-    //   totalChannels: channelData.length,
-    //   displayedChannels: sortedChannels.length,
-    //   totalConnections,
-    //   hasTraffic,
-    //   channels: sortedChannels
-    // });
 
     const colors = CHART_PALETTE;
 
@@ -928,6 +912,7 @@ const Dashboard: React.FC = () => {
           title="Aggregated Connections Over Time"
           headerActions={
             <Form.Select
+              data-testid="dashboard-bucket-select"
               aria-label="Select time interval for aggregated connections chart"
               className="form-control form-control-sm dropdown-styling"
               style={{ width: 'auto' }}
@@ -988,6 +973,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'pie' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-pie-button"
                   onClick={() => setChannelChartView('pie')}
                 >
                   Pie
@@ -995,6 +981,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'bar' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-bar-button"
                   onClick={() => setChannelChartView('bar')}
                 >
                   Bar
@@ -1002,6 +989,7 @@ const Dashboard: React.FC = () => {
                 <button
                   type="button"
                   className={`btn btn-outline-primary ${channelChartView === 'connections' ? 'active' : ''}`}
+                  data-testid="dashboard-chart-connections-button"
                   onClick={() => setChannelChartView('connections')}
                 >
                   Connections
@@ -1113,17 +1101,21 @@ const Dashboard: React.FC = () => {
                 <i className="fas fa-cog"></i> Gateway Configuration
               </h6>
               <div className="d-flex align-items-center gap-2">
-                <DeleteButton
-                  onDelete={async () => {
-                    await actions.truncateMetrics();
-                  }}
-                  title="Clear all stored metrics data"
-                  variant="danger"
-                >
-                  Delete
-                </DeleteButton>
+                {hasPermission('settings.edit') && (
+                  <DeleteButton
+                    onDelete={async () => {
+                      await actions.truncateMetrics();
+                    }}
+                    data-testid="dashboard-metrics-delete-button"
+                    title="Clear all stored metrics data"
+                    variant="danger"
+                  >
+                    Delete
+                  </DeleteButton>
+                )}
                 <button
                   className="btn btn-sm btn-outline-primary"
+                  data-testid="dashboard-logs-button"
                   onClick={() => navigate('/logs')}
                   title="View system logs"
                 >
@@ -1131,6 +1123,7 @@ const Dashboard: React.FC = () => {
                 </button>
                 <button
                   className="btn btn-sm btn-outline-primary"
+                  data-testid="dashboard-settings-button"
                   onClick={() => navigate('/settings')}
                   title="Configure dashboard settings"
                 >
