@@ -177,6 +177,23 @@ changes:
         inventory cannot be read; it reports the problem in its own tab.
   removed: []
   security:
+    - timestamp: '2026-11-09T00:00:00Z'
+      title: Refuse a surface that signs through another tenant's trust agent
+      description: >-
+        A surface's signing.connection_id (and each variant's) must now name a
+        trust agent connection its own tenant owns, or an appliance-wide one.
+        Before, only the connection record was tenant-checked, so a tenant
+        could point its surface at another tenant's connection and have its
+        tokens signed with that tenant's key. A connection that does not exist
+        is refused the same way, so the answer does not reveal which ids exist.
+    - timestamp: '2026-11-09T00:05:00Z'
+      title: Fail closed when a surface's mapped trust agent key is unavailable
+      description: >-
+        When the trust agent key a surface (or its variant or tenant) maps could
+        not be resolved, credential issuance used to log a warning and sign
+        with the appliance key, changing the issuer under callers and handing a
+        tenant's tokens to the operator's key. It now refuses. A surface that
+        maps nothing of its own still signs with the appliance key as before.
     - timestamp: '2026-11-08T10:10:00Z'
       title: Name a trust-agent context's identity only from a key it holds
       description: >-

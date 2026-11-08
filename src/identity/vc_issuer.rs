@@ -300,15 +300,17 @@ impl VCIssuer {
     /// signing with exactly the key it used before, which is what makes
     /// installing the directory a no-op for every existing deployment.
     ///
-    /// A resolution **failure** is logged and falls back rather than failing
-    /// the request: the mapping was already validated at startup, so a failure
-    /// here is a transient backend problem, and refusing to issue an identity
-    /// because an optional override is unreachable would take the surface down
-    /// over something it worked without yesterday.
+    /// A resolution **failure** falls back only for a surface that **maps
+    /// nothing of its own**: it signs with the appliance key either way, so the
+    /// fallback is the same key it always used. A surface with an explicit
+    /// mapping (its own `signing` block, a variant's, or its tenant's) fails
+    /// closed instead. Someone chose whose key signs there, and when that key
+    /// cannot be reached, signing with another would change the issuer under
+    /// callers' feet, or hand a tenant's tokens to the operator's key.
     async fn authority_for_surface(
         &self,
         surface_id: Option<&str>,
-    ) -> Option<Arc<dyn crate::identity::authority::CredentialAuthority>> {
+    ) -> Result<Option<Arc<dyn crate::identity::authority::CredentialAuthority>>> {
         let appliance = self
             .signing_authority
             .read()
@@ -325,7 +327,7 @@ impl VCIssuer {
             .await
             .clone()
         else {
-            return appliance;
+            return Ok(appliance);
         };
 
         let scope = match surface_id {
@@ -345,15 +347,30 @@ impl VCIssuer {
             Err(e) => Err(e),
         };
         match resolved {
-            Ok(authority) => Some(authority),
+            Ok(authority) => Ok(Some(authority)),
             Err(e) => {
+                if directory
+                    .has_explicit_mapping(purpose, &scope)
+                    .await
+                {
+                    warn!(
+                        target: "vta_audit",
+                        surface_id = surface_id.unwrap_or("<appliance-wide>"),
+                        error = %e.log_detail(),
+                        "the signing key this surface maps could not be resolved; refusing to sign with another",
+                    );
+                    return Err(anyhow::anyhow!(
+                        "the trust agent key this surface signs with is not available ({e}); \
+                         it is not replaced by the appliance key"
+                    ));
+                }
                 warn!(
                     target: "vta_audit",
                     surface_id = surface_id.unwrap_or("<appliance-wide>"),
                     error = %e.log_detail(),
                     "signing key could not be resolved; falling back to the appliance key",
                 );
-                appliance
+                Ok(appliance)
             }
         }
     }
@@ -1332,7 +1349,7 @@ impl VCIssuer {
         // narrowed to this surface's own key when one is mapped (VTA-19).
         let authority = self
             .authority_for_surface(surface_id)
-            .await;
+            .await?;
 
         // Clone what signing needs and release the config lock before any
         // `.await` on the authority — the local connector re-enters this same

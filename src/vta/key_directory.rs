@@ -856,6 +856,38 @@ impl KeyDirectory {
             .unwrap_or_else(|| KeyRef::local(purpose))
     }
 
+    /// Whether `scope` has a mapping of its own: a variant, surface or tenant
+    /// mapping, or a `signing` block on the surface itself. The appliance default
+    /// and the local key are what *everything* resolves to, so they do not count.
+    ///
+    /// An explicit mapping is a decision somebody made about whose key signs
+    /// here. When that key cannot be reached, signing with a different one is
+    /// not a graceful degradation: it changes the issuer under callers' feet and
+    /// can hand a tenant's tokens to the operator's key.
+    pub async fn has_explicit_mapping(
+        &self,
+        purpose: KeyPurpose,
+        scope: &KeyScope,
+    ) -> bool {
+        if self
+            .live_surface_ref(purpose, scope)
+            .await
+            .is_some()
+        {
+            return true;
+        }
+        self.mappings
+            .iter()
+            .filter(|m| m.purpose == purpose)
+            .any(|m| match &m.scope {
+                MappingScope::Variant { surface_id, variant_id } => {
+                    scope.surface_id.as_deref() == Some(surface_id) && scope.variant_id.as_deref() == Some(variant_id)
+                }
+                MappingScope::Surface { surface_id } => scope.surface_id.as_deref() == Some(surface_id),
+                MappingScope::Tenant { tenant_id } => scope.tenant_id.as_deref() == Some(tenant_id),
+            })
+    }
+
     /// [`Self::resolve`], plus **lazy context provisioning** (VTA-19).
     ///
     /// A VTA-backed key that names no context has one derived from the scope's
@@ -2276,5 +2308,53 @@ mod tests {
             .await
             .unwrap();
         assert!(!Arc::ptr_eq(&local, &authority), "an enabled block must resolve the VTA connector");
+    }
+
+    #[tokio::test]
+    async fn an_unmapped_scope_has_no_explicit_mapping_so_it_may_fall_back() {
+        let mut dir = directory_with(None);
+        dir.defaults
+            .insert(KeyPurpose::Jwt, vta_jwt_ref("appliance-key"));
+
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("s1"))
+                .await,
+            "the appliance default is what everything resolves to, not a mapping"
+        );
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::default())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_tenant_or_variant_mapping_is_explicit_only_for_its_own_scope() {
+        let mut dir = directory_with(None)
+            .with_tenant_mapping("tenant-a", vta_jwt_ref("tenant-key"))
+            .unwrap();
+        dir.push_surface_mapping("surface-1", vta_jwt_ref("surface-key"))
+            .unwrap();
+
+        assert!(
+            dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::tenant("tenant-a"))
+                .await
+        );
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::tenant("tenant-b"))
+                .await
+        );
+        assert!(
+            dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("surface-1"))
+                .await
+        );
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Jwt, &KeyScope::surface("surface-2"))
+                .await
+        );
+        assert!(
+            !dir.has_explicit_mapping(KeyPurpose::Credential, &KeyScope::surface("surface-1"))
+                .await,
+            "a mapping for one purpose says nothing about another"
+        );
     }
 }
