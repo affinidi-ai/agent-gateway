@@ -103,6 +103,8 @@ pub struct SurfaceWorld {
     pub admin_client: Option<AdminApiClient>,
     pub created_surface_id: Option<String>,
     pub surface_under_test_id: Option<String>,
+    /// Trust agent connection ids the gateway assigned, by the name a scenario gave them.
+    pub trust_agent_connections: HashMap<String, String>,
     pub admin_response: Option<RecordedResponse>,
     /// The delegation audit trail as last read through the admin API.
     pub delegation_audit_trail: Option<RecordedResponse>,
@@ -176,6 +178,7 @@ impl SurfaceWorld {
             admin_client: None,
             created_surface_id: None,
             surface_under_test_id: None,
+            trust_agent_connections: HashMap::new(),
             admin_response: None,
             delegation_audit_trail: None,
             surface_lookup_response: None,
