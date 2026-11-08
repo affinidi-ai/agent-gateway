@@ -444,6 +444,16 @@ then
   else
     echo "✅ gateway.json integration categories and types already include the example's"
   fi
+
+  # Older examples shipped a `payments` channel on `/payments`, which the
+  # dashboard's Payments page now owns; the gateway refuses to start with it.
+  payments_channel_filter='.channels[]? | select((.prefix // "") | ascii_downcase | ltrimstr("/") | split("/")[0] == "payments")'
+  if jq -e "any(${payments_channel_filter}; true)" "${gateway_json}" >/dev/null; then
+    removed=$(jq -r "${payments_channel_filter} | .prefix" "${gateway_json}" | paste -sd ' ' -)
+    updated=$(jq '.channels |= map(select((.prefix // "") | ascii_downcase | ltrimstr("/") | split("/")[0] != "payments"))' "${gateway_json}")
+    printf '%s\n' "${updated}" > "${gateway_json}"
+    echo "✅ gateway.json channel removed because the dashboard Payments page owns /payments: ${removed}"
+  fi
 fi
 
 if [[ ! -f "${target_dir}/config/metrics.json" ]]

@@ -2,7 +2,20 @@ branch: fix/agent-pay-gate-answers
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Remove the old /payments channel from local envs on make run-debug
+      description: >-
+        Local envs prepared from older example configs kept a `payments` channel on `/payments`,
+        which the dashboard's Payments page owns, so the gateway refused to start. Preparing an
+        existing local or Docker env now removes a channel on `/payments` from its `gateway.json`
+        and names the prefix it removed.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Refuse to start when an MCP proxy or redirect route hides a dashboard page
+      description: >-
+        The startup check that stops a channel or proxy route from shadowing a dashboard page now
+        also covers `mcp_proxies` prefixes and `redirect` routes, which are registered ahead of the
+        dashboard in the same way.
   removed: []
   security:
     - timestamp: '2026-11-06T16:30:00Z'

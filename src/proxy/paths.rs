@@ -438,7 +438,7 @@ fn first_segment(prefix: &str) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
-/// Validate that no channel / proxy / pipe prefix collides with a top-level
+/// Validate that no channel / MCP proxy / proxy / redirect prefix collides with a top-level
 /// SPA route. Channel routes are merged into the same router as the SPA's
 /// fallback `ServeDir`, and explicit channel routes win — a collision
 /// silently breaks the dashboard page with a proxy 404.
@@ -476,9 +476,10 @@ pub fn spa_collision_banner(collisions: &[(String, String)]) -> String {
          dashboard routes. Starting in this state would replace\n\
          dashboard pages with proxy 404s, so the server is exiting.\n\n\
          Collisions:\n{detail}\n\n\
-         Fix: rename each offending prefix (a channel's `prefix`, or the\n\
-         `prefix` of a proxy route, in your gateway.json) to one that is\n\
-         not a dashboard page, e.g. '/svc/<name>', and restart. The\n\
+         Fix: rename each offending prefix (a channel's or MCP proxy's\n\
+         `prefix`, or the `prefix` of a proxy or redirect route, in your\n\
+         gateway.json) to one that is not a dashboard page, e.g.\n\
+         '/svc/<name>', and restart. The\n\
          dashboard's Payments page owns '/payments', so a channel on\n\
          '/payments' must be renamed; clients that call it must use the\n\
          new prefix.\n\
@@ -778,7 +779,36 @@ mod tests {
         ))
         .expect("the shipped example config loads");
         assert!(!config.channels.is_empty(), "the example offers channel prefixes");
-        assert_eq!(check_spa_route_collisions(config.proxy_prefixes()), Vec::<(String, String)>::new());
+        assert_eq!(check_spa_route_collisions(config.dashboard_shadowing_prefixes()), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn an_mcp_proxy_or_redirect_route_on_a_dashboard_page_is_a_collision() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "mcp_proxies": [
+                { "id": "mcp", "name": "mcp", "prefix": "/mcp" },
+                { "id": "policies", "name": "policies", "prefix": "/policies" }
+            ],
+            "routes": {
+                "legacy": { "type": "redirect", "prefix": "/settings", "target": "/new" }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        let mut hits = check_spa_route_collisions(config.dashboard_shadowing_prefixes());
+        hits.sort_unstable();
+        assert_eq!(
+            hits,
+            vec![
+                ("/policies".to_string(), "/policies".to_string()),
+                ("/settings".to_string(), "/settings".to_string()),
+            ]
+        );
     }
 
     #[test]
