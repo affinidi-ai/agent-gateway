@@ -139,7 +139,8 @@ async fn validate_target_auth_methods(
 ///   route, and that resource is permitted for the provider's issuer. A
 ///   Transit Point's target may instead be `proxy://<id>`, an MCP Proxy of the
 ///   surface's tenant, served only through surfaces, whose `base_url` has that
-///   origin, and the binding is pinned to that proxy as it is now
+///   origin and whose spec sends no method override header, and the binding is
+///   pinned to that proxy as the write and the stored surface say
 ///   ([`pin_mcp_proxy_grants`]).
 /// - Every `proxy://` Transit Point, with such a binding or without, speaks
 ///   MCP and sends its backend no credential but that binding's grant, in a
@@ -152,15 +153,22 @@ async fn validate_target_auth_methods(
 ///   `outbound_credentials` or one variant's.
 /// - At-rest encryption is active and the identity hash pepper is configured,
 ///   since its grants are kept only then.
+///
+/// `surface` holds the `mcp_proxy_pin`s the write sent, and no other: a write
+/// that starts from the stored surface (a merge `PATCH`, a variant change, a
+/// tenant transfer) clears the stored pins first
+/// ([`forget_mcp_proxy_pins`]). `stored` is the surface as stored, `None` for
+/// a new one.
 pub async fn validate_external_consent_bindings(
     state: &IdentityApiState,
     surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
 ) -> Result<(), SurfaceApiError> {
     let proxies = state
         .mcp_proxy_store
         .as_deref()
         .map(|store| store as &dyn McpProxyStore);
-    pin_mcp_proxy_grants(surface, proxies).await;
+    pin_mcp_proxy_grants(surface, stored, proxies).await?;
     check_external_consent_bindings(
         state
             .credential_provider_store
@@ -182,53 +190,220 @@ pub async fn validate_external_consent_bindings(
     .await
 }
 
-/// Pin each `consent_mode: external` binding of a `proxy://` Transit Point,
-/// on the surface and in each variant's overrides, to that MCP Proxy as it is
-/// now: its [`crate::mcp_proxies::types::McpProxy::grant_pin`], which a grant
-/// through the proxy must still match when it is released and when it is sent
-/// ([`crate::credential_providers::external::check_proxy_pin`]). Every other
-/// binding's pin is cleared, and so is whatever pin the write sent: only the
-/// gateway sets one. A missing proxy gets none, and the save is refused by the
-/// checks that follow.
+/// The code of a surface save refused because a `proxy://` Transit Point
+/// binding's `mcp_proxy_pin` is not its MCP Proxy's current `grant_pin`.
+pub const MCP_PROXY_PIN_NOT_CURRENT: &str = "mcp_proxy_pin_not_current";
+
+/// The id of the MCP Proxy `point` sends a `consent_mode: external` grant
+/// through, when its target is `proxy://<id>` and it has such a binding: the
+/// bindings that are pinned.
+fn pinned_proxy_id(point: &crate::config::agent_surface::TransitPoint) -> Option<String> {
+    point
+        .transit_credentials
+        .as_ref()
+        .filter(|binding| binding.is_external())
+        .and_then(|_| crate::mcp_proxies::types::transit_proxy_id(&point.target_endpoint))
+        .map(str::to_string)
+}
+
+/// Settle the pin of each `consent_mode: external` binding of a `proxy://`
+/// Transit Point, on the surface and in each variant's overrides: the
+/// [`crate::mcp_proxies::types::McpProxy::grant_pin`] its MCP Proxy must still
+/// have for the Transit Point to answer through it and send the grant
+/// ([`crate::credential_providers::external::check_proxy_pin`]). A pin is a
+/// value the gateway computed, never one a write chose. `surface` holds the
+/// pins the write sent, `stored` the surface as stored:
 ///
-/// A save that changes nothing, of the surface or of the proxy, sets the pin
-/// it had, so a client that saves the proxy, then the surface, on every push
-/// changes neither.
+/// - A pin the write sent must be the proxy's current `grant_pin`, which every
+///   MCP Proxy answer carries, and is kept. So a client that writes the proxy,
+///   then the surface with the pin the proxy write answered, pins exactly the
+///   proxy it wrote, or is refused if the proxy changed in between. Any other
+///   pin is refused, naming the Transit Point: `400` with the code
+///   [`MCP_PROXY_PIN_NOT_CURRENT`].
+/// - With none sent, the binding keeps the pin stored for it: that of the
+///   stored binding of the Transit Point of the same id through the same
+///   proxy. So a save made for another reason never approves an edit to the
+///   proxy: a kept pin the proxy no longer has leaves the Transit Point
+///   refused until a save sends the proxy's current pin.
+/// - A binding with no pin stored, a new one, is pinned to the proxy as it is
+///   now.
+///
+/// Only a proxy of the surface's own tenant is compared or pinned: a missing
+/// proxy and another tenant's get no pin, alike, and the checks that follow
+/// refuse the save. Every other binding's pin is cleared.
 pub(crate) async fn pin_mcp_proxy_grants(
     surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
     proxies: Option<&dyn McpProxyStore>,
-) {
-    let pinned_proxy = |point: &crate::config::agent_surface::TransitPoint| {
-        point
-            .transit_credentials
-            .as_ref()
-            .filter(|binding| binding.is_external())
-            .and_then(|_| crate::mcp_proxies::types::transit_proxy_id(&point.target_endpoint))
-            .map(str::to_string)
-    };
+) -> Result<(), SurfaceApiError> {
     let mut ids: Vec<String> = all_transit_points(surface)
         .into_iter()
-        .filter_map(pinned_proxy)
+        .filter_map(pinned_proxy_id)
         .collect();
     ids.sort_unstable();
     ids.dedup();
-    let mut pins = std::collections::HashMap::with_capacity(ids.len());
+    let mut current = std::collections::HashMap::with_capacity(ids.len());
     if let Some(store) = proxies {
         for id in ids {
-            if let Ok(Some(proxy)) = store.get(&id).await {
-                pins.insert(id, proxy.grant_pin());
+            if let Ok(Some(proxy)) = store.get(&id).await
+                && proxy.tenant_id == surface.tenant_id
+            {
+                current.insert(id, proxy.grant_pin());
             }
         }
     }
+    let kept: std::collections::HashMap<(String, String), String> = stored
+        .map(all_transit_points)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|point| {
+            let proxy = pinned_proxy_id(point)?;
+            let pin = point
+                .transit_credentials
+                .as_ref()?
+                .mcp_proxy_pin
+                .clone()?;
+            Some(((point.id.clone(), proxy), pin))
+        })
+        .collect();
+    for (prefix, points) in transit_point_lists_mut(surface) {
+        for (index, point) in points.iter_mut().enumerate() {
+            let proxy = pinned_proxy_id(point);
+            let (id, alias) = (point.id.clone(), point.alias.clone());
+            let Some(binding) = point
+                .transit_credentials
+                .as_mut()
+            else {
+                continue;
+            };
+            let sent = binding.mcp_proxy_pin.take();
+            let Some(proxy) = proxy else {
+                continue;
+            };
+            let now = current.get(&proxy);
+            binding.mcp_proxy_pin = match (sent, now) {
+                (Some(sent), Some(now)) if sent == *now => Some(sent),
+                (Some(_), Some(_)) => {
+                    return Err(SurfaceApiError::BadRequestCode(
+                        MCP_PROXY_PIN_NOT_CURRENT,
+                        format!(
+                            "{prefix}transit.points[{index}] ('{alias}'): transit_credentials.mcp_proxy_pin is not the \
+                             current grant_pin of the MCP Proxy '{proxy}'. Send the grant_pin the MCP Proxy answers \
+                             with now to pin the binding to the proxy as it is, or leave mcp_proxy_pin out to keep \
+                             the pin stored"
+                        ),
+                    ));
+                }
+                (Some(_), None) => None,
+                (None, now) => kept
+                    .get(&(id, proxy))
+                    .or(now)
+                    .cloned(),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The Transit Point lists of `surface`, to change: its own, then each
+/// variant's overrides', each with the prefix that names it in a refusal.
+fn transit_point_lists_mut(
+    surface: &mut AgentSurface
+) -> Vec<(String, &mut Vec<crate::config::agent_surface::TransitPoint>)> {
+    let variants = surface
+        .variants
+        .iter_mut()
+        .filter_map(|variant| {
+            let prefix = format!("variant '{}' ", variant.alias);
+            variant
+                .overrides
+                .transit
+                .as_mut()
+                .and_then(|transit| transit.points.as_mut())
+                .map(|points| (prefix, points))
+        });
+    surface
+        .transit
+        .as_mut()
+        .map(|transit| (String::new(), &mut transit.points))
+        .into_iter()
+        .chain(variants)
+        .collect()
+}
+
+/// Clear the `mcp_proxy_pin` of every Transit Point binding of `surface`, its
+/// own and each variant's. A write that starts from the stored surface clears
+/// them before it applies what the request sent, so that only a pin the
+/// request itself sent is compared with the proxy's, and every other binding
+/// keeps its stored pin ([`pin_mcp_proxy_grants`]).
+pub(crate) fn forget_mcp_proxy_pins(surface: &mut AgentSurface) {
     for point in all_transit_points_mut(surface) {
-        let pin = pinned_proxy(point).and_then(|id| pins.get(&id).cloned());
         if let Some(binding) = point
             .transit_credentials
             .as_mut()
         {
-            binding.mcp_proxy_pin = pin;
+            binding.mcp_proxy_pin = None;
         }
     }
+}
+
+/// [`forget_mcp_proxy_pins`] for one variant's own Transit Points.
+pub(crate) fn forget_variant_mcp_proxy_pins(variant: &mut crate::config::agent_surface_variants::SurfaceVariant) {
+    for point in variant
+        .overrides
+        .transit
+        .iter_mut()
+        .filter_map(|transit| transit.points.as_mut())
+        .flatten()
+    {
+        if let Some(binding) = point
+            .transit_credentials
+            .as_mut()
+        {
+            binding.mcp_proxy_pin = None;
+        }
+    }
+}
+
+/// A warning for each `proxy://` Transit Point of `surface`, on the surface or
+/// in a variant, whose binding kept a pin its MCP Proxy no longer has: the
+/// proxy changed after the pin was taken, and the Transit Point is refused
+/// until a save sends the proxy's current `grant_pin`.
+pub(crate) async fn stale_mcp_proxy_pin_warnings(
+    proxies: Option<&dyn McpProxyStore>,
+    surface: &AgentSurface,
+) -> Vec<String> {
+    let Some(store) = proxies else {
+        return Vec::new();
+    };
+    let mut warnings = Vec::new();
+    for point in all_transit_points(surface) {
+        let Some(proxy_id) = pinned_proxy_id(point) else {
+            continue;
+        };
+        let Ok(Some(proxy)) = store.get(&proxy_id).await else {
+            continue;
+        };
+        let pin = point
+            .transit_credentials
+            .as_ref()
+            .and_then(|binding| {
+                binding
+                    .mcp_proxy_pin
+                    .as_deref()
+            });
+        if proxy.tenant_id == surface.tenant_id
+            && crate::credential_providers::external::check_proxy_pin(&proxy, pin).is_err()
+        {
+            warnings.push(format!(
+                "Transit Point '{}': its MCP Proxy '{proxy_id}' has changed since its grant binding was pinned, so \
+                 the Transit Point answers nothing and sends no grant through it until a save sends the proxy's \
+                 current grant_pin as transit_credentials.mcp_proxy_pin",
+                point.alias
+            ));
+        }
+    }
+    warnings
 }
 
 /// Every Transit Point of `surface`: its own and those of each variant's
@@ -523,8 +698,10 @@ impl GrantRules<'_> {
     /// `destination`, the origin of its permitted `resource`, under an issuer
     /// the operator permits; a Transit Point's `proxy://` destination is an MCP
     /// Proxy of the surface's tenant, served only through surfaces, whose
-    /// `base_url` has that origin, and which is still the proxy the binding
-    /// was just pinned to.
+    /// `base_url` has that origin and whose spec sends no method override
+    /// header. Its pin is not compared here: [`pin_mcp_proxy_grants`] settled
+    /// it, and a pin kept that the proxy no longer has refuses the Transit
+    /// Point when it is called, not the save.
     async fn check(
         &self,
         provider_id: &str,
@@ -558,10 +735,12 @@ impl GrantRules<'_> {
         }
         match destination {
             GrantTarget::AccessPointTarget(endpoint) => {
-                crate::credential_providers::external::check_grant_destination(&provider, endpoint, None).await
+                crate::credential_providers::external::check_grant_destination(&provider, endpoint, None)
+                    .await
+                    .map(|_| ())
             }
             GrantTarget::TransitPoint { endpoint, proxy_pin } => {
-                crate::credential_providers::external::check_transit_grant_destination(
+                match crate::credential_providers::external::check_transit_grant_destination(
                     &provider,
                     endpoint,
                     proxy_pin,
@@ -570,6 +749,19 @@ impl GrantRules<'_> {
                     None,
                 )
                 .await
+                {
+                    // Every other check passed. The save settled the pin: one
+                    // the write sent is the proxy's, and a new binding's is
+                    // the proxy's, so only a pin kept from the stored binding
+                    // can differ. The proxy changed after it was taken, and
+                    // the Transit Point stays refused until a save sends the
+                    // proxy's current pin; a save for another reason goes
+                    // through.
+                    Ok(_) | Err(crate::credential_providers::external::PROXY_CHANGED) => {
+                        crate::credential_providers::external::check_transit_grant_spec(endpoint, self.proxies).await
+                    }
+                    Err(refused) => Err(refused),
+                }
             }
         }
         .map_err(refuse)?;
@@ -4171,7 +4363,9 @@ mod tests {
         storage: GrantStorage,
         proxies: Option<&dyn McpProxyStore>,
     ) -> Result<(), String> {
-        pin_mcp_proxy_grants(&mut surface, proxies).await;
+        pin_mcp_proxy_grants(&mut surface, None, proxies)
+            .await
+            .expect("a new binding is pinned");
         check_external_consent_bindings(
             Some(providers),
             &surface,
@@ -4364,75 +4558,203 @@ mod tests {
         );
     }
 
-    /// A save pins each `proxy://` Transit Point's external binding, on the
-    /// surface and in a variant, to its MCP Proxy as it is then, whatever pin
-    /// the write sent, and clears the pin of every other binding. A save that
-    /// changes nothing sets the same pin. A binding checked against a proxy
-    /// edited since it was pinned is refused until it is pinned again.
+    /// The `mcp_proxy_pin` of every Transit Point binding of `surface`, its
+    /// own, then each variant's.
+    fn pins(surface: &AgentSurface) -> Vec<Option<String>> {
+        all_transit_points(surface)
+            .into_iter()
+            .map(|point| {
+                point
+                    .transit_credentials
+                    .as_ref()
+                    .and_then(|binding| binding.mcp_proxy_pin.clone())
+            })
+            .collect()
+    }
+
+    /// `binding` with the pin `pin`, as a write sends it.
+    fn sending_pin(
+        mut binding: serde_json::Value,
+        pin: &str,
+    ) -> serde_json::Value {
+        binding["mcp_proxy_pin"] = serde_json::json!(pin);
+        binding
+    }
+
+    /// The code and message of a refused save.
+    fn refusal(refused: Result<(), SurfaceApiError>) -> (&'static str, String) {
+        match refused {
+            Err(SurfaceApiError::BadRequestCode(code, message)) => (code, message),
+            other => panic!("expected a 400 with a code, got {other:?}"),
+        }
+    }
+
+    /// A new binding, on the surface or in a variant, is pinned to its MCP
+    /// Proxy as it is now; a pin the write sends is kept when it is the
+    /// proxy's current `grant_pin`, and any other is refused with a message
+    /// that names the Transit Point and the proxy, never the proxy's spec. A
+    /// pin sent for an `https` Transit Point is dropped. A pin sent for another
+    /// tenant's proxy is not compared with it: it is refused as a missing
+    /// proxy is, so the save tells nothing of that proxy.
     #[tokio::test]
-    async fn a_save_pins_each_proxy_grant_to_its_mcp_proxy_as_it_is_then() {
-        use crate::credential_providers::external::PROXY_CHANGED;
+    async fn a_save_pins_a_new_binding_and_keeps_a_sent_pin_only_when_it_is_the_proxys_current_one() {
+        use crate::credential_providers::external::PROXY_UNAVAILABLE;
         let directory = tempfile::tempdir().unwrap();
         let providers = providers_with(&directory).await;
         let proxies = grant_proxies(&directory).await;
-        let storage = GrantStorage {
-            encrypted: true,
-            stable_ids: true,
+        let mut drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        drive.openapi_spec = "openapi: 3.0.0 # the spec-text-7d1e".into();
+        proxies
+            .update(&drive)
+            .await
+            .unwrap();
+        let current = drive.grant_pin();
+        assert!(
+            current.starts_with("sha256:")
+                && current.len() == 71
+                && current[7..]
+                    .chars()
+                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
+            "{current}"
+        );
+
+        let https_point = {
+            let mut point = vendor_point(sending_pin(external("external-a", Some("owner")), "sha256:chosen"));
+            point["id"] = serde_json::json!("tp-2");
+            point
         };
-        let mut sent = external("external-a", Some("owner"));
-        sent["mcp_proxy_pin"] = serde_json::json!("sha256:chosen-by-the-writer");
-        let mut https_point = vendor_point(external("external-a", Some("owner")));
-        https_point["id"] = serde_json::json!("tp-2");
-        https_point["alias"] = serde_json::json!("vendor");
-        https_point["transit_credentials"]["mcp_proxy_pin"] = serde_json::json!("sha256:chosen-by-the-writer");
         let mut variant_point = proxy_point("drive", external("external-a", Some("owner")));
         variant_point["id"] = serde_json::json!("tp-v");
         let mut surface = surface_with_points(
-            serde_json::json!([proxy_point("drive", sent), https_point]),
+            serde_json::json!([
+                proxy_point("drive", sending_pin(external("external-a", Some("owner")), &current)),
+                https_point
+            ]),
             serde_json::json!([]),
-            Some(serde_json::json!([variant_point])),
+            Some(serde_json::json!([variant_point.clone()])),
         );
-        let pins = |surface: &AgentSurface| -> Vec<Option<String>> {
-            all_transit_points(surface)
-                .into_iter()
-                .map(|point| {
-                    point
-                        .transit_credentials
-                        .as_ref()
-                        .and_then(|binding| binding.mcp_proxy_pin.clone())
-                })
-                .collect()
-        };
+        pin_mcp_proxy_grants(&mut surface, None, Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&surface), [Some(current.clone()), None, Some(current.clone())]);
+        assert!(
+            checked_through(&providers, surface.clone(), GRANTS_KEPT, Some(&proxies))
+                .await
+                .is_ok()
+        );
+
+        for (case, mut surface, prefix) in [
+            (
+                "the surface's",
+                surface_with_points(
+                    serde_json::json!([proxy_point(
+                        "drive",
+                        sending_pin(external("external-a", Some("owner")), "sha256:chosen")
+                    )]),
+                    serde_json::json!([]),
+                    None,
+                ),
+                "",
+            ),
+            (
+                "a variant's",
+                surface_with_points(
+                    serde_json::json!([]),
+                    serde_json::json!([]),
+                    Some(serde_json::json!([proxy_point(
+                        "drive",
+                        sending_pin(external("external-a", Some("owner")), "sha256:chosen")
+                    )])),
+                ),
+                "variant 'candidate' ",
+            ),
+        ] {
+            let (code, message) = refusal(pin_mcp_proxy_grants(&mut surface, None, Some(&proxies)).await);
+            assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "{case}");
+            assert!(
+                message.starts_with(&format!("{prefix}transit.points[0] ('drive'): ")) && message.contains("'drive'"),
+                "{case}: {message}"
+            );
+            assert!(!message.contains("spec-text-7d1e") && !message.contains("sha256:chosen"), "{message}");
+        }
+
+        for proxy in ["of-tenant-b", "missing"] {
+            let other = proxies
+                .get("of-tenant-b")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut surface = surface_with_points(
+                serde_json::json!([proxy_point(
+                    proxy,
+                    sending_pin(external("external-a", Some("owner")), &other.grant_pin())
+                )]),
+                serde_json::json!([]),
+                None,
+            );
+            pin_mcp_proxy_grants(&mut surface, None, Some(&proxies))
+                .await
+                .unwrap_or_else(|error| panic!("{proxy}: not compared, {error:?}"));
+            assert_eq!(pins(&surface), [None], "{proxy}");
+            let refused = check_external_consent_bindings(
+                Some(&providers),
+                &surface,
+                GRANTS_KEPT,
+                &std::collections::HashMap::new(),
+                None,
+                Some(&proxies),
+            )
+            .await;
+            match refused {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(message.ends_with(PROXY_UNAVAILABLE), "{proxy}: {message}");
+                }
+                other => panic!("{proxy}: {other:?}"),
+            }
+        }
+    }
+
+    /// Grants can be kept: at-rest encryption on and the pepper configured.
+    const GRANTS_KEPT: GrantStorage = GrantStorage {
+        encrypted: true,
+        stable_ids: true,
+    };
+
+    /// A save that sends no pin, as a merge `PATCH`, a variant change, a
+    /// tenant transfer, or a `PUT` that leaves it out, keeps the binding's
+    /// stored pin, even when the MCP Proxy has changed since: the save goes
+    /// through, with a warning, and the Transit Point stays refused. A save that
+    /// sends the stored pin, now stale, is refused. A save that sends the
+    /// proxy's current pin pins the binding to it, and only then do the
+    /// Transit Point's grants go through the edited proxy again. A binding
+    /// that names another proxy than the stored one is a new binding.
+    #[tokio::test]
+    async fn a_save_without_a_pin_keeps_the_stored_one_so_an_edited_proxy_stays_refused() {
+        use crate::credential_providers::external::{PROXY_CHANGED, check_proxy_pin};
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
         let drive = proxies
             .get("drive")
             .await
             .unwrap()
             .unwrap();
-        pin_mcp_proxy_grants(&mut surface, Some(&proxies)).await;
-        assert_eq!(pins(&surface), [Some(drive.grant_pin()), None, Some(drive.grant_pin())]);
-        let saved = surface.clone();
-        pin_mcp_proxy_grants(&mut surface, Some(&proxies)).await;
-        assert_eq!(pins(&surface), pins(&saved), "a save that changes nothing keeps the pins");
-        let check = |surface: AgentSurface| {
-            let providers = providers.clone();
-            let proxies: &dyn McpProxyStore = &proxies;
-            async move {
-                check_external_consent_bindings(
-                    Some(&providers),
-                    &surface,
-                    storage,
-                    &std::collections::HashMap::new(),
-                    None,
-                    Some(proxies),
-                )
-                .await
-            }
-        };
-        assert!(
-            check(surface.clone())
-                .await
-                .is_ok()
+        let mut variant_point = proxy_point("drive", external("external-a", Some("owner")));
+        variant_point["id"] = serde_json::json!("tp-v");
+        let mut stored = surface_with_points(
+            serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+            serde_json::json!([]),
+            Some(serde_json::json!([variant_point])),
         );
+        pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let first = drive.grant_pin();
+        assert_eq!(pins(&stored), [Some(first.clone()), Some(first.clone())]);
 
         let mut edited = drive.clone();
         edited.openapi_spec = r#"{"openapi": "3.0.0", "paths": {"/files/trash": {"delete": {}}}}"#.into();
@@ -4440,15 +4762,252 @@ mod tests {
             .update(&edited)
             .await
             .unwrap();
-        match check(surface.clone()).await {
-            Err(SurfaceApiError::BadRequest(message)) => {
-                assert!(message.ends_with(PROXY_CHANGED), "{message}");
+        let check = |surface: &AgentSurface| {
+            let (providers, surface) = (providers.clone(), surface.clone());
+            let proxies: &dyn McpProxyStore = &proxies;
+            async move {
+                check_external_consent_bindings(
+                    Some(&providers),
+                    &surface,
+                    GRANTS_KEPT,
+                    &std::collections::HashMap::new(),
+                    None,
+                    Some(proxies),
+                )
+                .await
             }
-            other => panic!("a stale pin is refused: {other:?}"),
+        };
+
+        let mut unrelated = stored.clone();
+        unrelated.name = "renamed, a save for another reason".into();
+        forget_mcp_proxy_pins(&mut unrelated);
+        assert_eq!(pins(&unrelated), [None, None], "a write from the stored surface sends no pin");
+        pin_mcp_proxy_grants(&mut unrelated, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&unrelated), [Some(first.clone()), Some(first.clone())], "the stored pins are kept");
+        assert!(
+            check(&unrelated)
+                .await
+                .is_ok(),
+            "the save goes through"
+        );
+        assert_eq!(
+            check_proxy_pin(&edited, pins(&unrelated)[0].as_deref()),
+            Err(PROXY_CHANGED),
+            "and the Transit Point stays refused"
+        );
+        let warnings = stale_mcp_proxy_pin_warnings(Some(&proxies), &unrelated).await;
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("'drive'") && warnings[0].contains("grant_pin"), "{warnings:?}");
+
+        let mut echoed = stored.clone();
+        let (code, message) = refusal(pin_mcp_proxy_grants(&mut echoed, Some(&stored), Some(&proxies)).await);
+        assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "the stored pin, sent back after the proxy changed");
+        assert!(message.starts_with("transit.points[0] ('drive')"), "{message}");
+
+        let mut approved = stored.clone();
+        forget_mcp_proxy_pins(&mut approved);
+        approved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some(edited.grant_pin());
+        pin_mcp_proxy_grants(&mut approved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(
+            pins(&approved),
+            [Some(edited.grant_pin()), Some(first.clone())],
+            "the binding the write sent the current pin for is pinned to the proxy as it is; the other keeps its pin"
+        );
+        assert_eq!(check_proxy_pin(&edited, pins(&approved)[0].as_deref()), Ok(()));
+        assert!(check(&approved).await.is_ok());
+        assert_eq!(
+            stale_mcp_proxy_pin_warnings(Some(&proxies), &approved)
+                .await
+                .len(),
+            1
+        );
+
+        let mut moved = stored.clone();
+        forget_mcp_proxy_pins(&mut moved);
+        let mut sheets = drive.clone();
+        sheets.id = "sheets".into();
+        sheets.name = "Sheets".into();
+        proxies
+            .create(&sheets)
+            .await
+            .unwrap();
+        moved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .target_endpoint = "proxy://sheets".into();
+        pin_mcp_proxy_grants(&mut moved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        assert_eq!(pins(&moved)[0], Some(sheets.grant_pin()), "another proxy: a new binding, pinned as it is");
+    }
+
+    /// A grant binding is refused at save on a `proxy://` Transit Point whose
+    /// MCP Proxy's spec has a tool with a method override header parameter,
+    /// in any case; a query parameter of that name is not a header, and
+    /// passes.
+    #[tokio::test]
+    async fn a_save_refuses_a_grant_through_an_mcp_proxy_whose_spec_overrides_the_method() {
+        use crate::credential_providers::external::PROXY_OVERRIDES_THE_METHOD;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        let proxies = grant_proxies(&directory).await;
+        let spec = |name: &str, location: &str| {
+            format!(
+                r#"{{"openapi": "3.0.0", "info": {{"title": "Drive", "version": "1"}},
+                "paths": {{"/files": {{"get": {{"operationId": "search_files",
+                    "parameters": [{{"name": "{name}", "in": "{location}", "schema": {{"type": "string"}}}}],
+                    "responses": {{"200": {{"description": "Files"}}}}}}}}}}}}"#
+            )
+        };
+        let surface = || {
+            surface_with_points(
+                serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+                serde_json::json!([]),
+                None,
+            )
+        };
+        let mut drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        for header in ["X-HTTP-Method-Override", "x-http-method", "X-Method-OVERRIDE"] {
+            drive.openapi_spec = spec(header, "header");
+            assert!(crate::mcp_proxies::handlers::spec_sends_a_method_override(&drive), "{header}: the spec loads");
+            proxies
+                .update(&drive)
+                .await
+                .unwrap();
+            let refused = checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies))
+                .await
+                .expect_err(header);
+            assert!(refused.ends_with(PROXY_OVERRIDES_THE_METHOD), "{header}: {refused}");
         }
-        pin_mcp_proxy_grants(&mut surface, Some(&proxies)).await;
-        assert_eq!(pins(&surface)[0], Some(edited.grant_pin()), "a save pins the proxy as it is now");
-        assert!(check(surface).await.is_ok());
+        for (name, location) in [("X-HTTP-Method-Override", "query"), ("X-Request-Reason", "header")] {
+            drive.openapi_spec = spec(name, location);
+            proxies
+                .update(&drive)
+                .await
+                .unwrap();
+            assert_eq!(
+                checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies)).await,
+                Ok(()),
+                "{name} in {location}"
+            );
+        }
+    }
+
+    /// A save that changes a binding's pin records it, with the Transit Point,
+    /// the proxy and both pins, when it is written: a new binding pinned, and
+    /// the proxy's current pin sent in place of the stored one. A save that
+    /// keeps the pin records nothing.
+    #[tokio::test]
+    async fn a_save_that_changes_a_pin_records_it() {
+        use crate::audit::context::in_management_request;
+        use crate::audit::events::Actor;
+        use crate::audit::producer::capture;
+        use crate::surfaces::AgentSurfaceStore;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = grant_proxies(&directory).await;
+        let surfaces = crate::surfaces::FileSystemAgentSurfaceStore::new(
+            directory
+                .path()
+                .join("surfaces"),
+        )
+        .await
+        .unwrap();
+        let drive = proxies
+            .get("drive")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stored = surface_with_points(
+            serde_json::json!([proxy_point("drive", external("external-a", Some("owner")))]),
+            serde_json::json!([]),
+            None,
+        );
+        pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let mut edited = drive.clone();
+        edited.name = "Drive, renamed".into();
+        proxies
+            .update(&edited)
+            .await
+            .unwrap();
+        let mut kept = stored.clone();
+        forget_mcp_proxy_pins(&mut kept);
+        pin_mcp_proxy_grants(&mut kept, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+        let mut approved = stored.clone();
+        approved
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some(edited.grant_pin());
+        pin_mcp_proxy_grants(&mut approved, Some(&stored), Some(&proxies))
+            .await
+            .unwrap();
+
+        let ((), records) = capture(in_management_request(Actor::user("u-1"), async {
+            for surface in [&stored, &kept, &approved] {
+                surfaces
+                    .save(surface)
+                    .await
+                    .unwrap();
+            }
+        }))
+        .await;
+        let changes: Vec<_> = records
+            .iter()
+            .filter(|record| crate::delegation_vault::audit::action_category(&record.event) == "mcp_proxy_pin_changed")
+            .map(|record| {
+                let change = serde_json::to_value(&record.event).unwrap()["mcp_proxy_pin_changed"].clone();
+                (
+                    change["transit_point_id"].clone(),
+                    change["mcp_proxy_id"].clone(),
+                    change["previous_pin"].clone(),
+                    change["pin"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (
+                    serde_json::json!("tp-1"),
+                    serde_json::json!("drive"),
+                    serde_json::Value::Null,
+                    serde_json::json!(drive.grant_pin())
+                ),
+                (
+                    serde_json::json!("tp-1"),
+                    serde_json::json!("drive"),
+                    serde_json::json!(drive.grant_pin()),
+                    serde_json::json!(edited.grant_pin())
+                ),
+            ],
+            "{records:?}"
+        );
     }
 
     /// With `external_consent_issuers` set, a binding's provider must name a

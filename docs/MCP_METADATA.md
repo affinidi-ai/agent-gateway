@@ -573,7 +573,9 @@ notification accepted with `202`, any method but `POST` answered `405`, and a
 `2026-07-28` request refused with `-32022` naming `2024-11-05`. Its tool calls,
 with or without a grant, go through pinned Strict egress with redirects refused,
 never through `rmcp-openapi`'s client. Its backend gets no credential but a
-`consent_mode: external` grant, sent only with a tool call; see
+`consent_mode: external` grant, sent only with a tool call, and with such a
+binding it answers nothing, `tools/list` and `initialize` included, while the
+proxy differs from the one the binding was pinned to; see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy).
 
 The OpenAPI library rebuilds parameter schemas and can drop extension

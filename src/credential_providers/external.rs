@@ -22,14 +22,17 @@
 //!   sent: a Transit Point carries them only to the origin of `resource`, and a
 //!   `proxy://` Transit Point only to an MCP Proxy of its tenant, served only
 //!   through surfaces, whose `base_url` has that origin
-//!   ([`check_proxy_grant_destination`]), and only while the proxy is the one
-//!   the surface was saved with ([`check_proxy_pin`]).
+//!   ([`check_proxy_grant_destination`]), whose spec sends no method override
+//!   header ([`check_proxy_grant_spec`]), and only while the proxy is the one
+//!   the binding was pinned to ([`check_proxy_pin`]).
 //!
 //! So a token that can edit providers or surfaces cannot point a provider whose
 //! grants are stored at an endpoint of its choosing, which would collect them on
 //! the next refresh or revocation, nor send its grants to a host of its choosing;
 //! and a token that can edit an MCP Proxy but not the surface cannot change what
-//! the grants sent through it are used for.
+//! the grants sent through it are used for, or what the agent is told about its
+//! tools: a surface save takes a new pin only when the write sends the proxy's
+//! current one.
 
 use std::sync::Arc;
 
@@ -1014,19 +1017,23 @@ pub async fn check_proxy_grant_destination(
         })
 }
 
-/// The refusal of a grant through an MCP Proxy that changed after the surface
-/// was saved: its `base_url`, spec or `flatten_post_params` differ from those
-/// the binding was pinned to ([`check_proxy_pin`]).
-pub const PROXY_CHANGED: &str = "consent_mode external needs the MCP Proxy as it was when the surface was saved: its \
-                                 base_url or OpenAPI spec has changed since, so save the surface again to use it";
+/// The refusal of a grant through an MCP Proxy that changed after its binding
+/// was pinned: its `base_url`, spec, `flatten_post_params` or `name` differ
+/// from those the binding was pinned to ([`check_proxy_pin`]).
+pub const PROXY_CHANGED: &str = "consent_mode external needs the MCP Proxy as it was when its binding was pinned: its \
+                                 base_url, OpenAPI spec or name has changed since, so save the surface with the \
+                                 proxy's current grant_pin as mcp_proxy_pin to use it";
 
-/// Whether the MCP Proxy `proxy` still does what it did when the surface
-/// whose `proxy://` Transit Point names it was saved: its
-/// [`crate::mcp_proxies::types::McpProxy::grant_pin`] is `pinned`, the one the
-/// save set on the binding. A binding with no pin, as one stored outside the
-/// API has, is refused alike. So whoever may edit the proxy, but not the
-/// surface, cannot change what a grant is used for: which operations its tool
-/// names call, on which paths, with which descriptions.
+/// Whether the MCP Proxy `proxy` still does what it did, and shows the agent
+/// what it did, when the binding of the `proxy://` Transit Point that names it
+/// was pinned: its [`crate::mcp_proxies::types::McpProxy::grant_pin`] is
+/// `pinned`, the one a surface save set on the binding. A binding with no pin,
+/// as one stored outside the API has, is refused alike. The Transit Point
+/// answers `initialize` and `tools/list` and sends a tool call only while it
+/// passes. So whoever may edit the proxy, but not the surface, cannot change
+/// what a grant is used for (which operations its tool names call, on which
+/// paths) or what the agent reads (the tools' descriptions and input schemas,
+/// the server name).
 pub fn check_proxy_pin(
     proxy: &crate::mcp_proxies::types::McpProxy,
     pinned: Option<&str>,
@@ -1066,6 +1073,45 @@ pub async fn check_transit_grant_destination(
     let destination = check_proxy_grant_destination(provider, &proxy, tenant_id, exact_allowlist).await?;
     check_proxy_pin(&proxy, proxy_pin)?;
     Ok(destination)
+}
+
+/// The refusal of a grant through an MCP Proxy whose spec has a tool with a
+/// method override header parameter ([`check_proxy_grant_spec`]).
+pub const PROXY_OVERRIDES_THE_METHOD: &str = "consent_mode external needs an MCP Proxy whose OpenAPI spec has no \
+                                              header parameter named X-HTTP-Method-Override, X-HTTP-Method or \
+                                              X-Method-Override, which would let a tool call run another HTTP method \
+                                              than its operation's";
+
+/// Whether the MCP Proxy `proxy` may send a grant with its tool calls as its
+/// spec defines them: no tool has a header parameter that asks the backend to
+/// run another HTTP method than the operation's
+/// ([`crate::mcp_proxies::handlers::METHOD_OVERRIDE_HEADERS`], any case).
+/// Such a header would let the agent turn an allowed tool into another
+/// operation behind the same tool name, past name-based tool gating. Checked
+/// when the surface is saved, when a connect starts, and on every tool call
+/// that carries the grant.
+pub fn check_proxy_grant_spec(proxy: &crate::mcp_proxies::types::McpProxy) -> Result<(), &'static str> {
+    if crate::mcp_proxies::handlers::spec_sends_a_method_override(proxy) {
+        return Err(PROXY_OVERRIDES_THE_METHOD);
+    }
+    Ok(())
+}
+
+/// [`check_proxy_grant_spec`] for the MCP Proxy a Transit Point's
+/// `proxy://<id>` `target_endpoint` names, read from `proxies`. Any other
+/// endpoint passes, and so does a proxy that cannot be read: the destination
+/// check refuses it.
+pub async fn check_transit_grant_spec(
+    target_endpoint: &str,
+    proxies: Option<&dyn crate::mcp_proxies::McpProxyStore>,
+) -> Result<(), &'static str> {
+    let (Some(proxy_id), Some(store)) = (crate::mcp_proxies::types::transit_proxy_id(target_endpoint), proxies) else {
+        return Ok(());
+    };
+    match store.get(proxy_id).await {
+        Ok(Some(proxy)) => check_proxy_grant_spec(&proxy),
+        _ => Ok(()),
+    }
 }
 
 /// The refusal of a `proxy://` Transit Point that does not speak MCP.
@@ -1339,27 +1385,40 @@ pub(crate) mod tests {
     }
 
     /// The pin of an MCP Proxy changes with what its tool calls do (its
-    /// `base_url`, its spec, `flatten_post_params`) and with nothing else, so
-    /// an update that changes none of them keeps it.
+    /// `base_url`, its spec, `flatten_post_params`) and what it shows the
+    /// agent (its spec, its name), and with nothing else, so an update that
+    /// changes none of them keeps it. It is `sha256:` and 64 lowercase hex
+    /// digits.
     #[test]
-    fn an_mcp_proxy_pin_follows_what_its_tool_calls_do_and_nothing_else() {
+    fn an_mcp_proxy_pin_follows_what_its_tool_calls_do_and_shows_and_nothing_else() {
         let mut proxy = grant_proxy("drive", Some("tenant-a"), "https://203.0.113.10/drive/v3");
         proxy.openapi_spec = r#"{"openapi": "3.0.0", "paths": {"/files": {}}}"#.into();
         let pin = proxy.grant_pin();
-        assert!(pin.starts_with("sha256:"), "{pin}");
+        let digits = pin
+            .strip_prefix("sha256:")
+            .unwrap_or_default();
+        assert!(
+            digits.len() == 64
+                && digits
+                    .chars()
+                    .all(|digit| matches!(digit, '0'..='9' | 'a'..='f')),
+            "{pin}"
+        );
         assert_eq!(check_proxy_pin(&proxy, Some(&pin)), Ok(()));
         let mut unchanged = proxy.clone();
-        unchanged.name = "Renamed".into();
         unchanged.description = "Described".into();
         unchanged.updated_at = chrono::Utc::now() + chrono::Duration::hours(1);
         unchanged.managed_by = Some("Boris".into());
-        assert_eq!(unchanged.grant_pin(), pin, "a save that changes nothing it calls keeps the pin");
+        unchanged.status = crate::mcp_proxies::types::McpProxyStatus::Disabled;
+        unchanged.endpoint_path = "/moved".into();
+        assert_eq!(unchanged.grant_pin(), pin, "a save that changes nothing it calls or shows keeps the pin");
         type Edit = fn(&mut crate::mcp_proxies::types::McpProxy);
-        let edits: [(&str, Edit); 4] = [
+        let edits: [(&str, Edit); 5] = [
             ("base_url", |proxy| proxy.base_url = "https://203.0.113.10/drive/v2".into()),
             ("spec", |proxy| proxy.openapi_spec = "{\"paths\": {}}".into()),
             ("spec whitespace", |proxy| proxy.openapi_spec.push(' ')),
             ("flatten_post_params", |proxy| proxy.flatten_post_params = true),
+            ("name", |proxy| proxy.name = "Renamed".into()),
         ];
         for (case, edit) in edits {
             let mut edited = proxy.clone();

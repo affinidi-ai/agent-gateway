@@ -645,6 +645,7 @@ pub(super) async fn call(
             exact_allowlist: egress_allowlist,
         },
         sent_token,
+        None,
     )
     .await
 }
@@ -657,7 +658,9 @@ pub(super) async fn call(
 /// only to that origin, and an answer that refuses the grant, as
 /// [`crate::delegation_vault::release::vendor_answer`] reads it, is
 /// [`RestError::GrantRefused`], without its body, so the caller can refresh
-/// the grant or refuse the call with a fixed reason.
+/// the grant or refuse the call with a fixed reason. `sent` is set just before
+/// the request goes out, once its URL, egress, headers and body passed every
+/// check, so a call refused by any of them is never taken as sent.
 pub(super) async fn call_through_transit_point(
     base_url: &str,
     metadata: &ToolMetadata,
@@ -667,6 +670,7 @@ pub(super) async fn call_through_transit_point(
     content_type: &str,
     grant_destination: Option<&url::Origin>,
     exact_allowlist: Option<&str>,
+    sent: &std::sync::atomic::AtomicBool,
 ) -> Result<CallToolResult, RestError> {
     send(
         base_url,
@@ -680,6 +684,7 @@ pub(super) async fn call_through_transit_point(
             exact_allowlist,
         },
         None,
+        Some(sent),
     )
     .await
 }
@@ -727,6 +732,7 @@ async fn send(
     content_type: &str,
     egress: RestEgress<'_>,
     sent_token: Option<&SentServiceToken<'_>>,
+    sent: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<CallToolResult, RestError> {
     if serde_json::to_vec(arguments)
         .map_err(|_| RestError::Arguments)?
@@ -800,6 +806,9 @@ async fn send(
         .is_some_and(|body| body.len() > limits.max_request_bytes.get())
     {
         return Err(RestError::Arguments);
+    }
+    if let Some(sent) = sent {
+        sent.store(true, std::sync::atomic::Ordering::Release);
     }
     let mut response = client
         .execute(request)
@@ -1634,7 +1643,8 @@ mod tests {
     /// through Strict egress, which admits the loopback fixture only from the
     /// test allow-list. An answer that refuses the grant comes back as its
     /// status and challenges, never its body; any other answer, a `403` that
-    /// is not about the grant's scope among them, is the tool's result.
+    /// is not about the grant's scope among them, is the tool's result. Only
+    /// a call that went out is reported sent.
     #[tokio::test]
     async fn a_call_with_a_grant_goes_only_to_its_origin_and_reports_a_refused_grant() {
         use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
@@ -1661,7 +1671,8 @@ mod tests {
                 exact_allowlist.map(str::to_string),
             );
             async move {
-                call_through_transit_point(
+                let went_out = std::sync::atomic::AtomicBool::new(false);
+                let answer = call_through_transit_point(
                     &base,
                     &metadata("/files"),
                     &json!({}),
@@ -1670,34 +1681,37 @@ mod tests {
                     "application/json",
                     Some(&destination),
                     exact_allowlist.as_deref(),
+                    &went_out,
                 )
-                .await
+                .await;
+                (answer, went_out.load(std::sync::atomic::Ordering::Acquire))
             }
         };
 
-        let answered = sent(&destination, Some(&origin))
-            .await
-            .unwrap();
-        assert_eq!(answered.is_error, Some(false));
+        let (answered, went_out) = sent(&destination, Some(&origin)).await;
+        assert_eq!(answered.unwrap().is_error, Some(false));
+        assert!(went_out);
         match sent(&destination, Some(&origin)).await {
-            Err(RestError::GrantRefused { status, challenges }) => {
+            (Err(RestError::GrantRefused { status, challenges }), true) => {
                 assert_eq!(status, 401);
                 assert_eq!(challenges, [HeaderValue::from_static(challenge)]);
             }
             other => panic!("expected the refused grant, got {other:?}"),
         }
-        let forbidden = sent(&destination, Some(&origin))
-            .await
-            .unwrap();
-        assert_eq!(forbidden.is_error, Some(true), "a 403 that is not about scope is the tool's own error");
+        let (forbidden, went_out) = sent(&destination, Some(&origin)).await;
+        assert_eq!(forbidden.unwrap().is_error, Some(true), "a 403 that is not about scope is the tool's own error");
+        assert!(went_out);
 
         let elsewhere = Url::parse("http://127.0.0.1:9")
             .unwrap()
             .origin();
-        assert!(matches!(sent(&elsewhere, Some(&origin)).await, Err(RestError::Target)), "another origin");
         assert!(
-            matches!(sent(&destination, None).await, Err(RestError::Target)),
-            "Strict egress refuses the loopback fixture without the test allow-list"
+            matches!(sent(&elsewhere, Some(&origin)).await, (Err(RestError::Target), false)),
+            "another origin, never sent"
+        );
+        assert!(
+            matches!(sent(&destination, None).await, (Err(RestError::Target), false)),
+            "Strict egress refuses the loopback fixture without the test allow-list, and it is never sent"
         );
         let requests = vendor.requests();
         assert_eq!(requests.len(), 3, "only the permitted calls reach the backend");
@@ -1741,6 +1755,7 @@ mod tests {
                     "application/json",
                     None,
                     exact_allowlist.as_deref(),
+                    &std::sync::atomic::AtomicBool::new(false),
                 )
                 .await
             }

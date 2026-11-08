@@ -1025,7 +1025,7 @@ authorization URL for such a binding.
 | `subject` | Required: `owner` for one grant every caller of the Transit Point uses, or `caller` for one grant per caller, selected by the caller's [identity hash](#the-callers-identity-hash). Refused with every other consent mode |
 | `credential_provider_id` | A provider with an `issuer` and the surface's own tenant, exactly: an untenanted provider for an untenanted surface |
 | `scopes`, `inject_as` | As for any binding |
-| `mcp_proxy_pin` | Set by the gateway on every save, for a `proxy://` Transit Point only ([Through an MCP Proxy](#through-an-mcp-proxy)); a value a write sends is ignored |
+| `mcp_proxy_pin` | For a `proxy://` Transit Point only: the `grant_pin` of its MCP Proxy the binding is pinned to ([Through an MCP Proxy](#through-an-mcp-proxy)). A write may send the proxy's current `grant_pin` to pin the binding to the proxy as it is; any other value is refused, and leaving it out keeps the stored pin (a new binding is pinned to the proxy as it is). Cleared on every other binding |
 
 The Transit Point itself must send the grant only where it belongs:
 
@@ -1101,7 +1101,7 @@ the request's id, with the reason in its `data`; on any other (`http`, A2A) it i
 | --- | --- | --- | --- |
 | `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
 | `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
-| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there, or that MCP Proxy has changed since the surface was saved ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there, or that MCP Proxy has changed since its binding was pinned or its spec has a method override header ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
 
 A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
 identity hash. A binding that some other path reached with a provider that has an `issuer`, the
@@ -1200,39 +1200,90 @@ an `https` target's:
 | `protocol` | `mcp` |
 | The MCP Proxy | Of the surface's own tenant, exactly, and served only through surfaces (`direct_access: false`), so its backend is reached with the grant only through the Transit Point that holds it. A proxy anyone can call on its own route is refused |
 | Its `base_url` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource` |
-| Its pin | The proxy as it was when the surface was last saved: below |
+| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any case): many REST APIs, Google's among them, run the method such a header names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes |
+| Its pin | The proxy as it was when the binding was pinned: below |
 | `inject_as` | A header: `bearer_header` (the default) or `custom_header`, never `meta`. The grant is the call's only credential |
 | `target_auth` | None |
 
 They are checked when the surface is saved (`400`), when a connect starts (`409`,
 `binding_not_servable`), and on every call: when the grant is released, and again with the proxy
-record the call is sent through. So a proxy edited afterwards to point elsewhere, another
-`base_url` or `direct_access` turned on, is never sent the grant: the call answers
-`connector_unavailable`. Only a tool call carries the grant, and only to that origin, never
-outside the proxy's base path.
+record the call is sent through (the spec when the call is sent). So a proxy edited afterwards
+to point elsewhere, another `base_url` or `direct_access` turned on, is never sent the grant: the
+call answers `connector_unavailable`. Only a tool call carries the grant, and only to that
+origin, never outside the proxy's base path. A save checks the proxy as it is now even when the
+binding keeps a pin the proxy no longer has (below), so a proxy edited to break one of these
+rules refuses every save of the surface until it is put right.
 
 **The pin.** Whoever may edit an MCP Proxy (`mcp_proxies.edit`, or a token scoped to that one
-proxy) can change which operation a tool name calls, its path and its description, on the same
-origin, without touching the surface. So each save of the surface, by whoever may edit it, pins
-the binding to the proxy as it is then: the gateway sets the binding's `mcp_proxy_pin` to a
-SHA-256 digest of the proxy's `base_url`, its OpenAPI spec as stored, and
-`flatten_post_params`. A value a write sends is ignored, and every other binding's is cleared.
-While the proxy's digest differs, after any edit to one of the three (even whitespace in the
-spec), the grant is not sent: the connect start answers `409` and the call
-`connector_unavailable`, and the log names the Transit Point and the proxy
-(`mcp_proxy_changed_since_the_surface_was_saved`). Saving the surface again pins the proxy as it
-is then. A binding stored outside the API, which has no pin, is refused alike until it is saved
-through the API. The proxy's name, description, status, timestamps and other fields are not part
-of the digest, so a client that saves the proxy and then the surface on every push, unchanged,
-keeps the same pin.
+proxy) can change which operation a tool name calls, its path, its description and the server
+name the agent is told, on the same origin, without touching the surface. So each `consent_mode:
+external` binding of a `proxy://` Transit Point is pinned to the proxy as a surface save saw it:
+its `mcp_proxy_pin` is the proxy's `grant_pin`, `sha256:` and 64 lowercase hex digits, a SHA-256
+digest of the proxy's `base_url`, its OpenAPI spec as stored, `flatten_post_params` and `name`.
+Every MCP Proxy answer carries `grant_pin`: create, update, `GET` of one and the list. A save
+settles the pin of each such binding, on the surface and in each variant:
+
+| The write sends | The binding's pin |
+| --- | --- |
+| `mcp_proxy_pin` equal to the proxy's current `grant_pin` | That pin: the binding is pinned to the proxy as it is |
+| Any other `mcp_proxy_pin` (stale, or wrong) | The save is refused: `400`, `code` `mcp_proxy_pin_not_current`, naming the Transit Point (`transit.points[0] ('drive')`, or `variant 'beta' transit.points[0] ...`) and the proxy, never its spec |
+| No `mcp_proxy_pin`, and the binding has one stored | The stored pin, even when the proxy has changed since, so a save made for another reason never approves an edited proxy. The save answers a `Warning` header naming the Transit Point when the kept pin is stale |
+| No `mcp_proxy_pin`, and the binding has none stored (a new binding, a variant copy, or one stored outside the API) | The proxy's current `grant_pin` |
+
+The stored binding is the one of the same Transit Point id that names the same proxy; a Transit
+Point moved to another proxy is a new binding. A merge `PATCH`, a variant create, update, patch,
+delete or promote, and a tenant transfer start from the stored surface, so a pin they carry from
+it is not one they sent: only a pin in the request body itself is compared. A client that `GET`s
+a surface and `PUT`s it back sends the stored pin; after the proxy changed, that save is
+refused, and leaving `mcp_proxy_pin` out keeps the stored pin. A pin is compared only with a
+proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
+and the save is refused as for any binding to such a proxy, so the answer tells nothing of
+another tenant's proxy. The gateway never stores a pin it did not compute or compare.
+
+While the proxy's `grant_pin` differs from the binding's pin, after any edit to one of the four
+(even whitespace in the spec), the Transit Point answers nothing through the proxy: the connect
+start answers `409`, and every `POST`, `initialize`, `tools/list` and notifications as well as a
+tool call, answers `connector_unavailable`, so an edited description or server name never
+reaches the agent either. The log names the Transit Point and the proxy
+(`mcp_proxy_changed_since_it_was_pinned`). A save that sends the proxy's current `grant_pin`
+pins it as it is. Fields outside the pin are shown to the agent by nothing on this path, or are
+checked on their own: `description`, `status` (a disabled proxy only refuses),
+`channel_prefix`, `endpoint_path`, the proxy's own `mcp_http` (the Transit Point's applies), the
+timestamps and `managed_by` are not part of it, and `tenant_id` and `direct_access` are checked
+on every call. A client that writes the proxy and then the surface with the `grant_pin` the
+proxy write answered pins exactly the proxy it wrote, or is refused if the proxy changed in
+between.
+
+Each save that changes a pin, a new binding pinned or a stale pin replaced by the proxy's current
+one, records an `mcp_proxy_pin_changed` event in the VP Audit Log and logs it at info, with the
+surface, the Transit Point's id and alias, the variant, the proxy's id and the previous and new
+pins, never the proxy's spec, `base_url` or name.
 
 **What a request releases.** Only a tool call, a `POST` of one JSON-RPC object with an `id` and
 the method `tools/call`, is released the grant. `initialize`, `tools/list`, notifications, other
 methods, a `GET` and a body that is not one object never carry it, so they neither refresh it nor
-record a use, and they are answered before the person has connected. The `token_injected` audit
-record and the grant's last use are written only when a tool call that carries the grant is sent
-to the backend, after the proxy and the call have been checked: once for the call, and once more
-for its retry after a refresh.
+record a use, and they are answered before the person has connected (while the pin holds). The
+`token_injected` audit record and the grant's last use are written only when a tool call that
+carries the grant went out to the backend, after the proxy, the pin, the call's URL and Strict
+egress passed: once for the call, and once more for its retry after a refresh. A call refused
+by any of them records nothing.
+
+**On real vendor traffic.** The rules above fail closed, and some legitimate calls fail with a
+generic tool error:
+
+- A redirect is refused, never followed with the grant. An API that answers a download or an
+  export with a `3xx` to another host (Google may, to `*.googleusercontent.com`) fails.
+- A call stays under the proxy's `base_url` path. With `https://www.googleapis.com/drive/v3`,
+  uploads (`/upload/drive/v3/...`) and `files.download`'s `/download/drive/v3/...` are outside
+  it; a proxy that needs them uses `https://www.googleapis.com/` with a spec that lists only the
+  operations allowed, which the pin then fixes.
+- The answer is capped by the Transit Point's `mcp_http.max_response_bytes`, 1 MiB by default,
+  so larger exports and downloads fail unless it is raised.
+- The call is made directly: `HTTPS_PROXY` and other egress proxy settings are not used, so a
+  deployment that must reach the vendor through an HTTP proxy cannot use this path.
+- `https` only, and no internal address: an MCP Proxy that wraps an internal or private-address
+  REST API works as an Access Point Target, whose Configured egress allows it, but not behind a
+  Transit Point.
 
 The backend's answer to a tool call is the tool's result, a `403` for anything but scope
 included, except an answer that refuses the grant, which is handled as an `https` vendor's

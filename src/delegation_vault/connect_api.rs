@@ -397,21 +397,28 @@ pub async fn start_connect(
         )
         .await
     } else {
+        let proxies = state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore);
         match servable_transit_point(&surface, binding.hop) {
-            Ok(proxy_pin) => {
-                crate::credential_providers::external::check_transit_grant_destination(
-                    &provider,
-                    &binding.target_endpoint,
-                    proxy_pin.as_deref(),
-                    state
-                        .mcp_proxy_store
-                        .as_deref()
-                        .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
-                    tenant_id,
-                    exact_allowlist,
-                )
-                .await
-            }
+            Ok(proxy_pin) => match crate::credential_providers::external::check_transit_grant_destination(
+                &provider,
+                &binding.target_endpoint,
+                proxy_pin.as_deref(),
+                proxies,
+                tenant_id,
+                exact_allowlist,
+            )
+            .await
+            {
+                Ok(destination) => {
+                    crate::credential_providers::external::check_transit_grant_spec(&binding.target_endpoint, proxies)
+                        .await
+                        .map(|()| destination)
+                }
+                Err(refused) => Err(refused),
+            },
             Err(refused) => Err(refused),
         }
     };
@@ -1617,9 +1624,10 @@ mod tests {
     /// A Transit Point whose target is an MCP Proxy starts a connect only while
     /// that proxy, of the surface's tenant and served only through surfaces,
     /// sends its tool calls to the origin of the provider's resource, is still
-    /// the proxy the surface was saved with, and while the Transit Point meets
-    /// every rule a call to it does: a proxy edited to point elsewhere, to
-    /// call other operations, or opened to direct callers, a binding never
+    /// the proxy the binding was pinned to, has no method override header in
+    /// its spec, and while the Transit Point meets every rule a call to it
+    /// does: a proxy edited to point elsewhere, to call other operations, to
+    /// take a method override header, or opened to direct callers, a binding never
     /// pinned, and a Transit Point that does not speak MCP, has a target_auth
     /// or puts the grant in `_meta`, are refused, so no consent is run for a
     /// binding every call would refuse.
@@ -1664,9 +1672,11 @@ mod tests {
                 if pinned {
                     crate::identity::handlers::surface_tenancy::pin_mcp_proxy_grants(
                         &mut surface,
+                        None,
                         Some(proxies.as_ref() as &dyn McpProxyStore),
                     )
-                    .await;
+                    .await
+                    .expect("a new binding is pinned");
                 }
                 surfaces
                     .save(&surface)
@@ -1728,6 +1738,17 @@ mod tests {
                 .unwrap();
             refused(case).await;
         }
+        let mut overriding = servable.clone();
+        overriding.openapi_spec = r#"{"openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+            "paths": {"/files": {"get": {"operationId": "search", "parameters": [{"name": "X-HTTP-Method-Override",
+                "in": "header", "schema": {"type": "string"}}], "responses": {"200": {"description": "Files"}}}}}}"#
+            .into();
+        proxies
+            .update(&overriding)
+            .await
+            .unwrap();
+        save(point.clone(), true).await;
+        refused("a spec with a method override header, pinned as it is").await;
         proxies
             .update(&other_operations)
             .await

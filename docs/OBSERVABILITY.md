@@ -804,6 +804,20 @@ for which writes.
   names the management caller as on policy change events. The record carries no secret value and
   no record name, and sets no `surface_id`.
 
+**MCP Proxy pin change events.** Raised by management API writes to a surface (group
+Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)
+for when a save changes a pin.
+
+- `mcp_proxy_pin_changed`: a save pinned the `consent_mode: external` binding of a `proxy://`
+  Transit Point to its MCP Proxy as the proxy is now, one record per binding: a new binding
+  pinned (no `previous_pin`), or the proxy's current pin sent in place of the stored one.
+  `transit_point_id` and `transit_point` (its alias) name the Transit Point, `surface_variant`
+  the variant's alias, with `variant_id`, or `_base_`, `mcp_proxy_id` the proxy, and
+  `previous_pin` and `pin` the pins (`sha256:<hex>`, the proxy's `grant_pin`). `actor` names the
+  management caller as on policy change events, and the top level carries `surface_id` and
+  `channel_name`. No record carries the proxy's spec, `base_url` or name. Each is also logged at
+  info under `credential_delegation`.
+
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
 **Connector calls.** A call through a Transit Point whose `transit_credentials` take a connector
