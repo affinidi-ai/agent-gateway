@@ -1,0 +1,99 @@
+# Bundled VTA sidecar (tier T1) as one Pod: the gateway and its trust agent are
+# two containers that share a network namespace, so the agent's loopback is
+# private to the pair, and an emptyDir carries the public bootstrap files.
+#
+# See docker-compose.yml for the flow and for what this tier does not claim: it
+# is NOT a key-custody tier.
+#
+# Create these first:
+#   kubectl create configmap vta-bundled-files \
+#     --from-file=vta-setup.base.toml --from-file=vta-entrypoint.sh
+#   kubectl create secret generic vta-seed-passphrase \
+#     --from-literal=vta_seed_passphrase="$(openssl rand -base64 32)"
+#   kubectl create secret generic gateway-encryption \
+#     --from-literal=TG_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+# and a ConfigMap `gateway-config` holding your gateway config files, with the
+# [vta] block from config.bundled.toml added to config.toml.
+#
+# Pin both images by digest. Build the VTA image from
+# verifiable-trust-infrastructure@gateway-integration until
+# `Capability::ContextCreate` is released.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gateway-storage
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vta-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-gateway-bundled
+  labels:
+    app: agent-gateway-bundled
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  containers:
+    - name: gateway
+      image: REPLACE_WITH_GATEWAY_IMAGE@sha256:REPLACE
+      ports:
+        - containerPort: 8443
+      envFrom:
+        - secretRef:
+            name: gateway-encryption
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - { name: gateway-storage, mountPath: /app/_storage }
+        - { name: bootstrap, mountPath: /bootstrap }
+        - { name: gateway-config, mountPath: /app/config, readOnly: true }
+        - { name: tmp, mountPath: /tmp }
+    - name: vta
+      image: REPLACE_WITH_VTA_IMAGE@sha256:REPLACE
+      command: ["/bin/sh", "/etc/vta/vta-entrypoint.sh"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - { name: vta-data, mountPath: /var/lib/vta }
+        - { name: bootstrap, mountPath: /bootstrap }
+        - { name: vta-files, mountPath: /etc/vta, readOnly: true }
+        - { name: vta-seed-passphrase, mountPath: /run/secrets, readOnly: true }
+        - { name: tmp, mountPath: /tmp }
+  volumes:
+    - name: gateway-storage
+      persistentVolumeClaim: { claimName: gateway-storage }
+    - name: vta-data
+      persistentVolumeClaim: { claimName: vta-data }
+    - name: bootstrap
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}
+    - name: gateway-config
+      configMap: { name: gateway-config }
+    - name: vta-files
+      configMap:
+        name: vta-bundled-files
+        defaultMode: 0555
+    - name: vta-seed-passphrase
+      secret:
+        secretName: vta-seed-passphrase
+        items:
+          - { key: vta_seed_passphrase, path: vta_seed_passphrase }

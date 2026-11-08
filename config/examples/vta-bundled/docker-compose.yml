@@ -1,70 +1,76 @@
 # Bundled VTA sidecar (tier T1) — one deployment unit, one `docker compose up`.
 #
-# The gateway and its Verifiable Trust Agent run as two containers in the same
-# unit. The gateway's code path is *identical* to a remote VTA — only the
-# endpoint differs — so switching this deployment to a customer-operated VTA is
-# a configuration change, not a code change.
+# The gateway and its Verifiable Trust Agent run as two containers that share one
+# network namespace. They set themselves up on first start with no manual grant:
+#
+#   1. the gateway writes its control did:key to the `bootstrap` volume
+#   2. the sidecar sets itself up once, enrols that key with a fixed grant, and
+#      writes its own did:key to the same volume
+#   3. the gateway pins that DID, authenticates, and creates its signing key
 #
 # This is NOT a key-custody tier. The sidecar shares a host, a disk and an
-# operator with the gateway, so "the keys are held by a separate agent" is not
-# a property this shape has. `GET /v1/vta/status` reports
-# `custody_claim: false`, and nothing in the product may claim otherwise.
+# operator with the gateway, so "the keys are held by a separate agent" is not a
+# property this shape has. `GET /v1/vta/status` reports `custody_claim: false`,
+# and nothing in the product may claim otherwise.
+#
+# Before the first `up`:
+#   mkdir -p secrets config
+#   openssl rand -base64 32 > secrets/vta_seed_passphrase   # encrypts the VTA's seed
+#   cp <your gateway config files> config/                   # add the [vta] block from
+#                                                            # config.bundled.toml to config.toml
+#   export GATEWAY_IMAGE=...@sha256:...  VTA_IMAGE=...@sha256:...
+#   export TG_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+#
+# The VTA image must be built from `verifiable-trust-infrastructure` branch
+# `gateway-integration` until `Capability::ContextCreate` is released: a stock
+# image refuses the sidecar's grant with "unknown capability".
 
-name: agent-trust-gateway-bundled
-
-networks:
-  # The VTA is reachable only from the gateway. It is deliberately not on any
-  # network an inbound listener is published on, so even a misconfigured
-  # surface has no route to it — the in-process reservation
-  # (`src/vta/isolation.rs`) is the second layer, not the only one.
-  vta-internal:
-    internal: true
-  public: {}
+name: agent-gateway-bundled
 
 volumes:
   gateway-storage:
-  # The sidecar's key material. Back this up with the gateway's own storage:
-  # losing it loses every key the VTA holds, and the recovery path is to
-  # rotate, not to restore (see the runbook in docs/VTA_INTEGRATION_POC.md).
+  # The sidecar's key material. Back this up separately from the seed passphrase.
+  # Losing it loses every key the VTA holds, and the recovery is to rotate, not to
+  # restore: see the runbook in docs/VTA_INTEGRATION_POC.md.
   vta-data:
+  # Public data only: the gateway's control DID in, the sidecar's DID out.
+  bootstrap:
+
+secrets:
+  vta_seed_passphrase:
+    file: ./secrets/vta_seed_passphrase
 
 services:
-  vta:
-    # Pin by digest in a real deployment: an unpinned sidecar is a supply-chain
-    # hole in the component that holds the signing keys.
-    image: ${VTA_IMAGE:-ghcr.io/affinidi/vta-service:latest}
-    restart: unless-stopped
-    networks: [vta-internal]
-    # No `ports:` — the Trust Task surface is never published off the host.
-    volumes:
-      - vta-data:/var/lib/vta
-    environment:
-      VTA_DATA_DIR: /var/lib/vta
-      VTA_LISTEN: 0.0.0.0:3000
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/vta", "health"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 20s
-
   gateway:
-    image: ${GATEWAY_IMAGE:-ghcr.io/affinidi/agent-trust-gateway:latest}
+    # Pin by digest: an unpinned image is a supply-chain hole in the component
+    # that authenticates to the one holding the signing keys.
+    image: ${GATEWAY_IMAGE:?pin the gateway image by digest}
     restart: unless-stopped
-    depends_on:
-      vta:
-        condition: service_healthy
-    networks: [vta-internal, public]
     ports:
       - "8443:8443"
     volumes:
       - gateway-storage:/app/_storage
-      - ./config.bundled.toml:/app/config/config.toml:ro
+      - bootstrap:/bootstrap
+      - ./config:/app/config:ro
     environment:
-      # Encryption at rest is mandatory on this tier: the sidecar's keys live
-      # on this host's disk, so it is the only thing between a disk image and
-      # the signing keys. Startup fails closed when it is unavailable.
+      # Encryption at rest is mandatory on this tier; startup fails closed
+      # without it. Point `[encryption] key_env_var` at this variable.
       TG_ENCRYPTION_KEY: ${TG_ENCRYPTION_KEY:?set a 32-byte base64 key}
-      # Stable control-key seed, so the gateway keeps the same identity on the
-      # VTA across restarts instead of needing a fresh grant each boot.
-      TG_VTA_CONTROL_KEY: ${TG_VTA_CONTROL_KEY:?run `openssl rand -hex 32`}
+
+  vta:
+    image: ${VTA_IMAGE:?pin the VTA image by digest, built from gateway-integration}
+    restart: unless-stopped
+    # Share the gateway's network namespace: the sidecar listens on its own
+    # loopback only, which nothing else can reach. No ports, no networks.
+    network_mode: "service:gateway"
+    depends_on:
+      gateway:
+        condition: service_started
+    entrypoint: ["/bin/sh", "/etc/vta/vta-entrypoint.sh"]
+    volumes:
+      - vta-data:/var/lib/vta
+      - bootstrap:/bootstrap
+      - ./vta-setup.base.toml:/etc/vta/setup.base.toml:ro
+      - ./vta-entrypoint.sh:/etc/vta/vta-entrypoint.sh:ro
+    secrets:
+      - vta_seed_passphrase
