@@ -2,6 +2,16 @@ branch: dp-vta-integration
 changes:
   added: []
   changed:
+    - timestamp: '2026-11-08T21:00:00Z'
+      title: Authenticate to a bundled trust agent as a did:key by default
+      description: >-
+        A bundled trust agent is reached over loopback and cannot resolve the
+        gateway's public address, so the gateway no longer publishes a
+        did:webvh to authenticate to it. A new [vta] control_did_method
+        setting (did_key or did_webvh) chooses the DID explicitly; absent, a
+        bundled sidecar uses did_key and a separately-operated agent keeps
+        did_webvh. publish_auth_did is still read, and must agree with
+        control_did_method when both are set.
     - timestamp: '2026-11-08T18:30:00Z'
       title: Authenticate to a trust agent as a did:webvh by default
       description: >-

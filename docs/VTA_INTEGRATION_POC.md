@@ -379,11 +379,20 @@ keys. See *Manual walkthrough* below for that path end to end.
 The steps here are the **config-file** route, for fleet or IaC installs that
 cannot use a dashboard.
 
-1. **Start the gateway with `[vta]` enabled.** On first boot it publishes a
-   `did:webvh` to authenticate with and logs it, along with the URL that
-   document is served at. This is the default (`publish_auth_did = true`);
-   set it to `false`, or set `auth_did` to a DID you host yourself, to change
-   it.
+1. **Start the gateway with `[vta]` enabled.** For a separately-operated
+   trust agent (`mode = "appliance"`) it publishes a `did:webvh` to
+   authenticate with on first boot and logs it, along with the URL that
+   document is served at. For a bundled sidecar (`mode = "embedded"`) it
+   authenticates as the plain `did:key` and publishes nothing, because the
+   sidecar is reached over loopback and cannot resolve the gateway's public
+   address.
+
+   `control_did_method = "did_key" | "did_webvh"` chooses explicitly. Absent,
+   the gateway decides in this order: a configured `auth_did` (a DID you host
+   yourself) wins; then `control_did_method`; then `did_key` for a bundled
+   sidecar; then the older `publish_auth_did` (`false` means `did_key`);
+   otherwise `did_webvh`. `control_did_method` and `publish_auth_did` must
+   agree when both are set.
 
 2. **Make that URL reachable from the trust agent.** It is served
    unauthenticated at `/vta-auth/did.jsonl` (and under `/.well-known/`). The
@@ -394,8 +403,8 @@ cannot use a dashboard.
    loopback and private hosts by default as an SSRF guard
    (`HostPolicy::PublicOnly`), and refuses before any signature is checked —
    the failure looks like a proof error, not a networking one. A deployment
-   that cannot expose the path should set `publish_auth_did = false`, so the
-   gateway authenticates as the plain `did:key`, and accept that rotating the
+   that cannot expose the path should set `control_did_method = "did_key"`, so
+   the gateway authenticates as the plain `did:key`, and accept that rotating the
    key needs a fresh grant. Development setups can opt in with
    `VTA_ALLOW_PRIVATE_ENDPOINTS` on the agent. The DID's address is
    `http://` for `localhost` and `https://` for every other host, on the port

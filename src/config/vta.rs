@@ -51,6 +51,28 @@ pub enum VtaMode {
     Bundled,
 }
 
+/// How the gateway names itself when it authenticates to its trust agent.
+///
+/// `did:key` is the key itself: nothing to host, nothing for the agent to
+/// resolve, and rotation is an `acl/swap-key` against the agent. `did:webvh`
+/// keeps one identifier across key rotation, at the price of the agent
+/// resolving the gateway's published document on every authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlDidMethod {
+    DidKey,
+    DidWebvh,
+}
+
+impl ControlDidMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DidKey => "did_key",
+            Self::DidWebvh => "did_webvh",
+        }
+    }
+}
+
 impl VtaMode {
     /// Operator-facing tier label, surfaced by the management API and the
     /// dashboard.
@@ -80,10 +102,6 @@ impl VtaMode {
     pub fn allows_self_administration(self) -> bool {
         matches!(self, Self::Bundled)
     }
-}
-
-fn default_publish_auth_did() -> bool {
-    true
 }
 
 fn default_timeout_ms() -> u64 {
@@ -276,19 +294,23 @@ pub struct VtaConfig {
     #[serde(default)]
     pub auth_did: Option<String>,
 
-    /// Publish a `did:webvh` at `/vta-auth/did.jsonl` and authenticate as it,
-    /// instead of as the control key's own `did:key`. **On by default.**
+    /// Which DID the gateway authenticates to the trust agent as. Absent means
+    /// "decide from the deployment": see
+    /// [`effective_control_did_method`](Self::effective_control_did_method).
     ///
-    /// The benefit is rotation: a `did:key` *is* its key, so replacing the key
-    /// needs a fresh grant, while a `did:webvh` keeps the identifier the
-    /// operator granted. The trust agent resolves the published document on
-    /// every authentication, so the gateway's `/vta-auth/did.jsonl` must be
-    /// reachable from the agent. Set `false` for a gateway the agent cannot
-    /// reach (behind NAT, on a private network): it then authenticates as the
-    /// `did:key` and rotating the key needs a new grant. `auth_did` still
-    /// overrides this: an operator who hosts their own identity keeps it.
-    #[serde(default = "default_publish_auth_did")]
-    pub publish_auth_did: bool,
+    /// `did_key` needs no hosting and no resolution by the agent. `did_webvh`
+    /// publishes a document at `/vta-auth/did.jsonl` that the agent resolves on
+    /// **every** authentication, so the gateway must be reachable from it.
+    /// `auth_did` still overrides this: an operator who hosts their own
+    /// identity keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_did_method: Option<ControlDidMethod>,
+
+    /// Older spelling of [`control_did_method`](Self::control_did_method):
+    /// `true` means `did_webvh`, `false` means `did_key`. Read only when
+    /// `control_did_method` is absent and the deployment is not bundled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_auth_did: Option<bool>,
 
     /// The verification method id within [`auth_did`](Self::auth_did) that the
     /// held signing key corresponds to — the fragment the auth proof names.
@@ -369,7 +391,8 @@ impl Default for VtaConfig {
             mode: VtaMode::default(),
             auth_key_source: None,
             auth_did: None,
-            publish_auth_did: default_publish_auth_did(),
+            control_did_method: None,
+            publish_auth_did: None,
             auth_verification_method: None,
             expect_pcr0: None,
             timeout_ms: default_timeout_ms(),
@@ -416,6 +439,16 @@ impl VtaConfig {
         require("base_url", &self.base_url)?;
         require("vta_did", &self.vta_did)?;
         require("context_id", &self.context_id)?;
+        if let (Some(method), Some(publish)) = (self.control_did_method, self.publish_auth_did) {
+            let publishes = method == ControlDidMethod::DidWebvh;
+            if publishes != publish {
+                return Err(format!(
+                    "[vta] control_did_method = \"{}\" contradicts publish_auth_did = {publish}; \
+                     set only control_did_method",
+                    method.as_str()
+                ));
+            }
+        }
         if self.timeout_ms == 0 {
             return Err("[vta] timeout_ms must be greater than zero".to_string());
         }
@@ -486,6 +519,34 @@ impl VtaConfig {
         Ok(())
     }
 
+    /// The DID method the gateway authenticates as, decided in this order:
+    ///
+    /// 1. `auth_did` set: the operator hosts their own identity.
+    /// 2. `control_did_method` set: that.
+    /// 3. a bundled sidecar: `did_key`, because it is reached over loopback and
+    ///    cannot resolve the gateway's public address.
+    /// 4. `publish_auth_did`, where `false` means `did_key`; otherwise
+    ///    `did_webvh`.
+    pub fn effective_control_did_method(&self) -> ControlDidMethod {
+        if let Some(auth_did) = self.auth_did.as_deref() {
+            return if auth_did.starts_with("did:key:") {
+                ControlDidMethod::DidKey
+            } else {
+                ControlDidMethod::DidWebvh
+            };
+        }
+        if let Some(method) = self.control_did_method {
+            return method;
+        }
+        if self.mode == VtaMode::Bundled {
+            return ControlDidMethod::DidKey;
+        }
+        match self.publish_auth_did {
+            Some(false) => ControlDidMethod::DidKey,
+            _ => ControlDidMethod::DidWebvh,
+        }
+    }
+
     /// The operator-facing deployment tier, for the management API and the
     /// dashboard. Reported even when the block is disabled, so the UI can say
     /// "local key" rather than guessing.
@@ -514,6 +575,81 @@ impl VtaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block(extra: &str) -> VtaConfig {
+        toml::from_str(&format!(
+            r#"
+            enabled = true
+            base_url = "http://127.0.0.1:8100"
+            vta_did = "did:key:z6MkVta"
+            context_id = "gateway"
+            signing_key_id = "gateway-jwt-1"
+            {extra}
+            "#
+        ))
+        .expect("parse")
+    }
+
+    #[test]
+    fn a_bundled_block_authenticates_as_did_key_by_default() {
+        let cfg = block(r#"mode = "embedded""#);
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidKey);
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn a_bundled_block_can_opt_in_to_did_webvh() {
+        let cfg = block("mode = \"embedded\"\ncontrol_did_method = \"did_webvh\"");
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn an_appliance_block_keeps_did_webvh_by_default() {
+        let cfg = block("");
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
+    }
+
+    #[test]
+    fn publish_auth_did_false_still_means_did_key_on_an_appliance() {
+        let cfg = block("publish_auth_did = false");
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidKey);
+    }
+
+    #[test]
+    fn publish_auth_did_does_not_override_a_bundled_default() {
+        let cfg = block("mode = \"embedded\"\npublish_auth_did = true");
+        assert_eq!(
+            cfg.effective_control_did_method(),
+            ControlDidMethod::DidKey,
+            "a bundled sidecar cannot resolve the gateway's public address"
+        );
+    }
+
+    #[test]
+    fn an_explicit_auth_did_wins_over_every_setting() {
+        let cfg = block("auth_did = \"did:webvh:Qm:host.example:gw\"\ncontrol_did_method = \"did_key\"");
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
+        let key = block("mode = \"embedded\"\nauth_did = \"did:key:z6MkGw\"");
+        assert_eq!(key.effective_control_did_method(), ControlDidMethod::DidKey);
+    }
+
+    #[test]
+    fn contradicting_control_did_method_and_publish_auth_did_is_refused() {
+        let cfg = block("control_did_method = \"did_key\"\npublish_auth_did = true");
+        let err = cfg
+            .validate()
+            .expect_err("contradiction");
+        assert!(err.contains("control_did_method") && err.contains("publish_auth_did"), "{err}");
+
+        let reverse = block("control_did_method = \"did_webvh\"\npublish_auth_did = false");
+        assert!(reverse.validate().is_err());
+
+        let agreeing = block("control_did_method = \"did_key\"\npublish_auth_did = false");
+        agreeing
+            .validate()
+            .expect("agreeing settings are fine");
+    }
 
     #[test]
     fn default_is_disabled_and_valid() {

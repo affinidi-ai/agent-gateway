@@ -17,6 +17,10 @@ enabled = true
 # `vta-service` runs as its own process in this deployment unit.
 mode = "embedded"
 
+# The sidecar is reached over loopback and cannot resolve the gateway's public
+# address, so the gateway authenticates as its own did:key (the default here).
+control_did_method = "did_key"
+
 # The sidecar is reachable only on the internal compose network, and the
 # gateway reserves this address so no surface, MCP proxy or A2A proxy can be
 # pointed at it (`GET /v1/vta/status` lists the reserved origins).

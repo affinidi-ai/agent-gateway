@@ -104,19 +104,6 @@ fn build_a2a_proxy_router_unauthenticated(
         .layer(Extension(secrets_store))
 }
 
-/// Give `[vta]` a stable `did:webvh` to authenticate with, creating it on
-/// first boot.
-///
-/// Opt-in via `[vta] publish_auth_did`, and off by default: the agent resolves
-/// the published document on **every** authentication, so a gateway it cannot
-/// reach would stop authenticating entirely. The plain `did:key` needs no
-/// resolution and always works, so it stays the default and this is the
-/// upgrade for deployments that can publish.
-///
-/// An explicitly configured `auth_did` always wins: the operator may already
-/// host one, and silently replacing it would invalidate the grant they made
-/// against it. Any failure degrades to the `did:key` — this is a rotation
-/// story, not a requirement, so it must not stop the gateway starting.
 /// Give the appliance a persistent VTA identity, and make it the key `[vta]`
 /// authenticates with when the operator named no source.
 ///
@@ -186,11 +173,28 @@ async fn connection_did_publisher(
     Some(std::sync::Arc::new(crate::vta::auth_did::ConnectionDidPublisher::new(storage, domain)))
 }
 
+/// Give `[vta]` a stable `did:webvh` to authenticate with, creating it on
+/// first boot, when the effective control DID method calls for one.
+///
+/// The method comes from [`VtaConfig::effective_control_did_method`]: a bundled
+/// sidecar defaults to `did:key`, because it is reached over loopback and
+/// cannot resolve the gateway's public address, so nothing is published for
+/// it unless the operator sets `control_did_method = "did_webvh"`. For a
+/// `did:webvh` the agent resolves the published document on **every**
+/// authentication, so a gateway it cannot reach stops authenticating.
+///
+/// An explicitly configured `auth_did` always wins: the operator may already
+/// host one, and silently replacing it would invalidate the grant they made
+/// against it. A publishing failure degrades to the `did:key`, because this is
+/// a rotation story, not a requirement, and must not stop the gateway starting.
 async fn ensure_vta_auth_did(
     mut config: crate::config::vta::VtaConfig,
     vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>,
 ) -> crate::config::vta::VtaConfig {
-    if !config.enabled || !config.publish_auth_did || config.auth_did.is_some() {
+    if !config.enabled
+        || config.auth_did.is_some()
+        || config.effective_control_did_method() != crate::config::vta::ControlDidMethod::DidWebvh
+    {
         return config;
     }
 

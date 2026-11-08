@@ -161,6 +161,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
+| `[vta]` | Signing through a trust agent. Off by default. `mode = "embedded"` is the bundled sidecar. `control_did_method = "did_key"` or `"did_webvh"` chooses the DID the gateway authenticates as; absent, a bundled sidecar uses `did_key` and a separately-operated agent uses `did_webvh`. See [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATION_POC.md). |
 
 Fields and defaults are defined in [`src/config/bootstrap.rs`](../src/config/bootstrap.rs).
 `config.example.toml` documents each field inline and is the most complete field-level
