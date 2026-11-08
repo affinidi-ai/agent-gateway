@@ -124,6 +124,16 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-08T23:30:00Z'
+      title: Correct the bundled trust agent compose example and add a Kubernetes one
+      description: >-
+        The compose example used settings the trust agent does not have
+        (VTA_LISTEN, VTA_DATA_DIR, port 3000, a health command) and put the
+        agent on a network where anything could reach it. It now shares the
+        gateway's network namespace so the agent listens on loopback only, uses
+        the agent's own port and health check, carries the shared bootstrap
+        volume and an encrypted seed secret, and needs no hand-made control key
+        or DID. A one-Pod Kubernetes example is added.
     - timestamp: '2026-11-08T10:20:00Z'
       title: Verify a trust-agent presentation bound to a challenge or domain
       description: >-
