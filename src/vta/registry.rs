@@ -436,7 +436,14 @@ impl VtaConnectionRegistry {
             .map_err(|e| VtaError::Config(format!("control key lookup failed: {e}")))?
             .ok_or_else(|| VtaError::Config(format!("control key `{secret_ref}` was not found")))?;
         let seed = super::decode_hex_seed(secret.value.trim())?;
-        Ok(Arc::new(ControlKey::from_seed(seed)))
+        let key = ControlKey::from_seed(seed);
+        match connection
+            .control_did
+            .as_deref()
+        {
+            Some(did) => Ok(Arc::new(key.with_stable_did(did.to_string(), None)?)),
+            None => Ok(Arc::new(key)),
+        }
     }
 }
 
@@ -631,6 +638,7 @@ mod tests {
             vta_did: format!("did:webvh:{id}.example"),
             default_context_id: Some("ctx".to_string()),
             control_key_ref: Some(format!("secret-{id}")),
+            control_did: None,
             status: VtaConnectionStatus::Connected,
             keys: Default::default(),
             pairing: Default::default(),
@@ -772,6 +780,66 @@ mod tests {
                 .expect("there is nowhere to read the control key from"),
         );
         assert!(msg.contains("secrets store"), "unexpected error: {msg}");
+    }
+
+    const SEED_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+
+    fn secrets_with_seed() -> Option<Arc<dyn SecretsStore>> {
+        Some(Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![("secret-c1", None, SEED_HEX)])))
+    }
+
+    /// The key a connection authenticates with names itself by the connection's
+    /// published `did:webvh`, so the grant the operator made stays valid when
+    /// the key is replaced.
+    #[tokio::test]
+    async fn a_connection_with_a_published_did_authenticates_as_it() {
+        let mut c = connection("c1", true);
+        c.control_did = Some("did:webvh:QmScid:gw.example.com:vta-auth:c1".to_string());
+        let registry = registry(MemoryStore::new(vec![c.clone()]), secrets_with_seed());
+
+        let key = registry
+            .control_key(&c)
+            .await
+            .expect("the control key resolves");
+
+        assert_eq!(key.did(), "did:webvh:QmScid:gw.example.com:vta-auth:c1");
+        assert_eq!(key.verification_method(), "did:webvh:QmScid:gw.example.com:vta-auth:c1#key-1");
+    }
+
+    /// A connection created before the DID existed keeps authenticating as the
+    /// `did:key` it was granted.
+    #[tokio::test]
+    async fn a_connection_without_a_published_did_keeps_its_did_key() {
+        let c = connection("c1", true);
+        let registry = registry(MemoryStore::new(vec![c.clone()]), secrets_with_seed());
+
+        let key = registry
+            .control_key(&c)
+            .await
+            .expect("the control key resolves");
+
+        assert_eq!(key.did(), crate::vta::control_key_did(SEED_HEX).expect("derive"));
+        assert!(
+            key.did()
+                .starts_with("did:key:")
+        );
+    }
+
+    /// A DID that is not a `did:webvh` is a configuration error, not something
+    /// to authenticate under.
+    #[tokio::test]
+    async fn a_recorded_did_that_is_not_a_webvh_is_refused() {
+        let mut c = connection("c1", true);
+        c.control_did = Some("did:key:z6MkSomething".to_string());
+        let registry = registry(MemoryStore::new(vec![c.clone()]), secrets_with_seed());
+
+        let err = registry
+            .control_key(&c)
+            .await
+            .err()
+            .expect("refused");
+
+        assert!(detail(err).contains("did:webvh"));
     }
 
     /// A connection that has not completed pairing has not proved it can sign

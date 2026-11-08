@@ -465,6 +465,7 @@ mod live_tests {
                 vta_did: vta_did.clone(),
                 default_context_id: Some(context.clone()),
                 control_key_ref: Some(CONTROL_SECRET_ID.to_string()),
+                control_did: None,
                 status: VtaConnectionStatus::Connected,
                 keys: Default::default(),
                 pairing: crate::vta::pairing::PairingRecord {

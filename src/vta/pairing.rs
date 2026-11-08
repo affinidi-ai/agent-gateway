@@ -32,7 +32,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::vta::VtaError;
 use crate::vta::connections::{VtaConnection, VtaConnectionStatus};
-use crate::vta::control_key::SignerKeyProvider;
 use crate::vta::onboarding::{GrantScope, grant_command_with_provisioning};
 
 /// How long a pairing payload stays valid. Short, because it is a one-shot
@@ -365,20 +364,11 @@ pub fn assert_usable(
     Ok(())
 }
 
-/// Mint a fresh per-connection control key and return its `did:key` plus the
-/// seed, for the caller to store **by reference** in the secrets store.
-///
-/// Per connection, never shared: revoking one must not strand the others, and a
-/// leaked seed must not authenticate the gateway to every VTA it knows.
-pub fn mint_control_key() -> (String, String) {
-    let key = crate::vta::control_key::ControlKey::generate();
-    (key.did().to_string(), key.seed_hex())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vta::connections::VtaConnectionTransport;
+    use crate::vta::control_key::SignerKeyProvider;
 
     fn connection(context: Option<&str>) -> VtaConnection {
         let now = Utc::now();
@@ -393,6 +383,7 @@ mod tests {
             vta_did: "did:webvh:vta.customer.example".to_string(),
             default_context_id: context.map(str::to_string),
             control_key_ref: Some("secret-control-key".to_string()),
+            control_did: None,
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),
@@ -718,8 +709,10 @@ mod tests {
 
     #[test]
     fn every_connection_gets_its_own_control_key() {
-        let (first_did, first_seed) = mint_control_key();
-        let (second_did, second_seed) = mint_control_key();
+        let first = crate::vta::control_key::ControlKey::generate();
+        let second = crate::vta::control_key::ControlKey::generate();
+        let (first_did, first_seed) = (first.did().to_string(), first.seed_hex());
+        let (second_did, second_seed) = (second.did().to_string(), second.seed_hex());
 
         assert_ne!(first_did, second_did, "a shared key would let one leak authenticate everywhere");
         assert_ne!(first_seed, second_seed);

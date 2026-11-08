@@ -381,7 +381,9 @@ cannot use a dashboard.
 
 1. **Start the gateway with `[vta]` enabled.** On first boot it publishes a
    `did:webvh` to authenticate with and logs it, along with the URL that
-   document is served at.
+   document is served at. This is the default (`publish_auth_did = true`);
+   set it to `false`, or set `auth_did` to a DID you host yourself, to change
+   it.
 
 2. **Make that URL reachable from the trust agent.** It is served
    unauthenticated at `/vta-auth/did.jsonl` (and under `/.well-known/`). The
@@ -392,13 +394,30 @@ cannot use a dashboard.
    loopback and private hosts by default as an SSRF guard
    (`HostPolicy::PublicOnly`), and refuses before any signature is checked —
    the failure looks like a proof error, not a networking one. A deployment
-   that cannot expose the path should keep the plain `did:key` and accept that
-   rotating the key needs a fresh grant. Development setups can opt in with
-   `VTA_ALLOW_PRIVATE_ENDPOINTS` on the agent.
+   that cannot expose the path should set `publish_auth_did = false`, so the
+   gateway authenticates as the plain `did:key`, and accept that rotating the
+   key needs a fresh grant. Development setups can opt in with
+   `VTA_ALLOW_PRIVATE_ENDPOINTS` on the agent. The DID's address is
+   `http://` for `localhost` and `https://` for every other host, on the port
+   the gateway's own DID names, so a development gateway serving HTTPS on a
+   local port cannot be resolved by the agent either.
 
    A warning at startup that the auth DID could not be resolved is **expected**
    — the listener is not up yet when the check runs. What matters is whether
    the agent can reach it, which that check cannot answer.
+
+**Connections created in the dashboard** authenticate the same way. A new
+connection mints its own control key and publishes its own `did:webvh` at
+`/vta-auth/{connection_id}/did.jsonl` (and under `/.well-known/`), under the
+domain the gateway's own DID names. That DID is the one the pairing step shows
+and the grant command names, and it stays the same when the control key is
+replaced. The same reachability rule applies: the agent resolves it on every
+authentication. A gateway whose own DID names no domain, or a connection created
+through the API with `"control_identity": "did_key"`, authenticates as the
+`did:key` of its control key instead. A connection created before this existed
+keeps the `did:key` it was granted. Replacing a published connection's key
+means updating its log off this host; the gateway holds only the current signing
+key, so a compromise is recovered by revoking the grant, not by rotating.
 
 3. **Run the grant command the gateway prints**, on the agent, as an
    administrator. This is the one consent step; the gateway never holds admin

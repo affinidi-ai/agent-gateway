@@ -4478,6 +4478,7 @@ mod live_connection_tests {
                 vta_did: vta_did.clone(),
                 default_context_id: Some(context.clone()),
                 control_key_ref: Some(CONTROL_SECRET_ID.to_string()),
+                control_did: None,
                 status: VtaConnectionStatus::Connected,
                 keys: SigningKeys {
                     active: Some(SigningKey {
@@ -4664,6 +4665,7 @@ mod surface_injection_tests {
                 vta_did: "did:webvh:agent.example".to_string(),
                 default_context_id: Some("ctx-a".to_string()),
                 control_key_ref: Some("ctl".to_string()),
+                control_did: None,
                 status: crate::vta::connections::VtaConnectionStatus::Connected,
                 keys: Default::default(),
                 pairing: crate::vta::pairing::PairingRecord {

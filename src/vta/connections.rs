@@ -101,6 +101,16 @@ pub struct VtaConnection {
     /// control-key seed for this connection. **Never inline key material.**
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_key_ref: Option<String>,
+    /// The `did:webvh` this connection authenticates as, when it has one.
+    ///
+    /// The gateway publishes it at `/vta-auth/{id}/did.jsonl` and the control
+    /// key above is the key it declares, so the identifier an operator grants
+    /// stays put when that key is replaced. Absent for a connection created
+    /// before this existed or opted out of it: it authenticates as the
+    /// `did:key` of its control key, which cannot be rotated without a new
+    /// grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_did: Option<String>,
     #[serde(default)]
     pub status: VtaConnectionStatus,
 
@@ -301,6 +311,7 @@ impl VtaConnection {
             // store, so the record has no reference to carry. The connector for
             // this connection keeps using the bootstrap key.
             control_key_ref: None,
+            control_did: None,
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),
@@ -494,6 +505,7 @@ mod tests {
             vta_did: "did:webvh:vta.customer.example".to_string(),
             default_context_id: Some("ctx".to_string()),
             control_key_ref: Some("secret-control-key".to_string()),
+            control_did: None,
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),
@@ -520,6 +532,38 @@ mod tests {
         for forbidden in ["control_key_seed", "private_key", "session_token", "bearer"] {
             assert!(!text.contains(forbidden), "record leaked `{forbidden}`: {text}");
         }
+    }
+
+    /// A record written before the field existed still loads, and keeps
+    /// authenticating as its `did:key`.
+    #[test]
+    fn a_record_without_a_control_did_loads_and_omits_it_on_write() {
+        let mut json = serde_json::to_value(connection("c1")).expect("serialise");
+        json.as_object_mut()
+            .unwrap()
+            .remove("control_did");
+
+        let loaded: VtaConnection = serde_json::from_value(json).expect("an older record loads");
+
+        assert!(loaded.control_did.is_none());
+        let written = serde_json::to_value(&loaded).expect("serialise");
+        assert!(
+            written
+                .get("control_did")
+                .is_none(),
+            "an absent DID is not written as null"
+        );
+    }
+
+    #[test]
+    fn a_control_did_round_trips() {
+        let mut record = connection("c1");
+        record.control_did = Some("did:webvh:QmScid:gw.example.com:vta-auth:c1".to_string());
+
+        let back: VtaConnection =
+            serde_json::from_value(serde_json::to_value(&record).expect("serialise")).expect("load");
+
+        assert_eq!(back.control_did.as_deref(), Some("did:webvh:QmScid:gw.example.com:vta-auth:c1"));
     }
 
     #[test]

@@ -63,12 +63,39 @@ use crate::vta::control_key::ControlKey;
 /// Path segment the auth DID lives under, in both the identifier and the URL.
 pub const AUTH_DID_PATH_SEGMENT: &str = "vta-auth";
 
-/// Directory under the issuer's storage where the log is kept.
+/// Directory under the issuer's storage where the logs are kept.
 const AUTH_DID_DIR: &str = "vta_auth";
 
-/// Where the auth DID's log lives, given the issuer storage root.
+/// Subdirectory holding one log per managed connection.
+const CONNECTION_DIR: &str = "connections";
+
+/// Where the appliance's own auth DID log lives, given the issuer storage root.
 pub fn auth_did_dir(issuer_storage: &Path) -> PathBuf {
     issuer_storage.join(AUTH_DID_DIR)
+}
+
+/// Where a managed connection's auth DID log lives.
+///
+/// `connection_id` is used as a path segment, so anything that is not a plain
+/// identifier is refused rather than joined.
+pub fn connection_auth_did_dir(
+    issuer_storage: &Path,
+    connection_id: &str,
+) -> Result<PathBuf, VtaError> {
+    if !is_plain_identifier(connection_id) {
+        return Err(VtaError::Config(format!("[vta] connection id `{connection_id}` cannot name an auth DID")));
+    }
+    Ok(auth_did_dir(issuer_storage)
+        .join(CONNECTION_DIR)
+        .join(connection_id))
+}
+
+/// A non-empty run of ASCII letters, digits, `-` and `_`.
+pub fn is_plain_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Create the gateway's auth `did:webvh`, or adopt the one already there.
@@ -81,8 +108,60 @@ pub async fn ensure_auth_did(
     domain: &str,
     control_key: &ControlKey,
 ) -> Result<String, VtaError> {
-    let dir = auth_did_dir(issuer_storage);
+    ensure_did_at(auth_did_dir(issuer_storage), domain, AUTH_DID_PATH_SEGMENT.to_string(), control_key).await
+}
 
+/// Create the auth `did:webvh` of one managed connection, or adopt the one
+/// already there.
+///
+/// Each connection authenticates with its **own** key (revoking one must not
+/// strand the others), so each gets its own identifier, served at
+/// `/vta-auth/{connection_id}/did.jsonl`. Idempotent for the same reason as
+/// [`ensure_auth_did`]: the operator's grant names this DID.
+pub async fn ensure_connection_auth_did(
+    issuer_storage: &Path,
+    domain: &str,
+    connection_id: &str,
+    control_key: &ControlKey,
+) -> Result<String, VtaError> {
+    let dir = connection_auth_did_dir(issuer_storage, connection_id)?;
+    ensure_did_at(dir, domain, format!("{AUTH_DID_PATH_SEGMENT}:{connection_id}"), control_key).await
+}
+
+/// Publishes managed connections' auth DIDs under this gateway's domain.
+///
+/// Held by the connection admin API. Absent when the gateway has no domain to
+/// publish under, in which case a connection authenticates as its `did:key`.
+#[derive(Debug, Clone)]
+pub struct ConnectionDidPublisher {
+    issuer_storage: PathBuf,
+    domain: String,
+}
+
+impl ConnectionDidPublisher {
+    pub fn new(
+        issuer_storage: PathBuf,
+        domain: String,
+    ) -> Self {
+        Self { issuer_storage, domain }
+    }
+
+    /// Create (or adopt) `connection_id`'s `did:webvh`, declaring `key`.
+    pub async fn publish(
+        &self,
+        connection_id: &str,
+        key: &ControlKey,
+    ) -> Result<String, VtaError> {
+        ensure_connection_auth_did(&self.issuer_storage, &self.domain, connection_id, key).await
+    }
+}
+
+async fn ensure_did_at(
+    dir: PathBuf,
+    domain: &str,
+    path_segments: String,
+    control_key: &ControlKey,
+) -> Result<String, VtaError> {
     if let Some(existing) = read_existing_did(&dir).await? {
         return Ok(existing);
     }
@@ -92,7 +171,7 @@ pub async fn ensure_auth_did(
         .map_err(|e| VtaError::Config(format!("[vta] create auth DID directory: {e}")))?;
 
     let domain_encoded = domain.replace(':', "%3A");
-    let placeholder = format!("did:webvh:{{SCID}}:{domain_encoded}:{AUTH_DID_PATH_SEGMENT}");
+    let placeholder = format!("did:webvh:{{SCID}}:{domain_encoded}:{path_segments}");
     let document = auth_did_document(&placeholder, &control_key.public_key_multibase());
 
     let private_jwk = control_key_jwk(control_key);
@@ -112,7 +191,7 @@ pub async fn ensure_auth_did(
     // nothing about whether the agent can reach it.
     tracing::info!(
         did = %created.final_did,
-        url = %format!("{}{AUTH_DID_PATH_SEGMENT}/did.jsonl", base_url),
+        url = %format!("{}{}/did.jsonl", base_url, path_segments.replace(':', "/")),
         "published the gateway's trust-agent auth DID; this URL must be reachable from the agent"
     );
 
@@ -295,6 +374,103 @@ mod tests {
             json!(format!("{did}#key-1")),
             "the default verification method the control key presents is `#key-1`"
         );
+    }
+
+    /// A connection's DID names the connection, so two connections never share
+    /// an identity, and the path it resolves from is the one the gateway serves.
+    #[tokio::test]
+    async fn each_connection_gets_its_own_did_under_its_own_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_a = ControlKey::from_seed([5u8; 32]);
+        let key_b = ControlKey::from_seed([6u8; 32]);
+
+        let a = ensure_connection_auth_did(dir.path(), "example.com", "conn-a", &key_a)
+            .await
+            .expect("create a");
+        let b = ensure_connection_auth_did(dir.path(), "example.com", "conn-b", &key_b)
+            .await
+            .expect("create b");
+
+        assert_ne!(a, b);
+        assert!(a.starts_with("did:webvh:"), "{a}");
+        assert!(a.ends_with(":example.com:vta-auth:conn-a"), "{a}");
+        assert!(b.ends_with(":example.com:vta-auth:conn-b"), "{b}");
+
+        let app_did = ensure_auth_did(dir.path(), "example.com", &key_a)
+            .await
+            .expect("the appliance's own DID is unaffected");
+        assert!(app_did.ends_with(":example.com:vta-auth"), "{app_did}");
+    }
+
+    /// The operator granted this DID; a restart must not mint another.
+    #[tokio::test]
+    async fn a_restart_adopts_a_connections_existing_did() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ControlKey::from_seed([7u8; 32]);
+
+        let first = ensure_connection_auth_did(dir.path(), "example.com", "conn-a", &key)
+            .await
+            .expect("create");
+        let second = ensure_connection_auth_did(dir.path(), "example.com", "conn-a", &key)
+            .await
+            .expect("adopt");
+
+        assert_eq!(first, second);
+    }
+
+    /// The document the connection's DID resolves to declares the key the
+    /// connection authenticates with, and only for authentication.
+    #[tokio::test]
+    async fn a_connections_document_declares_its_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ControlKey::from_seed([8u8; 32]);
+
+        let did = ensure_connection_auth_did(dir.path(), "example.com", "conn-a", &key)
+            .await
+            .expect("create");
+        let log_dir = connection_auth_did_dir(dir.path(), "conn-a").expect("dir");
+        let raw = crate::storage::did_artifacts::read_did_log_raw(&log_dir)
+            .await
+            .expect("read")
+            .expect("log exists");
+        let entry: Value = serde_json::from_str(
+            raw.lines()
+                .next()
+                .expect("a line"),
+        )
+        .expect("parses");
+        let state = &entry["state"];
+
+        assert_eq!(state["id"], json!(did));
+        assert_eq!(state["verificationMethod"][0]["publicKeyMultibase"], json!(key.public_key_multibase()));
+        assert_eq!(state["authentication"][0], json!(format!("{did}#key-1")));
+        assert!(
+            state
+                .get("assertionMethod")
+                .is_none()
+        );
+    }
+
+    /// An id is a path segment on disk and in the URL, so a traversal attempt
+    /// is refused instead of joined.
+    #[tokio::test]
+    async fn an_id_that_is_not_a_plain_identifier_cannot_name_a_did() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = ControlKey::from_seed([9u8; 32]);
+
+        for bad in ["", "..", "a/b", "a:b", "a b", "../x", "a%2Fb"] {
+            let err = ensure_connection_auth_did(dir.path(), "example.com", bad, &key)
+                .await
+                .expect_err(bad);
+            assert!(
+                err.log_detail()
+                    .contains("cannot name an auth DID"),
+                "{bad}: {}",
+                err.log_detail()
+            );
+        }
+        assert!(is_plain_identifier("3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f"));
+        assert!(is_plain_identifier("vta-bootstrap"));
     }
 }
 
@@ -557,5 +733,146 @@ mod live_tests {
         .expect("the presentation must verify against the agent's own key");
 
         eprintln!("LIVE_CHAIN_OK auth={auth_did} agent={}", agent.did);
+    }
+    const CONN_SEED: [u8; 32] = [78u8; 32];
+    const CONN_STORAGE: &str = "/tmp/tg-vta-conn-auth-e2e";
+    const CONN_PORT: u16 = 4568;
+    const CONN_ID: &str = "live-conn-webvh";
+
+    /// Serve connection logs at the path the real gateway route serves them
+    /// on (`/vta-auth/{connection_id}/did.jsonl`), reading them from where the
+    /// publisher wrote them.
+    async fn serve_connection_dids(storage: PathBuf) -> std::net::SocketAddr {
+        use axum::Router;
+        use axum::extract::Path as UrlPath;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/vta-auth/{connection_id}/did.jsonl",
+            get(move |UrlPath(id): UrlPath<String>| {
+                let storage = storage.clone();
+                async move {
+                    match connection_auth_did_dir(&storage, &id) {
+                        Ok(dir) => tokio::fs::read_to_string(dir.join("did.jsonl"))
+                            .await
+                            .unwrap_or_default(),
+                        Err(_) => String::new(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", CONN_PORT))
+            .await
+            .expect("bind the connection DID server; is the port already in use?");
+        let addr = listener
+            .local_addr()
+            .expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// A managed connection authenticates to a real VTA **as the `did:webvh`
+    /// the gateway published for it**, through the real connection registry.
+    ///
+    /// This is the path the dashboard creates: a per-connection key in the
+    /// secrets store, a recorded `control_did`, and a registry that presents
+    /// the key under that DID. It succeeds only if the VTA resolved the log at
+    /// `/vta-auth/{id}/did.jsonl` and found the control key declared in it.
+    ///
+    /// The first run prints the grant command for the published DID. Run it on
+    /// the VTA, then run the test again: the DID is stable across runs.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service and a one-time grant of the published connection DID"]
+    async fn live_a_managed_connection_authenticates_as_its_published_did() {
+        use crate::vta::connections::{
+            VtaConnection, VtaConnectionStatus, VtaConnectionStorage, VtaConnectionTransport,
+        };
+        use crate::vta::registry::VtaConnectionRegistry;
+
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID");
+        let parent = std::env::var("VTA_LIVE_PARENT_CONTEXT").expect("set VTA_LIVE_PARENT_CONTEXT");
+
+        let storage = PathBuf::from(CONN_STORAGE);
+        tokio::fs::create_dir_all(&storage)
+            .await
+            .expect("storage");
+        let control = ControlKey::from_seed(CONN_SEED);
+        let publisher = ConnectionDidPublisher::new(storage.clone(), format!("localhost:{CONN_PORT}"));
+        let did = publisher
+            .publish(CONN_ID, &control)
+            .await
+            .expect("publish the connection's DID");
+        eprintln!("LIVE_CONN_DID={did}");
+        assert_eq!(
+            publisher
+                .publish(CONN_ID, &control)
+                .await
+                .expect("adopt"),
+            did,
+            "a restart must not change the identity the grant names"
+        );
+        let addr = serve_connection_dids(storage.clone()).await;
+        eprintln!("LIVE_CONN_DID_URL=http://{addr}/vta-auth/{CONN_ID}/did.jsonl");
+
+        let now = chrono::Utc::now();
+        let connection = VtaConnection {
+            id: CONN_ID.to_string(),
+            tenant_id: None,
+            name: "live webvh connection".to_string(),
+            description: None,
+            enabled: true,
+            transport: VtaConnectionTransport::Https,
+            endpoint: url,
+            vta_did,
+            default_context_id: Some(parent.clone()),
+            control_key_ref: Some("conn-seed".to_string()),
+            control_did: Some(did.clone()),
+            status: VtaConnectionStatus::Unpaired,
+            keys: Default::default(),
+            pairing: Default::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        let records = tempfile::tempdir().expect("records");
+        let store: Arc<dyn VtaConnectionStorage> = Arc::new(
+            crate::vta::connections::FileSystemVtaConnectionStore::new(records.path().to_path_buf())
+                .await
+                .expect("store"),
+        );
+        let seed_hex: &'static str = Box::leak(
+            control
+                .seed_hex()
+                .into_boxed_str(),
+        );
+        let secrets: Arc<dyn crate::secrets::SecretsStore> =
+            Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![("conn-seed", None, seed_hex)]));
+        let registry = VtaConnectionRegistry::new(store, Some(secrets), None, None, Duration::from_secs(15), 4);
+
+        let outcome = match registry
+            .verify(&connection)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) => panic!(
+                "could not authenticate as the published connection DID.\n\n\
+                 If this is a permission error, grant it once on the VTA:\n\n  {}\n\n\
+                 If it is an authentication error, the VTA could not resolve http://{addr}/vta-auth/{CONN_ID}/did.jsonl\n\n{e:?}",
+                crate::vta::onboarding::grant_command_with_provisioning(&did, &parent),
+            ),
+        };
+
+        assert!(
+            outcome
+                .scope
+                .contexts
+                .iter()
+                .any(|c| c == &parent),
+            "the session must carry the granted context: {:?}",
+            outcome.scope
+        );
+        eprintln!("LIVE_CONN_OK did={did} scope={:?}", outcome.scope);
     }
 }

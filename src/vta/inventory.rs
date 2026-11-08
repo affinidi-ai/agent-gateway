@@ -251,6 +251,7 @@ mod tests {
             vta_did: format!("did:webvh:{id}.example"),
             default_context_id: Some("ctx".to_string()),
             control_key_ref: Some("secret".to_string()),
+            control_did: None,
             status: VtaConnectionStatus::Connected,
             pairing: crate::vta::pairing::PairingRecord {
                 state: crate::vta::pairing::PairingState::Connected,

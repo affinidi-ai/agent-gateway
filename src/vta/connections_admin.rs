@@ -48,6 +48,9 @@ pub struct VtaConnectionAdminState {
     /// Agent identities, so a connection that holds agents' keys cannot be
     /// disconnected without the caller acknowledging they will be stranded.
     pub identity_store: Option<Arc<dyn crate::identity::store::IdentityStore>>,
+    /// Publishes a new connection's `did:webvh`. `None` when the gateway has no
+    /// domain to publish under, so connections authenticate as their `did:key`.
+    pub auth_did_publisher: Option<Arc<crate::vta::auth_did::ConnectionDidPublisher>>,
 }
 
 /// Query for the actions that stop a connection signing.
@@ -114,6 +117,20 @@ async fn guard_stranded_agents(
     ))
 }
 
+/// The identifier a new connection authenticates to its VTA as.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlIdentity {
+    /// A `did:webvh` the gateway publishes, so the control key can be replaced
+    /// without a new grant. The VTA must be able to reach the gateway's
+    /// `/vta-auth/{id}/did.jsonl`.
+    #[default]
+    Webvh,
+    /// The `did:key` of the control key itself. Needs nothing published, and
+    /// replacing the key means a new identifier and a new grant.
+    DidKey,
+}
+
 /// Body for create / update.
 #[derive(Debug, Default, Deserialize)]
 pub struct VtaConnectionRequest {
@@ -132,6 +149,9 @@ pub struct VtaConnectionRequest {
     pub default_context_id: Option<String>,
     #[serde(default)]
     pub control_key_ref: Option<String>,
+    /// Applies when the gateway mints the control key (no `control_key_ref`).
+    #[serde(default)]
+    pub control_identity: ControlIdentity,
 }
 
 #[derive(Debug, Serialize)]
@@ -273,12 +293,24 @@ fn to_connection(
         vta_did: body.vta_did,
         default_context_id: body.default_context_id,
         control_key_ref: body.control_key_ref,
+        control_did: None,
         status,
         keys: Default::default(),
         pairing: Default::default(),
         created_at: now,
         updated_at: now,
     }
+}
+
+/// The published DID survives an edit, because the grant names it. It belongs
+/// to the control key, so a connection pointed at a different key loses it.
+fn kept_control_did(
+    existing: &VtaConnection,
+    updated: &VtaConnection,
+) -> Option<String> {
+    (existing.control_key_ref == updated.control_key_ref)
+        .then(|| existing.control_did.clone())
+        .flatten()
 }
 
 async fn invalidate(
@@ -341,6 +373,7 @@ pub async fn create_connection(
     {
         return response.into_response();
     }
+    let control_identity = body.control_identity;
     let mut connection = to_connection(uuid::Uuid::new_v4().to_string(), body, VtaConnectionStatus::Unpaired);
 
     // Every connection gets its **own** control key (VTA-24): revoking one
@@ -354,11 +387,10 @@ pub async fn create_connection(
         .map(|r| r.trim().is_empty())
         .unwrap_or(true)
         && let Some(Extension(secrets)) = secrets_store.as_ref()
+        && let Err(response) =
+            give_connection_a_control_identity(&state, secrets, &mut connection, control_identity).await
     {
-        match mint_connection_control_key(secrets, &connection.id, connection.tenant_id.clone()).await {
-            Ok(secret_ref) => connection.control_key_ref = Some(secret_ref),
-            Err(response) => return response.into_response(),
-        }
+        return response.into_response();
     }
 
     if let Err(message) = connection.validate() {
@@ -525,7 +557,8 @@ pub async fn update_connection(
     {
         return response.into_response();
     }
-    let updated = to_connection(id.clone(), body, existing.status);
+    let mut updated = to_connection(id.clone(), body, existing.status);
+    updated.control_did = kept_control_did(&existing, &updated);
     if let Err(message) = updated.validate() {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
@@ -888,18 +921,52 @@ pub async fn connection_status(
         .into_response()
 }
 
-/// Mint this connection's own Ed25519 control key and store the seed in the
+/// Mint `connection`'s own control key, store it, and — when asked and the
+/// gateway has a domain to publish under — publish the `did:webvh` that
+/// declares it. Records the secret reference and the DID on the connection.
+///
+/// Without a publisher the connection authenticates as the `did:key` of its
+/// key. A publisher that fails is an error, not a fallback: the identifier the
+/// operator is about to grant would otherwise silently differ from the one
+/// they asked for.
+async fn give_connection_a_control_identity(
+    state: &VtaConnectionAdminState,
+    secrets: &Arc<dyn SecretsStore>,
+    connection: &mut VtaConnection,
+    identity: ControlIdentity,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let key = crate::vta::control_key::ControlKey::generate();
+    connection.control_key_ref =
+        Some(store_connection_control_key(secrets, &connection.id, connection.tenant_id.clone(), &key).await?);
+    if identity == ControlIdentity::Webvh
+        && let Some(publisher) = &state.auth_did_publisher
+    {
+        let did = publisher
+            .publish(&connection.id, &key)
+            .await
+            .map_err(|e| {
+                error!(connection_id = %connection.id, error = %e.log_detail(), "Failed to publish the connection's auth DID");
+                (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to publish the control DID"))
+            })?;
+        connection.control_did = Some(did);
+    }
+    Ok(())
+}
+
+/// Store this connection's own Ed25519 control key: the seed goes in the
 /// secrets store, returning the reference to record.
 ///
 /// The seed never touches the connection record, so a leaked record file
 /// cannot authenticate to the VTA; and the key is per connection, so revoking
 /// one cannot strand the others.
-async fn mint_connection_control_key(
+async fn store_connection_control_key(
     secrets: &Arc<dyn SecretsStore>,
     connection_id: &str,
     tenant_id: Option<String>,
+    key: &crate::vta::control_key::ControlKey,
 ) -> Result<String, (StatusCode, Json<ErrorBody>)> {
-    let (control_did, seed) = crate::vta::pairing::mint_control_key();
+    let control_did = crate::vta::control_key::SignerKeyProvider::did(key).to_string();
+    let seed = key.seed_hex();
     let secret_id = format!("vta-control-key-{connection_id}");
     secrets
         .create(crate::secrets::CreateSecretRequest {
@@ -937,6 +1004,12 @@ async fn resolve_control_did(
     secrets_store: Option<&Arc<dyn SecretsStore>>,
     vta_config: &crate::config::vta::VtaConfig,
 ) -> Result<String, (StatusCode, Json<ErrorBody>)> {
+    if let Some(did) = connection
+        .control_did
+        .as_deref()
+    {
+        return Ok(did.to_string());
+    }
     let secret_ref = match connection
         .control_key_ref
         .as_deref()
@@ -996,6 +1069,9 @@ async fn bootstrap_control_did(
                  restart and cannot be granted; set auth_key_source (env:// or file://) and restart",
             ),
         ));
+    }
+    if let Some(did) = vta_config.auth_did.as_deref() {
+        return Ok(did.to_string());
     }
     let key = crate::vta::build_control_key_material(vta_config)
         .await
@@ -1438,6 +1514,7 @@ mod tests {
             provisioner: None,
             default_resolution: Arc::new(crate::vta::onboarding_default::resolve(&VtaConfig::default())),
             identity_store,
+            auth_did_publisher: None,
         };
         (state, dir)
     }
@@ -1520,6 +1597,274 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    // ---- the identity a new connection authenticates as ------------------
+
+    /// Records what is stored so the test can read the seed back, as the
+    /// registry will.
+    struct RecordingSecrets(std::sync::Mutex<Vec<crate::secrets::CreateSecretRequest>>);
+
+    #[async_trait::async_trait]
+    impl SecretsStore for RecordingSecrets {
+        async fn create(
+            &self,
+            request: crate::secrets::CreateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            let now = chrono::Utc::now();
+            Ok(crate::secrets::Secret {
+                id: format!("internal-{}", request.secret_id),
+                tenant_id: request.tenant_id,
+                name: request.name,
+                secret_id: request.secret_id,
+                description: request.description,
+                value: request.value,
+                secret_type: request.secret_type,
+                tags: request.tags,
+                created_at: now,
+                updated_at: now,
+            })
+        }
+
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::secrets::Secret>> {
+            unimplemented!()
+        }
+
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+
+        async fn update(
+            &self,
+            _id: &str,
+            _request: crate::secrets::UpdateSecretRequest,
+        ) -> anyhow::Result<crate::secrets::Secret> {
+            unimplemented!()
+        }
+
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn find_by_tag(
+            &self,
+            _tag: &str,
+        ) -> anyhow::Result<Vec<crate::secrets::SecretListItem>> {
+            unimplemented!()
+        }
+    }
+
+    /// A store that returns `seed` for the reference [`give_connection_a_control_identity`] recorded.
+    fn store_holding(seed: &str) -> Arc<dyn SecretsStore> {
+        let seed: &'static str = Box::leak(
+            seed.to_string()
+                .into_boxed_str(),
+        );
+        Arc::new(crate::integrations::definitions::test_secrets::Secrets(vec![(
+            "vta-control-key-3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f",
+            None,
+            seed,
+        )]))
+    }
+
+    fn new_connection() -> VtaConnection {
+        to_connection(
+            "3f2c9a1e-7d4b-4c1a-9e55-0a1b2c3d4e5f".to_string(),
+            VtaConnectionRequest {
+                name: "Customer VTA".to_string(),
+                endpoint: "https://vta.example".to_string(),
+                vta_did: "did:webvh:QmVta:vta.example".to_string(),
+                ..Default::default()
+            },
+            VtaConnectionStatus::Unpaired,
+        )
+    }
+
+    async fn state_publishing_under(storage: &std::path::Path) -> (VtaConnectionAdminState, tempfile::TempDir) {
+        let (mut state, dir) = admin_state(None).await;
+        state.auth_did_publisher = Some(Arc::new(crate::vta::auth_did::ConnectionDidPublisher::new(
+            storage.to_path_buf(),
+            "gw.example.com".to_string(),
+        )));
+        (state, dir)
+    }
+
+    /// The identifier the operator is asked to grant is the published
+    /// `did:webvh`, it names the connection, and the key it declares is the one
+    /// the seed in the secrets store derives.
+    #[tokio::test]
+    async fn a_new_connection_authenticates_as_a_published_did_webvh() {
+        let storage = tempfile::tempdir().expect("storage");
+        let (state, _dir) = state_publishing_under(storage.path()).await;
+        let secrets = Arc::new(RecordingSecrets(Default::default()));
+        let store: Arc<dyn SecretsStore> = secrets.clone();
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect("provisioned");
+
+        let did = connection
+            .control_did
+            .clone()
+            .expect("a published DID is recorded");
+        assert!(did.starts_with("did:webvh:"), "{did}");
+        assert!(did.ends_with(&format!(":gw.example.com:vta-auth:{}", connection.id)), "{did}");
+
+        let stored = secrets
+            .0
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            connection
+                .control_key_ref
+                .as_deref(),
+            Some(stored[0].secret_id.as_str())
+        );
+        assert!(
+            stored[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("did:key:"),
+            "the secret's description names the key's own did:key"
+        );
+
+        let seed = crate::vta::decode_hex_seed(&stored[0].value).expect("seed");
+        let key = crate::vta::control_key::ControlKey::from_seed(seed);
+        let log_dir = crate::vta::auth_did::connection_auth_did_dir(storage.path(), &connection.id).expect("dir");
+        let raw = crate::storage::did_artifacts::read_did_log_raw(&log_dir)
+            .await
+            .expect("read")
+            .expect("a log was published");
+        let entry: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["state"]["id"], serde_json::json!(did));
+        assert_eq!(
+            entry["state"]["verificationMethod"][0]["publicKeyMultibase"],
+            serde_json::json!(key.public_key_multibase())
+        );
+
+        let shown = resolve_control_did(&connection, None, &VtaConfig::default())
+            .await
+            .expect("resolves");
+        assert_eq!(shown, did, "pairing shows the DID the gateway really authenticates as");
+    }
+
+    #[tokio::test]
+    async fn asking_for_a_did_key_publishes_nothing() {
+        let storage = tempfile::tempdir().expect("storage");
+        let (state, _dir) = state_publishing_under(storage.path()).await;
+        let secrets = Arc::new(RecordingSecrets(Default::default()));
+        let store: Arc<dyn SecretsStore> = secrets.clone();
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::DidKey)
+            .await
+            .expect("provisioned");
+
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+        let seed = secrets.0.lock().unwrap()[0]
+            .value
+            .clone();
+        let shown = resolve_control_did(&connection, Some(&store_holding(&seed)), &VtaConfig::default())
+            .await
+            .expect("resolves");
+        assert_eq!(shown, crate::vta::control_key_did(&seed).expect("derive"));
+        assert!(shown.starts_with("did:key:"));
+        assert!(
+            !crate::vta::auth_did::auth_did_dir(storage.path()).exists(),
+            "nothing may be published for a did:key connection"
+        );
+    }
+
+    /// A gateway with no domain to publish under cannot give a resolvable
+    /// `did:webvh`, so the connection works as a `did:key` rather than not at all.
+    #[tokio::test]
+    async fn without_a_domain_a_connection_falls_back_to_its_did_key() {
+        let (state, _dir) = admin_state(None).await;
+        let store: Arc<dyn SecretsStore> = Arc::new(RecordingSecrets(Default::default()));
+        let mut connection = new_connection();
+
+        give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect("provisioned");
+
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+        assert!(
+            connection
+                .control_key_ref
+                .is_some()
+        );
+    }
+
+    /// A publisher that cannot write is an error: granting a different
+    /// identifier than the one asked for would be worse than failing.
+    #[tokio::test]
+    async fn a_publisher_that_fails_fails_the_create() {
+        let blocker = tempfile::NamedTempFile::new().expect("a file where the directory should go");
+        let (state, _dir) = state_publishing_under(blocker.path()).await;
+        let store: Arc<dyn SecretsStore> = Arc::new(RecordingSecrets(Default::default()));
+        let mut connection = new_connection();
+
+        let (status, _) = give_connection_a_control_identity(&state, &store, &mut connection, ControlIdentity::Webvh)
+            .await
+            .expect_err("publishing cannot succeed");
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            connection
+                .control_did
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_published_did_unless_the_key_changes() {
+        let mut existing = new_connection();
+        existing.control_key_ref = Some("k1".to_string());
+        existing.control_did = Some("did:webvh:QmScid:gw.example.com:vta-auth:c".to_string());
+        let mut same = new_connection();
+        same.control_key_ref = Some("k1".to_string());
+        let mut other = new_connection();
+        other.control_key_ref = Some("k2".to_string());
+
+        assert_eq!(kept_control_did(&existing, &same), existing.control_did);
+        assert_eq!(kept_control_did(&existing, &other), None);
+    }
+
+    /// The `[vta]` block's own configured DID is what is offered for granting.
+    #[tokio::test]
+    async fn the_bootstrap_block_offers_its_configured_auth_did() {
+        let var = "TG_TEST_VTA_BOOTSTRAP_DID_KEY";
+        let mut config = bootstrap_config(Some(&format!("env://{var}")));
+        config.auth_did = Some("did:webvh:QmScid:gw.example.com:vta-auth".to_string());
+        let connection = VtaConnection::from_bootstrap(&config).expect("a bootstrap record");
+
+        let did = resolve_control_did(&connection, None, &config)
+            .await
+            .expect("resolves");
+
+        assert_eq!(did, "did:webvh:QmScid:gw.example.com:vta-auth");
     }
 
     /// The whole point of the fallback: an operator pairing the `[vta]` block

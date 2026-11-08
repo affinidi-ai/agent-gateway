@@ -82,6 +82,10 @@ impl VtaMode {
     }
 }
 
+fn default_publish_auth_did() -> bool {
+    true
+}
+
 fn default_timeout_ms() -> u64 {
     5_000
 }
@@ -273,21 +277,17 @@ pub struct VtaConfig {
     pub auth_did: Option<String>,
 
     /// Publish a `did:webvh` at `/vta-auth/did.jsonl` and authenticate as it,
-    /// instead of as the control key's own `did:key`.
+    /// instead of as the control key's own `did:key`. **On by default.**
     ///
-    /// **Off by default, and that is deliberate.** The benefit is rotation: a
-    /// `did:key` *is* its key, so replacing the key needs a fresh grant. But
-    /// the trust agent resolves the published document on every
-    /// authentication, so a gateway whose address it cannot reach — behind
-    /// NAT, on a private network, or serving HTTPS on a port the DID's `http`
-    /// URL cannot reach — stops authenticating **at all**. Defaulting this on
-    /// would trade a working deployment for a convenience, which is the wrong
-    /// way round.
-    ///
-    /// Turn it on when the gateway's `/vta-auth/did.jsonl` is reachable from
-    /// the agent. `auth_did` still overrides it: an operator who hosts their
-    /// own identity keeps it.
-    #[serde(default)]
+    /// The benefit is rotation: a `did:key` *is* its key, so replacing the key
+    /// needs a fresh grant, while a `did:webvh` keeps the identifier the
+    /// operator granted. The trust agent resolves the published document on
+    /// every authentication, so the gateway's `/vta-auth/did.jsonl` must be
+    /// reachable from the agent. Set `false` for a gateway the agent cannot
+    /// reach (behind NAT, on a private network): it then authenticates as the
+    /// `did:key` and rotating the key needs a new grant. `auth_did` still
+    /// overrides this: an operator who hosts their own identity keeps it.
+    #[serde(default = "default_publish_auth_did")]
     pub publish_auth_did: bool,
 
     /// The verification method id within [`auth_did`](Self::auth_did) that the
@@ -369,7 +369,7 @@ impl Default for VtaConfig {
             mode: VtaMode::default(),
             auth_key_source: None,
             auth_did: None,
-            publish_auth_did: false,
+            publish_auth_did: default_publish_auth_did(),
             auth_verification_method: None,
             expect_pcr0: None,
             timeout_ms: default_timeout_ms(),

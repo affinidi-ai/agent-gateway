@@ -1030,6 +1030,21 @@ async fn load_latest_log_state_as_json(path: &std::path::Path) -> Option<serde_j
 
 /// Read a `did.jsonl` file and return an HTTP response with the appropriate
 /// Content-Type and CORS headers, or a RFC 9457 problem-details body on error.
+fn did_log_not_found() -> Response {
+    let problem = serde_json::json!({
+        "type": "https://identity.foundation/didwebvh/v1.0/#problem-details",
+        "title": "notFound",
+        "status": 404,
+        "detail": "DID log not found for the requested path"
+    });
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/problem+json"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        problem.to_string(),
+    )
+        .into_response()
+}
+
 async fn serve_did_jsonl_file(path: &std::path::Path) -> Response {
     let dir = path.parent().unwrap_or(path);
     match crate::storage::did_artifacts::read_did_log_raw(dir).await {
@@ -1039,20 +1054,7 @@ async fn serve_did_jsonl_file(path: &std::path::Path) -> Response {
             content,
         )
             .into_response(),
-        Ok(None) => {
-            let problem = serde_json::json!({
-                "type": "https://identity.foundation/didwebvh/v1.0/#problem-details",
-                "title": "notFound",
-                "status": 404,
-                "detail": "DID log not found for the requested path"
-            });
-            (
-                StatusCode::NOT_FOUND,
-                [(header::CONTENT_TYPE, "application/problem+json"), (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
-                problem.to_string(),
-            )
-                .into_response()
-        }
+        Ok(None) => did_log_not_found(),
         Err(e) => {
             error!(error = %e, path = %path.display(), "Failed to read did.jsonl");
             let problem = serde_json::json!({
@@ -1100,6 +1102,33 @@ pub async fn serve_vta_auth_did_jsonl(State(state): State<crate::identity::state
             .await,
     );
     serve_did_jsonl_file(&dir.join("did.jsonl")).await
+}
+
+/// Handler for `GET /vta-auth/{connection_id}/did.jsonl`
+///
+/// Serves the `did:webvh` one managed VTA connection authenticates with.
+/// Unauthenticated for the same reason as [`serve_vta_auth_did_jsonl`]. The id
+/// becomes a path segment, so anything that is not a plain identifier is a 404
+/// rather than a lookup.
+pub async fn serve_vta_connection_auth_did_jsonl(
+    State(state): State<crate::identity::state::IdentityApiState>,
+    axum::extract::Path(connection_id): axum::extract::Path<String>,
+) -> Response {
+    let storage = state
+        .vc_issuer
+        .get_storage_path()
+        .await;
+    connection_auth_did_response(&storage, &connection_id).await
+}
+
+async fn connection_auth_did_response(
+    storage: &std::path::Path,
+    connection_id: &str,
+) -> Response {
+    match crate::vta::auth_did::connection_auth_did_dir(storage, connection_id) {
+        Ok(dir) => serve_did_jsonl_file(&dir.join("did.jsonl")).await,
+        Err(_) => did_log_not_found(),
+    }
 }
 
 /// Handler for `GET /channel/{channel_id}/did.jsonl`
@@ -1160,6 +1189,7 @@ pub async fn serve_surface_did_witness(axum::extract::Path(_surface_id): axum::e
 
 #[cfg(test)]
 mod tests {
+    use super::connection_auth_did_response;
     use crate::identity::FilesystemIdentityStore;
     use crate::identity::didwebvh::types::{LogEntry, LogParameters};
     use crate::identity::{
@@ -1658,5 +1688,62 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(super::AppError::BadRequest(_))), "got {result:?}");
+    }
+    async fn body_of(response: axum::response::Response) -> (axum::http::StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    /// The trust agent fetches the connection's log from here, so what was
+    /// published is what is served, as `text/jsonl`.
+    #[tokio::test]
+    async fn a_connections_published_log_is_served_by_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::vta::control_key::ControlKey::from_seed([11u8; 32]);
+        crate::vta::auth_did::ensure_connection_auth_did(dir.path(), "gw.example.com", "conn-a", &key)
+            .await
+            .unwrap();
+
+        let response = connection_auth_did_response(dir.path(), "conn-a").await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap(),
+            "text/jsonl"
+        );
+        let (status, body) = body_of(response).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(body.contains(":gw.example.com:vta-auth:conn-a"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_published_nothing_is_a_404() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let (status, body) = body_of(connection_auth_did_response(dir.path(), "unknown").await).await;
+
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert!(body.contains("notFound"), "{body}");
+    }
+
+    /// The id is a path segment: a traversal attempt is a 404, and never reads
+    /// another connection's (or the appliance's own) log.
+    #[tokio::test]
+    async fn an_id_that_is_not_a_plain_identifier_is_a_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::vta::control_key::ControlKey::from_seed([12u8; 32]);
+        crate::vta::auth_did::ensure_auth_did(dir.path(), "gw.example.com", &key)
+            .await
+            .unwrap();
+
+        for bad in ["..", "../vta_auth", "a/b", ""] {
+            let (status, _) = body_of(connection_auth_did_response(dir.path(), bad).await).await;
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{bad}");
+        }
     }
 }

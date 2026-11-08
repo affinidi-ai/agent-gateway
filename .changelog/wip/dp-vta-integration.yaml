@@ -2,6 +2,17 @@ branch: dp-vta-integration
 changes:
   added: []
   changed:
+    - timestamp: '2026-11-08T18:30:00Z'
+      title: Authenticate to a trust agent as a did:webvh by default
+      description: >-
+        New trust-agent connections and the [vta] block now authenticate as a
+        did:webvh the gateway publishes (at /vta-auth/{connection_id}/did.jsonl
+        for a connection), so the DID an operator grants stays the same when
+        the control key is replaced. The agent resolves the document on every
+        authentication, so the gateway must be reachable from it; set
+        publish_auth_did = false, or create the connection with
+        control_identity "did_key", to keep authenticating as a did:key.
+        Connections that already exist keep their did:key.
     - timestamp: '2026-11-08T12:00:00Z'
       title: Issue trust-agent-signed tokens under the DID of the signing key
       description: >-

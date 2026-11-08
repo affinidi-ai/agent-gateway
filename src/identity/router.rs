@@ -160,6 +160,32 @@ async fn ensure_appliance_vta_identity(
     config
 }
 
+/// The publisher for new connections' `did:webvh`s, under the domain this
+/// gateway's own DID names. `None` when it names none, so a connection falls
+/// back to its `did:key` instead of publishing a DID nobody can resolve.
+async fn connection_did_publisher(
+    vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>
+) -> Option<std::sync::Arc<crate::vta::auth_did::ConnectionDidPublisher>> {
+    let issuer_did = match vc_issuer
+        .get_issuer_did()
+        .await
+    {
+        Ok(did) => did,
+        Err(e) => {
+            tracing::warn!(error = %e, "no gateway DID to derive a connection auth DID domain from; new VTA connections authenticate as did:key");
+            return None;
+        }
+    };
+    let domain = crate::vault_identity::handlers::extract_domain_from_did(&issuer_did);
+    if domain.trim().is_empty() {
+        return None;
+    }
+    let storage = vc_issuer
+        .get_storage_path()
+        .await;
+    Some(std::sync::Arc::new(crate::vta::auth_did::ConnectionDidPublisher::new(storage, domain)))
+}
+
 async fn ensure_vta_auth_did(
     mut config: crate::config::vta::VtaConfig,
     vc_issuer: &std::sync::Arc<crate::identity::VCIssuer>,
@@ -2515,6 +2541,7 @@ pub async fn create_identity_api_router(
                 provisioner: Some(std::sync::Arc::clone(&context_provisioner)),
                 default_resolution: std::sync::Arc::clone(&default_resolution),
                 identity_store: Some(sts_vc_issuer.get_identity_store()),
+                auth_did_publisher: connection_did_publisher(&sts_vc_issuer).await,
             },
             sts_secrets_store.clone(),
         )
@@ -2913,6 +2940,8 @@ pub fn create_did_router(
         // be reachable from wherever the agent runs.
         .route("/vta-auth/did.jsonl", get(handlers::serve_vta_auth_did_jsonl))
         .route("/.well-known/vta-auth/did.jsonl", get(handlers::serve_vta_auth_did_jsonl))
+        .route("/vta-auth/{connection_id}/did.jsonl", get(handlers::serve_vta_connection_auth_did_jsonl))
+        .route("/.well-known/vta-auth/{connection_id}/did.jsonl", get(handlers::serve_vta_connection_auth_did_jsonl))
         // Empty witness-proofs document — the did:webvh resolver fetches this
         // alongside did.jsonl; without a route it falls through to the SPA.
         .route("/.well-known/did-witness.json", get(handlers::serve_gateway_did_witness))
