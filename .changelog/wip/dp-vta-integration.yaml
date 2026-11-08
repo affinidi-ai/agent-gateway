@@ -2,6 +2,15 @@ branch: dp-vta-integration
 changes:
   added: []
   changed:
+    - timestamp: '2026-11-08T21:30:00Z'
+      title: Stop granting raw sign to the gateway on a trust agent
+      description: >-
+        The grant command the gateway prints for a trust agent no longer names
+        the raw sign capability, because no gateway code path calls keys/sign;
+        it signs through sign-jws and sign-document. Existing grants that
+        still carry sign keep working. The gateway can now ask the agent
+        which capabilities it holds (auth/whoami) and refuse a bundled
+        grant that is wider than the one it was enrolled with.
     - timestamp: '2026-11-08T21:00:00Z'
       title: Authenticate to a bundled trust agent as a did:key by default
       description: >-

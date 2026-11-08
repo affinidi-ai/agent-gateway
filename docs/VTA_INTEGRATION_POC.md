@@ -325,7 +325,7 @@ context. `src/vta/context_identity.rs`'s tests cover each of those refusals.
   exists; the proof says *this* request came from the key behind it.
 - The live tests need a grant that is **`--role admin` *and* scoped to one
   context**, which is the combination they jointly describe:
-  `vta acl create --did <control did> --role initiator --contexts gwtest --capabilities context-create,key-mint,sign,sign-jws,sign-document`
+  `vta acl create --did <control did> --role initiator --contexts gwtest --capabilities context-create,key-mint,sign-jws,sign-document`
   followed by `vta acl update <control did> --role admin`. The role is what
   `live_grant_scope_is_parsed_from_the_real_token` checks is detected as
   over-privileged; the context scoping is what makes

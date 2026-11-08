@@ -4379,7 +4379,7 @@ mod live_connection_tests {
                     "could not mint a key as {}.\n\
                      Grant it first (stop the VTA, it holds a file lock):\n  \
                      vta --config <cfg> acl create --did {} --role initiator \
-                     --contexts <context> --capabilities context-create,key-mint,sign,sign-jws,sign-document\n\
+                     --contexts <context> --capabilities context-create,key-mint,sign-jws,sign-document\n\
                      underlying error: {e}",
                     control_did(),
                     control_did(),

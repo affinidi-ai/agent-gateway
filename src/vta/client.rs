@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 pub(crate) const TRUST_TASKS_PATH: &str = "/trust-tasks";
 const TASK_AUTH_CHALLENGE: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
 const TASK_AUTH_AUTHENTICATE: &str = "https://trusttasks.org/spec/auth/authenticate/0.3";
+const TASK_AUTH_WHOAMI: &str = "https://trusttasks.org/spec/auth/whoami/0.1";
 
 /// A cached, memory-only session. Tokens never touch disk, are **zeroized** when
 /// this value is dropped (re-auth replaces it), and carry no `Debug`.
@@ -220,6 +221,14 @@ impl VtaRestClient {
             .ok_or_else(|| VtaError::Protocol("no session after authenticate".to_string()))
     }
 
+    /// What the trust agent says this gateway may do right now
+    /// (`auth/whoami/0.1`): its role, its context scopes and its **effective**
+    /// capabilities, freshly resolved from the agent's access control entry.
+    pub async fn whoami(&self) -> Result<super::onboarding::Whoami, VtaError> {
+        self.dispatch(TASK_AUTH_WHOAMI, json!({}))
+            .await
+    }
+
     /// Dispatch a session-authenticated Trust Task, returning its parsed
     /// response payload.
     pub async fn dispatch<T: DeserializeOwned>(
@@ -340,6 +349,17 @@ mod tests {
                 }
             }));
         }
+        if type_uri.contains("auth/whoami") {
+            return Json(json!({
+                "type": "https://trusttasks.org/spec/auth/whoami/0.1#response",
+                "payload": {
+                    "session": { "id": "s", "subject": "did:key:z6MkGw" },
+                    "roles": ["initiator"],
+                    "scopes": ["ctx:gateway"],
+                    "capabilities": ["context-create", "key-mint", "sign-jws", "sign-document"],
+                }
+            }));
+        }
         Json(json!({ "error": "unexpected task" }))
     }
 
@@ -384,6 +404,27 @@ mod tests {
             .expect("authenticate");
         assert_eq!(token, "access-token-1");
         assert_eq!(auth_count.load(Ordering::SeqCst), 1, "one auth handshake");
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_the_effective_grant() {
+        let (base, _) = spawn_mock_vta(3600).await;
+        let client = test_client(&base, Arc::new(ControlKey::from_seed([4u8; 32])));
+
+        let who = client
+            .whoami()
+            .await
+            .expect("whoami");
+
+        assert_eq!(who.roles, ["initiator"]);
+        assert_eq!(who.scopes, ["ctx:gateway"]);
+        who.assert_bundled_grant("gateway")
+            .expect("the mock holds exactly the bundled grant");
+        assert!(
+            who.assert_bundled_grant("other")
+                .is_err(),
+            "a different context is not the grant"
+        );
     }
 
     #[tokio::test]

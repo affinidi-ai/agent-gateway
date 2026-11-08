@@ -28,6 +28,17 @@ use serde_json::Value;
 
 use super::error::VtaError;
 
+/// The role the gateway is granted on a trust agent it is a client of.
+pub const GRANT_ROLE: &str = "initiator";
+
+/// The capabilities the gateway is granted, and the only ones it uses: it
+/// creates contexts and keys, and signs JWTs and documents. The raw `sign`
+/// capability is not among them because no gateway code path calls `keys/sign`.
+pub const GRANT_CAPABILITIES: [&str; 4] = ["context-create", "key-mint", "sign-jws", "sign-document"];
+
+/// Capabilities the gateway must never hold, whatever else the grant says.
+const FORBIDDEN_CAPABILITIES: [&str; 4] = ["key-export", "policy-admin", "device-admin", "sign"];
+
 /// The exact one-consent-step grant command the customer runs on their VTA to
 /// authorize the gateway's control DID with a **sign/issue-only** role scoped to
 /// a single context. Printed by the gateway; run by the customer (who holds VTA
@@ -67,7 +78,7 @@ pub fn grant_command(
 /// **Why the capabilities are spelled out.** `effective_capabilities` treats
 /// explicitly named role-derived capabilities as a *narrowing*: naming them
 /// reduces the grant to exactly those. So this command confers precisely
-/// `{context-create, key-mint, sign, sign-jws, sign-document}` — strictly less
+/// `{context-create, key-mint, sign-jws, sign-document}` — strictly less
 /// than the whole `application` role the original command handed over, despite
 /// the higher-sounding role name.
 ///
@@ -82,9 +93,73 @@ pub fn grant_command_with_provisioning(
     context_id: &str,
 ) -> String {
     format!(
-        "vta acl create --did {control_did} --role initiator --contexts {context_id} \
-         --capabilities context-create,key-mint,sign,sign-jws,sign-document --label agent-gateway"
+        "vta acl create --did {control_did} --role {GRANT_ROLE} --contexts {context_id} \
+         --capabilities {} --label agent-gateway",
+        GRANT_CAPABILITIES.join(",")
     )
+}
+
+/// What a trust agent says the caller may do right now, from `auth/whoami/0.1`.
+///
+/// The session token carries a role and contexts but no capabilities, so this
+/// is the only place the gateway can see the capabilities it actually holds.
+/// They are the **effective** set, resolved from the agent's access control
+/// entry at the time of the call.
+///
+/// Every field is required, deliberately: a response is parsed as the flat
+/// shape first and as a `#response` envelope second, so defaulted fields would
+/// let the envelope itself parse as an empty grant.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Whoami {
+    pub roles: Vec<String>,
+    pub scopes: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+impl Whoami {
+    /// Assert the grant is exactly the one the bundled sidecar was enrolled
+    /// with: the [`GRANT_ROLE`] in `context_id` alone, holding every capability
+    /// in [`GRANT_CAPABILITIES`] and none of the forbidden ones.
+    ///
+    /// More than expected is a failure, not a bonus: a gateway that quietly
+    /// holds an admin grant over its own sidecar has authority nothing asked
+    /// for.
+    pub fn assert_bundled_grant(
+        &self,
+        context_id: &str,
+    ) -> Result<(), VtaError> {
+        let refuse =
+            |detail: String| Err(VtaError::Config(format!("the bundled trust agent grant is wrong: {detail}")));
+        if self.roles != [GRANT_ROLE] {
+            return refuse(format!("expected role `{GRANT_ROLE}`, found {:?}", self.roles));
+        }
+        let expected_scope = format!("ctx:{context_id}");
+        if self.scopes != [expected_scope.clone()] {
+            return refuse(format!("expected scope `{expected_scope}` alone, found {:?}", self.scopes));
+        }
+        if let Some(missing) = GRANT_CAPABILITIES
+            .iter()
+            .find(|c| {
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|held| held == *c)
+            })
+        {
+            return refuse(format!("capability `{missing}` is missing"));
+        }
+        if let Some(extra) = FORBIDDEN_CAPABILITIES
+            .iter()
+            .find(|c| {
+                self.capabilities
+                    .iter()
+                    .any(|held| held == *c)
+            })
+        {
+            return refuse(format!("capability `{extra}` must not be held"));
+        }
+        Ok(())
+    }
 }
 
 /// The scope of the grant the VTA issued to the gateway, read from its session
@@ -381,6 +456,101 @@ impl OnboardingState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn whoami(
+        roles: &[&str],
+        scopes: &[&str],
+        caps: &[&str],
+    ) -> Whoami {
+        let owned = |v: &[&str]| {
+            v.iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        Whoami {
+            roles: owned(roles),
+            scopes: owned(scopes),
+            capabilities: owned(caps),
+        }
+    }
+
+    #[test]
+    fn the_exact_bundled_grant_is_accepted() {
+        let w = whoami(&["initiator"], &["ctx:gateway"], &GRANT_CAPABILITIES);
+        w.assert_bundled_grant("gateway")
+            .expect("exact grant");
+    }
+
+    #[test]
+    fn a_grant_with_a_forbidden_capability_is_refused_naming_it() {
+        let mut caps = GRANT_CAPABILITIES.to_vec();
+        caps.push("key-export");
+        let err = whoami(&["initiator"], &["ctx:gateway"], &caps)
+            .assert_bundled_grant("gateway")
+            .expect_err("key-export must be refused");
+        assert!(
+            err.log_detail()
+                .contains("key-export"),
+            "{}",
+            err.log_detail()
+        );
+    }
+
+    #[test]
+    fn raw_sign_is_refused_even_though_the_role_may_imply_it() {
+        let mut caps = GRANT_CAPABILITIES.to_vec();
+        caps.push("sign");
+        assert!(
+            whoami(&["initiator"], &["ctx:gateway"], &caps)
+                .assert_bundled_grant("gateway")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_missing_capability_is_refused_naming_it() {
+        let err = whoami(&["initiator"], &["ctx:gateway"], &["context-create", "key-mint", "sign-jws"])
+            .assert_bundled_grant("gateway")
+            .expect_err("sign-document is missing");
+        assert!(
+            err.log_detail()
+                .contains("sign-document"),
+            "{}",
+            err.log_detail()
+        );
+    }
+
+    #[test]
+    fn an_admin_role_or_a_wider_scope_is_refused() {
+        let caps = GRANT_CAPABILITIES;
+        assert!(
+            whoami(&["admin"], &["ctx:gateway"], &caps)
+                .assert_bundled_grant("gateway")
+                .is_err()
+        );
+        assert!(
+            whoami(&["initiator"], &[], &caps)
+                .assert_bundled_grant("gateway")
+                .is_err()
+        );
+        assert!(
+            whoami(&["initiator"], &["ctx:gateway", "ctx:other"], &caps)
+                .assert_bundled_grant("gateway")
+                .is_err()
+        );
+        assert!(
+            whoami(&["initiator"], &["ctx:other"], &caps)
+                .assert_bundled_grant("gateway")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_provisioning_grant_command_names_exactly_the_granted_capabilities() {
+        let command = grant_command_with_provisioning("did:key:z6MkGw", "gateway");
+        assert!(command.contains("--capabilities context-create,key-mint,sign-jws,sign-document "), "{command}");
+        assert!(!command.contains(",sign,"), "raw sign is not granted: {command}");
+    }
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     /// The provisioning grant must confer every capability the provisioning and

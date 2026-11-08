@@ -875,7 +875,7 @@ mod live_tests {
     ///
     /// ```text
     /// vta acl create --did <GATEWAY_PROVISIONER_DID> --role initiator \
-    ///   --contexts <parent> --capabilities context-create,key-mint,sign,sign-jws,sign-document
+    ///   --contexts <parent> --capabilities context-create,key-mint,sign-jws,sign-document
     /// ```
     #[tokio::test]
     #[ignore = "requires a running vta-service and a provisioning-only grant for the printed DID; run manually"]
