@@ -313,8 +313,9 @@ gateway on it yourself). No code path differs.
 
 ### What was verified, and how
 
-Run live against the real `vta` binary and the real `agent-gateway` binary, from
-zero: first start with no manual step; restart keeping the same identity and
+`scripts/vta-bundled-e2e.sh` repeats it: it runs the real `vta` and `agent-gateway`
+binaries from zero in temporary directories (`VTA_BIN=… ./scripts/vta-bundled-e2e.sh`;
+it needs a built VTA and `make config-debug` once, and is not part of CI). It covers: first start with no manual step; restart keeping the same identity and
 creating no second key; a revoked gateway reported and **not** re-enrolled by
 the entrypoint; re-grant and restart recovering; a wiped sidecar reported as
 `vta_replaced` and recovered with `--vta-rebootstrap --yes`; a real
