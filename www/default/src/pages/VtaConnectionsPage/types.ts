@@ -89,6 +89,35 @@ export interface VtaDeploymentStatus {
   self_administered: boolean;
   auto_provision_contexts: boolean;
   reserved_origins: string[];
+  /** The DID method the gateway authenticates to the agent as. */
+  control_did_method?: 'did_key' | 'did_webvh';
+  /** How the bundled sidecar's first-start bootstrap went. Absent unless one runs. */
+  bootstrap?: VtaBootstrapStatus | null;
+}
+
+export type VtaBootstrapState =
+  | 'connected'
+  | 'waiting_for_vta'
+  | 'enrolment_refused'
+  | 'vta_replaced'
+  | 'vta_lost'
+  | 'revoked'
+  | 'misconfigured';
+
+/** The bundled trust agent's bootstrap, from `GET /v1/vta/status`. */
+export interface VtaBootstrapStatus {
+  state: VtaBootstrapState;
+  /** What an operator should do about it, written by the backend. */
+  advice: string;
+  detail?: string;
+  vta_did?: string;
+  control_did?: string;
+  context_id: string;
+  bootstrapped_at?: string;
+  /** A completed bootstrap was recorded before this start. */
+  previously_connected: boolean;
+  /** `unclaimed` until a person claims the trust agent. */
+  owner: string;
 }
 
 export type WizardBackend = 'bundled' | 'own';

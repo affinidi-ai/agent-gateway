@@ -1,6 +1,14 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-08T23:45:00Z'
+      title: Show the bundled trust agent's bootstrap state on the Trust Agent page
+      description: >-
+        GET /v1/vta/status now reports how the bundled trust agent's first-start
+        bootstrap went (connected, waiting, refused, replaced, lost, revoked or
+        misconfigured), what to do about it, and who owns the trust agent
+        (unclaimed until a person claims it). The Trust Agent page's banner
+        shows it, and still never implies key custody for a bundled deployment.
     - timestamp: '2026-11-08T23:00:00Z'
       title: Rotate the gateway's trust agent control key without a new grant
       description: >-

@@ -1647,4 +1647,59 @@ mod tests {
             "unchanged"
         );
     }
+
+    #[test]
+    fn the_status_json_is_the_shape_the_dashboard_reads() {
+        let status = BootstrapStatus {
+            state: BootstrapState::VtaReplaced,
+            advice: BootstrapState::VtaReplaced.advice(),
+            detail: Some("the sidecar now publishes another DID".to_string()),
+            vta_did: Some(VTA.to_string()),
+            control_did: Some("did:key:z6MkGw".to_string()),
+            context_id: "gateway".to_string(),
+            bootstrapped_at: None,
+            previously_connected: true,
+            owner: "unclaimed",
+        };
+
+        let json = serde_json::to_value(&status).expect("serialise");
+
+        assert_eq!(json["state"], "vta_replaced", "snake_case, as the dashboard's VtaBootstrapState");
+        assert_eq!(json["owner"], "unclaimed");
+        assert_eq!(json["previously_connected"], true);
+        assert_eq!(json["context_id"], "gateway");
+        assert!(
+            json["advice"]
+                .as_str()
+                .is_some_and(|a| a.contains("investigate"))
+        );
+        assert!(
+            json.get("bootstrapped_at")
+                .is_none(),
+            "an absent time is omitted, not null"
+        );
+        for every_state in [
+            BootstrapState::Connected,
+            BootstrapState::WaitingForVta,
+            BootstrapState::EnrolmentRefused,
+            BootstrapState::VtaReplaced,
+            BootstrapState::VtaLost,
+            BootstrapState::Revoked,
+            BootstrapState::Misconfigured,
+        ] {
+            let name = serde_json::to_value(every_state).unwrap();
+            assert!(
+                name.as_str()
+                    .is_some_and(|n| n
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_')),
+                "{name}"
+            );
+            assert!(
+                !every_state
+                    .advice()
+                    .is_empty()
+            );
+        }
+    }
 }

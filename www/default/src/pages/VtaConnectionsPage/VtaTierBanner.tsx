@@ -1,9 +1,47 @@
 import React from 'react';
-import type { VtaDeploymentStatus } from './types';
+import type { VtaBootstrapState, VtaBootstrapStatus, VtaDeploymentStatus } from './types';
 
 interface VtaTierBannerProps {
   deployment: VtaDeploymentStatus | null;
 }
+
+const BOOTSTRAP_LABELS: Record<VtaBootstrapState, string> = {
+  connected: 'Connected',
+  waiting_for_vta: 'Waiting for the trust agent',
+  enrolment_refused: 'Enrolment refused',
+  vta_replaced: 'Trust agent replaced',
+  vta_lost: 'Trust agent lost its key',
+  revoked: 'Access revoked',
+  misconfigured: 'Needs attention',
+};
+
+const BootstrapStatusLine: React.FC<{ bootstrap: VtaBootstrapStatus }> = ({ bootstrap }) => {
+  const healthy = bootstrap.state === 'connected';
+  return (
+    <div
+      className={`small mt-2 ${healthy ? 'text-muted' : 'text-danger'}`}
+      data-testid="vta-bootstrap-status"
+    >
+      <strong>Bundled trust agent: {BOOTSTRAP_LABELS[bootstrap.state]}.</strong>{' '}
+      {healthy ? (
+        <>
+          Owner: <span data-testid="vta-bootstrap-owner">{bootstrap.owner}</span>
+          {bootstrap.owner === 'unclaimed' && ' (no person owns this trust agent yet)'}.
+        </>
+      ) : (
+        <>
+          <span data-testid="vta-bootstrap-advice">{bootstrap.advice}</span>
+          {bootstrap.previously_connected && ' Signing is refused until this is resolved.'}
+          {bootstrap.detail && (
+            <div className="text-muted" data-testid="vta-bootstrap-detail">
+              {bootstrap.detail}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
 
 /**
  * States the active signing tier, and — when the deployment does not support
@@ -53,6 +91,7 @@ export const VtaTierBanner: React.FC<VtaTierBannerProps> = ({ deployment }) => {
             a separate party. Connect your own VTA for that.
           </>
         )}
+        {deployment.bootstrap && <BootstrapStatusLine bootstrap={deployment.bootstrap} />}
         {deployment.reserved_origins.length > 0 && (
           <div className="small text-muted mt-1">
             Reserved as control-plane addresses and refused as proxy targets:{' '}

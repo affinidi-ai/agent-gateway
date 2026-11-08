@@ -1143,6 +1143,24 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Tooltip last attempt, reason   | `identities-recorder-last-attempt`, `identities-recorder-reason`         |
 | Tooltip registry entry         | `identities-recorder-entry-<registry id>`                                |
 
+## Trust Agent page
+
+`/trust-agent` lists the Verifiable Trust Agent connections and states which signing tier the
+gateway is on. The tier banner (`VtaTierBanner`) reads `GET /v1/vta/status` and never derives
+anything itself:
+
+- `custody_claim` is computed by the backend. It is false for the bundled sidecar and for
+  local signing, and the banner then says the deployment is **not** a key custody tier. Never
+  write copy that implies custody while it is false.
+- For a bundled sidecar that bootstraps itself (`bootstrap` present), the banner adds one line
+  (`data-testid="vta-bootstrap-status"`): the state, from the fixed set `connected`,
+  `waiting_for_vta`, `enrolment_refused`, `vta_replaced`, `vta_lost`, `revoked` and
+  `misconfigured`. A healthy state shows the owner (`vta-bootstrap-owner`, `unclaimed` until a
+  person claims the trust agent). Any other state shows the backend's `advice`
+  (`vta-bootstrap-advice`) and `detail` (`vta-bootstrap-detail`) in danger text, and says signing
+  is refused when `previously_connected` is true. The advice text is the backend's, so a new
+  state needs a label here and advice there.
+
 ## Connections page
 
 `/connections` (`pages/ConnectionsPage.tsx`) has the tabs **Gateways**, **Payment Gateways**,
