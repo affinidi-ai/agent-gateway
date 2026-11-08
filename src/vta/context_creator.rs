@@ -46,12 +46,6 @@ const TASK_CONTEXTS_UPDATE_DID: &str = "https://trusttasks.org/spec/vta/contexts
 /// `keys/create/0.1`.
 const TASK_KEYS_CREATE: &str = "https://trusttasks.org/spec/keys/create/0.1";
 
-/// `keys/list/0.2`.
-///
-/// Not `keys/show`: that one refuses an **internal** key outright — the record
-/// carries only the public half, but the guard is on the origin, not on what is
-/// being read. `list` returns the same records, so adoption goes through it.
-
 /// Suffix on the issuer key minted for a context.
 ///
 /// Derived from the leaf id rather than random, so a retry after a timeout
