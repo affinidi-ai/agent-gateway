@@ -2191,6 +2191,14 @@ pub struct TransitCredentials {
     /// Required with `external`, refused with every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<GrantSubject>,
+    /// For a `consent_mode = external` binding on a Transit Point whose target
+    /// is `proxy://<id>`: the [`crate::mcp_proxies::types::McpProxy::grant_pin`]
+    /// of that MCP Proxy when the surface was last saved. The gateway sets it
+    /// on every save, and clears it on every other binding; a value a write
+    /// sends is ignored. The grant goes through the proxy only while the
+    /// proxy's pin is still this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy_pin: Option<String>,
 }
 
 fn default_transit_elicit_timeout_secs() -> u64 {

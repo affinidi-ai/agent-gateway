@@ -33,17 +33,19 @@ pub(super) enum RestError {
     GrantRefused { status: u16, challenges: Vec<HeaderValue> },
 }
 
-/// How the client of a credentialed tool call is vetted.
+/// How the client of a tool call is vetted.
 #[derive(Clone, Copy)]
 enum RestEgress<'a> {
     /// A stored backend, under the Configured egress policy;
     /// `exact_allowlist` is the BDD allow-list of fixtures.
     Configured { exact_allowlist: Option<&'a str> },
-    /// A call that carries a grant by binding: only to `destination`, the
-    /// origin of its provider's `resource`, through Strict, `https`-only egress
-    /// pinned to the vetted addresses, as a Transit Point sends a grant
-    /// ([`crate::egress::pinned_vendor_client`]).
-    Grant { destination: &'a url::Origin, exact_allowlist: Option<&'a str> },
+    /// A tool call of a Transit Point's MCP Proxy: through Strict,
+    /// `https`-only egress pinned to the vetted addresses, as a Transit Point
+    /// sends a grant ([`crate::egress::pinned_vendor_client`]). With
+    /// `grant_destination`, the call carries a grant by binding: it goes only
+    /// to that origin, the origin of its provider's `resource`, and an answer
+    /// that refuses the grant is [`RestError::GrantRefused`].
+    Transit { grant_destination: Option<&'a url::Origin>, exact_allowlist: Option<&'a str> },
 }
 
 struct OfflineSchemas;
@@ -452,7 +454,11 @@ fn request_headers(
     let mut headers = HeaderMap::new();
     for (name, value) in target {
         if !protected_header(name) {
-            headers.append(name.clone(), value.clone());
+            // The target's headers carry its credential, a grant among them,
+            // in whichever header it goes: never indexed by HPACK.
+            let mut value = value.clone();
+            value.set_sensitive(true);
+            headers.append(name.clone(), value);
         }
     }
     for (name, value) in &parameters.headers {
@@ -643,21 +649,23 @@ pub(super) async fn call(
     .await
 }
 
-/// A tool call that carries a grant by binding in `target_headers`: sent only
-/// to `destination`, the origin of the grant's `resource`, through Strict,
-/// `https`-only egress pinned to the vetted addresses (`exact_allowlist`, the
-/// BDD allow-list, alone admits a fixture). An answer that refuses the grant,
-/// as [`crate::delegation_vault::release::vendor_answer`] reads it, is
+/// A tool call of a Transit Point's MCP Proxy, with a grant by binding in
+/// `target_headers` or with no credential: sent through Strict, `https`-only
+/// egress pinned to the vetted addresses, with redirects refused
+/// (`exact_allowlist`, the BDD allow-list, alone admits a fixture). With
+/// `grant_destination`, the origin of the grant's `resource`, the call goes
+/// only to that origin, and an answer that refuses the grant, as
+/// [`crate::delegation_vault::release::vendor_answer`] reads it, is
 /// [`RestError::GrantRefused`], without its body, so the caller can refresh
 /// the grant or refuse the call with a fixed reason.
-pub(super) async fn call_with_grant(
+pub(super) async fn call_through_transit_point(
     base_url: &str,
     metadata: &ToolMetadata,
     arguments: &Value,
     target_headers: &HeaderMap,
     limits: &McpHttpConfig,
     content_type: &str,
-    destination: &url::Origin,
+    grant_destination: Option<&url::Origin>,
     exact_allowlist: Option<&str>,
 ) -> Result<CallToolResult, RestError> {
     send(
@@ -667,15 +675,18 @@ pub(super) async fn call_with_grant(
         target_headers,
         limits,
         content_type,
-        RestEgress::Grant { destination, exact_allowlist },
+        RestEgress::Transit {
+            grant_destination,
+            exact_allowlist,
+        },
         None,
     )
     .await
 }
 
-/// The client a credentialed tool call to `url` is sent with, vetted as
-/// `egress` says and pinned to the vetted address, so DNS cannot rebind it
-/// between the check and the call. Redirects stay off.
+/// The client a tool call to `url` is sent with, vetted as `egress` says and
+/// pinned to the vetted address, so DNS cannot rebind it between the check
+/// and the call. Redirects stay off.
 async fn pinned_client(
     url: &Url,
     timeout: Duration,
@@ -693,8 +704,11 @@ async fn pinned_client(
             .map_err(|_| RestError::Target)?
             .0)
         }
-        RestEgress::Grant { destination, exact_allowlist } => {
-            if url.origin() != *destination {
+        RestEgress::Transit {
+            grant_destination,
+            exact_allowlist,
+        } => {
+            if grant_destination.is_some_and(|destination| url.origin() != *destination) {
                 return Err(RestError::Target);
             }
             crate::egress::pinned_vendor_client(url.as_str(), timeout, exact_allowlist)
@@ -796,7 +810,7 @@ async fn send(
             .forget_if_refused(response.status().as_u16(), response.headers())
             .await;
     }
-    if let RestEgress::Grant { .. } = egress
+    if let RestEgress::Transit { grant_destination: Some(_), .. } = egress
         && !matches!(
             crate::delegation_vault::release::vendor_answer(response.status(), response.headers()),
             crate::delegation_vault::release::VendorAnswer::Pass
@@ -1647,14 +1661,14 @@ mod tests {
                 exact_allowlist.map(str::to_string),
             );
             async move {
-                call_with_grant(
+                call_through_transit_point(
                     &base,
                     &metadata("/files"),
                     &json!({}),
                     &headers,
                     &limits,
                     "application/json",
-                    &destination,
+                    Some(&destination),
                     exact_allowlist.as_deref(),
                 )
                 .await
@@ -1692,6 +1706,79 @@ mod tests {
                 .iter()
                 .all(|(head, _)| head.starts_with("GET /files ") && head.contains("authorization: Bearer granted")),
             "{requests:?}"
+        );
+    }
+
+    /// A Transit Point's tool call without a grant goes through the same
+    /// Strict egress as one with a grant: a backend whose host resolves to an
+    /// internal address, as a rebinding host would, is never reached, nor is
+    /// one only the test allow-list admits without it; a redirect is never
+    /// followed; and a backend's own refusal is the tool's result, not a
+    /// refused grant.
+    #[tokio::test]
+    async fn a_transit_point_call_without_a_grant_reaches_no_internal_address_and_follows_no_redirect() {
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let backend = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"files": []})),
+            Answer::json(401, json!({"error": "no key"})).with_header("WWW-Authenticate", "Bearer"),
+        ])
+        .await;
+        let elsewhere = RecordingServer::start_answering(vec![Answer::json(200, json!({"stolen": true}))]).await;
+        let redirecting = RecordingServer::start_answering(vec![
+            Answer::status(302).with_header("Location", &format!("{}/files", elsewhere.origin())),
+        ])
+        .await;
+        let limits = McpHttpConfig::default();
+        let call = |base: String, exact_allowlist: Option<String>| {
+            let limits = limits.clone();
+            async move {
+                call_through_transit_point(
+                    &base,
+                    &metadata("/files"),
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    None,
+                    exact_allowlist.as_deref(),
+                )
+                .await
+            }
+        };
+        let allowlist = Some(format!("{},{},{}", backend.origin(), elsewhere.origin(), redirecting.origin()));
+
+        let answered = call(backend.origin(), allowlist.clone())
+            .await
+            .unwrap();
+        assert_eq!(answered.is_error, Some(false));
+        let refused = call(backend.origin(), allowlist.clone())
+            .await
+            .unwrap();
+        assert_eq!(refused.is_error, Some(true), "with no grant, a 401 is the tool's own error");
+
+        let rebound = backend
+            .origin()
+            .replacen("http://127.0.0.1", "https://localhost", 1);
+        assert!(
+            matches!(call(rebound, allowlist.clone()).await, Err(RestError::Target)),
+            "a host that resolves to loopback is refused"
+        );
+        assert!(
+            matches!(call(backend.origin(), None).await, Err(RestError::Target)),
+            "Strict egress refuses a loopback backend the test allow-list does not admit"
+        );
+        assert!(
+            matches!(call(redirecting.origin(), allowlist).await, Err(RestError::Redirect)),
+            "a redirect is refused, not followed"
+        );
+        assert_eq!(backend.requests().len(), 2);
+        assert_eq!(redirecting.requests().len(), 1);
+        assert!(
+            elsewhere
+                .requests()
+                .is_empty(),
+            "{:?}",
+            elsewhere.requests()
         );
     }
 }

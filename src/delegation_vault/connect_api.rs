@@ -230,6 +230,41 @@ async fn permitted_provider(
     Ok(provider)
 }
 
+/// Whether the Transit Point `hop` of `surface` can be served as a call to it
+/// would be, in every view of the surface that has it: a `proxy://` Transit
+/// Point must meet the same rules
+/// ([`crate::credential_providers::external::check_proxy_transit_point`]),
+/// so no consent is run, and no refresh token kept, for a binding every call
+/// would refuse. Its binding's `mcp_proxy_pin` when it can, which the
+/// destination check compares with the proxy as it is now.
+fn servable_transit_point(
+    surface: &crate::config::agent_surface::AgentSurface,
+    hop: &str,
+) -> Result<Option<String>, &'static str> {
+    let views = crate::identity::handlers::surface_tenancy::resolved_views(surface)
+        .map_err(|_| "the surface's variants cannot be resolved")?;
+    let mut pin = None;
+    let mut found = false;
+    for view in &views {
+        for point in view
+            .transit_points()
+            .iter()
+            .filter(|point| point.id == hop)
+        {
+            crate::credential_providers::external::check_proxy_transit_point(view, point)?;
+            found = true;
+            pin = point
+                .transit_credentials
+                .as_ref()
+                .and_then(|binding| binding.mcp_proxy_pin.clone());
+        }
+    }
+    if !found {
+        return Err("the surface serves no Transit Point at this hop");
+    }
+    Ok(pin)
+}
+
 /// The revoker of grants made with `provider`, on behalf of `actor`.
 fn revoker(
     state: &DelegationVaultState,
@@ -362,17 +397,23 @@ pub async fn start_connect(
         )
         .await
     } else {
-        crate::credential_providers::external::check_transit_grant_destination(
-            &provider,
-            &binding.target_endpoint,
-            state
-                .mcp_proxy_store
-                .as_deref()
-                .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
-            tenant_id,
-            exact_allowlist,
-        )
-        .await
+        match servable_transit_point(&surface, binding.hop) {
+            Ok(proxy_pin) => {
+                crate::credential_providers::external::check_transit_grant_destination(
+                    &provider,
+                    &binding.target_endpoint,
+                    proxy_pin.as_deref(),
+                    state
+                        .mcp_proxy_store
+                        .as_deref()
+                        .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
+                    tenant_id,
+                    exact_allowlist,
+                )
+                .await
+            }
+            Err(refused) => Err(refused),
+        }
     };
     if destination.is_err() {
         return error(
@@ -1575,10 +1616,15 @@ mod tests {
 
     /// A Transit Point whose target is an MCP Proxy starts a connect only while
     /// that proxy, of the surface's tenant and served only through surfaces,
-    /// sends its tool calls to the origin of the provider's resource: a proxy
-    /// edited to point elsewhere, or opened to direct callers, is refused.
+    /// sends its tool calls to the origin of the provider's resource, is still
+    /// the proxy the surface was saved with, and while the Transit Point meets
+    /// every rule a call to it does: a proxy edited to point elsewhere, to
+    /// call other operations, or opened to direct callers, a binding never
+    /// pinned, and a Transit Point that does not speak MCP, has a target_auth
+    /// or puts the grant in `_meta`, are refused, so no consent is run for a
+    /// binding every call would refuse.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_proxy_transit_point_connects_only_while_its_mcp_proxy_sends_to_the_resource() {
+    async fn a_proxy_transit_point_connects_only_while_every_call_to_it_could_carry_the_grant() {
         use crate::credential_providers::external::tests::grant_proxy;
         use crate::mcp_proxies::McpProxyStore;
         let mut fixture = Fixture::new(vec![token_answer("proxy-access")]).await;
@@ -1588,56 +1634,109 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let servable = grant_proxy("drive", Some("tenant-a"), &format!("{}/drive/v3", fixture.vendor_origin));
+        let mut servable = grant_proxy("drive", Some("tenant-a"), &format!("{}/drive/v3", fixture.vendor_origin));
+        servable.openapi_spec =
+            r#"{"openapi": "3.0.0", "paths": {"/files": {"get": {"operationId": "search"}}}}"#.into();
         proxies
             .create(&servable)
             .await
             .unwrap();
         fixture.state.mcp_proxy_store = Some(proxies.clone());
-        fixture
+        let point = json!({"id": "drive-hop", "alias": "drive", "target_endpoint": "proxy://drive",
+            "protocol": "mcp", "require_transit_token": true,
+            "transit_credentials": {"credential_provider_id": "vendor", "consent_mode": "external",
+                "subject": "owner", "scopes": ["read"]}});
+        let surfaces = fixture
             .state
             .agent_surface_store
             .clone()
-            .unwrap()
-            .save(
-                &serde_json::from_value(json!({
+            .unwrap();
+        let save = |point: serde_json::Value, pinned: bool| {
+            let (surfaces, proxies) = (surfaces.clone(), proxies.clone());
+            async move {
+                let mut surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                     "surface_id": "drive-agent", "name": "drive-agent", "tenant_id": "tenant-a",
                     "access_point": {"listen_address": "https://gateway.example", "route": "/drive", "protocol": "mcp"},
                     "target": {"endpoint": "https://managed.example/agent"},
-                    "transit": {"points": [{"id": "drive-hop", "alias": "drive", "target_endpoint": "proxy://drive",
-                        "protocol": "mcp", "require_transit_token": true,
-                        "transit_credentials": {"credential_provider_id": "vendor", "consent_mode": "external",
-                            "subject": "owner", "scopes": ["read"]}}]}
+                    "transit": {"points": [point]}
                 }))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
+                .unwrap();
+                if pinned {
+                    crate::identity::handlers::surface_tenancy::pin_mcp_proxy_grants(
+                        &mut surface,
+                        Some(proxies.as_ref() as &dyn McpProxyStore),
+                    )
+                    .await;
+                }
+                surfaces
+                    .save(&surface)
+                    .await
+                    .unwrap();
+            }
+        };
         let start = json!({"surface_id": "drive-agent", "hop": "drive-hop", "credential_provider_id": "vendor",
             "subject": "owner", "redirect_uri": CALLBACK});
+        let refused = |case: &'static str| {
+            let (fixture, start) = (&fixture, start.clone());
+            async move {
+                let (status, refused) = fixture
+                    .start(Some("tenant-a"), start)
+                    .await;
+                assert_eq!(
+                    (status, refused["code"].clone()),
+                    (StatusCode::CONFLICT, json!("binding_not_servable")),
+                    "{case}"
+                );
+            }
+        };
+        save(point.clone(), true).await;
         let (status, started) = fixture
             .start(Some("tenant-a"), start.clone())
             .await;
         assert_eq!(status, StatusCode::CREATED, "{started}");
 
+        save(point.clone(), false).await;
+        refused("a binding stored outside the API, never pinned").await;
+        let mut with_target_auth = point.clone();
+        with_target_auth["target_auth"] =
+            json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}});
+        let mut a2a = point.clone();
+        a2a["protocol"] = json!("a2a");
+        let mut in_meta = point.clone();
+        in_meta["transit_credentials"]["inject_as"] = json!({"type": "meta", "field": "token"});
+        for (case, point) in
+            [("a target_auth", with_target_auth), ("protocol a2a", a2a), ("the grant in _meta", in_meta)]
+        {
+            save(point, true).await;
+            refused(case).await;
+        }
+
+        save(point.clone(), true).await;
+        let mut other_operations = servable.clone();
+        other_operations.openapi_spec =
+            r#"{"openapi": "3.0.0", "paths": {"/files/trash": {"delete": {"operationId": "search"}}}}"#.into();
         let mut elsewhere = servable.clone();
         elsewhere.base_url = "http://127.0.0.1:10/drive/v3".into();
         let mut direct = servable.clone();
         direct.direct_access = true;
-        for (case, proxy) in [("another origin", elsewhere), ("direct callers", direct)] {
+        for (case, proxy) in
+            [("other operations", other_operations.clone()), ("another origin", elsewhere), ("direct callers", direct)]
+        {
             proxies
                 .update(&proxy)
                 .await
                 .unwrap();
-            let (status, refused) = fixture
-                .start(Some("tenant-a"), start.clone())
-                .await;
-            assert_eq!(
-                (status, refused["code"].clone()),
-                (StatusCode::CONFLICT, json!("binding_not_servable")),
-                "{case}"
-            );
+            refused(case).await;
         }
+        proxies
+            .update(&other_operations)
+            .await
+            .unwrap();
+        save(point, true).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), start)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "saved again, the surface is pinned to the proxy as it is: {started}");
     }
 
     /// The Access Point Target's binding is connected under the hop `target`:

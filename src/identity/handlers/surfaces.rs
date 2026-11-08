@@ -960,7 +960,9 @@ fn validate_transit_points(
 
 /// Give each Transit Point of one list, the surface's or a variant's (named by
 /// `place`), an id when it has none, and refuse an alias that is not URL-safe
-/// or that another point of the list has.
+/// or that another point of the list has, and a `proxy://` target whose id no
+/// MCP Proxy can have: a Transit Point is dispatched to the whole id, so a
+/// save checks that same id.
 fn identify_transit_points(
     points: &mut [crate::config::agent_surface::TransitPoint],
     place: &str,
@@ -972,6 +974,14 @@ fn identify_transit_points(
         }
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
+        }
+        if crate::mcp_proxies::types::endpoint_proxy_id(&tp.target_endpoint).is_some()
+            && crate::mcp_proxies::types::transit_proxy_id(&tp.target_endpoint).is_none()
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{place}transit.points[{idx}]: target_endpoint proxy://<id> needs the id of an MCP Proxy: letters, \
+                 digits, '-' and '_', and nothing after it"
+            )));
         }
         if let Err(msg) = tp.validate_per_caller_rate_limit() {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
@@ -3157,7 +3167,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
-    super::surface_tenancy::validate_external_consent_bindings(&state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface).await?;
 
     // Reject overlapping outbound listener routes before they can reach
     // the Axum router and panic the gateway on rebuild.
@@ -4159,7 +4169,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
-    super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(state, &mut surface).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
@@ -5900,6 +5910,33 @@ mod validation_tests {
         }
         let mut surface = surface_with_transit_points(distinct.clone(), distinct);
         assert!(validate_transit_points(&mut surface, 30, None).is_ok(), "the variant may reuse the surface's ids");
+    }
+
+    /// A Transit Point is dispatched to the MCP Proxy its whole `proxy://` id
+    /// names, so a save refuses an id no MCP Proxy can have, `proxy://a/b`
+    /// among them, rather than check one proxy and dispatch to another.
+    #[test]
+    fn a_transit_point_naming_an_id_no_mcp_proxy_can_have_is_refused() {
+        let point = |endpoint: &str| serde_json::json!({ "id": "drive-id", "alias": "drive", "target_endpoint": endpoint, "protocol": "mcp" });
+        let expected = "target_endpoint proxy://<id> needs the id of an MCP Proxy";
+        for endpoint in ["proxy://a/b", "proxy://drive/", "proxy://drive?x=1", "proxy://../drive", "proxy://"] {
+            for (place, points, variant_points) in [
+                ("", serde_json::json!([point(endpoint)]), serde_json::json!([])),
+                ("variant 'candidate' ", serde_json::json!([]), serde_json::json!([point(endpoint)])),
+            ] {
+                let mut surface = surface_with_transit_points(points, variant_points);
+                match validate_transit_points(&mut surface, 30, None) {
+                    Err(SurfaceApiError::BadRequest(message)) => assert!(
+                        message.starts_with(&format!("{place}transit.points[0]: {expected}")),
+                        "{endpoint}: {message}"
+                    ),
+                    other => panic!("{endpoint}: expected a 400, got {other:?}"),
+                }
+            }
+        }
+        let mut surface =
+            surface_with_transit_points(serde_json::json!([point("proxy://drive_v3-1")]), serde_json::json!([]));
+        assert!(validate_transit_points(&mut surface, 30, None).is_ok());
     }
 
     fn caller_key() -> serde_json::Value {

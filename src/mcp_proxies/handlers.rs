@@ -42,7 +42,7 @@ fn mcp_proxy_allowed(
 /// A caller-chosen proxy id. It names the record's file on disk and is embedded
 /// in `TENANT:{tenant}:mcp-proxies:{id}` scope targets, so path separators, dots
 /// and colons are all excluded.
-fn is_valid_mcp_proxy_id(id: &str) -> bool {
+pub fn is_valid_mcp_proxy_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 128
@@ -2764,6 +2764,14 @@ pub struct PreparedMcpRequest {
     call: McpCall,
 }
 
+impl PreparedMcpRequest {
+    /// Whether the request calls a tool, the only call that reaches the
+    /// proxy's backend.
+    pub fn calls_a_tool(&self) -> bool {
+        matches!(self.call, McpCall::ToolsCall { .. })
+    }
+}
+
 enum McpCall {
     Initialize,
     ToolsList,
@@ -2807,8 +2815,10 @@ pub fn prepare_mcp_request(
         let mut headers = reqwest::header::HeaderMap::new();
         let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
             .map_err(|e| format!("Invalid target auth header name '{}': {}", header_name, e))?;
-        let value = reqwest::header::HeaderValue::from_str(header_value)
+        let mut value = reqwest::header::HeaderValue::from_str(header_value)
             .map_err(|e| format!("Invalid target auth header value: {}", e))?;
+        // A credential, whatever header it goes in: never indexed by HPACK.
+        value.set_sensitive(true);
         headers.insert(name, value);
         channel_info!(config_id, "Injecting target auth header '{}' into MCP proxy requests", header_name);
         Some(headers)
@@ -2838,7 +2848,9 @@ pub fn prepare_mcp_request(
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
 
-    channel_info!(config_id, "🔧 Handling MCP method: {}", method);
+    // The method is the caller's: logged escaped and cut short, so it can
+    // neither forge a log line nor flood the log.
+    channel_info!(config_id, "🔧 Handling MCP method: {}", loggable::untrusted(method));
 
     let call = match method {
         "initialize" => McpCall::Initialize,
@@ -2890,7 +2902,7 @@ pub fn prepare_mcp_request(
             }
         }
         _ => {
-            warn!("❌ Unknown MCP method: {}", method);
+            warn!(method = %loggable::untrusted(method), "❌ Unknown MCP method");
             return Err(format!("Unknown MCP method: {}", method).into());
         }
     };
@@ -3182,12 +3194,10 @@ fn tool_call_result(result: rmcp::model::CallToolResult) -> serde_json::Value {
 
 /// The grant by binding a Transit Point sends its MCP Proxy's backend: the
 /// header it goes in, and `destination`, the origin of its provider's
-/// `resource`, the only origin a call carrying it is sent to. `exact_allowlist`
-/// is the BDD allow-list of fixtures, `None` in production.
+/// `resource`, the only origin a call carrying it is sent to.
 pub struct ProxyGrant {
     pub header: (String, String),
     pub destination: url::Origin,
-    pub exact_allowlist: Option<String>,
 }
 
 /// What an MCP Proxy behind a Transit Point answered.
@@ -3204,24 +3214,27 @@ pub enum TransitProxyAnswer {
 }
 
 /// Serve a legacy MCP request for a Transit Point whose target is
-/// `proxy://<id>`: `initialize` and `tools/list` from the proxy's spec, and a
-/// `tools/call` through its REST backend. With `grant`, a tool call carries
-/// the grant's header and goes only to its `destination`, through Strict,
-/// `https`-only egress, never outside the proxy's base path; a backend answer
-/// that refuses the grant is [`TransitProxyAnswer::GrantRefused`]. Without one,
-/// the call carries no credential. The surface's own timeout, retry, circuit
-/// breaker and mirroring are its Target's and do not apply.
+/// `proxy://<id>`, prepared by [`prepare_mcp_request`] with the grant's
+/// header: `initialize` and `tools/list` from the proxy's spec, and a
+/// `tools/call` through its REST backend, never outside the proxy's base
+/// path. Every tool call goes through Strict, `https`-only egress pinned to the
+/// vetted addresses, with redirects refused, as a Transit Point sends a grant
+/// (`exact_allowlist`, the BDD allow-list, alone admits a fixture), never
+/// through the OpenAPI library's client, which follows redirects and vets no
+/// address. With `grant`, a tool call carries the grant's header and goes
+/// only to its `destination`; a backend answer that refuses the grant is
+/// [`TransitProxyAnswer::GrantRefused`]. Without one, the call carries no
+/// credential. The surface's own timeout, retry, circuit breaker and
+/// mirroring are its Target's and do not apply.
 pub async fn serve_through_transit_point(
     proxy: &McpProxy,
-    request: serde_json::Value,
+    prepared: PreparedMcpRequest,
     grant: Option<ProxyGrant>,
     limits: &crate::config::McpHttpConfig,
+    exact_allowlist: Option<&str>,
     config_id: &str,
 ) -> Result<TransitProxyAnswer, McpProxyCallError> {
-    let header = grant
-        .as_ref()
-        .map(|grant| grant.header.clone());
-    let PreparedMcpRequest { server, request, call } = prepare_mcp_request(proxy, request, header, config_id)?;
+    let PreparedMcpRequest { server, request, call } = prepared;
     let result = match call {
         McpCall::Initialize => initialize_result(proxy),
         McpCall::ToolsList => tools_list_result(proxy, &server),
@@ -3234,37 +3247,39 @@ pub async fn serve_through_transit_point(
                 .get_tool(&tool_name)
                 .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
             channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
-            let result = match (credentialed.as_deref(), grant.as_ref()) {
-                (Some((stored, headers)), Some(grant)) => match super::modern_rest::call_with_grant(
-                    stored.directory.as_str(),
-                    &stored.metadata,
-                    &arguments,
-                    headers,
-                    limits,
-                    &stored.content_type,
-                    &grant.destination,
-                    grant
-                        .exact_allowlist
-                        .as_deref(),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
-                        return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
-                    }
-                    Err(error) => return Err(format!("Tool execution failed: {error}").into()),
-                },
-                (None, None) => call_legacy_tool(tool, &arguments, None, limits, None)
-                    .await
-                    .map_err(|error| format!("Tool execution failed: {error}"))?,
+            let (stored, headers) = match (credentialed, grant.as_ref()) {
+                (Some(credentialed), Some(_)) => *credentialed,
+                (None, None) => (
+                    StoredToolCall::prepare(proxy, &server.openapi_spec, tool)
+                        .map_err(|error| format!("Tool execution failed: {error}"))?,
+                    ReqwestHeaderMap::new(),
+                ),
                 _ => {
                     return Err("Tool execution failed: the grant could not be prepared"
                         .to_string()
                         .into());
                 }
             };
-            tool_call_result(result)
+            match super::modern_rest::call_through_transit_point(
+                stored.directory.as_str(),
+                &stored.metadata,
+                &arguments,
+                &headers,
+                limits,
+                &stored.content_type,
+                grant
+                    .as_ref()
+                    .map(|grant| &grant.destination),
+                exact_allowlist,
+            )
+            .await
+            {
+                Ok(result) => tool_call_result(result),
+                Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
+                    return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
+                }
+                Err(error) => return Err(format!("Tool execution failed: {error}").into()),
+            }
         }
     };
     Ok(TransitProxyAnswer::Response(serde_json::json!({

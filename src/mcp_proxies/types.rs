@@ -100,6 +100,50 @@ impl McpProxy {
     pub fn full_path(&self) -> String {
         format!("{}{}", self.channel_prefix, self.endpoint_path)
     }
+
+    /// The digest of what a tool call through this proxy does: its
+    /// `base_url`, its OpenAPI spec, as stored, and `flatten_post_params`,
+    /// which together decide the request each tool sends. A surface save pins
+    /// it on a `proxy://` Transit Point's `consent_mode: external` binding
+    /// ([`crate::config::agent_surface::TransitCredentials::mcp_proxy_pin`]),
+    /// and the grant goes through the proxy only while the proxy still has
+    /// it, so an edit to the proxy cannot change what a grant is used for
+    /// until a surface editor saves the surface again. Timestamps and other
+    /// fields are not part of it, so an update that changes none of the three
+    /// keeps it.
+    pub fn grant_pin(&self) -> String {
+        use sha2::Digest;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"agent-gateway mcp-proxy grant pin v1\n");
+        for field in [
+            self.base_url.as_bytes(),
+            self.openapi_spec.as_bytes(),
+            if self.flatten_post_params {
+                b"flatten"
+            } else {
+                b"keep"
+            },
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
+        format!("sha256:{}", hex::encode(digest.finalize()))
+    }
+}
+
+/// The id of the MCP Proxy a `proxy://<id>` endpoint names: all of the
+/// endpoint after the scheme, as a surface's Target and a Transit Point are
+/// dispatched. `None` for an endpoint of another scheme.
+pub fn endpoint_proxy_id(endpoint: &str) -> Option<&str> {
+    endpoint.strip_prefix("proxy://")
+}
+
+/// The id of the MCP Proxy a Transit Point's `proxy://<id>` endpoint names,
+/// when it is one an MCP Proxy can have
+/// ([`crate::mcp_proxies::handlers::is_valid_mcp_proxy_id`]). A surface save
+/// refuses any other, and a call never looks it up.
+pub fn transit_proxy_id(endpoint: &str) -> Option<&str> {
+    endpoint_proxy_id(endpoint).filter(|id| super::handlers::is_valid_mcp_proxy_id(id))
 }
 
 fn default_direct_access() -> bool {
