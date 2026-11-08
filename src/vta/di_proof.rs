@@ -102,7 +102,7 @@ mod tests {
         let key = ControlKey::from_seed([3u8; 32]);
         let doc = json!({
             "id": "urn:uuid:11111111-1111-1111-1111-111111111111",
-            "type": "https://trusttasks.org/spec/auth/authenticate/0.2",
+            "type": "https://trusttasks.org/spec/auth/authenticate/0.3",
             "issuer": key.did(),
             "recipient": "did:webvh:vta.example",
             "payload": { "challenge": "abc", "sessionId": "s1", "scope": [] }

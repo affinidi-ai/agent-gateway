@@ -3823,18 +3823,25 @@ mod live_tests {
             .expect("build a live client");
         let idx: u32 = rand::random::<u32>() % 2_000_000;
         let key_id = format!("gateway-surface-e2e-{idx}");
-        let _created: serde_json::Value = client
+        let created: serde_json::Value = client
             .dispatch_signed(
                 "https://trusttasks.org/spec/keys/create/0.1",
                 json!({
                     "keyType": "ed25519",
                     "keyId": key_id,
                     "label": "gateway-surface-e2e",
+                    "contextId": context,
                     "internal": true,
                 }),
             )
             .await
             .expect("the granted control DID can mint a key in its context");
+        // An internal key's record is never returned again, so its public half
+        // is taken from the response that created it — what provisioning does.
+        let public_key = crate::vta::context_identity::payload_of(&created)["key"]["publicKey"]
+            .as_str()
+            .expect("the create response carries the public key")
+            .to_string();
 
         crate::config::vta::VtaConfig {
             enabled: true,
@@ -3842,6 +3849,7 @@ mod live_tests {
             vta_did: Some(vta_did),
             context_id: Some(context),
             signing_key_id: Some(key_id),
+            signing_key_public: Some(public_key),
             auth_key_source: Some(format!("env://{LIVE_SEED_VAR}")),
             ..Default::default()
         }
@@ -4059,16 +4067,21 @@ mod live_connection_tests {
         serde_json::from_slice(&raw).expect("JSON header")
     }
 
-    /// Mint a key in the granted context, returning its id.
-    async fn mint_key(client: &Arc<crate::vta::client::VtaRestClient>) -> String {
+    /// Mint a key in the granted context, returning its id and public key. The
+    /// public half comes from the response that created the key, because an
+    /// internal key's record is never returned again.
+    async fn mint_key(client: &Arc<crate::vta::client::VtaRestClient>) -> (String, String) {
         let key_id = format!("live-conn-{}", uuid::Uuid::new_v4());
-        let _: serde_json::Value = client
+        let context =
+            std::env::var("VTA_LIVE_PARENT_CONTEXT").expect("set VTA_LIVE_PARENT_CONTEXT to the granted context");
+        let created: serde_json::Value = client
             .dispatch_signed(
                 "https://trusttasks.org/spec/keys/create/0.1",
                 json!({
                     "keyType": "ed25519",
                     "keyId": key_id,
                     "label": "live connection test",
+                    "contextId": context,
                     "internal": true,
                 }),
             )
@@ -4084,7 +4097,11 @@ mod live_connection_tests {
                     control_did(),
                 )
             });
-        key_id
+        let public_key = crate::vta::context_identity::payload_of(&created)["key"]["publicKey"]
+            .as_str()
+            .expect("the create response carries the public key")
+            .to_string();
+        (key_id, public_key)
     }
 
     /// The DID the fixed test seed resolves to — the one that must be granted.
@@ -4124,8 +4141,8 @@ mod live_connection_tests {
             )
             .expect("build a live client"),
         );
-        let active_key = mint_key(&client).await;
-        let other_key = mint_key(&client).await;
+        let (active_key, active_public_key) = mint_key(&client).await;
+        let (other_key, other_public_key) = mint_key(&client).await;
 
         // The control key as the connection's secret, exactly as the pairing
         // wizard stores it.
@@ -4177,12 +4194,21 @@ mod live_connection_tests {
                 keys: SigningKeys {
                     active: Some(SigningKey {
                         key_id: active_key.clone(),
-                        public_key: None,
+                        public_key: Some(active_public_key),
                         label: None,
                         added_at: now,
                         retired_at: None,
                     }),
-                    retiring: Vec::new(),
+                    // The second surface names a different key of the same agent.
+                    // The connection records both halves, as provisioning does,
+                    // because an internal key's record is never returned again.
+                    retiring: vec![SigningKey {
+                        key_id: other_key.clone(),
+                        public_key: Some(other_public_key),
+                        label: None,
+                        added_at: now,
+                        retired_at: Some(now),
+                    }],
                 },
                 pairing: crate::vta::pairing::PairingRecord {
                     state: crate::vta::pairing::PairingState::Connected,

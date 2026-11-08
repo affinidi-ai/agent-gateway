@@ -26,12 +26,12 @@ use crate::vta::client::VtaRestClient;
 /// `vta/contexts/get/1.0`.
 const TASK_CONTEXTS_GET: &str = "https://trusttasks.org/spec/vta/contexts/get/1.0";
 
-/// `keys/list/0.1`.
+/// `keys/list/0.2`.
 ///
 /// Not `keys/show`: that refuses an **internal** key outright, because the
 /// guard is on the key's origin rather than on what is read. `list` returns the
 /// same public records.
-const TASK_KEYS_LIST: &str = "https://trusttasks.org/spec/keys/list/0.1";
+const TASK_KEYS_LIST: &str = "https://trusttasks.org/spec/keys/list/0.2";
 
 /// `keys/sign-document/0.1`.
 const TASK_KEYS_SIGN_DOCUMENT: &str = "https://trusttasks.org/spec/keys/sign-document/0.1";
@@ -43,9 +43,12 @@ pub const PURPOSE_ASSERTION_METHOD: &str = "assertionMethod";
 /// itself, such as a holder proof on a presentation.
 pub const PURPOSE_AUTHENTICATION: &str = "authentication";
 
-/// Keys a context is asked for in one listing. A provisioned context holds a
-/// handful, so this is a bound rather than a page size to walk.
+/// Keys asked for per page of a listing.
 const KEY_LISTING_LIMIT: u64 = 100;
+
+/// Pages followed before giving up. A provisioned context holds a handful of
+/// keys, so reaching this means something is wrong, not that the context is big.
+const KEY_LISTING_MAX_PAGES: usize = 20;
 
 /// The body of a Trust Task response.
 ///
@@ -57,6 +60,50 @@ pub(crate) fn payload_of(response: &Value) -> &Value {
     response
         .get("payload")
         .unwrap_or(response)
+}
+
+/// Every key record in `context_id`, following the listing's cursor to the end.
+///
+/// `keys/list/0.2` is paged and says a producer that stops while it still
+/// returns a `nextCursor` has silently skipped every key past the page
+/// boundary. A caller looking for one key would then report it missing when it
+/// was merely on the next page, so the whole listing is read.
+pub(crate) async fn list_context_keys(
+    client: &VtaRestClient,
+    context_id: &str,
+    status: Option<&str>,
+) -> Result<Vec<Value>> {
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..KEY_LISTING_MAX_PAGES {
+        let mut request = json!({ "contextId": context_id, "limit": KEY_LISTING_LIMIT });
+        if let Some(status) = status {
+            request["status"] = json!(status);
+        }
+        if let Some(cursor) = &cursor {
+            request["cursor"] = json!(cursor);
+        }
+        let response = client
+            .dispatch_signed::<Value>(TASK_KEYS_LIST, request)
+            .await
+            .map_err(|e| anyhow!("listing the keys of context `{context_id}`: {e}"))?;
+        let page = payload_of(&response);
+        keys.extend(
+            page.get("keys")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        match page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+        {
+            Some(next) => cursor = Some(next.to_string()),
+            None => return Ok(keys),
+        }
+    }
+    bail!("the key listing of context `{context_id}` did not end within {KEY_LISTING_MAX_PAGES} pages")
 }
 
 /// The DID a context signs as, the key that DID is, and the verification
@@ -243,16 +290,9 @@ impl ContextIdentityResolver {
             .dispatch_signed::<Value>(TASK_CONTEXTS_GET, json!({ "id": self.context_id }))
             .await
             .map_err(|e| anyhow!("reading context `{}` to sign as it: {e}", self.context_id))?;
-        let keys = self
-            .client
-            .dispatch_signed::<Value>(
-                TASK_KEYS_LIST,
-                json!({ "contextId": self.context_id, "status": "active", "limit": KEY_LISTING_LIMIT }),
-            )
-            .await
-            .map_err(|e| anyhow!("listing the keys of context `{}`: {e}", self.context_id))?;
+        let keys = json!({ "keys": list_context_keys(&self.client, &self.context_id, Some("active")).await? });
 
-        let identity = identity_from_records(&self.context_id, payload_of(&context), payload_of(&keys))?;
+        let identity = identity_from_records(&self.context_id, payload_of(&context), &keys)?;
         *self.cached.write().await = Some(identity.clone());
         Ok(identity)
     }
@@ -324,6 +364,10 @@ pub(crate) mod mock {
         pub echo_key_id: Arc<Mutex<Option<String>>>,
         pub tamper_document: Arc<Mutex<bool>>,
         pub refuse_signing: Arc<Mutex<bool>>,
+        /// Serve the listing in two pages, the real key on the second, so a
+        /// caller that stops at the first `nextCursor` would miss it.
+        pub paged_listing: Arc<Mutex<bool>>,
+        pub list_requests: Arc<Mutex<Vec<Value>>>,
     }
 
     impl MockContextVta {
@@ -355,6 +399,8 @@ pub(crate) mod mock {
                 echo_key_id: Arc::new(Mutex::new(None)),
                 tamper_document: Arc::new(Mutex::new(false)),
                 refuse_signing: Arc::new(Mutex::new(false)),
+                paged_listing: Arc::new(Mutex::new(false)),
+                list_requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -443,13 +489,34 @@ pub(crate) mod mock {
             return Json(json!({ "id": "urn:uuid:envelope", "payload": record }));
         }
         if type_uri.contains("keys/list") {
-            return Json(json!({ "id": "urn:uuid:envelope", "payload": { "keys": [{
+            vta.list_requests
+                .lock()
+                .unwrap()
+                .push(payload.clone());
+            let real = json!({
                 "keyId": vta.key_id,
                 "keyType": "ed25519",
                 "status": vta.key_status,
                 "publicKey": vta.public_key,
                 "contextId": vta.context_id,
-            }]}}));
+            });
+            let decoy = json!({
+                "keyId": "a-decoy",
+                "keyType": "ed25519",
+                "status": "active",
+                "publicKey": "z6MkNotTheContextsKey",
+                "contextId": vta.context_id,
+            });
+            let paged = *vta
+                .paged_listing
+                .lock()
+                .unwrap();
+            let page = match (paged, payload["cursor"].as_str()) {
+                (true, None) => json!({ "keys": [decoy], "nextCursor": "page-2" }),
+                (true, Some(_)) => json!({ "keys": [real] }),
+                (false, _) => json!({ "keys": [real] }),
+            };
+            return Json(json!({ "id": "urn:uuid:envelope", "payload": page }));
         }
         if type_uri.contains("keys/sign-document") {
             vta.sign_calls
@@ -714,6 +781,33 @@ mod tests {
             .expect_err("a document that is not the one sent must not be passed on")
             .to_string();
         assert!(err.contains("not the document that was sent"), "{err}");
+    }
+
+    /// The listing is paged, and a key on a later page is still the context's
+    /// key: stopping at the first `nextCursor` would report it missing.
+    #[tokio::test]
+    async fn a_key_on_a_later_page_of_the_listing_is_found() {
+        let vta = MockContextVta::new("gw/ctx", "ctx-issuer");
+        *vta.paged_listing
+            .lock()
+            .unwrap() = true;
+        let url = vta.spawn().await;
+        let resolver = ContextIdentityResolver::new(vta.client(&url), "gw/ctx".to_string());
+
+        let identity = resolver
+            .identity()
+            .await
+            .expect("the key on the second page must be found");
+
+        assert_eq!(identity.key_id, "ctx-issuer");
+        let requests = vta
+            .list_requests
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(requests.len(), 2, "both pages must be read");
+        assert_eq!(requests[1]["cursor"], json!("page-2"), "the cursor must be passed back unchanged");
+        assert_eq!(requests[0]["status"], json!("active"));
     }
 
     #[tokio::test]

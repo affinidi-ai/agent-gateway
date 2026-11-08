@@ -2,7 +2,7 @@
 //! authenticates to the VTA with (VTA-02/03).
 //!
 //! This is **not** an issuer/signing key: it only proves control of the
-//! gateway's auth identity when it signs the `auth/authenticate/0.2` Trust Task.
+//! gateway's auth identity when it signs the `auth/authenticate/0.3` Trust Task.
 //!
 //! Signing goes through the [`SignerKeyProvider`] seam so the key material can
 //! be swapped for a **non-exportable KMS/HSM** key without touching the auth

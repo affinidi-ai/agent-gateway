@@ -155,6 +155,23 @@ pub struct SigningKeys {
 }
 
 impl SigningKeys {
+    /// The public half recorded for `key_id`, whether the key is active or still
+    /// being published.
+    ///
+    /// The trust agent never returns the record of an **internal** key, so the
+    /// public half recorded when the key was minted is the only source of it. A
+    /// connector that does not use it has to ask the agent, and is refused.
+    pub fn public_key_of(
+        &self,
+        key_id: &str,
+    ) -> Option<&str> {
+        self.active
+            .iter()
+            .chain(self.retiring.iter())
+            .find(|key| key.key_id == key_id)
+            .and_then(|key| key.public_key.as_deref())
+    }
+
     /// Rotate to `next`, retiring the current active key.
     ///
     /// The old key is **moved to `retiring`, never dropped**: a verifier picks
@@ -859,5 +876,30 @@ mod tests {
                 .is_none(),
             "an unprovisioned connection stays clean: {json}"
         );
+    }
+    fn recorded_key(
+        id: &str,
+        public: Option<&str>,
+    ) -> SigningKey {
+        SigningKey {
+            key_id: id.to_string(),
+            public_key: public.map(str::to_string),
+            label: None,
+            added_at: Utc::now(),
+            retired_at: None,
+        }
+    }
+
+    #[test]
+    fn the_recorded_public_half_is_found_for_an_active_or_a_retiring_key() {
+        let keys = SigningKeys {
+            active: Some(recorded_key("active", Some("z6MkActive"))),
+            retiring: vec![recorded_key("old", Some("z6MkOld")), recorded_key("legacy", None)],
+        };
+        assert_eq!(keys.public_key_of("active"), Some("z6MkActive"));
+        assert_eq!(keys.public_key_of("old"), Some("z6MkOld"));
+        assert_eq!(keys.public_key_of("legacy"), None, "a record without one has none to offer");
+        assert_eq!(keys.public_key_of("unknown"), None);
+        assert_eq!(SigningKeys::default().public_key_of("active"), None);
     }
 }

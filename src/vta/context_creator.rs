@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::vta::VtaError;
 use crate::vta::client::VtaRestClient;
-use crate::vta::context_identity::payload_of;
+use crate::vta::context_identity::{list_context_keys, payload_of};
 use crate::vta::key_directory::ContextId;
 use crate::vta::provisioning::ContextCreator;
 
@@ -46,12 +46,11 @@ const TASK_CONTEXTS_UPDATE_DID: &str = "https://trusttasks.org/spec/vta/contexts
 /// `keys/create/0.1`.
 const TASK_KEYS_CREATE: &str = "https://trusttasks.org/spec/keys/create/0.1";
 
-/// `keys/list/0.1`.
+/// `keys/list/0.2`.
 ///
 /// Not `keys/show`: that one refuses an **internal** key outright — the record
 /// carries only the public half, but the guard is on the origin, not on what is
 /// being read. `list` returns the same records, so adoption goes through it.
-const TASK_KEYS_LIST: &str = "https://trusttasks.org/spec/keys/list/0.1";
 
 /// Suffix on the issuer key minted for a context.
 ///
@@ -243,11 +242,10 @@ impl GatewayContextCreator {
             // A retry after a timeout finds the key already minted. Adopt it
             // rather than mint a second one the context will never use.
             Err(e) if already_exists(&e) => {
-                let listed = self
-                    .client
-                    .dispatch_signed::<serde_json::Value>(TASK_KEYS_LIST, json!({ "contextId": context_id }))
-                    .await?;
-                public_key_in_list(payload_of(&listed), key_id)
+                let listed = list_context_keys(&self.client, context_id, None)
+                    .await
+                    .map_err(|e| VtaError::Protocol(e.to_string()))?;
+                public_key_in_list(&listed, key_id)
             }
             Err(e) => return Err(e),
         };
@@ -268,15 +266,12 @@ fn public_key_of(payload: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The `publicKey` of one named key in a `keys/list` response.
+/// The `publicKey` of one named key among a context's key records.
 fn public_key_in_list(
-    payload: &serde_json::Value,
+    keys: &[serde_json::Value],
     key_id: &str,
 ) -> Option<String> {
-    payload
-        .get("keys")?
-        .as_array()?
-        .iter()
+    keys.iter()
         .find(|k| {
             k.get("keyId")
                 .or_else(|| k.get("key_id"))

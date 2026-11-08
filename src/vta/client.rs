@@ -3,7 +3,7 @@
 //! The gateway and VTA are separate services; this client speaks the VTA's HTTP
 //! Trust-Task surface with the gateway's own `reqwest` stack — it does **not**
 //! link `vta-sdk`. It performs the DI-signed auth handshake
-//! (`auth/challenge/0.1` → `auth/authenticate/0.2`), caches the session tokens
+//! (`auth/challenge/0.1` → `auth/authenticate/0.3`), caches the session tokens
 //! **in memory only**, and dispatches further Trust Tasks with the bearer token.
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 pub(crate) const TRUST_TASKS_PATH: &str = "/trust-tasks";
 const TASK_AUTH_CHALLENGE: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
-const TASK_AUTH_AUTHENTICATE: &str = "https://trusttasks.org/spec/auth/authenticate/0.2";
+const TASK_AUTH_AUTHENTICATE: &str = "https://trusttasks.org/spec/auth/authenticate/0.3";
 
 /// A cached, memory-only session. Tokens never touch disk, are **zeroized** when
 /// this value is dropped (re-auth replaces it), and carry no `Debug`.

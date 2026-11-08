@@ -300,7 +300,16 @@ impl VtaConnectionRegistry {
             })
             .unwrap_or_default();
 
-        Ok(Arc::new(VtaCredentialAuthority::new(client, signing_key_id, None)))
+        // The public half the connection recorded when it minted the key. The
+        // keys are internal, so the agent will not return their records: without
+        // this the connector asks for it and is refused. A record that predates
+        // storing it still falls back to asking.
+        let public_key = connection
+            .keys
+            .public_key_of(&signing_key_id)
+            .map(str::to_string);
+
+        Ok(Arc::new(VtaCredentialAuthority::new(client, signing_key_id, None).with_signing_key_public(public_key)))
     }
 
     /// The dialled client for a connection, before any signing role is put on

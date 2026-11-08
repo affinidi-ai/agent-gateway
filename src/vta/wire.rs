@@ -55,7 +55,7 @@ impl std::fmt::Debug for TokenBundle {
     }
 }
 
-/// `auth/authenticate/0.2#response`: `{ session, tokens }`. Only `tokens` is
+/// `auth/authenticate/0.3#response`: `{ session, tokens }`. Only `tokens` is
 /// consumed; the `session` object is ignored (serde drops unknown fields).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthenticateResponse {
