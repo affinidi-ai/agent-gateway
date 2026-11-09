@@ -107,13 +107,13 @@ describe('IdentityPanel From API Key', () => {
     [
       'unavailable',
       'atgk_revoked (belongs to another surface)',
-      'The API key this Identity uses belongs to another surface.',
+      'The API key this Identity uses belongs to another surface. Select an active API key of this surface.',
     ],
-  ] as const)('names a %s stored key and warns', async (status, label, warning) => {
+  ] as const)('names a blocking %s stored key and warns', async (status, label, warning) => {
     renderPanel(protectedSlot, {
       surfaceId: 'surface-1',
       apiKeyId: 'atgk_revoked',
-      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_revoked', status }]),
+      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_revoked', status, blocking: true }]),
     });
     const select = screen.getByTestId('identity-panel-api-key-select');
     await within(select).findByRole('option', { name: 'client-1' });
@@ -122,18 +122,43 @@ describe('IdentityPanel From API Key', () => {
     expect(stored).toBeDisabled();
     expect(select).toHaveValue('atgk_revoked');
     expect(screen.getByTestId('identity-api-key-revoked-warning')).toHaveTextContent(warning);
+    expect(screen.queryByTestId('identity-api-key-other-surface-notice')).toBeNull();
+  });
+
+  it('notes a non-blocking stored key of another surface without the blocking warning', async () => {
+    renderPanel(protectedSlot, {
+      surfaceId: 'surface-1',
+      apiKeyId: 'atgk_other',
+      apiKeyStatuses: apiKeyStatusMap([
+        { key_id: 'atgk_other', status: 'unavailable', blocking: false },
+      ]),
+    });
+    const select = screen.getByTestId('identity-panel-api-key-select');
+    await within(select).findByRole('option', { name: 'client-1' });
+    expect(
+      within(select).getByRole('option', { name: 'atgk_other (belongs to another surface)' })
+    ).toBeDisabled();
+    expect(select).toHaveValue('atgk_other');
+    expect(screen.queryByTestId('identity-api-key-revoked-warning')).toBeNull();
+    const notice = screen.getByTestId('identity-api-key-other-surface-notice');
+    expect(notice).toHaveTextContent(
+      'The API key this Identity uses belongs to another surface. Select an active API key of this surface.'
+    );
+    expect(notice).toHaveClass('text-warning');
+    expect(notice).toHaveAttribute('role', 'status');
   });
 
   it('shows no warning for an active stored key', async () => {
     renderPanel(protectedSlot, {
       surfaceId: 'surface-1',
       apiKeyId: 'atgk_own',
-      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_own', status: 'active' }]),
+      apiKeyStatuses: apiKeyStatusMap([{ key_id: 'atgk_own', status: 'active', blocking: false }]),
     });
     const select = screen.getByTestId('identity-panel-api-key-select');
     await within(select).findByRole('option', { name: 'client-1' });
     expect(select).toHaveValue('atgk_own');
     expect(screen.queryByTestId('identity-api-key-revoked-warning')).toBeNull();
+    expect(screen.queryByTestId('identity-api-key-other-surface-notice')).toBeNull();
   });
 
   it('lists no keys on the create page, which already has a surface id', () => {

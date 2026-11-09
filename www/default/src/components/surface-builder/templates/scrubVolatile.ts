@@ -26,7 +26,11 @@ const VOLATILE_TP_CANVAS_FIELDS = [
 
 // Read-only fields the gateway sets on a surface response; they describe the
 // stored surface, not the configuration a template carries.
-const DERIVED_SURFACE_FIELDS = ['access_point_status', 'api_key_references'] as const;
+const DERIVED_SURFACE_FIELDS = [
+  'access_point_status',
+  'api_key_references',
+  'serving_status',
+] as const;
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);

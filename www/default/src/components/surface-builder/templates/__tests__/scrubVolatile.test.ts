@@ -77,7 +77,8 @@ describe('scrubVolatileTemplateFields', () => {
     const out = scrubVolatileTemplateFields({
       name: 's',
       access_point_status: 'not_ready',
-      api_key_references: [{ key_id: 'atgk_own', status: 'revoked' }],
+      api_key_references: [{ key_id: 'atgk_own', status: 'revoked', blocking: true }],
+      serving_status: 'not_serving',
     });
     expect(out).toEqual({ name: 's' });
   });
@@ -87,7 +88,8 @@ describe('scrubVolatileTemplateFields', () => {
       {
         name: 's',
         access_point_status: 'ready',
-        api_key_references: [{ key_id: 'atgk_own', status: 'active' }],
+        api_key_references: [{ key_id: 'atgk_own', status: 'active', blocking: false }],
+        serving_status: 'serving',
       },
       { tokenizeNamedFields: false }
     );

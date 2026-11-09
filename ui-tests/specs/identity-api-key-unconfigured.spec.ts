@@ -2,7 +2,8 @@
  * Unconfigured Identity tests
  *
  * Asserts a protected From API Key Identity whose stored key the surface
- * response reports as revoked or deleted (`api_key_references`) gets the red
+ * response reports as revoked or deleted, and so blocking
+ * (`api_key_references`), gets the red
  * canvas ring, a short reason under the node, a labelled picker entry with a
  * warning in its panel, and a Save error; choosing an active key clears the
  * ring and warning, and an active stored key shows neither.
@@ -51,7 +52,7 @@ function surfaceFixture(storedKey: string, status: ReferenceStatus) {
             inbound: {type: 'from_api_key'},
             protected: {type: 'from_api_key', api_key_id: storedKey},
         },
-        api_key_references: [{key_id: storedKey, status}],
+        api_key_references: [{key_id: storedKey, status, blocking: status !== 'active'}],
     };
 }
 

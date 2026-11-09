@@ -13,8 +13,8 @@ import FieldHelp from '../../../shared/FieldHelp';
 import { isInboundIdentity } from './placement';
 import {
   apiKeyReferenceWarningText,
+  storedApiKeyProblem,
   unlistedApiKeyLabel,
-  unusableApiKeyStatus,
 } from './apiKeyStatus';
 import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 
@@ -182,7 +182,8 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
   const apiKeys = surfaceKeys.filter(k => k.status === 'active');
   const storedKeyId: string = config.api_key_id || '';
   const storedKeyListed = !storedKeyId || apiKeys.some(k => k.key_id === storedKeyId);
-  const storedKeyProblem = unusableApiKeyStatus(storedKeyId, meta?.apiKeyStatuses);
+  const storedKeyReference = storedApiKeyProblem(storedKeyId, meta?.apiKeyStatuses);
+  const storedKeyProblem = storedKeyReference?.status ?? null;
   const storedKeyName =
     storedKeyProblem === 'revoked'
       ? surfaceKeys.find(k => k.key_id === storedKeyId)?.client_id
@@ -403,13 +404,22 @@ const IdentityPanel: React.FC<ConfigPanelProps> = ({
               </option>
             ))}
           </Form.Select>
-          {storedKeyProblem && (
+          {storedKeyReference?.blocking && (
             <div
               className="text-danger small mt-1"
               role="alert"
               data-testid="identity-api-key-revoked-warning"
             >
-              {apiKeyReferenceWarningText(storedKeyProblem)}
+              {apiKeyReferenceWarningText(storedKeyReference.status)}
+            </div>
+          )}
+          {storedKeyReference && !storedKeyReference.blocking && (
+            <div
+              className="text-warning small mt-1"
+              role="status"
+              data-testid="identity-api-key-other-surface-notice"
+            >
+              {apiKeyReferenceWarningText(storedKeyReference.status)}
             </div>
           )}
           {!surfaceId && (

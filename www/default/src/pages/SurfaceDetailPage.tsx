@@ -1677,6 +1677,7 @@ const SurfaceDetailPage: React.FC = () => {
   // Stored without `public`: Public access shows a legacy state, which the
   // operator can close.
   const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
+  const refusingRequests = surface?.serving_status === 'not_serving';
 
   const policyDefinitionsSaveBlocker = surfacePolicyBlockingReason(
     builder.state.nodes,
@@ -1701,8 +1702,18 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || (saveWarnings && saveWarnings.length > 0) ? (
+          error || refusingRequests || (saveWarnings && saveWarnings.length > 0) ? (
             <>
+              {refusingRequests && (
+                <div
+                  className="alert alert-warning surface-page-alert mb-2"
+                  role="status"
+                  data-testid="surface-refusing-requests"
+                >
+                  <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                  This surface is refusing requests
+                </div>
+              )}
               {error && (
                 <div
                   className="alert alert-danger surface-page-alert mb-2"

@@ -3,6 +3,7 @@ import {
   apiKeyReferenceWarning,
   apiKeyStatusMap,
   firstUnusableApiKeyIdentity,
+  storedApiKeyProblem,
   unlistedApiKeyLabel,
 } from '../apiKeyStatus';
 
@@ -14,11 +15,12 @@ const protectedNode = (config: Record<string, unknown>) => ({
 });
 
 const statuses = apiKeyStatusMap([
-  { key_id: 'atgk_active', status: 'active' },
-  { key_id: 'atgk_revoked', status: 'revoked' },
-  { key_id: 'atgk_missing', status: 'missing' },
-  { key_id: 'atgk_other', status: 'unavailable' },
-  { key_id: 'atgk_unknown', status: 'unknown' },
+  { key_id: 'atgk_active', status: 'active', blocking: false },
+  { key_id: 'atgk_revoked', status: 'revoked', blocking: true },
+  { key_id: 'atgk_missing', status: 'missing', blocking: true },
+  { key_id: 'atgk_other', status: 'unavailable', blocking: true },
+  { key_id: 'atgk_other_warn', status: 'unavailable', blocking: false },
+  { key_id: 'atgk_unknown', status: 'unknown', blocking: false },
 ]);
 
 describe('apiKeyReferenceWarning', () => {
@@ -31,18 +33,24 @@ describe('apiKeyReferenceWarning', () => {
       'atgk_missing',
       'The API key this Identity uses was deleted. Select an active API key of this surface.',
     ],
-    ['atgk_other', 'The API key this Identity uses belongs to another surface.'],
+    [
+      'atgk_other',
+      'The API key this Identity uses belongs to another surface. Select an active API key of this surface.',
+    ],
   ])('warns for %s', (keyId, warning) => {
     expect(
       apiKeyReferenceWarning(protectedNode({ type: 'from_api_key', api_key_id: keyId }), statuses)
     ).toBe(warning);
   });
 
-  it.each(['atgk_active', 'atgk_unknown', 'atgk_unlisted'])('does not warn for %s', keyId => {
-    expect(
-      apiKeyReferenceWarning(protectedNode({ type: 'from_api_key', api_key_id: keyId }), statuses)
-    ).toBeNull();
-  });
+  it.each(['atgk_active', 'atgk_other_warn', 'atgk_unknown', 'atgk_unlisted'])(
+    'does not warn for %s',
+    keyId => {
+      expect(
+        apiKeyReferenceWarning(protectedNode({ type: 'from_api_key', api_key_id: keyId }), statuses)
+      ).toBeNull();
+    }
+  );
 
   it('reads a Transit Point Identity too', () => {
     const node = {
@@ -86,6 +94,7 @@ describe('apiKeyReferenceCanvasReason', () => {
     ['atgk_revoked', 'API key revoked'],
     ['atgk_missing', 'API key deleted'],
     ['atgk_other', 'API key of another surface'],
+    ['atgk_other_warn', null],
     ['atgk_active', null],
     ['atgk_unknown', null],
   ])('gives %s a short reason that tells the states apart', (keyId, reason) => {
@@ -117,9 +126,29 @@ describe('firstUnusableApiKeyIdentity', () => {
   it('returns null when every key is usable or statuses are unknown', () => {
     const active = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_active' });
     const revoked = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_revoked' });
-    expect(firstUnusableApiKeyIdentity([active], statuses)).toBeNull();
+    const otherWarn = protectedNode({ type: 'from_api_key', api_key_id: 'atgk_other_warn' });
+    expect(firstUnusableApiKeyIdentity([active, otherWarn], statuses)).toBeNull();
     expect(firstUnusableApiKeyIdentity([revoked], undefined)).toBeNull();
     expect(firstUnusableApiKeyIdentity([], statuses)).toBeNull();
+  });
+});
+
+describe('storedApiKeyProblem', () => {
+  it.each([
+    ['atgk_revoked', { status: 'revoked', blocking: true }],
+    ['atgk_missing', { status: 'missing', blocking: true }],
+    ['atgk_other', { status: 'unavailable', blocking: true }],
+    ['atgk_other_warn', { status: 'unavailable', blocking: false }],
+    ['atgk_active', null],
+    ['atgk_unknown', null],
+    ['atgk_unlisted', null],
+  ])('reports %s by its status and blocking', (keyId, problem) => {
+    expect(storedApiKeyProblem(keyId, statuses)).toEqual(problem);
+  });
+
+  it('reports nothing without a key id or statuses', () => {
+    expect(storedApiKeyProblem('', statuses)).toBeNull();
+    expect(storedApiKeyProblem('atgk_revoked', undefined)).toBeNull();
   });
 });
 

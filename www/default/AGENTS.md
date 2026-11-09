@@ -409,19 +409,27 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   as a disabled option, so it cannot be picked again once changed, labelled by its status
   (below), or "<id> (not an active key of this surface)" when that status is not `revoked`,
   `missing` or `unavailable`. **Unconfigured Identity**: the surface read and save
-  responses carry `api_key_references` (`key_id` and `status`), passed to the panels and the
-  canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). A
+  responses carry `api_key_references` (`key_id`, `status` and `blocking`), passed to the panels and the
+  canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). The
+  gateway sets `blocking` on `revoked` and `missing`, and on `unavailable` (another surface's
+  key) only while `tenant_credential_isolation` is `enforce`; the dashboard follows `blocking`
+  and does not work it out itself. A
   protected, external or Transit Point From API Key Identity whose current `api_key_id` is
-  `revoked`, `missing` or `unavailable` gets the canvas's red `unconfigured-ring` (red, dashed
+  `blocking` gets the canvas's red `unconfigured-ring` (red, dashed
   and animated by the `.surface-builder-canvas .unconfigured-ring` rule, like every other ring)
   with "API key revoked", "API key deleted" or "API key of another surface" under its label, and
-  the panel shows the full warning under the picker (`identity-api-key-revoked-warning`) and
+  the panel shows the full warning in red under the picker (`identity-api-key-revoked-warning`,
+  `role="alert"`) and
   labels the stored key "<client id> (revoked)" (the revoked key's name from the surface's key
   list, or its id when that list does not have it), "<id> (deleted)" or "<id> (belongs to
   another surface)". The
   warnings are "The API key this Identity uses was revoked. Select an active API key of this
   surface.", "… was deleted. Select an active API key of this surface." and "The API key this
-  Identity uses belongs to another surface." An `active` or `unknown` status, a key id not in the
+  Identity uses belongs to another surface. Select an active API key of this surface." An
+  `unavailable` key that is not `blocking` (`warn`) keeps the "(belongs to another surface)"
+  label and shows the same text in the warning yellow (`text-warning`, `role="status"`,
+  `identity-api-key-other-surface-notice`), with no ring, no canvas reason and no Save block. An
+  `active` or `unknown` status, a key id not in the
   list, and the inbound Identity show nothing. The lookup is by key id, so variant canvases use
   the same list, and picking an active key clears the ring before Save. It blocks Save on the
   surface page, in the base and every variant, with "Identity: " and the full warning
@@ -438,9 +446,14 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
   injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
   canvas Identity nodes (top-level and in variant overrides), every `atgk_` Caller Context
-  `secret_id` of the base and the variant overrides, and the read-only `access_point_status` and
-  `api_key_references`, so the new surface's Identity asks for its own key. A surface write never
-  sends `access_point_status` or `api_key_references` (`toBackendSurface`). An error-level dependency blocks
+  `secret_id` of the base and the variant overrides, and the read-only `access_point_status`,
+  `api_key_references` and `serving_status`, so the new surface's Identity asks for its own key. A
+  surface write never sends `access_point_status`, `api_key_references` or `serving_status`
+  (`toBackendSurface`). **Refusing requests**: while the surface response's `serving_status`
+  (present only beside `api_key_references`) is `not_serving`, the surface page's top banner shows
+  "This surface is refusing requests" (`surface-refusing-requests`, `alert-warning`,
+  `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
+  notice names none. An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
