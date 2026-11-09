@@ -2302,6 +2302,62 @@ fn rest_api_answers_pdf_document(
     );
 }
 
+#[given(expr = "REST API {string} answers a file of {int} bytes")]
+fn rest_api_answers_file_of_size(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    size: usize,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/octet-stream".to_string())]),
+            body: serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                vec![0xffu8; size],
+            )),
+            stream: MockStream::Bytes,
+        },
+    );
+}
+
+#[given(expr = "the surface limits MCP responses to {int} bytes")]
+fn surface_limits_mcp_responses(
+    world: &mut SurfaceWorld,
+    max_response_bytes: usize,
+) {
+    world
+        .surface_config
+        .mcp_http
+        .get_or_insert_with(|| serde_json::json!({}))["max_response_bytes"] = serde_json::json!(max_response_bytes);
+}
+
+#[given(expr = "REST API {string} answers its weather as {string}")]
+fn rest_api_answers_weather_as_content_type(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    content_type: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), content_type)]),
+            body: serde_json::json!({"city": "Paris", "temperature": 21, "conditions": "Sunny"}),
+            stream: MockStream::None,
+        },
+    );
+}
+
 #[given(expr = "REST API {string} is failing with status {int}")]
 fn rest_api_is_failing_with_status(
     world: &mut SurfaceWorld,

@@ -180,6 +180,34 @@ Feature: Routing through a proxy:// MCP target
     And REST API "bravo" received "GET /weather/Paris/map"
     And the MCP tool result is REST API "bravo"'s file as an embedded "application/pdf" resource
 
+  Scenario: A 2026-07-28 tool call returns a file the REST API answers as an embedded resource
+    Given REST API "bravo" answers a PDF document
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/map"
+    And the MCP tool result is REST API "bravo"'s file as an embedded "application/pdf" resource
+
+  Scenario: A 2026-07-28 tool call returns JSON the REST API serves under a non-JSON content type as text
+    Given REST API "bravo" answers its weather as "application/octet-stream"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 200
+    And the MCP tool result matches REST API "bravo" response
+
+  Scenario: A 2026-07-28 tool call refuses a file that does not fit the response limit once base64-encoded
+    Given the surface limits MCP responses to 4096 bytes
+    And REST API "bravo" answers a file of 3200 bytes
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" using protocol version "2026-07-28"
+    Then the response status is 502
+    And the MCP response is a JSON-RPC error with code -32603
+
+  Scenario: A credentialed tool call returns JSON the REST API serves under a non-JSON content type as text
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" answers its weather as "application/octet-stream"
+    When the caller invokes the MCP tool "get_weather" for city "Paris" with a valid API key
+    Then the response status is 200
+    And the MCP tool result matches REST API "bravo" response
+
   Scenario: A legacy MCP proxy tool call answers the same failed tool result with and without the Target credential
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"

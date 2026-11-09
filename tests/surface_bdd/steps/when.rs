@@ -3123,6 +3123,25 @@ async fn mcp_tool_call_with_city_argument_and_valid_api_key(
     send_json_request_and_record(world, body, vec![header]).await;
 }
 
+#[when(expr = "the caller invokes the MCP tool {string} for city {string} using protocol version {string}")]
+async fn mcp_tool_call_with_city_argument_using_protocol_version(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+    city: String,
+    protocol_version: String,
+) {
+    let protocol_version = McpVersion::from(protocol_version.as_str());
+    let mut body = crate::bdd_support::json_rpc::build_modern_mcp_tool_call_body(
+        serde_json::json!("bdd-modern-call"),
+        &tool_name,
+        &protocol_version,
+    );
+    body["params"]["arguments"] = serde_json::json!({ "city": city });
+    let mut headers = modern_mcp_request_headers(&protocol_version, "tools/call");
+    headers.push(("Mcp-Name".to_string(), tool_name));
+    send_json_request_and_record(world, body, headers).await;
+}
+
 #[when(expr = "the caller invokes the MCP tool {string} for city {string} once without and once with a valid API key")]
 async fn mcp_tool_call_with_city_argument_without_then_with_valid_api_key(
     world: &mut SurfaceWorld,

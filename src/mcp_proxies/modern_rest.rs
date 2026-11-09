@@ -751,17 +751,16 @@ pub(super) async fn call(
         }
         body.extend_from_slice(&chunk);
     }
-    let mime = content_type
-        .as_ref()
-        .and_then(|value| {
-            value
-                .parse::<mime::Mime>()
-                .ok()
-        });
-    let (content, structured) = if mime
-        .as_ref()
-        .is_some_and(|mime| mime.type_() == mime::IMAGE)
-    {
+    let is_image = !body.is_empty()
+        && content_type
+            .as_deref()
+            .and_then(|value| {
+                value
+                    .parse::<mime::Mime>()
+                    .ok()
+            })
+            .is_some_and(|mime| mime.type_() == mime::IMAGE);
+    let (content, structured) = if is_image {
         (
             vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&body),
@@ -770,17 +769,9 @@ pub(super) async fn call(
             None,
         )
     } else {
-        let decoded = if mime
-            .as_ref()
-            .is_none_or(is_text)
-        {
-            String::from_utf8(body).map_err(std::string::FromUtf8Error::into_bytes)
-        } else {
-            Err(body)
-        };
-        match decoded {
+        match String::from_utf8(body) {
             Ok(body) => text_content(metadata, &url, status, content_type, body)?,
-            Err(bytes) => (vec![binary_content(&url, content_type, &bytes)], None),
+            Err(error) => (vec![binary_content(&url, content_type, error.as_bytes())], None),
         }
     };
     let mut result = if status.is_success() {
@@ -844,17 +835,6 @@ fn resource_uri(url: &Url) -> String {
     url.set_query(None);
     url.set_fragment(None);
     url.to_string()
-}
-
-fn is_text(mime: &mime::Mime) -> bool {
-    mime.type_() == mime::TEXT
-        || [mime::JSON, mime::XML].contains(&mime.subtype())
-        || mime
-            .suffix()
-            .is_some_and(|suffix| [mime::JSON, mime::XML].contains(&suffix))
-        || (mime.type_() == mime::APPLICATION
-            && ["javascript", "x-www-form-urlencoded", "yaml", "x-yaml", "ndjson", "x-ndjson"]
-                .contains(&mime.subtype().as_str()))
 }
 
 fn binary_content(
@@ -1293,12 +1273,6 @@ mod tests {
                 axum::routing::get(|| async { ([("content-type", "application/pdf")], PDF).into_response() }),
             )
             .route(
-                "/ascii-pdf",
-                axum::routing::get(|| async {
-                    ([("content-type", "application/pdf")], "%PDF-1.4 plain").into_response()
-                }),
-            )
-            .route(
                 "/untyped",
                 axum::routing::get(|| async {
                     axum::http::Response::builder()
@@ -1365,7 +1339,6 @@ mod tests {
         };
         for (path, mime, bytes, is_error) in [
             ("/pdf", "application/pdf", PDF.to_vec(), false),
-            ("/ascii-pdf", "application/pdf", b"%PDF-1.4 plain".to_vec(), false),
             ("/untyped", "application/octet-stream", vec![0u8, 159, 146, 150], false),
             ("/latin1", "text/plain; charset=iso-8859-1", vec![b'c', b'a', b'f', 0xe9], false),
             ("/denied", "application/pdf", PDF.to_vec(), true),
@@ -1407,6 +1380,124 @@ mod tests {
                 .unwrap()
                 .contains("hello")
         );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn utf8_bodies_stay_text_whatever_their_content_type() {
+        use axum::response::IntoResponse;
+
+        let typed = |content_type: &'static str, body: &'static str| {
+            axum::routing::get(move || async move { ([("content-type", content_type)], body).into_response() })
+        };
+        let app = axum::Router::new()
+            .route("/octet-json", typed("application/octet-stream", r#"{"ok":true}"#))
+            .route("/amz-json", typed("application/x-amz-json-1.1", r#"{"ok":true}"#))
+            .route("/ascii-pdf", typed("application/pdf", "%PDF-1.4 plain"))
+            .route("/empty-pdf", typed("application/pdf", ""))
+            .route("/empty-png", typed("image/png", ""));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |tool: ToolMetadata| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                call(
+                    &base,
+                    &tool,
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for path in ["/octet-json", "/amz-json"] {
+            let mut tool = metadata(path);
+            tool.output_schema = Some(json!({"type": "object", "properties": {"body": {"type": "object"}}}));
+            let result = fetch(tool).await;
+            assert_eq!(result.is_error, Some(false), "{path}");
+            assert_eq!(result.structured_content, Some(json!({"status": 200, "body": {"ok": true}})), "{path}");
+        }
+        for (path, text) in
+            [("/ascii-pdf", "%PDF-1.4 plain"), ("/empty-pdf", "Status: 200 OK"), ("/empty-png", "Status: 200 OK")]
+        {
+            let result = serde_json::to_value(fetch(metadata(path)).await).unwrap();
+            assert_eq!(result["isError"], false, "{path}");
+            assert_eq!(result["content"][0]["type"], "text", "{path}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(text),
+                "{path}: {result}"
+            );
+        }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_rest_client_bounds_file_and_image_bytes_before_encoding() {
+        use axum::response::IntoResponse;
+
+        let sized = |content_type: &'static str, byte: u8, len: usize| {
+            axum::routing::get(
+                move || async move { ([("content-type", content_type)], vec![byte; len]).into_response() },
+            )
+        };
+        let app = axum::Router::new()
+            .route("/file-fits", sized("application/octet-stream", 0xff, 400))
+            .route("/file-over", sized("application/octet-stream", 0xff, 401))
+            .route("/image-fits", sized("image/png", 0xff, 400))
+            .route("/image-over", sized("image/png", 0xff, 401))
+            .route("/text-over", sized("text/plain", b'a', 401));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits: McpHttpConfig = serde_json::from_value(json!({"max_response_bytes": 400})).unwrap();
+        for (path, fits) in [
+            ("/file-fits", true),
+            ("/file-over", false),
+            ("/image-fits", true),
+            ("/image-over", false),
+            ("/text-over", false),
+        ] {
+            let result = call(
+                &base,
+                &metadata(path),
+                &json!({}),
+                &HeaderMap::new(),
+                &limits,
+                "application/json",
+                Some(base.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_ok(), fits, "{path}");
+            if !fits {
+                assert!(matches!(result, Err(RestError::Limit)), "{path}");
+            }
+        }
         tasks.shutdown().await;
     }
 
