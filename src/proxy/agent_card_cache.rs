@@ -45,6 +45,13 @@ struct CacheEntry {
 }
 
 impl CacheEntry {
+    fn now(payload: Option<Value>) -> Self {
+        Self {
+            fetched_at: Instant::now(),
+            payload,
+        }
+    }
+
     fn is_fresh(
         &self,
         now: Instant,
@@ -58,24 +65,7 @@ impl CacheEntry {
     }
 }
 
-fn cache() -> &'static DashMap<CacheKey, CacheEntry> {
-    static CACHE: OnceLock<DashMap<CacheKey, CacheEntry>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
-}
-
 type SurfaceCardKey = (String, String, String);
-
-fn surface_card_cache() -> &'static DashMap<SurfaceCardKey, CacheEntry> {
-    static CACHE: OnceLock<DashMap<SurfaceCardKey, CacheEntry>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
-}
-
-fn make_key(
-    target_endpoint: &str,
-    agent_card_path: Option<&str>,
-) -> CacheKey {
-    (target_endpoint.to_string(), agent_card_path.map(str::to_string))
-}
 
 /// Memoized outcome of cryptographically verifying a target card's
 /// `agent-identity-credential/v1` Verifiable Presentation. Only
@@ -88,21 +78,108 @@ struct VerifiedVpEntry {
     subject_did: String,
 }
 
-fn verified_vp_cache() -> &'static DashMap<String, VerifiedVpEntry> {
-    static CACHE: OnceLock<DashMap<String, VerifiedVpEntry>> = OnceLock::new();
-    CACHE.get_or_init(DashMap::new)
+#[derive(Default)]
+struct AgentCardCache {
+    cards: DashMap<CacheKey, CacheEntry>,
+    surface_cards: DashMap<SurfaceCardKey, CacheEntry>,
+    verified_vps: DashMap<String, VerifiedVpEntry>,
+}
+
+impl AgentCardCache {
+    fn lookup_verified_vp(
+        &self,
+        vp: &str,
+    ) -> Option<String> {
+        let entry = self.verified_vps.get(vp)?;
+        (Instant::now().saturating_duration_since(entry.verified_at) < POSITIVE_TTL).then(|| entry.subject_did.clone())
+    }
+
+    fn insert_verified_vp(
+        &self,
+        vp: &str,
+        subject_did: &str,
+    ) {
+        self.verified_vps.insert(
+            vp.to_string(),
+            VerifiedVpEntry {
+                verified_at: Instant::now(),
+                subject_did: subject_did.to_string(),
+            },
+        );
+    }
+
+    fn lookup(
+        &self,
+        target_endpoint: &str,
+        agent_card_path: Option<&str>,
+    ) -> Option<Option<Value>> {
+        let entry = self
+            .cards
+            .get(&make_key(target_endpoint, agent_card_path))?;
+        entry
+            .is_fresh(Instant::now())
+            .then(|| entry.payload.clone())
+    }
+
+    fn insert(
+        &self,
+        target_endpoint: &str,
+        agent_card_path: Option<&str>,
+        payload: Option<Value>,
+    ) {
+        self.cards
+            .insert(make_key(target_endpoint, agent_card_path), CacheEntry::now(payload));
+    }
+
+    fn lookup_surface_card(
+        &self,
+        surface_id: &str,
+        card_url: &str,
+        target_auth: &str,
+    ) -> Option<Option<Value>> {
+        let entry = self
+            .surface_cards
+            .get(&(surface_id.to_string(), card_url.to_string(), target_auth.to_string()))?;
+        entry
+            .is_fresh(Instant::now())
+            .then(|| entry.payload.clone())
+    }
+
+    fn insert_surface_card(
+        &self,
+        surface_id: &str,
+        card_url: &str,
+        target_auth: &str,
+        payload: Option<Value>,
+    ) {
+        self.surface_cards
+            .insert((surface_id.to_string(), card_url.to_string(), target_auth.to_string()), CacheEntry::now(payload));
+    }
+
+    fn invalidate_all(&self) {
+        self.cards.clear();
+        self.surface_cards.clear();
+        self.verified_vps.clear();
+    }
+}
+
+fn global() -> &'static AgentCardCache {
+    static CACHE: OnceLock<AgentCardCache> = OnceLock::new();
+    CACHE.get_or_init(AgentCardCache::default)
+}
+
+fn make_key(
+    target_endpoint: &str,
+    agent_card_path: Option<&str>,
+) -> CacheKey {
+    (target_endpoint.to_string(), agent_card_path.map(str::to_string))
 }
 
 /// Lookup a memoized VP-verification result. Returns `Some(subject_did)`
 /// when a fresh successful verification exists; `None` when the caller
 /// must verify and, on success, memoize via [`insert_verified_vp`].
 pub fn lookup_verified_vp(vp: &str) -> Option<String> {
-    let entry = verified_vp_cache().get(vp)?;
-    if Instant::now().saturating_duration_since(entry.verified_at) < POSITIVE_TTL {
-        Some(entry.subject_did.clone())
-    } else {
-        None
-    }
+    global().lookup_verified_vp(vp)
 }
 
 /// Memoize a successful VP verification, mapping the VP string to the
@@ -111,13 +188,7 @@ pub fn insert_verified_vp(
     vp: &str,
     subject_did: &str,
 ) {
-    verified_vp_cache().insert(
-        vp.to_string(),
-        VerifiedVpEntry {
-            verified_at: Instant::now(),
-            subject_did: subject_did.to_string(),
-        },
-    );
+    global().insert_verified_vp(vp, subject_did);
 }
 
 /// Lookup a cached agent card. Returns `Some(Option<Value>)` when a
@@ -128,14 +199,7 @@ pub fn lookup(
     target_endpoint: &str,
     agent_card_path: Option<&str>,
 ) -> Option<Option<Value>> {
-    let key = make_key(target_endpoint, agent_card_path);
-    let now = Instant::now();
-    let entry = cache().get(&key)?;
-    if entry.is_fresh(now) {
-        Some(entry.payload.clone())
-    } else {
-        None
-    }
+    global().lookup(target_endpoint, agent_card_path)
 }
 
 /// Insert a fresh fetch result. `payload = None` records a negative
@@ -145,14 +209,7 @@ pub fn insert(
     agent_card_path: Option<&str>,
     payload: Option<Value>,
 ) {
-    let key = make_key(target_endpoint, agent_card_path);
-    cache().insert(
-        key,
-        CacheEntry {
-            fetched_at: Instant::now(),
-            payload,
-        },
-    );
+    global().insert(target_endpoint, agent_card_path, payload);
 }
 
 /// [`lookup`] for the card `surface_id` read from `card_url` with the Target
@@ -164,10 +221,7 @@ pub fn lookup_surface_card(
     card_url: &str,
     target_auth: &str,
 ) -> Option<Option<Value>> {
-    let entry = surface_card_cache().get(&(surface_id.to_string(), card_url.to_string(), target_auth.to_string()))?;
-    entry
-        .is_fresh(Instant::now())
-        .then(|| entry.payload.clone())
+    global().lookup_surface_card(surface_id, card_url, target_auth)
 }
 
 /// [`insert`] for the card `surface_id` read from `card_url` with `target_auth`.
@@ -177,155 +231,163 @@ pub fn insert_surface_card(
     target_auth: &str,
     payload: Option<Value>,
 ) {
-    surface_card_cache().insert(
-        (surface_id.to_string(), card_url.to_string(), target_auth.to_string()),
-        CacheEntry {
-            fetched_at: Instant::now(),
-            payload,
-        },
-    );
+    global().insert_surface_card(surface_id, card_url, target_auth, payload);
 }
 
 /// Drop every cached entry (agent-card payloads, surface policy cards **and**
 /// memoized VP-verification outcomes). Wired into the reload seams so a
 /// config redeploy never serves a stale card or a stale identity verdict.
 pub fn invalidate_all() {
-    #[cfg(test)]
-    let _serialized = tests::wait_for_cache_test();
-    cache().clear();
-    surface_card_cache().clear();
-    verified_vp_cache().clear();
-}
-
-#[cfg(test)]
-pub(crate) fn entry_count() -> usize {
-    cache().len()
+    global().invalidate_all();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::sync::Mutex;
-
-    // Serialize every test in this module — they all share the same
-    // process-global `CACHE` — and hold off a clear from any other test,
-    // such as a surface save, until the running one ends.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    thread_local! {
-        static RUNS_CACHE_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-
-    /// Waits for a running test of this module, so a clear from elsewhere never
-    /// empties the cache between its insert and lookup; the test itself clears
-    /// without waiting.
-    pub(super) fn wait_for_cache_test() -> Option<std::sync::MutexGuard<'static, ()>> {
-        (!RUNS_CACHE_TEST.get()).then(|| {
-            TEST_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        })
-    }
-
-    struct CacheTest {
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for CacheTest {
-        fn drop(&mut self) {
-            RUNS_CACHE_TEST.set(false);
-        }
-    }
-
-    fn setup() -> CacheTest {
-        let guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        RUNS_CACHE_TEST.set(true);
-        invalidate_all();
-        CacheTest { _guard: guard }
-    }
 
     #[test]
     fn positive_hit_within_ttl() {
-        let _guard = setup();
-        insert("https://a.example.com", None, Some(json!({"kind": "card"})));
-        let hit = lookup("https://a.example.com", None).expect("fresh entry");
+        let cache = AgentCardCache::default();
+        cache.insert("https://a.example.com", None, Some(json!({"kind": "card"})));
+        let hit = cache
+            .lookup("https://a.example.com", None)
+            .expect("fresh entry");
         assert_eq!(hit, Some(json!({"kind": "card"})));
     }
 
     #[test]
     fn different_agent_card_path_isolates_key() {
-        let _guard = setup();
-        insert("https://a.example.com", None, Some(json!({"kind": "default"})));
-        insert("https://a.example.com", Some("/custom/agent.json"), Some(json!({"kind": "custom"})));
-        assert_eq!(lookup("https://a.example.com", None), Some(Some(json!({"kind": "default"}))));
-        assert_eq!(lookup("https://a.example.com", Some("/custom/agent.json")), Some(Some(json!({"kind": "custom"}))));
+        let cache = AgentCardCache::default();
+        cache.insert("https://a.example.com", None, Some(json!({"kind": "default"})));
+        cache.insert("https://a.example.com", Some("/custom/agent.json"), Some(json!({"kind": "custom"})));
+        assert_eq!(cache.lookup("https://a.example.com", None), Some(Some(json!({"kind": "default"}))));
+        assert_eq!(
+            cache.lookup("https://a.example.com", Some("/custom/agent.json")),
+            Some(Some(json!({"kind": "custom"})))
+        );
     }
 
     #[test]
     fn negative_entry_returns_some_none() {
-        let _guard = setup();
-        insert("https://down.example.com", None, None);
-        let hit = lookup("https://down.example.com", None).expect("fresh negative entry");
+        let cache = AgentCardCache::default();
+        cache.insert("https://down.example.com", None, None);
+        let hit = cache
+            .lookup("https://down.example.com", None)
+            .expect("fresh negative entry");
         assert!(hit.is_none(), "negative cache entry surfaces as Some(None)");
     }
 
     #[test]
-    fn invalidate_all_clears_cache() {
-        let _guard = setup();
-        insert("https://a.example.com", None, Some(json!({"a": 1})));
-        insert("https://b.example.com", None, None);
-        assert_eq!(entry_count(), 2);
-        invalidate_all();
-        assert_eq!(entry_count(), 0);
-        assert!(lookup("https://a.example.com", None).is_none());
+    fn a_stale_entry_is_a_miss() {
+        let cache = AgentCardCache::default();
+        cache.insert("https://a.example.com", None, Some(json!({"a": 1})));
+        cache.insert("https://down.example.com", None, None);
+        let backdate = |key: CacheKey, age: Duration| {
+            if let Some(mut entry) = cache.cards.get_mut(&key) {
+                entry.fetched_at = Instant::now()
+                    .checked_sub(age)
+                    .expect("monotonic clock far enough from its origin");
+            }
+        };
+        backdate(make_key("https://a.example.com", None), POSITIVE_TTL);
+        backdate(make_key("https://down.example.com", None), NEGATIVE_TTL);
+        assert!(
+            cache
+                .lookup("https://a.example.com", None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup("https://down.example.com", None)
+                .is_none()
+        );
     }
 
     #[test]
-    fn a_clear_from_another_thread_waits_for_the_running_cache_test() {
-        let running = setup();
-        insert("https://held.example.com", None, Some(json!({"held": true})));
-        let clear = std::thread::spawn(invalidate_all);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(
-            lookup("https://held.example.com", None),
-            Some(Some(json!({"held": true}))),
-            "a clear from another thread ran during the test"
+    fn invalidate_all_clears_cache() {
+        let cache = AgentCardCache::default();
+        cache.insert("https://a.example.com", None, Some(json!({"a": 1})));
+        cache.insert("https://b.example.com", None, None);
+        assert_eq!(cache.cards.len(), 2);
+        cache.invalidate_all();
+        assert_eq!(cache.cards.len(), 0);
+        assert!(
+            cache
+                .lookup("https://a.example.com", None)
+                .is_none()
         );
-        drop(running);
-        clear.join().unwrap();
-        assert!(lookup("https://held.example.com", None).is_none(), "the clear ran once the test ended");
     }
 
     #[test]
     fn a_surface_card_is_seen_only_by_its_surface_and_target_auth_and_cleared_on_invalidate_all() {
-        let _guard = setup();
+        let cache = AgentCardCache::default();
         let url = "https://a.example.com/.well-known/agent.json";
         let key_a = r#"{"method":"a"}"#;
-        assert!(lookup_surface_card("orders", url, key_a).is_none(), "miss before insert");
-        insert_surface_card("orders", url, key_a, Some(json!({"kind": "protected"})));
-        insert_surface_card("billing", url, key_a, None);
-        assert_eq!(lookup_surface_card("orders", url, key_a), Some(Some(json!({"kind": "protected"}))));
-        assert_eq!(lookup_surface_card("billing", url, key_a), Some(None));
-        assert!(lookup_surface_card("orders", url, r#"{"method":"b"}"#).is_none(), "another Target authentication");
-        assert!(lookup_surface_card("orders", "https://b.example.com/.well-known/agent.json", key_a).is_none());
-        assert!(lookup("https://a.example.com", None).is_none(), "an outbound lookup never sees it");
-        invalidate_all();
-        assert!(lookup_surface_card("orders", url, key_a).is_none(), "cleared on invalidate_all");
+        assert!(
+            cache
+                .lookup_surface_card("orders", url, key_a)
+                .is_none(),
+            "miss before insert"
+        );
+        cache.insert_surface_card("orders", url, key_a, Some(json!({"kind": "protected"})));
+        cache.insert_surface_card("billing", url, key_a, None);
+        assert_eq!(cache.lookup_surface_card("orders", url, key_a), Some(Some(json!({"kind": "protected"}))));
+        assert_eq!(cache.lookup_surface_card("billing", url, key_a), Some(None));
+        assert!(
+            cache
+                .lookup_surface_card("orders", url, r#"{"method":"b"}"#)
+                .is_none(),
+            "another Target authentication"
+        );
+        assert!(
+            cache
+                .lookup_surface_card("orders", "https://b.example.com/.well-known/agent.json", key_a)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup("https://a.example.com", None)
+                .is_none(),
+            "an outbound lookup never sees it"
+        );
+        cache.invalidate_all();
+        assert!(
+            cache
+                .lookup_surface_card("orders", url, key_a)
+                .is_none(),
+            "cleared on invalidate_all"
+        );
     }
 
     #[test]
     fn verified_vp_roundtrip_and_invalidation() {
-        let _guard = setup();
+        let cache = AgentCardCache::default();
         let vp = "{\"vp\":\"target\"}";
-        assert!(lookup_verified_vp(vp).is_none(), "miss before insert");
-        insert_verified_vp(vp, "did:web:subject");
-        assert_eq!(lookup_verified_vp(vp).as_deref(), Some("did:web:subject"));
-        // A different VP string must not collide.
-        assert!(lookup_verified_vp("{\"vp\":\"other\"}").is_none());
-        invalidate_all();
-        assert!(lookup_verified_vp(vp).is_none(), "cleared on invalidate_all");
+        assert!(
+            cache
+                .lookup_verified_vp(vp)
+                .is_none(),
+            "miss before insert"
+        );
+        cache.insert_verified_vp(vp, "did:web:subject");
+        assert_eq!(
+            cache
+                .lookup_verified_vp(vp)
+                .as_deref(),
+            Some("did:web:subject")
+        );
+        assert!(
+            cache
+                .lookup_verified_vp("{\"vp\":\"other\"}")
+                .is_none()
+        );
+        cache.invalidate_all();
+        assert!(
+            cache
+                .lookup_verified_vp(vp)
+                .is_none(),
+            "cleared on invalidate_all"
+        );
     }
 }
