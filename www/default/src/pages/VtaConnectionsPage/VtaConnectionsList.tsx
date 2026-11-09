@@ -4,6 +4,7 @@ import { formatDateTime } from '../../utils/stringUtils';
 import {
   TRANSPORT_LABELS,
   isOverPrivileged,
+  canRevoke,
   isUsable,
   presentPairing,
 } from './vtaConnectionHelpers';
@@ -109,7 +110,7 @@ export const VtaConnectionsList: React.FC<VtaConnectionsListProps> = ({
                     {busyId === connection.id ? 'Checking…' : 'Verify'}
                   </AppButton>
                 )}
-                {canDelete && connection.pairing.state !== 'revoked' && (
+                {canDelete && canRevoke(connection) && (
                   <AppButton
                     variant="outline-danger"
                     size="sm"

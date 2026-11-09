@@ -418,6 +418,15 @@ pub async fn create_connection(
     }
 }
 
+/// A stored connection as the API shows it: the bootstrap record reports the
+/// bundled sidecar's own state when this gateway runs one.
+fn present(connection: VtaConnection) -> VtaConnection {
+    match crate::vta::bundled::status() {
+        Some(status) => connection.presented_with_bundled(&status),
+        None => connection,
+    }
+}
+
 /// `GET /v1/vta/connections` — list connections.
 pub async fn list_connections(
     Extension(user_id): Extension<String>,
@@ -443,6 +452,10 @@ pub async fn list_connections(
     match state.store.list().await {
         Ok(mut connections) => {
             connections.retain(|connection| connection_allowed(connection, &context, &scope));
+            let connections: Vec<VtaConnection> = connections
+                .into_iter()
+                .map(present)
+                .collect();
             (StatusCode::OK, Json(connections)).into_response()
         }
         Err(e) => {
@@ -477,7 +490,7 @@ pub async fn get_connection(
     }
     match state.store.get(&id).await {
         Ok(Some(connection)) if connection_allowed(&connection, &context, &scope) => {
-            (StatusCode::OK, Json(connection)).into_response()
+            (StatusCode::OK, Json(present(connection))).into_response()
         }
         Ok(_) => not_found().into_response(),
         Err(e) => {

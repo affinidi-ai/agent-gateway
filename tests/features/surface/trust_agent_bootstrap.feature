@@ -16,6 +16,13 @@ Feature: A bundled trust agent connects itself on first start
     And the gateway wrote its own did:key for the trust agent to enrol
     And the trust agent was asked to create 1 signing key
 
+  Scenario: The connection list shows the bundled trust agent as connected, not as waiting to be paired
+    Given a bundled trust agent that has enrolled the gateway
+    When the operator lists the trust agent connections
+    Then the admin API response status is 200
+    And the bootstrap connection is shown as connected
+    And the bootstrap connection shows the bundled grant and no error
+
   Scenario: A trust agent that has not published its identity is waited for, and signing stays local
     Given a bundled trust agent that has not published its identity
     When the operator reads the trust agent status

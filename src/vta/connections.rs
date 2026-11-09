@@ -327,6 +327,48 @@ impl VtaConnection {
     pub fn is_bootstrap(&self) -> bool {
         self.id == BOOTSTRAP_CONNECTION_ID
     }
+
+    /// This record as the API shows it while the gateway runs a bundled
+    /// sidecar. The sidecar is enrolled by the bootstrap, not by the pairing
+    /// flow, so the stored record never leaves `draft`; what the operator
+    /// should see is the bootstrap's own outcome. Nothing is stored, so the
+    /// view cannot go stale, and any other connection is returned unchanged.
+    pub fn presented_with_bundled(
+        mut self,
+        status: &crate::vta::bundled::BootstrapStatus,
+    ) -> Self {
+        use crate::vta::bundled::BootstrapState;
+        use crate::vta::pairing::PairingState;
+        if !self.is_bootstrap() {
+            return self;
+        }
+        let state = match status.state {
+            BootstrapState::Connected => PairingState::Connected,
+            BootstrapState::WaitingForVta => PairingState::AwaitingGrant,
+            BootstrapState::Revoked => PairingState::Revoked,
+            BootstrapState::EnrolmentRefused
+            | BootstrapState::VtaReplaced
+            | BootstrapState::VtaLost
+            | BootstrapState::Misconfigured => PairingState::Degraded,
+        };
+        let connected = state == PairingState::Connected;
+        self.status = state.into();
+        self.pairing = crate::vta::pairing::PairingRecord {
+            state,
+            control_did: status.control_did.clone(),
+            pinned_vta_did: status.vta_did.clone(),
+            granted_role: connected.then(|| crate::vta::onboarding::GRANT_ROLE.to_string()),
+            granted_contexts: if connected {
+                vec![status.context_id.clone()]
+            } else {
+                Vec::new()
+            },
+            payload_expires_at: None,
+            last_verified_at: status.bootstrapped_at,
+            last_error: (!connected).then(|| status.advice.to_string()),
+        };
+        self
+    }
 }
 
 impl StorableEntity for VtaConnection {
@@ -512,6 +554,88 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    fn bundled_status(state: crate::vta::bundled::BootstrapState) -> crate::vta::bundled::BootstrapStatus {
+        crate::vta::bundled::BootstrapStatus {
+            state,
+            advice: "do the thing",
+            detail: None,
+            vta_did: Some("did:key:z6MkVta".to_string()),
+            control_did: Some("did:key:z6MkGateway".to_string()),
+            context_id: "gateway".to_string(),
+            bootstrapped_at: Some(Utc::now()),
+            previously_connected: true,
+            owner: "unclaimed",
+        }
+    }
+
+    #[test]
+    fn a_connected_bundled_agent_shows_as_paired_with_its_grant() {
+        use crate::vta::bundled::BootstrapState;
+        use crate::vta::pairing::PairingState;
+        let status = bundled_status(BootstrapState::Connected);
+        let shown = connection(BOOTSTRAP_CONNECTION_ID).presented_with_bundled(&status);
+        assert_eq!(shown.status, VtaConnectionStatus::Connected);
+        assert_eq!(shown.pairing.state, PairingState::Connected);
+        assert_eq!(
+            shown
+                .pairing
+                .pinned_vta_did
+                .as_deref(),
+            Some("did:key:z6MkVta")
+        );
+        assert_eq!(
+            shown
+                .pairing
+                .granted_role
+                .as_deref(),
+            Some("initiator")
+        );
+        assert_eq!(shown.pairing.granted_contexts, vec!["gateway".to_string()]);
+        assert_eq!(shown.pairing.last_verified_at, status.bootstrapped_at);
+        assert_eq!(shown.pairing.last_error, None);
+    }
+
+    #[test]
+    fn a_bundled_agent_that_is_not_connected_shows_why() {
+        use crate::vta::bundled::BootstrapState;
+        use crate::vta::pairing::PairingState;
+        for (state, expected) in [
+            (BootstrapState::WaitingForVta, PairingState::AwaitingGrant),
+            (BootstrapState::Revoked, PairingState::Revoked),
+            (BootstrapState::EnrolmentRefused, PairingState::Degraded),
+            (BootstrapState::VtaReplaced, PairingState::Degraded),
+            (BootstrapState::VtaLost, PairingState::Degraded),
+            (BootstrapState::Misconfigured, PairingState::Degraded),
+        ] {
+            let shown = connection(BOOTSTRAP_CONNECTION_ID).presented_with_bundled(&bundled_status(state));
+            assert_eq!(shown.pairing.state, expected, "{state:?}");
+            assert!(
+                !shown
+                    .pairing
+                    .state
+                    .is_usable(),
+                "{state:?}"
+            );
+            assert_eq!(
+                shown
+                    .pairing
+                    .last_error
+                    .as_deref(),
+                Some("do the thing"),
+                "{state:?}"
+            );
+            assert_eq!(shown.status, VtaConnectionStatus::from(expected), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn another_connection_is_never_shown_with_the_bundled_state() {
+        use crate::vta::bundled::BootstrapState;
+        let shown = connection("c1").presented_with_bundled(&bundled_status(BootstrapState::Connected));
+        assert_eq!(shown.status, VtaConnectionStatus::Unpaired);
+        assert_eq!(shown.pairing, Default::default());
     }
 
     async fn store() -> (FileSystemVtaConnectionStore, tempfile::TempDir) {

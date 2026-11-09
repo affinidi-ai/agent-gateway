@@ -229,6 +229,9 @@ create a context outside `gateway/*`.
 
 `GET /v1/vta/status` reports `bootstrap.state`. Nothing below is ever fixed
 automatically.
+`GET /v1/vta/connections` shows the sidecar's `vta-bootstrap` record from the same state
+(`connected`, `awaiting_grant` for `waiting_for_vta`, `revoked`, `degraded` for the rest, with
+the advice as `last_error`), computed on each read and never stored.
 
 | State | Meaning | Signing | Operator action |
 |---|---|---|---|

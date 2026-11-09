@@ -132,6 +132,15 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T09:30:00Z'
+      title: Show the bundled trust agent's connection as connected, not unpaired
+      description: >-
+        The Trust Agent page listed the bundled sidecar's connection as "Not
+        paired" next to a banner that said it was connected, because the record
+        is created as a draft and the automatic bootstrap never pairs it. The
+        connection API now reports that record's state from the bootstrap
+        itself, including why it is not connected, and the page no longer
+        offers a Revoke button the server always refuses.
     - timestamp: '2026-11-09T06:00:00Z'
       title: Make the bundled sidecar compose example start with real containers
       description: >-

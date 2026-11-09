@@ -50,6 +50,47 @@ async fn operator_reads_trust_agent_status(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
+#[when("the operator lists the trust agent connections")]
+async fn operator_lists_trust_agent_connections(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/vta/connections", None).await;
+    world.admin_response = Some(response);
+}
+
+fn bootstrap_connection(world: &SurfaceWorld) -> &serde_json::Value {
+    let body = &world
+        .admin_response
+        .as_ref()
+        .expect("the trust agent connections were listed")
+        .body;
+    body.as_array()
+        .and_then(|connections| {
+            connections
+                .iter()
+                .find(|connection| connection["id"] == "vta-bootstrap")
+        })
+        .unwrap_or_else(|| panic!("no bootstrap connection in {body}"))
+}
+
+#[then("the bootstrap connection is shown as connected")]
+async fn bootstrap_connection_is_connected(world: &mut SurfaceWorld) {
+    let connection = bootstrap_connection(world);
+    assert_eq!(connection["status"], "connected", "{connection}");
+    assert_eq!(connection["pairing"]["state"], "connected", "{connection}");
+}
+
+#[then("the bootstrap connection shows the bundled grant and no error")]
+async fn bootstrap_connection_shows_grant(world: &mut SurfaceWorld) {
+    let pairing = &bootstrap_connection(world)["pairing"];
+    assert_eq!(pairing["granted_role"], "initiator", "{pairing}");
+    assert_eq!(pairing["granted_contexts"], serde_json::json!(["gateway"]), "{pairing}");
+    assert!(
+        pairing
+            .get("last_error")
+            .is_none(),
+        "{pairing}"
+    );
+}
+
 fn status(world: &SurfaceWorld) -> &serde_json::Value {
     &world
         .admin_response

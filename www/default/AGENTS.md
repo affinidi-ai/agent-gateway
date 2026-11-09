@@ -1160,6 +1160,10 @@ anything itself:
   (`vta-bootstrap-advice`) and `detail` (`vta-bootstrap-detail`) in danger text, and says signing
   is refused when `previously_connected` is true. The advice text is the backend's, so a new
   state needs a label here and advice there.
+- The connections table below it reads `GET /v1/vta/connections`. The `vta-bootstrap` record is
+  the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
+  Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
+  (`canRevoke`), since the server refuses to revoke it. Verify stays.
 
 ## Connections page
 
