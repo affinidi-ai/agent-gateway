@@ -1,0 +1,20 @@
+branch: fix/upgrade-rmcp
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Upgrade rmcp to 3.9 and rmcp-openapi to 0.32.1
+      description: >-
+        cargo audit failed every build on RUSTSEC-2026-0462: before 3.9.0, the Streamable
+        HTTP clients in rmcp read a response body into memory with no size limit. The
+        gateway does not compile those clients (it uses rmcp only through rmcp-openapi, to
+        build and call OpenAPI-backed MCP Proxy tools), but the advisory applies to the
+        crate version. rmcp moves from 1.8 to 3.9 and rmcp-openapi from 0.28 to 0.32.1,
+        which needs rmcp 3. The rmcp-openapi releases in between also change how it builds
+        tools from an OpenAPI document (OpenAPI examples, allOf and anyOf in tool schemas,
+        deepObject query parameters sent as key[prop]=value). tokio-util is no longer
+        pinned to an exact version, since rmcp-openapi 0.32 needs 0.7.19 or later.
+  breaking: []
