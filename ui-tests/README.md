@@ -40,6 +40,7 @@ Before running tests, ensure:
    the run for debugging. Set `AG_ENV_DIR=<dir>` to use an existing env and its own ports
    instead; that dir is never wiped. To run the gateway yourself, from the repository root:
    ```bash
+   make config-certs    # certificates and keys, including the master key the env encrypts with
    ./scripts/_prepare.sh debug tmp/local-ui-tests --auto-accept
    cargo build --bin agent-gateway
    cd tmp/local-ui-tests
