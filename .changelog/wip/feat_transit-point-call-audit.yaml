@@ -18,5 +18,12 @@ changes:
   changed: []
   fixed: []
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-09T09:00:00Z'
+      title: Update actix-web and actix-http to patched releases
+      description: >-
+        The locked actix-http 3.13.1 and actix-web 4.14.0 (pulled in through rmcp-actix-web) are
+        now 3.21.0 and 4.19.0, which fix RUSTSEC-2026-0446, -0447, -0448 and -0455: request
+        smuggling through malformed chunked trailers and unbounded decompression of request
+        bodies. The dependency audit passes again.
   breaking: []
