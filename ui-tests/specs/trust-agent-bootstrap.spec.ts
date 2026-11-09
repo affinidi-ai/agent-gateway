@@ -115,4 +115,69 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
     ).toBeVisible();
     await expect(page.getByTestId("vta-bootstrap-status")).toHaveCount(0);
   });
+
+  test("a gateway signing locally because the sidecar never came up says why", async ({
+    page,
+  }) => {
+    await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
+      route.fulfill({
+        json: {
+          ...deployment({
+            state: "waiting_for_vta",
+            advice: "start the bundled trust agent, then restart the gateway",
+            context_id: "gateway",
+            previously_connected: false,
+            owner: "unclaimed",
+          }),
+          enabled: false,
+          tier: "local",
+        },
+      }),
+    );
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      route.fulfill({ json: [] }),
+    );
+    await page.goto(`${BASE_URL}/trust-agent`);
+    await expect(page.getByText("Signing locally")).toBeVisible();
+    await expect(page.getByTestId("vta-bootstrap-advice")).toContainText(
+      "restart the gateway",
+    );
+  });
+
+  test("Settings names the bundled trust agent as the current signing default", async ({
+    page,
+  }) => {
+    await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
+      route.fulfill({
+        json: {
+          ...deployment(null),
+          default_resolution: {
+            backend: "bundled",
+            reason:
+              "the [vta] block is enabled, so this appliance signs through its bundled trust agent",
+            explicit: true,
+          },
+        },
+      }),
+    );
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      route.fulfill({ json: [bootstrapConnection] }),
+    );
+    await page.goto(`${BASE_URL}/settings`);
+    await page.getByTestId("key-management-settings-toggle").click();
+    const picker = page.locator("#default-signing-select");
+    await expect(picker).toBeVisible();
+    await expect(picker.locator("option:checked")).toHaveText(
+      "The bundled trust agent (default)",
+    );
+    await expect(picker.locator("option", { hasText: "own key" })).toHaveCount(
+      0,
+    );
+    await expect(
+      picker.locator("option", { hasText: "Bootstrap VTA" }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByTestId("key-management-settings-signing-with"),
+    ).toContainText("bundled");
+  });
 });

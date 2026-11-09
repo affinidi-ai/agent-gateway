@@ -24,6 +24,12 @@ Feature: A bundled trust agent connects itself on first start
     And the bootstrap connection is shown as connected
     And the bootstrap connection shows the bundled grant and no error
 
+  Scenario: The key inventory shows the bundled trust agent as paired and usable
+    Given a bundled trust agent that has enrolled the gateway
+    When the operator reads the key inventory
+    Then the admin API response status is 200
+    And the inventory lists the bundled trust agent as paired and usable
+
   Scenario: Verifying the bundled trust agent's connection is refused, so signing is not interrupted
     Given a bundled trust agent that has enrolled the gateway
     When the operator verifies the bundled trust agent connection

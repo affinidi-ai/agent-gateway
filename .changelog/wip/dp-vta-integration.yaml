@@ -132,6 +132,19 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T13:45:00Z'
+      title: Say what the appliance signs with in Settings, and why a sidecar failed
+      description: >-
+        The Key management card in Settings preselected "This gateway's own key
+        (local)" while the appliance signed through the bundled sidecar, listed
+        the sidecar's own record as "not ready", kept saying "bundled" after a
+        default was chosen, and lost its confirmation message after a save. Its
+        first option now names what the configuration resolves to, the card shows
+        the chosen default, and the confirmation stays. The reason line also no
+        longer cuts off ("its bundled trust agent") or prints an internal state
+        name, the key inventory shows the bundled connection as paired and
+        usable, and the Trust Agent page tells the operator why the gateway is
+        signing locally when the sidecar never came up.
     - timestamp: '2026-11-09T12:45:00Z'
       title: Keep the bundled trust agent as default when connecting another agent
       description: >-

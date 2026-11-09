@@ -8,9 +8,26 @@ import type { VtaConnection } from '../VtaConnectionsPage/types';
 /** `local` is not a connection id, so it needs a sentinel the select can hold. */
 const LOCAL = '__local__';
 
+/** What the configuration resolves to when no default is stored: the sentinel option. */
+export type ConfiguredDefault = 'local' | 'bundled' | 'vta';
+
+const CONFIGURED_LABELS: Record<ConfiguredDefault, string> = {
+  local: "This gateway's own key (local)",
+  bundled: 'The bundled trust agent (default)',
+  vta: 'The configured agent (from the [vta] block)',
+};
+
+/** The bundled sidecar's own record: the sentinel option already stands for it. */
+const BOOTSTRAP_CONNECTION_ID = 'vta-bootstrap';
+
 interface Props {
   /** Refetch the status strip once the backend actually changes. */
   onChanged: () => void;
+  /**
+   * What the configuration resolves to. Choosing the first option clears the stored
+   * default, which hands signing back to this, so the option must say so.
+   */
+  configuredDefault?: ConfiguredDefault;
 }
 
 /**
@@ -22,7 +39,10 @@ interface Props {
  * disabled with the reason, because hiding it would read as "pairing did not
  * work" when the real gap is a missing key.
  */
-export const DefaultSigningPicker: React.FC<Props> = ({ onChanged }) => {
+export const DefaultSigningPicker: React.FC<Props> = ({
+  onChanged,
+  configuredDefault = 'local',
+}) => {
   const [connections, setConnections] = useState<VtaConnection[] | null>(null);
   const [selected, setSelected] = useState<string>(LOCAL);
   const [saving, setSaving] = useState(false);
@@ -106,16 +126,18 @@ export const DefaultSigningPicker: React.FC<Props> = ({ onChanged }) => {
             setSaved(false);
           }}
         >
-          <option value={LOCAL}>This gateway&apos;s own key (local)</option>
-          {(connections ?? []).map(connection => {
-            const ready = usable(connection) && Boolean(activeKeyId(connection));
-            return (
-              <option key={connection.id} value={connection.id} disabled={!ready}>
-                {connection.name}
-                {ready ? '' : ' — not ready: pair it and provision a key first'}
-              </option>
-            );
-          })}
+          <option value={LOCAL}>{CONFIGURED_LABELS[configuredDefault]}</option>
+          {(connections ?? [])
+            .filter(c => configuredDefault === 'local' || c.id !== BOOTSTRAP_CONNECTION_ID)
+            .map(connection => {
+              const ready = usable(connection) && Boolean(activeKeyId(connection));
+              return (
+                <option key={connection.id} value={connection.id} disabled={!ready}>
+                  {connection.name}
+                  {ready ? '' : ' — not ready: pair it and provision a key first'}
+                </option>
+              );
+            })}
         </Form.Select>
       </Form.Group>
 

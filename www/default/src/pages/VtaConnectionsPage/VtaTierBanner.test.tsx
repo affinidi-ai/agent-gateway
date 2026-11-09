@@ -80,4 +80,35 @@ describe('VtaTierBanner bundled bootstrap', () => {
     expect(screen.getByTestId('vta-bootstrap-advice')).toHaveTextContent('start the bundled');
     expect(screen.getByTestId('vta-bootstrap-status')).not.toHaveTextContent('Signing is refused');
   });
+
+  it('says why the gateway signs locally when the bundled trust agent never came up', () => {
+    // The status reports the deployment as not enabled in that case, but the
+    // operator still has to be told the sidecar is the reason.
+    render(
+      <VtaTierBanner
+        deployment={deployment({
+          enabled: false,
+          tier: 'local',
+          bootstrap: bootstrap({
+            state: 'waiting_for_vta',
+            previously_connected: false,
+            advice: 'start the bundled trust agent, then restart the gateway',
+          }),
+        })}
+      />
+    );
+    expect(screen.getByText(/Signing locally/)).toBeInTheDocument();
+    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent(
+      'Waiting for the trust agent'
+    );
+    expect(screen.getByTestId('vta-bootstrap-advice')).toHaveTextContent(
+      'start the bundled trust agent, then restart the gateway'
+    );
+  });
+
+  it('shows nothing extra when signing locally with no bundled trust agent', () => {
+    render(<VtaTierBanner deployment={deployment({ enabled: false, tier: 'local' })} />);
+    expect(screen.getByText(/Signing locally/)).toBeInTheDocument();
+    expect(screen.queryByTestId('vta-bootstrap-status')).not.toBeInTheDocument();
+  });
 });

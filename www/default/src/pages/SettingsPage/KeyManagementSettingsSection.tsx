@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { apiClient } from '../../api';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
-import { DefaultSigningPicker } from './DefaultSigningPicker';
+import { DefaultSigningPicker, type ConfiguredDefault } from './DefaultSigningPicker';
 
 interface DefaultResolution {
   backend: string;
@@ -20,6 +20,9 @@ interface VtaStatus {
   default_resolution?: DefaultResolution;
 }
 
+const configuredDefault = (backend?: string): ConfiguredDefault =>
+  backend === 'bundled' ? 'bundled' : backend === 'local' || !backend ? 'local' : 'vta';
+
 /**
  * Key management, collapsed out of the default path (VTA-26).
  *
@@ -34,6 +37,7 @@ export const KeyManagementSettingsSection: React.FC = () => {
   const { hasPermission } = usePermissions();
   const [expanded, setExpanded] = useState(false);
   const [status, setStatus] = useState<VtaStatus | null>(null);
+  const [chosen, setChosen] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const canViewConnections = hasPermission('vta_connections.view');
@@ -45,6 +49,21 @@ export const KeyManagementSettingsSection: React.FC = () => {
       if (!response.ok) throw new Error(response.statusText);
       setStatus(await response.json());
       setError(null);
+      // The status reports what the configuration resolves to. A default chosen
+      // here is stored apart from it and wins, so it is read too.
+      try {
+        const [settingsResponse, connectionsResponse] = await Promise.all([
+          apiClient.fetch('/api/v1/settings'),
+          apiClient.fetch('/api/v1/vta/connections'),
+        ]);
+        const settings = settingsResponse.ok ? await settingsResponse.json() : null;
+        const connections = connectionsResponse.ok ? await connectionsResponse.json() : [];
+        const id = settings?.default_signing?.connection_id ?? null;
+        const named = id ? connections.find((c: { id: string }) => c.id === id) : null;
+        setChosen(id ? (named?.name ?? id) : null);
+      } catch {
+        setChosen(null);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not read the signing status.');
     }
@@ -93,17 +112,21 @@ export const KeyManagementSettingsSection: React.FC = () => {
             <>
               <dl className="row small">
                 <dt className="col-sm-4">Signing with</dt>
-                <dd className="col-sm-8">
+                <dd className="col-sm-8" data-testid="key-management-settings-signing-with">
                   <code>
-                    {status.default_resolution?.backend ?? (status.enabled ? 'vta' : 'local')}
+                    {chosen ??
+                      status.default_resolution?.backend ??
+                      (status.enabled ? 'vta' : 'local')}
                   </code>
-                  {status.default_resolution?.explicit === false && (
+                  {!chosen && status.default_resolution?.explicit === false && (
                     <span className="badge text-bg-secondary ms-2">default</span>
                   )}
                 </dd>
                 <dt className="col-sm-4">Why</dt>
                 <dd className="col-sm-8 text-muted">
-                  {status.default_resolution?.reason ?? 'No signing backend is configured.'}
+                  {chosen
+                    ? 'Chosen below as the appliance default. A surface with its own signing key is not affected.'
+                    : (status.default_resolution?.reason ?? 'No signing backend is configured.')}
                 </dd>
                 <dt className="col-sm-4">Deployment</dt>
                 <dd className="col-sm-8">
@@ -129,10 +152,11 @@ export const KeyManagementSettingsSection: React.FC = () => {
 
               {canEditSettings && canViewConnections && (
                 <DefaultSigningPicker
+                  configuredDefault={configuredDefault(status.default_resolution?.backend)}
                   onChanged={() => {
-                    // The strip above reports what is actually resolved, so it
-                    // has to be re-read rather than assumed from the choice.
-                    setStatus(null);
+                    // The strip above reports what is actually in force, so it is
+                    // re-read rather than assumed from the choice. The picker stays
+                    // mounted, or its confirmation would vanish with it.
                     void load();
                   }}
                 />

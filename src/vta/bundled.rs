@@ -134,6 +134,21 @@ pub struct RetiredKey {
     pub retired_at: DateTime<Utc>,
 }
 
+impl BootstrapState {
+    /// How an operator reads the state, in a sentence: never the internal name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::WaitingForVta => "waiting for the trust agent",
+            Self::EnrolmentRefused => "refusing the gateway",
+            Self::VtaReplaced => "not the trust agent this gateway pinned",
+            Self::VtaLost => "missing the gateway's signing key",
+            Self::Revoked => "no longer granting the gateway access",
+            Self::Misconfigured => "not reachable because of a problem on this side",
+        }
+    }
+}
+
 /// The result of one bootstrap, for the status API.
 #[derive(Debug, Clone, Serialize)]
 pub struct BootstrapStatus {

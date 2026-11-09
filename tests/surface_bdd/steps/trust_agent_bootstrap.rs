@@ -62,6 +62,31 @@ async fn operator_verifies_bundled_connection(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
+#[when("the operator reads the key inventory")]
+async fn operator_reads_key_inventory(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/key-management/inventory", None).await;
+    world.admin_response = Some(response);
+}
+
+#[then("the inventory lists the bundled trust agent as paired and usable")]
+async fn inventory_lists_bundled_agent_usable(world: &mut SurfaceWorld) {
+    let body = &world
+        .admin_response
+        .as_ref()
+        .expect("the key inventory was read")
+        .body;
+    let connection = body["connections"]
+        .as_array()
+        .and_then(|connections| {
+            connections
+                .iter()
+                .find(|c| c["connection_id"] == "vta-bootstrap")
+        })
+        .unwrap_or_else(|| panic!("no bootstrap connection in {body}"));
+    assert_eq!(connection["pairing_state"], "connected", "{connection}");
+    assert_eq!(connection["usable"], true, "{connection}");
+}
+
 fn bootstrap_connection(world: &SurfaceWorld) -> &serde_json::Value {
     let body = &world
         .admin_response

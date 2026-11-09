@@ -63,6 +63,7 @@ export const VtaTierBanner: React.FC<VtaTierBannerProps> = ({ deployment }) => {
         <div>
           <strong>Signing locally.</strong> This gateway signs with its own in-process key. Connect
           a Verifiable Trust Agent below to move signing to an agent instead.
+          {deployment.bootstrap && <BootstrapStatusLine bootstrap={deployment.bootstrap} />}
         </div>
       </div>
     );

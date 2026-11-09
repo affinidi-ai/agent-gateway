@@ -1164,6 +1164,15 @@ anything itself:
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
   (`canRevoke`) or Verify (`canVerify`), since the server refuses both.
+- While the gateway signs locally because a bundled trust agent never came up (`enabled` is
+  false), the banner still shows the bootstrap line, so the operator is told why.
+- **Settings → Key management** (`KeyManagementSettingsSection`, with `DefaultSigningPicker`)
+  reports what is in force: a default chosen in the picker (stored in `default_signing`) wins over
+  what the configuration resolves to (`default_resolution` of `GET /v1/vta/status`). The picker's
+  first option clears the stored choice, which hands signing back to the configuration, so it is
+  named for what that resolves to: "The bundled trust agent (default)", "The configured agent",
+  or "This gateway's own key (local)". The bundled connection is not listed again, and the
+  confirmation stays visible after a save because the picker stays mounted.
 - The connect wizard's last step offers **Use this agent for all signing**, pre-checked only
   when the appliance has no default yet. A default is either a stored one
   (`default_signing.connection_id` in `GET /v1/settings`) or the bundled trust agent

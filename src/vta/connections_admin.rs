@@ -1202,6 +1202,9 @@ pub async fn key_inventory(
             // caller cannot otherwise see.
             connections.retain(|connection| connection_allowed(connection, &context, &scope));
             connections
+                .into_iter()
+                .map(present)
+                .collect::<Vec<_>>()
         }
         Err(e) => {
             error!("Failed to list VTA connections for the key inventory: {}", e);

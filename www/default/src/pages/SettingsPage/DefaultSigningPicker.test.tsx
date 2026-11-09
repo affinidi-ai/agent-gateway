@@ -127,4 +127,33 @@ describe('DefaultSigningPicker', () => {
     const option = screen.getByRole('option', { name: /Production agent/ }) as HTMLOptionElement;
     expect(option.disabled).toBe(true);
   });
+
+  /**
+   * The sentinel option clears the override, which hands the choice back to the
+   * configuration. When that is the bundled trust agent, calling it the
+   * gateway's own key tells the operator the opposite of what happens.
+   */
+  it('names the configured default honestly, and does not list the bundled record twice', async () => {
+    respondWith([
+      connection({ id: 'vta-bootstrap', name: 'Bootstrap VTA', keys: {} }),
+      connection(),
+    ]);
+    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="bundled" />);
+
+    await screen.findByRole('option', { name: /Production agent/ });
+    expect(
+      screen.getByRole('option', { name: 'The bundled trust agent (default)' })
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /own key/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Bootstrap VTA/ })).not.toBeInTheDocument();
+  });
+
+  it('still calls the local default the gateway’s own key', async () => {
+    respondWith([connection()]);
+    render(<DefaultSigningPicker onChanged={jest.fn()} />);
+
+    expect(
+      await screen.findByRole('option', { name: /This gateway's own key \(local\)/ })
+    ).toBeInTheDocument();
+  });
 });

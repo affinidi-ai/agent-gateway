@@ -80,7 +80,7 @@ impl DefaultResolution {
 pub fn resolve(config: &VtaConfig) -> DefaultResolution {
     if config.enabled {
         let backend = if config.mode == VtaMode::Bundled {
-            "bundled"
+            "bundled trust agent"
         } else {
             "configured agent"
         };
@@ -160,8 +160,9 @@ pub fn with_bundled_bootstrap(
         return DefaultResolution {
             backend: "bundled",
             reason: format!(
-                "the bundled agent is {:?}{detail}, so signing is refused rather than switching issuer key: {}",
-                status.state, status.advice
+                "the bundled agent is {}{detail}, so signing is refused rather than switching issuer key: {}",
+                status.state.label(),
+                status.advice
             ),
             explicit: true,
             fallback_from: None,
@@ -170,8 +171,9 @@ pub fn with_bundled_bootstrap(
     DefaultResolution {
         backend: "local",
         reason: format!(
-            "the bundled agent is {:?}{detail}, so this gateway is signing with its own local key: {}",
-            status.state, status.advice
+            "the bundled agent is {}{detail}, so this gateway is signing with its own local key: {}",
+            status.state.label(),
+            status.advice
         ),
         explicit: true,
         fallback_from: Some("bundled"),
@@ -196,6 +198,18 @@ mod tests {
             signing_key_id: Some("k1".to_string()),
             ..VtaConfig::default()
         }
+    }
+
+    #[test]
+    fn the_reason_for_an_enabled_block_names_what_signs() {
+        assert_eq!(
+            resolve(&enabled(VtaMode::Bundled)).reason,
+            "the [vta] block is enabled, so this appliance signs through its bundled trust agent"
+        );
+        assert_eq!(
+            resolve(&enabled(VtaMode::Appliance)).reason,
+            "the [vta] block is enabled, so this appliance signs through its configured agent"
+        );
     }
 
     #[test]
@@ -341,8 +355,15 @@ mod tests {
         assert!(
             resolution
                 .reason
-                .contains("WaitingForVta"),
+                .contains("waiting for the trust agent"),
             "{}",
+            resolution.reason
+        );
+        assert!(
+            !resolution
+                .reason
+                .contains("WaitingForVta"),
+            "an operator should not read an internal name: {}",
             resolution.reason
         );
         assert!(
