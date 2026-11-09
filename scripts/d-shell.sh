@@ -16,7 +16,7 @@ fi
 
 	# --volume ${docker_env_dir}/data:/app/data \
     # --volume ./config/local-www-config.json:/app/www/dashboard/config.json \
-container_id=$(docker run \
+container_id=$(AG_MASTER_KEY="$(cat "${envs_dir}/master_encryption_key" 2>/dev/null || true)" docker run \
 	--interactive \
 	--detach \
 	--network host \

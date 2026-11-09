@@ -18,7 +18,6 @@ export tag="${TAG:-${agent_name}:local}"
 
 export AG_IDENTITY_HASH_PEPPER="${AG_IDENTITY_HASH_PEPPER:-$(cat "${envs_dir}/identity_hash_pepper" 2>/dev/null || true)}"
 export AG_BACKUP_ENCRYPTION_KEY="${AG_BACKUP_ENCRYPTION_KEY:-$(cat "${envs_dir}/backup_encryption_key" 2>/dev/null || true)}"
-export AG_MASTER_KEY="${AG_MASTER_KEY:-$(cat "${envs_dir}/master_encryption_key" 2>/dev/null || true)}"
 
 # Per-instance ports are derived from these bases by adding a stable offset
 # (see scripts/_prepare.sh → assign_ports). Each local-* instance gets a

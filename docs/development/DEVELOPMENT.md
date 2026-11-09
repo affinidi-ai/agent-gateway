@@ -139,7 +139,8 @@ exist` instead of a cryptic in-container error. Keep the backup key exported for
 A config that `make config-docker` creates encrypts storage at rest with the master key
 from `AG_MASTER_KEY`, and the gateway refuses to start without it. Export the same
 value every time: storage encrypted under one key cannot be read with another.
-`make docker-run` passes it from `envs/master_encryption_key` itself.
+`make docker-run` passes it from `envs/master_encryption_key` itself, whatever
+`AG_MASTER_KEY` your shell holds.
 
 ### Accessing the gateway
 
