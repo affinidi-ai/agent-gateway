@@ -9543,6 +9543,9 @@ mod mcp_receive_tests;
 mod fabric_transit_tests;
 
 #[cfg(test)]
+mod fabric_card_fetch_tests;
+
+#[cfg(test)]
 mod variant_routing_tests;
 
 #[cfg(test)]
