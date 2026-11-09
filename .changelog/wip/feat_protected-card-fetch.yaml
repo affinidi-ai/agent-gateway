@@ -28,8 +28,10 @@ changes:
         that carries the Target credential and keeps only Accept, Accept-Language and User-Agent
         from the peer, with no delegated credential, transit token or trace id. Its answer
         reaches the peer with only the headers that describe the card. A redirect answers 502
-        Upstream redirected, as on the direct path, and any other refusal only its status. Any other public read, a HEAD of the card path or the legacy agent.json
-        included, is forwarded without the credential. A GET at the configured card location is
+        Upstream redirected, as on the direct path, and any other refusal only its status.
+        Without Target authentication the fetch is still forwarded as the peer sent it and a
+        Target redirect is relayed. Any other public read, a HEAD of the card path or the legacy
+        agent.json included, is forwarded without the credential. A GET at the configured card location is
         the card fetch after source authentication, including for a caller who failed it on a
         surface that forwards failed callers to policy; a closed surface or one that rejects
         failed callers answers it 401. The card read for policy input now presents the Target

@@ -460,25 +460,29 @@ calls, but it moves the default paths of the surface's Transit Points, which fol
 
 ### Agent card fetch over Fabric
 
-The receiving gateway fetches the local Target's agent card with the
-[direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` whose
+On a surface with `target.auth`, the receiving gateway fetches the local Target's agent card with
+the [direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rules. Only a `GET` whose
 path is exactly `/.well-known/agent-card.json` or the surface's configured card location, the paths
 a sending gateway's card fetch asks for, is a card fetch
-([`is_fabric_card_fetch`](../src/proxy/handler.rs)). On a surface with `target.auth`, that fetch is
-the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
+([`is_fabric_card_fetch`](../src/proxy/handler.rs)). That fetch is the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
 the configured location on the Target's origin), carrying `target.auth` and only the peer's
 `Accept`, `Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers
 and body are dropped, and the fetch carries no caller's material: no delegated credential from
 `outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
 configured card location, and no `X-Gateway-Trace-Id`.
 
-The Target's answer reaches the peer with only `Content-Type`, `Content-Language`,
+The Target's answer to that fetch reaches the peer with only `Content-Type`, `Content-Language`,
 `Cache-Control`, `ETag`, `Last-Modified` and `Vary`, so a session cookie or authentication header
 the Target sets for the credential stays on the receiving gateway, and a card is processed as an
 agent card response. The client does not follow redirects: a 3xx answers the peer `502` "Upstream
 redirected", as on the direct path, without the Target's `Location`. Any other non-2xx answer
 reaches the peer as its status with the body "Upstream error: <status>", so nothing the Target says
 about the credential reaches the peer.
+
+Without `target.auth` none of these rules apply: the card fetch is forwarded as the peer sent it,
+body included, with the header rules of any other forwarded request, and the Target's answer is
+relayed as for any other request. A Target redirect is relayed with its status, so the sending
+gateway's caller gets that 3xx status with the body "Upstream error: <status>" and no `Location`.
 
 Every other public read skips caller authentication and is forwarded without the credential:
 another discovery path such as `/discovery` or `/.well-known/ucp`, a `HEAD` of the card path, the
