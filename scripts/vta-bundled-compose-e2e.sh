@@ -25,15 +25,12 @@ GATEWAY_IMAGE="${GATEWAY_IMAGE:?set GATEWAY_IMAGE}"
 VTA_IMAGE="${VTA_IMAGE:?set VTA_IMAGE}"
 WAIT_SECS="${WAIT_SECS:-120}"
 
-for f in "${repo}/envs/local/config/config.toml" "${repo}/envs/certs/cert.pem"; do
-  [[ -e "${f}" ]] || { echo "missing: ${f}" >&2; exit 2; }
-done
+# shellcheck source=scripts/vta-bundled-lib.sh
+source "${repo}/scripts/vta-bundled-lib.sh"
 docker image inspect "${GATEWAY_IMAGE}" "${VTA_IMAGE}" >/dev/null
 
 work="$(mktemp -d)"
 project="vtabundled$$"
-cp -R "${repo}/config/examples/vta-bundled/." "${work}/"
-mkdir -p "${work}/config" "${work}/certs" "${work}/secrets"
 
 cleanup() {
   docker rm -f "${project}-anchor" "${project}-vta2" >/dev/null 2>&1 || true
@@ -42,38 +39,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cp -R "${repo}/envs/local/config/." "${work}/config/"
-cp "${repo}/envs/certs/cert.pem" "${repo}/envs/certs/key.pem" "${work}/certs/"
-python3 - "${work}" "${repo}" <<'PY'
-import sys
-work, repo = sys.argv[1:3]
-p = work + "/config/config.toml"
-s = open(p).read()
-s = s.replace(repo + "/envs/local/certs", "/app/certs").replace(repo + "/envs/local", "/app")
-s = s.replace("TRUST_GATEWAY_MASTER_KEY", "TG_ENCRYPTION_KEY")
-s = s.replace("env://TRUST_GATEWAY_BACKUP_ENCRYPTION_KEY", "env://AG_BACKUP_ENCRYPTION_KEY")
-s += open(work + "/config.bundled.toml").read()
-open(p, "w").write(s)
-
-# The local dev gateway.json carries legacy channel and proxy prefixes that
-# collide with the dashboard's pages once the image's dashboard is present, and a
-# dashboard path on the host. A deployment would not have either.
-import json
-gp = work + "/config/gateway.json"
-g = json.loads(open(gp).read().replace(repo + "/www/default/build", "/app/www").replace(repo + "/envs/local", "/app"))
-g["channels"] = []
-g["mcp_proxies"] = []
-open(gp, "w").write(json.dumps(g, indent=2))
-PY
-openssl rand -base64 32 > "${work}/secrets/vta_seed_passphrase"
-
+prepare_stack "${work}" || exit 2
 export GATEWAY_IMAGE VTA_IMAGE
-export TG_ENCRYPTION_KEY
-TG_ENCRYPTION_KEY="$(openssl rand -base64 32)"
-export AG_BACKUP_ENCRYPTION_KEY
-AG_BACKUP_ENCRYPTION_KEY="$(cat "${repo}/envs/backup_encryption_key")"
-export AG_IDENTITY_HASH_PEPPER
-AG_IDENTITY_HASH_PEPPER="$(cat "${repo}/envs/identity_hash_pepper")"
+export_stack_env
 
 dc() { (cd "${work}" && docker compose -p "${project}" "$@"); }
 failures=0

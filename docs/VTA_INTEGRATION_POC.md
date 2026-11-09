@@ -323,6 +323,21 @@ retired key's public half is recorded, so tokens it signed still verify.
 and set `mode`, `base_url` and `vta_did` (and, for a remote agent, grant the
 gateway on it yourself). No code path differs.
 
+### Trying it by hand
+
+`scripts/vta-bundled-manual.sh` brings up the shipped Compose example with real containers and
+leaves it running (`GATEWAY_IMAGE=… VTA_IMAGE=… ./scripts/vta-bundled-manual.sh up`; needs port
+8443 free and `make config-debug` once). `login` explains the dashboard login: open
+`https://localhost:8443/dashboard`, accept the certificate warning, register a passkey (the
+first one becomes the administrator, and the page then asks you to sign in with it), and open
+**Trust Agent**. The banner reads "Bundled trust agent: Connected. Owner: unclaimed". With a
+token copied from the browser console (`copy(sessionStorage.getItem('session_token'))`),
+`AG_TOKEN=… status` prints `GET /v1/vta/status` and `AG_TOKEN=… sign` issues a credential and
+shows its `kid` (`gateway-jwt-N`) and subject; `logs` shows the sidecar's `payload signed` line
+for that key and the gateway's `token_signed` audit record. `down` removes everything. To see
+the failure states, stop the sidecar before the first start, or run the VTA's offline
+`acl delete` against the `vta-data` volume.
+
 ### What was verified, and how
 
 Three layers, from the outside in:
