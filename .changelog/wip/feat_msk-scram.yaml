@@ -27,4 +27,11 @@ changes:
         malformed chunked trailers), RUSTSEC-2026-0447 and RUSTSEC-2026-0448 (compressed
         bodies exhausting memory before limits apply) and RUSTSEC-2026-0455 (large-window
         Brotli bodies bypassing decompression limits).
+    - timestamp: '2026-11-09T14:00:00Z'
+      title: Upgrade rmcp to 3.9 to bound Streamable HTTP client response bodies
+      description: >-
+        rmcp moves from 1.8.0 to 3.9.0 and rmcp-openapi from 0.28.1 to 0.32.1, fixing
+        RUSTSEC-2026-0462 (Streamable HTTP clients buffering response bodies without a
+        limit). The gateway no longer enables rmcp's client transport, which it never used,
+        and tokio-util is no longer pinned to 0.7.18 so rmcp-actix-web 0.13 can resolve.
   breaking: []

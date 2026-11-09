@@ -15,7 +15,7 @@ keywords = ["agents", "gateway", "identity", "mcp", "security"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.49.0", features = ["full"] }
-tokio-util = "=0.7.18"
+tokio-util = "0.7.19"
 
 # HTTP server and client
 hyper = { version = "1.8.1", features = ["full"] }
@@ -202,12 +202,8 @@ x402-chain-solana = { version = "1.1.3", features = [
 alloy = "2.5"
 solana-sdk = "3.0.0"
 
-rmcp = { version = "1.0", features = [
-    "client",
-    "client-side-sse",
-    "transport-streamable-http-client",
-] }
-rmcp-openapi = "0.28.0"
+rmcp = "3.9"
+rmcp-openapi = "0.32.1"
 rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
 
 # Stream helpers for MCP Streamable HTTP transport
