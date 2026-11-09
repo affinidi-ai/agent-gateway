@@ -10,8 +10,11 @@ changes:
         for a key of the surface, missing when no key has the id, unavailable for another
         surface's key, whose status is never reported, and unknown when the API key store
         cannot be read or no loaded key folder holds the id while a folder cannot be loaded.
-        blocking is true for revoked and missing, true for unavailable when the key is revoked
-        or tenant_credential_isolation is enforce, and false for active and unknown, so it says
+        blocking comes from the same judgment that refuses requests, so it is true exactly when
+        the gateway refuses the surface for that id: for revoked and missing, for unavailable
+        when the key is revoked or tenant_credential_isolation is enforce (not for a legacy
+        Caller Context secret whose owning surface is gone), and never for active and unknown;
+        it says
         whether the reference keeps the surface from serving. The surface's own key folder is
         read from disk for it, so a key another node revoked is reported revoked at once. It is
         computed by the gateway, so a tenant caller who cannot list API keys sees it too, and a

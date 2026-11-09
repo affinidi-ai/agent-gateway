@@ -2221,10 +2221,10 @@ pub enum ApiKeyReferenceStatus {
 }
 
 /// An API Key Provider key id a surface names, how it stands, and whether the surface must name
-/// another key before it serves (`blocking`): for a key of this surface when it is revoked or
-/// missing, for a key of another surface when it is revoked or `tenant_credential_isolation` is
-/// `enforce`, and never while the store cannot tell. Another surface's revoked key stays
-/// `unavailable`, as the surface's `serving_status` already shows it does not serve.
+/// another key before it serves (`blocking`): exactly when [`judge_provider_keys`], which the
+/// provider key gate refuses by, finds a breach for the id, and never while the store cannot tell.
+/// Another surface's revoked key stays `unavailable`, as the surface's `serving_status` already
+/// shows it does not serve.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ApiKeyReference {
     pub key_id: String,
@@ -2232,16 +2232,25 @@ pub struct ApiKeyReference {
     pub blocking: bool,
 }
 
-/// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` names, judged as
-/// [`judge_provider_keys`] does: a legacy secret is reported only when a key of that id exists,
-/// and an id is `unknown` when `listing` is `None` or a key folder it could not load may hold it. Only a key of this surface reports its
-/// status, so nothing of another surface's key is revealed. Sorted by key id.
+/// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` of `tenant_id` names,
+/// judged by [`judge_provider_keys`] with `surface_tenants` mapping each key owner to its tenant:
+/// a legacy secret is reported only when a key of that id exists, and an id is `unknown` when
+/// `listing` is `None` or a key folder it could not load may hold it. Only a key of this surface
+/// reports its status, so nothing of another surface's key is revealed. Sorted by key id.
 pub(crate) fn api_key_references(
     surface_id: &str,
+    tenant_id: Option<&str>,
     ids: &ProviderKeyIds,
     listing: Option<&KeyListing>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
     isolation: RuleMode,
 ) -> Vec<ApiKeyReference> {
+    let issues = judge_provider_keys(surface_id, tenant_id, ids, listing, surface_tenants, isolation);
+    let breaches = |key_id: &str| {
+        issues
+            .iter()
+            .any(|issue| issue.key_id == key_id && issue.kind.is_breach())
+    };
     let mut references: Vec<_> = ids
         .keys
         .iter()
@@ -2269,17 +2278,10 @@ pub(crate) fn api_key_references(
                     KeyStatus::Found(_) => ApiKeyReferenceStatus::Active,
                 },
             };
-            let blocking = match status {
-                ApiKeyReferenceStatus::Revoked | ApiKeyReferenceStatus::Missing => true,
-                ApiKeyReferenceStatus::Unavailable => {
-                    isolation.is_enforced() || listing.is_some_and(|listing| listing.is_revoked(key_id))
-                }
-                ApiKeyReferenceStatus::Active | ApiKeyReferenceStatus::Unknown => false,
-            };
             Some(ApiKeyReference {
                 key_id: key_id.clone(),
                 status,
-                blocking,
+                blocking: status != ApiKeyReferenceStatus::Unknown && breaches(key_id),
             })
         })
         .collect();
@@ -2288,8 +2290,10 @@ pub(crate) fn api_key_references(
 }
 
 /// The [`ApiKeyReference`]s of `surface` in its base and every variant, read from a listing of
-/// the API key store, so an id that a key folder which cannot be loaded may hold is `unknown`,
-/// never `missing`. `None` when the surface names no key id or its variants cannot be resolved.
+/// the API key store and the tenants of the surfaces owning the keys it names, so an id that a
+/// key folder which cannot be loaded may hold is `unknown`, never `missing`, and every id is
+/// `unknown` while either store cannot be read. `None` when the surface names no key id or its
+/// variants cannot be resolved.
 pub(crate) async fn surface_api_key_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -2307,12 +2311,52 @@ pub(crate) async fn surface_api_key_references(
             .ok(),
         None => None,
     };
+    let (listing, owner_tenants) = match listing {
+        Some(listing) => match key_owner_tenants(state, &listing, &ids).await {
+            Ok(owner_tenants) => (Some(listing), owner_tenants),
+            Err(error) => {
+                tracing::warn!(surface = %surface.surface_id, %error, "Could not read the surfaces owning the API keys a surface names");
+                (None, Vec::new())
+            }
+        },
+        None => (None, Vec::new()),
+    };
+    let surface_tenants = owner_tenants
+        .iter()
+        .map(|(id, tenant)| (id.as_str(), tenant.as_deref()))
+        .collect();
     Some(api_key_references(
         &surface.surface_id,
+        surface.tenant_id.as_deref(),
         &ids,
         listing.as_ref(),
+        &surface_tenants,
         crate::config::credential_policy::credential_policy().tenant_credential_isolation,
     ))
+}
+
+/// The tenant of each stored surface `listing` names as the owner of a key id of `ids`; an owner
+/// that is not stored is left out, as the provider key gate leaves it out.
+async fn key_owner_tenants(
+    state: &IdentityApiState,
+    listing: &KeyListing,
+    ids: &ProviderKeyIds,
+) -> anyhow::Result<Vec<(String, Option<String>)>> {
+    let store = state
+        .agent_surface_store
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the agent surface store is not configured"))?;
+    let owners: std::collections::BTreeSet<&String> = ids
+        .all()
+        .flat_map(|id| listing.owners_of(id))
+        .collect();
+    let mut tenants = Vec::new();
+    for owner in owners {
+        if let Some(stored) = crate::surfaces::AgentSurfaceStore::get(store, owner).await? {
+            tenants.push((owner.clone(), stored.tenant_id));
+        }
+    }
+    Ok(tenants)
 }
 
 #[cfg(test)]
@@ -2700,6 +2744,45 @@ mod tests {
         assert_eq!(reference_rule(&stored_key, RuleMode::Warn, ResourceKind::ApiKeys, "atgk_new"), RuleMode::Enforce);
     }
 
+    /// The references of surface `own`, of no tenant, whose key owners are none of them stored.
+    fn own_references(
+        ids: &ProviderKeyIds,
+        listing: Option<&KeyListing>,
+        isolation: RuleMode,
+    ) -> Vec<ApiKeyReference> {
+        api_key_references("own", None, ids, listing, &std::collections::HashMap::new(), isolation)
+    }
+
+    #[test]
+    fn a_legacy_secret_of_a_surface_that_is_gone_blocks_only_as_the_gate_refuses_it() {
+        let ids = ProviderKeyIds {
+            keys: Vec::new(),
+            legacy_secrets: vec!["atgk_legacy_foreign".into()],
+        };
+        let listing = KeyListing::from(std::collections::HashMap::from([(
+            "atgk_legacy_foreign".to_string(),
+            vec!["other".to_string()],
+        )]));
+        let stored_owner = std::collections::HashMap::from([("other", None)]);
+        let blocking = |tenants: &std::collections::HashMap<&str, Option<&str>>| {
+            api_key_references("own", None, &ids, Some(&listing), tenants, RuleMode::Enforce)
+                .into_iter()
+                .map(|reference| (reference.status, reference.blocking))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            blocking(&std::collections::HashMap::new()),
+            [(ApiKeyReferenceStatus::Unavailable, false)],
+            "the gate serves a legacy secret whose owning surface is gone"
+        );
+        assert_eq!(
+            blocking(&stored_owner),
+            [(ApiKeyReferenceStatus::Unavailable, true)],
+            "a legacy secret of another stored surface is refused under enforce"
+        );
+    }
+
     #[test]
     fn api_key_references_report_status_only_for_the_surfaces_own_keys() {
         let ids = ProviderKeyIds {
@@ -2723,7 +2806,7 @@ mod tests {
         let reference = |key_id: &str, status| (key_id.to_string(), status);
 
         assert_eq!(
-            api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
+            own_references(&ids, Some(&listing), RuleMode::Warn)
                 .into_iter()
                 .map(|reference| (reference.key_id, reference.status))
                 .collect::<Vec<_>>(),
@@ -2737,7 +2820,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            api_key_references("own", &ids, None, RuleMode::Warn)
+            own_references(&ids, None, RuleMode::Warn)
                 .into_iter()
                 .map(|reference| reference.status)
                 .collect::<Vec<_>>(),
@@ -2767,7 +2850,7 @@ mod tests {
         ]))
         .with(&["atgk_revoked", "atgk_foreign_revoked", "atgk_legacy_revoked"], &[]);
         let blocking = |listing: &KeyListing, mode| {
-            api_key_references("own", &ids, Some(listing), mode)
+            own_references(&ids, Some(listing), mode)
                 .into_iter()
                 .filter(|reference| reference.blocking)
                 .map(|reference| reference.key_id)
@@ -2779,7 +2862,7 @@ mod tests {
             "another surface's revoked key blocks under warn, as the gate refuses it"
         );
         assert_eq!(
-            api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
+            own_references(&ids, Some(&listing), RuleMode::Warn)
                 .into_iter()
                 .find(|reference| reference.key_id == "atgk_foreign_revoked")
                 .map(|reference| reference.status),
@@ -2801,13 +2884,13 @@ mod tests {
             "an unknown id does not block"
         );
         assert!(
-            api_key_references("own", &ids, None, RuleMode::Enforce)
+            own_references(&ids, None, RuleMode::Enforce)
                 .iter()
                 .all(|reference| !reference.blocking),
             "nothing blocks while the store cannot be read"
         );
         assert_eq!(
-            serde_json::to_value(&api_key_references("own", &ids, Some(&listing), RuleMode::Warn)[0]).unwrap(),
+            serde_json::to_value(&own_references(&ids, Some(&listing), RuleMode::Warn)[0]).unwrap(),
             serde_json::json!({"key_id": "atgk_active", "status": "active", "blocking": false})
         );
     }
@@ -2876,7 +2959,7 @@ mod tests {
             keys: vec!["atgk_own".into(), "atgk_unknown".into()],
             legacy_secrets: vec!["atgk_legacy".into()],
         };
-        let statuses: Vec<_> = api_key_references("own", &ids, Some(&partial_listing()), RuleMode::Warn)
+        let statuses: Vec<_> = own_references(&ids, Some(&partial_listing()), RuleMode::Warn)
             .into_iter()
             .map(|reference| (reference.key_id, reference.status))
             .collect();
@@ -2962,7 +3045,7 @@ mod tests {
         assert!(!cached.is_revoked(&revoked), "node B's cache is stale");
         assert!(listing.is_revoked(&revoked), "the save is judged from the folder as stored");
         assert_eq!(listing.owners_of(&added), ["own".to_string()], "a key another node added is found");
-        let statuses: Vec<_> = api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
+        let statuses: Vec<_> = own_references(&ids, Some(&listing), RuleMode::Warn)
             .into_iter()
             .map(|reference| (reference.key_id, reference.status))
             .collect();

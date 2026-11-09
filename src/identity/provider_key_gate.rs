@@ -85,18 +85,61 @@ struct Owners {
     whole: bool,
 }
 
-/// The key ids judged for a surface of `tenant_id`, those found in a key folder, those of them it
-/// may not use, those revoked, those no key has, those judged while the stores could not be read,
-/// the surfaces read as their owners, and when each id is judged again.
+/// Why a key id keeps a surface from serving, in rising precedence: a surface naming several
+/// such ids is refused for the highest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Refusal {
+    /// A key the surface may not use.
+    Tenant,
+    /// A key id no key has.
+    Missing,
+    /// A revoked key.
+    Revoked,
+    /// A key id judged while the stores could not be read.
+    Unavailable,
+}
+
+impl Refusal {
+    /// The refusal an issue of `kind` gives, `None` when it does not keep the surface from serving.
+    fn of(kind: ProviderKeyIssueKind) -> Option<Self> {
+        match kind {
+            ProviderKeyIssueKind::StoreUnavailable => Some(Self::Unavailable),
+            ProviderKeyIssueKind::RevokedKey => Some(Self::Revoked),
+            ProviderKeyIssueKind::MissingKey => Some(Self::Missing),
+            kind => kind
+                .is_breach()
+                .then_some(Self::Tenant),
+        }
+    }
+
+    /// The highest refusal `issues` give, as the reason the surface is not ready.
+    fn of_issues<'a>(issues: impl IntoIterator<Item = &'a ProviderKeyIssue>) -> Option<NotReadyReason> {
+        issues
+            .into_iter()
+            .filter_map(|issue| Self::of(issue.kind))
+            .max()
+            .map(Self::reason)
+    }
+
+    fn reason(self) -> NotReadyReason {
+        match self {
+            Self::Tenant => NotReadyReason::ProviderKeyTenant,
+            Self::Missing => NotReadyReason::ApiKeyMissing,
+            Self::Revoked => NotReadyReason::ApiKeyRevoked,
+            Self::Unavailable => NotReadyReason::ApiKeyStoreUnavailable,
+        }
+    }
+}
+
+/// The key ids judged for a surface of `tenant_id`, those found in a key folder, the highest
+/// refusal of each id that keeps the surface from serving, the surfaces read as their owners, and
+/// when each id is judged again.
 #[derive(Debug, PartialEq, Eq)]
 struct Entry {
     tenant_id: Option<String>,
     judged: HashSet<String>,
     found: HashSet<String>,
-    refused: HashSet<String>,
-    revoked: HashSet<String>,
-    missing: HashSet<String>,
-    unavailable: HashSet<String>,
+    refusals: HashMap<String, Refusal>,
     owners: HashSet<String>,
     recheck: HashMap<String, Instant>,
 }
@@ -132,11 +175,10 @@ impl Entry {
                 .all()
                 .all(|id| self.judged.contains(id)))
         .then(|| {
-            let any = |set: &HashSet<String>| {
-                ids.all()
-                    .any(|id| set.contains(id))
-            };
-            refusal(any(&self.unavailable), any(&self.revoked), any(&self.missing), any(&self.refused))
+            ids.all()
+                .filter_map(|id| self.refusals.get(id))
+                .max()
+                .map(|refusal| refusal.reason())
         })
     }
 
@@ -184,48 +226,30 @@ impl Entry {
         verdict: &Verdict,
         recheck_at: Instant,
     ) -> Self {
-        let ids_where = |keep: &dyn Fn(ProviderKeyIssueKind) -> bool| {
-            verdict
-                .issues
-                .iter()
-                .filter(|issue| keep(issue.kind))
-                .map(|issue| issue.key_id.clone())
-                .collect()
-        };
+        let mut refusals: HashMap<String, Refusal> = HashMap::new();
+        for issue in &verdict.issues {
+            if let Some(refusal) = Refusal::of(issue.kind) {
+                refusals
+                    .entry(issue.key_id.clone())
+                    .and_modify(|kept| *kept = (*kept).max(refusal))
+                    .or_insert(refusal);
+            }
+        }
+        let recheck = ids
+            .all()
+            .filter(|id| {
+                verdict.found.contains(*id)
+                    || matches!(refusals.get(*id), Some(Refusal::Missing | Refusal::Unavailable))
+            })
+            .map(|id| (id.clone(), recheck_at))
+            .collect();
         Self {
             tenant_id: surface.tenant_id.clone(),
             judged: ids.all().cloned().collect(),
             found: verdict.found.clone(),
-            unavailable: ids_where(&|kind| kind == ProviderKeyIssueKind::StoreUnavailable),
-            revoked: ids_where(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
-            missing: ids_where(&|kind| kind == ProviderKeyIssueKind::MissingKey),
-            refused: ids_where(&|kind| {
-                kind.is_breach()
-                    && !matches!(
-                        kind,
-                        ProviderKeyIssueKind::StoreUnavailable
-                            | ProviderKeyIssueKind::RevokedKey
-                            | ProviderKeyIssueKind::MissingKey
-                    )
-            }),
+            refusals,
             owners: verdict.owners.clone(),
-            recheck: ids
-                .all()
-                .filter(|id| {
-                    verdict.found.contains(*id)
-                        || verdict
-                            .issues
-                            .iter()
-                            .any(|issue| {
-                                issue.key_id == **id
-                                    && matches!(
-                                        issue.kind,
-                                        ProviderKeyIssueKind::MissingKey | ProviderKeyIssueKind::StoreUnavailable
-                                    )
-                            })
-                })
-                .map(|id| (id.clone(), recheck_at))
-                .collect(),
+            recheck,
         }
     }
 
@@ -241,23 +265,14 @@ impl Entry {
         }
         for id in &later.judged {
             self.found.remove(id);
-            self.refused.remove(id);
-            self.revoked.remove(id);
-            self.missing.remove(id);
-            self.unavailable.remove(id);
+            self.refusals.remove(id);
             self.recheck.remove(id);
         }
         self.judged
             .extend(later.judged);
         self.found.extend(later.found);
-        self.refused
-            .extend(later.refused);
-        self.revoked
-            .extend(later.revoked);
-        self.missing
-            .extend(later.missing);
-        self.unavailable
-            .extend(later.unavailable);
+        self.refusals
+            .extend(later.refusals);
         self.owners
             .extend(later.owners);
         self.recheck
@@ -273,36 +288,7 @@ struct Verdict {
 
 impl Verdict {
     fn reason(&self) -> Option<NotReadyReason> {
-        let any = |kind: &dyn Fn(ProviderKeyIssueKind) -> bool| {
-            self.issues
-                .iter()
-                .any(|issue| kind(issue.kind))
-        };
-        refusal(
-            any(&|kind| kind == ProviderKeyIssueKind::StoreUnavailable),
-            any(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
-            any(&|kind| kind == ProviderKeyIssueKind::MissingKey),
-            any(&|kind| kind.is_breach()),
-        )
-    }
-}
-
-/// Why a surface is refused: while the stores cannot be read, then for a revoked key, then for a
-/// key id no key has, then for a key it may not use.
-fn refusal(
-    unavailable: bool,
-    revoked: bool,
-    missing: bool,
-    refused: bool,
-) -> Option<NotReadyReason> {
-    if unavailable {
-        Some(NotReadyReason::ApiKeyStoreUnavailable)
-    } else if revoked {
-        Some(NotReadyReason::ApiKeyRevoked)
-    } else if missing {
-        Some(NotReadyReason::ApiKeyMissing)
-    } else {
-        refused.then_some(NotReadyReason::ProviderKeyTenant)
+        Refusal::of_issues(&self.issues)
     }
 }
 
@@ -622,17 +608,10 @@ impl ProviderKeyGate {
         if ids.is_empty() {
             return None;
         }
-        match self
-            .entries
+        self.entries
             .get(&surface.surface_id)?
             .decides(surface.tenant_id.as_deref(), &ids, Instant::now())?
-        {
-            Some(NotReadyReason::ApiKeyStoreUnavailable) => Some(API_KEY_STORE_UNAVAILABLE),
-            Some(NotReadyReason::ApiKeyRevoked) => Some(API_KEY_REVOKED),
-            Some(NotReadyReason::ApiKeyMissing) => Some(API_KEY_MISSING),
-            Some(NotReadyReason::ProviderKeyTenant) => Some(PROVIDER_KEY_TENANT_RULE),
-            Some(NotReadyReason::NoSourceAuthentication) | None => None,
-        }
+            .map(NotReadyReason::as_str)
     }
 
     /// Whether a verdict is kept for `surface_id`.
@@ -1051,11 +1030,14 @@ mod tests {
                 "atgk_revoked".to_string(),
             ]
             .into(),
-            refused: [KEY_B.to_string()].into(),
             found: HashSet::new(),
-            revoked: ["atgk_revoked".to_string()].into(),
-            missing: ["atgk_missing".to_string()].into(),
-            unavailable: ["atgk_unread".to_string()].into(),
+            refusals: [
+                (KEY_B.to_string(), Refusal::Tenant),
+                ("atgk_revoked".to_string(), Refusal::Revoked),
+                ("atgk_missing".to_string(), Refusal::Missing),
+                ("atgk_unread".to_string(), Refusal::Unavailable),
+            ]
+            .into(),
             owners: HashSet::new(),
             recheck: [("atgk_missing".to_string(), later), ("atgk_unread".to_string(), later)].into(),
         };
@@ -1254,7 +1236,7 @@ mod tests {
             .get("owner-a")
             .unwrap();
         assert_eq!(entry.judged, [KEY_A.to_string(), KEY_B.to_string()].into());
-        assert_eq!(entry.refused, [KEY_B.to_string()].into());
+        assert_eq!(entry.refusals, [(KEY_B.to_string(), Refusal::Tenant)].into());
         drop(entry);
         assert_eq!(
             enforced
@@ -1599,7 +1581,7 @@ mod tests {
             .get("later")
             .unwrap();
         assert!(
-            entry.refused.contains(later)
+            entry.refusals.get(later) == Some(&Refusal::Tenant)
                 && entry
                     .recheck
                     .contains_key(later),

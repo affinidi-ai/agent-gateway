@@ -343,10 +343,13 @@ same-tenant key of another surface that still serves under `warn` is `unavailabl
 surface names only its own keys. The field is absent when the surface names no key id, and on
 the surface list and variant responses. The surface's own key folder is read from disk for it,
 so a key of the surface another node revoked, deleted or created is reported as stored; when
-that folder cannot be read, its keys are `unknown`. `blocking` is `true` for a `revoked` or
-`missing` key, and for an `unavailable` key when that key is revoked, as the gate refuses a
-revoked key in both modes, or when `tenant_credential_isolation` is `enforce`; it is `false` for
-an `active` or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
+that folder cannot be read, its keys are `unknown`, as they are while the surfaces owning its
+keys cannot be read. `blocking` is `true` exactly when the provider key gate refuses the surface
+for that id, judged from the same rules: for a `revoked` or `missing` key, and for an
+`unavailable` key when that key is revoked, as the gate refuses a revoked key in both modes, or
+when `tenant_credential_isolation` is `enforce`, except for a legacy Caller Context secret whose
+owning surface no longer exists, which the gate does not refuse. It is `false` for an `active`
+or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
 `serving_status` already shows that it does not serve.
 
 Beside `api_key_references`, the same responses carry a read-only `serving_status`: `serving` or
