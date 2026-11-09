@@ -128,10 +128,19 @@ impl BodyRefusal {
     /// JSON-RPC errors as the Access Point's malformed-body guard.
     pub fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Batch => crate::a2a::create_error_response(
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                "JSON-RPC batches are not supported",
-            ),
+            Self::Batch => {
+                let body = serde_json::json!({
+                    "type": "about:blank",
+                    "title": "Unprocessable Entity",
+                    "status": 422,
+                    "detail": "JSON-RPC batches are not supported",
+                });
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::UNPROCESSABLE_ENTITY)
+                    .header("content-type", "application/problem+json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap()
+            }
             Self::NotJson(details) => super::create_mcp_error_response(
                 None,
                 super::error_codes::PARSE_ERROR,
@@ -685,7 +694,7 @@ mod tests {
             (
                 &b"[]"[..],
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                serde_json::json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity",
+                serde_json::json!({"type": "about:blank", "title": "Unprocessable Entity",
                     "status": 422, "detail": "JSON-RPC batches are not supported"}),
             ),
             (

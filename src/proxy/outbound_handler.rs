@@ -9551,7 +9551,7 @@ mod tests {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
                 assert_eq!(
                     error,
-                    json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+                    json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
                     "{tool}"
                 );
             }
