@@ -73,15 +73,5 @@ ignore = [
     "RUSTSEC-2026-0398",
     # https://rustsec.org/advisories/RUSTSEC-2026-0403
     "RUSTSEC-2026-0403",
-
-    # rmcp 1.8.0 — a Streamable HTTP client buffers a response body with no bound, so an
-    # MCP server it calls can exhaust memory. Severity 6.5 (medium). Fixed in rmcp >= 3.9.0,
-    # two major lines on, and rmcp-openapi 0.28.1 still requires rmcp ^1.0, so bumping the
-    # direct dependency would only add a second rmcp to the lock file. The gateway no longer
-    # compiles the affected code: the `client`, `client-side-sse` and
-    # `transport-streamable-http-client` features are off in Cargo.toml, leaving rmcp's
-    # default server-side features. Revisit when rmcp-openapi moves to rmcp 3.x.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0462
-    "RUSTSEC-2026-0462",
 ]
 informational_warnings = ["unmaintained", "unsound", "notice"]
