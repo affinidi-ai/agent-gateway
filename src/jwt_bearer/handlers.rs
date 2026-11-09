@@ -36,17 +36,17 @@ fn resource_scope(scope: &Option<Extension<PatResourceScope>>) -> Option<&PatRes
 
 /// Refuses a remote `jwks_uri` the JWKS fetch would refuse: one that is not an
 /// http(s) URL or whose host resolves to loopback, an unspecified address or
-/// cloud metadata. A host that does
-/// not resolve now is saved, and is vetted again on every fetch.
-async fn check_jwks_source(source: &JwksSource) -> Result<(), axum::response::Response> {
+/// cloud metadata, answering the `400` to return. A host that does not resolve
+/// now is saved, and is vetted again on every fetch.
+async fn check_jwks_source(source: &JwksSource) -> Option<axum::response::Response> {
     let JwksSource::Remote { jwks_uri } = source else {
-        return Ok(());
+        return None;
     };
     match crate::jwt_bearer::jwks::vet_jwks_uri(jwks_uri).await {
         Err(crate::jwt_bearer::errors::JwtBearerError::JwksUriBlocked) => {
-            Err((StatusCode::BAD_REQUEST, ErrorBody::json(JWKS_URI_BLOCKED)).into_response())
+            Some((StatusCode::BAD_REQUEST, ErrorBody::json(JWKS_URI_BLOCKED)).into_response())
         }
-        _ => Ok(()),
+        _ => None,
     }
 }
 
@@ -196,7 +196,7 @@ pub async fn create_strategy(
         return (StatusCode::FORBIDDEN, ErrorBody::json(e.message())).into_response();
     }
 
-    if let Err(response) = check_jwks_source(&body.jwks_source).await {
+    if let Some(response) = check_jwks_source(&body.jwks_source).await {
         return response;
     }
 
@@ -386,7 +386,7 @@ pub async fn update_strategy(
             .into_response();
     }
 
-    if let Err(response) = check_jwks_source(&body.jwks_source).await {
+    if let Some(response) = check_jwks_source(&body.jwks_source).await {
         return response;
     }
 
