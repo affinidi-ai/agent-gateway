@@ -600,15 +600,17 @@ async fn connect(
         .await
         .map_err(misconfigured)?;
 
-    let client = VtaRestClient::new(
-        base_url,
-        &published,
-        Arc::new(control_key) as Arc<dyn SignerKeyProvider>,
-        Duration::from_millis(config.timeout_ms),
-        config.max_concurrent,
-        None,
-    )
-    .map_err(|e| misconfigured(format!("could not build the trust agent client: {}", e.log_detail())))?;
+    let client = Arc::new(
+        VtaRestClient::new(
+            base_url,
+            &published,
+            Arc::new(control_key) as Arc<dyn SignerKeyProvider>,
+            Duration::from_millis(config.timeout_ms),
+            config.max_concurrent,
+            None,
+        )
+        .map_err(|e| misconfigured(format!("could not build the trust agent client: {}", e.log_detail())))?,
+    );
 
     client
         .authenticate()
@@ -653,6 +655,11 @@ async fn connect(
                 .public
         }
     };
+
+    // The sidecar's context is created by hand, so it has no DID, and a
+    // credential issued as it would have no issuer. Giving it one is what makes
+    // the context usable as an issuing authority; it is a no-op once set.
+    super::context_creator::ensure_context_can_issue(&client, context_id).await;
 
     if let Some(state) = state {
         if state.control_did == control_did {
@@ -1032,6 +1039,9 @@ mod tests {
         capabilities: Vec<&'static str>,
         keys: Vec<Value>,
         creates: usize,
+        issuer_creates: usize,
+        context_did: Option<String>,
+        did_updates: usize,
         allowed: Option<Vec<String>>,
     }
 
@@ -1043,12 +1053,37 @@ mod tests {
                 capabilities: super::super::onboarding::GRANT_CAPABILITIES.to_vec(),
                 keys: Vec::new(),
                 creates: 0,
+                issuer_creates: 0,
+                context_did: None,
+                did_updates: 0,
                 allowed: None,
             })))
         }
 
         fn creates(&self) -> usize {
             self.0.lock().unwrap().creates
+        }
+
+        fn issuer_creates(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .issuer_creates
+        }
+
+        fn context_did(&self) -> Option<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .context_did
+                .clone()
+        }
+
+        fn did_updates(&self) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .did_updates
         }
     }
 
@@ -1094,8 +1129,25 @@ mod tests {
         if task.contains("keys/list") {
             return Json(json!({ "payload": { "keys": vta.keys } })).into_response();
         }
+        if task.contains("contexts/get") {
+            return Json(json!({ "payload": { "id": "gateway", "did": vta.context_did } })).into_response();
+        }
+        if task.contains("contexts/update-did") {
+            vta.did_updates += 1;
+            vta.context_did = body["payload"]["did"]
+                .as_str()
+                .map(str::to_string);
+            return Json(json!({ "payload": { "id": "gateway" } })).into_response();
+        }
         if task.contains("keys/create") {
-            vta.creates += 1;
+            if body["payload"]["keyId"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("-issuer"))
+            {
+                vta.issuer_creates += 1;
+            } else {
+                vta.creates += 1;
+            }
             let record = json!({
                 "keyId": body["payload"]["keyId"],
                 "keyType": "ed25519",
@@ -1166,6 +1218,37 @@ mod tests {
         async fn run(&self) -> Outcome {
             run(&self.config, self.storage.path()).await
         }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_gives_the_gateway_context_the_identity_it_issues_as() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+
+        let outcome = fixture.run().await;
+
+        assert_eq!(outcome.status.state, BootstrapState::Connected, "{:?}", outcome.status.detail);
+        assert_eq!(mock.issuer_creates(), 1, "one issuer key is minted in the context");
+        assert_eq!(
+            mock.context_did().as_deref(),
+            Some("did:key:z6MkMintedPublicKey"),
+            "the context's DID is the did:key of that key, so a credential it issues has an issuer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_leaves_the_gateway_context_identity_alone() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+
+        fixture.run().await;
+        let second = fixture.run().await;
+
+        assert_eq!(second.status.state, BootstrapState::Connected, "{:?}", second.status.detail);
+        assert_eq!(mock.issuer_creates(), 1, "no second issuer key");
+        assert_eq!(mock.did_updates(), 1, "the DID is written once");
     }
 
     #[tokio::test]

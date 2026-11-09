@@ -132,6 +132,14 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T11:30:00Z'
+      title: Let surfaces on the bundled trust agent issue identity credentials
+      description: >-
+        A request through a surface that signs with the bundled sidecar logged
+        "context gateway has no DID" and carried no identity credential, because
+        the sidecar's gateway context was never given the signing identity a
+        credential is issued as. The bootstrap now gives it one when it connects,
+        once, and a restart leaves it alone.
     - timestamp: '2026-11-09T09:30:00Z'
       title: Show the bundled trust agent's connection as connected, not unpaired
       description: >-

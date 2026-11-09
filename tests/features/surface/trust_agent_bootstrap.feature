@@ -15,6 +15,7 @@ Feature: A bundled trust agent connects itself on first start
     And the gateway authenticates as a did:key
     And the gateway wrote its own did:key for the trust agent to enrol
     And the trust agent was asked to create 1 signing key
+    And the trust agent gave the gateway context an identity to issue as
 
   Scenario: The connection list shows the bundled trust agent as connected, not as waiting to be paired
     Given a bundled trust agent that has enrolled the gateway

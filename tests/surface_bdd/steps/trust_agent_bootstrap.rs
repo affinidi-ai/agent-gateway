@@ -159,6 +159,20 @@ async fn gateway_wrote_its_did_key(world: &mut SurfaceWorld) {
     );
 }
 
+#[then("the trust agent gave the gateway context an identity to issue as")]
+async fn trust_agent_gave_context_an_identity(world: &mut SurfaceWorld) {
+    let agent = world
+        .bundled_trust_agent
+        .as_ref()
+        .expect("a bundled trust agent");
+    assert_eq!(
+        agent
+            .context_identity()
+            .as_deref(),
+        Some("did:key:z6MkBddMintedPublicKey")
+    );
+}
+
 #[then(expr = "the trust agent was asked to create {int} signing key(s)")]
 async fn trust_agent_was_asked_to_create_keys(
     world: &mut SurfaceWorld,

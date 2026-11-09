@@ -341,6 +341,26 @@ for that key and the gateway's `token_signed` audit record. `down` removes every
 the failure states, stop the sidecar before the first start, or run the VTA's offline
 `acl delete` against the `vta-data` volume.
 
+### A custom trust agent beside the bundled one
+
+The bundled sidecar is the appliance default. An operator can still connect a trust agent of
+their own and name it on a surface (`signing.connection_id`, with its `context_id` and
+`key_id`). That surface's identity credential is issued and signed by the custom trust agent,
+under the DID of the context it names; every other surface keeps the sidecar. Each agent's own
+key, and the presentation it makes, stay in the appliance default, so a request through a custom
+surface touches both trust agents.
+
+`scripts/vta-custom-e2e.sh` runs this with the real `vta` and `agent-gateway` binaries and the
+local A2A agent (`VTA_BIN=… A2A_AGENT_DIR=… ./scripts/vta-custom-e2e.sh`; not part of CI). It
+starts the gateway with its bundled sidecar, sets up a second VTA from nothing, pairs it
+through the management API, grants it offline, creates two surfaces (one default, one on the
+custom connection) and sends a message through each. It then checks, from the body the agent
+received, that each message carries an identity credential whose signature verifies under its
+issuer and a presentation that verifies under the agent, that the two issuers differ, that each
+issuer is a context DID set by its own trust agent, and, from each trust agent's log, that
+the default message's credential was signed by the sidecar and the custom message's by the
+custom trust agent.
+
 ### What was verified, and how
 
 Three layers, from the outside in:

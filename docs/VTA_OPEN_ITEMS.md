@@ -15,6 +15,21 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 - **The offline CLI's audit rows** are written by the `gateway-integration` branch; a trust
   agent built without that change enrols the gateway with no audit record.
 
+## Custom trust agents beside the bundled default
+
+- **An agent's own key stays in the appliance default.** A surface that signs through a custom
+  connection has its identity credential issued by that trust agent, but each agent's own key,
+  and so the presentation it holds, is created in and signed by the appliance default (the
+  bundled sidecar), because an onboarded agent keeps its key where it was created. Only the
+  issuer's signature moves to the custom trust agent.
+- **A custom connection's `did:webvh` control identity needs the trust agent to reach the
+  gateway over the address it was published at.** A local development gateway names its TLS
+  port, which a trust agent resolving a `localhost` DID over plain `http` cannot reach, so the
+  live check connects its custom trust agent with `control_identity: "did_key"`.
+- **Surface signing cannot name the bundled connection.** A surface's `signing.connection_id`
+  of `vta-bootstrap` is refused as unusable (the record has no control key of its own); the
+  bundled sidecar is reached through the appliance default only.
+
 ## On the bundled sidecar
 
 - **No person owns it.** The super-admin slot stays empty (`owner: unclaimed`). A claim flow

@@ -38,6 +38,7 @@ struct AgentState {
     behaviour: Behaviour,
     keys: Vec<Value>,
     creates: usize,
+    context_did: Option<String>,
 }
 
 #[derive(Debug)]
@@ -96,8 +97,22 @@ async fn trust_tasks(
     if task.contains("keys/list") {
         return Json(json!({ "payload": { "keys": agent.keys } })).into_response();
     }
+    if task.contains("contexts/get") {
+        return Json(json!({ "payload": { "id": "gateway", "did": agent.context_did } })).into_response();
+    }
+    if task.contains("contexts/update-did") {
+        agent.context_did = body["payload"]["did"]
+            .as_str()
+            .map(str::to_string);
+        return Json(json!({ "payload": { "id": "gateway" } })).into_response();
+    }
     if task.contains("keys/create") {
-        agent.creates += 1;
+        if !body["payload"]["keyId"]
+            .as_str()
+            .is_some_and(|id| id.ends_with("-issuer"))
+        {
+            agent.creates += 1;
+        }
         let record = json!({
             "keyId": body["payload"]["keyId"], "keyType": "ed25519", "status": "active",
             "publicKey": "z6MkBddMintedPublicKey",
@@ -116,6 +131,7 @@ impl MockTrustAgent {
             behaviour,
             keys: Vec::new(),
             creates: 0,
+            context_did: None,
         }));
         let app = Router::new()
             .route("/health", get(health))
@@ -156,6 +172,14 @@ impl MockTrustAgent {
             text,
         )
         .expect("publish the identity");
+    }
+
+    pub fn context_identity(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("mock trust agent state")
+            .context_did
+            .clone()
     }
 
     pub fn signing_keys_created(&self) -> usize {
