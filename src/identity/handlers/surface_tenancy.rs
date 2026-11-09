@@ -1301,7 +1301,16 @@ impl ReferenceAuthorizer<'_> {
         if ids.is_empty() {
             return Ok(());
         }
-        let listing = provider_key_listing(self.state).await?;
+        let store = self
+            .state
+            .api_key_store
+            .as_deref()
+            .ok_or_else(|| unavailable("API key"))?;
+        let listing = if names_a_new_key_id(&self.grandfathered, ids) {
+            provider_key_listing_with_folder(store, self.current_surface_id, ids).await?
+        } else {
+            provider_key_listing_in(store).await?
+        };
         for secret_id in &ids.legacy_secrets {
             self.legacy_secret(secret_id, &listing)
                 .await?;
@@ -1391,6 +1400,15 @@ impl ReferenceAuthorizer<'_> {
         }
         self.revoked_key(secret_id, surface_ids, listing, kept)
     }
+}
+
+/// Whether a save names a key id of `ids` the stored surface did not already name.
+fn names_a_new_key_id(
+    grandfathered: &[(ResourceKind, String)],
+    ids: &ProviderKeyIds,
+) -> bool {
+    ids.all()
+        .any(|id| !is_grandfathered(grandfathered, ResourceKind::ApiKeys, id))
 }
 
 /// The surfaces whose key folders hold the key `id` a save names, or `None` when the save leaves
@@ -2021,17 +2039,6 @@ pub(crate) async fn provider_key_owners(
     Ok(listing)
 }
 
-/// The [`KeyListing`] of the API key store; a key folder that could not be loaded is left out.
-async fn provider_key_listing(state: &IdentityApiState) -> Result<KeyListing, SurfaceApiError> {
-    provider_key_listing_in(
-        state
-            .api_key_store
-            .as_deref()
-            .ok_or_else(|| unavailable("API key"))?,
-    )
-    .await
-}
-
 /// Refuses a new surface whose id's key folder holds any API key record, readable or not, such
 /// as the keys kept from a deleted surface of that id, so a new surface never takes over another
 /// surface's keys and the DIDs derived from them. Only the key folder of `surface_id` is read,
@@ -2275,7 +2282,7 @@ pub(crate) async fn surface_api_key_references(
         return None;
     }
     let listing = match state.api_key_store.as_deref() {
-        Some(store) => provider_key_listing_in(store)
+        Some(store) => provider_key_listing_with_folder(store, &surface.surface_id, &ids)
             .await
             .inspect_err(|error| {
                 tracing::warn!(surface = %surface.surface_id, ?error, "Could not list the API keys a surface names");
@@ -2314,6 +2321,32 @@ impl KeyListing {
         );
         self
     }
+}
+
+/// [`provider_key_listing_in`] with the key folder of `surface_id` read from disk, so a key of
+/// `ids` that another node created, revoked or deleted there is listed as stored. When that
+/// folder cannot be read, it is skipped and owns none of `ids`.
+pub(crate) async fn provider_key_listing_with_folder(
+    store: &dyn crate::api_keys::store::ApiKeyStore,
+    surface_id: &str,
+    ids: &ProviderKeyIds,
+) -> Result<KeyListing, SurfaceApiError> {
+    let mut listing = provider_key_listing_in(store).await?;
+    let named = ids
+        .all()
+        .map(String::as_str)
+        .collect();
+    match store
+        .list_from_disk(surface_id)
+        .await
+    {
+        Ok(keys) => listing.take_in_folder(surface_id, keys, &named),
+        Err(error) => {
+            tracing::warn!(surface = %surface_id, %error, "Could not read a surface's API key folder from disk");
+            listing.skip_folder(surface_id, &named);
+        }
+    }
+    Ok(listing)
 }
 
 /// The [`KeyListing`] of `store`: a key folder that could not be loaded is left out and named as
@@ -2794,6 +2827,133 @@ mod tests {
             Err("400 API key reference is not accessible".to_string())
         );
         assert_eq!(outcome(&complete, "atgk_unknown", false, true), Ok(None), "a legacy secret no key has");
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_a_surfaces_folder_reads_its_keys_as_another_node_stored_them() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let node_a = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        let revoked = node_a
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let node_b = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        node_a
+            .revoke("own", &revoked, "test")
+            .await
+            .unwrap();
+        let added = node_a
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let ids = ProviderKeyIds {
+            keys: vec![added.clone(), revoked.clone()],
+            legacy_secrets: Vec::new(),
+        };
+        let mut sorted = ids.keys.clone();
+        sorted.sort();
+
+        let cached = provider_key_listing_in(&node_b)
+            .await
+            .unwrap();
+        let listing = provider_key_listing_with_folder(&node_b, "own", &ids)
+            .await
+            .unwrap();
+
+        assert!(!cached.is_revoked(&revoked), "node B's cache is stale");
+        assert!(listing.is_revoked(&revoked), "the save is judged from the folder as stored");
+        assert_eq!(listing.owners_of(&added), ["own".to_string()], "a key another node added is found");
+        let statuses: Vec<_> = api_key_references("own", &ids, Some(&listing))
+            .into_iter()
+            .map(|reference| (reference.key_id, reference.status))
+            .collect();
+        let expected: Vec<_> = sorted
+            .into_iter()
+            .map(|id| {
+                let status = if id == revoked {
+                    ApiKeyReferenceStatus::Revoked
+                } else {
+                    ApiKeyReferenceStatus::Active
+                };
+                (id, status)
+            })
+            .collect();
+        assert_eq!(statuses, expected);
+    }
+
+    #[tokio::test]
+    async fn a_listing_whose_surfaces_folder_cannot_be_read_reads_its_keys_as_unknown() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::api_keys::FileSystemApiKeyStore::new(
+            directory
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let own = store
+            .create("own", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let foreign = store
+            .create("other", "client", None, "test")
+            .await
+            .unwrap()
+            .key_id;
+        let locked = directory.path().join("own");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let ids = ProviderKeyIds {
+            keys: vec![own.clone(), foreign.clone()],
+            legacy_secrets: Vec::new(),
+        };
+
+        let listing = provider_key_listing_with_folder(&store, "own", &ids).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !unreadable {
+            return;
+        }
+
+        let listing = listing.unwrap();
+        assert_eq!(listing.status_of(&own), KeyStatus::Unknown);
+        assert_eq!(listing.owners_of(&foreign), ["other".to_string()], "another folder's key is judged as usual");
+        assert!(
+            matches!(listed_owners(&listing, &own, false, false), Err(SurfaceApiError::Unavailable(_))),
+            "a new reference to it is refused as unavailable"
+        );
+    }
+
+    #[test]
+    fn a_save_reads_the_surfaces_key_folder_only_when_it_names_a_key_id_it_did_not_already_name() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_kept".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let kept = |ids: &[&str]| -> Vec<(ResourceKind, String)> {
+            ids.iter()
+                .map(|id| (ResourceKind::ApiKeys, id.to_string()))
+                .collect()
+        };
+
+        assert!(!names_a_new_key_id(&kept(&["atgk_kept", "atgk_legacy"]), &ids));
+        assert!(names_a_new_key_id(&kept(&["atgk_kept"]), &ids));
+        assert!(names_a_new_key_id(&[(ResourceKind::Secrets, "atgk_kept".into())], &ids));
     }
 
     #[tokio::test]

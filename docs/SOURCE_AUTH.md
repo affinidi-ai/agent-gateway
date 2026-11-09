@@ -338,12 +338,12 @@ with the ids the gate checks (a legacy Caller Context secret only when a key of 
 exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
 has the id, `unavailable` for a key of any other surface, whose status is never reported,
 and `unknown`, as the gate's `store_unavailable`, for every id when the API key store cannot be
-read, and for an id no loaded key folder holds while a key folder cannot be loaded. A same-tenant key of another surface that still serves under `warn` is
-`unavailable` too: a surface names only its own keys. The field is absent when the surface
-names no key id, and on the surface list and variant responses. It is read from this node's API
-key cache, so after a key is revoked on another node it can still say `active` until this node's
-cache sees the revocation, while the go-live recheck reads the key folders from disk and refuses
-the surface within `cache_refresh_interval_secs` (30 seconds when it is `0`).
+read, and for an id no loaded key folder holds while a key folder cannot be loaded. A
+same-tenant key of another surface that still serves under `warn` is `unavailable` too: a
+surface names only its own keys. The field is absent when the surface names no key id, and on
+the surface list and variant responses. The surface's own key folder is read from disk for it,
+so a key of the surface another node revoked, deleted or created is reported as stored; when
+that folder cannot be read, its keys are `unknown`.
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -1281,10 +1281,10 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
   deleted with "API-key parent Surface reference is not accessible"; neither tells the key's
   status. One the stored surface already named is kept, so a GET→PUT of that surface saves; the
   surface stays [not ready](#provider-keys-when-a-surface-goes-live) until it names an active key.
-  This rule reads this node's API key cache, so a save on this node can accept a new reference
-  to a key revoked on another node until this node's cache sees the revocation; the go-live
-  recheck reads the key folders from disk and refuses that surface within
-  `cache_refresh_interval_secs` (30 seconds when it is `0`).
+  A save that names a key id the stored surface did not already name reads the surface's own
+  key folder from disk, so a key of this surface another node revoked, deleted or created is
+  judged as stored; when that folder cannot be read, the save answers `503` "API key store is
+  unavailable". A save that only keeps the key ids the stored surface named reads no folder.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
