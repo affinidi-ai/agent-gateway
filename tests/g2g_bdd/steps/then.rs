@@ -287,6 +287,63 @@ pub async fn request_at_path_had_empty_body(
     );
 }
 
+/// `host` and `content-length` are left out: the HTTP client sets them for the
+/// connection and the body, whoever sends the request.
+#[then(
+    expr = "the {word} request at path {string} that gateway {int} sent to managed agent {string} carried only headers {string}"
+)]
+pub async fn request_at_path_from_gateway_carried_only_headers(
+    world: &mut G2gWorld,
+    method: String,
+    path: String,
+    gw_index: usize,
+    target_name: String,
+    expected: String,
+) {
+    let (target_gw, _) = world.target(&target_name);
+    assert_eq!(
+        target_gw, gw_index,
+        "managed agent '{target_name}' is behind gateway {target_gw}, not gateway {gw_index}"
+    );
+    let request = only_request_matching(world, &target_name, &method, &path).await;
+    let received: BTreeSet<&str> = request
+        .header_values
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !matches!(*name, "host" | "content-length"))
+        .collect();
+    let expected: BTreeSet<&str> = expected
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(received, expected, "headers of {method} {path} that gateway {gw_index} sent to '{target_name}'");
+}
+
+#[then(expr = "the {word} request at path {string} to managed agent {string} carried the caller's A2A message parts")]
+pub async fn request_at_path_carried_callers_message_parts(
+    world: &mut G2gWorld,
+    method: String,
+    path: String,
+    target_name: String,
+) {
+    let request = only_request_matching(world, &target_name, &method, &path).await;
+    let sent = world
+        .sent_body
+        .as_ref()
+        .expect("a When must record the sent body before this Then");
+    let parts = sent
+        .pointer("/params/message/parts")
+        .expect("the caller sent an A2A message");
+    assert_eq!(
+        request
+            .json_body()
+            .pointer("/params/message/parts"),
+        Some(parts),
+        "{method} {path} to managed agent '{target_name}' must carry the caller's message parts, got '{}'",
+        request.raw_body
+    );
+}
+
 #[then(regex = r#"^gateway (\d+) did not receive a fabric forward request$"#)]
 pub async fn gateway_did_not_receive_fabric_forward_request(
     world: &mut G2gWorld,
@@ -537,6 +594,42 @@ async fn vp_audit_log_of_gateway_records_failed_identity_binding(
         .await
         .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
     assert!(found, "expected gateway {gateway} to record a failed identity binding because {reason}, got {events:?}");
+}
+
+/// A `target_auth_failed` record of a Fabric request to the surface: `refused`
+/// when `target.auth.fallback` is `reject`, `forwarded without it` under `passthrough`.
+#[then(
+    regex = r#"^the VP Audit Log of gateway (\d+) records that the Target credential of surface "([^"]+)" was not sent on a Fabric request, which was (refused|forwarded without it)$"#
+)]
+async fn vp_audit_log_records_unsent_target_credential_over_fabric(
+    world: &mut G2gWorld,
+    gateway: usize,
+    surface_name: String,
+    outcome: String,
+) {
+    let (_, surface_id) = world.surface(&surface_name);
+    let outcome = if outcome == "refused" {
+        "rejected"
+    } else {
+        "passthrough"
+    };
+    let (found, events) = world
+        .harness()
+        .gw(gateway)
+        .admin
+        .wait_for_audit_event(|event| {
+            let rejected = &event["event"]["request_rejected"];
+            rejected["reason"] == "target_auth_failed"
+                && rejected["target_auth"]["outcome"] == outcome
+                && event["via_fabric"] == true
+                && event["surface_id"] == surface_id.as_str()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("the VP Audit Log of gateway {gateway} must be readable: {error:#}"));
+    assert!(
+        found,
+        "expected gateway {gateway} to record a {outcome} target_auth_failed Fabric request to surface '{surface_id}', got {events:?}"
+    );
 }
 
 #[then(

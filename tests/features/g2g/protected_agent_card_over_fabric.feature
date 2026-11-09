@@ -22,16 +22,34 @@ Feature: Protected agent card fetch over Fabric
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-forwarded-user"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-caller-note"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-gateway-trace-id"
+    And the GET request at path "/.well-known/agent-card.json" that gateway 2 sent to managed agent "bravo" carried only headers "accept, accept-language, x-target-api-key"
 
   Scenario: gateway 2 refuses the agent card fetch when its Target credential cannot be resolved
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/agent-card.json"
     Then the response status is 502
     And the response detail is "Target authentication failed"
     And managed agent "bravo" was not called
+    And the VP Audit Log of gateway 2 records that the Target credential of surface "alpha" was not sent on a Fabric request, which was refused
+
+  Scenario: gateway 2 under fallback passthrough fetches its configured card location without its Target credential
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" publishes an agent card naming DID "did:example:bravo"
+    And surface "alpha" fetches its agent card from path "/cards/me"
+    And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback passthrough
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And the VP Audit Log of gateway 2 keeps every audit event
+    When the caller sends a GET request with an A2A message body to gateway 1 surface "charlie" path "/cards/me"
+    Then the response status is 200
+    And the response says "did:example:bravo"
+    And the GET request at path "/cards/me" to managed agent "bravo" did not carry header "x-target-api-key"
+    And the GET request at path "/cards/me" to managed agent "bravo" had an empty body
+    And the VP Audit Log of gateway 2 records that the Target credential of surface "alpha" was not sent on a Fabric request, which was forwarded without it
 
   Scenario: gateway 2 fetches the agent card with its credential provider's token
     Given a fabric with 2 gateways
@@ -146,6 +164,17 @@ Feature: Protected agent card fetch over Fabric
     And managed agent "bravo" received a GET request at path "/.well-known/agent.json"
     And the GET request at path "/.well-known/agent.json" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
 
+  Scenario: gateway 2 presents its credential provider's token when it reads the agent card for its surface policy
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And managed agent "bravo" publishes an agent card naming DID "did:example:bravo"
+    And surface "alpha" authenticates to its managed agent with a client credentials provider
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    And surface "alpha" has a request policy that allows only requests whose Target agent card names DID "did:example:bravo"
+    When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
+    Then the response status is 200
+    And the GET request at path "/.well-known/agent.json" to managed agent "bravo" carried header "authorization" with value "Bearer bdd-target-provider-token"
+
   Scenario: gateway 2 reads the agent card for its surface policy once for two requests
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
@@ -185,6 +214,33 @@ Feature: Protected agent card fetch over Fabric
       | /discovery                        | /discovery                        |
       | /.well-known/ucp                  | /.well-known/ucp                  |
       | /x/agent-card.json                | /x/agent-card.json                |
+
+  Scenario: gateway 2 forwards an authenticated caller's POST to its configured card location with its body and Target credential
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" fetches its agent card from path "/cards/me"
+    And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a POST request to gateway 1 surface "charlie" path "/cards/me" with headers
+      | x-api-key | bdd-source-api-key |
+    Then the response status is 200
+    And managed agent "bravo" received a POST request at path "/cards/me"
+    And the POST request at path "/cards/me" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
+    And the POST request at path "/cards/me" to managed agent "bravo" carried the caller's A2A message parts
+
+  Scenario: gateway 2 forwards a POST to its configured card location from a caller without an API key without its Target credential
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" fetches its agent card from path "/cards/me"
+    And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a POST request to gateway 1 surface "charlie" path "/cards/me"
+    Then the response status is 200
+    And managed agent "bravo" received a POST request at path "/cards/me"
+    And the POST request at path "/cards/me" to managed agent "bravo" did not carry header "x-target-api-key"
+    And the POST request at path "/cards/me" to managed agent "bravo" carried the caller's A2A message parts
 
   Scenario: gateway 2 does not treat a card path whose case differs as its agent card fetch
     Given a fabric with 2 gateways

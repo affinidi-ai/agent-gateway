@@ -376,10 +376,9 @@ async fn send_method_request_to_surface_path(
     for (name, value) in &headers {
         request = request.header(name.as_str(), value.as_str());
     }
-    match body {
-        Some(body) => request = request.json(&body),
-        None if method == reqwest::Method::POST => request = request.json(&build_a2a_request_body()),
-        None => {}
+    if let Some(body) = body.or_else(|| (method == reqwest::Method::POST).then(build_a2a_request_body)) {
+        request = request.json(&body);
+        world.sent_body = Some(body);
     }
     let response = request
         .send()
