@@ -20,6 +20,7 @@ pub fn create_credential_providers_router(
     vault: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
     resource_origins: std::collections::HashMap<String, Vec<String>>,
     issuers: Option<std::collections::HashMap<String, Vec<String>>>,
+    references: super::references::ReferenceStores,
 ) -> Router {
     let state = handlers::CredentialProviderState {
         store,
@@ -32,6 +33,8 @@ pub fn create_credential_providers_router(
         egress_allowlist: crate::egress::bdd_egress_allowlist(),
         resource_origins: Arc::new(resource_origins),
         issuers: Arc::new(issuers),
+        references,
+        rbac: guard.clone(),
     };
     let gate = guard.as_ref();
     Router::new()

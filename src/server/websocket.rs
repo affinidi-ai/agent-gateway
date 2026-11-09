@@ -8,7 +8,7 @@ use axum::{
     },
     http::{
         HeaderMap, StatusCode,
-        header::{AUTHORIZATION, COOKIE, ORIGIN},
+        header::{AUTHORIZATION, ORIGIN},
     },
     response::{IntoResponse, Response},
 };
@@ -345,7 +345,7 @@ async fn verify_websocket_terms(
 }
 
 /// Extract session token from Authorization header, rejected query parameters, or cookies.
-/// Priority: Authorization Bearer header > rejected `token` query param > `session_token` cookie.
+/// Priority: Authorization Bearer header > rejected `token` query param > `__Host-session_token` cookie.
 fn extract_session_token(
     headers: &HeaderMap,
     params: &HashMap<String, String>,
@@ -373,27 +373,10 @@ fn extract_session_token(
         }
     }
 
-    if let Some(cookie_header) = headers.get(COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        for cookie in cookie_str.split(';') {
-            let parts: Vec<&str> = cookie
-                .trim()
-                .splitn(2, '=')
-                .collect();
-            if parts.len() == 2 && parts[0] == crate::auth::session_cookie::SESSION_COOKIE_NAME {
-                let token = parts[1].trim();
-                if !token.is_empty() {
-                    return Some(SessionToken {
-                        token: token.to_string(),
-                        source: SessionTokenSource::Cookie,
-                    });
-                }
-            }
-        }
-    }
-
-    None
+    crate::auth::session_cookie::session_cookie_value(headers).map(|token| SessionToken {
+        token: token.to_string(),
+        source: SessionTokenSource::Cookie,
+    })
 }
 
 fn build_allowed_websocket_origins(network_config: &crate::config::NetworkConfig) -> HashSet<String> {
@@ -645,7 +628,7 @@ mod tests {
 
     fn session(terms_gate: crate::auth::session::TermsSessionGate) -> crate::auth::session::Session {
         crate::auth::session::Session {
-            token: "token".to_string(),
+            token_hash: crate::storage::filesystem::token_storage_id("token"),
             username: "user".to_string(),
             user_id: "user-1".to_string(),
             created_at: Utc::now(),
@@ -747,7 +730,7 @@ mod tests {
     fn test_extract_session_token_prefers_authorization_header() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer bearer-token"));
-        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+        headers.insert(COOKIE, HeaderValue::from_static("__Host-session_token=cookie-token"));
         let params = HashMap::from([(String::from("token"), String::from("query-token"))]);
 
         let token = extract_session_token(&headers, &params).expect("token should be extracted");
@@ -770,12 +753,20 @@ mod tests {
     #[test]
     fn test_extract_session_token_uses_cookie_when_present() {
         let mut headers = HeaderMap::new();
-        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+        headers.insert(COOKIE, HeaderValue::from_static("__Host-session_token=cookie-token"));
 
         let token = extract_session_token(&headers, &HashMap::new()).expect("token should be extracted");
 
         assert_eq!(token.token, "cookie-token");
         assert_eq!(token.source, SessionTokenSource::Cookie);
+    }
+
+    #[test]
+    fn test_extract_session_token_ignores_the_unprefixed_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("session_token=cookie-token"));
+
+        assert!(extract_session_token(&headers, &HashMap::new()).is_none());
     }
 
     #[test]

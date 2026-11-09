@@ -106,9 +106,10 @@ pub enum CardAuthResult {
     Failed,
 }
 
-/// Why the gateway did not obtain its Target credential. `Forbidden`,
-/// `InvalidHeader`, `OutsideTargetBase` and `HeaderConflict` are never reported;
-/// they keep the spellings the dashboard accepts.
+/// Why the gateway did not obtain its Target credential. `Forbidden` is a credential
+/// a `[credential_policy]` rule in `enforce` withholds, and `InvalidHeader` a stored one
+/// whose header breaks a header rule. `OutsideTargetBase` and `HeaderConflict` are never
+/// reported; they keep the spellings the dashboard accepts.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(not(test), expect(dead_code))]
@@ -133,6 +134,8 @@ impl CardAuthFailure {
             | TargetAuthError::SecretNotFound
             | TargetAuthError::ServiceToken(ServiceTokenError::SecretUnavailable) => Self::SecretUnavailable,
             TargetAuthError::ProviderNotFound => Self::ProviderNotFound,
+            TargetAuthError::Withheld(_) => Self::Forbidden,
+            TargetAuthError::InvalidHeader => Self::InvalidHeader,
             TargetAuthError::ProviderNeedsConsent | TargetAuthError::ServiceToken(ServiceTokenError::Unsupported) => {
                 Self::Unsupported
             }
@@ -237,7 +240,6 @@ pub struct AgentCardPreview {
     pub cached: bool,
     pub fetch: Option<CardFetchReport>,
     pub auth: Option<CardAuthReport>,
-    pub payment_required: bool,
     outcome: (),
     pub before: Option<serde_json::Value>,
     pub after: Option<serde_json::Value>,
@@ -266,7 +268,6 @@ impl AgentCardPreview {
             cached: false,
             fetch: None,
             auth: None,
-            payment_required: false,
             outcome: (),
             before: None,
             after: None,
@@ -532,7 +533,8 @@ impl PreviewMemory {
     }
 
     /// The preview of the running `state`, fetched for `caller` within the fetch
-    /// limits. Past either limit, a read answers with the last preview of the same
+    /// limits. A surface deriving a DID from an API key it may not use gets no
+    /// preview and no fetch. Past either limit, a read answers with the last preview of the same
     /// running surface, marked `cached`; a refresh, or a read without one, is
     /// [`RateLimited`]. Every fetch is audited.
     pub(crate) async fn preview(
@@ -545,6 +547,13 @@ impl PreviewMemory {
             .surface
             .surface_id
             .as_str();
+        if crate::identity::provider_key_gate::gate()
+            .refuses(&state.surface)
+            .await
+            .is_some()
+        {
+            return Ok(AgentCardPreview::unsupported(surface_id, UnsupportedReason::NotRunning));
+        }
         let digest = surface_digest(&state.surface);
         if let Err(limited) = self.admit(caller.user_id, surface_id) {
             if request == PreviewRequest::Refresh {
@@ -612,9 +621,10 @@ async fn fetch_preview(
     let fetched_at = Utc::now();
     let mut headers = HeaderMap::new();
     headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
-    let built = tokio::time::timeout(deadline, build_public_card(state, &headers, PREVIEW_SOURCE, CardMode::Preview))
-        .await
-        .ok();
+    let built =
+        tokio::time::timeout(deadline, build_public_card(state, &headers, PREVIEW_SOURCE, CardMode::Preview, None))
+            .await
+            .ok();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut auth = CardAuthReport::for_surface(surface);
@@ -669,7 +679,6 @@ async fn fetch_preview(
         fetched_at: Some(timestamp(fetched_at)),
         fetch: Some(fetch),
         auth: Some(auth),
-        payment_required: crate::proxy::handler::card_payment_gates(surface).any(),
         before,
         after,
         before_bytes,
@@ -802,8 +811,8 @@ mod tests {
             json!({
                 "surface_id": "s-1", "supported": false, "unsupported_reason": "not_a2a", "variant": null,
                 "generated": false, "served_url": null, "source_url": null, "source_url_query_hidden": false,
-                "fetched_at": null, "cached": false, "fetch": null, "auth": null, "payment_required": false,
-                "outcome": null, "before": null, "after": null, "before_bytes": null, "after_bytes": null,
+                "fetched_at": null, "cached": false, "fetch": null, "auth": null, "outcome": null,
+                "before": null, "after": null, "before_bytes": null, "after_bytes": null,
                 "display_limit_bytes": 0, "last_caller_fetch": null
             })
         );
@@ -967,6 +976,11 @@ mod tests {
             (TargetAuthError::SecretNotFound, CardAuthFailure::SecretUnavailable),
             (TargetAuthError::ProviderNotFound, CardAuthFailure::ProviderNotFound),
             (TargetAuthError::ProviderNeedsConsent, CardAuthFailure::Unsupported),
+            (
+                TargetAuthError::Withheld(crate::config::target_auth_rules::TargetCredentialRule::Https),
+                CardAuthFailure::Forbidden,
+            ),
+            (TargetAuthError::InvalidHeader, CardAuthFailure::InvalidHeader),
             (TargetAuthError::ServiceToken(ServiceTokenError::TokenRequestFailed), CardAuthFailure::TokenUnavailable),
             (TargetAuthError::ServiceToken(ServiceTokenError::TokenEndpointRefused), CardAuthFailure::TokenUnavailable),
             (
@@ -1103,31 +1117,6 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_reports_a_payment_only_when_the_card_route_asks_for_one() {
-        let paid = |payment_policy: serde_json::Value| {
-            crate::proxy::handler::card_payment_gates(&surface_with(
-                "s",
-                json!({"endpoint": "https://agent.example", "payment_policy": payment_policy}),
-            ))
-            .any()
-        };
-        assert!(paid(json!({"type": "x402", "enabled": true})));
-        assert!(!paid(json!({"type": "x402", "enabled": false})));
-        assert!(
-            !paid(json!({"type": "x402", "enabled": true, "provider": "agent_pay",
-                "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface"})),
-            "a delegated x402 policy does not paywall the card"
-        );
-        assert!(
-            !crate::proxy::handler::card_payment_gates(&surface_with(
-                "s",
-                json!({"endpoint": "https://agent.example"})
-            ))
-            .any()
-        );
-    }
-
-    #[test]
     fn the_digest_changes_with_the_surface() {
         let surface = |endpoint: &str| surface_with("s", json!({"endpoint": endpoint}));
         assert_eq!(surface_digest(&surface("https://a.example")), surface_digest(&surface("https://a.example")));
@@ -1146,7 +1135,7 @@ mod tests {
 
         assert_eq!(fetch_of(&preview), (CardFetchStatus::Ok, None, None));
         assert_eq!(auth_of(&preview), (CardAuthKind::None, CardAuthResult::NotConfigured, None));
-        assert!(preview.supported && !preview.cached && !preview.generated && !preview.payment_required);
+        assert!(preview.supported && !preview.cached && !preview.generated);
         assert_eq!(preview.before, Some(agent_card()));
         assert_eq!(preview.before_bytes, Some(serialized_len(&agent_card())));
         let after = preview.after.clone().unwrap();
@@ -1183,6 +1172,64 @@ mod tests {
                 && !received
                     .headers
                     .contains_key("cookie")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_surface_naming_another_tenants_api_key_gets_no_preview_and_no_fetch() {
+        let _gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))],
+            &[("owner-a", "atgk_preview_a"), ("owner-b", "atgk_preview_b")],
+        )
+        .await;
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let naming = |surface_id: &str, key_id: &str| {
+            let mut surface = surface_with(surface_id, json!({"endpoint": target.url()}));
+            surface.tenant_id = Some("tenant-a".into());
+            surface
+                .identity_slots
+                .external =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": key_id})).unwrap());
+            surface
+        };
+        let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
+
+        let refused = memory
+            .preview(&running(naming("cross", "atgk_preview_b")).await, &caller("u-gate"), PreviewRequest::Read)
+            .await
+            .unwrap();
+        assert_eq!(refused, AgentCardPreview::unsupported("cross", UnsupportedReason::NotRunning));
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            0,
+            "a not-ready surface is never fetched"
+        );
+        assert!(
+            memory
+                .previews
+                .get("cross")
+                .await
+                .is_none()
+                && memory
+                    .good_cards
+                    .get("cross")
+                    .await
+                    .is_none(),
+            "nothing is kept"
+        );
+
+        let shown = memory
+            .preview(&running(naming("own", "atgk_preview_a")).await, &caller("u-gate"), PreviewRequest::Read)
+            .await
+            .unwrap();
+        assert_eq!(fetch_of(&shown), (CardFetchStatus::Ok, None, None));
+        assert_eq!(
+            target
+                .request_count
+                .load(Ordering::SeqCst),
+            1
         );
     }
 
@@ -1369,8 +1416,33 @@ mod tests {
             "method": {"static_secret": {"secret_id": "missing", "header_name": "x-key"}}}}))
         .await;
 
-        let (preview, _) = fetch_preview(&state, Duration::from_secs(5)).await;
+        let ((preview, _), events) =
+            crate::audit::producer::capture(fetch_preview(&state, Duration::from_secs(5))).await;
 
+        let records: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                crate::delegation_vault::audit::DelegationAuditAction::RequestRejected {
+                    reason, target_auth, ..
+                } => Some((
+                    *reason,
+                    target_auth
+                        .as_ref()
+                        .map(|detail| detail.outcome),
+                    event.surface_id.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            records,
+            vec![(
+                crate::audit::request_events::RejectionReason::TargetAuthFailed,
+                Some(crate::audit::request_events::TargetAuthOutcome::Rejected),
+                Some("orders".to_string())
+            )],
+            "the preview records the credential it could not obtain once"
+        );
         assert_eq!(fetch_of(&preview), (CardFetchStatus::Failed, Some(CardFetchCause::AuthFailed), None));
         assert_eq!(
             auth_of(&preview),

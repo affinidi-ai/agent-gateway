@@ -31,8 +31,9 @@ leaves a secret out keeps it, and one that sends it as `null` clears it. A secre
 instead hold `$SECRET:<secret_id>`, a reference to an appliance-wide secret in the secrets
 store, resolved at each delivery and shown in responses as written; a reference that does not
 resolve fails the delivery. Only a value that is the reference as a whole counts. Deleting a
-secret that an endpoint references is refused with `409` naming the endpoints; change or
-delete those endpoints first. Changing the secret's value is allowed, and the next delivery
+secret that an endpoint references is refused with `409` naming the endpoints, even with
+`?force=true`, which overrides only references from surfaces, credential providers, A2A proxies
+and STS clients; change or delete those endpoints first. Changing the secret's value is allowed, and the next delivery
 uses it. Only appliance-wide secrets resolve; a tenant-owned one never does. No `secrets.*`
 permission is checked when a reference is saved or resolved, so `integrations.edit` can use, and
 therefore read, every appliance-wide secret: pointing an endpoint that holds a reference at a
@@ -110,7 +111,12 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Connection point | `connection_point.created`, `updated`, `deleted`, `connected` |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
+| Payment | `payment.challenge_issued`, `paid`, `held`, `rejected`, `unconfirmed`, `unavailable`, `authorized`, `voided`, `capture_failed`, `reconcile_failed`: the outcomes of payments delegated to a connected agent-pay gateway |
 | Audit | `audit.<event>` for every event of the audit catalog ([`src/audit/catalog.rs`](../src/audit/catalog.rs)) |
+
+This gateway verifies no x402 or MPP payment itself, so `x402.verification.failed` and the three
+`mpp.*` events stay in the catalog, where existing integrations name them, but are never raised.
+The other x402 events come from settling and pruning x402 payments recorded before.
 
 A passkey registration raises `user.created`, and an administrator's approval `user.approved`. A
 SAML sign-in that creates the user raises `user.created`; SAML users are approved on creation,
@@ -131,6 +137,41 @@ These integration events are separate from the [event hook](#event-hook) calls o
 names. The event hook's `created` and `deleted` also report the connection points the gateway
 creates and removes itself, and its `connected` reports a listener's first mediator connection,
 not a pairing.
+### Delegated payment events
+
+The payment gate raises one `payment.*` event per call to a connected agent-pay gateway
+([`payment_gate_integration_triggers.rs`](../src/integrations/payment_gate_integration_triggers.rs)).
+They go to every active integration whose event set holds the event.
+
+| Event | Meaning |
+| --- | --- |
+| `payment.challenge_issued` | The payment gateway answered with a payment challenge |
+| `payment.paid` | The payment gateway accepted the payment |
+| `payment.held` | The payment gateway held the payment for review |
+| `payment.rejected` | The payment gateway rejected the payment, or the credential had already been used for a request this gateway forwarded |
+| `payment.unconfirmed` | The payment gateway did not say whether the payment was taken, or is still working on it; the caller was told to retry the same request with the same credential within 120 seconds |
+| `payment.authorized` | The payment gateway held the funds until the Target delivers |
+| `payment.voided` | Held funds were released because the Target did not deliver |
+| `payment.capture_failed` | The Target delivered but capturing the held funds failed |
+| `payment.reconcile_failed` | A held or unconfirmed payment could not be settled before its deadline |
+| `payment.unavailable` | The payment gateway could not be reached or gave no usable answer, or the surface still carries an unsupported local x402 or MPP policy |
+
+Each carries `SURFACE_ID`, `VARIANT`, `PAYMENT_GATEWAY_ID`, `PAYMENT_SURFACE_ID`, `RESOURCE`,
+`RAIL` (`x402` or `mpp`, empty when the request carried no credential and the payment surface offers both), `AMOUNT`, `CURRENCY`, `CASE_ID` (a held payment's review case),
+`REMOTE_STATUS` (the payment gateway's HTTP status), `TRACE_ID`, `AUTHORIZATION_ID` (agent-pay's
+authorization of funds held until delivery), `RECEIPT_REFERENCE` (the MPP receipt reference or x402
+settlement transaction hash), `QUOTED_AMOUNT` and `QUOTED_CURRENCY` (the manifest price, set only
+when the receipt charged another), `PRICE_MISMATCH` (`true` or `false`), `REASON` (why the payment
+was refused, failed or released, as the ledger row keeps it: clipped to 200 characters with
+credential-shaped words redacted), and `SEVERITY` (`info` for
+`paid`, `challenge_issued`, `held`, `authorized` and `voided`, `warning` for `rejected` and `unconfirmed`, `error` for `unavailable`, `capture_failed` and `reconcile_failed`),
+alongside `EVENT_TYPE` and `TIMESTAMP`. A value that is absent is an empty string. No payer
+identity or credential is included. The governance audit forwarding of a `payment` record carries
+only the fingerprint of its signed credential (`AUDIT_VP_FINGERPRINT`); `AUDIT_VP_JWT` is empty
+for it (see [`OBSERVABILITY.md`](OBSERVABILITY.md#payment-credentials-in-the-audit-trail)).
+
+A surface that still carries a local x402 or MPP policy raises
+`payment.unavailable` at most once a minute, whatever the request rate.
 
 ## Templates
 
@@ -157,8 +198,8 @@ Every event fills these variables, plus its own:
 
 The computed variables (`EVENT_TYPE`, `EVENT_NAME`, `EVENT_SUMMARY`, `EVENT_DATA`,
 `APPLIANCE_ID`) are always set by the gateway, never by the code that raised the event. Each
-event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`, and
-`GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
+event's own variables, such as `GATEWAY_ID`, `GATEWAY_NAME`, `GATEWAY_DID`,
+`GATEWAY_ROLE` (`Peer` or `Payment`) and `GATEWAY_STATUS` for a gateway event, are listed in the catalog. Gateway and user events, and
 the connection point `created`, `updated` and `deleted` events, also carry `OLD_STATE` and
 `NEW_STATE`: the resource before and after the change as JSON, empty for a create or a delete
 respectively. A connection point's state leaves out its invitation (`oob_id`, `oob_url`,
@@ -626,13 +667,18 @@ logged.
 Separate from integrations, the gateway keeps notifications for dashboard users, shown in
 the top bar.
 
-| Route | Purpose |
-| --- | --- |
-| `GET`, `POST /v1/notifications` | List and create |
-| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one |
-| `GET /v1/notifications/unread/count` | The badge count |
-| `POST /v1/notifications/send-welcome` | Send the welcome message |
-| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template |
+| Route | Purpose | Permission |
+| --- | --- | --- |
+| `GET`, `POST /v1/notifications` | List and create | Session |
+| `GET`, `PUT`, `DELETE /v1/notifications/{id}` | Read, update, or delete one | Session |
+| `GET /v1/notifications/unread/count` | The badge count | Session |
+| `POST /v1/notifications/send-welcome` | Send the welcome message | `users.approve` |
+| `GET`, `PUT /v1/notifications/user-welcome-template` | Read or change the welcome template | `users.approve` |
+
+The session routes act on the caller's own notifications. The welcome routes need
+`users.approve`, which the built-in defaults grant to `administrator` only, and refuse every
+request with `403` when no auth backend is configured; `send-welcome` sends to the user named in
+the request. See [`RBAC.md`](RBAC.md#maintenance-and-welcome-routes).
 
 Welcome messages for administrators and users start from the templates
 [`admin_welcome.json`](../src/integrations/admin_welcome.json) and
@@ -652,6 +698,7 @@ endpoint, an event set and an integration, all three with the old integration's 
 - **Event set:** the events it actually received. That means:
   - the event types of its gateway and user attachments (an empty list meant all of them);
   - every x402 or MPP event for those categories;
+  - every `payment.*` event for an appliance-wide `payment` integration;
   - `connection_point.connected` when a connection point named it;
   - for an appliance-wide `audit` integration, the audit records the previous version
     forwarded, including the three the VP Audit Log settings gated.
@@ -659,7 +706,7 @@ endpoint, an event set and an integration, all three with the old integration's 
   limits of 7 days and 20 attempts, since unset means retried forever.
 - **Endpoint only:** an integration that received nothing keeps only its endpoint, so its
   destination is not lost. This covers `surface`, `identity` and unattached
-  `general`/`connection_point` integrations, and tenant-owned `audit` ones.
+  `general`/`connection_point` integrations, and tenant-owned `audit` and `payment` ones.
 
 **What changes, for each integration the report names:**
 - **Scope:** an integration attached to some gateways or connection points now receives the

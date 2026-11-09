@@ -22,6 +22,7 @@ pub fn caller_authentication_method_json(config: &SurfaceSourceAuthConfig) -> Va
             "type": "jwt_bearer",
             "jwt_verification_strategy_id": "bdd-jwt-strategy",
             "audiences": &cfg.audiences,
+            "forward_header": cfg.forward_header,
         }),
         SurfaceSourceAuthConfig::ApiKey(cfg) => api_key_source_auth_method_json(&cfg.header_name, &cfg.secret_id),
         SurfaceSourceAuthConfig::ApiKeyProvider(cfg) => json!({
@@ -57,6 +58,7 @@ mod tests {
             jwks_url: "https://example.test/.well-known/jwks.json".to_string(),
             issuer: "https://example.test/".to_string(),
             audiences: vec![],
+            forward_header: false,
         });
         let api_key = SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
             header_name: "x-api-key".to_string(),

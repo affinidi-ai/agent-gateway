@@ -16,8 +16,8 @@ use crate::observability::loggable;
 use crate::state::{MultiSurfaceProxyState, SurfaceInfo};
 
 // ── Credential delegation global stores ──────────────────────────────────────
-// Follows the same OnceLock pattern used for mpp_transaction_store and
-// trust_registry_listener_manager in gateways/connection_points/message_processor.rs
+// Follows the same OnceLock pattern used for trust_registry_listener_manager
+// in gateways/connection_points/message_processor.rs
 
 static GLOBAL_CREDENTIAL_PROVIDER_STORE: OnceLock<
     Arc<dyn crate::credential_providers::storage::CredentialProviderStorage>,
@@ -83,6 +83,17 @@ fn cors_request_method(request_parts: &RequestParts) -> String {
 
 fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
     cors_layer(cors_origins, false)
+}
+
+/// Removes every `Set-Cookie` and `Set-Cookie2` from an Access Point's answer.
+/// The target shares the caller-facing host with the gateway's dashboard, so a
+/// cookie it sets would land on the dashboard's origin; and the caller's
+/// cookies are never forwarded to it, so a cookie it sets could never come back.
+async fn withhold_target_cookies(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.remove(axum::http::header::SET_COOKIE);
+    headers.remove("set-cookie2");
+    response
 }
 
 /// CORS for protected resource metadata: browser MCP clients on any origin
@@ -218,7 +229,7 @@ fn extract_hostname(url: &str) -> Option<String> {
 /// the inbound listener on `inbound_port`. Returns `None` when no overlap exists
 /// (i.e. inbound and outbound have fully separate domains).
 ///
-/// Used by `run_port_server` to decide whether to register the `/outbound/*`
+/// Used by `build_port_router` to decide whether to register the `/outbound/*`
 /// reverse-proxy on the inbound port.
 pub(crate) fn find_shared_outbound_listener(
     network_config: &crate::config::NetworkConfig,
@@ -612,9 +623,11 @@ pub(crate) fn open_transit_points(
         .collect()
 }
 
-/// Run a listener for a specific port that handles multiple channels with different routes
-/// Returns the MultiSurfaceProxyState for this port so channels can be updated dynamically
-pub async fn run_port_server(
+/// Build the router of the inbound listener on `port`, which serves every
+/// surface on that port, with the MultiSurfaceProxyState its routes share so
+/// those surfaces can be updated in place. Binding the port is left to the
+/// caller, so a rebuilt router can replace the one a bound listener serves.
+pub async fn build_port_router(
     port: u16,
     surfaces: Vec<crate::config::agent_surface::AgentSurface>,
     _tls_acceptor: TlsAcceptor,
@@ -623,18 +636,15 @@ pub async fn run_port_server(
     bootstrap_config: Arc<crate::config::BootstrapConfig>,
     metrics_store: Option<Arc<crate::metrics::MetricsStore>>,
     task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    task_id: Option<String>,
     ws_state: Option<Arc<crate::server::WsState>>,
     vc_issuer: Option<Arc<crate::identity::VCIssuer>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
-    state_sender: Option<tokio::sync::oneshot::Sender<Arc<crate::state::MultiSurfaceProxyState>>>,
     identity_api_router: Option<axum::Router>,
     onboarding_router: Option<axum::Router>,
     did_router: Option<axum::Router>,
     secrets_router: Option<axum::Router>,
     secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>>,
     network_config: Arc<crate::config::NetworkConfig>,
-    use_tls: bool,
     policy_manager: Option<Arc<crate::policies::SurfacePolicyManager>>,
     gateway_policy_manager: Option<Arc<crate::policies::GatewayPolicyManager>>,
     mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
@@ -644,16 +654,13 @@ pub async fn run_port_server(
     _notification_store: Option<Arc<crate::integrations::FileSystemNotificationStore>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
-    direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     resolved_surface_cache: Arc<crate::surfaces::ResolvedSurfaceCache>,
     #[cfg(feature = "didwebvh")] didwebvh_identity_store: Option<
         Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>,
     >,
     #[cfg(feature = "didwebvh")] didwebvh_log_storage: Option<Arc<dyn crate::storage::DidLogStorage>>,
-) -> anyhow::Result<()> {
-    let _task_id = task_id.unwrap_or_else(|| format!("port-{}-{}", port, uuid::Uuid::new_v4()));
-
-    info!("Starting port listener on port {} for {} channel(s)", port, surfaces.len());
+) -> anyhow::Result<(Router, Arc<MultiSurfaceProxyState>)> {
+    info!("Building the port listener router on port {} for {} channel(s)", port, surfaces.len());
 
     // Build channel info for each channel on this port
     let mut channel_infos = Vec::new();
@@ -908,20 +915,6 @@ pub async fn run_port_server(
 
     let channel_infos_arc = Arc::new(RwLock::new(channel_infos));
 
-    // Use the global transaction store (created unconditionally in orchestrator.rs)
-    // This single store handles ALL x402 operations:
-    // - HTTP payment middleware (GW1 role: create payment, send to facilitator)
-    // - DIDComm message handlers (GW2 role: receive verify/settle requests)
-    // - Admin API (serves UI data)
-    // - Settlement worker (processes transactions where facilitator_gateway_id == this gateway)
-    let transaction_store = crate::gateways::connection_points::message_processor::get_transaction_store();
-    if transaction_store.is_none() {
-        warn!("Transaction store not initialized - x402 payment processing will fail");
-    }
-
-    // Transaction store workers (cleanup, crash recovery, settlement) are spawned in orchestrator.rs
-    // No duplicate workers needed here - all x402 operations use the single global store
-
     let state = Arc::new(MultiSurfaceProxyState {
         config: Arc::clone(&config),
         network_config: Arc::clone(&network_config),
@@ -937,8 +930,6 @@ pub async fn run_port_server(
         policy_manager: policy_manager.clone(),
         gateway_policy_manager: gateway_policy_manager.clone(),
         didauth_session_store: Arc::clone(&didauth_session_store),
-        transaction_store: transaction_store.clone(),
-        mpp_transaction_store: crate::gateways::connection_points::message_processor::get_mpp_transaction_store(),
         trust_registry_listener_manager:
             crate::gateways::connection_points::message_processor::get_trust_registry_listener_manager(),
         source_auth_middleware: source_auth_middleware.clone(),
@@ -960,11 +951,6 @@ pub async fn run_port_server(
         a2a_proxy_store: a2a_proxy_store.clone(),
         resolved_surface_cache: resolved_surface_cache.clone(),
     });
-
-    // Send the state back to the caller if requested
-    if let Some(sender) = state_sender {
-        let _ = sender.send(state.clone());
-    }
 
     // Settlement worker is spawned in orchestrator.rs - no duplicate needed here
 
@@ -995,6 +981,7 @@ pub async fn run_port_server(
                         "/.well-known/oauth-protected-resource/{*path}",
                         axum::routing::any(crate::protocols::protected_resource::protected_resource_metadata),
                     )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
                     .layer(if crate::protocols::protected_resource::proxies_metadata_paths(&network_config) {
                         proxy_cors_layer(&network_config.cors)
                     } else {
@@ -1204,6 +1191,7 @@ pub async fn run_port_server(
                         &format!("{}/{{{}}}", prefix, "*path"),
                         axum::routing::any(super::handler::multi_channel_proxy_handler),
                     )
+                    .layer(axum::middleware::map_response(withhold_target_cookies))
                     .layer(proxy_cors_layer(&network_config.cors))
                     .with_state(state.as_ref().clone());
 
@@ -1257,6 +1245,7 @@ pub async fn run_port_server(
         }
 
         let proxy_router = proxy_router
+            .layer(axum::middleware::map_response(withhold_target_cookies))
             .layer(axum::middleware::from_fn(crate::observability::trace_http_request))
             .layer(proxy_cors_layer(&network_config.cors))
             .with_state(state.as_ref().clone());
@@ -1331,39 +1320,11 @@ pub async fn run_port_server(
         }
     }
 
-    // x402 e2e test endpoints — gated on `facilitator_mode.enable_test_endpoints`.
-    // These are unauthenticated conformance surfaces (incl. POST /close) and
-    // must stay off in non-test deployments.
     if config
         .facilitator_mode
         .enable_test_endpoints
     {
-        info!("Adding x402 multi-chain test endpoints: /protected (EVM + Solana), /health, /close");
-
-        let test_endpoints_config = match bootstrap_config.load_test_endpoints_config() {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                warn!("Failed to load test endpoints config: {}. Test endpoints will use default values.", e);
-                Arc::new(crate::config::TestEndpointsConfig {
-                    evm: None,
-                    solana_devnet: None,
-                    solana_mainnet: None,
-                })
-            }
-        };
-
-        let x402_test_router = axum::Router::new()
-            .route("/protected", axum::routing::get(crate::x402::protected_eip3009))
-            .route("/protected-permit2", axum::routing::get(crate::x402::protected_permit2))
-            .route("/protected-solana-devnet", axum::routing::get(crate::x402::protected_solana_devnet))
-            .route("/protected-solana-mainnet", axum::routing::get(crate::x402::protected_solana_mainnet))
-            .route("/health", axum::routing::get(crate::x402::test_health))
-            .route("/close", axum::routing::post(crate::x402::test_close))
-            .with_state(test_endpoints_config);
-
-        app = app.merge(x402_test_router);
-    } else {
-        info!("x402 test endpoints disabled (facilitator_mode.enable_test_endpoints=false)");
+        warn!("facilitator_mode.enable_test_endpoints is ignored: the x402 test endpoints are no longer served");
     }
 
     // Proxy {TP_OUTBOUND_PATH_PREFIX}/* to the outbound listener when inbound and outbound share a hostname.
@@ -1415,17 +1376,11 @@ pub async fn run_port_server(
         app = app.merge(secrets_router_ref.clone());
     }
 
-    // Merge x402 HTTP Facilitator API router if enabled in gateway config
     if config
         .facilitator_mode
         .facilitator_via_http
     {
-        info!("Merging x402 HTTP Facilitator API router at /api/x402 (standard spec endpoints)");
-        let http_facilitator_state = crate::x402::HttpFacilitatorState {
-            channels: state.channels.clone(),
-        };
-        let http_facilitator_router = crate::x402::create_http_facilitator_router().with_state(http_facilitator_state);
-        app = app.nest("/api/x402", http_facilitator_router);
+        warn!("facilitator_mode.facilitator_via_http is ignored: the /api/x402 facilitator is no longer served");
     }
 
     // Process fallback routes last so they don't override specific routes
@@ -1511,9 +1466,7 @@ pub async fn run_port_server(
     // extension. No-op when the upstream extension is absent.
     let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
 
-    let bind_addrs = inbound_bind_addresses(&network_config, port)?;
-
-    info!("Port listener binding to {:?} for {} channels", bind_addrs, surfaces.len());
+    info!("Port listener router on port {} serves {} channels", port, surfaces.len());
     for surface in &surfaces {
         info!(
             "  Channel '{}' route '{}' -> {}",
@@ -1533,84 +1486,7 @@ pub async fn run_port_server(
         }
     }
 
-    // Serve with or without TLS based on protocol, on every address of the port.
-    let result: anyhow::Result<()> = async {
-        let listeners = bind_inbound_listeners(&bind_addrs).await?;
-        if use_tls {
-            info!("Port {} using TLS (HTTPS)", port);
-            // Load TLS config (with optional client auth verifier).
-            let tls_config = crate::server::load_server_config(
-                &config.tls.cert_path,
-                &config.tls.key_path,
-                direct_client_auth
-                    .as_deref()
-                    .cloned(),
-            )?;
-
-            // Create TLS listeners using axum_server. If direct client auth is
-            // enabled, wrap the acceptor so peer certs are captured into a
-            // per-request extension.
-            let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
-                axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
-            );
-            let servers = listeners
-                .into_iter()
-                .map(axum_server::Server::<SocketAddr>::from_listener);
-            if direct_client_auth.is_some() {
-                futures::future::try_join_all(servers.map(|server| {
-                    server
-                        .acceptor(crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor.clone()))
-                        .serve(
-                            app.clone()
-                                .into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                }))
-                .await?;
-            } else {
-                futures::future::try_join_all(servers.map(|server| {
-                    server
-                        .acceptor(rustls_acceptor.clone())
-                        .serve(
-                            app.clone()
-                                .into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                }))
-                .await?;
-            }
-        } else {
-            info!("Port {} using plain HTTP (no TLS)", port);
-            futures::future::try_join_all(
-                listeners
-                    .into_iter()
-                    .map(|listener| {
-                        axum::serve(
-                            listener,
-                            app.clone()
-                                .into_make_service_with_connect_info::<SocketAddr>(),
-                        )
-                        .into_future()
-                    }),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-    .await;
-
-    // Cleanup: Unregister tasks when server stops
-    if let Some(ref monitor) = task_monitor {
-        let channel_infos = channel_infos_arc.read().await;
-        info!("Port listener {} stopped, unregistering {} channel tasks", port, channel_infos.len());
-        for channel_info in channel_infos.iter() {
-            info!("Unregistering task {} for channel '{}'", channel_info.task_id, channel_info.surface.name);
-            monitor
-                .unregister_task(&channel_info.task_id)
-                .await;
-        }
-    }
-
-    result?;
-    Ok(())
+    Ok((app, state))
 }
 
 /// Get the shared outbound channel state for `config_id`.
@@ -1649,7 +1525,7 @@ fn get_or_create_outbound_channel_state(
 
 /// The socket address a listener binds on `port`, from its `bind_address`, an
 /// IPv4 or IPv6 address, the IPv6 one optionally in brackets.
-fn listener_socket_address(
+pub(crate) fn listener_socket_address(
     bind_address: &str,
     port: u16,
 ) -> anyhow::Result<SocketAddr> {
@@ -1663,7 +1539,7 @@ fn listener_socket_address(
 /// `bind_address` of every inbound listener configured for the port, the
 /// unspecified ones first (`::` before `0.0.0.0`). A port without an inbound
 /// listener is an error rather than a bind on every interface.
-fn inbound_bind_addresses(
+pub(crate) fn inbound_bind_addresses(
     network_config: &crate::config::NetworkConfig,
     port: u16,
 ) -> anyhow::Result<Vec<SocketAddr>> {
@@ -1718,7 +1594,7 @@ fn bound_listener_covers(
 /// Bind every inbound address of a port. An address the operating system
 /// reports in use while a listener already bound on the port accepts its
 /// connections, as an IPv6 dual-stack wildcard does for IPv4, is skipped.
-async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
+pub(crate) async fn bind_inbound_listeners(addresses: &[SocketAddr]) -> anyhow::Result<Vec<tokio::net::TcpListener>> {
     let mut listeners: Vec<tokio::net::TcpListener> = Vec::new();
     for &address in addresses {
         match tokio::net::TcpListener::bind(address).await {
@@ -1754,10 +1630,10 @@ pub(crate) fn retire_outbound_channel_state(retired: &std::sync::RwLock<crate::s
     state.identity_selector = None;
 }
 
-/// Run a simple outbound-only port listener.
+/// Build the router of an outbound-only port listener.
 ///
 /// This is the server-side counterpart of the outbound pipeline.  Unlike
-/// [`run_port_server`] (which serves a complex multi-channel inbound router)
+/// [`build_port_router`] (which builds a complex multi-channel inbound router)
 /// this function is intentionally minimal:
 /// - One route per `(channel, virtual_channel)` pair.
 /// - No identity API, no MCP proxies, no payment routes.
@@ -1765,15 +1641,11 @@ pub(crate) fn retire_outbound_channel_state(retired: &std::sync::RwLock<crate::s
 ///
 /// The caller is responsible for only passing channels that have `outbound.enabled = true`.
 ///
-/// Returns a map of `config_id → Arc<RwLock<OutboundSurfaceState>>` so the caller
-/// can store them for live updates (e.g. from `reload_single_channel`).
-///
-/// `states_registered` fires once every surface's state is in
-/// `outbound_channel_states`, before the listener binds, so a caller that waits
-/// for it never lets a later surface removal run before the state it must
-/// retire exists.
-pub async fn run_outbound_port_server(
-    bind_address: String,
+/// Every surface's state is in `outbound_channel_states` when this returns, so
+/// a later surface removal always finds the state it must retire. Binding the
+/// port is left to the caller, so a rebuilt router can replace the one a bound
+/// listener serves.
+pub async fn build_outbound_port_router(
     port: u16,
     channels: Vec<(crate::config::agent_surface::AgentSurface, Vec<crate::config::agent_surface::TransitPoint>)>,
     config: Arc<crate::config::GatewayConfig>,
@@ -1785,20 +1657,17 @@ pub async fn run_outbound_port_server(
     trust_registry_listener_manager: Option<Arc<crate::trust_registries::TrustRegistryListenerManager>>,
     vc_issuer: Option<Arc<crate::identity::VCIssuer>>,
     task_monitor: Option<Arc<crate::observability::TaskMonitor>>,
-    use_tls: bool,
     outbound_channel_states: Arc<
         std::sync::RwLock<
             std::collections::HashMap<String, Arc<std::sync::RwLock<crate::state::OutboundSurfaceState>>>,
         >,
     >,
-    direct_client_auth: Option<Arc<crate::server::DirectClientAuth>>,
     listener_manager: Arc<tokio::sync::RwLock<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>>,
     source_auth_middleware: Option<Arc<crate::source_auth::SourceAuthMiddleware>>,
-    states_registered: Option<tokio::sync::oneshot::Sender<()>>,
-) -> anyhow::Result<()> {
-    use axum::{Router, routing::any};
+) -> anyhow::Result<Router> {
+    use axum::routing::any;
 
-    info!("Starting outbound port listener on {}:{} for {} channel(s)", bind_address, port, channels.len());
+    info!("Building the outbound port listener router on port {} for {} channel(s)", port, channels.len());
 
     // Liveness probe for the channel/outbound listener (e.g. port 5000). This
     // listener has no identity router, so `/alive` is registered directly here
@@ -2011,10 +1880,6 @@ pub async fn run_outbound_port_server(
             }
         }
     }
-    if let Some(states_registered) = states_registered {
-        let _ = states_registered.send(());
-    }
-
     if network_config
         .sts
         .mcp_issuer
@@ -2039,47 +1904,13 @@ pub async fn run_outbound_port_server(
         );
     }
 
-    // Bind address — use the configured bind_address, not 0.0.0.0.
-    let bind_addr = listener_socket_address(&bind_address, port)?;
-
-    info!("Outbound port listener binding to {}", bind_addr);
-
     let app = app.layer(axum::middleware::from_fn(crate::observability::trace_http_request));
     let app = app.layer(axum::middleware::from_fn(crate::observability::access_log));
     let app = app.layer(axum::middleware::from_fn_with_state(
         std::sync::Arc::new(config.tls.client_auth.clone()),
         crate::source_auth::peer_cert::forwarded_peer_cert,
     ));
-    let app = app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert));
-
-    if use_tls {
-        let tls_config = crate::server::load_server_config(
-            &config.tls.cert_path,
-            &config.tls.key_path,
-            direct_client_auth
-                .as_deref()
-                .cloned(),
-        )?;
-        let rustls_acceptor = axum_server::tls_rustls::RustlsAcceptor::new(
-            axum_server::tls_rustls::RustlsConfig::from_config(tls_config),
-        );
-        if direct_client_auth.is_some() {
-            let acceptor = crate::source_auth::peer_cert::PeerCertAcceptor::new(rustls_acceptor);
-            axum_server::bind(bind_addr)
-                .acceptor(acceptor)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-        } else {
-            axum_server::bind(bind_addr)
-                .acceptor(rustls_acceptor)
-                .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                .await
-        }
-    } else {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await
-    }
-    .map_err(|e| anyhow::anyhow!("Outbound port listener error: {}", e))
+    Ok(app.layer(axum::middleware::from_fn(crate::source_auth::peer_cert::promote_direct_peer_cert)))
 }
 
 #[cfg(test)]
@@ -2261,6 +2092,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_access_point_answer_carries_no_cookie_the_target_set() {
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                axum::routing::any(|| async {
+                    (
+                        [
+                            (header::SET_COOKIE, "__Host-session_token=planted; Path=/; Secure"),
+                            (header::SET_COOKIE, "lb=sticky"),
+                            (header::HeaderName::from_static("set-cookie2"), "legacy=1"),
+                            (header::CACHE_CONTROL, "no-store"),
+                        ],
+                        StatusCode::OK,
+                    )
+                }),
+            )
+            .layer(axum::middleware::map_response(withhold_target_cookies));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/agents/worker/rpc")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::SET_COOKIE)
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("set-cookie2")
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
     #[test]
     fn proxy_cors_keeps_allowlist_for_non_discovery_paths() {
         let origin = HeaderValue::from_static("https://copilotstudio.microsoft.com");
@@ -2276,7 +2152,7 @@ mod tests {
         use tower::ServiceExt;
 
         // Mirrors the `/alive` route registered on the outbound/channel listener
-        // in `run_outbound_port_server` (used by ECS/ALB health checks on the
+        // in `build_outbound_port_router` (used by ECS/ALB health checks on the
         // channel port, e.g. 5000).
         let app = Router::new().route("/alive", axum::routing::get(crate::identity::handlers::alive_check));
 
@@ -2394,6 +2270,7 @@ mod tests {
                     payment_policy: None,
                     networking: None,
                     rate_limit: None,
+                    per_caller_rate_limit: None,
                     identity_injection: Default::default(),
                     managed_identity: None,
                     transit_credentials: None,
@@ -2831,8 +2708,7 @@ mod tests {
             "extension_inspection": {"enabled": false}
         }))
         .unwrap();
-        let server = tokio::spawn(run_outbound_port_server(
-            "::1".into(),
+        let router = build_outbound_port_router(
             port,
             Vec::new(),
             Arc::new(config),
@@ -2844,13 +2720,24 @@ mod tests {
             None,
             None,
             None,
-            false,
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            None,
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
+        )
+        .await
+        .unwrap();
+        let _server = crate::proxy::port_listener::BoundPort::bind(
+            port,
+            crate::proxy::port_listener::PortBinding {
+                addresses: vec![listener_socket_address("::1", port).unwrap()],
+                tls: false,
+            },
+            router,
             None,
-        ));
+            false,
+        )
+        .await
+        .unwrap();
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(2))
@@ -2867,18 +2754,14 @@ mod tests {
                 alive = Some(response.status());
                 break;
             }
-            if server.is_finished() {
-                break;
-            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        server.abort();
 
         assert_eq!(alive, Some(reqwest::StatusCode::OK));
     }
 
     #[tokio::test]
-    async fn an_outbound_listener_signals_once_its_surface_states_are_registered() {
+    async fn an_outbound_router_registers_its_surface_states_before_it_is_returned() {
         let config: GatewayConfig = serde_json::from_value(serde_json::json!({
             "tls": {"cert_path": "unused.pem", "key_path": "unused-key.pem"},
             "integration": {"variable_pattern": "\\$\\{([^}]+)\\}", "custom_variable_prefix": "_", "types": [],
@@ -2901,10 +2784,8 @@ mod tests {
             .points
             .clone();
         let states = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let (registered, states_registered) = tokio::sync::oneshot::channel();
 
-        let server = tokio::spawn(run_outbound_port_server(
-            "127.0.0.1".into(),
+        let _router = build_outbound_port_router(
             0,
             vec![(surface, points)],
             Arc::new(config),
@@ -2916,23 +2797,19 @@ mod tests {
             None,
             None,
             None,
-            false,
             states.clone(),
-            None,
             Arc::new(tokio::sync::RwLock::new(None)),
             None,
-            Some(registered),
-        ));
-        let signalled = tokio::time::timeout(std::time::Duration::from_secs(5), states_registered).await;
+        )
+        .await
+        .unwrap();
         let registered: Vec<String> = states
             .read()
             .unwrap()
             .keys()
             .cloned()
             .collect();
-        server.abort();
 
-        assert!(matches!(signalled, Ok(Ok(()))), "{signalled:?}");
         assert_eq!(registered, ["fresh"]);
     }
 

@@ -20,6 +20,20 @@ impl FileSystemMcpProxyStore {
         let storage = cached_storage(storage_dir, "mcp_proxy").await?;
         Ok(Self { storage })
     }
+
+    /// The `base_url` of the MCP proxy a `proxy://` Target names, where a Target credential sent
+    /// to that Target goes; `None` for any other endpoint or a proxy that cannot be loaded.
+    pub async fn target_base_url(
+        &self,
+        endpoint: &str,
+    ) -> Option<String> {
+        let proxy_id = endpoint.strip_prefix("proxy://")?;
+        self.get(proxy_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|proxy| proxy.base_url)
+    }
 }
 
 #[async_trait]

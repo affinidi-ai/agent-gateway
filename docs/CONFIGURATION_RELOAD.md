@@ -7,7 +7,7 @@ for supported configuration fields and operator guidance.
 ## Scope
 
 This page describes runtime configuration reload behavior: what a reload re-reads, what it does
-not, and how listener state is rebound. It also documents the `[a2a]` bootstrap table (see
+not, and how listener state is swapped. It also documents the `[a2a]` bootstrap table (see
 [A2A settings](#a2a-settings)). For what each configuration file controls and the effect of
 its fields, see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). The source of truth for
 accepted fields and defaults is the configuration types under [`src/config/`](../src/config/).
@@ -58,7 +58,7 @@ The runtime implementation is in
 
 | Method | Typical caller | Behavior |
 | --- | --- | --- |
-| `reload_channels` | Full-reload implementation | Replaces the complete runtime surface set and rebinds listeners. |
+| `reload_channels` | Full-reload implementation | Replaces the complete runtime surface set and swaps the router of every bound listener. |
 | `reload_channels_with_fallback` | `POST /v1/config/reload` | Loads the requested configuration and uses the cached snapshot only when loading the requested source fails. |
 | `reload_single_channel` | `reload_single_channel_with_fallback` | Rebuilds one surface and swaps it into the current inbound listener state. |
 | `reload_single_channel_with_fallback` | `POST /v1/config/reload/{config_id}` and surface mutation paths | Serializes and applies the single-surface update; a source-load error is returned rather than silently substituting another surface. |
@@ -76,46 +76,55 @@ flowchart TD
 ```
 
 Full and single-surface reloads share a reload lock so they cannot concurrently mutate listener
-state or rebind the same port.
+state or swap the router of the same port.
 
 ## Full reload
 
-A full reload is disruptive to the listener tasks, even though it does not restart the Agent
-Gateway process:
+A full reload rebuilds the router of every port listener but keeps each listener bound, so no
+connection is refused while it runs, on the inbound ports, the management API they serve, or the
+shared outbound ports:
 
 1. Load the configured source and inject active Agent Surface records.
-2. Abort existing inbound and outbound port-listener tasks and clear the inbound listeners'
-   stored runtime states.
-3. Clear stale task-monitor entries and wait briefly for listening sockets to be released.
-4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
-5. Reload network configuration, group active surfaces by listener, and rebuild derived surface
+2. Clear stale task-monitor entries; rebuilding the routers registers them again.
+3. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
+4. Reload network configuration, group active surfaces by listener, and rebuild derived surface
    state. Each surface's outbound state is updated in place rather than replaced: a surface that
    still has Transit Points on an outbound listener gets its new configuration written into its
    state, and the state of one that no longer has any, because it was deleted, disabled or
    emptied, is retired, so its routes refuse each request with `404`.
-6. Bind new inbound and outbound listeners, retaining each inbound listener's
-   `MultiSurfaceProxyState` for later single-surface updates. Only active surfaces' Transit
-   Points are served, so a deleted or disabled surface's never are. An outbound port with no
-   active Transit Points is bound with no proxy routes, as at startup, so its liveness route
-   remains available. The reload returns only once each rebuilt outbound listener has
-   registered its surfaces' outbound state, so a surface deleted right after it is retired
-   there too.
+5. Build a new router for each configured inbound and outbound port, retaining each inbound
+   listener's `MultiSurfaceProxyState` for later single-surface updates, and swap it into the
+   listener already bound on that port. Only active surfaces' Transit Points are served, so a
+   deleted or disabled surface's never are. An outbound port with no active Transit Points
+   serves no proxy routes, as at startup, so its liveness route remains available. Each
+   outbound router registers its surfaces' outbound state before the reload returns, so a
+   surface deleted right after it is retired there too.
+6. Stop the listener of a port no longer configured.
 
-Requests using a listener while it is stopped and rebound can be interrupted. Process-wide services
-that are not owned by those listener tasks continue running, but their routers are attached to the
-new listeners when those listeners are created.
+A listener is bound again only when its port's bind addresses or TLS setting change in
+`gateway.json`, or stopped when its port is removed. Requests using it while it is rebound can
+be interrupted, and a connection it accepted is not carried over: a plain HTTP connection is
+closed, and the next request on a TLS connection, which outlives its listener, is refused with
+`503` and `Connection: close`, so the client reconnects to the listener now bound. A TLS
+listener that stays bound reloads the gateway certificate and serves it from the next handshake
+on; if the certificate cannot be loaded, it keeps the one it has and the error is logged. A TLS
+port whose addresses change while the certificate cannot be loaded keeps its listener on its old
+addresses. A port that cannot be bound serves nothing, and its task-monitor entries, its Transit
+Points' included, are removed.
 
-A plain HTTP listener closes the connections kept alive on it when it stops. A TLS listener's
-connections outlive it, still served by its old routes; because those routes hold the outbound
-state updated in step 5, a removed Transit Point refuses the next request on such a connection
-with `404`, and a changed one is served with its new configuration. Likewise an Access Point
-route held by such a connection refuses with `404` a request to a surface that has since been
-disabled or deleted, rather than serving the copy the connection holds.
+Each request runs on the router current when it arrives, so a connection kept alive across a
+reload, plain HTTP or TLS, has its next request routed by the new router: a removed Transit Point
+or Access Point route refuses it with `404`, and a changed one is served with its new
+configuration. A request already being handled when the router is swapped completes on the
+router it started on; because that router holds the outbound state updated in step 4, a removed
+Transit Point refuses it with `404`.
 
 If the requested configuration source cannot be loaded,
 `reload_channels_with_fallback` attempts to load the cached `GatewayConfig`. If neither source is
-available, reload returns an error. A failure after listener teardown is not converted into the old
-live listener set.
+available, reload returns an error. A port whose router cannot be rebuilt keeps serving the router
+it had and its task-monitor entries, and the error is logged and returned as the reload's
+warning, which `POST /v1/config/reload` answers with; single-surface changes keep updating that
+router, so a surface added or changed on the port afterwards is served.
 
 With `channel_config_source = "local"`, a reload first re-reads the Agent Surface records from disk,
 and each record that changed on disk is then also applied as a single-surface change, as a change
@@ -141,10 +150,10 @@ A single-surface reload keeps the existing inbound listener bound:
 5. Refresh task-monitor entries and any existing outbound surface state.
 
 Concurrent inbound requests retain the listener and observe either the previous or replacement
-surface state around the brief write-lock acquisition. The operation does not promise that every
-outbound listener remains bound: if Transit Point routes were added, removed, renamed, or moved,
-the affected outbound listener is restarted because its Axum routes are static. An update that
-leaves the surface without Transit Points also retires its outbound state, as a delete does.
+surface state around the brief write-lock acquisition. If Transit Point routes were added,
+removed, renamed, or moved, the router of each affected outbound listener is rebuilt, because its
+Axum routes are static, and swapped into the listener, which stays bound. An update that leaves
+the surface without Transit Points also retires its outbound state, as a delete does.
 
 Single-surface reload assumes the Access Point still maps to a running inbound listener. Changes
 that require a different listener topology belong to a full reload.
@@ -156,14 +165,15 @@ answers, whichever path applies it:
 
 1. Retire the surface's outbound state: every route still holding it, on a new connection or
    one kept alive, refuses each request with `404`.
-2. Evict the surface's compiled policies, MCP tool gating, rate limiters and circuit breaker,
+2. Evict the surface's compiled policies, MCP tool gating, rate limiters (per-caller ones too) and circuit breaker,
    its variants' and its Transit Points' included.
 
 A surface without variants is removed in place: its Access Point leaves the running inbound
 listener and no listener is rebound, so the outbound listener its Transit Points shared with
 other surfaces' keeps serving them without interruption, and its retired routes stay on that
-listener, refusing with `404`, until the listener is next rebuilt. Deleting a surface with
-variants takes a full reload, because its variant routes are baked into the inbound listener.
+listener, refusing with `404`, until its router is next rebuilt. Deleting a surface with
+variants takes a full reload, because its variant routes are baked into the inbound listener's
+router; the listener stays bound.
 Disabling a surface retires its outbound state and evicts its compiled policies, MCP tool
 gating, rate limiters and circuit breaker the same way. Removing all of a surface's Transit
 Points retires its outbound state, but does not evict its compiled policies.
@@ -214,6 +224,12 @@ pipeline: the node admits traffic after one start attempt and, if that start is 
 integrations cannot be listed, or the other node still holds the journal), keeps trying in the
 background.
 
+Also on becoming Active, before it reloads its configuration, a node reconciles with disk its
+policy definitions, global policies, agent surfaces, gateways and API keys. API keys another node
+created, rotated or revoked while this node was Standby therefore authenticate, or stop
+authenticating, without a restart. A store that cannot be reconciled is logged and keeps what it
+held.
+
 Both modes build the source authentication middleware at startup, so a node whose JWT
 verification strategy store cannot be opened refuses to start in either mode (see
 [Source authentication](SOURCE_AUTH.md#source-authentication)).
@@ -249,15 +265,27 @@ needs a restart.
 | --- | --- | --- |
 | `token_endpoint_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a credential provider's token endpoint must use https; see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints). |
 | `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether credential providers may use only secrets of their own tenant, and tenant surfaces (including their custom metadata and the credential providers they bind) and tenant A2A Proxies only their own tenant's secrets and providers; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant) and [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs). |
+| `target_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential (a static secret or a credential provider) may only be sent to an `https` Target or Transit Point endpoint. A `fabric://` or `a2a-proxy://` endpoint is not https; a `proxy://` Target is judged by its MCP proxy's `base_url`. In `enforce` the credential is withheld at request time and `target.auth.fallback` decides the request; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
+| `target_source_auth` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential may only be sent from a leg that checks its callers: the Access Point (at least one `caller_authentication` method, or `mcp_http.authorization`) for the Target, the Transit Point itself (a transit token, `source_auth` or `mcp_http.authorization`) for a Transit Point. It also holds the Direct Line credential an A2A proxy sends for an `a2a-proxy://` Target of an A2A or AP2 surface, which `target_https` does not. In `enforce` the credential is withheld at request time, except on the gateway's own agent card fetch; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
 | `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
 | `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants and their refreshes, the legacy delegated refresh, the legacy code exchange and the `2026-07-28` consent exchange. It does not apply to the connect API's grant code exchange and refresh, which keep a fixed 30 seconds. The no-redirect rule is unchanged. |
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
-configurations that break a rule are refused on save. `"enforce"` also refuses them at runtime. For
-`tenant_credential_isolation` that means a tenant surface sending an appliance-wide secret or
-credential provider; a reference to another tenant's is refused in both modes (see
-[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). An
-unknown value fails startup, and an absent section means both rules are `"warn"`. The report also names a stored JWT Bearer provider without a subject under a third rule, `jwt_subject`, which only warns and has no setting. A provider with
+configurations that break `token_endpoint_https` or `tenant_credential_isolation` are refused on
+save, while ones that break `target_https` or `target_source_auth` are saved with a warning.
+`"enforce"` refuses all of them on save and also at runtime. For `tenant_credential_isolation`
+that means a tenant surface sending an appliance-wide secret or credential provider; for
+`target_https` and `target_source_auth`, a request whose Target credential breaks the rule goes
+out without it or is refused, as `target.auth.fallback` says (see
+[Target authentication rules](CREDENTIAL_DELEGATION.md#target-authentication-rules)). A
+reference to another tenant's is refused in both modes (see
+[Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs)). A
+stored surface that derives a DID from another tenant's API Key Provider key, or from the key of
+a surface with no tenant, keeps serving under `"warn"` and answers `503` under `"enforce"`; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+To move to `"enforce"` safely, run `"warn"`, read the report's `provider_key_tenant` lines, fix
+those surfaces, then restart with `"enforce"`. An
+unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
 `token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and

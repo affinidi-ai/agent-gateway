@@ -73,18 +73,18 @@ fn is_public_path(path: &str) -> bool {
 }
 
 /// Extract session token from the request's Authorization header or cookies.
-/// Priority: Authorization Bearer header > `session_token` cookie.
+/// Priority: Authorization Bearer header > `__Host-session_token` cookie.
 fn extract_session_token(request: &Request) -> Option<String> {
     extract_session_token_from_headers(request.headers())
 }
 
 /// Public helper: extract session token from request headers only.
-/// Priority: Authorization Bearer header > `session_token` cookie.
+/// Priority: Authorization Bearer header > `__Host-session_token` cookie.
 ///
 /// Tokens are deliberately never read from the URL query string: a token in the
 /// URL leaks into access logs, `Referer` headers, browser history, and proxy
 /// caches. Callers must supply the token via the `Authorization` header or the
-/// HttpOnly `session_token` cookie.
+/// HttpOnly `__Host-session_token` cookie.
 pub fn extract_session_token_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     // 1. Try Authorization header first (preferred — avoids token leaking into logs/URLs)
     if let Some(auth_header) = headers.get(axum::http::header::AUTHORIZATION)
@@ -97,22 +97,8 @@ pub fn extract_session_token_from_headers(headers: &axum::http::HeaderMap) -> Op
         }
     }
 
-    // 2. Fall back to cookie (SAML mode sets HttpOnly session_token cookie)
-    if let Some(cookie_header) = headers.get(axum::http::header::COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        for cookie in cookie_str.split(';') {
-            let parts: Vec<&str> = cookie
-                .trim()
-                .splitn(2, '=')
-                .collect();
-            if parts.len() == 2 && parts[0] == "session_token" && !parts[1].is_empty() {
-                return Some(parts[1].to_string());
-            }
-        }
-    }
-
-    None
+    // 2. Fall back to cookie (SAML mode sets HttpOnly __Host-session_token cookie)
+    session_cookie::session_cookie_value(headers).map(str::to_string)
 }
 
 /// Combined state required by the global session-auth middleware.
@@ -1069,7 +1055,7 @@ mod tests {
     // Tokens in the URL leak into access logs, Referer headers, browser
     // history, and proxy caches, so the query-string path is not honoured even
     // when the token is otherwise valid. Tokens must arrive via the
-    // Authorization header or the HttpOnly session_token cookie.
+    // Authorization header or the HttpOnly __Host-session_token cookie.
 
     #[tokio::test]
     async fn protected_endpoints_reject_valid_token_in_query_param() {
@@ -1153,7 +1139,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri("/v1/settings")
-            .header(axum::http::header::COOKIE, format!("session_token={token}"))
+            .header(axum::http::header::COOKIE, format!("lb=sticky; __Host-session_token={token}"))
             .body(Body::empty())
             .unwrap();
         let resp = app
@@ -1162,6 +1148,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200, "Cookie-based session should be accepted");
+    }
+
+    #[tokio::test]
+    async fn protected_endpoint_refuses_the_unprefixed_session_cookie() {
+        let sess_mgr = Arc::new(crate::auth::session::SessionManager::new());
+        let token = sess_mgr
+            .create_session("test-user".into(), "user-001".into())
+            .await;
+        let app = test_app(sess_mgr);
+
+        let req = axum::http::Request::builder()
+            .uri("/v1/settings")
+            .header(axum::http::header::COOKIE, format!("session_token={token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "a cookie without the __Host- prefix is not a session");
     }
 
     // ── Session token via Authorization Bearer header should work ──

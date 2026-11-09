@@ -2,10 +2,14 @@ import * as Cap from '../capabilities';
 import { registry } from '../registry';
 import { networkingConfigToWire } from '../networking/definition';
 import { rateLimitConfigToWire } from '../rate-limit/definition';
+import { perCallerRateLimitConfigToWire } from '../rate-limit/wire';
 import type { NodeDefinition, Protocol } from '../types';
 import type { SurfaceNodeType } from '../nodeTypes';
 import { urlError } from '../validators';
-import TransitPointPanel from './TransitPointPanel';
+import TransitPointPanel, {
+  inferEndpointType,
+  transitPointGatewayRoute,
+} from './TransitPointPanel';
 import { transitCredentialsToApi } from '../_shared/TransitCredentialBindingSection';
 import { providerTargetAuthToApi } from '../_shared/providerTargetAuth';
 import { identityConfigToWire } from '../identity/definition';
@@ -142,7 +146,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       Transit Point per outbound destination; the canvas can hold
       many.</p>
       <p>This variant speaks <strong>${label}</strong>. Each Transit
-      Point is its own mini-pipeline. You can drop Policy, Payment,
+      Point is its own mini-pipeline. You can drop Policy,
       Networking, Rate Limit, Metadata Extraction (A2A / AP2 header
       mapping only) or Trust Registry checks on its edges, and they
       apply just to that route rather than the main Target.</p>
@@ -175,7 +179,6 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
       Cap.SURFACE_PERIMETER,
       Cap.MIDDLEWARE_SLOT,
       Cap.POLICY_TARGET,
-      Cap.PAYMENT_TARGET,
       Cap.NETWORKING_TARGET,
       Cap.CREDENTIAL_TARGET,
       ...(protocol === 'a2a' || protocol === 'ap2' ? [Cap.METADATA_TARGET] : []),
@@ -191,7 +194,12 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
     requires: {},
     incompleteReason: config => {
       if (!config.listen_address) return 'Outbound listener address is required';
-      if (!config.target_endpoint) return 'Target endpoint is required';
+      if (inferEndpointType(config) === 'gateway') {
+        if (!transitPointGatewayRoute(config).gatewayId) return 'Select a gateway';
+        if (!config.target_endpoint) return 'Select an Agent Surface on the gateway';
+        return null;
+      }
+      if (!config.target_endpoint) return 'Target endpoint URL is required';
       return null;
     },
     validate: c => {
@@ -326,6 +334,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                   n => n.type === 'rate-limit' && n.parentId === tp.id
                 );
                 const rateLimit = rateLimitConfigToWire(rateLimitNode?.config);
+                const perCallerRateLimit = perCallerRateLimitConfigToWire(rateLimitNode?.config);
                 // Per-TP managed identity (MA→TP request slot): the identity
                 // element parents to this TP and the TP factory owns the
                 // `managed_identity` slice. The identity element's own
@@ -502,6 +511,7 @@ export function makeTransitPointDefinition(opts: TransitPointVariantOpts): NodeD
                     : {}),
                   ...(networking ? { networking } : {}),
                   ...(rateLimit ? { rate_limit: rateLimit } : {}),
+                  ...(perCallerRateLimit ? { per_caller_rate_limit: perCallerRateLimit } : {}),
                   ...(managedIdentity ? { managed_identity: managedIdentity } : {}),
                   ...(workloadBinding ? { workload_binding: workloadBinding } : {}),
                   ...(mcpToolGating ? { mcp_tool_gating: mcpToolGating } : {}),

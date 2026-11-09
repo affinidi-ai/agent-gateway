@@ -1937,9 +1937,10 @@ async fn inbound_a2a_surfaces_negotiate_with_their_own_accepted_versions() {
 // ── Refusals ahead of delegated payment ──────────────────────────────────────
 
 const DELEGATION_MISCONFIGURED: &str = "payment delegation misconfigured";
+const FABRIC_GATEWAY_NOT_CONNECTED: &str = "Gateway not connected";
 
-/// A direct A2A surface whose x402 policy delegates to a remote payment gateway
-/// (`provider = agent_pay`) without naming one. Every request that reaches the
+/// A direct A2A surface whose `agent_pay` policy charges every request but names
+/// no payment gateway. Every request that reaches the
 /// delegation step is recorded as a failed delegated payment and answered with a
 /// 502 carrying [`DELEGATION_MISCONFIGURED`], so that 502 marks exactly the
 /// requests the payment step saw.
@@ -1952,10 +1953,8 @@ fn agent_pay_surface(
     if let Some(endpoint) = endpoint {
         surface.target.endpoint = endpoint.to_string();
     }
-    surface.target.payment_policy = Some(
-        serde_json::from_value(json!({ "type": "x402", "enabled": true, "provider": "agent_pay" }))
-            .expect("agent_pay x402 policy"),
-    );
+    surface.target.payment_policy =
+        Some(serde_json::from_value(json!({ "type": "agent_pay", "require_all": true })).expect("agent_pay policy"));
     surface
 }
 
@@ -2116,7 +2115,8 @@ fn message_without_message_id() -> String {
 }
 
 /// With the default envelope validation, a `fabric://` target refuses a batch
-/// before payment, but lets a message missing A2A fields through to payment.
+/// before payment, but lets a message missing A2A fields through to fabric
+/// dispatch, where the unconnected peer gateway stops it before any payment.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_fabric_target_checks_the_envelope_by_default() {
     let h = fabric_harness(crate::config::agent_surface::A2aValidation::Envelope).await;
@@ -2126,8 +2126,8 @@ async fn inbound_a2a_fabric_target_checks_the_envelope_by_default() {
     assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
 
     let (status, body) = post_a2a(&h, "1.0", message_without_message_id()).await;
-    assert_eq!(status, 502, "a malformed message reaches payment: {status} {body}");
-    assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
+    assert_eq!(status, 503, "a malformed message reaches fabric dispatch: {status} {body}");
+    assert!(body.contains(FABRIC_GATEWAY_NOT_CONNECTED), "got {body}");
 }
 
 /// With `full` validation, a `fabric://` target also refuses a malformed message.
@@ -2140,14 +2140,14 @@ async fn inbound_a2a_fabric_target_checks_the_request_shape_when_full() {
     assert!(!body.contains(DELEGATION_MISCONFIGURED), "payment step must not run, got {body}");
 }
 
-/// With validation `off`, a `fabric://` target lets a batch through to payment.
+/// With validation `off`, a `fabric://` target lets a batch through to fabric dispatch.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_a2a_fabric_target_checks_nothing_when_off() {
     let h = fabric_harness(crate::config::agent_surface::A2aValidation::Off).await;
 
     let (status, body) = post_a2a(&h, "1.0", BATCH_REQUEST.to_string()).await;
-    assert_eq!(status, 502, "a batch reaches payment: {status} {body}");
-    assert!(body.contains(DELEGATION_MISCONFIGURED), "got {body}");
+    assert_eq!(status, 503, "a batch reaches fabric dispatch: {status} {body}");
+    assert!(body.contains(FABRIC_GATEWAY_NOT_CONNECTED), "got {body}");
 }
 
 /// An `a2a-proxy://` target is version-negotiated, ahead of delegated payment.

@@ -10,6 +10,9 @@ jest.mock('../../../api', () => ({
   apiClient: { fetch: jest.fn(), get: jest.fn().mockResolvedValue({ data: [] }) },
 }));
 jest.mock('../../../utils/toaster', () => ({ showToast: jest.fn() }));
+jest.mock('../../../utils/featureFlags', () => ({
+  useAgentPayFlag: () => ({ enabled: false, loaded: true }),
+}));
 jest.mock('../SurfaceCanvas', () => ({ getIncompleteReason: () => null }));
 jest.mock('../SurfaceBuilder', () => {
   const AgentCardFetchLine = jest.requireActual('../agent-card/AgentCardFetchLine').default;

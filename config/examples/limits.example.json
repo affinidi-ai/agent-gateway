@@ -72,12 +72,17 @@
     },
     "connections": {
       "name": "Connections (total)",
-      "description": "Total across gateways, mediators, connection points, and trust registries",
+      "description": "Total across gateways, payment gateways, mediators, connection points, and trust registries",
       "limit": 8
     },
     "connections.gateways": {
       "name": "Remote Gateways",
       "description": "Connected remote gateways; the Local Gateway is excluded",
+      "limit": 1
+    },
+    "connections.paymentgateways": {
+      "name": "Payment Gateways",
+      "description": "Connected payment gateways (agent-pay)",
       "limit": 1
     },
     "connections.mediators": {

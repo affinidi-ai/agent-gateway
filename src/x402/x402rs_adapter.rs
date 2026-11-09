@@ -140,45 +140,6 @@ pub fn to_settle_request(payload: &PaymentPayload) -> Result<proto::SettleReques
     to_verify_request(payload, &payload.accepted)
 }
 
-/// Extract payer address from VerifyResponse
-pub fn extract_payer(response: &proto::VerifyResponse) -> Option<String> {
-    // Try to extract payer from the response value
-    if let Ok(value) = serde_json::to_value(response) {
-        value
-            .get("payer")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    }
-}
-
-/// Check if verification was valid
-pub fn is_verification_valid(response: &proto::VerifyResponse) -> bool {
-    // Try to extract isValid field from the response
-    if let Ok(value) = serde_json::to_value(response) {
-        value
-            .get("isValid")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    } else {
-        false
-    }
-}
-
-/// Extract error reason from VerifyResponse
-pub fn extract_verify_error(response: &proto::VerifyResponse) -> Option<String> {
-    if let Ok(value) = serde_json::to_value(response) {
-        value
-            .get("invalidReason")
-            .or_else(|| value.get("errorReason"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    }
-}
-
 /// Extract transaction hash from SettleResponse
 pub fn extract_transaction(response: &proto::SettleResponse) -> Option<String> {
     if let Ok(value) = serde_json::to_value(response) {

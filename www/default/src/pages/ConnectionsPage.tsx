@@ -2,31 +2,43 @@ import React, { useCallback, useState } from 'react';
 import { Tab, Tabs } from 'react-bootstrap';
 import { useSearchParams } from 'react-router-dom';
 import SearchInput from '../components/shared/SearchInput';
+import { usePermissions } from '../context/PermissionsContext';
+import { useAgentPayFlag } from '../utils/featureFlags';
 import GatewaysPage from './GatewaysPage';
 import MediatorsPage from './MediatorsPage';
+import PaymentGatewaysPage from './PaymentGatewaysPage';
 import TrustRegistriesPage from './TrustRegistriesPage';
 
-type TabKey = 'gateways' | 'mediators' | 'trust-registries';
+type TabKey = 'gateways' | 'payment-gateways' | 'mediators' | 'trust-registries';
 
 interface TabCount {
   filtered: number;
   total: number;
 }
 
-const VALID_TABS: TabKey[] = ['gateways', 'mediators', 'trust-registries'];
+const ALL_TABS: TabKey[] = ['gateways', 'payment-gateways', 'mediators', 'trust-registries'];
 
 const ConnectionsPage: React.FC = () => {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { hasPermission } = usePermissions();
+  const showGateways = hasPermission('gateways.view');
+  const { enabled: agentPayOn } = useAgentPayFlag();
+  const showPaymentGateways = agentPayOn && hasPermission('payment_gateways.view');
+  const validTabs = ALL_TABS.filter(
+    tab =>
+      (tab !== 'gateways' || showGateways) && (tab !== 'payment-gateways' || showPaymentGateways)
+  );
   const tabFromUrl = searchParams.get('tab') as TabKey | null;
-  const initialTab: TabKey =
-    tabFromUrl && VALID_TABS.includes(tabFromUrl) ? tabFromUrl : 'gateways';
-  const [activeTab, setActiveTab] = useState<TabKey>(initialTab);
+  // The tab follows the URL, so a link to another tab of this page switches it.
+  const activeTab: TabKey =
+    tabFromUrl && validTabs.includes(tabFromUrl) ? tabFromUrl : (validTabs[0] ?? 'gateways');
   const [searchTerm, setSearchTerm] = useState('');
   // Pinned to DOM via ref callback so the embedded pages can portal
   // their action buttons into the tab banner.
   const [actionsContainer, setActionsContainer] = useState<HTMLDivElement | null>(null);
   const [counts, setCounts] = useState<Record<TabKey, TabCount>>({
     gateways: { filtered: 0, total: 0 },
+    'payment-gateways': { filtered: 0, total: 0 },
     mediators: { filtered: 0, total: 0 },
     'trust-registries': { filtered: 0, total: 0 },
   });
@@ -38,6 +50,13 @@ const ConnectionsPage: React.FC = () => {
       prev.gateways.filtered === filtered && prev.gateways.total === total
         ? prev
         : { ...prev, gateways: { filtered, total } }
+    );
+  }, []);
+  const setPaymentGatewaysCount = useCallback((filtered: number, total: number) => {
+    setCounts(prev =>
+      prev['payment-gateways'].filtered === filtered && prev['payment-gateways'].total === total
+        ? prev
+        : { ...prev, 'payment-gateways': { filtered, total } }
     );
   }, []);
   const setMediatorsCount = useCallback((filtered: number, total: number) => {
@@ -97,27 +116,46 @@ const ConnectionsPage: React.FC = () => {
         <Tabs
           activeKey={activeTab}
           onSelect={k => {
-            const next = (k as TabKey) || 'gateways';
-            setActiveTab(next);
-            setSearchParams({ tab: next }, { replace: true });
+            setSearchParams({ tab: (k as TabKey) || validTabs[0] }, { replace: true });
           }}
           className="mb-3 custom-channel-tabs"
         >
-          <Tab
-            eventKey="gateways"
-            tabAttrs={{ 'data-testid': 'connections-gateways-tab-trigger' }}
-            title={
-              <>
-                <i className="fas fa-server"></i> Gateways {tabBadge('gateways')}
-              </>
-            }
-          >
-            <GatewaysPage
-              externalSearchTerm={searchTerm}
-              onCountChange={setGatewaysCount}
-              actionsContainer={activeTab === 'gateways' ? actionsContainer : null}
-            />
-          </Tab>
+          {showGateways && (
+            <Tab
+              eventKey="gateways"
+              tabAttrs={{ 'data-testid': 'connections-gateways-tab-trigger' }}
+              title={
+                <>
+                  <i className="fas fa-server"></i> Gateways {tabBadge('gateways')}
+                </>
+              }
+            >
+              <GatewaysPage
+                externalSearchTerm={searchTerm}
+                onCountChange={setGatewaysCount}
+                actionsContainer={activeTab === 'gateways' ? actionsContainer : null}
+              />
+            </Tab>
+          )}
+
+          {showPaymentGateways && (
+            <Tab
+              eventKey="payment-gateways"
+              tabAttrs={{ 'data-testid': 'connections-tab-payment-gateways' }}
+              title={
+                <>
+                  <i className="fas fa-credit-card"></i> Payment Gateways{' '}
+                  {tabBadge('payment-gateways')}
+                </>
+              }
+            >
+              <PaymentGatewaysPage
+                externalSearchTerm={searchTerm}
+                onCountChange={setPaymentGatewaysCount}
+                actionsContainer={activeTab === 'payment-gateways' ? actionsContainer : null}
+              />
+            </Tab>
+          )}
 
           <Tab
             eventKey="mediators"

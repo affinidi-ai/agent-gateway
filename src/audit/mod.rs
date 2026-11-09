@@ -20,4 +20,6 @@ pub mod policy_refusals;
 pub mod producer;
 pub mod registry;
 pub mod request_events;
+pub mod secret_force_deletes;
 pub mod sources;
+pub mod target_auth_changes;

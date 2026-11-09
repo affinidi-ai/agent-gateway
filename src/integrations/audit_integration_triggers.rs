@@ -19,8 +19,23 @@ pub fn audit_event_type(event: &DelegationAuditEvent) -> String {
     format!("audit.{}", action_category(&event.event))
 }
 
+/// The record as it leaves the appliance. A payment record's signed credential
+/// (the gateway's receipt, rejection or access-grant VC) stays in the local
+/// audit file: integrations get its `vp_fingerprint` only.
+fn forwarded_record(event: &DelegationAuditEvent) -> std::borrow::Cow<'_, DelegationAuditEvent> {
+    if matches!(event.event, DelegationAuditAction::PaymentEvent(_)) && event.vp_jwt.is_some() {
+        let mut stripped = event.clone();
+        stripped.vp_jwt = None;
+        std::borrow::Cow::Owned(stripped)
+    } else {
+        std::borrow::Cow::Borrowed(event)
+    }
+}
+
 /// Runtime variables describing one audit record.
 pub fn audit_variables(event: &DelegationAuditEvent) -> HashMap<String, String> {
+    let event = forwarded_record(event);
+    let event = event.as_ref();
     let text = |value: &Option<String>| {
         value
             .clone()
@@ -104,7 +119,7 @@ struct PolicyVariables {
 /// The authenticated caller as a person reads it: email, else display name,
 /// else the authenticated subject (JWT `sub`, API key name, DID, mTLS principal).
 fn principal(caller: &AuditCallerContext) -> String {
-    [&caller.email, &caller.name, &caller.sub]
+    [&caller.email, &caller.name, &caller.principal, &caller.sub]
         .into_iter()
         .flatten()
         .find(|value| !value.is_empty())
@@ -189,10 +204,11 @@ mod tests {
     use super::*;
     use crate::audit::events::{
         Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeSource, RateLimitScope,
-        RejectionReason, RejectionStage, RequestFailureOutcome, TargetKind,
+        RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, audit_event,
+        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails,
+        TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -235,6 +251,7 @@ mod tests {
         name: Option<&str>,
     ) -> AuditCallerContext {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
         })
@@ -369,6 +386,48 @@ mod tests {
     }
 
     #[test]
+    fn a_payment_records_signed_credential_never_leaves_the_appliance_only_its_fingerprint() {
+        use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, PaymentStage};
+        let mut event = audit_event(
+            DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
+                rail: PaymentRail::Mpp,
+                stage: PaymentStage::Verified,
+                transaction_id: "row-1".to_string(),
+                amount: None,
+                currency: None,
+                method: None,
+                payer: None,
+                error: None,
+                delegated: true,
+                payment_gateway_id: Some("gw-pay".to_string()),
+                payment_surface_id: Some("ps-1".to_string()),
+                remote_status: Some(200),
+                delegation: None,
+            })),
+            None,
+            None,
+            None,
+            Some("surface-3"),
+        );
+        event.vp_jwt = Some("eyJhbGciOiJFZERTQSJ9.eyJncmFudCI6e319.sig".to_string());
+        event.vp_fingerprint = Some("sha256:grant".to_string());
+
+        let variables = audit_variables(&event);
+
+        assert_eq!(variables["AUDIT_CATEGORY"], "payment");
+        assert_eq!(variables["AUDIT_VP_JWT"], "");
+        assert_eq!(variables["AUDIT_VP_FINGERPRINT"], "sha256:grant");
+        let record: serde_json::Value = serde_json::from_str(&variables["AUDIT_RECORD"]).unwrap();
+        assert!(record.get("vp_jwt").is_none(), "{record}");
+        assert_eq!(record["vp_fingerprint"], "sha256:grant");
+        assert_eq!(
+            event.vp_jwt.as_deref(),
+            Some("eyJhbGciOiJFZERTQSJ9.eyJncmFudCI6e319.sig"),
+            "the local record keeps it"
+        );
+    }
+
+    #[test]
     fn allow_decision_has_no_deny_reason() {
         let variables = audit_variables(&policy_decision("allow"));
         assert_eq!(variables["AUDIT_DECISION"], "allow");
@@ -387,6 +446,14 @@ mod tests {
         assert_eq!(with(jwt_caller(None, Some("Ada Lovelace"))), "Ada Lovelace");
         assert_eq!(with(jwt_caller(None, None)), "user-123");
         assert_eq!(with(jwt_caller(Some(""), None)), "user-123", "an empty claim is skipped");
+        let by_oid = crate::delegation_vault::audit::build_caller_context(
+            &crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                principal_claim: "oid".to_string(),
+                subject: "person-1".to_string(),
+                claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+            },
+        );
+        assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");
 
         let api_key =
             crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::ApiKey {
@@ -495,7 +562,9 @@ mod tests {
             | DelegationAuditAction::PolicyAttached(_)
             | DelegationAuditAction::PolicyDetached(_)
             | DelegationAuditAction::PolicyAttachmentChanged(_)
-            | DelegationAuditAction::PolicyChangeRefused(_) => {}
+            | DelegationAuditAction::PolicyChangeRefused(_)
+            | DelegationAuditAction::TargetAuthChanged(_)
+            | DelegationAuditAction::SecretForceDeleted(_) => {}
         }
     }
 
@@ -542,6 +611,7 @@ mod tests {
                 payment_gateway_id: None,
                 payment_surface_id: None,
                 remote_status: None,
+                delegation: None,
             })),
             DelegationAuditAction::AuthFailed {
                 scheme: AuthScheme::Jwt,
@@ -552,6 +622,7 @@ mod tests {
             DelegationAuditAction::RateLimited {
                 scope: RateLimitScope::Surface,
                 retry_after_ms: None,
+                transit_point: None,
             },
             DelegationAuditAction::RequestRejected {
                 stage: RejectionStage::Routing,
@@ -559,6 +630,7 @@ mod tests {
                 http_status: Some(404),
                 rpc_error_code: None,
                 requested_variant: None,
+                target_auth: None,
             },
             DelegationAuditAction::IdentityBindingFailed {
                 outcome: IdentityBindingFailure::Absent,
@@ -596,6 +668,25 @@ mod tests {
             DelegationAuditAction::PolicyDetached(policy_change()),
             DelegationAuditAction::PolicyAttachmentChanged(policy_change()),
             DelegationAuditAction::PolicyChangeRefused(policy_change()),
+            DelegationAuditAction::TargetAuthChanged(Box::new(TargetAuthChangeDetails {
+                actor: Actor::user("u-1"),
+                surface_variant: "_base_".to_string(),
+                variant_id: None,
+                leg: TargetAuthLeg::Target,
+                transit_point_id: None,
+                transit_point: None,
+                previous_method: TargetAuthMethodKind::None,
+                method: TargetAuthMethodKind::StaticSecret,
+                previous_provider_id: None,
+                provider_id: None,
+                changed: Vec::new(),
+            })),
+            DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
+                actor: Actor::user("u-1"),
+                secret_id: "billing_api_key".to_string(),
+                force: true,
+                referrers: Vec::new(),
+            })),
         ]
     }
 

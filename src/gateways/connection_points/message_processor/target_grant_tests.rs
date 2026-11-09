@@ -19,10 +19,8 @@ fn fabric_receive_refuses_a_bound_target_before_payment() {
                 "surface_id": "paid-vendor", "name": "paid-vendor",
                 "access_point": {"listen_address": "127.0.0.1:8080", "route": "/paid-vendor", "protocol": "mcp"},
                 "target": {"endpoint": format!("{target}/mcp"), "payment_policy": {
-                    "type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
-                    "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
-                        "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
-                    "mcp_payment_triggers": {"mode": "all"}}},
+                    "type": "agent_pay", "payment_gateway_id": "payment-gateway",
+                    "payment_surface_id": "payment-surface"}},
                 "outbound_credentials": [{"credential_provider_id": "vendor", "consent_mode": "external",
                     "subject": "owner"}]
             })]
@@ -68,7 +66,7 @@ fn fabric_receive_refuses_a_discovery_read_of_a_bound_target() {
             message.message_body["path"] = json!(path);
             message.message_body["body"] = json!(null);
             message.message_body["headers"] =
-                json!({"cookie": "session_token=dashboard-session", "accept": "application/json"});
+                json!({"cookie": "__Host-session_token=dashboard-session", "accept": "application/json"});
             let (status, events) = receiver
                 .receive(&message)
                 .await;

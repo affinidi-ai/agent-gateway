@@ -53,7 +53,7 @@ const CREDENTIALS_TABS = tabs('credentials', [
 ]);
 const CREDENTIALS = ['credentials-search-input', ...CREDENTIALS_TABS];
 
-const POLICIES = ['policies-search-input', ...tabs('policies', ['gateway', 'agent-surface', 'paywall'])];
+const POLICIES = ['policies-search-input', ...tabs('policies', ['gateway', 'agent-surface'])];
 
 const SECRETS = ['secrets-search-input', ...tabs('secrets', ['secrets', 'api-keys', 'certificates', 'access-tokens'])];
 
@@ -205,12 +205,6 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         ],
     },
     {
-        id: 'policies-paywall',
-        route: '/policies?tab=paywall',
-        testIds: ['page-policies'],
-        actions: [...POLICIES, 'paywall-policies-add-surface-button'],
-    },
-    {
         id: 'secrets',
         route: '/secrets',
         testIds: ['page-secrets', `secrets-row-${FIXTURE_ID.secret}`],
@@ -286,15 +280,19 @@ const SIDEBAR_PAGES: LayoutPage[] = [
     },
     {
         id: 'payments',
-        route: '/x402payments',
-        testIds: ['page-payments', `payments-row-${FIXTURE_ID.payment}`],
+        route: '/payments',
+        testIds: [
+            'page-payments',
+            `payments-row-${FIXTURE_ID.payment}`,
+            `payments-held-case-${FIXTURE_ID.payment}`,
+            `payments-legacy-row-x402-${FIXTURE_ID.legacyPayment}`,
+        ],
         actions: [
-            'payments-search-input',
+            'payments-filter-input',
+            'payments-outcome-filter',
             'payments-refresh-button',
-            'payments-bucket-select',
-            'payments-overview-context-toggle',
+            `payments-surface-link-${FIXTURE_ID.payment}`,
             `payments-details-button-${FIXTURE_ID.payment}`,
-            `payments-delete-button-${FIXTURE_ID.payment}`,
         ],
     },
     {
@@ -679,7 +677,7 @@ const CREATE_PAGES: LayoutPage[] = [
     {
         id: 'jwt-strategy-new',
         route: '/jwt-verification-strategies/new',
-        testIds: ['page-jwt-strategy-editor'],
+        testIds: ['page-jwt-strategy-editor', 'jwt-strategy-editor-principal-claim-input'],
         actions: [
             'jwt-strategy-editor-back-button',
             'jwt-strategy-editor-check-jwks-button',

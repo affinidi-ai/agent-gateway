@@ -14,6 +14,7 @@ revision-specific behavior and limitations of the checked-out source.
 | MCP `2025-03-26`, `2025-06-18`, `2025-11-25` | Active | Admitted on every MCP endpoint and forwarded as session revisions, like `2024-11-05`. Advertised in discovery on every MCP endpoint except gateway-owned MCP Proxies, which answer `initialize` with `2024-11-05`. Tasks (`tasks/*`) and JSON-RPC batches are not supported (HTTP `422`). See [MCP Validation Boundary](#mcp-validation-boundary) |
 | MCP `2026-07-28` | Active | Admitted and advertised on every MCP endpoint, alongside the session revisions that endpoint advertises |
 | AP2 | Experimental | Disabled by default; production proof signing is not implemented |
+| x402, MPP | Delegated | Payment is taken by agent-pay through an `agent_pay` policy; this Gateway does not verify or settle payments itself. See [Payment](#payment) |
 
 The hosted documentation is rolling product documentation. Use this matrix and the repository
 changelog when behavior must match this source revision exactly.
@@ -28,7 +29,11 @@ resolved on those paths either, on the direct or fabric send leg, so a credentia
 resolved does not fail discovery.
 
 Forwarded requests on those public paths never carry the surface's `target.auth`: that
-credential vouches that the gateway vetted the caller, and discovery vetted nobody.
+credential vouches that the gateway vetted the caller, and discovery vetted nobody. On the
+receiving gateway of a Fabric route, only a `GET` of exactly `/.well-known/agent-card.json` or
+the surface's configured card location, the path a sending gateway's own card fetch uses, is
+treated as that fetch and carries `target.auth`. A `HEAD` of it, a query on it, `/discovery` or
+any other discovery read is a caller's and carries none.
 
 ### Agent card fetch
 
@@ -60,13 +65,13 @@ sequenceDiagram
 
 | Aspect | Behaviour |
 | --- | --- |
-| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read or the provider's token request fails. The cause is logged only. |
+| `target.auth.fallback: reject` | 502 with the generic detail "Target authentication failed" when the secret cannot be read, the provider's token request fails, or `target_https` in `enforce` withholds the credential from a Target that is not https. The cause is written to the VP Audit Log as a `target_auth_failed` record (see [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding)) and never reaches the caller. `target_source_auth` never withholds it here: the fetch is the gateway's own, with no caller to check (see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). |
 | `target.auth.fallback: passthrough` | Fetches without the credential. |
 | Provider token | Requested once, then reused from the vault and renewed up to 5 minutes before it expires. While a renewal fails, the cached token is still used until 60 seconds before it expires. |
 | Caller headers | Only `Accept`, `Accept-Language`, and `User-Agent` are forwarded while the credential is attached, so an anonymous caller can neither override the credential nor add identity or forwarding headers. |
 | Redirects | The client is pinned to the vetted target address with redirects disabled, so the credential cannot follow a 3xx to another host. A 3xx answers 502 "Upstream redirected". |
 | Blocked by egress policy | 403 |
-| Without `target.auth` | The fetch forwards caller headers and follows redirects as before. |
+| Without `target.auth` | The fetch forwards caller headers except `Cookie`, and follows redirects as before. |
 | `fabric://` targets | Unchanged. The remote gateway applies its own target auth. |
 
 The card fetched with `target.auth` is served to unauthenticated callers as is, so a
@@ -84,8 +89,7 @@ card, and how the gateway's fetch went:
   ignored.
 
 The preview builds the card exactly as the card route does for an anonymous caller, with the
-same Target Authentication, identity, endpoint rewrite and identity credential. It skips the
-x402 and MPP payment gate and reports only `payment_required`. It records no gateway fault,
+same Target Authentication, identity, endpoint rewrite and identity credential. It records no gateway fault,
 rejected request, Trust Recorder write or connection metric. It fetches from an `http(s)` Target
 over a client pinned to the vetted address, credential or not, without following redirects; a
 `fabric://` Target is asked through the remote gateway as the card route asks it. The request to the agent carries only
@@ -104,7 +108,6 @@ Every fetch result is a `200` with these fields, each always present:
 | `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
 | `fetch` | `status` (`ok`, `failed`, `not_served`), `cause`, `http_status`, `duration_ms`. |
 | `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
-| `payment_required` | Callers must pay before the card route serves the card. |
 | `before`, `before_bytes` | The agent's own card as fetched, and its size. |
 | `after`, `after_bytes` | The card the gateway serves, and its size. |
 | `display_limit_bytes` | 262144. A card larger than this is reported by size only, with the card `null`. |
@@ -117,8 +120,10 @@ could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3x
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
 `identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
-`token_unavailable` or `unsupported`; `forbidden`, `invalid_header`, `outside_target_base` and
-`header_conflict` are never sent and keep the spellings the dashboard accepts.
+`token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
+withholds the credential), or `invalid_header` (a stored Target authentication whose header
+breaks a header rule, which is never sent); `outside_target_base` and `header_conflict` are
+never sent and keep the spellings the dashboard accepts.
 
 When a fetch fails, `after` is the last good card the preview built for the same running surface
 on this replica, for up to 10 minutes after that fetch, and `null` once the surface changed.
@@ -167,14 +172,14 @@ the Managed Agent it reaches must share a version.
 
 On an A2A or AP2 surface the Gateway resolves the `A2A-Version` request header right after gateway
 OPA and the AP2 gate, and then runs [JSON-RPC and request-shape validation](#error-mapping). All
-three come before any payment (a delegated `agent_pay` payment or local x402/MPP verification), the
-forward-target egress check and forwarding. So a request refused with
+three come before any payment, the forward-target egress check and forwarding. So a request refused with
 any of the [errors below](#error-mapping) is never charged, and those errors take precedence over an egress
 block; the [protocol-version metric](OBSERVABILITY.md#a2a-protocol-version-metric)
 also counts requests that are refused later. A body over `max_body_size` is refused with HTTP
 `413` as it is read, before gateway OPA, so no policy decision is recorded for it. A delegated
-`agent_pay` payment is still settled before the rest of this Gateway's pipeline (egress check,
-Trust Check, surface policy, upstream), so a request it paid for can still be refused there.
+`agent_pay` payment is taken last, just before forwarding (see [Payment](#payment)), so a request
+refused by Trust Check, surface policy, target authentication or credential delegation is not
+charged, while one it paid for can still fail upstream.
 
 Negotiation runs on every request that reaches that point, whatever the HTTP method, and applies
 to Managed Agent, `a2a-proxy://` and `fabric://` targets alike, each against its surface's
@@ -217,8 +222,8 @@ default) or **Envelope + A2A fields**.
   appliance-wide caller can set it: an access token with a tenant or a resource scope (a resource
   pattern or required headers) that sets
   `"off"` on a surface that was not already `"off"` is refused with `403`, on create, `PUT`, merge
-  `PATCH` and the variant routes alike. On such a request, an x402 or MPP payment with A2A method
-  filters is required rather than skipped, since the filters cannot be matched. A batch that
+  `PATCH` and the variant routes alike. On such a request, an `agent_pay` policy with
+  `a2a_method_filters` charges it rather than skipping it, since the filters cannot be matched. A batch that
   contains an extended agent card request is still refused (see
   [Generated agent cards](#generated-agent-cards)).
 - The surface API stores the block explicitly on every save of an A2A or AP2 surface, the defaults
@@ -728,8 +733,8 @@ gateway does not run them again. So on a G2G hop:
   decides;
 - `agent_gateway_a2a_protocol_version_total` counts the request on the sending gateway, not on the
   receiving one;
-- an x402 or MPP payment with A2A method filters is checked on the receiving gateway without the
-  envelope check, so a body the filters cannot match is charged there whatever the validation level.
+- an `agent_pay` policy with `a2a_method_filters` on the receiving surface is checked on Fabric
+  receive without the envelope check, so a body the filters cannot match is charged there whatever the validation level.
 
 A malformed envelope, a batch, or an `A2A-Version` a `fabric://` surface does not accept is refused
 on the sending gateway, as on any other A2A surface, rather than forwarded for a conformant agent to
@@ -776,6 +781,77 @@ Relevant implementation:
   `ROLE_AGENT`, parts without `kind`), and `message/send` gets the v0.3 shape (the message itself as
   `result`, `kind: "message"`, `role: "agent"`, `kind: "text"` parts), whatever `A2A-Version` the
   caller sent.
+
+## Target Credential Scope
+
+A Target credential (`target.auth`, or a Transit Point's `target_auth`) is sent only to URLs
+under its Target or Transit Point destination. Before the credential
+is attached to a forwarded request, the gateway checks the outbound URL against the Target
+endpoint: the scheme, host and port must match (a default port matches an explicit one), and the
+path must equal the Target's path or continue below it after a `/`. Both paths are compared after
+decoding percent-encoded unreserved characters (`A`-`Z`, `a`-`z`, `0`-`9`, `-`, `.`, `_`, `~`)
+and removing `.` and `..` segments (RFC 3986 sections 2.3 and 5.2.4). `%2F` is never decoded, so
+`/base/%2Fx` stays under `/base` and `/base%2Fx` does not. A `;` parameter is part of its segment:
+`/base;v=1/x` is not under `/base`. Below a non-root base path, a segment that a server could
+still resolve as `.` or `..` is refused too, since some servers strip `;` parameters, decode `%2F`,
+treat `\` as a separator or decode more than once: a dot segment with `;` parameters (`..;`,
+`.;x`), a `.` or `..` beside an encoded slash or backslash (`..%2F`, `..%5C`, `%2F..`), and the
+same spelled with escapes that decode into them (`%252e`, `..%252F`, `..%255C`, `..%3B`, `%u002e`,
+overlong, fullwidth or other look-alike dots such as `%C0%AE` and `%E2%80%A5`), and a segment
+with `%00`, a `%u` escape, or a `%25` left after three rounds of decoding. `%2F` and
+`%5C` elsewhere in a segment (`/base/a%2Fb`) and `;` parameters on other segments
+(`/base/x;v=1`) stay allowed. The query is ignored, and a Target with an empty or `/` path allows
+every path on its origin. A `GET` or `HEAD` of the configured agent card location
+(`access_point.agent_card_path`, or the Transit Point's `agent_card_path`) on the destination's
+origin is also allowed; any other method there is refused.
+
+| Path | Checked URL | Refusal |
+| --- | --- | --- |
+| Direct forward | The Target endpoint joined with the request path | 502 "Target authentication failed" |
+| Fabric send (an Access Point with a `fabric://` Target) | The path after the route, which must not climb above the peer gateway's base | 502 "Target authentication failed" |
+| Fabric receive | The receiving surface's Target joined with the forwarded path | ForwardResponse 502, detail "Target authentication failed" |
+| MCP proxy `tools/call` (direct or over Fabric) | The REST URL the OpenAPI tool resolves, against the proxy's `base_url` with a trailing `/` added when missing | 502 "Target authentication failed" |
+| Transit Point to an `http(s)` destination | The destination endpoint joined with the path after the Transit Point's listen prefix | 502 "Target authentication credentials unavailable" |
+| Transit Point to a `fabric://` destination | The path after the listen prefix, which must not climb above the peer gateway's base | 502 "Target authentication credentials unavailable" |
+
+On the MCP proxy, a path parameter value containing another path parameter's `{name}`
+placeholder is also refused while the credential is attached, because the OpenAPI client
+substitutes parameters one at a time and the value would be rewritten into another parameter's
+place. It is refused as leaving the base: a 502 "Target authentication failed" and a
+`target_auth_failed` record in the VP Audit Log with outcome `rejected`, whatever the `fallback`.
+Any other value containing `{` or `}` is refused as invalid arguments by the gateway's REST client,
+which sends the tool call, encodes each path parameter as one segment, refuses a braced or `.`
+segment, and checks the base path after substitution. A refused request reaches neither the Target
+nor any other host. A surface without `target.auth`, or a
+Transit Point without `target_auth`, forwards as before. The 2026-07-28 MCP proxy path encodes
+each path parameter as one segment and refuses a parameter that makes a segment `.` or `..`, and,
+below a non-root `base_url` path, one that makes an ambiguous segment above (for example
+`../admin`, sent as `..%2Fadmin`), with or without the credential. The refusal is an HTTP `400` with JSON-RPC error `-32602` and the message "Invalid tool arguments", answered before any request is sent; it writes no VP Audit Log record.
+
+The forward clients do not follow redirects: a Target's 3xx is returned to the caller with its
+`Location`, so the credential never follows it to another URL. This holds for the pinned direct
+forward client, the pooled client used for `proxy://` surfaces, and the Fabric receive client.
+A legacy MCP proxy `tools/call` that carries the Target credential, direct or over Fabric, is
+sent by the gateway's REST client (the one the 2026-07-28 path uses) instead of `rmcp-openapi`'s
+client, which follows redirects. It resolves the tool against the proxy's `base_url` with a
+trailing `/` added when missing, as `rmcp-openapi` does (`/api/v4` reaches `/api/v4/pets/1`), and
+returns the same tool result (`content` and `isError`; a legacy tool result carries no
+`structuredContent`) for a JSON response, a failure status included, except as listed here. A 3xx
+fails the call with "Tool execution failed: REST tool redirects are not permitted", and the
+redirect target receives nothing. That client also applies the `mcp_http` size limits, encodes
+each path parameter as one segment, and refuses a `base_url` with user info. It checks a 2xx
+response against the tool's output schema, so a response the schema does not admit is a tool
+error, "REST response does not match the tool output schema", where `rmcp-openapi`'s client
+returns it as a success. The result text of a response that is not JSON leaves out the response
+headers and the request body, a response body other than an image that is not UTF-8 text fails
+the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
+rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
+vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud
+metadata refused, private ranges allowed) and pins the connection to the vetted address, so a host
+that later resolves to a refused address fails the call with "Tool execution failed: REST tool
+target is not permitted" before any request, and the credential is not sent. A tool call without
+the credential still runs on `rmcp-openapi`'s client and is unchanged.
 
 ## Upstream Response Bounds
 
@@ -940,44 +1016,39 @@ that changes may be overwritten by, or break, the managing product. The surface
 builder's "via MCP Proxy" target notes whether the chosen proxy can also be
 reached around the surface.
 
-## x402 Payment Verification
+## Payment
 
-A local x402 paywall verifies a caller's payment against the surface's own `payment_requirements`,
-never against the requirement the credential carries. The credential's `accepted` object must name
-one of the requirements the `402` challenge issued, exactly, in everything verification and
-settlement act on: `scheme`, `network`, `asset`, `payTo`, `amount`, the asset transfer method in
-`extra`, and the EIP-712 `name` and `version` in `extra`. The amount must equal the configured one
-for `upto` as well as `exact`, because an `upto` payer authorises the configured amount as the
-maximum. EVM addresses compare case-insensitively, because the challenge issues them lowercased;
-Solana addresses compare exactly. A credential that names no issued requirement is rejected with
-`400 invalid_payment` before any signature check, chain lookup, facilitator call, or settlement,
-in every `verification_mode` including `mock`, and its transaction record is marked failed. A
-surface with x402 enabled and no `payment_requirements` accepts no payment. Beyond that match,
-`mock` skips every signature, chain, and facilitator check, so it grants access for an unpaid
-credential; it is for tests only and must not be used in production.
+This Gateway takes payment only by delegating it to agent-pay. A surface's
+`target.payment_policy` of type `agent_pay` names a payment surface on a connected agent-pay
+gateway, which owns the price, the accepted x402 and MPP methods, verification and settlement.
+This Gateway decides whether a request is chargeable, sends agent-pay a payment request carrying any
+credential the caller presented, over the fabric after policy and just before forwarding, and relays agent-pay's answer: a `402`
+challenge, a receipt on the forwarded response, or a refusal. The policy fields, the request sent
+to agent-pay and the full answer mapping are in
+[Surface payment policy](CONFIGURATION_REFERENCE.md#surface-payment-policy) and
+[Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment).
 
-Every check takes its expected values from the resolved requirement: the recipient, amount, token,
-asset transfer method, and EIP-712 domain. A requirement checked by signature therefore needs
-`extra.assetTransferMethod` (`eip3009` or `permit2`), and an EIP-3009 one also needs `extra.name`
-and `extra.version`; clients no longer supply them. Signature checks require the authorised value
-to equal the configured amount. Solana transaction-hash verification checks native SOL lamports
-only and refuses a requirement for an SPL token, which must use `spl_transfer`. An embedded or
-external facilitator receives the resolved requirement as `paymentRequirements` next to the
-caller's `paymentPayload.accepted`, so the facilitator's own requirement match also applies.
+A request that reaches a charging surface through another gateway, over a `fabric://` Target, keeps
+the credentials that travel in the request: the x402 credential header, and a credential in the
+body (the MCP `payment_signature` and `payment_credential` arguments, `_meta` and A2A metadata).
+The sending gateway's header filter drops `Authorization`, so an MPP `Authorization: Payment ...`
+credential is not relayed and the receiving gateway answers the request as unpaid. A client that
+pays through a gateway hop sends an MPP credential in the body. A surface that charges the request
+itself reads `Authorization: Payment ...` as received.
 
-The transaction record and every settlement path (immediate, deferred, startup recovery, and
-fabric) use the payload with `accepted` replaced by the resolved requirement. A record written by
-an earlier build carries the caller's own `accepted`: the deferred worker and startup recovery
-settle it only if that still resolves to one of the surface's current requirements, and otherwise
-mark its settlement failed.
+When agent-pay holds a payment for human review (`202 held_for_oversight`), the request is not
+forwarded. An HTTP caller receives
+`202 {"status": "held_for_oversight", "case_id", "reason"}`; an MCP or A2A caller
+receives HTTP `200` with JSON-RPC error `1003` (`PAYMENT_PENDING`) and
+`data {httpStatus: 202, case_id, reason}`. This Gateway does not poll the case, so the client
+retries the request once the case is decided.
 
-In `fabric_gateway` verification mode, the requesting gateway resolves the requirement and sends it
-as `payment_requirement` in the `x402/verify-request` body. The facilitator gateway verifies against
-that requirement and rejects a verify-request that does not carry one. A facilitator gateway trusts
-its fabric peers: it verifies against the requirement a peer sends, and settles the payload a peer
-sends in `x402/settle-request` as it is. Upgrade requesting gateways first. An upgraded requester
-binds the payment, including its EIP-712 domain, before a facilitator on an earlier build sees it;
-an upgraded facilitator rejects every verify-request from a requester on an earlier build.
+A surface with an enabled local `x402` or `mpp` policy is refused with
+`503 {"error": "payment_unavailable"}` over HTTP and over the fabric, and saving one is refused
+with `400 local_payment_unsupported`; see
+[Migrating older policies](CONFIGURATION_REFERENCE.md#migrating-older-policies). The x402
+settlement and recovery workers keep running so payments verified locally earlier can still
+settle.
 
 ## AP2 Limitation
 

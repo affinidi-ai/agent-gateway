@@ -694,6 +694,56 @@ fn misconfigured(reason: impl Into<String>) -> anyhow::Error {
 #[error("token endpoint refused by egress policy")]
 pub struct TokenEndpointRefused;
 
+/// The OAuth error codes RFC 6749 section 5.2 and RFC 6750 section 3.1 register for a token
+/// endpoint or a protected resource.
+const REGISTERED_OAUTH_ERRORS: [&str; 8] = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+    "invalid_token",
+    "insufficient_scope",
+];
+
+/// A token endpoint's OAuth `error` code when it is a registered one, otherwise `other`. A token
+/// endpoint can put any short text in its `error`, so nothing else is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OAuthErrorCode(&'static str);
+
+impl OAuthErrorCode {
+    pub(crate) fn new(error: &str) -> Self {
+        Self(
+            REGISTERED_OAUTH_ERRORS
+                .into_iter()
+                .find(|registered| *registered == error)
+                .unwrap_or("other"),
+        )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl std::fmt::Display for OAuthErrorCode {
+    fn fmt(
+        &self,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A service token request the token endpoint answered with an OAuth error. Only its `error`
+/// code is kept.
+#[derive(Debug, thiserror::Error)]
+#[error("Provider token request rejected")]
+pub struct TokenRequestRejected {
+    pub code: OAuthErrorCode,
+}
+
 /// The token endpoint is not https, and the credential policy refuses it.
 #[derive(Debug, thiserror::Error)]
 #[error("token_endpoint must be an https URL")]
@@ -1045,7 +1095,19 @@ fn read_token_answer(
     {
         return Ok(None);
     }
-    anyhow::ensure!(status.is_success(), "Provider token request rejected");
+    if !status.is_success() {
+        return Err(
+            match value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(error) => anyhow::Error::new(TokenRequestRejected {
+                    code: OAuthErrorCode::new(error),
+                }),
+                None => anyhow!("Provider token request rejected"),
+            },
+        );
+    }
     let response: OAuthTokenResponse = serde_json::from_value(value).context("Invalid provider token response")?;
     anyhow::ensure!(
         !response
@@ -1499,6 +1561,28 @@ mod tests {
         assert_eq!(token_error_code(json_body), "invalid_grant");
         assert_eq!(token_error_code(form_body), "invalid_client");
         assert_eq!(token_error_code(r#"{"error":"vendor code 7!"}"#), "vendor code 7!");
+    }
+
+    #[test]
+    fn an_oauth_error_code_keeps_only_a_registered_code() {
+        for code in REGISTERED_OAUTH_ERRORS {
+            assert_eq!(OAuthErrorCode::new(code).as_str(), code);
+            assert_eq!(OAuthErrorCode::new(code).to_string(), code);
+        }
+        for code in [
+            "",
+            "INVALID_CLIENT",
+            "invalid_client ",
+            "client-id-12345",
+            "vendor code 7!",
+            UNRECOGNIZED_ERROR,
+            "line\nbreak",
+            &"e".repeat(65),
+        ] {
+            assert_eq!(OAuthErrorCode::new(code).as_str(), "other", "{code:?}");
+        }
+        assert_eq!(OAuthErrorCode::new("invalid_grant"), OAuthErrorCode::new("invalid_grant"));
+        assert_ne!(OAuthErrorCode::new("invalid_grant"), OAuthErrorCode::new("invalid_client"));
     }
 
     #[test]
@@ -2255,6 +2339,12 @@ mod tests {
             assert_eq!(format!("{exchange:#}"), "Token exchange failed (HTTP 400 Bad Request): invalid_grant");
             assert_eq!(format!("{refresh:#}"), "Token refresh failed (HTTP 400 Bad Request): invalid_grant");
             assert_eq!(format!("{service:#}"), "Provider token request rejected");
+            assert_eq!(
+                service
+                    .downcast_ref::<TokenRequestRejected>()
+                    .map(|rejected| rejected.code.as_str()),
+                Some("invalid_grant")
+            );
             let text = logs.text();
             for message in ["Token exchange failed", "Provider token request rejected"] {
                 let line = text

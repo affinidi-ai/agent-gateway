@@ -87,6 +87,16 @@ pub mod error_codes {
 pub mod application_error_codes {
     pub const PAYMENT_REQUIRED: i32 = 1001;
     pub const PAYMENT_REJECTED: i32 = 1002;
+    /// The payment is held for human review; `data.case_id` names the case.
+    pub const PAYMENT_PENDING: i32 = 1003;
+}
+
+/// The payment errors of the MPP MCP transport (`draft-payment-transport-mcp-00`
+/// §10), which a caller on the legacy MCP revision is answered with in place of
+/// [`application_error_codes`].
+pub mod payment_transport_error_codes {
+    pub const PAYMENT_REQUIRED: i32 = -32042;
+    pub const PAYMENT_VERIFICATION_FAILED: i32 = -32043;
 }
 
 #[cfg(test)]

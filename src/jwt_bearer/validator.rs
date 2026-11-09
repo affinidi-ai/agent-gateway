@@ -313,6 +313,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
 
     fn make_strategy() -> JwtVerificationStrategy {
         JwtVerificationStrategy {
+            principal_claim: None,
             id: "test-strategy-id".to_string(),
             tenant_id: None,
             name: "Test IdP".to_string(),
@@ -620,6 +621,7 @@ BNGV7kU9kiKxYO6H5k+Yb+kp
             y: None,
         };
         JwtVerificationStrategy {
+            principal_claim: None,
             id: "static-strategy-id".to_string(),
             tenant_id: None,
             name: "Static Test IdP".to_string(),

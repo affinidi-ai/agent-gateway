@@ -14,6 +14,8 @@ interface AuditCallerContext {
   iss?: string;
   aud?: string;
   sub?: string;
+  /** The value of the JWT strategy's principal claim, when it is not `sub`. */
+  principal?: string;
   email?: string;
   name?: string;
   email_redacted?: string;
@@ -277,6 +279,14 @@ const CredentialAuditTab: React.FC<CredentialAuditTabProps> = ({
                           <td className="text-muted fw-semibold">Subject</td>
                           <td>
                             <code>{evt.caller.sub}</code>
+                          </td>
+                        </tr>
+                      )}
+                      {evt.caller.principal && (
+                        <tr data-testid="credential-audit-caller-principal">
+                          <td className="text-muted fw-semibold">Principal</td>
+                          <td>
+                            <code>{evt.caller.principal}</code>
                           </td>
                         </tr>
                       )}

@@ -116,6 +116,14 @@ pub struct NetworkConfig {
         deserialize_with = "deserialize_transit_token_max_lifetime_secs"
     )]
     pub transit_token_max_lifetime_secs: u64,
+
+    /// The delegated payment gate's circuit breaker thresholds.
+    #[serde(default)]
+    pub payment_gate: crate::config::types::PaymentGateConfig,
+
+    /// How long and how large the delegated payments ledger is kept.
+    #[serde(default)]
+    pub payment_ledger: crate::config::types::PaymentLedgerConfig,
 }
 
 fn default_external_consent_refresh_refusals() -> u32 {
@@ -212,7 +220,7 @@ pub struct ChannelPrefix {
     /// Human-readable name (displayed in UI dropdown)
     pub name: String,
 
-    /// Route prefix (e.g., "/agents", "/payments")
+    /// Route prefix (e.g., "/agents", "/billing")
     pub prefix: String,
 }
 
@@ -258,6 +266,22 @@ pub struct RouteCategory {
 }
 
 impl NetworkConfig {
+    /// The route prefixes this configuration serves through the proxy: every
+    /// channel prefix and every route of type `proxy`. These are what must not
+    /// shadow a dashboard page.
+    pub fn proxy_prefixes(&self) -> Vec<&str> {
+        self.channels
+            .iter()
+            .map(|channel| channel.prefix.as_str())
+            .chain(
+                self.routes
+                    .values()
+                    .filter(|route| matches!(route.route_type, RouteType::Proxy))
+                    .map(|route| route.prefix.as_str()),
+            )
+            .collect()
+    }
+
     /// Load network configuration from a JSON file
     /// `transit_token_max_lifetime_secs` exactly as the file at `path` holds
     /// it, whatever its type, or `None` when the file does not set it.
@@ -527,6 +551,27 @@ fn validate_listener_set(listeners: &[Listener]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Warns about each listener external URL with no host that parses, through
+/// which no listener shares `/outbound`, naming it by its listener and
+/// position, never its value, which may hold a credential. Listeners change
+/// only on a restart, so startup calls this once.
+pub(crate) fn warn_about_unparsed_external_urls(listeners: &[Listener]) {
+    for l in listeners {
+        for (index, _) in l
+            .external_urls
+            .iter()
+            .enumerate()
+            .filter(|(_, url)| !Url::parse(url).is_ok_and(|url| url.has_host()))
+        {
+            tracing::warn!(
+                listener = %l.id,
+                external_url_index = index,
+                "Listener external URL has no host that parses, so no listener shares /outbound through it"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod listener_validation_tests {
     use super::*;
@@ -553,6 +598,35 @@ mod listener_validation_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate listener bind address 0.0.0.0:8080"), "got: {err}");
+    }
+
+    #[test]
+    fn an_external_url_without_a_host_is_named_by_its_position_not_its_value() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let mut outbound = listener("outbound-http", "0.0.0.0", 9000);
+        outbound.external_urls = vec![
+            "https://shared.example.com".into(),
+            "https://secret-user:secret-pass@shared.example.com:99999".into(),
+            "no-scheme".into(),
+        ];
+
+        warn_about_unparsed_external_urls(&[listener("inbound-http", "0.0.0.0", 8080), outbound]);
+
+        let text = logs.text();
+        let warnings: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("Listener external URL has no host that parses"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{text}");
+        assert!(
+            warnings
+                .iter()
+                .all(|line| line.contains("outbound-http")),
+            "{text}"
+        );
+        assert!(warnings[0].contains("external_url_index=1"), "{}", warnings[0]);
+        assert!(warnings[1].contains("external_url_index=2"), "{}", warnings[1]);
+        assert!(!text.contains("secret-pass"), "a log holds the URL: {text}");
     }
 
     #[test]
@@ -683,6 +757,55 @@ mod url_mapping_tests {
                 .trusted_proxies
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn the_payment_gate_breaker_defaults_to_five_failures_and_thirty_seconds_and_reads_its_overrides() {
+        let defaults = cfg_with_listeners(serde_json::json!([]));
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_failures(),
+            5
+        );
+        assert_eq!(
+            defaults
+                .payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(30)
+        );
+
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "routes": {},
+            "payment_gate": { "breaker_failures": 3, "breaker_open_secs": 90 },
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_failures(),
+            3
+        );
+        assert_eq!(
+            cfg.payment_gate
+                .breaker_open_for(),
+            std::time::Duration::from_secs(90)
+        );
+
+        let clamped = crate::config::types::PaymentGateConfig {
+            breaker_failures: Some(0),
+            breaker_open_secs: Some(86_400),
+        };
+        assert_eq!(clamped.breaker_failures(), 1);
+        assert_eq!(clamped.breaker_open_for(), std::time::Duration::from_secs(3600));
+
+        let unknown = serde_json::from_value::<crate::config::types::PaymentGateConfig>(
+            serde_json::json!({ "breaker_threshold": 3 }),
+        );
+        assert!(unknown.is_err(), "a misspelt key is refused");
     }
 
     #[test]
@@ -947,5 +1070,27 @@ mod url_mapping_tests {
                 "{not_whole}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_prefixes_are_the_channel_prefixes_and_the_proxy_routes_only() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/mcp" }],
+            "routes": {
+                "channels": { "type": "proxy", "prefix": "/svc" },
+                "api": { "type": "identity_api", "prefix": "/api" },
+                "dashboard": { "type": "static", "prefix": "/", "path": "www", "fallback": true }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        let mut prefixes = cfg.proxy_prefixes();
+        prefixes.sort_unstable();
+        assert_eq!(prefixes, vec!["/agents", "/svc"]);
     }
 }

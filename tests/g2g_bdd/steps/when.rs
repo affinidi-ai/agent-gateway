@@ -74,6 +74,19 @@ pub(crate) async fn send_a2a_request_through_transit_point(
 }
 
 #[when(
+    regex = r#"^managed agent "([^"]+)" sends an A2A message/send request through Transit Point "([^"]+)" with header "([^"]+)" set to "([^"]+)"$"#
+)]
+pub async fn managed_agent_sends_a2a_request_through_transit_point_with_header(
+    world: &mut G2gWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    send_a2a_request_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)]).await;
+}
+
+#[when(
     regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request through Transit Point \"([^\"]+)\" with header \"([^\"]+)\" set to \"([^\"]+)\" and header \"([^\"]+)\" set to \"([^\"]+)\"$"#
 )]
 pub async fn managed_agent_sends_a2a_request_through_transit_point_with_two_headers(
@@ -226,28 +239,6 @@ pub async fn a2a_request_sent_to_surface(
 ) {
     world.start().await;
     send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &[]).await;
-}
-
-#[when(expr = "the caller sends an A2A request to gateway {int} surface {string} with headers")]
-async fn a2a_request_sent_to_surface_with_headers(
-    world: &mut G2gWorld,
-    gw_index: usize,
-    surface_name: String,
-    step: &cucumber::gherkin::Step,
-) {
-    let headers: Vec<(String, String)> = step
-        .table
-        .as_ref()
-        .expect("step must have a table of headers")
-        .rows
-        .iter()
-        .map(|row| match row.as_slice() {
-            [name, value] => (name.clone(), value.clone()),
-            other => panic!("header row must have a name and a value, got {other:?}"),
-        })
-        .collect();
-    world.start().await;
-    send_rpc(world, gw_index, &surface_name, build_a2a_request_body(), &headers).await;
 }
 
 #[when(expr = "the caller fetches the agent card from gateway {int} surface {string}")]

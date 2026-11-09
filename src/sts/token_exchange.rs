@@ -11,12 +11,17 @@ use serde_json::{Map, Value};
 use crate::sts::errors::StsError;
 use crate::sts::types::{TokenEndpointForm, TokenExchangeRequest, TokenType};
 
-/// Extract `(sub, act)` from a verified assertion's claim set. `act` is cloned
-/// through verbatim so an existing delegation chain is preserved when the
-/// gateway layers a new actor on top.
-pub fn extract_subject_and_act(claims: &Value) -> (Option<String>, Option<Value>) {
+/// Extract `(subject, act)` from a verified assertion's claim set, the subject
+/// being the value of `principal_claim`: the claim the verification strategy
+/// that accepted the assertion names its subjects by. `act` is cloned through
+/// verbatim so an existing delegation chain is preserved when the gateway
+/// layers a new actor on top.
+pub fn extract_subject_and_act(
+    claims: &Value,
+    principal_claim: &str,
+) -> (Option<String>, Option<Value>) {
     let sub = claims
-        .get("sub")
+        .get(principal_claim)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let act = claims.get("act").cloned();
@@ -259,9 +264,21 @@ mod tests {
     #[test]
     fn extract_subject_and_act_reads_both() {
         let claims = json!({ "sub": "did:example:user", "act": { "sub": "did:example:agent" } });
-        let (sub, act) = extract_subject_and_act(&claims);
+        let (sub, act) = extract_subject_and_act(&claims, "sub");
         assert_eq!(sub.as_deref(), Some("did:example:user"));
         assert_eq!(act, Some(json!({ "sub": "did:example:agent" })));
+    }
+
+    #[test]
+    fn extract_subject_and_act_reads_the_strategys_principal_claim() {
+        let claims = json!({ "sub": "pairwise", "oid": "person-1" });
+        assert_eq!(
+            extract_subject_and_act(&claims, "oid")
+                .0
+                .as_deref(),
+            Some("person-1")
+        );
+        assert_eq!(extract_subject_and_act(&claims, "email").0, None);
     }
 
     #[test]

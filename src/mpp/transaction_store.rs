@@ -1,14 +1,14 @@
 //! MPP Transaction Store
 //!
-//! Filesystem-backed store for recording MPP payment transactions.
-//! Provides audit trail and observability for all MPP payment flows.
+//! Filesystem-backed store of the MPP payment transactions this gateway
+//! recorded when it verified MPP payments itself. Nothing records new ones; the
+//! admin API lists, reads and prunes the existing records.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tracing::{error, info};
 
-use crate::delegation_vault::audit::PaymentStage;
 use crate::storage::filesystem::{StorableEntity, StorageBackend, cached_storage};
 
 /// MPP transaction status
@@ -97,38 +97,6 @@ impl StorableEntity for MppTransaction {
     }
 }
 
-/// Emit a protocol-independent payment audit event for an MPP transaction.
-/// `vc_jwt`, when present, is a dispute-evidence credential minted for this
-/// stage and is stamped onto the same event.
-fn emit_mpp_payment_audit(
-    txn: &MppTransaction,
-    stage: PaymentStage,
-    vc_jwt: Option<&str>,
-) {
-    use crate::delegation_vault::audit::{PaymentEventDetails, PaymentRail, record_payment_event};
-    record_payment_event(
-        PaymentEventDetails {
-            rail: PaymentRail::Mpp,
-            stage,
-            transaction_id: txn.id.clone(),
-            amount: txn.amount.clone(),
-            currency: txn.currency.clone(),
-            method: (!txn.payment_method.is_empty()).then(|| txn.payment_method.clone()),
-            payer: txn.payer.clone(),
-            error: txn.error.clone(),
-            delegated: false,
-            payment_gateway_id: None,
-            payment_surface_id: None,
-            remote_status: None,
-        },
-        Some(&txn.surface_id),
-        Some(&txn.channel_name),
-        txn.trace_id.as_deref(),
-        false,
-        vc_jwt,
-    );
-}
-
 /// Filesystem-backed MPP transaction store
 pub struct MppTransactionStore {
     storage: Box<dyn StorageBackend<MppTransaction>>,
@@ -144,191 +112,6 @@ impl MppTransactionStore {
         info!("[mpp-txn-store] Initialized at {:?}", base_path);
 
         Ok(Self { storage })
-    }
-
-    /// Record a verified payment
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_verified(
-        &self,
-        channel_id: &str,
-        channel_name: &str,
-        resource_url: &str,
-        payment_method: &str,
-        reference: &str,
-        payer: Option<&str>,
-        amount: Option<&str>,
-        currency: Option<&str>,
-        trace_id: Option<String>,
-    ) -> Result<String, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let txn = MppTransaction {
-            id: id.clone(),
-            surface_id: channel_id.to_string(),
-            channel_name: channel_name.to_string(),
-            resource_url: resource_url.to_string(),
-            payment_method: payment_method.to_string(),
-            status: MppTransactionStatus::Verified,
-            reference: reference.to_string(),
-            error: None,
-            payer: payer.map(|s| s.to_string()),
-            amount: amount.map(|s| s.to_string()),
-            currency: currency.map(|s| s.to_string()),
-            created_at: Utc::now(),
-            trace_id,
-            receipt_vc_jwt: None,
-            receipt_vc_fingerprint: None,
-            rejection_vc_jwt: None,
-            rejection_vc_fingerprint: None,
-        };
-
-        let receipt =
-            crate::payment_credentials::issue_payment_receipt(crate::payment_credentials::PaymentReceiptInput {
-                rail: "mpp",
-                payment_id: txn.id.clone(),
-                trace_id: txn.trace_id.clone(),
-                amount: txn.amount.clone(),
-                currency: txn.currency.clone(),
-                method: (!txn.payment_method.is_empty()).then(|| txn.payment_method.clone()),
-                payer: txn.payer.clone(),
-                resource: Some(txn.resource_url.clone()),
-                settled: true,
-                settlement: None,
-                payer_signature: None,
-            })
-            .await;
-        let mut txn = txn;
-        if let Some(ref c) = receipt {
-            txn.receipt_vc_jwt = Some(c.jwt.clone());
-            txn.receipt_vc_fingerprint = Some(c.fingerprint.clone());
-        }
-
-        emit_mpp_payment_audit(
-            &txn,
-            PaymentStage::Verified,
-            receipt
-                .as_ref()
-                .map(|c| c.jwt.as_str()),
-        );
-        self.save_and_cache(txn)
-            .await?;
-
-        info!("[mpp-txn-store] Recorded verified payment: {}", id);
-        Ok(id)
-    }
-
-    /// Record a failed payment verification
-    pub async fn record_failed(
-        &self,
-        channel_id: &str,
-        channel_name: &str,
-        resource_url: &str,
-        payment_method: &str,
-        error_message: &str,
-        payer: Option<&str>,
-        trace_id: Option<String>,
-    ) -> Result<String, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let txn = MppTransaction {
-            id: id.clone(),
-            surface_id: channel_id.to_string(),
-            channel_name: channel_name.to_string(),
-            resource_url: resource_url.to_string(),
-            payment_method: payment_method.to_string(),
-            status: MppTransactionStatus::Failed,
-            reference: String::new(),
-            error: Some(error_message.to_string()),
-            payer: payer.map(|s| s.to_string()),
-            amount: None,
-            currency: None,
-            created_at: Utc::now(),
-            trace_id,
-            receipt_vc_jwt: None,
-            receipt_vc_fingerprint: None,
-            rejection_vc_jwt: None,
-            rejection_vc_fingerprint: None,
-        };
-
-        let rejection =
-            crate::payment_credentials::issue_payment_rejection(crate::payment_credentials::PaymentRejectionInput {
-                rail: "mpp",
-                payment_id: txn.id.clone(),
-                trace_id: txn.trace_id.clone(),
-                method: (!txn.payment_method.is_empty()).then(|| txn.payment_method.clone()),
-                payer: txn.payer.clone(),
-                reason: error_message.to_string(),
-            })
-            .await;
-        let mut txn = txn;
-        if let Some(ref c) = rejection {
-            txn.rejection_vc_jwt = Some(c.jwt.clone());
-            txn.rejection_vc_fingerprint = Some(c.fingerprint.clone());
-        }
-
-        emit_mpp_payment_audit(
-            &txn,
-            PaymentStage::Failed,
-            rejection
-                .as_ref()
-                .map(|c| c.jwt.as_str()),
-        );
-        self.save_and_cache(txn)
-            .await?;
-
-        info!("[mpp-txn-store] Recorded failed payment: {}", id);
-        Ok(id)
-    }
-
-    /// Record a 402 challenge issuance (no credential was provided)
-    pub async fn record_challenge_issued(
-        &self,
-        channel_id: &str,
-        channel_name: &str,
-        resource_url: &str,
-        trace_id: Option<String>,
-    ) -> Result<String, String> {
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let txn = MppTransaction {
-            id: id.clone(),
-            surface_id: channel_id.to_string(),
-            channel_name: channel_name.to_string(),
-            resource_url: resource_url.to_string(),
-            payment_method: String::new(),
-            status: MppTransactionStatus::ChallengeIssued,
-            reference: String::new(),
-            error: None,
-            payer: None,
-            amount: None,
-            currency: None,
-            created_at: Utc::now(),
-            trace_id,
-            receipt_vc_jwt: None,
-            receipt_vc_fingerprint: None,
-            rejection_vc_jwt: None,
-            rejection_vc_fingerprint: None,
-        };
-
-        emit_mpp_payment_audit(&txn, PaymentStage::ChallengeIssued, None);
-        self.save_and_cache(txn)
-            .await?;
-
-        info!("[mpp-txn-store] Recorded challenge issued: {}", id);
-        Ok(id)
-    }
-
-    async fn save_and_cache(
-        &self,
-        txn: MppTransaction,
-    ) -> Result<(), String> {
-        self.storage
-            .save_atomic(&txn)
-            .await
-            .map_err(|e| {
-                error!("[mpp-txn-store] Failed to save to disk: {}", e);
-                format!("Failed to persist transaction: {}", e)
-            })
     }
 
     /// Get a transaction by ID
@@ -403,95 +186,62 @@ impl MppTransactionStore {
 }
 
 #[cfg(test)]
+impl MppTransaction {
+    pub(crate) fn for_test(
+        surface_id: &str,
+        status: MppTransactionStatus,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            surface_id: surface_id.to_string(),
+            channel_name: "test-channel".to_string(),
+            resource_url: "/api/resource".to_string(),
+            payment_method: "tempo".to_string(),
+            status,
+            reference: String::new(),
+            error: None,
+            payer: None,
+            amount: None,
+            currency: None,
+            created_at: Utc::now(),
+            trace_id: None,
+            receipt_vc_jwt: None,
+            receipt_vc_fingerprint: None,
+            rejection_vc_jwt: None,
+            rejection_vc_fingerprint: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl MppTransactionStore {
+    pub(crate) async fn insert(
+        &self,
+        txn: MppTransaction,
+    ) {
+        self.storage
+            .save_atomic(&txn)
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::fs;
 
-    #[tokio::test]
-    async fn test_record_verified_payment() {
-        let temp_dir = std::env::temp_dir().join(format!("mpp-txn-test-{}", uuid::Uuid::new_v4()));
-        let store = MppTransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-
-        let id = store
-            .record_verified(
-                "ch-1",
-                "test-channel",
-                "/api/resource",
-                "tempo",
-                "0xdeadbeef",
-                Some("did:key:z6Mk..."),
-                Some("0.01"),
-                Some("USDC"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let txn = store.get(&id).await.unwrap();
-        assert_eq!(txn.surface_id, "ch-1");
-        assert_eq!(txn.payment_method, "tempo");
-        assert_eq!(txn.status, MppTransactionStatus::Verified);
-        assert_eq!(txn.reference, "0xdeadbeef");
-        assert_eq!(txn.payer.as_deref(), Some("did:key:z6Mk..."));
-        assert_eq!(txn.amount.as_deref(), Some("0.01"));
-        assert!(txn.error.is_none());
-
-        // Verify file on disk
-        let path = temp_dir.join(format!("{}.json", id));
-        assert!(path.exists());
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_record_failed_payment() {
-        let temp_dir = std::env::temp_dir().join(format!("mpp-txn-test-{}", uuid::Uuid::new_v4()));
-        let store = MppTransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-
-        let id = store
-            .record_failed(
-                "ch-1",
-                "test-channel",
-                "/api/resource",
-                "card",
-                "Stripe verification failed: amount mismatch",
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let txn = store.get(&id).await.unwrap();
-        assert_eq!(txn.status, MppTransactionStatus::Failed);
-        assert_eq!(txn.error.as_deref(), Some("Stripe verification failed: amount mismatch"));
-        assert!(txn.reference.is_empty());
-        assert!(txn.payer.is_none());
-
-        let _ = fs::remove_dir_all(&temp_dir).await;
-    }
-
-    #[tokio::test]
-    async fn test_record_challenge_issued() {
-        let temp_dir = std::env::temp_dir().join(format!("mpp-txn-test-{}", uuid::Uuid::new_v4()));
-        let store = MppTransactionStore::new(temp_dir.clone())
-            .await
-            .unwrap();
-
-        let id = store
-            .record_challenge_issued("ch-1", "test-channel", "/api/resource", None)
-            .await
-            .unwrap();
-
-        let txn = store.get(&id).await.unwrap();
-        assert_eq!(txn.status, MppTransactionStatus::ChallengeIssued);
-        assert!(txn.payment_method.is_empty());
-
-        let _ = fs::remove_dir_all(&temp_dir).await;
+    async fn record(
+        store: &MppTransactionStore,
+        surface_id: &str,
+        status: MppTransactionStatus,
+        reference: &str,
+    ) -> String {
+        let mut txn = MppTransaction::for_test(surface_id, status);
+        txn.reference = reference.to_string();
+        let id = txn.id.clone();
+        store.insert(txn).await;
+        id
     }
 
     #[tokio::test]
@@ -501,18 +251,9 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .record_verified("ch-1", "channel-a", "/a", "tempo", "ref1", None, None, None, None)
-            .await
-            .unwrap();
-        store
-            .record_verified("ch-2", "channel-b", "/b", "card", "ref2", None, None, None, None)
-            .await
-            .unwrap();
-        store
-            .record_failed("ch-1", "channel-a", "/c", "tempo", "bad proof", None, None)
-            .await
-            .unwrap();
+        record(&store, "ch-1", MppTransactionStatus::Verified, "ref1").await;
+        record(&store, "ch-2", MppTransactionStatus::Verified, "ref2").await;
+        record(&store, "ch-1", MppTransactionStatus::Failed, "").await;
 
         let ch1_txns = store
             .list_by_channel("ch-1")
@@ -528,6 +269,7 @@ mod tests {
             .list_by_channel("ch-2")
             .await;
         assert_eq!(ch2_txns.len(), 1);
+        assert_eq!(ch2_txns[0].reference, "ref2");
 
         let all = store.list_all().await;
         assert_eq!(all.len(), 3);
@@ -542,13 +284,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Record a transaction
-        let id = store
-            .record_verified("ch-1", "test", "/res", "tempo", "ref", None, None, None, None)
-            .await
-            .unwrap();
+        let id = record(&store, "ch-1", MppTransactionStatus::Verified, "ref").await;
 
-        // Cleanup with 0-day retention should delete it
         let deleted = store
             .cleanup_old_transactions(0)
             .await
@@ -570,23 +307,24 @@ mod tests {
     async fn test_persistence_across_reload() {
         let temp_dir = std::env::temp_dir().join(format!("mpp-txn-test-{}", uuid::Uuid::new_v4()));
 
-        // Create store and record a transaction
         let store = MppTransactionStore::new(temp_dir.clone())
             .await
             .unwrap();
-        let id = store
-            .record_verified("ch-1", "test", "/res", "tempo", "0xabc", None, None, None, None)
-            .await
-            .unwrap();
+        let id = record(&store, "ch-1", MppTransactionStatus::Verified, "0xabc").await;
         drop(store);
 
-        // Create a new store at the same path — should reload from disk
         let store2 = MppTransactionStore::new(temp_dir.clone())
             .await
             .unwrap();
         let txn = store2.get(&id).await.unwrap();
         assert_eq!(txn.reference, "0xabc");
         assert_eq!(txn.status, MppTransactionStatus::Verified);
+        assert!(
+            store2
+                .get("missing")
+                .await
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&temp_dir).await;
     }

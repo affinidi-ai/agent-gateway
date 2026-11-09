@@ -66,6 +66,74 @@ receive error, including lag, ends the connection; socket closure does likewise.
 `DashboardDelta` is already serialized before broadcast and held in `Arc<String>`, reducing clone
 cost across subscribers. Other variants are serialized per connection.
 
+## Payment gate metrics
+
+`agent_gateway_payment_gate_requests_total{surface_id,outcome}` counts each call a surface's
+`agent_pay` payment gate makes to agent-pay, by outcome: `paid`, `challenge`, `held`,
+`rejected` (a refused credential or payment, or a credential already used for a request this
+gateway forwarded), `unconfirmed` (whether the payment was taken is not known, or agent-pay is
+still working on it, and the caller was told to retry the same request with the same credential)
+or `unavailable` (agent-pay unreachable, rate limiting, failing before it was given a credential,
+an open circuit breaker, or a misconfigured policy). A surface refused because it still carries a local
+x402 or MPP policy is counted as `unavailable` too, on every request, while its audit event and its
+`payment.unavailable` integration event are raised at most once a minute per surface.
+`agent_gateway_payment_gate_latency_ms{surface_id}` is the histogram of the round trip; a decision
+that made no request to agent-pay (an open breaker, a caller deadline too short, a misconfigured
+policy, a gateway that is not connected, a refused legacy policy) is counted but has no latency
+sample. A free request makes no call and is not counted. A request
+refused by payment is recorded in the connection metrics as failed, or as a gateway fault for a
+`5xx`.
+
+Both are also exported where the other backends have a place for them:
+
+| Backend | Series |
+| --- | --- |
+| Prometheus | The two metrics above |
+| OpenTelemetry | The counter `gateway.payment_gate.requests.total` (attributes `surface.id`, `outcome`) and the histogram `gateway.payment_gate.latency` (attribute `surface.id`), recorded as each call is made |
+| CloudWatch | Totals across surfaces: `PaymentGateRequestCount` with an `Outcome` dimension beside the configured ones, and `PaymentGateAverageLatency` with `PaymentGateLatencySampleCount`. Pushed with the other metrics, and also when only they changed. There is no per-surface series, since each surface and outcome would be a billable CloudWatch metric |
+| File | Totals across surfaces in `payment_gate_metrics.json` beside the metrics file: `requests_by_outcome`, `latency_sum_ms` and `latency_count`, rewritten with each persist (the metrics file keeps the dashboard's format, which has no place for gate calls). Per-surface rows are in the payments ledger |
+
+### Settlement, breaker and ledger metrics
+
+The gate's request counter also counts `authorized` for an answer that holds the funds until
+the Target delivers (`payment-authorization`). Further Prometheus counters:
+
+| Metric | Labels | Counts |
+| --- | --- | --- |
+| `agent_gateway_payment_settlements_total` | `action` (`capture`, `void`, `status`, `reconcile`), `status` (agent-pay's answer: `captured`, `voided`, `failed`, `unconfirmed`, `expired`, `authorized`, `paid`, `unknown`; `unavailable` or `rejected` when there was no usable answer; `failed` for `reconcile` when the reconciler gave up) | Each `payment-settle` and `payment-settlement-status` request |
+| `agent_gateway_payment_gate_breaker_transitions_total` | `payment_gateway_id`, `state` (`open`, `closed`) | Each time a payment gateway's circuit breaker opens or closes; each is also logged (`warn` on open, `info` on close) |
+| `agent_gateway_payment_ledger_unwritten_rows_total` | none | Ledger rows held in memory only, because the write queue was full or a synchronous write failed |
+
+The integration events `payment.authorized`, `payment.voided`, `payment.capture_failed` and
+`payment.reconcile_failed`, and audit `payment` events with the stages `authorized`, `voided`,
+`settled` and `settlement_failed`, record the same transitions. A delegated `payment` audit event
+whose receipt names another price than the manifest snapshot carries `price_mismatch: true` with
+`quoted_amount` and `quoted_currency`, and its `amount`/`currency` are the receipt's.
+
+### Payment outcome in the access log and span
+
+A request on a surface that charges through agent-pay names the gate's decision on the
+`agent_gateway::access` line that closes it, ` payment_outcome="<outcome>" payment_ledger_id="<row id>"`,
+and on its root `http.request` span as `payment.outcome` and `payment.ledger_id`. The outcome is
+the ledger's (`paid`, `challenge`, `held`, `rejected`, `unconfirmed`, `unavailable`,
+`authorized`), so a refused request reads as a payment refusal rather than a failed connection;
+look the row up with `GET /api/admin/payments/{id}`. A request refused for a leftover local
+x402/MPP policy logs `payment_outcome="unavailable"` with an empty ledger id. The fabric path,
+which has no HTTP access log line, is unchanged.
+
+### Payment credentials in the audit trail
+
+When `payment_receipt_vc` is on, a payment audit record carries the gateway-signed credential for
+its outcome (`PaymentReceiptCredential`, `PaymentRejectionCredential`, or for a delegated payment
+`PaymentAccessGrantCredential`) in `vp_jwt` and its `sha256:` fingerprint in `vp_fingerprint`.
+No code path accepts any of these as proof of access: they are dispute evidence only, never
+returned to the caller and never verified by a gateway to admit a request. They are still signed
+statements naming the trace, the payment and, for a rejection, the payer reference, so the full
+JWT stays in the local VP Audit Log (`delegation-audit.jsonl`), where the Audit page shows it as
+evidence, and goes nowhere else: governance audit integrations get `AUDIT_VP_JWT` empty and an
+`AUDIT_RECORD` without `vp_jwt` for a `payment` record, `GET /api/admin/payments/audit` strips it,
+and the ledger and payment integration events carry only fingerprints.
+
 ## A2A protocol version metric
 
 `agent_gateway_a2a_protocol_version_total{channel_id,negotiated_version,method_era}` is a Prometheus
@@ -293,8 +361,15 @@ endpoint URL.
 | `subject` | `credential_provider` or `surface` |
 | `id` | The provider's `id` or the surface's `surface_id` |
 | `tenant` | The owning tenant, or `appliance` for an appliance-wide resource |
-| `rule` | `token_endpoint_https`, `tenant_credential_isolation` or `jwt_subject` |
+| `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
+
+A surface that derives a DID from an API Key Provider key it may not use, or whose key or
+owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
+`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
+`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
+is `true` when the surface is refused at runtime; see
+[Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
@@ -307,6 +382,14 @@ or provider that no longer exists is not reported.
 An `oauth2_jwt_bearer` provider breaks `jwt_subject` when it has no `jwt_subject`. It keeps
 signing assertions without `sub`, but its next update must set one; `enforced` is always `false`
 for this rule.
+A surface breaks `target_https` when its Target, or one of its Transit Points, sends a static secret
+or credential provider token to an endpoint that is not `https` (`http://`, `fabric://` and
+`a2a-proxy://` count as not https; a `proxy://` Target counts as its MCP proxy's `base_url`). It breaks `target_source_auth` when its Target sends a
+credential, or is an `a2a-proxy://` Target of an A2A or AP2 surface (its A2A proxy sends its
+Direct Line credential), and its Access Point has neither a source authentication method nor
+`mcp_http.authorization`, or a Transit Point sends one and requires no transit token and sets
+neither `mcp_http.authorization` nor its own `source_auth`. Both checks cover every surface
+variant as it resolves, and use the same predicates as the request path.
 
 ## Governance audit forwarding
 
@@ -326,7 +409,19 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
-**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths.
+**Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
+delegated credential events name the agent half of the credential's vault key as `agent_did`.
+For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving
+surface's id (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)), and the
+record names the Target (`target_endpoint`), `channel_name`, `protocol` and `mcp_tool_name`, with
+the caller the receiving surface verified as `caller` and the paired gateway that sent the
+request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
+`vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
+agent its presentation is for as `agent_did`.
+
+**Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
+at a Transit Point where an event below says so.
 Reasons are fixed codes; no record carries a credential, token or validator message.
 
 - `auth_failed`: the caller failed authentication. `scheme` is `jwt`, `api_key`, `did_auth`,
@@ -340,9 +435,16 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
   the request's trace id, and the TCP peer as `client_ip`, since the outbound listener does not
   resolve forwarded headers.
 - `rate_limited`: the request was refused with 429. `scope` is `surface` (the Access Point's
-  rate limit), `sse_sessions` (the legacy SSE session cap) or `fabric_capacity` (a full Fabric
-  stream cap on the way to a fabric target). `retry_after_ms` is the wait the caller is given,
-  when there is one; the surface limit also sends it as `Retry-After` in whole seconds.
+  rate limit), `sse_sessions` (the legacy SSE session cap), `fabric_capacity` (a full Fabric
+  stream cap on the way to a fabric target), `transit_point_caller` (a Transit Point's
+  [per-caller limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point)) or
+  `transit_point_overflow` (the bucket that per-caller limit's callers share while it holds as
+  many buckets as it may). `retry_after_ms`
+  is the wait the caller is given, when there is one; the surface and per-caller limits also send
+  it as `Retry-After` in whole seconds. A `transit_point_caller` record also names the Transit Point
+  (`transit_point`) and the caller's identity hash (`user_identity_hash`), and omits the hash for
+  a request with no identified caller. A `transit_point_overflow` record names the Transit Point
+  and no caller.
 - `request_rejected`: the gateway refused the request before or while forwarding it.
   `http_status` is the HTTP status the caller received, on HTTP paths only (the Access Point and
   the Transit Point); it is absent on every Fabric refusal (`via_fabric: true`), where no HTTP
@@ -398,15 +500,19 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     extension rules, and an inbound identity that is missing or invalid),
     `consent_identity_required` (credential delegation for an anonymous caller, and on Fabric
     receive for a request whose caller the receiving surface did not verify),
-    `access_point_not_ready` (a closed Access Point without source authentication answers every
-    request with `503`, on the direct path and over Fabric), for a request to a Target bound by
+    `access_point_not_ready` (a closed Access Point without source authentication, logged with
+    `reason=no source authentication`, or a surface that derives a DID from an API key it may
+    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
+    over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
     external consent refused before anything is sent `target_path_refused` (`400`, a path the
     grant is not sent to), `target_method_refused` (`405`) and `connector_unavailable` (`503`, a
     rule the surface breaks), and `version_unsupported` for a `2026-07-28` MCP request
     ([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#external-consent-on-the-access-point-target)),
     and on Fabric receive `delegation_not_enabled_for_partners` (a per-user delegated credential
-    binding applies, which a partner's request never gets); the peer is answered `403` with that
-    reason (see
+    binding applies and the view that serves the request does not release its Target's grants
+    to partners) and `consent_not_available_for_partners` (the caller has no grant for a
+    per-user binding that applies); the peer is answered `403` with that reason (see
     [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-fabric-receive)). A
     Transit Point records `consent_not_available_for_partners` too, against its surface with the
     call's trace id, for a call whose Fabric-issued transit token names a caller with no grant,
@@ -417,6 +523,31 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     pass 8 Fabric crossings, recorded against its surface with the call's trace id, and on Fabric
     receive `transit_token_unavailable` (the peer is answered `503`): the managed agent should
     get a transit token for the request and it could not be issued.
+    `target_auth_failed`: the Target credential (`target.auth`, or a Transit Point's
+    `target_auth`) was not sent, because it could not be obtained (a secret or provider that
+    cannot be read, a token request that failed), a `[credential_policy]` rule in `enforce`
+    withheld it, its stored `header_name` or `header_format` breaks a header rule (an invalid
+    or reserved header name, or a format without exactly one `{value}` or with CR, LF or NUL;
+    `outcome` follows the `fallback`), the request would have carried it outside the Target
+    base path, or a Transit
+    Point's resolved credential cannot be sent as a header (the last two always `rejected`,
+    whatever the `fallback`). One record per request, on the direct path, a `proxy://` MCP Target, the
+    Fabric send leg, Fabric receive (forward and MCP Proxy), a Transit Point, and the agent card
+    fetch and its preview. The record carries the request's trace id, except on the gateway's
+    own card fetch with no triggering request (the preview), where `trace_id` is absent; a card
+    fetch that serves a caller's `/.well-known/agent-card.json` request carries that request's
+    trace id. The record carries `provider_id` for a credential provider and a
+    `target_auth` object: `outcome` is `rejected` (the request was refused, `http_status` `502`
+    on HTTP) or `passthrough` (forwarded without the credential, no `http_status`),
+    `transit_point` names the Transit Point by alias when the credential was a Transit Point's
+    `target_auth` (absent for the Target), and
+    `oauth_error` is present when the token endpoint answered with an OAuth `error` code: the
+    code itself when RFC 6749 section 5.2 or RFC 6750 section 3.1 registers it
+    (`invalid_request`, `invalid_client`, `invalid_grant`, `unauthorized_client`,
+    `unsupported_grant_type`, `invalid_scope`, `invalid_token`, `insufficient_scope`), otherwise
+    `other`, so a token endpoint cannot write its own text into the record. A token, an
+    assertion, a secret, the token endpoint's body and its `error_description` are never
+    recorded.
 
   Requests answered before any gateway handler runs (a path under no configured route) and
   gateway faults (a failed egress check task) are not recorded.
@@ -476,6 +607,32 @@ so a change joins to the decisions it causes. No record carries the Rego text, t
 or a request body. Writes made outside a management request (startup migrations, replication)
 record nothing, and neither do writes a configuration reload makes, though the reload is asked
 for through the management API: it is the gateway's own work, not the user's change.
+
+**Target authentication change events.** Raised by management API writes to a surface (group
+Auth); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-target-authentication-changes)
+for which writes.
+
+- `target_auth_changed`: the Target authentication of one leg was added, changed or removed, one
+  record per leg. `leg` is `target` or `transit_point`, with `transit_point_id` and
+  `transit_point` (its alias) for a Transit Point; `surface_variant` is the variant's alias, with
+  `variant_id`, or `_base_`. `previous_method` and `method` are `static_secret`,
+  `credential_provider`, `credential_lookup` or `none`; `previous_provider_id` and `provider_id`
+  name the credential provider on either side. `changed` lists the parts a change to an existing
+  setting replaced (`method`, `secret_id`, `provider_id`, `header_name`, `header_format`,
+  `scopes`, `fallback`, `target_identifier`), by name only. `actor` names the management caller
+  as on policy change events, and the top level carries `surface_id` and `channel_name`. No
+  record carries a secret id, header name, header format or value.
+
+**Secret force-delete events.** Raised by `DELETE /secrets/{id}?force=true` (group Auth); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#auditing-a-forced-secret-delete).
+
+- `secret_force_deleted`: a secret was deleted with force, with or without records still using
+  it. `secret_id` is the secret's id, `force` is `true`, and `referrers` lists each record that
+  used it as `{kind, id}` (`surface`, `credential_provider`, `a2a_proxy` or `sts_client`). `actor`
+  names the management caller as on policy change events. The record carries no secret value and
+  no record name, and sets no `surface_id`.
+
+A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
@@ -645,11 +802,19 @@ default), `AUDIT_PROTOCOL`, `AUDIT_AGENT_DID`, `AUDIT_VIA_FABRIC`, `AUDIT_PRINCI
 `AUDIT_PRINCIPAL_EMAIL`, `AUDIT_PRINCIPAL_NAME`, `AUDIT_AUTH_METHOD`, `AUDIT_DECISION`,
 `AUDIT_DENY_REASON`, `AUDIT_POLICY_NAME`, `AUDIT_POLICY_VERSION`, `AUDIT_POLICY_CONTENT_HASH`,
 `AUDIT_VP_JWT` and `AUDIT_VP_FINGERPRINT`. `AUDIT_RECORD` is the full record in the
-`/v1/audit` row shape. The principal variables come from the record's `caller` context:
-`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (JWT
-`sub`, API key name, DID, mTLS principal, or on a Transit Point the caller the transit token
-carries), and all four are empty when the request had no caller context (no source auth, or a
-Transit Point whose token carries no caller). The policy variables describe the policy that made
+`/v1/audit` row shape. A `payment` record never carries its signed credential out of the appliance:
+`AUDIT_VP_JWT` is empty and `AUDIT_RECORD` has no `vp_jwt` for it, so integrations get only
+`AUDIT_VP_FINGERPRINT`; the full credential stays in the local VP Audit Log as dispute evidence
+(see [Payment credentials](#payment-credentials-in-the-audit-trail)). The principal variables come from the record's `caller` context:
+`AUDIT_PRINCIPAL` is the caller's email, else display name, else authenticated subject (for a
+JWT the value of its verification strategy's `principal_claim`, `sub` by default; the API key
+name, DID, mTLS principal, or on a Transit Point the caller the transit token carries), and all
+four are empty when the request had no caller context (no source auth, or a
+Transit Point whose token carries no caller). For a JWT caller that the Access Point's own
+source authentication verified through a strategy naming a claim other than `sub`, the `caller`
+context keeps the token's own `sub` in `sub`, so it matches the identity provider's logs, and
+adds the claim's value as `principal`. A Transit Point record takes its caller from the transit
+token, which carries no `principal`. The policy variables describe the policy that made
 a `policy_decision` (`AUDIT_POLICY_NAME` is the definition's name, else its id, else a label
 for the layer when the policy has no stored definition, such as "Gateway policy" or "Surface
 policy") and are empty for other records; see

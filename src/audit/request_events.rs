@@ -5,7 +5,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-pub use crate::audit::events::{RejectionReason, RejectionStage};
+pub use crate::audit::events::{RejectionReason, RejectionStage, TargetAuthOutcome};
 
 use crate::audit::events::{AuthScheme, RateLimitScope};
 use crate::delegation_vault::audit::{DelegationAuditAction, DelegationAuditEvent, audit_event, emit};
@@ -81,7 +81,44 @@ pub fn rate_limited(
         facts.record(DelegationAuditAction::RateLimited {
             scope,
             retry_after_ms: retry_after.map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+            transit_point: None,
         })
+    })
+}
+
+/// A Transit Point refused a request with 429 because its per-caller limit
+/// was reached. `caller_hash` is the identity hash of the caller the Transit
+/// Point identified, absent for a request with no identified caller. A refusal
+/// by the bucket callers share while the limit holds as many buckets as it may
+/// is recorded with scope `transit_point_overflow` and names no caller, since
+/// the caller did not spend an allowance of their own.
+pub fn transit_point_caller_rate_limited(
+    facts: &RequestFacts<'_>,
+    transit_point: &str,
+    caller_hash: Option<&str>,
+    refusal: crate::policies::CallerRefusal,
+) {
+    emit("rate_limited", || {
+        let mut event = facts.record(DelegationAuditAction::RateLimited {
+            scope: if refusal.overflow {
+                RateLimitScope::TransitPointOverflow
+            } else {
+                RateLimitScope::TransitPointCaller
+            },
+            retry_after_ms: Some(
+                u64::try_from(
+                    refusal
+                        .retry_after
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+            ),
+            transit_point: Some(transit_point.to_string()),
+        });
+        event.user_identity_hash = caller_hash
+            .filter(|_| !refusal.overflow)
+            .map(str::to_string);
+        event
     })
 }
 
@@ -113,7 +150,40 @@ fn record_rejection(
             http_status: (!facts.via_fabric).then_some(http_status),
             rpc_error_code,
             requested_variant: requested_variant.map(str::to_string),
+            target_auth: None,
         })
+    })
+}
+
+/// The Target credential was not sent: it could not be obtained, or a `[credential_policy]`
+/// rule in `enforce` withheld it. Recorded as a `forward` refusal with reason
+/// `target_auth_failed` whether `outcome` refused the request (`http_status` 502 on HTTP) or
+/// forwarded it without the credential (no `http_status`). `transit_point` names the Transit
+/// Point whose credential it was, absent for the Target; `provider_id` names the credential
+/// provider; `oauth_error` is the token endpoint's registered OAuth `error` code, or `other`,
+/// never its body.
+pub fn target_auth_failed(
+    facts: &RequestFacts<'_>,
+    transit_point: Option<&str>,
+    provider_id: Option<&str>,
+    outcome: TargetAuthOutcome,
+    oauth_error: Option<crate::delegation_vault::oauth::OAuthErrorCode>,
+) {
+    emit("request_rejected", || {
+        let mut record = facts.record(DelegationAuditAction::RequestRejected {
+            stage: RejectionStage::Forward,
+            reason: RejectionReason::TargetAuthFailed,
+            http_status: (outcome == TargetAuthOutcome::Rejected && !facts.via_fabric).then_some(502),
+            rpc_error_code: None,
+            requested_variant: None,
+            target_auth: Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(|code| code.to_string()),
+            }),
+        });
+        record.provider_id = provider_id.map(str::to_string);
+        record
     })
 }
 
@@ -403,7 +473,7 @@ mod tests {
         let recorded: Vec<_> = events
             .iter()
             .map(|event| match &event.event {
-                DelegationAuditAction::RateLimited { scope, retry_after_ms } => (*scope, *retry_after_ms),
+                DelegationAuditAction::RateLimited { scope, retry_after_ms, .. } => (*scope, *retry_after_ms),
                 other => panic!("expected RateLimited, got {other:?}"),
             })
             .collect();
@@ -413,6 +483,67 @@ mod tests {
                 .surface_id
                 .as_deref(),
             Some("surf-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_callers_rate_limit_records_the_point_the_caller_and_the_wait() {
+        use crate::audit::events::RateLimitScope;
+        let ((), events) = crate::audit::producer::capture(async {
+            let refusal = |overflow| crate::policies::CallerRefusal {
+                retry_after: std::time::Duration::from_millis(2500),
+                overflow,
+            };
+            transit_point_caller_rate_limited(&facts(), "partner", Some("caller-hash"), refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", None, refusal(false));
+            transit_point_caller_rate_limited(&facts(), "partner", Some("newcomer-hash"), refusal(true));
+        })
+        .await;
+
+        assert_eq!(events.len(), 3);
+        match &events[0].event {
+            DelegationAuditAction::RateLimited {
+                scope,
+                retry_after_ms,
+                transit_point,
+            } => {
+                assert_eq!(*scope, RateLimitScope::TransitPointCaller);
+                assert_eq!(*retry_after_ms, Some(2500));
+                assert_eq!(transit_point.as_deref(), Some("partner"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[0]
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash")
+        );
+        assert_eq!(events[1].user_identity_hash, None, "a request with no identified caller names none");
+        match &events[2].event {
+            DelegationAuditAction::RateLimited { scope, .. } => {
+                assert_eq!(*scope, RateLimitScope::TransitPointOverflow)
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        assert_eq!(
+            events[2].user_identity_hash, None,
+            "an overflow refusal names no caller, who spent no allowance of their own"
+        );
+        assert_eq!(
+            serde_json::to_value(&events[2]).unwrap()["event"]["rate_limited"]["scope"],
+            "transit_point_overflow"
+        );
+
+        let recorded = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(recorded["event"]["rate_limited"]["scope"], "transit_point_caller", "{recorded}");
+        let read_back: crate::delegation_vault::audit::DelegationAuditEvent = serde_json::from_value(recorded).unwrap();
+        assert_eq!(
+            read_back
+                .user_identity_hash
+                .as_deref(),
+            Some("caller-hash"),
+            "the audit log reads the record back with its caller"
         );
     }
 
@@ -476,6 +607,97 @@ mod tests {
             stored["event"]["request_rejected"]
                 .get("http_status")
                 .is_none(),
+            "{stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_the_provider_outcome_and_oauth_error_code() {
+        let fabric = RequestFacts { via_fabric: true, ..facts() };
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("invalid_client")),
+            );
+            target_auth_failed(&facts(), Some("partner"), None, TargetAuthOutcome::Passthrough, None);
+            target_auth_failed(&fabric, None, Some("machine"), TargetAuthOutcome::Rejected, None);
+        })
+        .await;
+
+        let recorded: Vec<_> = events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::RequestRejected {
+                    stage,
+                    reason,
+                    http_status,
+                    target_auth,
+                    ..
+                } => (*stage, *reason, *http_status, event.provider_id.clone(), target_auth.clone()),
+                other => panic!("expected RequestRejected, got {other:?}"),
+            })
+            .collect();
+        let detail = |outcome, transit_point: Option<&str>, oauth_error: Option<&str>| {
+            Some(crate::audit::events::TargetAuthRejection {
+                outcome,
+                transit_point: transit_point.map(str::to_string),
+                oauth_error: oauth_error.map(str::to_string),
+            })
+        };
+        let forward = (RejectionStage::Forward, RejectionReason::TargetAuthFailed);
+        assert_eq!(
+            recorded,
+            vec![
+                (
+                    forward.0,
+                    forward.1,
+                    Some(502),
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, Some("invalid_client"))
+                ),
+                (forward.0, forward.1, None, None, detail(TargetAuthOutcome::Passthrough, Some("partner"), None)),
+                (
+                    forward.0,
+                    forward.1,
+                    None,
+                    Some("machine".to_string()),
+                    detail(TargetAuthOutcome::Rejected, None, None)
+                ),
+            ]
+        );
+        assert_eq!(events[0].trace_id.as_deref(), Some("trace-1"));
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(
+            stored["event"]["request_rejected"],
+            serde_json::json!({
+                "stage": "forward", "reason": "target_auth_failed", "http_status": 502,
+                "target_auth": {"outcome": "rejected", "oauth_error": "invalid_client"}
+            })
+        );
+        assert_eq!(stored["provider_id"], "machine");
+    }
+
+    #[tokio::test]
+    async fn a_target_auth_failure_records_an_unregistered_oauth_error_as_other() {
+        let ((), events) = crate::audit::producer::capture(async {
+            target_auth_failed(
+                &facts(),
+                None,
+                Some("machine"),
+                TargetAuthOutcome::Rejected,
+                Some(crate::delegation_vault::oauth::OAuthErrorCode::new("echoed client-id-12345")),
+            );
+        })
+        .await;
+        let stored = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(stored["event"]["request_rejected"]["target_auth"]["oauth_error"], "other");
+        assert!(
+            !stored
+                .to_string()
+                .contains("client-id-12345"),
             "{stored}"
         );
     }

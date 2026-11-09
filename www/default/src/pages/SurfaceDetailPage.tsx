@@ -12,7 +12,10 @@ import {
   validateSurfacePayload,
   buildCanvasBlob,
 } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import type { Protocol } from '../components/surface-builder/elements/types';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSurfaceHistory } from '../components/surface-builder/hooks/useSurfaceHistory';
@@ -46,6 +49,7 @@ import {
   nodesFromSurface,
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
 import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
@@ -121,7 +125,8 @@ const SurfaceDetailPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // `Warning` headers of the last save, shown on the Transit Points they name.
+  // `Warning` headers of the last save but the Access Point's, shown in the
+  // banner and on the Transit Points they name.
   // A create that drew warnings sends them here in the route state. They are
   // kept with the surface they are about, since this page stays mounted when
   // the route moves to another surface.
@@ -1283,12 +1288,17 @@ const SurfaceDetailPage: React.FC = () => {
       payload = withDroppedProtectedResourcesRemoved(surface, payload);
       payload = withCallerAccessSettled(payload);
       let headerWarnings: string[] = [];
-      const updated = await apiClient.updateSurface(surfaceId, payload, {
-        onWarnings: received => {
-          headerWarnings = received;
-        },
-      });
-      setSavedWarnings({ surfaceId, warnings: headerWarnings });
+      const { warnings: bodyWarnings, ...updated } = await apiClient.updateSurface(
+        surfaceId,
+        payload,
+        {
+          onWarnings: received => {
+            headerWarnings = received;
+          },
+        }
+      );
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(bodyWarnings)];
+      setSavedWarnings({ surfaceId, warnings: shownSaveWarnings(serverWarnings) });
       setSurface(updated);
       setSaveCount(count => count + 1);
       setJsonOverride(null);
@@ -1379,7 +1389,9 @@ const SurfaceDetailPage: React.FC = () => {
       // Surface non-blocking structural warnings AFTER save so the
       // user notices issues like empty target endpoints / unrouted
       // transit points without being prevented from saving.
-      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${updated.name}" saved`, updated, {
+        headerWarnings: serverWarnings,
+      });
     } catch (err: any) {
       setError(err.message || 'Failed to save surface');
     } finally {
@@ -1671,7 +1683,11 @@ const SurfaceDetailPage: React.FC = () => {
           error || (saveWarnings && saveWarnings.length > 0) ? (
             <>
               {error && (
-                <div className="alert alert-danger surface-page-alert mb-2" role="alert">
+                <div
+                  className="alert alert-danger surface-page-alert mb-2"
+                  role="alert"
+                  data-testid="surface-error-alert"
+                >
                   <i className="fas fa-exclamation-circle me-2" />
                   {error}
                 </div>

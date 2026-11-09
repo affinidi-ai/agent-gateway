@@ -16,6 +16,7 @@ struct AdminApi {
     client: reqwest::Client,
     base: String,
     listener: String,
+    surfaces_dir: std::path::PathBuf,
 }
 
 impl AdminApi {
@@ -38,6 +39,36 @@ impl AdminApi {
             .await
             .unwrap_or_default();
         (status, serde_json::from_str(&text).unwrap_or(Value::String(text)), headers)
+    }
+
+    /// Gives a stored surface Target authentication the admin API would refuse on an http
+    /// Target, as a record saved before the rule existed, and reloads the configuration.
+    async fn store_target_auth(
+        &self,
+        surface_id: &str,
+        auth: Value,
+    ) {
+        let path = self
+            .surfaces_dir
+            .join(format!("{surface_id}.json"));
+        let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        stored["target"]["auth"] = auth;
+        std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        // The reload that followed the surface create can finish after this one and serve
+        // the stored file as it was, so reload until the running surface has the auth.
+        for _ in 0..40 {
+            self.post("config/reload", &json!({}))
+                .await;
+            if self
+                .running_card(surface_id)
+                .await["auth"]["kind"]
+                != "none"
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{surface_id}: the running surface never picked up its stored Target authentication");
     }
 
     async fn post(
@@ -104,7 +135,7 @@ impl AdminApi {
             let (status, body, _) = self
                 .send(
                     self.card(&self.client, surface_id)
-                        .header(reqwest::header::COOKIE, "session_token=management-cookie"),
+                        .header(reqwest::header::COOKIE, "__Host-session_token=management-cookie"),
                 )
                 .await;
             assert_eq!(status, 200, "{body}");
@@ -160,9 +191,15 @@ where
     F: FnOnce(&mut crate::config::GatewayConfig),
 {
     let mut client = None;
+    let mut surfaces_dir = None;
     let harness = GatewayHarness::start_with_mock(mock, |_, gw_config, bootstrap| {
         setup(gw_config);
         client = Some(configure_admin_api(bootstrap));
+        surfaces_dir = Some(std::path::PathBuf::from(
+            &bootstrap
+                .storage_paths
+                .agent_surfaces,
+        ));
     })
     .await;
     let mut listener = url::Url::parse(&harness.gateway_base).unwrap();
@@ -171,6 +208,7 @@ where
         .unwrap();
     let admin = AdminApi {
         client: client.unwrap(),
+        surfaces_dir: surfaces_dir.unwrap(),
         base: harness.gateway_base.clone(),
         listener: listener
             .origin()
@@ -434,8 +472,8 @@ async fn a_static_secret_is_sent_and_an_unanswered_token_is_reported() {
     let cases = [
         (
             "/smoke/card-static",
-            json!({"endpoint": harness.mock.url(), "auth": {"method": {"static_secret": {
-                "secret_id": "CARD_STATIC_KEY", "header_name": "x-agent-key"}}}}),
+            json!({"endpoint": harness.mock.url()}),
+            Some(json!({"method": {"static_secret": {"secret_id": "CARD_STATIC_KEY", "header_name": "x-agent-key"}}})),
             ("static_secret", "sent"),
             (json!("ok"), Value::Null, Value::Null),
             Some(("x-agent-key", "static-value")),
@@ -443,15 +481,21 @@ async fn a_static_secret_is_sent_and_an_unanswered_token_is_reported() {
         (
             "/smoke/card-needs-token",
             json!({"endpoint": unauthorized.url}),
+            None,
             ("none", "not_configured"),
             (json!("failed"), json!("needs_token"), json!(401)),
             None,
         ),
     ];
-    for (route, target, (kind, result), fetch, header) in cases {
+    for (route, target, stored_auth, (kind, result), fetch, header) in cases {
         let surface_id = admin
             .create_surface(route, target, json!({}))
             .await;
+        if let Some(auth) = stored_auth {
+            admin
+                .store_target_auth(&surface_id, auth)
+                .await;
+        }
         let preview = admin
             .running_card(&surface_id)
             .await;

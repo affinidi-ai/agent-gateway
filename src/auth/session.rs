@@ -6,10 +6,13 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::observability::loggable;
 use crate::storage::filesystem::{
-    StorableEntity, StorageBackend, in_memory_storage_with_timeout, loggable_id, rwlock_storage,
+    StorableEntity, StorageBackend, in_memory_storage_with_timeout, loggable_id, remove_entities_not_named_by_id,
+    rwlock_storage, token_storage_id,
 };
+
+/// Storage entity name of dashboard sessions.
+const ENTITY_NAME: &str = "session";
 
 /// Manager for authenticated sessions with filesystem persistence
 pub struct SessionManager {
@@ -28,11 +31,13 @@ pub enum TermsSessionGate {
 }
 
 /// Session data
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    /// Session token (used as storage key)
+    /// [`token_storage_id`] of the session token, and the record's storage key. The
+    /// token itself is never stored. Empty in a record an earlier version stored under
+    /// the token.
     #[serde(default)]
-    pub token: String,
+    pub token_hash: String,
     pub username: String,
     pub user_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -41,32 +46,13 @@ pub struct Session {
     pub terms_gate: TermsSessionGate,
 }
 
-impl std::fmt::Debug for Session {
-    fn fmt(
-        &self,
-        formatter: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        formatter
-            .debug_struct("Session")
-            .field("token", &loggable::secret(&self.token))
-            .field("username", &self.username)
-            .field("user_id", &self.user_id)
-            .field("created_at", &self.created_at)
-            .field("expires_at", &self.expires_at)
-            .field("terms_gate", &self.terms_gate)
-            .finish()
-    }
-}
-
 impl StorableEntity for Session {
+    /// A record an earlier version stored is keyed by the token itself until startup
+    /// removes it.
     const ID_IS_SECRET: bool = true;
 
     fn id(&self) -> &str {
-        &self.token
-    }
-
-    fn on_load(&mut self) {
-        // No fixup needed - token is stored in the struct
+        &self.token_hash
     }
 }
 
@@ -85,45 +71,49 @@ impl SessionManager {
         }
     }
 
-    /// Create a new session manager with filesystem persistence
+    /// Create a new session manager with filesystem persistence. A session file not
+    /// named by its token hash, such as one an earlier version named by the token
+    /// itself, is removed first, and its user signs in again.
     pub async fn with_storage(
         timeout_minutes: u64,
         storage_path: PathBuf,
     ) -> Result<Self> {
-        let storage: Box<dyn StorageBackend<Session>> = rwlock_storage(storage_path.clone(), "session").await?;
+        let unhashed = remove_entities_not_named_by_id::<Session>(&storage_path, ENTITY_NAME).await?;
+        if unhashed > 0 {
+            tracing::info!(
+                "Removed {} session(s) not stored under their token hash; their users sign in again",
+                unhashed
+            );
+        }
+        let storage: Box<dyn StorageBackend<Session>> = rwlock_storage(storage_path.clone(), ENTITY_NAME).await?;
 
-        // Fix up loaded sessions: set token from cache key for legacy files that lack it,
-        // and remove expired ones
         let now = chrono::Utc::now();
-        let mut expired_tokens = Vec::new();
+        let mut expired_ids = Vec::new();
         {
             let mut cache = storage
                 .raw_cache()
                 .expect("cached storage")
                 .write()
                 .await;
-            for (key, session) in cache.iter_mut() {
-                if session.token.is_empty() {
-                    session.token = key.clone();
-                }
+            for (id, session) in cache.iter() {
                 if now >= session.expires_at {
-                    expired_tokens.push(key.clone());
+                    expired_ids.push(id.clone());
                 }
             }
-            for token in &expired_tokens {
-                cache.remove(token);
+            for id in &expired_ids {
+                cache.remove(id);
             }
         }
 
         // Delete expired session files from disk
-        for token in &expired_tokens {
-            if let Err(e) = storage.delete(token).await {
-                tracing::warn!("Failed to delete expired session file {}: {}", loggable_id::<Session>(token), e);
+        for id in &expired_ids {
+            if let Err(e) = storage.delete(id).await {
+                tracing::warn!("Failed to delete expired session file {}: {}", loggable_id::<Session>(id), e);
             }
         }
 
-        if !expired_tokens.is_empty() {
-            tracing::info!("Cleaned up {} expired session(s) on load", expired_tokens.len());
+        if !expired_ids.is_empty() {
+            tracing::info!("Cleaned up {} expired session(s) on load", expired_ids.len());
         }
 
         let loaded = storage
@@ -180,7 +170,7 @@ impl SessionManager {
         let now = chrono::Utc::now();
 
         let session = Session {
-            token: session_token.clone(),
+            token_hash: token_storage_id(&session_token),
             username,
             user_id: user_id.clone(),
             created_at: now,
@@ -259,7 +249,7 @@ impl SessionManager {
 
         let mut session = match self
             .storage
-            .get(token)
+            .get(&token_storage_id(token))
             .await
             .ok()?
         {
@@ -321,7 +311,7 @@ impl SessionManager {
             return false;
         }
         matches!(
-            self.storage.get(token).await,
+            self.storage.get(&token_storage_id(token)).await,
             Ok(Some(session)) if chrono::Utc::now() < session.expires_at
         )
     }
@@ -333,7 +323,7 @@ impl SessionManager {
     ) {
         if let Err(e) = self
             .storage
-            .delete(token)
+            .delete(&token_storage_id(token))
             .await
         {
             tracing::error!("Failed to delete session: {}", e);
@@ -351,68 +341,55 @@ impl SessionManager {
         &self,
         user_id: &str,
     ) -> usize {
-        let tokens: Vec<String> = {
+        let ids: Vec<String> = {
             let cache = self.sessions();
             let sessions = cache.read().await;
             sessions
                 .iter()
                 .filter(|(_, session)| session.user_id == user_id)
-                .map(|(token, _)| token.clone())
+                .map(|(id, _)| id.clone())
                 .collect()
         };
 
-        if tokens.is_empty() {
+        if ids.is_empty() {
             return 0;
         }
 
-        for token in &tokens {
-            if let Err(e) = self
-                .storage
-                .delete(token)
-                .await
-            {
-                tracing::warn!(
-                    "Failed to delete session {} for user {}: {}",
-                    loggable_id::<Session>(token),
-                    user_id,
-                    e
-                );
+        for id in &ids {
+            if let Err(e) = self.storage.delete(id).await {
+                tracing::warn!("Failed to delete session {} for user {}: {}", loggable_id::<Session>(id), user_id, e);
             }
         }
 
-        tracing::info!("Revoked {} session(s) for user_id={}", tokens.len(), user_id);
-        tokens.len()
+        tracing::info!("Revoked {} session(s) for user_id={}", ids.len(), user_id);
+        ids.len()
     }
 
     /// Clean up expired sessions from memory and disk
     pub async fn cleanup_expired(&self) {
         let now = chrono::Utc::now();
 
-        let expired_tokens: Vec<String> = {
+        let expired_ids: Vec<String> = {
             let cache = self.sessions();
             let sessions = cache.read().await;
             sessions
                 .iter()
                 .filter(|(_, session)| now >= session.expires_at)
-                .map(|(token, _)| token.clone())
+                .map(|(id, _)| id.clone())
                 .collect()
         };
 
-        if expired_tokens.is_empty() {
+        if expired_ids.is_empty() {
             return;
         }
 
-        for token in &expired_tokens {
-            if let Err(e) = self
-                .storage
-                .delete(token)
-                .await
-            {
-                tracing::warn!("Failed to delete expired session {}: {}", loggable_id::<Session>(token), e);
+        for id in &expired_ids {
+            if let Err(e) = self.storage.delete(id).await {
+                tracing::warn!("Failed to delete expired session {}: {}", loggable_id::<Session>(id), e);
             }
         }
 
-        tracing::info!("Cleaned up {} expired session(s)", expired_tokens.len());
+        tracing::info!("Cleaned up {} expired session(s)", expired_ids.len());
     }
 }
 
@@ -426,6 +403,7 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
     use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::observability::loggable;
 
     const TOKEN: &str = "0f2c9d7e-1b3a-4c5d-8e9f-a0b1c2d3e4f5";
 
@@ -436,7 +414,7 @@ mod tests {
     ) -> Session {
         let now = chrono::Utc::now();
         Session {
-            token: token.to_string(),
+            token_hash: token_storage_id(token),
             username: "alice@example.com".to_string(),
             user_id: user_id.to_string(),
             created_at: now,
@@ -445,13 +423,125 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_debug_shows_only_a_token_prefix() {
-        let rendered = format!("{:?}", session_with_token(TOKEN, "user-a", 20));
+    fn file_names(directory: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .into_string()
+                    .unwrap()
+            })
+            .collect();
+        names.sort();
+        names
+    }
 
-        assert!(rendered.contains(r#"token: "0f2c9d7e...""#), "{rendered}");
-        assert!(rendered.contains(r#"user_id: "user-a""#), "{rendered}");
-        assert!(!rendered.contains(TOKEN), "{rendered}");
+    #[tokio::test]
+    async fn a_session_is_stored_under_its_token_hash_and_never_holds_the_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let token = manager
+            .create_session("alice@example.com".into(), "user-a".into())
+            .await;
+
+        let hash = token_storage_id(&token);
+        assert_eq!(file_names(directory.path()), vec![format!("{hash}.json")]);
+        let record = std::fs::read_to_string(
+            directory
+                .path()
+                .join(format!("{hash}.json")),
+        )
+        .unwrap();
+        assert!(!record.contains(&token), "{record}");
+        assert!(record.contains(&hash), "{record}");
+        assert_eq!(
+            manager
+                .validate_session(&token)
+                .await,
+            Some(("alice@example.com".to_string(), "user-a".to_string()))
+        );
+        assert!(
+            manager
+                .validate_session(&hash)
+                .await
+                .is_none(),
+            "the stored hash is not a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_removes_a_session_not_stored_under_its_token_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap()
+            .create_session("bob@example.com".into(), "user-b".into())
+            .await;
+        let now = chrono::Utc::now();
+        let stored_under_its_token = directory
+            .path()
+            .join(format!("{TOKEN}.json"));
+        std::fs::write(
+            &stored_under_its_token,
+            serde_json::to_vec(&serde_json::json!({
+                "token": TOKEN,
+                "username": "alice@example.com",
+                "user_id": "user-a",
+                "created_at": now,
+                "expires_at": now + chrono::Duration::minutes(20),
+                "terms_gate": "allowed_at_login",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let other_token = "5b6c7d8e-9f0a-4b1c-8d2e-3f4a5b6c7d8e";
+        let stored_under_another_hash = directory
+            .path()
+            .join(format!("{}.json", token_storage_id(other_token)));
+        std::fs::write(
+            &stored_under_another_hash,
+            serde_json::to_vec(&session_with_token(TOKEN, "user-a", 20)).unwrap(),
+        )
+        .unwrap();
+        let logs = FormattedLogs::capture();
+
+        let manager = SessionManager::with_storage(20, directory.path().to_path_buf())
+            .await
+            .unwrap();
+
+        assert!(!stored_under_its_token.exists());
+        assert!(!stored_under_another_hash.exists());
+        assert_eq!(file_names(directory.path()), vec![format!("{}.json", token_storage_id(&current))]);
+        assert!(
+            manager
+                .validate_session(TOKEN)
+                .await
+                .is_none()
+        );
+        assert!(
+            manager
+                .validate_session(other_token)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .validate_session(&current)
+                .await,
+            Some(("bob@example.com".to_string(), "user-b".to_string()))
+        );
+        let text = logs.text();
+        assert!(
+            text.contains("Removed 2 session(s) not stored under their token hash; their users sign in again"),
+            "{text}"
+        );
+        assert!(text.contains("Loaded 1 session(s) from disk"), "{text}");
+        assert!(!text.contains(TOKEN), "{text}");
     }
 
     #[tokio::test]
@@ -468,7 +558,7 @@ mod tests {
         let before = expires_at(
             manager
                 .storage
-                .get(&token)
+                .get(&token_storage_id(&token))
                 .await
                 .unwrap(),
         );
@@ -478,7 +568,7 @@ mod tests {
             expires_at(
                 manager
                     .storage
-                    .get(&token)
+                    .get(&token_storage_id(&token))
                     .await
                     .unwrap()
             ),
@@ -504,7 +594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_save_startup_scan_and_delete_log_only_a_token_prefix() {
+    async fn session_save_startup_scan_and_delete_never_log_the_token() {
         let directory = tempfile::tempdir().unwrap();
         let logs = FormattedLogs::capture();
 
@@ -528,7 +618,7 @@ mod tests {
             .await;
 
         let text = logs.text();
-        let prefix = loggable::secret(&token);
+        let prefix = loggable::secret(&token_storage_id(&token));
         assert!(text.contains("Session created for user_id: user-a"), "{text}");
         assert!(text.contains(&format!("Saved session {prefix} to")), "{text}");
         assert!(text.contains("Loaded session from"), "{text}");

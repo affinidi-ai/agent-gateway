@@ -114,6 +114,16 @@ flowchart LR
 | `8080` (HTTP) | The same, without TLS | Only a load balancer that terminates TLS |
 | `9000` (HTTP) | Calls your managed agents make to Transit Points | Only your managed agents' network. The internet only for a listener whose Transit Points all authenticate their callers with `source_auth`, and failed attempts are not throttled (see below) |
 
+**Serve the dashboard over HTTPS, or open it on `http://localhost`.** Its session cookie,
+`__Host-session_token`, is `Secure`, so a browser keeps it only there. Behind a load balancer
+that terminates TLS, port `8080` serves the dashboard as before. Opened over plain HTTP on any
+other host, the browser drops the cookie, and two things that authenticate only with it fail:
+
+- The dashboard's live-update WebSocket is refused on every attempt, so a full-screen
+  "Reconnecting to Gateway..." notice keeps returning while the tab is open.
+- [CLI browser login](ACCESS_TOKENS.md#cli-browser-login) never completes: the browser moves
+  between sign-in and the authorize page until the authorize throttle answers `429`.
+
 Each listener in `gateway.json` sets its own port, so open only the ones you use. Before
 you open any listener:
 
@@ -171,8 +181,8 @@ The gateway only calls out to what you configure. Allow egress to:
 | --- | --- |
 | Your managed agents, MCP servers and each Transit Point's target endpoint | Always |
 | `affinidi_terms_url` | `terms` is on in `gateway.json` |
-| A DIDComm mediator | You connect gateways over [Fabric](#fabric) |
-| Peer DID hosts, trust registries, OAuth providers, x402 facilitators | A surface uses identity verification, Trust Check, credential delegation or payments |
+| A DIDComm mediator | You connect gateways over [Fabric](#fabric), including to the agent-pay gateway a surface's payment policy names |
+| Peer DID hosts, trust registries, OAuth providers | A surface uses identity verification, Trust Check or credential delegation |
 | AWS Secrets Manager, Parameter Store, KMS | `secrets_backend = "aws"`, a secret uses an `aws_` reference, or encryption at rest uses KMS |
 | An OpenTelemetry collector or CloudWatch | You configure them in `metrics.json` |
 | `login.microsoftonline.com` and `graph.microsoft.com` | SAML login uses `graph_api` for Microsoft Entra ID provisioning and profile photos |

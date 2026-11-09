@@ -702,7 +702,7 @@ async fn vp_audit_events_matching(
         .unwrap_or_else(|error| panic!("the VP Audit Log must be readable: {error:#}"))
 }
 
-async fn expect_vp_audit_record(
+pub(crate) async fn expect_vp_audit_record(
     world: &mut SurfaceWorld,
     what: &str,
     matches: impl Fn(&serde_json::Value) -> bool,
@@ -787,6 +787,30 @@ async fn vp_audit_log_records_request_refusal(
 async fn vp_audit_log_records_surface_rate_limit_refusal(world: &mut SurfaceWorld) {
     expect_vp_audit_record(world, "a surface rate limit refusal", |event| {
         event["event"]["rate_limited"]["scope"] == "surface"
+    })
+    .await;
+}
+
+#[then(
+    expr = "the VP Audit Log records the per-caller rate limit refusal of caller {string} on Transit Point {string}"
+)]
+async fn vp_audit_log_records_per_caller_rate_limit_refusal(
+    world: &mut SurfaceWorld,
+    caller: String,
+    transit_point: String,
+) {
+    let identity_hash = crate::steps::given::caller_identity_hash(&caller);
+    let surface_id = world
+        .surface_under_test_id
+        .clone()
+        .expect("the surface under test has an id");
+    let what = format!("a per-caller rate limit refusal of caller '{caller}' on Transit Point '{transit_point}'");
+    expect_vp_audit_record(world, &what, |event| {
+        let refusal = &event["event"]["rate_limited"];
+        refusal["scope"] == "transit_point_caller"
+            && refusal["transit_point"] == transit_point.as_str()
+            && event["user_identity_hash"] == identity_hash.as_str()
+            && event["surface_id"] == surface_id.as_str()
     })
     .await;
 }
@@ -895,7 +919,8 @@ fn admin_api_response_status_is(
     world: &mut SurfaceWorld,
     expected: u16,
 ) {
-    assert_response_status(Some(get_admin_response(world).status), expected);
+    let response = get_admin_response(world);
+    assert_status_with_body(response.status, expected, &response.body, "admin API response");
 }
 
 #[then(expr = "the surface lookup response status is {int}")]
@@ -2659,6 +2684,21 @@ fn named_managed_agent_received_header(
     assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &expected_value);
 }
 
+#[then(expr = "managed agent {string} received the caller's {string} header unchanged")]
+fn named_managed_agent_received_callers_header_unchanged(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    header_name: String,
+) {
+    let sent = world
+        .sent_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(&header_name))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("the caller sent no '{header_name}' header"));
+    assert_actor_received_header(world, &agent_name, TargetActorKind::ManagedAgent, &header_name, &sent);
+}
+
 #[then(expr = "external agent {string} received header {string} with value {string}")]
 fn named_external_agent_received_header(
     world: &mut SurfaceWorld,
@@ -2877,7 +2917,34 @@ fn mcp_tool_result_matches_rest_api_response(
     let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
         .configured_response
         .body;
-    let body = get_response_body_value(world);
+    assert_mcp_tool_result_carries_rest_api_body(get_response_body_value(world), expected, &actor_name);
+}
+
+#[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
+fn mcp_tool_result_without_target_credential_matches_rest_api_response(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let expected = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let body = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result without the Target credential. Body: {body}"
+    );
+    assert_mcp_tool_result_carries_rest_api_body(body, expected, &actor_name);
+}
+
+fn assert_mcp_tool_result_carries_rest_api_body(
+    body: &serde_json::Value,
+    expected: &serde_json::Value,
+    actor_name: &str,
+) {
     let text = body
         .pointer("/result/content/0/text")
         .and_then(|value| value.as_str())
@@ -2891,6 +2958,64 @@ fn mcp_tool_result_matches_rest_api_response(
         actual, expected,
         "MCP tool result body differs from REST API '{}' response.\nExpected: {}\nActual: {}",
         actor_name, expected, actual
+    );
+}
+
+#[then(expr = "the MCP tool result is marked as an error")]
+fn mcp_tool_result_is_marked_as_an_error(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(true)),
+        "expected an MCP tool result with isError true. Body: {body}"
+    );
+}
+
+#[then(expr = "REST API {string} answered the same MCP tool result with and without the Target credential")]
+fn rest_api_answered_same_tool_result_with_and_without_target_credential(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+) {
+    let header_name = &world
+        .surface_config
+        .target_auth
+        .as_ref()
+        .expect("the scenario must configure a Target credential")
+        .header_name;
+    let context = format!("REST API '{}'", actor_name);
+    let requests = get_observed_target_requests(
+        get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi),
+        &context,
+    );
+    let [without, with] = requests else {
+        panic!("expected {context} to receive two requests, got {}: {requests:?}", requests.len());
+    };
+    assert_collaborator_header_absent(&without.headers, header_name, &format!("{context}, first request"));
+    assert!(
+        with.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(header_name)),
+        "expected the second request to {context} to carry the Target credential header '{header_name}'"
+    );
+    assert_eq!(
+        (&without.method, &without.path_and_query),
+        (&with.method, &with.path_and_query),
+        "both tool calls must reach the same {context} resource"
+    );
+    let without = world
+        .mcp_tool_response_without_target_credential
+        .as_ref()
+        .expect("the call without the Target credential must have been answered");
+    let with = get_response_body_value(world);
+    assert!(
+        without
+            .get("result")
+            .is_some(),
+        "the call without the Target credential must answer a tool result. Body: {without}"
+    );
+    assert_eq!(
+        without, with,
+        "the MCP tool result differs with the Target credential.\nWithout: {without}\nWith: {with}"
     );
 }
 
@@ -2923,14 +3048,29 @@ fn named_managed_agent_received_exactly_n_requests(
     agent_name: String,
     expected: usize,
 ) {
-    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
-    let context = format!("managed agent '{}'", agent_name);
+    assert_received_exactly(world, "managed agent", &agent_name, TargetActorKind::ManagedAgent, expected);
+}
+
+#[then(expr = "MCP server {string} received exactly {int} request(s)")]
+fn named_mcp_server_received_exactly_n_requests(
+    world: &mut SurfaceWorld,
+    server_name: String,
+    expected: usize,
+) {
+    assert_received_exactly(world, "MCP server", &server_name, TargetActorKind::McpServer, expected);
+}
+
+fn assert_received_exactly(
+    world: &mut SurfaceWorld,
+    role: &str,
+    name: &str,
+    kind: TargetActorKind,
+    expected: usize,
+) {
+    let target = get_observed_target_for_actor(world, name, kind);
+    let context = format!("{role} '{name}'");
     let actual = get_observed_target_requests(target, &context).len();
-    assert_eq!(
-        actual, expected,
-        "expected managed agent '{}' to receive exactly {} request(s), got {}",
-        agent_name, expected, actual
-    );
+    assert_eq!(actual, expected, "expected {context} to receive exactly {expected} request(s), got {actual}");
 }
 
 #[then(expr = "managed agent {string} received the request body {}")]

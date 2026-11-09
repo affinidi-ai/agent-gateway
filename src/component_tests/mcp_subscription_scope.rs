@@ -105,6 +105,7 @@ fn gateway() -> crate::gateways::types::Gateway {
         gateway_type: GatewayType::SelfGateway,
         status: GatewayStatus::Active,
         creation_type: GatewayCreationType::User,
+        role: crate::gateways::types::GatewayRole::Peer,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         exposed_channels: Vec::new(),

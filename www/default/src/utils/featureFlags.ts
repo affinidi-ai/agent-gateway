@@ -1,14 +1,19 @@
+import { useApp } from '../context/AppContext';
+import type { Settings } from '../types';
+
+/** Whether the agent-pay UI is shown: `feature_flags.agent_pay_delegation`, off unless `true`. */
+export const agentPayEnabled = (settings: Settings | null | undefined): boolean =>
+  settings?.feature_flags?.agent_pay_delegation === true;
+
 /**
- * Frontend-only feature flags for temporarily hiding UI surfaces.
- *
- * Driven by Create React App env vars (must be prefixed `REACT_APP_`).
- * Defaults are `false`. Set the env var to `"true"` (case-insensitive) to
- * re-enable the corresponding flow. These are compile-time constants
- * intentionally — they are not driven from backend settings (see
- * `Settings.feature_flags` for server-driven flags).
+ * `agent_pay_delegation` from the loaded settings, and whether they have loaded
+ * yet: before they have, the flag reads off.
  */
+export function useAgentPayFlag(): { enabled: boolean; loaded: boolean } {
+  const { state } = useApp();
+  return { enabled: agentPayEnabled(state.settings), loaded: state.settings !== null };
+}
 
-const isTrue = (value: string | undefined): boolean => value?.toLowerCase() === 'true';
-
-/** Controls the MPP Paywall section in the surface Policies tab. */
-export const ENABLE_MPP_PAYWALL = isTrue(process.env.REACT_APP_ENABLE_MPP_PAYWALL);
+/** Permissions any one of which opens Connections: a payment-gateways-only caller only while agent-pay is on. */
+export const connectionsPermissions = (agentPayOn: boolean): readonly string[] =>
+  agentPayOn ? ['gateways.view', 'payment_gateways.view'] : ['gateways.view'];

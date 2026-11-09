@@ -585,7 +585,11 @@ with the registered catalogs, so an update that does not rebuild them (for
 example only `name`, `status` or `mcp_http`) still returns it; a rebuild that
 loads the legacy catalog clears it. Management tool discovery
 (`POST /v1/mcp-proxies/discover-tools`) lists tools from the modern catalog, so
-it works for such a Proxy too. Both catalogs are published as one snapshot after
+it works for such a Proxy too. Each listed tool carries its `name`, its
+`description` when it has one, and `read_only` from a remote server's
+`annotations.readOnlyHint` when that is a boolean. Discovery with `surface_id`
+lists the saved MCP surface's Target instead of a caller-supplied one; see
+[POLICY.md](POLICY.md#other-pinned-egress-sinks) for its egress rule. Both catalogs are published as one snapshot after
 a successful build; a failed reload keeps the previous snapshot and removal
 drops both. Tests cover conditional input constraints, nested component
 references, scoped local definitions, output constraints, truthful discovery and
@@ -850,68 +854,79 @@ and responses are protected inside the new consent ticket. Transparent paths
 without gateway consent continue to forward upstream state unchanged.
 
 Direct modern consent runs after current source authorization, managed identity,
-Trust Check and policy/tool gates, before local or delegated payment and Target
-dispatch. Legacy payment order is unchanged. Direct modern policy evaluation
-therefore precedes payment settlement and does not see a settled payment context.
-Continuation claims precede payment verification as well as Target calls. Direct
-and sending Access Points, and independent Fabric receive, inspect local payment
-requirements first: a ready
-continuation with no applicable payment credential returns the local challenge
-without claiming it or activating staged consent. Repeated unpaid checks leave
-the retry usable; a later paid retry still needs the atomic claim. Failed or
-ambiguous payment processing never rearms a claimed continuation. Delegated
-payment challenges and real payment-rail conformance are not verified. Both
-JSON and SSE use a separate
+Trust Check and policy/tool gates, and before payment and Target dispatch. Payment
+is the last step before the request is dispatched (see
+[Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment)), so a request
+refused for a reason that does not depend on payment is never charged, and direct
+modern policy evaluation does not see a settled payment: `input.payment` says only
+whether the request is chargeable. Continuation claims precede the payment call as
+well as Target calls. Direct and sending Access Points, and independent Fabric
+receive, check first whether a chargeable request carries a credential: a ready
+continuation that holds no payment evidence and arrives with no credential is
+answered with agent-pay's challenge without being claimed or activating staged
+consent. Repeated unpaid checks leave the retry usable; a later paid retry still
+needs the atomic claim. A payment that was refused, or whose outcome is unknown,
+never rearms a claimed continuation. Both JSON and SSE use a separate
 terminal-response finalizer for continuation wrapping/consumption; application
 enrichment remains complete-only, and subscription completion bypasses both.
 The direct handler test supplies explicit internal admission dependencies. It
 checks pending
 consent before unavailable delegated payment, changed-policy rejection,
 delegated-token injection without the caller bearer, JSON/SSE upstream-state
-restoration and one Target call under concurrent retries. A local x402 fixture
-also checks repeated HTTP 402 responses followed by one successful paid retry
-and one conflict, with exactly one Target invocation; it uses mock verification
-and no settlement and does not establish external payment-rail conformance.
+restoration and one Target call under concurrent retries. Its `agent_pay` rounds
+run against an in-process payment gate and check that a paid first round and its
+continuation make one payment call between them, that a replayed continuation is
+neither charged nor forwarded, and that two identical paid requests reach the
+Target once. They do not establish conformance of a payment rail or of agent-pay.
 
-Only the credential argument consumed by the active local paywall is excluded
-from the continuation's business-argument digest: `payment_signature` for x402
-or `payment_credential` for MPP. Other arguments, nested fields, and credentials
-for disabled, unmatched or delegated paywalls remain bound. Successful modern
-payment processing removes the consumed header and argument, including a second
-argument copy when a header supplied the credential. x402 receipts use the
-configured response header; MPP receipts use `Payment-Receipt`. Receipt absence
-does not undo successful credential consumption. Legacy processing is unchanged.
+The payment credential is excluded from the continuation's business-argument
+digest wherever the request carries it: the `payment_signature` /
+`payment_credential` tool argument and `_meta["org.paymentauth/credential"]`
+(see [Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment) for
+every placement). Other arguments and nested fields remain bound. The credential
+is removed from the request, from the header and from every argument or `_meta`
+copy, before the request is forwarded, whether or not it is charged. x402
+receipts come back as `PAYMENT-RESPONSE` and MPP receipts as `Payment-Receipt`.
 
-Successful local payment on a consent-enabled modern path is retained as
-authenticated evidence inside the encrypted continuation. Evidence records the
-payment rail, optional receipt, verification time and expiry; receipt bytes are
+A paid request on a consent-enabled modern path keeps its receipt as authenticated
+evidence inside the encrypted continuation: the rail, the receipt, the receipt
+credential's fingerprint, the verification time and the expiry. Receipt bytes are
 bounded to 16 KiB and validity to the continuation's maximum lifetime. A later
 round must validate the same authorization, surface, provider, route and
-business arguments and win its own atomic claim before reusing the evidence.
-The local processor rechecks expiry and rail and returns the original receipt
-without another payment verification or settlement. Evidence expiry is never
-extended by a new upstream round or renewed consent, and descendant state is
-also capped to the previous operation's remaining lifetime. Direct and isolated
-receiver JSON/SSE tests use a real local transaction store and mock verification
-to assert one payment record across two rounds, identical receipts, and no
-additional payment or Target call on replay. This is not external payment-rail,
-full two-gateway, or distributed payment-store conformance.
+business arguments and win its own atomic claim before reusing the evidence; it
+then makes no payment call, and the original receipt comes back in the response
+headers and in `result._meta`. Evidence of another rail, or expired evidence, is
+refused with `403`. Evidence expiry is never extended by a new upstream round or
+renewed consent, and descendant state is also capped to the previous operation's
+remaining lifetime. The direct and isolated receiver JSON/SSE tests run against
+an in-process payment gate and assert one payment call across two rounds,
+identical receipts, and no payment call and no Target call on replay. They do not
+establish agent-pay's own conformance or a distributed payment store.
 
-The delegated-payment hop sends the payment gateway the headers the Access
-Point forwards to its own Target, so neither an endpoint-bound Resource Server
-bearer, a configured source-auth credential, caller-info headers, mapped headers
-the surface strips, `X-Transit-Token` nor hop-by-hop headers reach it; ingress
-authorization does not authorize a separate payment resource. `Authorization`
-crosses only with a `Payment` credential, and never when the surface's
-`source_auth` or Resource Server reads it. Payment headers remain available to
-the delegate. For admitted modern requests, delegated HTTP 402 responses are
-`no-store`; the retired payment codes `-32042` and `-32043` are mapped to the
-gateway application codes `1001` (payment required) and `1002` (payment rejected)
-with the caller's request ID and preserved challenge data and headers. Unknown
-upstream codes and legacy response bodies remain unchanged. The existing remote
-allow/challenge/deny contract does not establish that a challenged or timed-out
-payment had no side effects, so a claimed delegated operation is never rearmed.
-Safe delegated retries and cross-round remote payment reuse are not provided.
+An `agent_pay` surface charges a chargeable modern request after consent
+preparation and every other refusal that does not depend on payment, on the direct
+and sending Access Points and on Fabric receive. The payment hop carries only the
+payment credential, `content-type`, `traceparent` and `x-request-id`, never the
+caller's body, Resource Server bearer or source-auth credential. A refusal is
+`no-store` and uses the caller's request ID: `1001` (payment required,
+`data.challenges` and `data.x402`), `1002` (payment or credential refused,
+`data.failure`; a credential that was already used is `data.failure.reason`
+`payment_already_used` with a fresh challenge) or `1003` (payment pending review,
+`data.case_id`). A caller on the legacy MCP revision gets the codes of the MPP MCP
+payment transport instead: `-32042` for a challenge and `-32043` for a refusal. A payment whose
+outcome is not known (`data.error` `payment_unconfirmed`, `Retry-After: 2`) or that is still being
+made (`payment_in_progress`, `409`) is `-32603` on either revision, and tells the client to retry
+the same request with the same credential within agent-pay's 120-second replay window. A
+paid request is forwarded without its credential header, `payment_signature` /
+`payment_credential` argument or `_meta["org.paymentauth/credential"]`, and its
+response carries the receipt as `PAYMENT-RESPONSE` (x402) or `Payment-Receipt`
+(MPP) and in `result._meta["org.paymentauth/receipt"]` of every result message,
+the final message of a streamed response included. A failure after payment still
+carries the receipt. On a consent-enabled path the paid receipt is kept as
+`agent_pay` evidence in the encrypted continuation (above). A claimed delegated
+operation is never rearmed after a refused or timed-out payment; a client retry
+with the same credential is deduplicated by agent-pay through the idempotency
+key, and a payment buys one forwarded request.
 
 Transit Point preparation runs at the existing post-policy credential step.
 It uses the independently verified endpoint resource token, resolved agent DID
@@ -927,26 +942,30 @@ authenticated Fabric delivery conformance remain required.
 
 Fabric receive uses the same preparation after receiver-owned resource
 authorization, verified agent-presentation admission and surface/tool policy
-checks. Modern payment follows consent preparation; legacy ordering stays
-unchanged. Its continuation binds the authenticated sending peer as well as
-the receiving surface, variant, principal and resource. Prepared credentials
-replace Target credentials only after caller-header filtering. Modern receiving
-payment uses the shared local processor with receiver-owned configuration and
-headers, including argument-carried credentials and case-insensitive header
-names. x402 and MPP receipt headers and continuation finalization are shared by
-JSON and SSE.
+checks. Payment follows it and every other refusal that does not depend on
+payment, and is the last step before dispatch. Its continuation binds the
+authenticated sending peer as well as the receiving surface, variant, principal
+and resource. Prepared credentials replace Target credentials only after
+caller-header filtering. The receiver charges with its own configuration: it reads
+the credential from the forwarded headers, each decoded on its own so one header
+it cannot read costs it none of the others, or from the request body, and relays
+the receipt on a response of any status, in the final message of a streamed
+response and on a failure after payment. Receipt headers and continuation
+finalization are shared by JSON and SSE.
 An isolated receiver regression uses a real signed agent presentation and
 receiver-issued resource token, rejects a token for the ingress resource,
 requires consent before Target calls, rejects a changed peer, and permits one
-Target call under concurrent retries. It also covers repeated unpaid challenges,
-header- and argument-carried x402 payment, receipt preservation and removal of
-consumed credentials before the Target, using mock verification without
-settlement. This fixture enters the receiver with
+Target call under concurrent retries. Against an in-process payment gate it also
+covers an unpaid challenge, a header-carried credential, receipt preservation and
+removal of the consumed credential before the Target, a replayed credential
+refused with a fresh challenge, two identical paid requests reaching the Target
+once, and a paid first round with its continuation making one payment call. This
+fixture enters the receiver with
 explicit test-local admission; it is not a managed-mediator or encrypted-frame
 delivery test.
 
 The sending Access Point also prepares modern consent after its Fabric policy
-and tool gates, before mirroring, local/delegated payment or remote dispatch.
+and tool gates, before mirroring, payment or remote dispatch.
 Its `fabric_send` continuation role binds the selected remote peer and is
 distinct from the receiver's `fabric` role. Prepared credentials are added
 after source-token stripping; they must authorize the receiving resource,
@@ -1089,7 +1108,9 @@ OAuth callback. When the continuation runtime, STS profile and existing
 source-auth verification stores are
 configured, `/mcp-consent/connect/{provider-id}` and
 `/mcp-consent/callback/{provider-id}` are registered. The provider references an
-existing JWT verification strategy through `consent_identity_strategy_id`.
+existing JWT verification strategy through `consent_identity_strategy_id`; its
+`principal_claim` names the person who signs in to consent, as it names callers
+on a surface.
 Create/update enforce provider type, HTTPS issuer/resource, tenant-compatible
 references and PAT resource scope; the reference participates in ownership
 impact and reassignment. Connect and callback reject changed surface, provider
@@ -1301,7 +1322,10 @@ profile policy inputs additionally expose `input.sts.resource` and
 time spent in asynchronous policy preparation.
 
 Profile subjects derived from external assertions are namespaced by the
-verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`.
+verified issuer and subject: `urn:affinidi:mcp:subject:<SHA-256(JCS([iss,sub]))>`,
+where the subject is the value of the verifying strategy's `principal_claim`
+(`sub` by default). A strategy that names another claim binds its name too,
+`SHA-256(JCS([iss,subject,claim]))`, so one value in two claims is two subjects.
 Two trusted issuers using the same `sub` therefore cannot share a resource or
 delegation identity. Already-local profile subjects remain stable through
 ID-JAG redemption. Existing DID-issued endpoints keep their original subject
@@ -2115,7 +2139,7 @@ The MCP conformance harness (`scripts/mcp-conformance/`, `make mcp-conformance`)
 
 GET/DELETE with an explicit `2026-07-28` version return `405` / `Allow: POST` without consulting a legacy session; unmarked legacy GET/DELETE without a body remain unchanged. PUT, PATCH and extension methods return `405` with the endpoint's `Allow` list (`EndpointHttpPolicy::non_post_response`), and on Access Points, Transit Points and Fabric receive a body on any method but POST returns `400` (`non_post_body_response`). Modern response config additionally bounds JSON/SSE events (`max_response_bytes`, 1 MiB), source chunks (`max_chunk_bytes`, 256 KiB), idle time (60s) and lifetime (3600s; maximum 86400s). Direct/Transit modern response branches use the shared bounded adapter and existing complete-result processing, skip legacy fallback/session synthesis, and keep metrics/cleanup on response-body lifetime. Admitted modern requests on Access Points and Transit Points reach these branches; unit tests use explicit admitted fixtures, and the conformance harness exercises them on the mounted routes. Real TCP adapter tests cover incremental progress and quiet upstream cancellation. Result-only header production after SSE has started remains fail-closed, never silently dropped or injected into nonfinal results.
 
-Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The modern-only `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion and execution remain unchanged. Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
+Owned modern MCP dispatch (`mcp_proxies/handlers.rs`) handles discovery, deterministic tool catalogs and tool calls behind the `OwnedProxy` version policy, which admits `2026-07-28` for every Proxy and surface. Standalone dispatch precedes legacy sessions; modern surface-backed `proxy://` dispatch follows the shared request gates and feeds the common final-response path. Catalogs preserve available schemas/annotations and calls preserve structured results; tools are cloned before execution so catalog locks do not span network work. `mcp::tool_headers` validates bounded, properties-only `x-mcp-header` annotations and exact mirrored values, using the shared Base64 rules and exact safe-integer comparisons. Invalid tools are individually excluded; header mismatches return `400` / `-32020` before execution. Modern schema construction restores OpenAPI source schemas lost by the library and rejects unsafe flattening. The `mcp_proxies::modern_rest` adapter retains library parameter extraction/validation while using no-redirect, byte-bounded HTTP, authority-preserving path encoding, protected Target headers and bounded JSON/form/text/multipart encoding. Catalogs and execution select the same media type and only resolve bounded local OpenAPI references. Legacy conversion is unchanged, and a legacy `tools/call` without the Target credential still runs on `rmcp-openapi`'s client. A legacy `tools/call` that carries the Target credential runs through `modern_rest::call` instead: no redirects, the `mcp_http` limits, the tool resolved against the proxy's `base_url` with a trailing `/` added when missing, as `rmcp-openapi` resolves it, and each call vetted and pinned to the backend address as a modern call is (see `docs/PROTOCOLS.md`). Full schema fidelity and complete client-security conformance are not verified, and the conformance harness scores owned endpoints only on its tool subset; see `docs/MCP_METADATA.md`.
 
 `proxy::fabric_stream` is the additive framed Fabric transport that carries modern MCP between gateways: nonce-bound capability offers, authcrypt peer/recipient/Connection Point/listener-generation/thread binding, bounded bidirectional credits and reordering, Open replay protection and listener-owned receiving and outgoing tasks. Typed input preserves bytes, repeated headers and resolved variant snapshots through independent receiver admission. Direct and Transit senders use the negotiated transport after request gates; both ends reuse JSON/SSE and complete-result processing, including receiver-owned `proxy://` dispatch. Every frame observes its registered negotiated limits; dropping an HTTP body signals cancellation even while quiet, while normal EOF reports completion separately. Framed response sends require an exact peer-bound EndAck after sealing their final byte/sequence boundary, including empty responses; byte credit alone is not completion. Transport-owned metrics report only peer-acknowledged bytes and release connection guards on success, failure or drop. After a validated MCP final result, Direct and Transit adapters explicitly hand the response lease to the listener driver for a bounded End handshake; ordinary body drops still cancel. Peer consumption is not final HTTP-client delivery. Legacy ForwardRequest/ForwardResponse stay buffered. `a2a.fabric_stream_max_envelope_bytes` bounds actual encrypted payloads before sending; it is optional and range checked (64 KiB to 1 MiB, within `a2a.sdk_inbound_cache_bytes`) only when set, and `A2aConfig::stream_envelope_limit` otherwise uses 128 KiB capped at the SDK cache, so configs without it load whatever their cache size. `DidCommFrameSink` packs and sends every frame like `pack_and_send_message`, stamping `created_time`/`expires_time` so the receiver checks an Open's envelope times as it checks a `forward-request`'s (`envelope_replay::validate_envelope_times`); the Open's replay record is kept by the stream registry. Local capabilities advertise request streams and subscriptions; any active MCP surface admits a framed modern request; a `legacy_only` refusal comes only from older peers that do not admit modern MCP. The conformance harness `fabric` target covers the complete route over one Docker mediator; framed streams are not supported across mediator federation, where each gateway uses its own mediator. See `docs/MCP_METADATA.md`.
 
@@ -2143,7 +2167,7 @@ The opt-in `sts.mcp_issuer` profile uses a configured HTTPS origin and root or `
 
 MCP Resource Server alignment must reuse the existing `src/sts/` architecture. It adds no gateway-hosted browser login, authorization-code grant or PKCE authorization endpoint. Preserve existing DID-issued flows and do not claim compatibility with authorization-code-only clients. `mcp::continuations` provides bounded mandatory AEAD state, authorization/request and vault-identity/scope binding, atomic embedded and DynamoDB stores, monotonic retry rounds and single-use dispatch claims. URL elicitation requires the request-local capability, and decline/cancel persists denial. Modern third-party consent references an existing JWT strategy through `CredentialProvider.consent_identity_strategy_id`, with tenant/PAT and ownership-reference checks. The existing provider callback verifies a nonce-bound OIDC ID token's signature, issuer, client audience, expiry and deterministic issuer/subject match to the initiating STS principal; no account-link registry, email matching, new hosted login or browser-held MCP bearer establishes consent. Callback tickets bind current surface/provider/strategy snapshots. Verified credentials are staged invisibly to ordinary vault lookup, then activated only after a ready retry wins its single-use claim. A vault revocation epoch and composite credential version prevent stale publication across filesystem instances; any revocation conservatively invalidates outstanding staged consents. Client acceptance and legacy vault records never establish modern readiness. Modern gateway consent (MRTR) needs `[mcp.continuations]` in the bootstrap config and `sts.mcp_issuer`; a modern request to an endpoint with `outbound_credentials` while continuations are not configured fails with `503` / `-32603` ("MCP credential service unavailable"), never falling back to legacy consent. Full callback-route coverage, remote-filesystem conformance and distributed refresh coordination are not verified; see `docs/MCP_METADATA.md`.
 
-The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before local/delegated payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Payment retry/idempotency, distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
+The direct modern branch uses shared `proxy::credential_delegation::modern` preparation after current policy checks and before payment. The Transit Point branch reuses it at the post-policy credential step, bound to that endpoint's independently verified resource token, agent DID and alias; prepared credentials are applied after caller-header filtering. Both require verified vault provenance, authenticate gateway continuation kinds, and protect opaque upstream state plus requested input keys without prefix-based ownership guesses. JSON/SSE terminal finalization wraps continuations separately from complete-only enrichment. Explicit test-local admission exercises direct forwarding and concurrent retries, while admitted Transit Point steps cover resource binding, credential delivery and replay. Distributed refresh coordination, full routed consent and Fabric consent conformance are not verified.
 
 Fabric receive prepares modern consent after its own resource authorization, verified agent-presentation admission and policy gates, before payment and Target dispatch. Continuations additionally bind the authenticated sending peer; ingress-audience tokens do not authorize the receiver. An isolated signed-identity receiver test covers pending consent, delegated credential delivery, JSON/SSE upstream continuation restoration, cross-peer rejection and single-use concurrent retries. This does not establish encrypted-frame or managed-mediator conformance.
 
@@ -2153,8 +2177,8 @@ Modern credential preparation owns all configured bindings, including tool-filte
 
 Modern credential destinations must be unambiguous before fetching credentials or issuing consent: headers compare case-insensitively, metadata uses canonical key validation, and custom formats must contain `{value}`. Reject conflicting destinations, malformed values and credentials over 32 KiB instead of silently sanitizing or overwriting them. Prepared headers remain sensitive.
 
-Direct and sending Access Points and independent Fabric receive inspect local payment requirements before consuming a ready modern continuation. A no-credential challenge leaves the continuation and staged consent unclaimed; payment verification and Target dispatch still require the atomic claim. Failed or ambiguous payment processing never rearms an operation. Shared local processing uses each endpoint's own configuration and headers, removes consumed header and argument credentials, and preserves x402 versus MPP receipt names. Only the active local paywall's consumed argument is excluded from the continuation digest; business arguments, nested fields and other payment rails remain bound. Successful local payment on consent-enabled paths is retained as bounded, encrypted continuation evidence: later rounds revalidate authority and claim once before reusing the original receipt without another verification or settlement. Neither evidence nor descendant continuations extend the original expiry. Direct and isolated receiver JSON/SSE regressions assert one persisted mock x402 payment across rounds and no further work on replay. Delegated payment, external payment-rail and distributed payment-store conformance are not verified.
+Direct and sending Access Points and independent Fabric receive check whether a chargeable request carries a credential before consuming a ready modern continuation. A request with no credential and no payment evidence gets agent-pay's challenge and leaves the continuation and staged consent unclaimed; the payment call and Target dispatch still require the atomic claim. A refused or unknown payment outcome never rearms an operation. The consumed credential is removed from the request wherever it was carried, and only credential fields are excluded from the continuation digest; business arguments, nested fields and every other field remain bound. A paid request on consent-enabled paths is retained as bounded, encrypted continuation evidence: later rounds revalidate authority and claim once before reusing the original receipt without another payment call. Neither evidence nor descendant continuations extend the original expiry. Direct and isolated receiver JSON/SSE regressions run against an in-process payment gate and assert one payment call across rounds and no further work on replay. Payment-rail and agent-pay conformance are not verified.
 
-Delegated payment never forwards the ingress Resource Server bearer, and forwards `Authorization` only with a `Payment` credential. Modern delegated HTTP 402 challenges force `no-store` and map only retired payment codes `-32042`/`-32043` to application codes `1001`/`1002`, retaining caller correlation and challenge data/headers. Unknown upstream errors and legacy bodies remain unchanged. The remote allow/challenge/deny contract does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
+The payment call never forwards the ingress Resource Server bearer: it carries only the credential, `content-type`, `traceparent` and `x-request-id`. Every payment refusal is `no-store`. agent-pay's answers map to codes by their reason, not by status alone: a challenge or an expired payment is `1001`; a malformed or refused credential, a rejected payment and a credential already used are `1002`; a payment held for review is `1003`; a status or reason that is not agent-pay's is `payment_unavailable` (`502` or `503`) and is not a rejection. A caller on the legacy MCP revision, a request with no MCP protocol version, gets `-32042` for a challenge and `-32043` for the other `402` answers, as the retired transport sent them, with the caller's correlation, the challenge data and its headers retained. The payment gateway's answer does not prove absence of side effects; never rearm a claimed operation on a challenge or uncertain result.
 
 Vault mutations keep their acquired file lock in an owned task until filesystem work completes, even if the caller is cancelled; lock acquisition remains cancellable and provider network calls stay outside it. A cancelled mutation may have committed and must not be assumed absent. The shared atomic writer uses exclusive UUID temporary files, file flush/sync before rename and Unix directory sync after rename/deletion; a directory sync the filesystem reports as unsupported is logged once and skipped, while other sync failures propagate. Four-process local tests cover refresh claim races, revocation and abrupt owner death; paused-write tests cover cancellation. Real loopback DynamoDB-compatible tests race continuation claims and ID-JAG redemption across four processes. These checks do not prove remote-filesystem, deployed IAM, hardware power-loss or complete multi-host consent conformance.

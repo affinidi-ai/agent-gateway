@@ -8,7 +8,10 @@ import type { Protocol } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
-import { showSurfaceSaveToast } from '../components/surface-builder/elements/saveWarnings';
+import {
+  showSurfaceSaveToast,
+  shownSaveWarnings,
+} from '../components/surface-builder/elements/saveWarnings';
 import { useSurfaceBuilder } from '../components/surface-builder/hooks/useSurfaceBuilder';
 import { useSaveShortcut } from '../components/surface-builder/hooks/useSaveShortcut';
 import { useDiscardWithUndo } from '../components/surface-builder/hooks/useDiscardWithUndo';
@@ -41,6 +44,7 @@ import {
   getTemplateProtocolBadge,
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
+import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -468,14 +472,18 @@ const AddSurfacePage: React.FC = () => {
         },
       });
       justCreatedRef.current = true;
+      const serverWarnings = [...headerWarnings, ...saveWarningMessages(created?.warnings)];
       // Surface non-blocking structural warnings AFTER create. See
       // SurfaceDetailPage for full rationale.
-      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, { headerWarnings });
+      showSurfaceSaveToast(`Agent Surface "${name}" created`, payload, {
+        headerWarnings: serverWarnings,
+      });
       // Warnings from the gateway go with the operator to the new surface's
       // page, which lists them, since the toast goes after a few seconds.
-      if (headerWarnings.length > 0 && created?.surface_id) {
+      const shown = shownSaveWarnings(serverWarnings);
+      if (shown.length > 0 && created?.surface_id) {
         navigate(`/surfaces/${encodeURIComponent(created.surface_id)}`, {
-          state: { saveWarnings: headerWarnings },
+          state: { saveWarnings: shown },
         });
       } else {
         navigate('/surfaces');

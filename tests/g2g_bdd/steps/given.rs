@@ -13,14 +13,16 @@ use crate::bdd_support::config::fabric_surface_fixture::{
 };
 use crate::bdd_support::config::modern_consent::ModernConsentFixture;
 use crate::bdd_support::json_rpc::{
-    IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_ok_response,
+    IdentityBindingProof, McpVersion, build_mcp_echo_response_body, build_target_agent_card_naming_did,
+    build_target_ok_response,
 };
 use crate::bdd_support::mcp_consent::{ConsentRequest, complete_consent, open_consent_callback_with_tampered_state};
 use crate::bdd_support::mediator::Mediator as _;
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_ISSUER, OidcProvider};
 use crate::bdd_support::policies::{
     build_gateway_deny_all_policy, build_gateway_deny_unverified_source_auth_policy, build_mcp_tool_allow_policy,
-    build_surface_identity_binding_issuer_policy, build_transit_point_partner_policy,
+    build_surface_deny_target_trust_check_errors_policy, build_surface_identity_binding_issuer_policy,
+    build_surface_require_agent_did_policy, build_transit_point_partner_policy,
 };
 use crate::world::{FabricLink, G2gWorld, McpCaller, TransitPointFabricLink};
 
@@ -440,6 +442,52 @@ pub async fn transit_point_requires_a_transit_token(
     transit_point_spec_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} authenticates its callers with API key {string}")]
+pub async fn transit_point_authenticates_callers_with_api_key(
+    world: &mut G2gWorld,
+    transit_point: String,
+    valid_key: String,
+) {
+    let link = world
+        .transit_point_link(&transit_point)
+        .clone();
+    transit_point_spec_mut(world, &transit_point).source_auth = Some(SourceAuthSpec::ApiKey {
+        header_name: "x-api-key".to_string(),
+        secret_id: format!("{}-{transit_point}-caller-key", link.from_surface),
+        valid_key,
+    });
+}
+
+/// `error_codes` is a comma-separated list.
+#[given(expr = "surface {string} denies a target Trust Check reporting any of error codes {string}")]
+pub async fn surface_denies_target_trust_check_errors(
+    world: &mut G2gWorld,
+    surface_name: String,
+    error_codes: String,
+) {
+    let codes = error_codes
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    surface_spec_mut(world, &surface_name).transit_policy_rego =
+        Some(build_surface_deny_target_trust_check_errors_policy(&codes));
+}
+
+#[given(expr = "Transit Point {string} has a target-leg Trust Check")]
+pub fn transit_point_has_a_target_trust_check(
+    world: &mut G2gWorld,
+    transit_point: String,
+) {
+    assert!(
+        world.harness.is_none(),
+        "the Trust Check of Transit Point '{transit_point}' is applied when the fabric starts, so it must come first"
+    );
+    world
+        .topology
+        .transit_point_trust_checks
+        .push(transit_point);
+}
+
 /// How long a fresh pairing may take to record the peer's issuer DID.
 const PAIRING_ISSUER_DID_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -841,6 +889,51 @@ fn remote_record_id(
         .to_string()
 }
 
+#[given(expr = "surface {string} serves an agent card naming agent DID {string}")]
+pub fn surface_serves_an_agent_card_naming_agent_did(
+    world: &mut G2gWorld,
+    surface_name: String,
+    agent_did: String,
+) {
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_responses
+        .insert(surface_id, build_target_agent_card_naming_did(&agent_did));
+}
+
+/// Starts the fabric, since the policy is stored and attached through the admin API.
+#[given(expr = "surface {string} has a policy that requires its Target's agent DID to be {string}")]
+pub async fn surface_requires_its_targets_agent_did(
+    world: &mut G2gWorld,
+    surface_name: String,
+    agent_did: String,
+) {
+    world.start().await;
+    let (gw_index, surface_id) = world.surface(&surface_name);
+    let policy_definition_id = format!("{surface_id}-agent-did-policy");
+    let admin = &world
+        .harness()
+        .gw(gw_index)
+        .admin;
+    admin
+        .create_surface_policy_definition(
+            &policy_definition_id,
+            &format!("g2g BDD agent DID policy for {surface_id}"),
+            &build_surface_require_agent_did_policy(&agent_did),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{error:#}"));
+    admin
+        .patch_surface(
+            &surface_id,
+            &serde_json::json!({ "target": { "policy": { "policy_definition_id": policy_definition_id } } }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("attach agent DID policy to surface '{surface_id}': {error:#}"));
+}
+
 #[given(expr = "surface {string} has a policy that requires the caller identity to be issued by gateway {int}")]
 pub async fn surface_requires_caller_identity_issued_by_gateway(
     world: &mut G2gWorld,
@@ -1102,27 +1195,6 @@ async fn caller_holds_mcp_access_token(
             name: caller,
             gw_index,
             provider,
-        });
-}
-
-#[given(expr = "surface {string} delegates payment to gateway {int} surface {string}")]
-async fn surface_delegates_payment_over_fabric(
-    world: &mut G2gWorld,
-    surface_name: String,
-    payment_gw: usize,
-    payment_surface_name: String,
-) {
-    let (from_gw, from_surface) = world.surface(&surface_name);
-    let (_, to_surface) = world.surface(&payment_surface_name);
-    world
-        .topology
-        .payment_delegation_links
-        .push(FabricLink {
-            from_gw,
-            from_surface,
-            to_gw: payment_gw,
-            to_surface,
-            exposed: true,
         });
 }
 

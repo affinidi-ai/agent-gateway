@@ -160,9 +160,23 @@ impl Receiver {
         surface_id: &str,
         caller_key: Option<&str>,
     ) -> ReceivedMessage {
+        self.forward_request_to(surface_id, caller_key, "/", &[])
+    }
+
+    /// [`Self::forward_request`] for `path`, carrying `extra_headers` from the peer.
+    fn forward_request_to(
+        &self,
+        surface_id: &str,
+        caller_key: Option<&str>,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> ReceivedMessage {
         let mut headers = json!({"content-type": "application/json"});
         if let Some(key) = caller_key {
             headers["x-api-key"] = json!(key);
+        }
+        for (name, value) in extra_headers {
+            headers[*name] = json!(value);
         }
         ReceivedMessage::new(
             "receiver-connection".to_string(),
@@ -175,7 +189,7 @@ impl Receiver {
             None,
             Some(super::super::envelope_replay::now_secs() + 60),
             json!({
-                "channel_id": surface_id, "method": "POST", "path": "/",
+                "channel_id": surface_id, "method": "POST", "path": path,
                 "headers": headers,
                 "body": {"jsonrpc": "2.0", "id": 1, "method": "message/send", "params": {"message": {
                     "role": "user", "messageId": "m-1", "parts": [{"kind": "text", "text": "hello"}]
@@ -194,7 +208,7 @@ impl Receiver {
 
     /// Receives a request for `surface_id` under `mode`, and returns the
     /// `ForwardResponse` status, the credential headers the Target received
-    /// (none when it was not called), and the delegation audit details.
+    /// (none when it was not called), and the credential audit records.
     async fn receive(
         &self,
         surface_id: &str,
@@ -248,15 +262,29 @@ impl Receiver {
         let credentials = received
             .get(called_before)
             .map(|headers| (header(headers, "x-target-key"), header(headers, "authorization")));
-        (status, credentials, injected_details(&events))
+        (status, credentials, credential_records(&events))
     }
 }
 
-fn injected_details(events: &[DelegationAuditEvent]) -> Vec<String> {
+/// The detail of each injected delegated credential, and `target_auth_failed (<outcome>)` for
+/// each Target credential the receiving gateway did not send.
+fn credential_records(events: &[DelegationAuditEvent]) -> Vec<String> {
     events
         .iter()
-        .filter(|event| matches!(event.event, DelegationAuditAction::TokenInjected))
-        .filter_map(|event| event.detail.clone())
+        .filter_map(|event| match &event.event {
+            DelegationAuditAction::TokenInjected => event.detail.clone(),
+            DelegationAuditAction::RequestRejected {
+                reason: crate::audit::request_events::RejectionReason::TargetAuthFailed,
+                http_status,
+                target_auth: Some(target_auth),
+                ..
+            } => {
+                assert!(event.via_fabric, "a Fabric receive record is marked as such");
+                assert_eq!(*http_status, None, "a Fabric receive record has no HTTP status");
+                Some(format!("target_auth_failed ({:?})", target_auth.outcome))
+            }
+            _ => None,
+        })
         .collect()
 }
 
@@ -285,7 +313,7 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                 receiver
                     .receive("auth-other", mode)
                     .await,
-                (502, None, none.clone()),
+                (502, None, vec!["target_auth_failed (Rejected)".to_string()]),
                 "{mode:?}"
             );
             assert_eq!(
@@ -335,13 +363,93 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
             receiver
                 .receive("auth-wide", RuleMode::Enforce)
                 .await,
-            (502, None, none.clone())
+            (502, None, vec!["target_auth_failed (Rejected)".to_string()])
         );
         assert_eq!(
             receiver
                 .receive("delegated-wide", RuleMode::Enforce)
                 .await,
             (503, None, none)
+        );
+    });
+}
+
+#[test]
+fn fabric_receive_keeps_the_target_credential_under_its_base_path_and_drops_a_caller_copy() {
+    isolated("AG_FABRIC_TARGET_SCOPE_CHILD", async {
+        let receiver = Receiver::new().await;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "scoped", "name": "scoped", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "127.0.0.1:8080", "route": "/scoped", "protocol": "a2a",
+                "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
+                    "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
+            "target": {"endpoint": format!("{}/base", receiver.target.url),
+                "auth": {"method": {"static_secret": {"secret_id": "own", "header_name": "x-target-key"}}}}
+        }))
+        .unwrap();
+        FileSystemAgentSurfaceStore::new(receiver.surfaces_path.clone())
+            .await
+            .unwrap()
+            .save(&surface)
+            .await
+            .unwrap();
+        let receive = |path: &'static str| {
+            let message = receiver.forward_request_to(
+                "scoped",
+                Some(CALLER_KEY),
+                path,
+                &[("X-TARGET-KEY", "caller-chosen"), ("x_target_key", "caller-chosen")],
+            );
+            async move {
+                let policy: &'static CredentialPolicyConfig = Box::leak(Box::default());
+                let (result, events) = TEST_CREDENTIAL_POLICY
+                    .scope(
+                        policy,
+                        crate::audit::producer::capture(async {
+                            tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                                .await
+                                .expect("Fabric receive handler timed out")
+                        }),
+                    )
+                    .await;
+                let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                    panic!("expected a ForwardResponse, got {result:?}");
+                };
+                let status = response_body["status"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("no status in {response_body}"));
+                (status, credential_records(&events))
+            }
+        };
+
+        assert_eq!(receive("/x").await, (200, Vec::new()));
+        let received = receiver.target.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0]
+                .get_all("x-target-key")
+                .iter()
+                .collect::<Vec<_>>(),
+            ["own-value"]
+        );
+        assert!(
+            received[0]
+                .get("x_target_key")
+                .is_none(),
+            "{:?}",
+            received[0]
+        );
+
+        for path in ["/%2e%2e/admin", "/x/../../admin", "/..;/admin", "/..%252Fadmin"] {
+            assert_eq!(receive(path).await, (502, vec!["target_auth_failed (Rejected)".to_string()]), "{path}");
+        }
+        assert_eq!(
+            receiver
+                .target
+                .received()
+                .len(),
+            1,
+            "a path outside the base path never reaches the Target"
         );
     });
 }

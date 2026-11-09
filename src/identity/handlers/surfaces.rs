@@ -923,6 +923,7 @@ fn validate_transit_points(
     }
     refuse_reference_transit_tokens(surface)?;
     validate_transit_point_caller_authentication(surface, stored)?;
+    refuse_duplicate_transit_point_ids(surface)?;
     for variant in &mut surface.variants {
         if let Some(points) = variant
             .overrides
@@ -964,6 +965,16 @@ fn identify_transit_points(
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
         }
+        if let Err(msg) = tp.validate_per_caller_rate_limit() {
+            return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
+        }
+        if let Some(limit) = &tp.per_caller_rate_limit
+            && let Err(error) = crate::policies::CallerRateLimiter::new(&limit.into(), tp.alias.as_str())
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{place}transit.points[{idx}]: per_caller_rate_limit cannot be enforced: {error}"
+            )));
+        }
         if !seen.insert(tp.alias.clone()) {
             return Err(SurfaceApiError::BadRequest(format!(
                 "{place}transit.points[{idx}]: duplicate alias '{}'. Each transit point alias must be unique within \
@@ -1003,6 +1014,43 @@ fn refuse_reference_transit_tokens(surface: &AgentSurface) -> Result<(), Surface
                 "variant '{}' {}",
                 variant.alias, TRANSIT_TOKEN_REFERENCE_REFUSED
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse two Transit Points with one `id`, on the surface or in a variant's overrides (whose
+/// points replace the surface's). The id names a leg when a save keeps what the stored leg
+/// already had, so it must name one point only.
+fn refuse_duplicate_transit_point_ids(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let base = surface
+        .transit
+        .as_ref()
+        .map(|transit| (String::new(), transit.points.as_slice()));
+    let variants = surface
+        .variants
+        .iter()
+        .filter_map(|variant| {
+            let points = variant
+                .overrides
+                .transit
+                .as_ref()?
+                .points
+                .as_deref()?;
+            Some((format!("variants['{}'].", variant.alias), points))
+        });
+    for (prefix, points) in base
+        .into_iter()
+        .chain(variants)
+    {
+        let mut seen = std::collections::HashSet::with_capacity(points.len());
+        for (idx, point) in points.iter().enumerate() {
+            if !point.id.is_empty() && !seen.insert(point.id.as_str()) {
+                return Err(SurfaceApiError::BadRequest(format!(
+                    "{prefix}transit.points[{idx}]: duplicate id '{}'. Each transit point id must be unique within the surface.",
+                    point.id
+                )));
+            }
         }
     }
     Ok(())
@@ -1074,29 +1122,35 @@ fn validate_transit_point_caller_authentication(
 }
 
 /// A saved surface, with the [`save_warnings`] it calls for.
-type SavedSurface = (axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>);
+type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<AgentSurface>>>);
 
 /// The `Warning` headers (code 299) a save of `surface` answers with: its
 /// Access Point's ([`AgentSurface::access_point_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
-/// accepts through another ([`shared_issuer_warnings`]), each to a peer
+/// accepts through another ([`shared_issuer_warnings`]), each whose stored
+/// principal claim names no caller ([`unusable_principal_claim_warnings`]),
+/// each to a peer
 /// gateway that does not require the transit token ([`fabric_hop_limit_warnings`]),
 /// each that opts Fabric callers in to delegated credentials without a
 /// managed identity ([`fabric_delegation_identity_warnings`]), each that
 /// does so where the surface cannot tell a partner's users apart
-/// ([`fabric_caller_delegation_warnings`]), and each with external consent
+/// ([`fabric_caller_delegation_warnings`]), each view whose Target does so
+/// there, or on a Target the switch has no effect on
+/// ([`target_fabric_caller_delegation_warnings`]), and each with external consent
 /// that a variant keeps under its own settings
 /// ([`inherited_external_point_warnings`]), as the Access Point Target's
-/// binding with external consent ([`inherited_target_binding_warnings`]), and
+/// binding with external consent ([`inherited_target_binding_warnings`]),
 /// each enabled view that reaches that binding's vendor without it or a
-/// credential of its own ([`unbound_vendor_view_warnings`]).
+/// credential of its own ([`unbound_vendor_view_warnings`]), and each Target
+/// authentication that breaks a `target_https` or `target_source_auth` rule in `warn`.
 async fn save_warnings(
     state: &IdentityApiState,
     surface: &AgentSurface,
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1108,13 +1162,16 @@ async fn save_warnings(
         )
         .chain(shared_audience_warnings(surface))
         .chain(shared_issuer_warnings(surface, &issuers))
+        .chain(unusable_principal_claim_warnings(surface, &issuers))
         .chain(modern_delegation_warnings(surface))
         .chain(fabric_hop_limit_warnings(surface))
         .chain(fabric_delegation_identity_warnings(surface))
         .chain(fabric_caller_delegation_warnings(surface, &issuers))
+        .chain(target_fabric_caller_delegation_warnings(surface, &issuers))
         .chain(inherited_external_point_warnings(surface))
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
+        .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
@@ -1124,7 +1181,7 @@ async fn save_warnings(
 }
 
 /// A `Warning` header (code 299) carrying `warning`.
-fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
+pub(crate) fn warning_header(warning: &str) -> Option<axum::http::HeaderValue> {
     let quoted = warning
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
@@ -1262,7 +1319,7 @@ fn jwt_bearer_methods(
 async fn jwt_strategy_issuers(
     state: &IdentityApiState,
     surface: &AgentSurface,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, StrategyCallerNaming> {
     let mut issuers = std::collections::HashMap::new();
     let Some(store) = state
         .jwt_verification_strategy_store
@@ -1282,22 +1339,52 @@ async fn jwt_strategy_issuers(
                 continue;
             }
             if let Ok(Some(strategy)) = store.get(id).await {
-                issuers.insert(id.clone(), strategy.expected_issuer);
+                let principal_claim = strategy
+                    .principal_claim_name()
+                    .map(str::to_string)
+                    .map_err(|_| {
+                        strategy
+                            .principal_claim
+                            .clone()
+                            .unwrap_or_default()
+                    });
+                issuers.insert(
+                    id.clone(),
+                    StrategyCallerNaming {
+                        issuer: strategy.expected_issuer,
+                        principal_claim,
+                    },
+                );
             }
         }
     }
     issuers
 }
 
+/// The issuer a JWT verification strategy accepts and the claim it names
+/// callers by: together they decide which callers of two strategies are one.
+/// A stored claim the API refuses is `Err` with that claim: such a strategy
+/// names no caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrategyCallerNaming {
+    issuer: String,
+    principal_claim: Result<String, String>,
+}
+
 /// Each Transit Point, on the surface or in an enabled variant, whose
 /// `jwt_bearer` strategy names the same issuer, in `issuers`, as another
 /// strategy the same view accepts, on its Access Point or another Transit
-/// Point. The identity hash keys a JWT caller by its issuer and subject, so
-/// callers verified through either strategy are one caller, with the same
-/// delegated credentials.
+/// Point, and each pair of Access Point strategies that name one issuer but
+/// different claims ([`access_point_claim_warnings`]). The identity hash keys a
+/// JWT caller by its
+/// issuer, subject and principal claim, so callers verified through two
+/// strategies naming one claim are one caller, with the same delegated
+/// credentials, and through two naming different claims are two. A strategy
+/// whose stored claim names no caller is warned of on its own
+/// ([`unusable_principal_claim_warnings`]).
 fn shared_issuer_warnings(
     surface: &AgentSurface,
-    issuers: &std::collections::HashMap<String, String>,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     for (variant, view) in surface_views(surface) {
@@ -1319,23 +1406,181 @@ fn shared_issuer_warnings(
             let strategy = config
                 .jwt_verification_strategy_id
                 .as_str();
-            let Some(issuer) = issuers.get(strategy) else {
+            let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
                 continue;
             };
-            for other in accepted
+            for (other, other_claim) in accepted
                 .iter()
-                .filter(|other| **other != strategy && issuers.get(**other) == Some(issuer))
+                .filter(|other| **other != strategy)
+                .filter_map(|other| {
+                    usable_naming(issuers, other)
+                        .filter(|(other_issuer, _)| *other_issuer == issuer)
+                        .map(|(_, other_claim)| (other, other_claim))
+                })
             {
                 let name = transit_point_name(surface, variant.as_deref(), alias);
-                let warning = format!(
-                    "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
-                     strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
-                     with the same subject through either is one caller, with the same delegated credentials; use \
-                     one strategy per issuer"
-                );
+                let warning = if other_claim == claim {
+                    format!(
+                        "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
+                         strategy '{strategy}', and this surface accepts that issuer through '{other}' too: a caller \
+                         with the same subject through either is one caller, with the same delegated credentials; \
+                         use one strategy per issuer"
+                    )
+                } else {
+                    format!(
+                        "Transit Point {name} accepts tokens from issuer '{issuer}' through JWT verification \
+                         strategy '{strategy}', and this surface accepts that issuer through '{other}' too, but they \
+                         name callers by different claims ('{}' and '{}'): the same person through either is two \
+                         callers, each with delegated credentials of their own; use one strategy per issuer",
+                        claim, other_claim
+                    )
+                };
                 if !warnings.contains(&warning) {
                     warnings.push(warning);
                 }
+            }
+        }
+    }
+    for warning in access_point_claim_warnings(surface, issuers) {
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
+
+/// Each pair of JWT verification strategies the surface's Access Point
+/// accepts, on the surface or in an enabled variant, that name one issuer but
+/// different claims: the same person reaching the surface through either is
+/// two callers. A strategy is named with a variant only when that variant's
+/// overrides set the Access Point's caller authentication; one a variant
+/// inherits is the surface's own, so each pair is warned of once.
+fn access_point_claim_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    let mut accepted: Vec<(String, Option<String>)> = Vec::new();
+    for (variant, view) in surface_views(surface) {
+        let defined_by = variant
+            .as_deref()
+            .filter(|alias| variant_sets_caller_authentication(surface, alias))
+            .map(str::to_string);
+        let (access_point, _) = jwt_bearer_methods(&view, variant.as_deref());
+        for config in access_point {
+            let entry = (config.jwt_verification_strategy_id, defined_by.clone());
+            if !accepted.contains(&entry) {
+                accepted.push(entry);
+            }
+        }
+    }
+    let located = |strategy: &str, variant: &Option<String>| match variant {
+        Some(alias) => format!("'{strategy}' in variant '{alias}'"),
+        None => format!("'{strategy}'"),
+    };
+    let mut warnings = Vec::new();
+    for (index, (strategy, variant)) in accepted.iter().enumerate() {
+        let Some((issuer, claim)) = usable_naming(issuers, strategy) else {
+            continue;
+        };
+        for (other, other_variant) in accepted
+            .iter()
+            .skip(index + 1)
+        {
+            let Some((other_issuer, other_claim)) = usable_naming(issuers, other) else {
+                continue;
+            };
+            if other_issuer != issuer || other_claim == claim {
+                continue;
+            }
+            let warning = format!(
+                "The Access Point accepts tokens from issuer '{issuer}' through JWT verification strategies {} and \
+                 {}, which name callers by different claims ('{claim}' and '{other_claim}'): the same person \
+                 through either is two callers, each with delegated credentials of their own; use one strategy \
+                 per issuer",
+                located(strategy, variant),
+                located(other, other_variant)
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+    }
+    warnings
+}
+
+/// Whether the enabled variant `alias` overrides the Access Point's caller
+/// authentication rather than inheriting the surface's.
+fn variant_sets_caller_authentication(
+    surface: &AgentSurface,
+    alias: &str,
+) -> bool {
+    surface
+        .variants
+        .iter()
+        .any(|candidate| {
+            candidate.alias == alias
+                && candidate
+                    .overrides
+                    .access_point
+                    .as_ref()
+                    .is_some_and(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .is_some()
+                    })
+        })
+}
+
+/// The issuer and principal claim of `strategy` in `issuers`, unless its
+/// stored claim names no caller.
+fn usable_naming<'a>(
+    issuers: &'a std::collections::HashMap<String, StrategyCallerNaming>,
+    strategy: &str,
+) -> Option<(&'a str, &'a str)> {
+    let naming = issuers.get(strategy)?;
+    let claim = naming
+        .principal_claim
+        .as_deref()
+        .ok()?;
+    Some((naming.issuer.as_str(), claim))
+}
+
+/// Each JWT verification strategy a view of the surface accepts, on its
+/// Access Point or a Transit Point, whose stored `principal_claim` is one the
+/// API refuses, such as one written to storage by hand: it names no caller,
+/// so JWT source authentication through it answers `500`.
+fn unusable_principal_claim_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (variant, view) in surface_views(surface) {
+        let (access_point, transit_points) = jwt_bearer_methods(&view, variant.as_deref());
+        for strategy in access_point.iter().chain(
+            transit_points
+                .iter()
+                .map(|(_, config)| config),
+        ) {
+            let strategy = strategy
+                .jwt_verification_strategy_id
+                .as_str();
+            let Some(Err(stored)) = issuers
+                .get(strategy)
+                .map(|naming| {
+                    naming
+                        .principal_claim
+                        .as_ref()
+                })
+            else {
+                continue;
+            };
+            let warning = format!(
+                "JWT verification strategy '{strategy}' names callers by '{stored}', a claim the API refuses: it \
+                 identifies no caller, and JWT source authentication through it answers 500; create a strategy \
+                 that names another claim"
+            );
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
             }
         }
     }
@@ -1399,16 +1644,50 @@ fn fabric_delegation_identity_warnings(surface: &AgentSurface) -> Vec<String> {
     warnings
 }
 
+/// Why `view`'s caller authentication cannot tell apart the users a paired
+/// gateway sends requests for over Fabric
+/// ([`AgentSurface::fabric_caller_authentication_gap`]), or names a JWT
+/// verification strategy that, in `issuers`, names no issuer; `None` when it
+/// can tell them apart.
+fn fabric_caller_gap(
+    view: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Option<String> {
+    view.fabric_caller_authentication_gap()
+        .map(str::to_string)
+        .or_else(|| {
+            let (access_point, _) = jwt_bearer_methods(view, None);
+            access_point
+                .iter()
+                .map(|config| {
+                    config
+                        .jwt_verification_strategy_id
+                        .as_str()
+                })
+                .find(|strategy| {
+                    issuers
+                        .get(*strategy)
+                        .is_none_or(|naming| {
+                            naming
+                                .issuer
+                                .trim()
+                                .is_empty()
+                        })
+                })
+                .map(|strategy| {
+                    format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read")
+                })
+        })
+}
+
 /// Each Transit Point, on the surface or in an enabled variant, that sets
 /// `delegated_credentials_for_fabric_callers` where the view's caller
-/// authentication cannot tell a partner's users apart
-/// ([`AgentSurface::fabric_caller_authentication_gap`]), or names a JWT
-/// verification strategy that, in `issuers`, names no issuer. The receiving
-/// surface then puts no principal in a partner's transit token, so the
-/// Transit Point releases no delegated credential to Fabric callers.
+/// authentication cannot tell a partner's users apart ([`fabric_caller_gap`]).
+/// The receiving surface then puts no principal in a partner's transit token,
+/// so the Transit Point releases no delegated credential to Fabric callers.
 fn fabric_caller_delegation_warnings(
     surface: &AgentSurface,
-    issuers: &std::collections::HashMap<String, String>,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     for (variant, view) in surface_views(surface) {
@@ -1419,28 +1698,7 @@ fn fabric_caller_delegation_warnings(
         else {
             continue;
         };
-        let gap = view
-            .fabric_caller_authentication_gap()
-            .map(str::to_string)
-            .or_else(|| {
-                let (access_point, _) = jwt_bearer_methods(&view, None);
-                access_point
-                    .iter()
-                    .map(|config| {
-                        config
-                            .jwt_verification_strategy_id
-                            .as_str()
-                    })
-                    .find(|strategy| {
-                        issuers
-                            .get(*strategy)
-                            .is_none_or(|issuer| issuer.trim().is_empty())
-                    })
-                    .map(|strategy| {
-                        format!("its JWT verification strategy '{strategy}' names no issuer, or cannot be read")
-                    })
-            });
-        if let Some(gap) = gap {
+        if let Some(gap) = fabric_caller_gap(&view, issuers) {
             let label = variant.map_or_else(String::new, |alias| format!("variant '{alias}': "));
             warnings.push(format!(
                 "{label}Transit Point '{}' sets delegated_credentials_for_fabric_callers, but the surface's caller \
@@ -1451,6 +1709,46 @@ fn fabric_caller_delegation_warnings(
         }
     }
     warnings
+}
+
+/// Each view, the surface or an enabled variant, whose Target sets
+/// `delegated_credentials_for_fabric_callers` where the switch has no effect:
+/// on a Target that is not an HTTP or HTTPS URL
+/// ([`AgentSurface::target_is_http_url`]), to which Fabric receive sends no
+/// delegated credential, or where the view's caller authentication cannot
+/// tell a partner's users apart ([`fabric_caller_gap`]), when Fabric receive
+/// releases none of that view's per-user grants to partners. These are the
+/// conditions [`AgentSurface::releases_target_grants_to_fabric_callers`]
+/// checks on every request, with the strategy's issuer besides. The save is
+/// not refused, as for a Transit Point.
+fn target_fabric_caller_delegation_warnings(
+    surface: &AgentSurface,
+    issuers: &std::collections::HashMap<String, StrategyCallerNaming>,
+) -> Vec<String> {
+    surface_views(surface)
+        .into_iter()
+        .filter(|(_, view)| {
+            view.target
+                .delegated_credentials_for_fabric_callers
+        })
+        .filter_map(|(variant, view)| {
+            let label = variant.map_or_else(String::new, |alias| format!("variant '{alias}': "));
+            if !view.target_is_http_url() {
+                return Some(format!(
+                    "{label}the Target sets delegated_credentials_for_fabric_callers, but its endpoint is not an \
+                     http:// or https:// URL, so Fabric receive sends it no delegated credential and the switch has \
+                     no effect there"
+                ));
+            }
+            fabric_caller_gap(&view, issuers).map(|gap| {
+                format!(
+                    "{label}the Target sets delegated_credentials_for_fabric_callers, but the surface's caller \
+                     authentication cannot tell a partner's users apart, and {gap}, so Fabric callers get none of \
+                     its per-user delegated credentials"
+                )
+            })
+        })
+        .collect()
 }
 
 /// Each Transit Point with `consent_mode: external` that an enabled variant
@@ -1738,7 +2036,7 @@ fn outbound_listen_path_claims(
 /// would produce overlapping Axum routes.
 ///
 /// Each custom `listen_path` is registered as an exact route on the shared
-/// outbound port listener (`run_outbound_port_server`). Two transit points
+/// outbound port listener (`build_outbound_port_router`). Two transit points
 /// that resolve to the same effective listen address **and** the same
 /// `listen_path` register the same route; `Router::merge` then panics when
 /// the listener is (re)built after a save — taking the whole gateway down.
@@ -1925,6 +2223,8 @@ fn check_access_point_route_collisions(
 #[derive(Debug)]
 pub enum SurfaceApiError {
     BadRequest(String),
+    /// A 400 that also carries a stable machine-readable `code`.
+    BadRequestCode(&'static str, String),
     Forbidden(String),
     NotFound(String),
     UnsupportedMediaType(String),
@@ -1934,8 +2234,12 @@ pub enum SurfaceApiError {
 
 impl IntoResponse for SurfaceApiError {
     fn into_response(self) -> Response {
+        let code = match &self {
+            SurfaceApiError::BadRequestCode(code, _) => Some(*code),
+            _ => None,
+        };
         let (status, message, details) = match &self {
-            SurfaceApiError::BadRequest(msg) => {
+            SurfaceApiError::BadRequest(msg) | SurfaceApiError::BadRequestCode(_, msg) => {
                 warn!("Surface API Bad Request: {}", msg);
                 (StatusCode::BAD_REQUEST, "Bad Request", Some(msg.clone()))
             }
@@ -1963,6 +2267,7 @@ impl IntoResponse for SurfaceApiError {
 
         let body = Json(SurfaceErrorResponse {
             error: message.to_string(),
+            code,
             details,
         });
 
@@ -1974,7 +2279,35 @@ impl IntoResponse for SurfaceApiError {
 struct SurfaceErrorResponse {
     error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<String>,
+}
+
+/// A problem that did not stop a save, returned in the save response's
+/// `warnings` array.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SurfaceWarning {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// A saved surface or variant, plus any warnings raised while saving it.
+#[derive(Debug, Serialize)]
+pub struct SurfaceSaveResponse<T: Serialize> {
+    #[serde(flatten)]
+    pub saved: T,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SurfaceWarning>,
+}
+
+impl<T: Serialize> SurfaceSaveResponse<T> {
+    fn new(
+        saved: T,
+        warnings: Vec<SurfaceWarning>,
+    ) -> Json<Self> {
+        Json(Self { saved, warnings })
+    }
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -2183,113 +2516,416 @@ async fn agent_card_preview(
     }
 }
 
-/// Validate (and resolve) every x402 payment policy attached to the
-/// surface: the base `target.payment_policy` plus every variant
-/// override. Reuses the channel-handler validator so behaviour stays
-/// identical across both APIs — the global x402 recipient list is the
-/// only source of wallet addresses, and any client-supplied `pay_to`
-/// is overwritten in place.
-async fn validate_surface_payment_policies(surface: &mut AgentSurface) -> Result<(), SurfaceApiError> {
-    let recipients: Vec<crate::identity::handlers::config::X402RecipientAddress> =
-        match crate::x402::config_cache::get_x402_metadata().await {
-            Some(metadata) => metadata
-                .recipient_addresses
-                .clone(),
-            None => Vec::new(),
-        };
+/// Validate every payment setting on the surface, its variants and its
+/// Transit Points. Local x402/MPP policies, MPP auto-pay and Transit Point
+/// payment policies are refused with `local_payment_unsupported`. Each
+/// `agent_pay` policy must name a Remote gateway (either side may have opened
+/// the connection) and
+/// a payment surface whose manifest offers at least one payment point; the
+/// manifest, fetched afresh, replaces `manifest_snapshot`. When the payment
+/// gateway cannot be reached the save goes ahead with a `payment_unverified`
+/// warning, keeping the snapshot `stored` already verified for the same
+/// payment surface, if any.
+async fn validate_surface_payment_policies(
+    gateway_store: Option<&std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<Vec<SurfaceWarning>, SurfaceApiError> {
+    reject_unsupported_payment_settings(surface)?;
+    reject_fabric_routes_to_payment_gateways(gateway_store, surface).await?;
 
-    if let Some(crate::config::agent_surface::PaymentPolicy::X402(ref mut cfg)) = surface.target.payment_policy {
-        crate::identity::handlers::policy_validation::validate_payment_policy(
-            cfg,
-            &recipients,
+    let mut warnings = Vec::new();
+    if let Some(crate::config::agent_surface::PaymentPolicy::AgentPay(policy)) = surface
+        .target
+        .payment_policy
+        .as_mut()
+    {
+        verify_agent_pay_policy(
+            gateway_store,
+            policy,
+            stored.and_then(AgentSurface::agent_pay_policy),
             "Surface payment policy",
+            &mut warnings,
         )
-        .map_err(SurfaceApiError::BadRequest)?;
+        .await?;
     }
-
     for variant in surface.variants.iter_mut() {
-        let Some(target_overrides) = variant
+        let label = format!("Variant '{}' payment policy", variant.alias);
+        let stored_policy = stored
+            .and_then(|stored| {
+                stored
+                    .variants
+                    .iter()
+                    .find(|stored| stored.id == variant.id)
+            })
+            .and_then(|stored| {
+                stored
+                    .overrides
+                    .target
+                    .as_ref()
+            })
+            .and_then(|target| target.payment_policy.as_ref())
+            .and_then(|policy| match policy {
+                crate::config::agent_surface::PaymentPolicy::AgentPay(policy) => Some(policy),
+                _ => None,
+            });
+        if let Some(crate::config::agent_surface::PaymentPolicy::AgentPay(policy)) = variant
             .overrides
             .target
             .as_mut()
-        else {
-            continue;
-        };
-        if let Some(crate::config::agent_surface::PaymentPolicy::X402(ref mut cfg)) = target_overrides.payment_policy {
-            let label = format!("Variant '{}' payment policy", variant.alias);
-            crate::identity::handlers::policy_validation::validate_payment_policy(cfg, &recipients, &label)
-                .map_err(SurfaceApiError::BadRequest)?;
+            .and_then(|target| target.payment_policy.as_mut())
+        {
+            verify_agent_pay_policy(gateway_store, policy, stored_policy, &label, &mut warnings).await?;
         }
     }
-
-    Ok(())
+    Ok(warnings)
 }
 
-/// Validate MPP crypto-verification posture (base + every variant): reject a
-/// `passthrough` (unverified) mode or a 0-confirmation on-chain mode fronting
-/// a mainnet crypto payment method before the surface reaches disk.
-fn validate_surface_mpp_posture(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
-    if let Some(crate::config::agent_surface::PaymentPolicy::Mpp(cfg)) = surface
+/// Every `agent_pay` policy on the surface (base target first, then each
+/// variant override), labelled for logs.
+fn agent_pay_policies_mut(
+    surface: &mut AgentSurface
+) -> Vec<(String, &mut crate::config::agent_surface::AgentPayPolicy)> {
+    use crate::config::agent_surface::PaymentPolicy;
+
+    let mut policies = Vec::new();
+    if let Some(PaymentPolicy::AgentPay(policy)) = surface
         .target
         .payment_policy
-        .as_ref()
+        .as_mut()
     {
-        crate::mpp::posture::validate_mpp_posture(cfg, "Surface MPP config").map_err(SurfaceApiError::BadRequest)?;
+        policies.push(("base".to_string(), policy));
     }
-
-    for variant in &surface.variants {
-        let Some(crate::config::agent_surface::PaymentPolicy::Mpp(cfg)) = variant
+    for variant in surface.variants.iter_mut() {
+        if let Some(PaymentPolicy::AgentPay(policy)) = variant
             .overrides
             .target
-            .as_ref()
-            .and_then(|t| t.payment_policy.as_ref())
-        else {
+            .as_mut()
+            .and_then(|target| target.payment_policy.as_mut())
+        {
+            policies.push((format!("variant '{}'", variant.alias), policy));
+        }
+    }
+    policies
+}
+
+/// Serialises the writes that change a stored surface (an API save, a delete
+/// and a snapshot refresh) together with applying them to the running gateway,
+/// so a snapshot refresh never overwrites a concurrent edit and the running
+/// gateway ends up with what was stored last.
+static SURFACE_WRITES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Re-fetch the manifest of every payment surface an `agent_pay` policy
+/// points at and store a change in what it offers, or in its points' labels or
+/// logos, in
+/// the policy's `manifest_snapshot`, logging how the price or payment points
+/// drifted. A
+/// manifest that cannot be fetched, or no longer offers a payment point, leaves
+/// the snapshot as it was, and so does one the surface could not be saved
+/// with: the snapshot is stored only if the surface still passes the
+/// validation a save runs.
+///
+/// Only the snapshots are written, and only if the stored surface is still the
+/// one that was read; a surface edited while its manifests were being fetched
+/// is skipped until the next run.
+pub(crate) async fn refresh_payment_manifest_snapshots(state: &IdentityApiState) {
+    let (Some(store), Some(gateway_store)) = (
+        state
+            .agent_surface_store
+            .as_ref(),
+        state.gateway_store.as_ref(),
+    ) else {
+        return;
+    };
+    let surfaces = match store.list_all().await {
+        Ok(surfaces) => surfaces,
+        Err(e) => {
+            warn!("Payment manifest refresh: failed to list surfaces: {e}");
+            return;
+        }
+    };
+    let listener_manager = crate::gateways::connection_points::message_processor::get_listener_manager();
+    for surface in surfaces {
+        let Some(updated) = refreshed_surface(&surface, gateway_store, listener_manager.as_deref()).await else {
             continue;
         };
-        let label = format!("Variant '{}' MPP config", variant.alias);
-        crate::mpp::posture::validate_mpp_posture(cfg, &label).map_err(SurfaceApiError::BadRequest)?;
+        commit_refreshed_surface(store, &surface, &updated, async |saved| {
+            apply_surface_change(state, SurfaceChange::Upsert(saved)).await;
+        })
+        .await;
     }
+    match store.list_all().await {
+        Ok(mut surfaces) => {
+            let manifests: Vec<_> = surfaces
+                .iter_mut()
+                .flat_map(|surface| {
+                    agent_pay_policies_mut(surface)
+                        .into_iter()
+                        .filter_map(|(_, policy)| {
+                            policy
+                                .manifest_snapshot
+                                .clone()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let pruned = crate::gateways::payment_logos::prune_unreferenced(&manifests).await;
+            if pruned > 0 {
+                info!("Payment manifest refresh: removed {pruned} payment logo(s) no manifest references");
+            }
+        }
+        Err(e) => warn!("Payment manifest refresh: failed to list surfaces to prune payment logos: {e}"),
+    }
+}
 
+/// `surface` with the manifest snapshot of each of its `agent_pay` policies
+/// brought up to date, or `None` when no snapshot changed or the surface with
+/// the new snapshots would be refused on save.
+async fn refreshed_surface(
+    surface: &AgentSurface,
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    listener_manager: Option<&crate::gateways::ConnectionPointListenerManager>,
+) -> Option<AgentSurface> {
+    use crate::gateways::GatewayStore;
+
+    let mut updated = surface.clone();
+    let mut changed = false;
+    for (label, policy) in agent_pay_policies_mut(&mut updated) {
+        let gateway = match gateway_store
+            .get(&policy.payment_gateway_id)
+            .await
+        {
+            Ok(Some(gateway)) => gateway,
+            _ => continue,
+        };
+        match crate::gateways::handlers::fetch_payment_manifest(
+            listener_manager,
+            &gateway,
+            &policy.payment_surface_id,
+            true,
+        )
+        .await
+        {
+            Ok(Some(manifest)) if manifest.is_payable() => {
+                if policy
+                    .manifest_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.offers_same_as(&manifest) && snapshot.shows_same_as(&manifest))
+                {
+                    continue;
+                }
+                match policy
+                    .manifest_snapshot
+                    .as_ref()
+                    .and_then(|previous| manifest.drift_from(previous))
+                {
+                    Some(drift) => warn!(
+                        surface_id = %surface.surface_id,
+                        policy = %label,
+                        payment_surface_id = %policy.payment_surface_id,
+                        "Payment manifest drifted: {drift}"
+                    ),
+                    None => info!(
+                        surface_id = %surface.surface_id,
+                        policy = %label,
+                        payment_surface_id = %policy.payment_surface_id,
+                        "Payment manifest snapshot updated"
+                    ),
+                }
+                policy.manifest_snapshot = Some(manifest);
+                changed = true;
+            }
+            Ok(_) => warn!(
+                surface_id = %surface.surface_id,
+                policy = %label,
+                payment_surface_id = %policy.payment_surface_id,
+                "Payment surface no longer offers a payable manifest; keeping the last snapshot"
+            ),
+            Err(reason) => debug!(
+                surface_id = %surface.surface_id,
+                policy = %label,
+                "Payment manifest refresh skipped: {reason}"
+            ),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    if let Err(error) = validate_delegation_source_auth(&updated) {
+        warn!(
+            surface_id = %surface.surface_id,
+            "Payment manifest refresh: snapshot not stored, the surface would be refused on save: {error:?}"
+        );
+        return None;
+    }
+    Some(updated)
+}
+
+/// Saves `updated` and then runs `apply` when the stored surface is still
+/// `read`, the copy the snapshots were refreshed on. Holds [`SURFACE_WRITES`]
+/// throughout, so no other write lands between the check and the save or
+/// between the save and `apply`. Returns whether `updated` was saved.
+async fn commit_refreshed_surface(
+    store: &crate::surfaces::FileSystemAgentSurfaceStore,
+    read: &AgentSurface,
+    updated: &AgentSurface,
+    apply: impl AsyncFnOnce(&AgentSurface),
+) -> bool {
+    let _write = SURFACE_WRITES.lock().await;
+    let unchanged_since_read = matches!(
+        store.get(&read.surface_id).await,
+        Ok(Some(current)) if serde_json::to_value(&current).ok() == serde_json::to_value(read).ok()
+    );
+    if !unchanged_since_read {
+        return false;
+    }
+    if let Err(e) = store.save(updated).await {
+        warn!(surface_id = %read.surface_id, "Payment manifest refresh: failed to save surface: {e}");
+        return false;
+    }
+    apply(updated).await;
+    true
+}
+
+/// A payment gateway takes payments only; no Target or Transit Point may route to it.
+async fn reject_fabric_routes_to_payment_gateways(
+    gateway_store: Option<&std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
+    surface: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    use crate::gateways::GatewayStore;
+
+    let gateway_ids = surface.fabric_gateway_ids();
+    if gateway_ids.is_empty() {
+        return Ok(());
+    }
+    let store = gateway_store.ok_or_else(|| SurfaceApiError::InternalError("Gateway store not initialized".into()))?;
+    for gateway_id in gateway_ids {
+        let gateway = store
+            .get(gateway_id)
+            .await
+            .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load gateway: {e}")))?;
+        if gateway.is_some_and(|gateway| gateway.is_payment_gateway()) {
+            return Err(SurfaceApiError::BadRequestCode(
+                "fabric_route_to_payment_gateway",
+                format!("gateway '{gateway_id}' is a payment gateway and cannot be a fabric:// route"),
+            ));
+        }
+    }
     Ok(())
 }
 
-/// Reject an A2A surface that delegates x402 to a remote MPP rail while using
-/// `jwt_bearer` source auth on the `Authorization` header: MPP's A2A credential
-/// (`Authorization: Payment <cred>`) collides with the Bearer scheme the
-/// source-auth gate expects — the credential is rejected as a malformed Bearer
-/// token before delegation ever runs, and even a valid Bearer token would have
-/// the `Authorization` header stripped before the request is forwarded, so
-/// the remote payment gateway never receives the credential either way.
-fn validate_delegation_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
-    if surface.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::A2a {
-        return Ok(());
-    }
-    let Some(crate::config::agent_surface::PaymentPolicy::X402(cfg)) = surface
-        .target
-        .payment_policy
-        .as_ref()
-    else {
-        return Ok(());
-    };
-    let is_delegated_mpp = cfg.provider == crate::config::types::X402Provider::AgentPay
-        && cfg.delegated_rail == crate::config::types::DelegatedPaymentRail::Mpp;
-    if !is_delegated_mpp {
-        return Ok(());
-    }
-    if surface
-        .source_auth_methods()
+fn reject_unsupported_payment_settings(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    let views = super::surface_tenancy::resolved_views(surface)?;
+    let labels = std::iter::once(format!("Surface '{}'", surface.name)).chain(
+        surface
+            .variants
+            .iter()
+            .map(|variant| format!("Variant '{}'", variant.alias)),
+    );
+    let problems: Vec<String> = views
         .iter()
-        .any(|method| {
-            matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
-                if jwt.token_header.eq_ignore_ascii_case("authorization"))
+        .zip(labels)
+        .flat_map(|(view, label)| {
+            crate::identity::handlers::policy_validation::unsupported_payment_settings(view)
+                .into_iter()
+                .map(move |problem| format!("{label}: {problem}"))
         })
+        .collect();
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(SurfaceApiError::BadRequestCode("local_payment_unsupported", problems.join("; ")))
+}
+
+async fn verify_agent_pay_policy(
+    gateway_store: Option<&std::sync::Arc<crate::gateways::FileSystemGatewayStore>>,
+    policy: &mut crate::config::agent_surface::AgentPayPolicy,
+    stored: Option<&crate::config::agent_surface::AgentPayPolicy>,
+    label: &str,
+    warnings: &mut Vec<SurfaceWarning>,
+) -> Result<(), SurfaceApiError> {
+    use crate::gateways::GatewayStore;
+    use crate::identity::handlers::policy_validation::{
+        ManifestOutcome, apply_manifest, check_payment_gateway, verified_snapshot,
+    };
+
+    let invalid =
+        |message: String| SurfaceApiError::BadRequestCode("invalid_payment_policy", format!("{label}: {message}"));
+    policy.manifest_snapshot = None;
+    let errors = policy.validate();
+    if !errors.is_empty() {
+        return Err(invalid(errors.join("; ")));
+    }
+    let gateway = gateway_store
+        .ok_or_else(|| SurfaceApiError::InternalError("Gateway store not initialized".to_string()))?
+        .get(&policy.payment_gateway_id)
+        .await
+        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to load payment gateway: {e}")))?
+        .ok_or_else(|| invalid("payment gateway reference is not accessible".to_string()))?;
+    check_payment_gateway(&gateway).map_err(invalid)?;
+
+    let retained = verified_snapshot(policy, stored);
+    let listener_manager = crate::gateways::connection_points::message_processor::get_listener_manager();
+    let fetched = crate::gateways::handlers::fetch_payment_manifest(
+        listener_manager.as_deref(),
+        &gateway,
+        &policy.payment_surface_id,
+        true,
+    )
+    .await;
+    if let Err(reason) = &fetched {
+        warn!(gateway_id = %gateway.id, "{label}: payment manifest not fetched: {reason}");
+    }
+    match apply_manifest(policy, fetched, retained)
+        .map_err(|message| SurfaceApiError::BadRequestCode("payment_manifest_invalid", format!("{label}: {message}")))?
     {
-        return Err(SurfaceApiError::BadRequest(format!(
-            "Surface '{}': an A2A surface delegating payment to a remote MPP rail cannot use jwt_bearer source \
-             auth on the 'Authorization' header — MPP's A2A credential ('Authorization: Payment <cred>') collides \
-             with the Bearer scheme, so payment can never succeed. Use api_key, mtls, or did_auth source auth instead.",
-            surface.name
-        )));
+        ManifestOutcome::Verified => {}
+        ManifestOutcome::Unverified(message) => warnings.push(SurfaceWarning {
+            code: "payment_unverified",
+            message: format!("{label}: {message}"),
+        }),
+    }
+    Ok(())
+}
+
+/// Reject an A2A surface whose agent-pay payment surface takes only MPP while the
+/// surface uses `jwt_bearer` source auth on the `Authorization` header (base
+/// and every variant): MPP's A2A credential (`Authorization: Payment <cred>`)
+/// collides with the Bearer scheme the source-auth gate expects, so the
+/// credential is rejected as a malformed Bearer token before delegation ever
+/// runs, and even a valid Bearer token would have the `Authorization` header
+/// stripped before the request is forwarded. Whether the payment surface
+/// takes only MPP is read from the policy's manifest snapshot.
+fn validate_delegation_source_auth(surface: &AgentSurface) -> Result<(), SurfaceApiError> {
+    for view in super::surface_tenancy::resolved_views(surface)? {
+        if view.access_point.protocol != crate::config::agent_surface::SurfaceProtocol::A2a {
+            continue;
+        }
+        let delegates_to_mpp = view
+            .agent_pay_policy()
+            .and_then(|policy| {
+                policy
+                    .manifest_snapshot
+                    .as_ref()
+            })
+            .is_some_and(crate::gateways::payment_manifest::PaymentManifest::is_mpp_only);
+        if delegates_to_mpp
+            && view
+                .source_auth_methods()
+                .iter()
+                .any(|method| {
+                    matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
+                        if jwt.token_header.eq_ignore_ascii_case("authorization"))
+                })
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "Surface '{}': an A2A surface delegating payment to a remote MPP rail cannot use jwt_bearer source \
+                 auth on the 'Authorization' header — MPP's A2A credential ('Authorization: Payment <cred>') \
+                 collides with the Bearer scheme, so payment can never succeed. Use api_key, mtls, or did_auth \
+                 source auth instead.",
+                surface.name
+            )));
+        }
     }
     Ok(())
 }
@@ -2337,9 +2973,10 @@ fn validate_surface_mcp_tool_gating(surface: &AgentSurface) -> Result<(), Surfac
     Ok(())
 }
 
-/// A variant's Transit Point is enforced with the MCP tool gating, policy and
-/// response policy of the surface's Transit Point of the same alias, so one that
-/// sets any of them to something else is refused rather than silently ignored.
+/// A variant's Transit Point is enforced with the MCP tool gating, policy,
+/// response policy and per-caller rate limit of the surface's Transit Point of
+/// the same alias, so one that sets any of them to something else is refused
+/// rather than silently ignored.
 fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<String> {
     let mut errors = Vec::new();
     for variant in &surface.variants {
@@ -2365,6 +3002,13 @@ fn variant_transit_point_enforcement_overrides(surface: &AgentSurface) -> Vec<St
                 (
                     "response_policy",
                     changes_policy(point.response_policy.as_ref(), base.and_then(|base| base.response_policy.as_ref())),
+                ),
+                (
+                    "per_caller_rate_limit",
+                    point
+                        .per_caller_rate_limit
+                        .is_some()
+                        && !base.is_some_and(|base| base.has_same_per_caller_rate_limit(point)),
                 ),
             ];
             for (field, changed) in changed {
@@ -2410,7 +3054,10 @@ pub async fn create_surface(
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(mut surface, _): JsonWithSent<AgentSurface>,
-) -> Result<(StatusCode, axum::http::HeaderMap, Json<SurfaceResponse<AgentSurface>>), SurfaceApiError> {
+) -> Result<
+    (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<AgentSurface>>>),
+    SurfaceApiError,
+> {
     let store = state
         .agent_surface_store
         .as_ref()
@@ -2507,15 +3154,8 @@ pub async fn create_surface(
     // (listen_address, route) would cause one to silently never receive traffic.
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
 
-    // Validate and resolve x402 payment policies (base + every variant).
-    // This is the trust boundary for wallet addresses on the surface API.
-    validate_surface_payment_policies(&mut surface).await?;
+    let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, None).await?;
 
-    // Validate MPP crypto-verification posture (base + every variant).
-    validate_surface_mpp_posture(&surface)?;
-
-    // Reject an A2A + jwt_bearer(Authorization) surface that delegates to a
-    // remote MPP rail before it can be saved unreachable.
     validate_delegation_source_auth(&surface)?;
 
     // Validate MCP Tool Gating regex patterns (base + every variant).
@@ -2578,7 +3218,7 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, save_warnings(&state, &surface).await, Json(surface.into())))
+    Ok((StatusCode::CREATED, save_warnings(&state, &surface).await, SurfaceSaveResponse::new(surface.into(), warnings)))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -2666,7 +3306,7 @@ pub async fn update_surface(
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         store,
         surface,
@@ -2677,7 +3317,7 @@ pub async fn update_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -3446,7 +4086,7 @@ async fn validate_and_save_surface(
     scope: Option<&PatResourceScope>,
     resource_scoped: bool,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
-) -> Result<AgentSurface, SurfaceApiError> {
+) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
     // Ensure route starts with / BEFORE the shape check so the
     // historical "missing slash is auto-fixed" behaviour is preserved.
@@ -3500,8 +4140,7 @@ async fn validate_and_save_surface(
     super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
-    validate_surface_payment_policies(&mut surface).await?;
-    validate_surface_mpp_posture(&surface)?;
+    let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
     validate_delegation_source_auth(&surface)?;
     validate_surface_mcp_tool_gating(&surface)?;
     validate_resolved_variants(&surface)?;
@@ -3525,6 +4164,7 @@ async fn validate_and_save_surface(
     let allowlist = crate::egress::bdd_egress_allowlist();
     surface.trust_check_split = surface.has_trust_check_lists();
     surface.transit_point_source_auth = surface.has_transit_point_source_auth();
+    let _write = SURFACE_WRITES.lock().await;
     super::surface_grants::write_surface(
         &super::surface_grants::GrantRemoval::of(state, allowlist.as_deref(), actor),
         store.clone(),
@@ -3556,7 +4196,7 @@ async fn validate_and_save_surface(
 
     apply_surface_change(state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok(surface)
+    Ok((surface, warnings))
 }
 
 /// Whether an edit added, removed or changed the entries of the surface's Trust Recorder.
@@ -3657,7 +4297,7 @@ pub async fn patch_surface(
         refuse_a2a_settings_sent_on_other_protocols(&surface)?;
     }
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3668,7 +4308,7 @@ pub async fn patch_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -3753,7 +4393,7 @@ pub async fn patch_variant(
     let mut surface = existing.clone();
     surface.variants[variant_index] = new_variant;
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -3764,7 +4404,7 @@ pub async fn patch_variant(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -3795,6 +4435,7 @@ pub async fn delete_surface(
                 resource_scope(&scope),
             ) =>
         {
+            let _write = SURFACE_WRITES.lock().await;
             let allowlist = crate::egress::bdd_egress_allowlist();
             let actor = management_actor(&caller, &delegation);
             super::surface_grants::write_surface(
@@ -3947,6 +4588,22 @@ async fn apply_surface_change_while_locked(
     // DashMap clear) and safe (worst case is the next few requests
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
+
+    let provider_key_gate = crate::identity::provider_key_gate::gate();
+    let changed_id = match change {
+        SurfaceChange::Upsert(surface) => surface.surface_id.as_str(),
+        SurfaceChange::Delete(id) => id,
+    };
+    provider_key_gate.owner_changed(changed_id);
+    match change {
+        SurfaceChange::Upsert(surface) if surface.status == crate::config::agent_surface::SurfaceStatus::Active => {
+            provider_key_gate
+                .admit(surface)
+                .await
+        }
+        SurfaceChange::Upsert(surface) => provider_key_gate.forget(&surface.surface_id),
+        SurfaceChange::Delete(id) => provider_key_gate.forget(id),
+    }
 
     // Phase C — keep the resolved-surface snapshot cache in lockstep
     // with the on-disk store. Done up-front (before reload) so the
@@ -4233,9 +4890,9 @@ pub struct UpdateVariantRequest {
     pub trust_check_split: bool,
 }
 
-/// May this caller change or delete the surface? Reading an operator's surface
-/// through a tenant PAT is allowed; changing it is not.
-fn surface_visible(
+/// May this caller read the surface, and records attributed to it? Reading an
+/// operator's surface through a tenant PAT is allowed; changing it is not.
+pub(crate) fn surface_visible(
     tenant_id: Option<&str>,
     surface_id: &str,
     context: Option<&PatTenantContext>,
@@ -4350,7 +5007,10 @@ pub async fn create_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
     Json(body): Json<CreateVariantRequest>,
-) -> Result<(StatusCode, axum::http::HeaderMap, Json<SurfaceResponse<SurfaceVariant>>), SurfaceApiError> {
+) -> Result<
+    (StatusCode, axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>),
+    SurfaceApiError,
+> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -4417,7 +5077,7 @@ pub async fn create_variant(
         .variants
         .push(new_variant.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4437,11 +5097,15 @@ pub async fn create_variant(
 
     info!("Created variant '{}' (id={}) on surface '{}'", new_variant.alias, new_variant.id, surface_id);
 
-    let mut warnings = save_warnings(&state, &saved).await;
+    let mut headers = save_warnings(&state, &saved).await;
     if left_out_target_binding && let Some(value) = warning_header(&copied_target_binding_warning(&new_variant.alias)) {
-        warnings.append(axum::http::header::WARNING, value);
+        headers.append(axum::http::header::WARNING, value);
     }
-    Ok((StatusCode::CREATED, warnings, Json(SurfaceResponse::variant(new_variant, &saved))))
+    Ok((
+        StatusCode::CREATED,
+        headers,
+        SurfaceSaveResponse::new(SurfaceResponse::variant(new_variant, &saved), warnings),
+    ))
 }
 
 /// `PUT /v1/surfaces/{id}/variants/{variant_id}`
@@ -4458,7 +5122,7 @@ pub async fn update_variant(
     delegation: Option<Extension<PatDelegationContext>>,
     caller: Option<Extension<AuthGuardOk>>,
     JsonWithSent(body, sent): JsonWithSent<UpdateVariantRequest>,
-) -> Result<(axum::http::HeaderMap, Json<SurfaceResponse<SurfaceVariant>>), SurfaceApiError> {
+) -> Result<(axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResponse<SurfaceVariant>>>), SurfaceApiError> {
     let (store, mut surface) = load_surface_or_404(
         &state,
         &surface_id,
@@ -4573,7 +5237,7 @@ pub async fn update_variant(
     }
     settle_retained_protected_resources(&mut surface, false, &retained, &state.network_config)?;
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4599,7 +5263,10 @@ pub async fn update_variant(
 
     info!("Updated variant '{}' (id={}) on surface '{}'", updated.alias, updated.id, surface_id);
 
-    Ok((save_warnings(&state, &saved).await, Json(SurfaceResponse::variant(updated, &saved))))
+    Ok((
+        save_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(SurfaceResponse::variant(updated, &saved), warnings),
+    ))
 }
 
 /// `DELETE /v1/surfaces/{id}/variants/{variant_id}`
@@ -4715,7 +5382,7 @@ pub async fn promote_variant_to_default(
     let variant_alias = variant.alias.clone();
     surface.default_variant_id = Some(variant_id.clone());
 
-    let saved = validate_and_save_surface(
+    let (saved, warnings) = validate_and_save_surface(
         &state,
         &store,
         surface,
@@ -4729,7 +5396,7 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok((save_warnings(&state, &saved).await, Json(saved.into())))
+    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -5112,6 +5779,34 @@ mod validation_tests {
             }}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn two_transit_points_with_one_id_are_refused_in_the_surface_and_in_a_variant() {
+        let point = |id: &str, alias: &str| serde_json::json!({ "id": id, "alias": alias, "target_endpoint": format!("https://{alias}.example") });
+        let distinct = serde_json::json!([point("a-id", "partner"), point("b-id", "peer")]);
+        let shared = serde_json::json!([point("a-id", "partner"), point("a-id", "peer")]);
+        for (points, variant_points, expected) in [
+            (
+                shared.clone(),
+                distinct.clone(),
+                "transit.points[1]: duplicate id 'a-id'. Each transit point id must be unique within the surface.",
+            ),
+            (
+                distinct.clone(),
+                shared,
+                "variants['candidate'].transit.points[1]: duplicate id 'a-id'. Each transit point id must be unique \
+                 within the surface.",
+            ),
+        ] {
+            let mut surface = surface_with_transit_points(points, variant_points);
+            match validate_transit_points(&mut surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => assert_eq!(message, expected),
+                other => panic!("expected a 400, got {other:?}"),
+            }
+        }
+        let mut surface = surface_with_transit_points(distinct.clone(), distinct);
+        assert!(validate_transit_points(&mut surface, 30, None).is_ok(), "the variant may reuse the surface's ids");
     }
 
     fn caller_key() -> serde_json::Value {
@@ -5549,9 +6244,9 @@ mod validation_tests {
             .unwrap()
         };
         let issuers = std::collections::HashMap::from([
-            ("workforce".to_string(), "https://login.example".to_string()),
-            ("partner-keys".to_string(), "https://login.example".to_string()),
-            ("own-issuer".to_string(), "https://crm.example".to_string()),
+            ("workforce".to_string(), naming("https://login.example", "sub")),
+            ("partner-keys".to_string(), naming("https://login.example", "sub")),
+            ("own-issuer".to_string(), naming("https://crm.example", "sub")),
         ]);
         let warning = |name: &str| {
             format!(
@@ -5572,6 +6267,129 @@ mod validation_tests {
             .unwrap()
             .points = vec![serde_json::from_value(point("partner-keys")).unwrap()];
         assert_eq!(shared_issuer_warnings(&inherited, &issuers), vec![warning("'crm'")]);
+
+        let by_other_claims = std::collections::HashMap::from([
+            ("workforce".to_string(), naming("https://login.example", "sub")),
+            ("partner-keys".to_string(), naming("https://login.example", "oid")),
+        ]);
+        assert_eq!(
+            shared_issuer_warnings(&inherited, &by_other_claims),
+            vec![
+                "Transit Point 'crm' accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategy 'partner-keys', and this surface accepts that issuer through 'workforce' too, but they \
+                 name callers by different claims ('oid' and 'sub'): the same person through either is two \
+                 callers, each with delegated credentials of their own; use one strategy per issuer"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The Access Point different-claims warning compares the strategies of
+    /// every view: a variant that inherits the Access Point's methods adds no
+    /// copy of it, and one that overrides them with a strategy naming another
+    /// claim for the same issuer is warned of, under its name.
+    #[test]
+    fn the_access_point_claims_warning_compares_every_view_once() {
+        let jwt = |strategy: &str, header: &str| {
+            serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy,
+                "audiences": ["api://agent"], "token_header": header })
+        };
+        let surface_with = |methods: serde_json::Value, overrides: serde_json::Value| -> AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "name": "agent",
+                "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                    "caller_authentication": { "methods": methods } },
+                "target": { "endpoint": "https://agent.internal" },
+                "variants": [{ "id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": overrides }]
+            }))
+            .unwrap()
+        };
+        let issuers = std::collections::HashMap::from([
+            ("by-sub".to_string(), naming("https://login.example", "sub")),
+            ("by-oid".to_string(), naming("https://login.example", "oid")),
+        ]);
+        let expected = |second: &str| {
+            format!(
+                "The Access Point accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategies 'by-sub' and {second}, which name callers by different claims ('sub' and 'oid'): the \
+                 same person through either is two callers, each with delegated credentials of their own; use one \
+                 strategy per issuer"
+            )
+        };
+
+        let inheriting = surface_with(
+            serde_json::json!([jwt("by-sub", "Authorization"), jwt("by-oid", "X-Entra-Token")]),
+            serde_json::json!({}),
+        );
+        assert_eq!(shared_issuer_warnings(&inheriting, &issuers), vec![expected("'by-oid'")]);
+
+        let overriding = surface_with(
+            serde_json::json!([jwt("by-sub", "Authorization")]),
+            serde_json::json!({ "access_point": { "caller_authentication": { "methods": [jwt("by-oid", "Authorization")] } } }),
+        );
+        assert_eq!(shared_issuer_warnings(&overriding, &issuers), vec![expected("'by-oid' in variant 'beta'")]);
+    }
+
+    fn naming(
+        issuer: &str,
+        principal_claim: &str,
+    ) -> StrategyCallerNaming {
+        StrategyCallerNaming {
+            issuer: issuer.to_string(),
+            principal_claim: Ok(principal_claim.to_string()),
+        }
+    }
+
+    /// Two Access Point methods whose strategies name one issuer but different
+    /// claims split one person into two callers, and a strategy stored with a
+    /// claim the API refuses names nobody: a save says both, and neither is
+    /// mistaken for a claim the other strategies are compared with.
+    #[test]
+    fn a_save_warns_of_access_point_methods_naming_different_claims_and_of_an_unusable_claim() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "name": "agent",
+            "access_point": { "listen_address": "0.0.0.0:8443", "route": "/a2a", "protocol": "a2a",
+                "caller_authentication": { "methods": [
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "by-sub", "audiences": ["api://agent"] },
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "by-oid", "audiences": ["api://agent"],
+                        "token_header": "X-Entra-Token" },
+                    { "type": "jwt_bearer", "jwt_verification_strategy_id": "hand-edited", "audiences": ["api://agent"],
+                        "token_header": "X-Other-Token" }
+                ] } },
+            "target": { "endpoint": "https://agent.internal" }
+        }))
+        .unwrap();
+        let issuers = std::collections::HashMap::from([
+            ("by-sub".to_string(), naming("https://login.example", "sub")),
+            ("by-oid".to_string(), naming("https://login.example", "oid")),
+            (
+                "hand-edited".to_string(),
+                StrategyCallerNaming {
+                    issuer: "https://login.example".to_string(),
+                    principal_claim: Err("iss".to_string()),
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            shared_issuer_warnings(&surface, &issuers),
+            vec![
+                "The Access Point accepts tokens from issuer 'https://login.example' through JWT verification \
+                 strategies 'by-sub' and 'by-oid', which name callers by different claims ('sub' and 'oid'): the \
+                 same person through either is two callers, each with delegated credentials of their own; use one \
+                 strategy per issuer"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            unusable_principal_claim_warnings(&surface, &issuers),
+            vec![
+                "JWT verification strategy 'hand-edited' names callers by 'iss', a claim the API refuses: it \
+                 identifies no caller, and JWT source authentication through it answers 500; create a strategy that \
+                 names another claim"
+                    .to_string()
+            ]
+        );
     }
 
     /// A Transit Point that releases delegated credentials to Fabric callers
@@ -6262,8 +7080,8 @@ mod validation_tests {
     #[test]
     fn a_transit_point_that_opts_fabric_callers_in_is_warned_of_where_the_surface_cannot_tell_users_apart() {
         let issuers = std::collections::HashMap::from([
-            ("idp".to_string(), "https://idp.example".to_string()),
-            ("blank".to_string(), String::new()),
+            ("idp".to_string(), naming("https://idp.example", "sub")),
+            ("blank".to_string(), naming("", "sub")),
         ]);
         let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
         let mtls = serde_json::json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["cert"] },
@@ -6353,6 +7171,163 @@ mod validation_tests {
             [true],
             "only the variant that verifies an API key"
         );
+    }
+
+    /// A Target that releases per-user grants to Fabric callers is warned of
+    /// for each view, the surface or an enabled variant, whose caller
+    /// authentication cannot tell a partner's users apart, by the rule a
+    /// Transit Point's switch follows, or whose Target is not an HTTP URL; not
+    /// where callers are told apart, or where the view's Target does not set
+    /// the switch.
+    #[test]
+    fn target_warnings_name_each_view_where_the_switch_releases_nothing() {
+        let issuers = std::collections::HashMap::from([
+            ("idp".to_string(), naming("https://idp.example", "sub")),
+            ("blank".to_string(), naming("", "sub")),
+        ]);
+        let jwt = |strategy: &str, audiences: serde_json::Value| serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": audiences });
+        let mtls = serde_json::json!({ "type": "mtls", "trust": { "type": "pinned", "certificate_ids": ["cert"] },
+            "identity_binding": { "type": "fingerprint" } });
+        let releasing = |methods: serde_json::Value, releases: bool| {
+            let mut surface = with_caller_authentication(
+                surface_with_transit_points(serde_json::json!([]), serde_json::json!([])),
+                methods,
+            );
+            surface
+                .target
+                .delegated_credentials_for_fabric_callers = releases;
+            surface
+        };
+        let warning = "the Target sets delegated_credentials_for_fabric_callers, but the surface's caller \
+                       authentication cannot tell a partner's users apart, and";
+
+        let mut resource_tokens = releasing(serde_json::json!([mtls.clone()]), true);
+        resource_tokens.mcp_http = Some(
+            serde_json::from_value(serde_json::json!({ "authorization": { "resource": "https://gw.example/mcp" } }))
+                .unwrap(),
+        );
+        for (case, quiet) in [
+            ("a JWT naming an audience", releasing(serde_json::json!([per_user_jwt()]), true)),
+            (
+                "a JWT naming an audience beside mTLS",
+                releasing(serde_json::json!([mtls.clone(), per_user_jwt()]), true),
+            ),
+            ("a resource token beside mTLS", resource_tokens),
+            ("the switch off beside an API key", releasing(serde_json::json!([caller_key()]), false)),
+        ] {
+            assert_eq!(target_fabric_caller_delegation_warnings(&quiet, &issuers), Vec::<String>::new(), "{case}");
+        }
+
+        for (case, methods, reason) in [
+            ("no caller authentication", serde_json::json!([]), "it verifies no caller"),
+            ("mTLS only", serde_json::json!([mtls.clone()]), "it verifies no caller"),
+            ("an API key", serde_json::json!([caller_key()]), "every key in its secret as one caller"),
+            (
+                "an API key beside a JWT",
+                serde_json::json!([per_user_jwt(), caller_key()]),
+                "every key in its secret as one caller",
+            ),
+            (
+                "an API Key Provider key",
+                serde_json::json!([{ "type": "api_key_provider", "agent_id": "keys",
+                    "extraction": { "source": "http_header", "field": "X-API-Key" } }]),
+                "names the client that holds it",
+            ),
+            (
+                "a DID Auth session",
+                serde_json::json!([{ "type": "did_auth", "extraction": { "source": "http_header", "field": "X-Session" } }]),
+                "names the DID that signed in",
+            ),
+            ("a JWT naming no audience", serde_json::json!([jwt("idp", serde_json::json!([]))]), "names no audience"),
+            (
+                "a JWT naming no strategy",
+                serde_json::json!([jwt("", serde_json::json!(["api://agent"]))]),
+                "names no JWT verification strategy",
+            ),
+            (
+                "a JWT whose strategy cannot be read",
+                serde_json::json!([jwt("missing", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'missing' names no issuer",
+            ),
+            (
+                "a JWT whose strategy names no issuer",
+                serde_json::json!([jwt("blank", serde_json::json!(["api://agent"]))]),
+                "JWT verification strategy 'blank' names no issuer",
+            ),
+        ] {
+            let warnings = target_fabric_caller_delegation_warnings(&releasing(methods, true), &issuers);
+            assert_eq!(warnings.len(), 2, "{case}: the surface and its variant: {warnings:?}");
+            assert!(warnings[0].starts_with(warning), "{case}: {warnings:?}");
+            assert!(warnings[1].starts_with(&format!("variant 'candidate': {warning}")), "{case}: {warnings:?}");
+            for warning in &warnings {
+                assert!(warning.contains(reason), "{case}: {warning}");
+                assert!(warning_header(warning).is_some(), "{case}: {warning}");
+            }
+        }
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&releasing(serde_json::json!([caller_key()]), true), &issuers)[0],
+            "the Target sets delegated_credentials_for_fabric_callers, but the surface's caller authentication \
+             cannot tell a partner's users apart, and an api_key method names every key in its secret as one caller, \
+             the partner's and direct callers' alike, so Fabric callers get none of its per-user delegated credentials"
+        );
+
+        let mut variant_key = releasing(serde_json::json!([per_user_jwt()]), true);
+        variant_key.variants[0]
+            .overrides
+            .access_point = Some(
+            serde_json::from_value(serde_json::json!({ "caller_authentication": { "methods": [caller_key()] } }))
+                .unwrap(),
+        );
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&variant_key, &issuers)
+                .iter()
+                .map(|found| found.starts_with(&format!("variant 'candidate': {warning}")))
+                .collect::<Vec<_>>(),
+            [true],
+            "only the variant that verifies an API key"
+        );
+
+        let mut variant_off = releasing(serde_json::json!([caller_key()]), true);
+        variant_off.variants[0]
+            .overrides
+            .target = Some(
+            serde_json::from_value(serde_json::json!({ "delegated_credentials_for_fabric_callers": false })).unwrap(),
+        );
+        let warnings = target_fabric_caller_delegation_warnings(&variant_off, &issuers);
+        assert_eq!(warnings.len(), 1, "a variant that turns the switch off is not warned of: {warnings:?}");
+        assert!(warnings[0].starts_with(warning), "{warnings:?}");
+
+        variant_key.variants[0].enabled = false;
+        assert_eq!(
+            target_fabric_caller_delegation_warnings(&variant_key, &issuers),
+            Vec::<String>::new(),
+            "a disabled variant serves nothing"
+        );
+
+        for endpoint in [
+            "proxy://tools",
+            "a2a-proxy://worker",
+            "fabric://peer/surface",
+            "ws://agent.internal/socket",
+            "agent.internal:8080",
+            "HTTPS://agent.internal",
+            " https://agent.internal",
+        ] {
+            for methods in [serde_json::json!([per_user_jwt()]), serde_json::json!([caller_key()])] {
+                let mut not_http = releasing(methods, true);
+                not_http.target.endpoint = endpoint.to_string();
+                assert!(!not_http.target_is_http_url(), "{endpoint}");
+                assert_eq!(
+                    target_fabric_caller_delegation_warnings(&not_http, &issuers),
+                    ["", "variant 'candidate': "].map(|label| format!(
+                        "{label}the Target sets delegated_credentials_for_fabric_callers, but its endpoint is not an \
+                         http:// or https:// URL, so Fabric receive sends it no delegated credential and the switch \
+                         has no effect there"
+                    )),
+                    "{endpoint}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6459,6 +7434,59 @@ mod validation_tests {
                 other => panic!("{case}: expected a 400, got {other:?}"),
             }
         }
+    }
+
+    /// A Transit Point's per-caller rate limit is checked when the surface is
+    /// saved, on the surface and in a variant's own points: a limit that could
+    /// never admit a request, or has no window, is refused with the point named.
+    #[test]
+    fn a_save_refuses_a_per_caller_rate_limit_that_cannot_work() {
+        let point = |limit: serde_json::Value| {
+            serde_json::json!({ "alias": "partner", "target_endpoint": "https://partner.example",
+                "require_transit_token": true, "per_caller_rate_limit": limit })
+        };
+        for (case, limit, expected) in [
+            ("no requests", serde_json::json!({ "requests": 0, "window_secs": 60 }), "requests"),
+            ("no window", serde_json::json!({ "requests": 5, "window_secs": 0 }), "window_secs"),
+            ("a zero burst", serde_json::json!({ "requests": 5, "window_secs": 60, "burst": 0 }), "burst"),
+            (
+                "more requests than the window can count",
+                serde_json::json!({ "requests": 4_000_000_000_u32, "window_secs": 1 }),
+                "cannot be enforced",
+            ),
+            (
+                "a window too long to count",
+                serde_json::json!({ "requests": 1, "window_secs": 20_000_000_000_u64 }),
+                "cannot be enforced",
+            ),
+            (
+                "a burst too long to refill",
+                serde_json::json!({ "requests": 1, "window_secs": 1_000_000_000_u64, "burst": 100 }),
+                "cannot be enforced",
+            ),
+        ] {
+            let mut on_surface =
+                surface_with_transit_points(serde_json::json!([point(limit.clone())]), serde_json::json!([]));
+            match validate_transit_points(&mut on_surface, 30, None) {
+                Err(SurfaceApiError::BadRequest(message)) => {
+                    assert!(
+                        message.starts_with("transit.points[0]: ") && message.contains(expected),
+                        "{case}: {message}"
+                    )
+                }
+                other => panic!("{case}: expected a 400, got {other:?}"),
+            }
+            let mut in_variant = surface_with_transit_points(serde_json::json!([]), serde_json::json!([point(limit)]));
+            assert!(
+                matches!(validate_transit_points(&mut in_variant, 30, None), Err(SurfaceApiError::BadRequest(_))),
+                "{case} in a variant"
+            );
+        }
+        let mut fine = surface_with_transit_points(
+            serde_json::json!([point(serde_json::json!({ "requests": 5, "window_secs": 60, "burst": 10 }))]),
+            serde_json::json!([]),
+        );
+        assert!(validate_transit_points(&mut fine, 30, None).is_ok());
     }
 
     /// A save refuses `transit_token_mode: reference`, on the surface or in a
@@ -7134,6 +8162,7 @@ mod validation_tests {
                 mpp_auto_pay: false,
                 mpp_auto_pay_max_amount: None,
                 fabric_delegated_credentials: false,
+                delegated_credentials_for_fabric_callers: false,
             },
             transit: None,
             canvas: None,
@@ -8076,21 +9105,53 @@ mod validation_tests {
         validate_source_auth(&s, None).expect("no caller_auth must pass");
     }
 
-    // Delegated (Model B) A2A + jwt_bearer(Authorization) is unreachable: MPP's
-    // A2A credential collides with the Bearer scheme (see `validate_delegation_source_auth`).
+    fn manifest_with(protocols: &[&str]) -> crate::gateways::payment_manifest::PaymentManifest {
+        crate::gateways::payment_manifest::PaymentManifest {
+            payment_points: protocols
+                .iter()
+                .map(|protocol| crate::gateways::payment_manifest::PaymentPoint {
+                    id: format!("{protocol}:point"),
+                    protocol: protocol.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn agent_pay(protocols: &[&str]) -> crate::config::agent_surface::PaymentPolicy {
+        crate::config::agent_surface::PaymentPolicy::AgentPay(crate::config::agent_surface::AgentPayPolicy {
+            payment_gateway_id: "gw1".to_string(),
+            payment_surface_id: "surf1".to_string(),
+            manifest_snapshot: Some(manifest_with(protocols)),
+            ..Default::default()
+        })
+    }
+
+    fn payment_variant(
+        policy: crate::config::agent_surface::PaymentPolicy
+    ) -> crate::config::agent_surface_variants::SurfaceVariant {
+        use crate::config::agent_surface_variants::{SurfaceOverrides, SurfaceVariant, TargetOverrides};
+        SurfaceVariant {
+            id: "v1".into(),
+            alias: "paid".into(),
+            name: "Paid".into(),
+            description: String::new(),
+            enabled: true,
+            overrides: SurfaceOverrides {
+                target: Some(TargetOverrides {
+                    payment_policy: Some(policy),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }
+    }
 
     fn delegated_mpp_surface() -> AgentSurface {
-        use crate::config::agent_surface::PaymentPolicy;
-        use crate::config::types::{DelegatedPaymentRail, X402Config, X402Provider};
         let mut s = base_surface();
         s.access_point.protocol = SurfaceProtocol::A2a;
-        s.target.payment_policy = Some(PaymentPolicy::X402(X402Config {
-            provider: X402Provider::AgentPay,
-            delegated_rail: DelegatedPaymentRail::Mpp,
-            payment_gateway_id: Some("gw1".to_string()),
-            payment_surface_id: Some("surf1".to_string()),
-            ..Default::default()
-        }));
+        s.target.payment_policy = Some(agent_pay(&["mpp"]));
         s
     }
 
@@ -8186,6 +9247,27 @@ mod validation_tests {
             .caller_authentication = Some(jwt_bearer_auth("Authorization"));
         // Not a delegated MPP config (no payment_policy at all) — must pass.
         validate_delegation_source_auth(&s).expect("no delegated MPP config must pass");
+    }
+
+    #[test]
+    fn delegation_source_auth_accepts_a_payment_surface_that_also_takes_x402() {
+        let mut s = base_surface();
+        s.access_point.protocol = SurfaceProtocol::A2a;
+        s.target.payment_policy = Some(agent_pay(&["mpp", "x402"]));
+        s.access_point
+            .caller_authentication = Some(jwt_bearer_auth("Authorization"));
+        validate_delegation_source_auth(&s).expect("x402 still works alongside the Bearer header");
+    }
+
+    #[test]
+    fn delegation_source_auth_rejects_a_variant_that_delegates_to_mpp() {
+        let mut s = base_surface();
+        s.access_point.protocol = SurfaceProtocol::A2a;
+        s.access_point
+            .caller_authentication = Some(jwt_bearer_auth("Authorization"));
+        s.variants = vec![payment_variant(agent_pay(&["mpp"]))];
+        let err = validate_delegation_source_auth(&s).expect_err("the variant's MPP rail collides with Bearer");
+        assert!(matches!(err, SurfaceApiError::BadRequest(msg) if msg.contains("jwt_bearer")));
     }
 
     #[test]
@@ -8979,6 +10061,719 @@ mod validation_tests {
 
         assert!(reject_target_trust_checks_unless_target_runs_them(&s).is_ok());
     }
+
+    fn local_x402() -> crate::config::agent_surface::PaymentPolicy {
+        crate::config::agent_surface::PaymentPolicy::X402(crate::config::types::X402Config::default())
+    }
+
+    fn unsupported_code_and_details(err: SurfaceApiError) -> (&'static str, String) {
+        match err {
+            SurfaceApiError::BadRequestCode(code, details) => (code, details),
+            other => panic!("expected BadRequestCode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_x402_policy_is_refused_on_save() {
+        let mut s = base_surface();
+        s.target.payment_policy = Some(local_x402());
+        let (code, details) = unsupported_code_and_details(reject_unsupported_payment_settings(&s).unwrap_err());
+        assert_eq!(code, "local_payment_unsupported");
+        assert!(details.starts_with("Surface 'test': local x402/MPP"), "{details}");
+    }
+
+    #[test]
+    fn local_mpp_policy_on_a_variant_is_refused_on_save() {
+        let mut s = base_surface();
+        s.variants = vec![payment_variant(crate::config::agent_surface::PaymentPolicy::Mpp(
+            serde_json::from_value(serde_json::json!({"realm": "r", "secret_key": "$K"})).unwrap(),
+        ))];
+        let (code, details) = unsupported_code_and_details(reject_unsupported_payment_settings(&s).unwrap_err());
+        assert_eq!(code, "local_payment_unsupported");
+        assert!(details.starts_with("Variant 'paid': local x402/MPP"), "{details}");
+    }
+
+    #[test]
+    fn a_disabled_local_policy_and_an_agent_pay_policy_are_accepted() {
+        let mut s = base_surface();
+        s.target.payment_policy =
+            Some(crate::config::agent_surface::PaymentPolicy::X402(crate::config::types::X402Config {
+                enabled: false,
+                ..Default::default()
+            }));
+        s.variants = vec![payment_variant(agent_pay(&["x402"]))];
+        assert!(reject_unsupported_payment_settings(&s).is_ok());
+    }
+
+    #[test]
+    fn mpp_auto_pay_is_refused_on_the_surface_and_on_a_variant() {
+        let mut s = base_surface();
+        s.target.mpp_auto_pay = true;
+        let (code, details) = unsupported_code_and_details(reject_unsupported_payment_settings(&s).unwrap_err());
+        assert_eq!(code, "local_payment_unsupported");
+        assert!(details.contains("mpp_auto_pay"), "{details}");
+
+        let mut s = base_surface();
+        let mut variant = payment_variant(agent_pay(&["x402"]));
+        if let Some(target) = variant
+            .overrides
+            .target
+            .as_mut()
+        {
+            target.mpp_auto_pay_max_amount = Some("1.00".into());
+        }
+        s.variants = vec![variant];
+        let (_, details) = unsupported_code_and_details(reject_unsupported_payment_settings(&s).unwrap_err());
+        assert!(details.starts_with("Variant 'paid': mpp_auto_pay"), "{details}");
+    }
+
+    #[test]
+    fn transit_point_payment_policy_is_refused_on_save() {
+        let mut s: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "s1",
+            "name": "test",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/api", "protocol": "a2a"},
+            "target": {"endpoint": "https://upstream.example"},
+            "transit": {"points": [{
+                "name": "paid-peer",
+                "target_endpoint": "fabric://gw2/summarizer",
+                "protocol": "a2a",
+                "payment_policy": {"type": "mpp", "auto_pay": true}
+            }]}
+        }))
+        .unwrap();
+        let (code, details) = unsupported_code_and_details(reject_unsupported_payment_settings(&s).unwrap_err());
+        assert_eq!(code, "local_payment_unsupported");
+        assert!(details.contains("Transit Point 'paid-peer': payment_policy"), "{details}");
+
+        if let Some(transit) = s.transit.as_mut() {
+            transit.points[0].payment_policy = None;
+        }
+        assert!(reject_unsupported_payment_settings(&s).is_ok());
+    }
+
+    #[tokio::test]
+    async fn coded_bad_request_carries_its_code() {
+        let response = SurfaceApiError::BadRequestCode("local_payment_unsupported", "nope".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "Bad Request", "code": "local_payment_unsupported", "details": "nope"})
+        );
+    }
+
+    #[test]
+    fn save_response_lists_warnings_beside_the_saved_record_only_when_present() {
+        let warned = serde_json::to_value(SurfaceSaveResponse {
+            saved: serde_json::json!({"surface_id": "s1"}),
+            warnings: vec![SurfaceWarning {
+                code: "payment_unverified",
+                message: "unreachable".into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            warned,
+            serde_json::json!({"surface_id": "s1", "warnings": [{"code": "payment_unverified", "message": "unreachable"}]})
+        );
+        let clean = serde_json::to_value(SurfaceSaveResponse {
+            saved: serde_json::json!({"surface_id": "s1"}),
+            warnings: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(clean, serde_json::json!({"surface_id": "s1"}));
+    }
+
+    #[test]
+    fn agent_pay_policies_are_collected_from_the_base_and_every_variant() {
+        let mut s = base_surface();
+        s.target.payment_policy = Some(agent_pay(&["x402"]));
+        s.variants = vec![payment_variant(agent_pay(&["mpp"]))];
+        let labels: Vec<String> = agent_pay_policies_mut(&mut s)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, vec!["base".to_string(), "variant 'paid'".to_string()]);
+
+        let mut free = base_surface();
+        free.target.payment_policy = Some(local_x402());
+        assert!(agent_pay_policies_mut(&mut free).is_empty());
+    }
+
+    use crate::config::agent_surface::{AgentPayPolicy, PaymentPolicy};
+    use crate::gateways::GatewayStore;
+    use crate::gateways::payment_manifest::{ManifestFetchError, PaymentManifest, install_test_answer};
+    use crate::gateways::types::{Gateway, GatewayCreationType, GatewayType};
+
+    struct Stores {
+        surfaces: std::sync::Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
+        gateways: std::sync::Arc<crate::gateways::FileSystemGatewayStore>,
+        gateway: Gateway,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn stores() -> Stores {
+        let dir = tempfile::tempdir().unwrap();
+        let surfaces = std::sync::Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().join("surfaces"))
+                .await
+                .unwrap(),
+        );
+        let gateways = std::sync::Arc::new(
+            crate::gateways::FileSystemGatewayStore::new(
+                dir.path().join("gateways"),
+                Some("did:web:self.example".to_string()),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut gateway = Gateway::new_with_creation_type(
+            "pay".into(),
+            String::new(),
+            "did:web:pay.example".into(),
+            GatewayType::Remote,
+            GatewayCreationType::User,
+        );
+        gateway.role = crate::gateways::types::GatewayRole::Payment;
+        gateways
+            .create(&gateway)
+            .await
+            .unwrap();
+        Stores {
+            surfaces,
+            gateways,
+            gateway,
+            _dir: dir,
+        }
+    }
+
+    fn priced(
+        protocols: &[&str],
+        amount: &str,
+    ) -> PaymentManifest {
+        let mut manifest = manifest_with(protocols);
+        manifest.amount.amount = amount.into();
+        manifest.amount.unit = "USDC".into();
+        manifest
+    }
+
+    fn paid_surface(
+        gateway: &Gateway,
+        snapshot: Option<PaymentManifest>,
+    ) -> AgentSurface {
+        let mut surface = base_surface();
+        surface.target.payment_policy = Some(PaymentPolicy::AgentPay(AgentPayPolicy {
+            payment_gateway_id: gateway.id.clone(),
+            payment_surface_id: "pay-1".into(),
+            manifest_snapshot: snapshot,
+            ..Default::default()
+        }));
+        surface
+    }
+
+    fn snapshot_of(surface: &AgentSurface) -> Option<&PaymentManifest> {
+        surface
+            .agent_pay_policy()
+            .and_then(|policy| {
+                policy
+                    .manifest_snapshot
+                    .as_ref()
+            })
+    }
+
+    fn unreachable() -> Result<Option<PaymentManifest>, ManifestFetchError> {
+        Err(ManifestFetchError::Unavailable("timeout".into()))
+    }
+
+    #[tokio::test]
+    async fn a_stored_legacy_delegated_policy_is_loaded_as_agent_pay_and_rewritten_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("s-legacy.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "surface_id": "s-legacy", "name": "legacy",
+                "access_point": {"listen_address": "0.0.0.0:8443", "route": "/legacy", "protocol": "mcp"},
+                "target": {
+                    "endpoint": "https://upstream.example",
+                    "payment_policy": {
+                        "type": "x402", "provider": "agent_pay", "enabled": true,
+                        "payment_gateway_id": "gw-1", "payment_channel_id": "pay-1", "delegated_rail": "mpp"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let loaded = store
+            .get("s-legacy")
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = loaded
+            .agent_pay_policy()
+            .expect("the legacy policy loads as agent_pay");
+        assert_eq!(
+            (
+                policy
+                    .payment_gateway_id
+                    .as_str(),
+                policy
+                    .payment_surface_id
+                    .as_str()
+            ),
+            ("gw-1", "pay-1")
+        );
+        assert_eq!(policy.mcp_payment_triggers, Some(crate::config::types::McpPaymentTriggers::All));
+
+        let on_disk: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["target"]["payment_policy"],
+            serde_json::json!({
+                "type": "agent_pay", "payment_gateway_id": "gw-1", "payment_surface_id": "pay-1",
+                "mcp_payment_triggers": {"mode": "all"}, "timeout_ms": 15000
+            }),
+            "the stored file is rewritten with the defaults applied, not left for a later refresh to write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_nothing_while_the_offer_is_unchanged_whatever_credential_it_is_signed_with() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut fresh = priced(&["x402"], "0.01");
+        fresh.credential = Some("eyJhbGciOiJFZERTQSJ9.new-jti.signature".into());
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(fresh)));
+
+        assert!(
+            refreshed_surface(&surface, &stores.gateways, None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_a_changed_price_and_nothing_else() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(priced(&["x402"], "0.05"))));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("a changed price is stored");
+        assert_eq!(snapshot_of(&updated), Some(&priced(&["x402"], "0.05")));
+        let mut expected = surface.clone();
+        expected.target.payment_policy = updated
+            .target
+            .payment_policy
+            .clone();
+        assert_eq!(serde_json::to_value(&updated).unwrap(), serde_json::to_value(&expected).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_the_logos_a_snapshot_taken_before_them_lacks() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut with_logo = priced(&["x402"], "0.01");
+        with_logo.payment_points[0].logo = Some(crate::gateways::payment_logos::LogoRef {
+            id: "base".into(),
+            media_type: "image/svg+xml".into(),
+            sha256: "a".repeat(64),
+        });
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(with_logo.clone())));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("the logo is stored although the offer did not change");
+        assert_eq!(snapshot_of(&updated), Some(&with_logo));
+
+        let refreshed_again = paid_surface(&stores.gateway, Some(with_logo));
+        assert!(
+            refreshed_surface(&refreshed_again, &stores.gateways, None)
+                .await
+                .is_none(),
+            "an unchanged offer with the same logos is not rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_stores_a_point_agent_pay_renamed() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut renamed = priced(&["x402"], "0.01");
+        renamed.payment_points[0].label = "PayPal".into();
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(renamed.clone())));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("the new label is stored although the offer did not change");
+        assert_eq!(snapshot_of(&updated), Some(&renamed));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_keeps_the_snapshot_when_the_manifest_is_missing_unpayable_or_unreachable() {
+        let stores = stores().await;
+        let surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        for answer in [Ok(None), Ok(Some(PaymentManifest::default())), unreachable()] {
+            install_test_answer(&stores.gateway.id, "pay-1", answer);
+            assert!(
+                refreshed_surface(&surface, &stores.gateways, None)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refresh_updates_the_policy_of_a_variant_too() {
+        let stores = stores().await;
+        let mut surface = base_surface();
+        let mut variant = payment_variant(PaymentPolicy::AgentPay(AgentPayPolicy {
+            payment_gateway_id: stores.gateway.id.clone(),
+            payment_surface_id: "pay-1".into(),
+            manifest_snapshot: Some(priced(&["x402"], "0.01")),
+            ..Default::default()
+        }));
+        variant.id = "v-paid".into();
+        surface.variants = vec![variant];
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(priced(&["x402"], "0.20"))));
+
+        let updated = refreshed_surface(&surface, &stores.gateways, None)
+            .await
+            .expect("the variant's price changed");
+        let policy = match updated.variants[0]
+            .overrides
+            .target
+            .as_ref()
+            .and_then(|target| target.payment_policy.as_ref())
+        {
+            Some(PaymentPolicy::AgentPay(policy)) => policy,
+            other => panic!("expected an agent_pay policy, got {other:?}"),
+        };
+        assert_eq!(policy.manifest_snapshot, Some(priced(&["x402"], "0.20")));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_does_not_store_a_snapshot_a_save_would_refuse_the_surface_with() {
+        let stores = stores().await;
+        let mut surface = paid_surface(&stores.gateway, Some(priced(&["x402", "mpp"], "0.01")));
+        surface.access_point.protocol = SurfaceProtocol::A2a;
+        surface
+            .access_point
+            .caller_authentication = Some(jwt_bearer_auth("Authorization"));
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(priced(&["mpp"], "0.01"))));
+        assert!(
+            refreshed_surface(&surface, &stores.gateways, None)
+                .await
+                .is_none(),
+            "an MPP-only payment surface cannot take payment behind jwt_bearer on Authorization"
+        );
+
+        surface
+            .access_point
+            .caller_authentication = Some(jwt_bearer_auth("X-Auth-Token"));
+        assert!(
+            refreshed_surface(&surface, &stores.gateways, None)
+                .await
+                .is_some(),
+            "the same manifest is stored when the credential header does not collide"
+        );
+    }
+
+    async fn commit(
+        stores: &Stores,
+        read: &AgentSurface,
+        updated: &AgentSurface,
+    ) -> (bool, usize) {
+        let applied = std::sync::atomic::AtomicUsize::new(0);
+        let saved = commit_refreshed_surface(&stores.surfaces, read, updated, async |_| {
+            applied.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await;
+        (saved, applied.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_refresh_is_saved_and_applied_only_over_the_surface_it_was_computed_on() {
+        let stores = stores().await;
+        let read = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let updated = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.05")));
+        stores
+            .surfaces
+            .save(&read)
+            .await
+            .unwrap();
+
+        assert_eq!(commit(&stores, &read, &updated).await, (true, 1));
+        let stored = stores
+            .surfaces
+            .get("s1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot_of(&stored), Some(&priced(&["x402"], "0.05")));
+
+        let mut edited = read.clone();
+        edited.name = "edited by an operator".into();
+        stores
+            .surfaces
+            .save(&edited)
+            .await
+            .unwrap();
+        assert_eq!(commit(&stores, &read, &updated).await, (false, 0));
+        let stored = stores
+            .surfaces
+            .get("s1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.name, "edited by an operator");
+        assert_eq!(snapshot_of(&stored), Some(&priced(&["x402"], "0.01")), "the edit is kept whole");
+
+        stores
+            .surfaces
+            .delete("s1")
+            .await
+            .unwrap();
+        assert_eq!(commit(&stores, &read, &updated).await, (false, 0));
+        assert!(
+            stores
+                .surfaces
+                .get("s1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a deleted surface is not brought back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_waits_for_a_write_in_progress_and_then_leaves_its_edit_alone() {
+        let stores = stores().await;
+        let read = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let updated = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.05")));
+        stores
+            .surfaces
+            .save(&read)
+            .await
+            .unwrap();
+
+        let write_in_progress = SURFACE_WRITES.lock().await;
+        let refresh = {
+            let (surfaces, read, updated) = (stores.surfaces.clone(), read.clone(), updated.clone());
+            tokio::spawn(async move { commit_refreshed_surface(&surfaces, &read, &updated, async |_| {}).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!refresh.is_finished(), "the refresh must not read or write while a save is in progress");
+
+        let mut edited = read.clone();
+        edited.name = "edited by an operator".into();
+        stores
+            .surfaces
+            .save(&edited)
+            .await
+            .unwrap();
+        drop(write_in_progress);
+
+        assert!(!refresh.await.unwrap(), "the edit made during the wait is seen, so the refresh is skipped");
+        let stored = stores
+            .surfaces
+            .get("s1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.name, "edited by an operator");
+        assert_eq!(snapshot_of(&stored), Some(&priced(&["x402"], "0.01")));
+    }
+
+    #[tokio::test]
+    async fn a_save_keeps_the_verified_snapshot_while_the_payment_gateway_is_unreachable() {
+        let stores = stores().await;
+        let verified = priced(&["x402"], "0.01");
+        let stored = paid_surface(&stores.gateway, Some(verified.clone()));
+        let mut surface = paid_surface(&stores.gateway, Some(priced(&["x402"], "9.99")));
+        install_test_answer(&stores.gateway.id, "pay-1", unreachable());
+
+        let warnings = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, Some(&stored))
+            .await
+            .unwrap();
+        assert_eq!(snapshot_of(&surface), Some(&verified), "the client's snapshot is discarded, the verified one kept");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "payment_unverified");
+        assert!(
+            warnings[0]
+                .message
+                .contains("last verified manifest was kept"),
+            "{}",
+            warnings[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_without_a_verified_snapshot_or_for_another_payment_surface_stores_none() {
+        let stores = stores().await;
+        install_test_answer(&stores.gateway.id, "pay-1", unreachable());
+        install_test_answer(&stores.gateway.id, "pay-2", unreachable());
+
+        let mut first_save = paid_surface(&stores.gateway, Some(priced(&["x402"], "9.99")));
+        let warnings = validate_surface_payment_policies(Some(&stores.gateways), &mut first_save, None)
+            .await
+            .unwrap();
+        assert_eq!(snapshot_of(&first_save), None);
+        assert!(
+            !warnings[0]
+                .message
+                .contains("kept"),
+            "{}",
+            warnings[0].message
+        );
+
+        let stored = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut moved = paid_surface(&stores.gateway, None);
+        if let Some(PaymentPolicy::AgentPay(policy)) = moved
+            .target
+            .payment_policy
+            .as_mut()
+        {
+            policy.payment_surface_id = "pay-2".into();
+        }
+        validate_surface_payment_policies(Some(&stores.gateways), &mut moved, Some(&stored))
+            .await
+            .unwrap();
+        assert_eq!(snapshot_of(&moved), None, "another payment surface's price is not carried over");
+    }
+
+    #[tokio::test]
+    async fn a_save_replaces_the_snapshot_when_the_payment_gateway_answers_and_refuses_a_missing_surface() {
+        let stores = stores().await;
+        let stored = paid_surface(&stores.gateway, Some(priced(&["x402"], "0.01")));
+        let mut surface = paid_surface(&stores.gateway, None);
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(Some(priced(&["x402"], "0.07"))));
+        let warnings = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, Some(&stored))
+            .await
+            .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(snapshot_of(&surface), Some(&priced(&["x402"], "0.07")));
+
+        install_test_answer(&stores.gateway.id, "pay-1", Ok(None));
+        let error = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, Some(&stored))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SurfaceApiError::BadRequestCode("payment_manifest_invalid", _)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_surface_cannot_route_to_a_payment_gateway_over_fabric() {
+        let stores = stores().await;
+        let mut surface = base_surface();
+        surface.target.endpoint = format!("fabric://{}/agent", stores.gateway.id);
+        let error = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SurfaceApiError::BadRequestCode("fabric_route_to_payment_gateway", _)), "{error:?}");
+
+        surface.target.endpoint = "fabric://some-peer/agent".into();
+        assert!(
+            validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+                .await
+                .is_ok(),
+            "a route to a peer is unaffected"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_pay_policy_naming_a_peer_is_refused() {
+        let stores = stores().await;
+        let mut peer = Gateway::new_with_creation_type(
+            "peer".into(),
+            String::new(),
+            "did:web:peer.example".into(),
+            GatewayType::Remote,
+            GatewayCreationType::User,
+        );
+        peer.id = "routing-peer".into();
+        stores
+            .gateways
+            .create(&peer)
+            .await
+            .unwrap();
+        let mut surface = paid_surface(&peer, None);
+        let error = validate_surface_payment_policies(Some(&stores.gateways), &mut surface, None)
+            .await
+            .unwrap_err();
+        match error {
+            SurfaceApiError::BadRequestCode("invalid_payment_policy", message) => {
+                assert!(message.ends_with("gateway 'routing-peer' is not a payment gateway"), "{message}")
+            }
+            other => panic!("expected invalid_payment_policy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_variant_keeps_its_own_verified_snapshot() {
+        let stores = stores().await;
+        let variant_with = |snapshot: Option<PaymentManifest>| {
+            let mut variant = payment_variant(PaymentPolicy::AgentPay(AgentPayPolicy {
+                payment_gateway_id: stores.gateway.id.clone(),
+                payment_surface_id: "pay-1".into(),
+                manifest_snapshot: snapshot,
+                ..Default::default()
+            }));
+            variant.id = "v-paid".into();
+            variant
+        };
+        let mut stored = base_surface();
+        stored.variants = vec![variant_with(Some(priced(&["x402"], "0.03")))];
+        let mut surface = base_surface();
+        surface.variants = vec![variant_with(None)];
+        install_test_answer(&stores.gateway.id, "pay-1", unreachable());
+
+        validate_surface_payment_policies(Some(&stores.gateways), &mut surface, Some(&stored))
+            .await
+            .unwrap();
+        let kept = match surface.variants[0]
+            .overrides
+            .target
+            .as_ref()
+            .and_then(|target| target.payment_policy.as_ref())
+        {
+            Some(PaymentPolicy::AgentPay(policy)) => policy
+                .manifest_snapshot
+                .clone(),
+            other => panic!("expected an agent_pay policy, got {other:?}"),
+        };
+        assert_eq!(kept, Some(priced(&["x402"], "0.03")));
+    }
+
+    #[tokio::test]
+    async fn a_kept_mpp_only_snapshot_still_refuses_an_a2a_surface_behind_jwt_bearer() {
+        let stores = stores().await;
+        let stored = paid_surface(&stores.gateway, Some(priced(&["mpp"], "0.01")));
+        let mut surface = paid_surface(&stores.gateway, None);
+        surface.access_point.protocol = SurfaceProtocol::A2a;
+        surface
+            .access_point
+            .caller_authentication = Some(jwt_bearer_auth("Authorization"));
+        install_test_answer(&stores.gateway.id, "pay-1", unreachable());
+
+        validate_surface_payment_policies(Some(&stores.gateways), &mut surface, Some(&stored))
+            .await
+            .unwrap();
+        assert!(
+            validate_delegation_source_auth(&surface).is_err(),
+            "an edit made while the payment gateway is down cannot drop the snapshot the guard reads"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9172,7 +10967,8 @@ mod tests {
                 "alias": "partner", "target_endpoint": "https://partner.example.com/mcp", "protocol": "mcp",
                 "policy": { "policy_definition_id": "partner-policy" },
                 "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
-                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+                    "action": { "effect": "deny", "patterns": ["^admin_"] } }] },
+                "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
             }] },
             "variants": [{ "id": "v-dev", "alias": "dev", "name": "dev", "enabled": true,
                 "overrides": { "transit": { "points": points } } }]
@@ -9201,11 +10997,17 @@ mod tests {
         let restated = variant_point(serde_json::json!({
             "policy": { "policy_definition_id": "partner-policy" },
             "mcp_tool_gating": { "gates": [{ "id": "g1", "name": "no admin",
-                "action": { "effect": "deny", "patterns": ["^admin_"] } }] }
+                "action": { "effect": "deny", "patterns": ["^admin_"] } }] },
+            "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
         }));
         let omitted = variant_point(serde_json::json!({}));
+        let burst_written_out = variant_point(
+            serde_json::json!({ "per_caller_rate_limit": { "requests": 5, "window_secs": 60, "burst": 5 } }),
+        );
 
-        for points in [serde_json::json!([restated]), serde_json::json!([omitted])] {
+        for points in
+            [serde_json::json!([restated]), serde_json::json!([omitted]), serde_json::json!([burst_written_out])]
+        {
             let surface = surface_with_variant_transit_points(points.clone());
             assert!(validate_surface_mcp_tool_gating(&surface).is_ok(), "{points}");
         }
@@ -9227,6 +11029,17 @@ mod tests {
             (
                 "response_policy",
                 variant_point(serde_json::json!({ "response_policy": { "policy_definition_id": "dev-response" } })),
+            ),
+            (
+                "per_caller_rate_limit",
+                variant_point(serde_json::json!({ "per_caller_rate_limit": { "requests": 50, "window_secs": 60 } })),
+            ),
+            (
+                "per_caller_rate_limit",
+                serde_json::json!({
+                    "alias": "dev-only", "target_endpoint": "https://dev-only.example.com/mcp", "protocol": "mcp",
+                    "per_caller_rate_limit": { "requests": 5, "window_secs": 60 }
+                }),
             ),
             (
                 "policy",

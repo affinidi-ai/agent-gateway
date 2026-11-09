@@ -733,6 +733,119 @@ async fn a_refusal_a_new_connect_would_not_fix_keeps_the_grant() {
     assert_eq!(kept.access_token, "fresh", "the grant is refreshed for the next call");
 }
 
+/// A refresh token the authorization server refuses, after the Target refused
+/// the token, ends the connection: the grant is removed and revoked, nothing
+/// is sent again, and the caller is told to connect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_refresh_after_the_targets_refusal_removes_the_grant() {
+    let fixture = Fixture::new(
+        vec![Answer::json(400, json!({"error": "invalid_grant"})), Answer::status(200)],
+        vec![rejected_token()],
+    )
+    .await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"]["reason"], "connect_required");
+    assert_eq!(body["error"]["data"]["subject"], "owner");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        headers
+            .get("www-authenticate")
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        1,
+        "nothing is sent again"
+    );
+    assert!(
+        !fixture
+            .kept(&owner_key())
+            .await,
+        "a refused refresh removes the grant"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        fixture
+            .authorization_server
+            .revoked_tokens(),
+        ["first", "first-refresh"]
+    );
+}
+
+/// A grant asked for beyond its binding's scopes as saved now is not sent:
+/// the caller is told to connect, and the grant is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_beyond_its_bindings_scopes_is_not_sent() {
+    let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    fixture
+        .store(&owner_key(), "read-access")
+        .await;
+    let mut narrowed: Value =
+        serde_json::to_value(vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner")).unwrap();
+    narrowed["outbound_credentials"][0]["scopes"] = json!(["write"]);
+    fixture
+        .serve(serde_json::from_value(narrowed).unwrap())
+        .await;
+    let (status, headers, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["error"]["code"], -32001);
+    assert_eq!(body["error"]["data"], json!({"reason": "connect_required", "subject": "owner"}));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .kept(&owner_key())
+            .await
+    );
+}
+
+/// A retry with the refreshed token that cannot be sent answers `502`, and
+/// keeps the refreshed grant for the next call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_that_cannot_be_sent_answers_bad_gateway() {
+    let fixture = Fixture::new(vec![refresh_answer("second")], vec![rejected_token(), Answer::hung_up()]).await;
+    fixture
+        .store(&owner_key(), "first")
+        .await;
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["detail"], "Upstream request failed");
+    let bearers: Vec<_> = fixture
+        .vendor_saw()
+        .into_iter()
+        .map(|(bearer, _)| bearer.unwrap())
+        .collect();
+    assert_eq!(bearers, ["Bearer first", "Bearer second"]);
+    let kept = fixture
+        .vault
+        .grant(&owner_key())
+        .await
+        .unwrap()
+        .expect("the refreshed grant is kept");
+    assert_eq!(kept.access_token, "second");
+}
+
 /// A public discovery read carries no caller, and so no grant, and nothing of
 /// the caller's but its request: not its cookies or credentials. The agent
 /// card is fetched from the Target's own card URL, whatever path the caller
@@ -749,7 +862,7 @@ async fn a_discovery_read_carries_no_grant() {
             .method("GET")
             .uri(path)
             .header("x-api-key", KEY)
-            .header("cookie", "session_token=dashboard-session")
+            .header("cookie", "__Host-session_token=dashboard-session")
             .header("authorization", "Bearer the-callers-own-token")
             .header("proxy-authorization", "Basic cHJveHk6c2VjcmV0")
             .header("x-caller-did", "did:example:spoofed")
@@ -813,7 +926,7 @@ async fn the_target_gets_nothing_of_the_callers_but_its_request() {
     let call = || {
         let (mut parts, body) = mcp_call(Some(KEY)).into_parts();
         for (name, value) in [
-            ("cookie", "session_token=dashboard-session; lb=sticky"),
+            ("cookie", "__Host-session_token=dashboard-session; lb=sticky"),
             ("proxy-authorization", "Basic cHJveHk6c2VjcmV0"),
             ("x-caller-did", "did:example:spoofed"),
             ("x-caller-identity-source", "spoofed"),
@@ -1414,9 +1527,10 @@ async fn a_refusal_before_anything_is_sent_is_audited() {
 }
 
 /// A surface that charges its callers never releases the Target's grant, as
-/// one edited by hand might: it is refused `connector_unavailable` before any
-/// payment is asked for or settled, so nobody pays for a request no grant can
-/// serve.
+/// one edited by hand might: an agent-pay surface is refused
+/// `connector_unavailable`, and a local payment, no longer taken, is refused
+/// `payment_unavailable`, both before any payment is asked for or settled, so
+/// nobody pays for a request no grant can serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_payment_is_taken_for_the_targets_grant() {
     let fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
@@ -1424,18 +1538,22 @@ async fn no_payment_is_taken_for_the_targets_grant() {
         .store(&owner_key(), "owner-access")
         .await;
     let target = format!("{}/mcp", fixture.vendor.origin());
-    for (case, payment_policy) in [
+    for (case, payment_policy, refusal_at, refusal) in [
         (
-            "a payment this gateway takes",
+            "a local payment",
             json!({"type": "x402", "enabled": true, "verification_mode": "mock", "settlement_mode": "none",
                 "payment_requirements": [{"scheme": "exact", "network": "eip155:1", "amount": "1000",
                     "asset": "0x123", "payTo": "0x456", "maxTimeoutSeconds": 300}],
                 "mcp_payment_triggers": {"mode": "all"}}),
+            "",
+            json!({"error": "payment_unavailable"}),
         ),
         (
-            "a payment another gateway takes",
-            json!({"type": "x402", "enabled": true, "provider": "agent_pay",
-                "payment_gateway_id": "payment-gateway", "payment_surface_id": "payment-surface"}),
+            "a payment agent-pay takes",
+            json!({"type": "agent_pay", "payment_gateway_id": "payment-gateway",
+                "payment_surface_id": "payment-surface"}),
+            "/error/data",
+            json!({"reason": "connector_unavailable"}),
         ),
     ] {
         let mut surface = serde_json::to_value(vendor_surface("mcp", &target, "owner")).unwrap();
@@ -1449,7 +1567,7 @@ async fn no_payment_is_taken_for_the_targets_grant() {
             .send(call_to("POST", "/vendor", Some(call)))
             .await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
-        assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}), "{case}");
+        assert_eq!(body.pointer(refusal_at), Some(&refusal), "{case}: {body}");
         assert!(
             headers
                 .get("payment-required")

@@ -131,7 +131,7 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "payment",
         "Payment Event",
-        "An x402 or MPP payment lifecycle event (challenge, verification, settlement)",
+        "An agent-pay payment event (challenge, paid, held for review, rejected, unavailable); legacy x402/MPP settlement records may still appear",
         Payments,
     ),
     event(
@@ -155,7 +155,8 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
     event(
         "rate_limited",
         "Rate Limited",
-        "A request was refused because a surface rate limit, SSE session cap or Fabric stream capacity was reached",
+        "A request was refused because a surface rate limit, a Transit Point's per-caller rate limit, SSE session cap \
+         or Fabric stream capacity was reached",
         Requests,
     ),
     event(
@@ -190,6 +191,18 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "Policy Change Refused",
         "A change to a policy, or to where a policy applies, was refused",
         Policies,
+    ),
+    event(
+        "target_auth_changed",
+        "Target Authentication Changed",
+        "The credential a surface sends to its Target or a Transit Point was added, changed or removed",
+        Auth,
+    ),
+    event(
+        "secret_force_deleted",
+        "Secret Force-Deleted",
+        "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
+        Auth,
     ),
 ];
 
@@ -269,6 +282,8 @@ mod tests {
         assert_eq!(group_of("trace_terminated"), Some(AuditEventGroup::Trace));
         assert_eq!(group_of("payment"), Some(AuditEventGroup::Payments));
         assert_eq!(group_of("auth_failed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("target_auth_changed"), Some(AuditEventGroup::Auth));
+        assert_eq!(group_of("secret_force_deleted"), Some(AuditEventGroup::Auth));
         assert_eq!(group_of("identity_binding_failed"), Some(AuditEventGroup::Identity));
         assert_eq!(group_of("identity_binding_verified"), Some(AuditEventGroup::Identity));
         for request in ["request_rejected", "rate_limited"] {

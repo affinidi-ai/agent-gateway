@@ -509,7 +509,7 @@ impl ModernDelegationContext<'_> {
             ContinuationRoute::AccessPoint
             | ContinuationRoute::Fabric { .. }
             | ContinuationRoute::FabricSend { .. } => {
-                crate::proxy::handler::surface_payment::request_without_local_payment(self.surface, request)
+                crate::proxy::handler::surface_payment::request_without_payment_credentials(self.surface, request)
             }
             _ => request.clone(),
         };
@@ -766,6 +766,7 @@ impl ModernDelegationContext<'_> {
                 | ServiceTokenError::SecretUnavailable
                 | ServiceTokenError::TokenRequestFailed
                 | ServiceTokenError::ProviderMisconfigured
+                | ServiceTokenError::TokenRequestRejected(_)
                 | ServiceTokenError::TokenEndpointRefused
                 | ServiceTokenError::TokenEndpointNotHttps
                 | ServiceTokenError::StoreUnavailable => ContinuationError::Unavailable,
@@ -931,33 +932,21 @@ impl PreparedDelegation {
         Ok(remaining.map_or(ttl_secs, |remaining| ttl_secs.min(remaining)))
     }
 
-    pub fn record_local_payment(
+    /// Keeps the payment taken for this request so a later continuation round
+    /// is not charged again. `evidence` receives `(verified_at, expires_at)`.
+    pub fn record_payment(
         &mut self,
-        payment: &crate::proxy::handler::surface_payment::SurfacePayment,
+        evidence: impl FnOnce(u64, u64) -> ContinuationPayment,
         ttl_secs: u64,
         now: u64,
     ) -> Result<(), ContinuationError> {
-        if !payment.consumed || self.payment.is_some() {
+        if self.payment.is_some() {
             return Ok(());
         }
         let expires_at = now
             .checked_add(self.continuation_ttl(ttl_secs, now)?)
             .ok_or(ContinuationError::InvalidRecord)?;
-        let evidence = if let Some(context) = &payment.context {
-            ContinuationPayment::X402 {
-                receipt: context
-                    .response_header
-                    .clone(),
-                verified_at: now,
-                expires_at,
-            }
-        } else {
-            ContinuationPayment::Mpp {
-                receipt: payment.mpp_receipt.clone(),
-                verified_at: now,
-                expires_at,
-            }
-        };
+        let evidence = evidence(now, expires_at);
         evidence.validate(now)?;
         self.payment = Some(evidence);
         Ok(())
@@ -1294,6 +1283,7 @@ mod tests {
                 issuer: "https://gateway.example/oauth2/mcp".into(),
             };
             let caller = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
             };
@@ -1655,6 +1645,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -1849,6 +1840,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -1961,6 +1953,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2041,6 +2034,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2151,6 +2145,7 @@ mod tests {
             issuer: "https://gateway.example/oauth2/mcp".into(),
         };
         let caller = AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
         };
@@ -2538,6 +2533,7 @@ mod tests {
                 issuer: "https://gateway.example/oauth2/mcp".into(),
             };
             let caller = AuthenticatedIdentity::JwtBearer {
+                principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
             };

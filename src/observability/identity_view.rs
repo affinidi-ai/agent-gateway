@@ -117,10 +117,10 @@ pub struct NamingFields {
     pub display_name_source: Option<DisplayNameSource>,
     pub display_name_verified: bool,
     pub display_name_pending: bool,
-    pub name_conflict: bool,
 }
 
-/// Managed rows take names only from their managed display name; caller rows only from caller lookups.
+/// Managed rows take names only from their managed display name, so a shared managed DID has
+/// none; caller rows only from caller lookups.
 pub fn naming_for(
     origin: Option<IdentityOrigin>,
     managed: Option<&ManagedDisplayName>,
@@ -130,10 +130,6 @@ pub fn naming_for(
         (Some(IdentityOrigin::Managed), Some(ManagedDisplayName::Named(name)), _) => NamingFields {
             display_name: Some(name.as_str().to_string()),
             display_name_source: Some(DisplayNameSource::SurfaceName),
-            ..Default::default()
-        },
-        (Some(IdentityOrigin::Managed), Some(ManagedDisplayName::Conflict { .. }), _) => NamingFields {
-            name_conflict: true,
             ..Default::default()
         },
         (Some(IdentityOrigin::ExternalCaller), _, Some(CallerLookup::Pending)) => NamingFields {
@@ -151,14 +147,14 @@ pub fn naming_for(
 }
 
 /// A managed row shows its target's Agent Card name, when known, in place of the surface name.
-/// A name conflict still hides every name.
+/// Pass a card name only for a DID with one managed surface: a shared managed DID has no name.
 pub fn with_target_card_name(
     naming: NamingFields,
     origin: Option<IdentityOrigin>,
     card_name: Option<String>,
 ) -> NamingFields {
     match (origin, card_name) {
-        (Some(IdentityOrigin::Managed), Some(name)) if !naming.name_conflict => NamingFields {
+        (Some(IdentityOrigin::Managed), Some(name)) => NamingFields {
             display_name: Some(name),
             display_name_source: Some(DisplayNameSource::TargetAgentCard),
             ..Default::default()
@@ -264,13 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn test_naming_for_conflict_sets_flag_without_name() {
-        let conflict = ManagedDisplayName::Conflict {
+    fn test_naming_for_shared_managed_did_has_no_name() {
+        let shared = ManagedDisplayName::Shared {
             surface_ids: vec!["a".into(), "b".into()],
         };
-        let fields = naming_for(Some(IdentityOrigin::Managed), Some(&conflict), None);
-        assert!(fields.name_conflict);
-        assert_eq!(fields.display_name, None);
+        let c = caller(DisplayNameSource::AgentName, true);
+        assert_eq!(naming_for(Some(IdentityOrigin::Managed), Some(&shared), Some(&c)), NamingFields::default());
     }
 
     #[test]
@@ -355,14 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_target_card_name_ignored_for_conflicts_and_callers() {
-        let conflict = ManagedDisplayName::Conflict {
-            surface_ids: vec!["s1".into(), "s2".into()],
-        };
-        let base = naming_for(Some(IdentityOrigin::Managed), Some(&conflict), None);
-        let fields = with_target_card_name(base.clone(), Some(IdentityOrigin::Managed), Some("DateTime Agent".into()));
-        assert_eq!(fields, base);
-
+    fn test_target_card_name_ignored_for_callers() {
         let caller = naming_for(Some(IdentityOrigin::ExternalCaller), None, None);
         let fields =
             with_target_card_name(caller.clone(), Some(IdentityOrigin::ExternalCaller), Some("DateTime Agent".into()));

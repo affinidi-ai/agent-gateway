@@ -177,6 +177,19 @@ pub fn free_port() -> (u16, ReservedPort) {
     panic!("no free gateway test ports in {GATEWAY_TEST_PORT_START}..{GATEWAY_TEST_PORT_END}");
 }
 
+/// An address that accepts every connection and closes it at once, so a request
+/// to it fails the same way each time and no other server can take its port.
+pub fn closing_endpoint() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            drop(connection);
+        }
+    });
+    address
+}
+
 // ── mock target server ───────────────────────────────────────────────────────
 
 /// The details of a request received by the mock server.
@@ -190,7 +203,17 @@ pub struct ReceivedRequest {
 
 enum MockBody {
     Json(String),
-    Streamed { content_type: &'static str, chunks: Vec<(Duration, String)>, hold_open: bool },
+    /// Every response has this status and content type.
+    Status {
+        status: u16,
+        content_type: &'static str,
+        body: String,
+    },
+    Streamed {
+        content_type: &'static str,
+        chunks: Vec<(Duration, String)>,
+        hold_open: bool,
+    },
 }
 
 /// A running axum server that simply echoes back a configurable response.
@@ -213,6 +236,23 @@ impl MockServer {
     /// Start the mock with a custom response body returned for every request.
     pub async fn start_with_response(response_body: impl Into<String>) -> Self {
         Self::start_with_response_gate(MockBody::Json(response_body.into()), None).await
+    }
+
+    /// Start the mock so every response has `status` and `content_type`.
+    pub async fn start_with_status(
+        status: u16,
+        content_type: &'static str,
+        response_body: impl Into<String>,
+    ) -> Self {
+        Self::start_with_response_gate(
+            MockBody::Status {
+                status,
+                content_type,
+                body: response_body.into(),
+            },
+            None,
+        )
+        .await
     }
 
     pub async fn start_paused(response_body: impl Into<String>) -> (Self, Arc<tokio::sync::Notify>) {
@@ -307,8 +347,11 @@ impl MockServer {
                     if let Some(gate) = gate {
                         gate.notified().await;
                     }
-                    let (content_type, body) = match response_body.as_ref() {
-                        MockBody::Json(body) => ("application/json", axum::body::Body::from(body.clone())),
+                    let (status, content_type, body) = match response_body.as_ref() {
+                        MockBody::Json(body) => (200, "application/json", axum::body::Body::from(body.clone())),
+                        MockBody::Status { status, content_type, body } => {
+                            (*status, *content_type, axum::body::Body::from(body.clone()))
+                        }
                         MockBody::Streamed {
                             content_type,
                             chunks,
@@ -324,11 +367,11 @@ impl MockServer {
                             } else {
                                 axum::body::Body::from_stream(chunks)
                             };
-                            (*content_type, body)
+                            (200, *content_type, body)
                         }
                     };
                     Response::builder()
-                        .status(200)
+                        .status(status)
                         .header("content-type", content_type)
                         .body(body)
                         .unwrap()
@@ -1018,8 +1061,9 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         "created_at": now, "updated_at": now
     }))
     .unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
     let session = crate::auth::session::Session {
-        token: uuid::Uuid::new_v4().to_string(),
+        token_hash: crate::storage::filesystem::token_storage_id(&token),
         username: user.username.clone(),
         user_id: user.user_id.clone(),
         created_at: now,
@@ -1038,7 +1082,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
             &bootstrap
                 .storage_paths
                 .sessions,
-            &session.token,
+            &session.token_hash,
             serde_json::to_value(&session).unwrap(),
         ),
     ] {
@@ -1049,7 +1093,7 @@ pub fn configure_admin_api(bootstrap: &BootstrapConfig) -> reqwest::Client {
         )
         .unwrap();
     }
-    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", session.token)).unwrap();
+    let mut authorization = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).unwrap();
     authorization.set_sensitive(true);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::AUTHORIZATION, authorization);
@@ -1378,6 +1422,7 @@ fn build_gateway_config(bootstrap: &BootstrapConfig) -> GatewayConfig {
 struct GatewayServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     startup_log: StartupLog,
+    provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -1459,17 +1504,20 @@ fn spawn_gateway_server(
     let credential_policy = bootstrap
         .credential_policy
         .clone();
+    let provider_key_gate: &'static crate::identity::provider_key_gate::ProviderKeyGate = Box::leak(Box::default());
     let thread = std::thread::Builder::new()
         .name("gw-harness".to_string())
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
             let _log = thread_log.capture_on_this_thread();
             crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+            crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .thread_stack_size(8 * 1024 * 1024)
                 .on_thread_start(move || {
-                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone())
+                    crate::config::credential_policy::use_thread_credential_policy(credential_policy.clone());
+                    crate::identity::provider_key_gate::use_thread_gate(provider_key_gate);
                 })
                 .build()
                 .expect("build gateway harness runtime");
@@ -1491,6 +1539,7 @@ fn spawn_gateway_server(
     GatewayServer {
         shutdown: Some(shutdown_tx),
         startup_log,
+        provider_key_gate,
         _thread: thread,
     }
 }
@@ -1786,6 +1835,12 @@ impl GatewayHarness {
         self._gw_server
             .startup_log
             .text()
+    }
+
+    /// The provider key gate this gateway keeps its verdicts in.
+    pub fn provider_key_gate(&self) -> &'static crate::identity::provider_key_gate::ProviderKeyGate {
+        self._gw_server
+            .provider_key_gate
     }
 }
 

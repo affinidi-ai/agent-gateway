@@ -145,28 +145,6 @@ impl BootstrapConfig {
         );
         Ok(metadata)
     }
-
-    /// Load test endpoints configuration from test-endpoints.json
-    pub fn load_test_endpoints_config(&self) -> anyhow::Result<TestEndpointsConfig> {
-        let test_endpoints_path = &self
-            .config_files
-            .test_endpoints;
-        info!("Loading test endpoints configuration from: {}", test_endpoints_path);
-
-        // Read and parse test-endpoints.json
-        let contents = std::fs::read_to_string(test_endpoints_path)?;
-        let config: TestEndpointsConfig = serde_json::from_str(&contents)?;
-
-        info!(
-            "Loaded test endpoints config: evm={}, solana_devnet={}, solana_mainnet={}",
-            config.evm.is_some(),
-            config.solana_devnet.is_some(),
-            config
-                .solana_mainnet
-                .is_some()
-        );
-        Ok(config)
-    }
 }
 
 #[allow(dead_code)]
@@ -306,27 +284,21 @@ impl GatewayConfig {
             // Validate authentication configuration
             validate_source_auth_surface(surface)?;
 
-            // Validate MPP configuration if present
-            if let Some(mpp_config) = surface.mpp_config() {
-                for warning in mpp_config.validate(&surface.name) {
-                    warn!("{}", warning);
-                }
-            }
-
-            if let Some(x402) = surface.x402_config()
-                && let Some(ref triggers) = x402.mcp_payment_triggers
-            {
-                for warning in triggers.validate(&surface.name) {
-                    warn!("{}", warning);
-                }
-            }
-
-            // Warn if mpp_auto_pay is enabled but no mpp_policy is set
-            if surface.mpp_auto_pay() && surface.mpp_config().is_none() {
+            if surface.payment_policy_unsupported() {
                 warn!(
-                    "[mpp] Channel '{}'{}: mpp_auto_pay is enabled but no mpp_policy is configured",
+                    "Surface '{}'{}: local x402/MPP payment is no longer supported; requests answer 503 until the \
+                     payment policy points at an agent-pay surface (connecting a payment gateway needs the \
+                     agent_pay_delegation feature flag)",
                     surface.name, channel_id
                 );
+            }
+            if let Some(policy) = surface.agent_pay_policy() {
+                for error in policy.validate() {
+                    warn!("Surface '{}'{}: agent_pay payment policy: {}", surface.name, channel_id, error);
+                }
+            }
+            if surface.target.mpp_auto_pay {
+                warn!("Surface '{}'{}: mpp_auto_pay is no longer supported and is ignored", surface.name, channel_id);
             }
         }
 

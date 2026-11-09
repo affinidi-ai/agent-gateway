@@ -34,6 +34,24 @@ version and client declarations (see
 `input.mcp` only for modern requests, so a rule keyed on `input.mcp` never
 matched legacy Fabric traffic; it now does, and a decision can change on upgrade.
 
+### Payment context (`input.payment`)
+
+On a surface with an `agent_pay` payment policy, every policy that runs for it gets
+`input.payment`: the appliance-wide and per-gateway gateway policies as well as the surface
+policies, on the direct Access Point and on Fabric receive alike. A surface without an
+`agent_pay` policy has no `input.payment`.
+
+```json
+{"required": true, "rail": "x402", "amount": "0.25", "currency": "USD"}
+```
+
+`required` says whether the request is chargeable under the policy's triggers. `rail` is the
+rail of the credential the caller presented, or the only rail the payment surface's manifest
+offers; `amount` and `currency` come from the manifest snapshot. Each is omitted when unknown.
+Payment is taken only after policy allows the request, so a denied request is never charged,
+and policy never sees whether a payment succeeded: the older `input.payment.verified` field is
+gone, and a rule that reads it no longer matches.
+
 ## Versioned policy definitions
 
 Policy definitions are immutable and versioned
@@ -379,17 +397,17 @@ keep the rule in the Transit Point's own `response_policy`.
 | `input.transit.caller.verification` | `transit_token` | The call carries a valid transit token whose `user_identity_hash` came from source authentication on the Access Point. |
 | | `unverified` | A valid transit token names a caller DID but carries no verified principal: the DID was asserted or derived from request fields on the Access Point. |
 | | `fabric_peer` | The call carries a valid transit token this gateway issued for a request a paired gateway sent over Fabric (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). The peer gateway is verified, and named in `fabric`. The caller it sent the request for is verified only when the receiving surface's own `source_auth` or resource token verified a credential on that request with caller authentication that tells a partner's users apart (see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)): then `verified` is `true` and `user_identity_hash` names that caller. An API key or other shared credential leaves it unverified. Whatever the peer says about its caller never verifies it. A rule on `verification == "transit_token"` never matches it. |
-| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
+| | `anonymous` | The call carries no valid transit token: none on a Transit Point that does not require one, one there that does not verify, or a discovery read (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A Transit Point that does not require a token still verifies one the agent sends, so a valid token is reported as above. There it names the caller to policy and to the Transit Point's [per-caller rate limit](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point) only: delegated credentials, Workload Binding and stream expiry still treat the call as carrying no token. A client the Transit Point authenticated does not change this. |
 | `input.transit.caller.identity_source` | `gateway-computed`, `self-presented`, `verified-presentation` | How the Access Point established the caller DID. Absent when the token has none. |
 | | `fabric-presentation`, `fabric-asserted` | For a `fabric_peer` caller: the DID came from a presentation one of the connection's issuers signed, or from anything else the peer sent (or the request names no DID). |
-| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (the JWT `sub`, API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT that names no `sub`. |
+| `input.transit.caller.user_identity_hash` | lowercase hex SHA-256 | The caller's [identity hash](CREDENTIAL_DELEGATION.md#the-callers-identity-hash) the Access Point computed: the source-auth method, its issuer, the surface's tenant and the principal (for a JWT the value of its strategy's [`principal_claim`](SOURCE_AUTH.md#which-claim-names-a-jwt-caller), `sub` by default, with the claim's name when it is not `sub`; the API key name, DID or mTLS principal). The same subject verified by another method, issuer or tenant has another hash. For a `fabric_peer` caller it is the caller the receiving surface verified on the Fabric request, the same value for the same credential as on its Access Point. Present only when `verified`, and absent for a JWT without a non-empty string in its strategy's principal claim. |
 | `input.transit.caller.did` | DID | The caller DID an Access Point's transit token carries. Always asserted, even when `verified` is `true`: `verified` is about the principal behind `user_identity_hash`, not this DID. Never present for a `fabric_peer` caller, whose DID is in `fabric.caller_did`. Absent when the token has none. |
 | `input.transit.caller.fields` | object | The caller claims this Transit Point allowlists, verbatim: its enabled `workload_binding.caller_context_fields` with `caller_source: transit_token`, taken from the caller's verified JWT claims on the Access Point, or, for a `fabric_peer` caller, on the receiving surface. The token carries the claims every Transit Point of the surface allowlists, but each Transit Point's policy sees only its own. Absent unless the caller is `verified` and the Transit Point allowlists a claim the token carries. |
 | `input.transit.caller.fabric` | object | Present for a `fabric_peer` caller, whose transit token was issued for a request that arrived over Fabric: `peer_gateway_id` (the sending gateway's Remote gateway record), `peer_issuer_did` (its issuer DID, once pairing established it), `hops` (the Fabric crossings the request made) and `caller_did`. The Fabric handshake verified the peer. `caller_did` is present only when a presentation from one of the connection's issuers carried it (`fabric-presentation`), and is still the peer's word, never verified, even beside `verified: true`: any paired gateway can vouch for any DID. To admit a DID one partner vouches for, match it together with `identity_source == "fabric-presentation"` and `fabric.peer_issuer_did`. |
 | `input.transit.client.verification` | `resource_token` | The Transit Point verified the client's resource-server token (`mcp_http.authorization`) on this request. `input.source_auth` carries the same identity with its claims. |
 | | `source_auth` | The Transit Point's own `source_auth` verified the client's API key, JWT or client certificate on this request (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-point-source-authentication)). `input.source_auth` carries the same identity, with a JWT's claims. |
 | `input.transit.client.method` | `jwt_bearer`, `api_key`, `did_auth`, `mtls` | The source-auth method that verified the client (`api_key` also for `api_key_provider`). |
-| `input.transit.client.user_identity_hash` | lowercase hex SHA-256 | The client's identity hash, computed as for the caller. It equals a caller's hash only when both were verified the same way. Absent for a JWT that names no `sub`. |
+| `input.transit.client.user_identity_hash` | lowercase hex SHA-256 | The client's identity hash, computed as for the caller. It equals a caller's hash only when both were verified the same way. Absent for a JWT without a non-empty string in its strategy's principal claim. |
 | `input.transit.client.subject` | string | The verified principal itself. Absent with the hash. |
 
 On an MCP Transit Point that requires a resource token and also receives a transit token,
@@ -492,8 +510,9 @@ disabled** — so a host cannot rebind to an internal/metadata IP between vettin
 and connect, and an upstream 3xx is returned to the caller rather than followed.
 A2A-proxy and legacy MCP `proxy://` targets are **not** DNS-resolved/pinned here
 (vetted at dial time / MCP-proxy create time). A modern (`2026-07-28`) owned MCP
-Proxy `tools/call` dials its REST backend through a pinned, redirect-free client
-too, under the stricter save-time policy (see _Other pinned egress sinks_). A
+Proxy `tools/call`, and a legacy one that carries the Target credential, dials its
+REST backend through a pinned, redirect-free client too, under the stricter
+save-time policy (see _Other pinned egress sinks_). A
 blocked target fails closed (inbound
 and Fabric receive `403` "Request blocked by egress policy"; outbound
 `TargetAuthUnavailable`) with the resolved IP log-only.
@@ -544,12 +563,24 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   **origin-locked** to the SSE host via
   `mcp::sse_transport::resolve_session_post_url`, so a cross-origin `endpoint`
   event can't redirect the POST to an internal address).
+- `egress::pinned_forward_client` (the forward step's policy) pins **MCP tool
+  discovery of a saved surface** (`surface_id`): the gateway reads the surface's
+  stored Target and `target.auth` itself, so it reaches exactly what the
+  surface already forwards to (loopback and RFC 1918 allowed, cloud metadata
+  blocked) and the caller cannot choose the host. The caller must be able to
+  read the surface (tenant and resource scope, else `404`), and a
+  `target_endpoint` sent with it that differs from the saved one is refused
+  with `409` before any dial.
 - `egress::pinned_configured_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, allows RFC 1918) pins the
   modern owned **MCP Proxy `tools/call`** to its REST backend
-  (`src/mcp_proxies/modern_rest.rs`). It applies at call time the same policy
-  `validate_resolved_url` applies to `base_url` when the proxy is saved, so a
-  backend host that rebinds to loopback afterwards is refused. Under
+  (`src/mcp_proxies/modern_rest.rs`), and a legacy MCP Proxy `tools/call` that
+  carries the Target credential, direct or over Fabric, the same way. It applies
+  at call time the same policy `validate_resolved_url` applies to `base_url`
+  when the proxy is saved, so a backend host that rebinds to loopback afterwards
+  is refused before any request, and the credential is never sent to it. A
+  legacy call without the credential still runs on `rmcp-openapi`'s client and
+  is not pinned. Under
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
@@ -581,6 +612,14 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   inbound forward step. Without `target.auth` the fetch
   uses the shared proxy client, which returns a 3xx rather than following it
   but is not pinned.
+- An Access Point with a `fabric://` Target gives its surface policy the card
+  it serves, built in process the way the preview builds it, never requested
+  through its own listener. Payment gating, rate limits, metrics and the Trust
+  Recorder do not see that read. The card is read from the remote gateway over
+  Fabric within `a2a.timeout_seconds`, or the surface's shorter request
+  timeout, and a card larger than `a2a.max_body_size` is refused, like a card
+  fetched over HTTP. The card the Access Point serves over Fabric is read the
+  same way.
 - The [agent card preview](PROTOCOLS.md#agent-card-preview) builds the same card
   but always fetches an `http(s)` Target over `egress::pinned_forward_client`, with
   or without `target.auth`, and records nothing; a blocked target reports
@@ -596,7 +635,30 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   agent context (`src/proxy/outbound_handler.rs::fetch_agent_card`) pins each
   well-known URL with `egress::pinned_forward_client`, the forward step's
   policy, and reads the card within the Transit Point's response bounds. A
-  blocked URL, a redirect or an oversized card yields no card.
+  blocked URL, a redirect or an oversized card yields no card. For a
+  `fabric://` target the card is read over Fabric instead, never through the
+  Transit Point's own listener, at `/.well-known/agent-card.json` and then,
+  as a fallback, `/.well-known/agent.json`. Both are discovery paths, which the
+  remote gateway answers as public card reads with its surface's card and
+  identity credential. The remote reads `/.well-known/agent-card.json` from its
+  configured card location, with its Target credential when it has one. It
+  reads the `/.well-known/agent.json` fallback as a public discovery read,
+  without that credential, so a remote Target that serves its card only at the
+  legacy path and requires its credential there is reported as
+  `AGENT_CARD_UNAVAILABLE`. Any other path is an ordinary request through the
+  remote Access Point, so `agent_card_path` is not used, and the Surface Builder
+  does not offer it on a `fabric://` Transit Point. A `404` or `503` the
+  remote gateway answers itself (an unknown or inactive surface) and a Fabric
+  transport failure end the read with no card; any other answer without a
+  usable card moves on to the next path, which the remote reads with different
+  credentials. Trust Checks and a
+  Transit Point policy with `require_agent_context` share the agent card cache,
+  so a card is read once a minute and a missing one, for any target, is
+  remembered for 10 seconds. A read that failed on this gateway's side (no
+  Fabric connection yet, the mediator refusing the message, or the reply not
+  picked up) and a `503` from the briefly unavailable remote are not cached, so
+  the next request reads again. The policy does not read a card the request's Trust Checks already
+  found unavailable.
 - The **managed agent Agent Card fetch** for display names
   (`src/identity/target_card_names.rs`) reads the card of an A2A or AP2
   surface's operator-configured HTTP(S) target through the same
@@ -725,20 +787,22 @@ documented here so operators can assess exposure.
   resolver that honours `HostPolicy` or pins the checked address, injected through
   the SDK. See [Agent name resolution](#agent-name-resolution).
 
-- **The legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
+- **The uncredentialed legacy stored-MCP-proxy runtime path is not pinned.** A stored MCP Proxy
   serving `2024-11-05` is an `rmcp_openapi` `Server` (`src/mcp_proxies/handlers.rs::McpServerManager`);
   discovery through it reads tool names from the loaded OpenAPI spec and does not
-  dial, but a `tools/call` dials `base_url` through rmcp-openapi's own internally
-  built HTTP client (re-resolves at connect; `base_url` is management-gated and
-  checked on create/update with `validate_resolved_url`, which blocks cloud
-  metadata, loopback and unspecified addresses but not RFC 1918). The gateway
-  cannot pin that client, so this path retains a DNS-rebinding window between
-  validation and connect. Modern `tools/call` uses the gateway's own pinned
-  client instead (`egress::pinned_configured_client`, see _Other pinned egress
-  sinks_), which applies the save-time policy at call time: a host that rebinds
-  to loopback, an unspecified address or cloud metadata after validation is
-  refused. It does not refuse a rebind to an RFC 1918 address, because that
-  policy allows RFC 1918.
+  dial, but a `tools/call` without the Target credential dials `base_url` through
+  rmcp-openapi's own internally built HTTP client, which re-resolves at connect
+  (`base_url` is management-gated and checked on create/update with
+  `validate_resolved_url`, which blocks cloud metadata, loopback and unspecified
+  addresses but not RFC 1918), so that call retains a DNS-rebinding window between
+  validation and connect. A legacy `tools/call` that carries the Target credential,
+  and every modern `tools/call`, uses the gateway's own REST client
+  (`modern_rest::call`) pinned with `egress::pinned_configured_client` (see _Other
+  pinned egress sinks_), which applies the save-time policy at call time: a host
+  that rebinds to loopback, an unspecified address or cloud metadata after
+  validation is refused before the request, so the credential never reaches it.
+  It does not refuse a rebind to an RFC 1918 address, because that policy allows
+  RFC 1918.
 - **The process-wide Legacy-SSE session cache** (keyed by `base_url`) can reuse a
   non-discovery session's client for a discovery GET. The POST origin-lock closes
   the metadata vector regardless, but the reused GET leg is not pinned.

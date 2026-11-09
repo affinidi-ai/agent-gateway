@@ -41,7 +41,7 @@ There is no external datastore.
 | --- | --- |
 | Runtime | A DashMap cache is authoritative. [`src/state/`](src/state/) holds the per-surface runtime state. |
 | Disk | JSON files under `_storage/`, written immediately on change. [`src/storage/`](src/storage/) holds the store traits and the filesystem implementation. |
-| Reload | Surfaces are hot-reloadable. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
+| Reload | Surfaces are hot-reloadable. A reload swaps the router each port listener serves and keeps the listener bound, so it refuses no connection. Editing `_storage/` by hand needs a restart or `POST /v1/config/reload`, unless `cache_refresh_interval_secs` is set. |
 
 Encryption at rest is optional and lives in [`src/encryption/`](src/encryption/). See
 [`docs/CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) for reload mechanics and
@@ -93,11 +93,11 @@ flowchart TB
     end
     subgraph G["Gateway plane"]
         direction LR
-        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"] --> B5["Delegated<br/>agent_pay payment"]
+        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"]
     end
     subgraph P["Before forwarding"]
         direction LR
-        P1[Egress check] --> P2[Body-size re-check] --> P3["Local x402 / MPP"] --> P4[MCP tool policies]
+        P1[Egress check] --> P2[Body-size re-check] --> P4[MCP tool policies]
     end
     subgraph C["Caller context"]
         direction LR
@@ -107,21 +107,31 @@ flowchart TB
         direction LR
         D1[Access Point OPA] --> D2["Appliance-wide<br/>surface policy"] --> D3[Surface OPA] --> D4["MCP tool gating, tools/call"]
     end
+    subgraph Y["Consent"]
+        direction LR
+        Y1["Consent preparation<br/>(modern MCP)"]
+    end
     subgraph O["Request preparation"]
         direction LR
-        O1[Headers] --> O2[Transit token] --> O3[MCP custom metadata] --> O4[Credential delegation] --> O5[VP injection]
+        O1[Headers] --> O2[Transit token] --> O3[MCP custom metadata] --> O4["Target authentication,<br/>credential delegation"] --> O5[VP injection]
+    end
+    subgraph Z["Payment"]
+        direction LR
+        Z1["Circuit breaker<br/>check"] --> Z2["Delegated<br/>agent_pay payment"]
     end
     subgraph F["Forward and respond"]
         direction LR
         F1[Forward] --> F2["Resolve protected<br/>identity"] --> F3["Response processing,<br/>tools/list filter"] --> F4[Metrics]
     end
-    E --> G --> P --> C --> S --> O --> F
-    B5 -. fabric:// Target .-> FP["Fabric paywall,<br/>MCP tool policies"] --> FB([Fabric dispatch])
+    E --> G --> P --> C --> S --> Y --> O --> Z --> F
+    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch])
 ```
 
-A `fabric://` Target leaves after the delegated payment. It then runs its own paywall
-(skipped when the delegated payment already decided) and, for MCP, the MCP tool policies,
-before fabric dispatch. Version negotiation and request validation run on the sending gateway, before
+A `fabric://` Target leaves after request validation. It then runs its own surface policy
+and, for MCP, the MCP tool policies and gating, target authentication and credential delegation,
+and only then the delegated payment, just before fabric dispatch. Payment is the last step on every
+path, so a request is never charged and then refused for a reason that does not depend on payment.
+Version negotiation and request validation run on the sending gateway, before
 that; the fabric receive pipeline does not run them again.
 
 Each stage is driven from `handler.rs`; the column below names the module holding the
@@ -131,7 +141,7 @@ logic.
 | --- | --- | --- |
 | Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401`, the body saying only that the credential is missing or invalid and the reason logged, on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, on one whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a valid JWT), and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
-| Rate limiting | Per-surface request limits | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
+| Rate limiting | Per-surface request limits; a Transit Point's shared and per-caller limits are checked on the outbound path | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
 | MCP wire validation | Rejecting malformed or non-active MCP revisions | [`src/mcp/`](src/mcp/) |
 | Agent context | Trust-registry context from the original body, as `input.agent` for every policy and Trust Check template | [`src/surface_context/`](src/surface_context/) |
@@ -139,10 +149,8 @@ logic.
 | Gateway OPA | The appliance-level policy gate | [`src/policies/gateway_manager.rs`](src/policies/gateway_manager.rs) |
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
-| Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
-| Egress check | Vetting the forward target before anything is charged locally | [`src/egress.rs`](src/egress.rs) |
+| Egress check | Vetting the forward target before the request is charged or forwarded | [`src/egress.rs`](src/egress.rs) |
 | Body-size limit | Refusing a body over `[a2a] max_body_size` with `413`, as it is read and again before forwarding; an MCP Access Point reads up to its `mcp_http.max_request_bytes` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
-| Local payment | x402 and MPP verification and paywalls | [`src/x402/`](src/x402/), [`src/mpp/`](src/mpp/) |
 | MCP tool policies | Per-tool authorization, configured as `target.mcp_tool_policies` | [`src/policies/opa.rs`](src/policies/opa.rs) |
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
@@ -152,6 +160,7 @@ logic.
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
+| Delegated payment | Deciding whether an `agent_pay` request is chargeable and asking agent-pay to take the payment, last, just before the request is forwarded; receipts, audit, metrics and the payments ledger. Manifest discovery in [`src/gateways/payment_manifest.rs`](src/gateways/payment_manifest.rs) and the held-payment status query in [`src/gateways/payment_case.rs`](src/gateways/payment_case.rs) | [`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs), [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Headers | Trace ID, `did:webvh` identity headers (`x-did-identity`, `x-did-signed-identity`), and caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`); the caller's own copies of these headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls. Fabric receive issues one too, for an HTTP(S) Target | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent. A Target bound by external consent is instead sent its grant by binding, in place of the caller's credentials and caller-info headers, only at its endpoint path on the provider's resource through Strict egress, its route chosen before any payment; the Target's refusal of the token gets one refresh and one retry after the response | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs), [`src/proxy/target_grant.rs`](src/proxy/target_grant.rs) |
@@ -211,15 +220,19 @@ token, which refuses rather than passing to policy) → rate limit → body extr
 over `[a2a] max_body_size`, or over `mcp_http.max_request_bytes` on MCP) → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
-and request validation (A2A and AP2) → delegated `agent_pay` payment (a
-`fabric://` Target leaves here: its own paywall, MCP tool policies for MCP, then fabric
-dispatch) → forward-target egress check → body-size re-check (a body the gateway grew, and an
-MCP Access Point's body over `max_body_size`) → local x402/MPP → MCP tool
+and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
+MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
+payment, then fabric dispatch) →
+forward-target egress check → body-size re-check (a body the gateway grew, and an
+MCP Access Point's body over `max_body_size`) → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
-(`tools/call`) → identity and caller-info headers → transit token generation → MCP custom
-metadata → credential delegation and consent → deferred VP injection → forward → resolve
-protected identity → response processing, including the `tools/list` filter → metrics.
+(`tools/call`) → consent preparation (modern MCP) → identity and caller-info headers → transit
+token generation → MCP custom metadata → target authentication → credential delegation and
+consent → deferred VP injection → Target circuit breaker check → delegated `agent_pay` payment (an
+A2A proxy or MCP proxy Target is charged here too, once the proxy is found and its own checks have
+passed) → mirroring → forward → resolve protected identity → response processing, including the
+`tools/list` filter → metrics.
 
 Outbound:
 
@@ -333,10 +346,11 @@ Breaking one of these is a correctness bug, not a style question.
 | A Transit Point authenticates its caller, with a transit token, a Resource Server token or its `source_auth`, before anything is forwarded or any credential resolved, unless it is marked `allow_unauthenticated_callers`; one whose caller authentication cannot be enforced refuses every request. The one exception: a Transit Point that relies on the transit token alone forwards a discovery read, a `GET` or `HEAD` of a discovery document directly below the Transit Point, without it, and without any credential. | Anyone who reaches a Transit Point would call its target as this gateway, with its target credentials. |
 | A managed agent receives the caller-info and `did:webvh` identity headers (`CallerHeaders::NAMES`) only as this gateway sets them: the inbound path and Fabric receive drop every copy a caller or a peer gateway sent, and a Transit Point sends its target none of them. | The agent, or a Transit Point's target, could not rely on these headers. |
 | A transit token issued for a request that arrived over Fabric names the peer gateway, never carries a `sub`, and its only principal (`fabric.principal_hash`) is the caller the receiving surface's own source authentication verified, set only when that authentication tells a partner's users apart; nothing the peer says about its caller becomes one. It opens the Transit Points of the surface that served the request, as an Access Point's token does, keys a delegated credential only on one that sets `delegated_credentials_for_fabric_callers`, and the agent gets only the token this gateway issued. | A partner gateway's word about a user could unlock that user's grants, or a token a peer sent could reach the agent. |
-| Fabric receive never releases its Target's per-user delegated credentials, and never starts consent for a legacy Fabric request. A Transit Point's `delegated_credentials_for_fabric_callers` releases a grant only beside caller authentication that tells a partner's users apart, checked when the token is issued and again on the call, and a Transit Point never starts consent, legacy or `2026-07-28`, for a caller a Fabric-issued token names: it releases only a grant that already exists. | One partner credential would key one grant for all of the partner's users, or an authorization URL relayed through a partner would let it bind its own account. |
+| Fabric receive releases its Target's per-user delegated credentials only on a view whose HTTP or HTTPS Target sets `delegated_credentials_for_fabric_callers` beside caller authentication that tells a partner's users apart, checked on every request, and then only the grant kept under the receiving surface for the caller that surface verified, never one a partner names; it never starts consent for a legacy Fabric request. The check treats any `jwt_bearer` method with a verification strategy and an audience as telling users apart, so a static `target_auth` JWT the partner presents for every user keys one grant for all of them. A Transit Point's `delegated_credentials_for_fabric_callers` releases a grant only beside caller authentication that tells a partner's users apart, checked when the token is issued and again on the call, and a Transit Point never starts consent, legacy or `2026-07-28`, for a caller a Fabric-issued token names: it releases only a grant that already exists. | One partner credential would key one grant for all of the partner's users, a partner could pick whose grant it is sent, or an authorization URL relayed through a partner would let it bind its own account. |
+| The Target credential is attached only to a request for the Target's origin and under its base path; any other URL is refused with `502` and the credential never follows a redirect ([Target base path](docs/CREDENTIAL_DELEGATION.md#target-base-path), [Target Credential Scope](docs/PROTOCOLS.md#target-credential-scope)). It is withheld under `target_https` and `target_source_auth` `enforce` where the Target is not https or the leg does not check its callers ([Target credential rules on the request path](docs/CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). A caller header spelled like a credential header (compared without regard to case or to `_` against `-`) is dropped on every leg ([Credential headers on a Transit Point](docs/CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point)). | The operator's credential would reach another host or path, or a caller could supply or replace it. |
 | Every Fabric send sets its own hop count, never a copy a caller, agent or peer sent, and a request past 8 Fabric crossings is refused. | Agents that call each other through their gateways could pass a request back and forth without end. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
-| x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
+| A surface charges only through agent-pay. An enabled local x402 or MPP policy fails closed with `503 payment_unavailable` over HTTP and over the fabric, and cannot be saved. | A surface its operator meant to charge would forward requests unpaid. |
 
 ## Module map
 
@@ -373,7 +387,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names) | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
+| [`identity/`](src/identity/) | Agent DIDs, `did:webvh` logs, credential issuance, VP verification, display names (including dashboard-only managed-agent Agent Card names); `handlers/surface_target_auth.rs` checks a surface save against the Target authentication rules, refusing or warning by rule mode | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#managed-identity), [`POLICY.md`](docs/POLICY.md) |
 | [`source_auth/`](src/source_auth/) | JWT bearer, API key, DID Auth, mTLS on the inbound edge, and a Transit Point's `source_auth` | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md) |
 | [`event_hook/`](src/event_hook/) | Operator-configured notifications of Connection Point lifecycle events to a receiver: signed, sequenced, delivered from background tasks with retries, nothing persisted. `directory.rs` is the cached client of the operator-configured mediator directory, whose entries `mediators/` lists next to stored records | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#mediator-directory) |
 | [`didauth/`](src/didauth/) | The DID Auth challenge and JWS ceremony | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#did-auth) |
@@ -398,15 +412,16 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`x402/`](src/x402/) | x402 settlement, facilitator calls, transaction records | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
-| [`mpp/`](src/mpp/) | Machine Payments Protocol | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`x402/`](src/x402/) | Mapping agent-pay's answers (`delegate.rs`); the chargeable-request matching (`middleware.rs`) and payment-header parsing the agent-pay gate shares; settlement, startup recovery and the admin API for x402 transactions recorded before local x402 payment was withdrawn. It verifies no payment and is not an x402 facilitator | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
+| [`mpp/`](src/mpp/) | The local MPP policy configuration a stored surface still loads, the MPP challenge and credential wire formats the agent-pay gate relays, and the admin API for MPP transactions recorded before local MPP payment was withdrawn. It verifies no payment | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#migrating-older-policies) |
+| [`payments_ledger/`](src/payments_ledger/) | One record per delegated payment call: a bounded in-memory window served at `/api/admin/payments`, and append-only hourly segment files kept 7 days | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#taking-the-payment), [`RBAC.md`](docs/RBAC.md) |
 | [`payment_credentials.rs`](src/payment_credentials.rs) | Dispute-evidence credentials | Source only: [`src/payment_credentials.rs`](src/payment_credentials.rs) |
 
 ### Federation
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
+| [`gateways/`](src/gateways/) | Remote gateway records (peers and payment gateways, kept apart by `role_scope.rs`; `usage.rs` says what still depends on one), pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
 | [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane
@@ -421,7 +436,7 @@ from.
 | [`surface_templates/`](src/surface_templates/) | Built-in and user surface templates | [`templates README`](config/examples/agent_surface_templates/README.md) |
 | [`agents_api/`](src/agents_api/) | Agent self-registration: `/agents-api/v1/onboard` mints a DID from identity fields, with `sign-jwt` and `verify-jwt` | Source only: [`src/agents_api/handlers/onboard.rs`](src/agents_api/handlers/onboard.rs). The onboarding capture endpoint is in `identity/`; see [`AGENT_ONBOARDING_CAPTURE.md`](docs/AGENT_ONBOARDING_CAPTURE.md). |
 | [`terms/`](src/terms/) | Terms versions, acceptance records, consent gating | [`TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md) |
-| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
+| [`credential_providers/`](src/credential_providers/) | OAuth credential provider records; `references.rs` lists what still uses a provider or a secret, so deleting or retyping one can be refused | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
 | [`delegation_vault/`](src/delegation_vault/) | Per-caller OAuth tokens, the consent flow, and the shape of governance audit records. `service_token.rs` obtains and caches the gateway's own provider tokens for delegation bindings and target authentication; `jwt_assertion.rs` signs the RFC 7523 assertions. Tokens are encrypted only when encryption at rest is enabled; grants by binding (external consent) are kept only then and only with `AG_IDENTITY_HASH_PEPPER` set, sent only to their provider's `resource` origin, and revoked at the vendor when their provider or binding is removed (`identity/handlers/surface_grants.rs`). The connect API (`connect_api.rs`, pending connects in `connects.rs`) starts and completes external consent, holding the PKCE verifier and redeeming the code (`token_endpoint.rs`); `release.rs` refreshes a grant single-flight, on a task of its own, before it is sent and refuses with fixed reasons; `revocation.rs` revokes removed grants, leaving to the sweep those whose vendor account's authorization it cannot tell is unused; `sweep.rs` removes daily what can never be released, and decides those revocations. | [`CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md) |
 | [`audit/`](src/audit/) | Governance audit pipeline: event catalog, per-sink selection, producer, durable journal, and per-sink delivery to the VP Audit Log and Governance Audit integrations | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md#governance-audit-forwarding) |
 | [`integrations/`](src/integrations/) | Webhooks, notifications, and outbound integrations | [`INTEGRATIONS.md`](docs/INTEGRATIONS.md) |
@@ -431,14 +446,14 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
+| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers) | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
 | [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`export/`](src/export/) | Redacted `.atgx` storage export | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
 | [`observability/`](src/observability/) | Tracing, policy audit events, dashboard event stream, identity view and caller names | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
 | [`metrics/`](src/metrics/) | Metric collection, retention, aggregation | [`OBSERVABILITY.md`](docs/OBSERVABILITY.md) |
-| [`component_tests/`](src/component_tests/) | Cross-module tests that need no Docker | [`CONTRIBUTING.md`](CONTRIBUTING.md) |
+| [`component_tests/`](src/component_tests/) | Frozen legacy cross-module tests; takes no additions | [`TESTING.md`](docs/development/TESTING.md#legacy-component-tests) |
 
 ## Where to look
 

@@ -353,6 +353,9 @@ async fn inject_surfaces_into_config(
                             if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
                                 continue;
                             }
+                            crate::identity::provider_key_gate::gate()
+                                .admit(surface)
+                                .await;
                             if existing_surface_ids.contains(&surface.surface_id) {
                                 continue;
                             }

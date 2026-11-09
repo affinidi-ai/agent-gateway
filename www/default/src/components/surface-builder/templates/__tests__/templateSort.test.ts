@@ -4,6 +4,7 @@ import {
   getTemplateProtocol,
   getTemplateProtocolBadge,
   templateMatchesProtocol,
+  templateTakesPayments,
 } from '../templateSort';
 import type { SurfaceTemplate } from '../../../../api';
 
@@ -102,5 +103,37 @@ describe('templateMatchesProtocol', () => {
 
   it('keeps an untagged partial available across protocols', () => {
     expect(templateMatchesProtocol(t({ tags: ['security'] }), 'a2a')).toBe(true);
+  });
+});
+
+describe('templateTakesPayments', () => {
+  it('is true for a Payment item or a surface or variant payment policy', () => {
+    expect(templateTakesPayments(t({ items: [{ scope: 'edge', kind: 'payment' }] }))).toBe(true);
+    expect(
+      templateTakesPayments(
+        t({ kind: 'full', surface: { target: { payment_policy: { type: 'agent_pay' } } } })
+      )
+    ).toBe(true);
+    expect(
+      templateTakesPayments(
+        t({
+          kind: 'full',
+          surface: {
+            target: {},
+            variants: [{ overrides: { target: { payment_policy: { type: 'agent_pay' } } } }],
+          },
+        })
+      )
+    ).toBe(true);
+  });
+
+  it('is false for a template without payments', () => {
+    expect(templateTakesPayments(t({ items: [{ scope: 'edge', kind: 'rate-limit' }] }))).toBe(
+      false
+    );
+    expect(
+      templateTakesPayments(t({ kind: 'full', surface: { target: {}, variants: [{}] } }))
+    ).toBe(false);
+    expect(templateTakesPayments(t({}))).toBe(false);
   });
 });

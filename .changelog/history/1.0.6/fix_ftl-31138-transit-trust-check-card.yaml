@@ -1,0 +1,18 @@
+branch: fix/ftl-31138-transit-trust-check-card
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-05T10:23:24Z'
+      title: Let a Fabric Transit Point use caller authentication and a Trust Check together
+      description: >-
+        The gateway read a fabric:// Transit Point's target agent card through the Transit
+        Point's own listener without a credential, so the Transit Point's caller authentication
+        refused it, the card was unavailable and every Trust Check failed. A Transit Point with
+        no custom route never got the card at all. The card for Trust Checks and for policies
+        with require_agent_context is now read over Fabric directly, at the well-known card
+        paths as before, and outside callers still need a credential to read it through the
+        Transit Point.
+  removed: []
+  security: []
+  breaking: []

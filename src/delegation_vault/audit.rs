@@ -10,7 +10,8 @@
 use crate::audit::events::{
     Actor, AuthScheme, DelegationFailureReason, IdentityBindingFailure, PolicyChangeAction, PolicyChangeSource,
     PolicyField, PolicyMode, PolicySlot, PolicyTargetKind, RateLimitScope, RefusalReason, RejectionReason,
-    RejectionStage, RequestFailureOutcome, TargetKind,
+    RejectionStage, RequestFailureOutcome, TargetAuthField, TargetAuthLeg, TargetAuthMethodKind, TargetAuthRejection,
+    TargetKind,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -54,6 +55,11 @@ pub struct AuditCallerContext {
     /// `sub` claim (JWT subject)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub: Option<String>,
+    /// The value of the JWT verification strategy's principal claim, when the
+    /// strategy names a claim other than `sub`: the subject the caller is
+    /// identified by. `sub` then holds the token's own `sub`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub principal: Option<String>,
     /// Management-API personal access token id, when the caller authenticated
     /// with a PAT rather than a console session. Attributes a management action
     /// (e.g. a delegation-vault revoke) to the exact token used.
@@ -65,8 +71,9 @@ pub struct AuditCallerContext {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub user_identity_hash: Option<String>,
     /// The paired gateway that sent the request over Fabric, for a
-    /// `fabric_verified` or `fabric_asserted` caller: its issuer DID, else its
-    /// Remote gateway record id.
+    /// `fabric_verified` or `fabric_asserted` caller, and for the caller of a
+    /// delegated credential released on Fabric receive: its issuer DID, else
+    /// its Remote gateway record id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub peer_gateway: Option<String>,
     /// Raw caller email captured for administrator-only audit evidence.
@@ -215,19 +222,27 @@ pub enum PaymentStage {
     Verified,
     /// Payment verification failed (invalid or absent credential).
     Failed,
+    /// The delegated payment is held for human review.
+    Held,
+    /// Whether the delegated payment was taken is not known: the payment gateway
+    /// did not answer in time or its answer was unusable, and the caller was
+    /// told to retry the same request with the same credential.
+    Unconfirmed,
+    /// Funds are held until the Target delivers.
+    Authorized,
+    /// Held funds were released without a charge.
+    Voided,
     /// Funds settled on-chain / with the payment processor.
     Settled,
     /// Settlement failed after a successful verification.
     SettlementFailed,
 }
 
-/// Protocol-independent payment lifecycle event. Emitted at every stage of a
-/// payment (challenge → verify → settle) for **every** rail (x402, MPP, and
-/// future protocols), so the whole end-to-end payment interaction is captured in
-/// one audit trail — not only the delegated leg. When the payment was relayed to
-/// a remote gateway over the fabric (Model B delegation) `delegated` is true and
-/// the remote ids / status are populated; correlation with the remote gateway's
-/// own trail is via the shared top-level `trace_id`.
+/// Protocol-independent payment event. Emitted for every outcome of a payment
+/// delegated to agent-pay (challenge, paid, held for review, rejected,
+/// unavailable): `delegated` is true and the remote ids / status are populated;
+/// correlation with the agent-pay gateway's own trail is via the shared
+/// top-level `trace_id`. Legacy x402/MPP settlement records may still appear.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PaymentEventDetails {
     /// Which payment protocol produced the event.
@@ -264,6 +279,53 @@ pub struct PaymentEventDetails {
     /// HTTP-style status from the remote gateway's response, delegation only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_status: Option<u16>,
+    /// What agent-pay reported for a delegated payment, delegation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Box<DelegatedPaymentFacts>>,
+}
+
+/// The facts of one delegated payment, as recorded by the payment gate. Never
+/// carries the payment credential; the payer is a hash or a verified agent DID.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
+pub struct DelegatedPaymentFacts {
+    /// MCP tool, A2A method or HTTP path the payment was for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    /// Variant alias of the caller's surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    /// DID of the agent-pay gateway that answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_did: Option<String>,
+    /// Oversight case of a held payment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    /// Fingerprint of agent-pay's receipt credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vc_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// MPP receipt `reference`, or the x402 settlement transaction hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_reference: Option<String>,
+    /// MPP receipt `challengeId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_id: Option<String>,
+    /// x402 settlement network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    pub latency_ms: u64,
+    /// agent-pay's authorization of funds held until the Target delivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_id: Option<String>,
+    /// The manifest price, when the receipt names a different amount; the
+    /// event's `amount` and `currency` are then the receipt's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quoted_currency: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub price_mismatch: bool,
 }
 
 /// The surface, gateway or appliance-wide set a policy is attached to.
@@ -378,6 +440,53 @@ impl PolicyChangeDetails {
     }
 }
 
+/// A management change to the Target Authentication of one leg of a surface: the Target or a
+/// Transit Point, of the base surface or of a variant as it resolves. Names the method and
+/// credential provider before and after; never a secret id, header name, header format or value.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TargetAuthChangeDetails {
+    pub actor: Actor,
+    /// The variant's alias, or `_base_` for the base surface.
+    pub surface_variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    pub leg: TargetAuthLeg,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point_id: Option<String>,
+    /// The Transit Point's alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transit_point: Option<String>,
+    pub previous_method: TargetAuthMethodKind,
+    pub method: TargetAuthMethodKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// The parts a change to an existing setting replaced; empty when the setting was added or
+    /// removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<TargetAuthField>,
+}
+
+/// A secret deleted with `force=true` through the management API. Names the secret by its id
+/// and each record that still used it by kind and id; never the secret's value or a record's
+/// name.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SecretForceDeleteDetails {
+    pub actor: Actor,
+    pub secret_id: String,
+    pub force: bool,
+    #[serde(default)]
+    pub referrers: Vec<SecretReferrerDetails>,
+}
+
+/// A record that used a secret when it was force-deleted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SecretReferrerDetails {
+    pub kind: String,
+    pub id: String,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -476,11 +585,9 @@ pub enum DelegationAuditAction {
         /// `transit_point` | `fabric`.
         flow: String,
     },
-    /// Protocol-independent payment lifecycle event (x402, MPP, …). Covers the
-    /// whole challenge → verify → settle flow for both locally-enforced payments
-    /// and payments delegated to a remote gateway over the fabric (in which case
-    /// `delegated` is true and the remote ids / status are populated). Boxed to
-    /// keep the enum small.
+    /// Protocol-independent payment event: an agent-pay delegated payment
+    /// outcome (challenge, paid, held for review, rejected, unavailable), or a
+    /// legacy x402/MPP settlement record. Boxed to keep the enum small.
     PaymentEvent(Box<PaymentEventDetails>),
     /// Source authentication failed. `blocking` is false when the failure was
     /// handed to policy instead of refusing the request.
@@ -495,6 +602,9 @@ pub enum DelegationAuditAction {
         scope: RateLimitScope,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        /// The Transit Point whose per-caller limit refused the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transit_point: Option<String>,
     },
     RequestRejected {
         stage: RejectionStage,
@@ -512,6 +622,10 @@ pub enum DelegationAuditAction {
         /// longest alias a variant can have. Caller-chosen text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_variant: Option<String>,
+        /// On `target_auth_failed` only: whether the request was refused or forwarded
+        /// without the credential, and the token endpoint's OAuth `error` code.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_auth: Option<TargetAuthRejection>,
     },
     IdentityBindingFailed {
         outcome: IdentityBindingFailure,
@@ -566,6 +680,10 @@ pub enum DelegationAuditAction {
     PolicyAttachmentChanged(Box<PolicyChangeDetails>),
     /// A policy change was refused; `action` names the change attempted.
     PolicyChangeRefused(Box<PolicyChangeDetails>),
+    /// The Target Authentication of one leg of a surface was added, changed or removed.
+    TargetAuthChanged(Box<TargetAuthChangeDetails>),
+    /// A secret was deleted with `force=true`, with or without records still using it.
+    SecretForceDeleted(Box<SecretForceDeleteDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -619,6 +737,8 @@ impl DelegationAuditAction {
                 | Self::PolicyDetached(_)
                 | Self::PolicyAttachmentChanged(_)
                 | Self::PolicyChangeRefused(_)
+                | Self::TargetAuthChanged(_)
+                | Self::SecretForceDeleted(_)
         )
     }
 }
@@ -1080,7 +1200,27 @@ pub fn vp_fingerprint(vp_jwt: &str) -> String {
 /// Build an `AuditCallerContext` from a source-auth identity
 pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity) -> AuditCallerContext {
     match identity {
-        crate::source_auth::AuthenticatedIdentity::JwtBearer { subject, claims } => {
+        crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject,
+            principal_claim,
+            claims,
+        } => {
+            let named_by_sub = principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM;
+            let (sub, principal) = if named_by_sub {
+                (Some(subject.clone()), None)
+            } else {
+                let carried = claims
+                    .get(principal_claim.as_str())
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty() && *value == subject.as_str());
+                (
+                    claims
+                        .get("sub")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    carried.map(String::from),
+                )
+            };
             let iss = claims
                 .get("iss")
                 .and_then(|v| v.as_str())
@@ -1111,7 +1251,8 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
                 auth_method: "jwt_bearer".to_string(),
                 iss,
                 aud,
-                sub: Some(subject.clone()),
+                sub,
+                principal,
                 token_id: None,
                 email: email.map(String::from),
                 name: name.map(String::from),
@@ -1126,6 +1267,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             }
         }
         crate::source_auth::AuthenticatedIdentity::ApiKey { key_name, .. } => AuditCallerContext {
+            principal: None,
             auth_method: "api_key".to_string(),
             iss: None,
             aud: None,
@@ -1143,6 +1285,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             peer_gateway: None,
         },
         crate::source_auth::AuthenticatedIdentity::DidAuth { did } => AuditCallerContext {
+            principal: None,
             auth_method: "did_auth".to_string(),
             iss: None,
             aud: None,
@@ -1167,6 +1310,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             source,
             ..
         } => AuditCallerContext {
+            principal: None,
             auth_method: "mtls".to_string(),
             iss: Some(issuer_dn.clone()),
             aud: None,
@@ -1186,6 +1330,26 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             user_identity_hash: None,
             peer_gateway: None,
         },
+    }
+}
+
+/// Build the `AuditCallerContext` of a delegated credential released on Fabric
+/// receive: the caller the receiving surface's own `source_auth` or resource
+/// token verified on the request ([`build_caller_context`]), with the paired
+/// gateway that sent it as `peer_gateway`: its issuer DID, else its Remote
+/// gateway record id.
+pub fn fabric_receive_caller_context(
+    identity: &crate::source_auth::AuthenticatedIdentity,
+    peer_issuer_did: Option<&str>,
+    peer_gateway_id: &str,
+) -> AuditCallerContext {
+    AuditCallerContext {
+        peer_gateway: Some(
+            peer_issuer_did
+                .unwrap_or(peer_gateway_id)
+                .to_string(),
+        ),
+        ..build_caller_context(identity)
     }
 }
 
@@ -1220,6 +1384,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
             .clone()
             .unwrap_or_else(|| fabric.peer_gateway_id.clone());
         return Some(AuditCallerContext {
+            principal: None,
             auth_method: if verified {
                 "fabric_verified"
             } else {
@@ -1257,6 +1422,7 @@ pub fn transit_caller_context(claims: &crate::proxy::transit_token::TransitToken
         return None;
     }
     Some(AuditCallerContext {
+        principal: None,
         auth_method: "transit_token".to_string(),
         iss: None,
         aud: None,
@@ -1299,6 +1465,7 @@ pub fn binding_caller_context(binding: &crate::surface_context::IdentityBindingC
         return None;
     }
     Some(AuditCallerContext {
+        principal: None,
         auth_method: "workload_binding".to_string(),
         iss: Some(binding.gateway_did.clone()),
         aud: None,
@@ -1335,6 +1502,7 @@ pub fn management_caller_context(
         "session"
     };
     Some(AuditCallerContext {
+        principal: None,
         auth_method: auth_method.to_string(),
         iss: None,
         aud: None,
@@ -1406,6 +1574,8 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyDetached(_) => "policy_detached",
         DelegationAuditAction::PolicyAttachmentChanged(_) => "policy_attachment_changed",
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
+        DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
+        DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
     }
 }
 
@@ -1559,6 +1729,29 @@ pub async fn read_audit_log(
         total_pages,
         category_counts,
     })
+}
+
+/// The `payment` records in VP Audit Log `content`, newest first.
+fn payment_events_in(content: &str) -> Vec<DelegationAuditEvent> {
+    content
+        .lines()
+        .rev()
+        .filter(|line| line.contains("\"payment_event\""))
+        .filter_map(|line| serde_json::from_str::<DelegationAuditEvent>(line.trim()).ok())
+        .filter(|event| matches!(event.event, DelegationAuditAction::PaymentEvent(_)))
+        .collect()
+}
+
+/// The `payment` records the VP Audit Log keeps, newest first. Empty before the
+/// audit pipeline is set up or while the log does not exist.
+pub async fn read_payment_events() -> Vec<DelegationAuditEvent> {
+    let Some(path) = AUDIT_PATH.get() else {
+        return Vec::new();
+    };
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .unwrap_or_default();
+    payment_events_in(&content)
 }
 
 /// Emit a policy-decision audit record (`decision` is `allow`, `deny` or
@@ -1758,6 +1951,7 @@ mod tests {
     #[test]
     fn caller_context_preserves_raw_jwt_identity_evidence() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({
                 "iss": "https://issuer.example",
@@ -1779,6 +1973,67 @@ mod tests {
                 .is_none()
         );
         assert!(caller.name_redacted.is_none());
+        assert!(caller.principal.is_none(), "a caller named by sub has no separate principal");
+    }
+
+    /// A strategy that names callers by another claim keeps the token's own
+    /// `sub` in the record, so it matches the identity provider's logs, and
+    /// adds the claim's value as the principal.
+    #[test]
+    fn caller_context_keeps_the_tokens_sub_beside_another_principal_claim() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "person-1".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub", "oid": "person-1" }),
+        };
+        let caller = build_caller_context(&identity);
+        assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
+        assert_eq!(caller.principal.as_deref(), Some("person-1"));
+        let without_sub = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "person-1".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
+        };
+        assert_eq!(build_caller_context(&without_sub).sub, None);
+        let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "oid".to_string(),
+            subject: "<none>".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
+        };
+        let caller = build_caller_context(&without_oid);
+        assert_eq!(caller.principal, None, "a token without the claim has no principal, not the placeholder");
+        assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
+    }
+
+    /// The caller of a credential released on Fabric receive is the one the
+    /// receiving surface verified, with the peer gateway that sent the request:
+    /// its issuer DID, else its record id. A direct caller names no peer.
+    #[test]
+    fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
+        let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            subject: "alice".to_string(),
+            claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
+            principal_claim: "sub".to_string(),
+        };
+
+        let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
+        assert_eq!(
+            (received.auth_method.as_str(), received.iss.as_deref(), received.sub.as_deref()),
+            ("jwt_bearer", Some("https://issuer.example"), Some("alice"))
+        );
+        assert_eq!(
+            received
+                .peer_gateway
+                .as_deref(),
+            Some("did:web:partner.example")
+        );
+        assert_eq!(
+            fabric_receive_caller_context(&identity, None, "partner-record")
+                .peer_gateway
+                .as_deref(),
+            Some("partner-record")
+        );
+        assert_eq!(build_caller_context(&identity).peer_gateway, None);
     }
 
     #[test]
@@ -1974,6 +2229,58 @@ mod tests {
     }
 
     #[test]
+    fn only_payment_records_are_read_from_the_log_newest_first() {
+        let payment = |id: &str| {
+            let mut event = audit_event(
+                DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
+                    rail: PaymentRail::X402,
+                    stage: PaymentStage::Failed,
+                    transaction_id: id.to_string(),
+                    amount: None,
+                    currency: None,
+                    method: None,
+                    payer: None,
+                    error: Some("payment_event mentioned".to_string()),
+                    delegated: true,
+                    payment_gateway_id: None,
+                    payment_surface_id: None,
+                    remote_status: None,
+                    delegation: None,
+                })),
+                None,
+                None,
+                None,
+                Some("s-1"),
+            );
+            event.trace_id = Some(format!("trace-{id}"));
+            serde_json::to_string(&event).unwrap()
+        };
+        let mut other = audit_event(DelegationAuditAction::VpInjected, None, None, None, Some("s-1"));
+        other.detail = Some("\"payment_event\" in a detail".to_string());
+        let content = [
+            payment("old"),
+            serde_json::to_string(&other).unwrap(),
+            "not json \"payment_event\"".to_string(),
+            payment("new"),
+        ]
+        .join("\n");
+
+        let events = payment_events_in(&content);
+
+        let traces: Vec<_> = events
+            .iter()
+            .map(|event| {
+                event
+                    .trace_id
+                    .as_deref()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(traces, vec!["trace-new", "trace-old"]);
+        assert!(payment_events_in("").is_empty());
+    }
+
+    #[test]
     fn test_payment_event_category_and_serialization() {
         // A locally-enforced MPP verification: delegation fields omitted.
         let local = DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
@@ -1989,6 +2296,7 @@ mod tests {
             payment_gateway_id: None,
             payment_surface_id: None,
             remote_status: None,
+            delegation: None,
         }));
         assert_eq!(action_category(&local), "payment");
         assert!(!local.is_vp_audit());
@@ -2028,6 +2336,7 @@ mod tests {
             payment_gateway_id: Some("gw-pay".to_string()),
             payment_surface_id: Some("surface-1".to_string()),
             remote_status: Some(402),
+            delegation: None,
         }));
         let json = serde_json::to_value(&delegated).unwrap();
         assert_eq!(json["payment_event"]["rail"], "x402");
@@ -2139,6 +2448,7 @@ mod tests {
                 DelegationAuditAction::RateLimited {
                     scope: RateLimitScope::SseSessions,
                     retry_after_ms: Some(1500),
+                    transit_point: None,
                 },
                 "rate_limited",
             ),
@@ -2149,6 +2459,7 @@ mod tests {
                     http_status: Some(413),
                     rpc_error_code: Some(-32600),
                     requested_variant: None,
+                    target_auth: None,
                 },
                 "request_rejected",
             ),
@@ -2224,6 +2535,7 @@ mod tests {
             http_status: Some(403),
             rpc_error_code: None,
             requested_variant: None,
+            target_auth: None,
         })
         .unwrap();
         assert_eq!(stored["request_rejected"]["stage"], "admission");
@@ -2455,6 +2767,7 @@ mod tests {
     #[tokio::test]
     async fn audit_policy_decision_records_the_authenticated_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
         };
@@ -2707,6 +3020,7 @@ mod tests {
     #[test]
     fn a_vp_injection_record_has_the_full_field_set() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
         };
@@ -2737,6 +3051,7 @@ mod tests {
     #[tokio::test]
     async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
         };

@@ -18,12 +18,14 @@ use crate::trust_registries::TrustRegistryStore;
 
 use super::surfaces::SurfaceApiError;
 
-/// Validates the resources a surface references. A tenant surface may not send an
+/// Validates the resources a surface references and the rules its Target authentication
+/// must meet. A tenant surface may not send an
 /// appliance-wide secret or credential provider upstream or back to its caller, nor the gateway
 /// credential of a provider holding a secret outside the provider's tenant: a reference that
 /// breaks that rule is refused unless `stored` (the surface as stored, if any) already sent it
 /// to every destination that it goes to now, and even then when
-/// `tenant_credential_isolation` is `enforce`.
+/// `tenant_credential_isolation` is `enforce`. An API Key Provider key id `stored` already
+/// derived a DID from is kept the same way, and kept even when the key no longer exists.
 pub async fn validate_surface_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -34,7 +36,15 @@ pub async fn validate_surface_references(
     let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
     let grandfathered = match stored {
         Some(stored) if stored.tenant_id == surface.tenant_id => {
-            grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?)
+            let mut grandfathered =
+                grandfathered_references(&sent_credentials(stored).unwrap_or_default(), &sent_credentials(surface)?);
+            grandfathered.extend(
+                provider_key_ids(stored)
+                    .unwrap_or_default()
+                    .all()
+                    .map(|key_id| (ResourceKind::ApiKeys, key_id.clone())),
+            );
+            grandfathered
         }
         _ => Vec::new(),
     };
@@ -49,15 +59,23 @@ pub async fn validate_surface_references(
     };
 
     for reference in collect_surface_reference_keys(surface)? {
-        if reference.custom_metadata && surface.tenant_id.is_none() {
+        if !reference.is_checked_on(surface) {
             continue;
         }
         authorizer
             .validate_reference(&reference)
             .await?;
     }
-    validate_target_auth_methods(state, surface).await
+    authorizer
+        .provider_keys(&provider_key_ids(surface)?)
+        .await?;
+    validate_target_auth_methods(state, surface).await?;
+    let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
+    super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
+
+pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
+    "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent";
 
 /// The target authentication methods of every Target and Transit Point, in every
 /// variant, must be usable: `credential_lookup` was never implemented, and a provider
@@ -97,9 +115,7 @@ async fn validate_target_auth_methods(
                         .map_err(|error| internal("Credential provider", error))?
                         .ok_or_else(|| inaccessible("Credential provider"))?;
                     if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
-                        return Err(SurfaceApiError::BadRequest(
-                            "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent".into(),
-                        ));
+                        return Err(SurfaceApiError::BadRequest(TARGET_AUTH_NEEDS_CONSENT.into()));
                     }
                 }
             }
@@ -675,6 +691,26 @@ pub(crate) struct SurfaceReferenceKey {
     pub custom_metadata: bool,
 }
 
+impl SurfaceReferenceKey {
+    /// Whether a save of `surface` checks this reference: every one but a `custom_metadata`
+    /// one of a surface with no tenant.
+    fn is_checked_on(
+        &self,
+        surface: &AgentSurface,
+    ) -> bool {
+        !(self.custom_metadata && surface.tenant_id.is_none())
+    }
+}
+
+/// The secrets a save of `surface` requires to exist.
+pub(crate) fn checked_secret_ids(surface: &AgentSurface) -> Result<Vec<String>, SurfaceApiError> {
+    Ok(collect_surface_reference_keys(surface)?
+        .into_iter()
+        .filter(|reference| reference.kind == ResourceKind::Secrets && reference.is_checked_on(surface))
+        .map(|reference| reference.id)
+        .collect())
+}
+
 pub(crate) fn collect_surface_reference_keys(
     surface: &AgentSurface
 ) -> Result<Vec<SurfaceReferenceKey>, SurfaceApiError> {
@@ -862,7 +898,7 @@ fn grandfathered_references(
     grandfathered
 }
 
-fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
+pub(crate) fn resolved_views(surface: &AgentSurface) -> Result<Vec<AgentSurface>, SurfaceApiError> {
     let mut views = vec![surface.clone()];
     for variant in &surface.variants {
         let mut resolvable = surface.clone();
@@ -948,7 +984,7 @@ impl ReferenceAuthorizer<'_> {
                     .await
             }
             ResourceKind::ApiKeys => {
-                self.api_key_parent(&reference.id)
+                self.api_key_parent(&reference.id, &reference.id)
                     .await
             }
             _ => Err(SurfaceApiError::InternalError(format!("Unsupported Surface reference kind: {}", reference.kind))),
@@ -1214,29 +1250,122 @@ impl ReferenceAuthorizer<'_> {
         self.ensure(resource.tenant_id.as_deref(), ResourceKind::TrustRegistries, &resource.id, "Trust Registry")
     }
 
+    /// The surface `id` owning API keys must be one this surface may reference, and `scope_id`,
+    /// the surface id or a key id, must match the token's API key pattern.
     async fn api_key_parent(
         &self,
         id: &str,
+        scope_id: &str,
     ) -> Result<(), SurfaceApiError> {
+        let tenant_id = self
+            .api_key_parent_tenant(id)
+            .await?
+            .ok_or_else(|| inaccessible("API-key parent Surface"))?;
+        self.ensure(tenant_id.as_deref(), ResourceKind::ApiKeys, scope_id, "API-key parent Surface")
+    }
+
+    /// The tenant of the surface `id` owning API keys, or `None` when that surface no longer
+    /// exists.
+    async fn api_key_parent_tenant(
+        &self,
+        id: &str,
+    ) -> Result<Option<Option<String>>, SurfaceApiError> {
         if id == self.current_surface_id {
-            return self.ensure(self.owner_tenant_id, ResourceKind::ApiKeys, id, "API-key parent Surface");
+            return Ok(Some(
+                self.owner_tenant_id
+                    .map(str::to_string),
+            ));
         }
         let store = self
             .state
             .agent_surface_store
             .as_ref()
             .ok_or_else(|| unavailable("API-key parent Surface"))?;
-        let resource = store
+        Ok(store
             .get(id)
             .await
             .map_err(|error| internal("API-key parent Surface", error))?
-            .ok_or_else(|| inaccessible("API-key parent Surface"))?;
-        self.ensure(
-            resource.tenant_id.as_deref(),
-            ResourceKind::ApiKeys,
-            &resource.surface_id,
-            "API-key parent Surface",
-        )
+            .map(|surface| surface.tenant_id))
+    }
+
+    /// A provider key a surface derives a DID from must exist and have an owning surface, unless
+    /// the stored surface already named it, and that owning surface must be one this surface may
+    /// reference. A tenant surface names a key of a surface with no tenant only as it sends an
+    /// appliance-wide secret upstream. The token's API key pattern must match every key id.
+    async fn provider_keys(
+        &self,
+        ids: &ProviderKeyIds,
+    ) -> Result<(), SurfaceApiError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let owners = provider_key_owners(self.state).await?;
+        for secret_id in &ids.legacy_secrets {
+            self.legacy_secret(secret_id, &owners)
+                .await?;
+        }
+        for key_id in &ids.keys {
+            let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, key_id);
+            if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
+                return Err(inaccessible("API-key parent Surface"));
+            }
+            let Some(surface_ids) = owners.get(key_id) else {
+                if kept {
+                    continue;
+                }
+                return Err(inaccessible("API key"));
+            };
+            for surface_id in surface_ids {
+                let Some(tenant_id) = self
+                    .api_key_parent_tenant(surface_id)
+                    .await?
+                else {
+                    if kept {
+                        continue;
+                    }
+                    return Err(inaccessible("API-key parent Surface"));
+                };
+                if !can_reference_with_rule(
+                    self.owner_tenant_id,
+                    tenant_id.as_deref(),
+                    self.rule_for(ResourceKind::ApiKeys, key_id),
+                ) {
+                    return Err(inaccessible("API-key parent Surface"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A Caller Context API Key `secret_id` shaped like a key id, on a view whose inbound
+    /// Identity is From API Key, shares the DID of a key of that id. A new one is refused when
+    /// that key belongs to a surface this one may not reference, or to a surface with no tenant;
+    /// one the stored surface already named is kept under `warn`. An id no key has stays a
+    /// plain secret.
+    async fn legacy_secret(
+        &self,
+        secret_id: &str,
+        owners: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<(), SurfaceApiError> {
+        let rule = self.rule_for(ResourceKind::ApiKeys, secret_id);
+        for surface_id in owners
+            .get(secret_id)
+            .into_iter()
+            .flatten()
+        {
+            let Some(tenant_id) = self
+                .api_key_parent_tenant(surface_id)
+                .await?
+            else {
+                continue;
+            };
+            let breaks = !can_reference(self.owner_tenant_id, tenant_id.as_deref())
+                || crate::tenancy::breaks_tenant_isolation(self.owner_tenant_id, tenant_id.as_deref());
+            if breaks && rule.is_enforced() {
+                return Err(inaccessible("API-key parent Surface"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1413,6 +1542,9 @@ fn collect_effective_surface_references(
     if let Some(id) = endpoint_id(&surface.target.endpoint, "fabric://") {
         push_reference(references, ResourceKind::Gateways, id);
     }
+    if let Some(policy) = surface.agent_pay_policy() {
+        push_reference(references, ResourceKind::Gateways, &policy.payment_gateway_id);
+    }
 }
 
 /// The Target's and the Access Point's response custom metadata, both returned to the caller.
@@ -1549,6 +1681,274 @@ fn collect_identity_injection_references(
     }
 }
 
+/// The API Key Provider key ids a surface, or one of its views, derives a DID from (`keys`),
+/// and the Caller Context API Key `secret_id`s shaped like a key id on a view whose inbound
+/// Identity is From API Key (`legacy_secrets`), which a secret stored before the prefix was
+/// reserved can still carry. Both sorted and without duplicates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderKeyIds {
+    pub keys: Vec<String>,
+    pub legacy_secrets: Vec<String>,
+}
+
+impl ProviderKeyIds {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.legacy_secrets.is_empty()
+    }
+
+    pub(crate) fn all(&self) -> impl Iterator<Item = &String> + Clone {
+        self.keys
+            .iter()
+            .chain(&self.legacy_secrets)
+    }
+
+    fn add_view(
+        &mut self,
+        view: &AgentSurface,
+    ) {
+        use crate::source_auth::{ManagedIdentityConfig, SourceAuthConfig};
+        let mut push = |identity: Option<&ManagedIdentityConfig>| {
+            if let Some(ManagedIdentityConfig::FromApiKey { api_key_id: Some(id) }) = identity
+                && id.starts_with(crate::api_keys::KEY_ID_PREFIX)
+            {
+                self.keys.push(id.clone());
+            }
+        };
+        push(
+            view.identity_slots
+                .protected
+                .as_ref(),
+        );
+        push(
+            view.identity_slots
+                .external
+                .as_ref(),
+        );
+        push(
+            crate::config::agent_surface_compat::identity_injection_to_managed_identity(
+                &view.target.identity_injection,
+            )
+            .as_ref(),
+        );
+        for point in view
+            .transit
+            .iter()
+            .flat_map(|transit| &transit.points)
+        {
+            push(
+                point
+                    .managed_identity
+                    .as_ref(),
+            );
+        }
+        if matches!(view.inbound_identity(), Some(ManagedIdentityConfig::FromApiKey { .. })) {
+            for method in view
+                .access_point
+                .caller_authentication
+                .iter()
+                .flat_map(|authentication| &authentication.methods)
+            {
+                if let SourceAuthConfig::ApiKey(config) = method
+                    && config
+                        .secret_id
+                        .starts_with(crate::api_keys::KEY_ID_PREFIX)
+                {
+                    self.legacy_secrets
+                        .push(config.secret_id.clone());
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        self.keys.sort();
+        self.keys.dedup();
+        self.legacy_secrets
+            .retain(|id| !self.keys.contains(id));
+        self.legacy_secrets.sort();
+        self.legacy_secrets.dedup();
+        self
+    }
+}
+
+/// [`ProviderKeyIds`] of a surface in its base and every variant.
+pub(crate) fn provider_key_ids(surface: &AgentSurface) -> Result<ProviderKeyIds, SurfaceApiError> {
+    let mut ids = ProviderKeyIds::default();
+    for view in resolved_views(surface)? {
+        ids.add_view(&view);
+    }
+    Ok(ids.finish())
+}
+
+/// [`ProviderKeyIds`] of a surface as served: a resolved view, which has no variants, is read in
+/// place; a surface with variants is read in every view.
+pub(crate) fn served_provider_key_ids(surface: &AgentSurface) -> Result<ProviderKeyIds, SurfaceApiError> {
+    if !surface.variants.is_empty() {
+        return provider_key_ids(surface);
+    }
+    let mut ids = ProviderKeyIds::default();
+    ids.add_view(surface);
+    Ok(ids.finish())
+}
+
+/// Why a stored surface's use of an API Key Provider key id is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderKeyIssueKind {
+    /// The key belongs to a surface the surface may not reference: another tenant's, or a
+    /// tenant's key on a surface with no tenant. A breach only when enforced, as a stored one is
+    /// kept serving under `warn`.
+    OtherTenant { enforced: bool },
+    /// A tenant surface names the key of a surface with no tenant; a breach only when enforced.
+    ApplianceKey { enforced: bool },
+    /// No key has this id; key ids are never reused, so its DID is no other key's.
+    MissingKey,
+    /// The surface owning the key no longer exists.
+    MissingOwner,
+    /// The API key store is unavailable, so the key's owner cannot be told.
+    StoreUnavailable,
+}
+
+impl ProviderKeyIssueKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OtherTenant { .. } => "other_tenant",
+            Self::ApplianceKey { .. } => "appliance_key",
+            Self::MissingKey => "missing_key",
+            Self::MissingOwner => "missing_owner",
+            Self::StoreUnavailable => "store_unavailable",
+        }
+    }
+
+    /// Whether the surface must not serve while it names the key.
+    pub(crate) fn is_breach(self) -> bool {
+        matches!(
+            self,
+            Self::StoreUnavailable | Self::OtherTenant { enforced: true } | Self::ApplianceKey { enforced: true }
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderKeyIssue {
+    pub key_id: String,
+    pub kind: ProviderKeyIssueKind,
+}
+
+/// Every API Key Provider key id a stored surface derives a DID from that it may not use, or
+/// whose key or owner is gone ([`judge_provider_keys`] on [`provider_key_ids`]).
+pub(crate) fn provider_key_verdict(
+    surface: &AgentSurface,
+    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    isolation: RuleMode,
+) -> Result<Vec<ProviderKeyIssue>, SurfaceApiError> {
+    Ok(judge_provider_keys(
+        surface.tenant_id.as_deref(),
+        &provider_key_ids(surface)?,
+        owners,
+        surface_tenants,
+        isolation,
+    ))
+}
+
+/// The issues of the key ids `ids` a surface of `tenant_id` names. A legacy secret is reported
+/// only when a key of that id belongs to a surface the surface may not reference, or to a
+/// surface with no tenant. `owners` is `None` when the API key store is unavailable;
+/// `surface_tenants` maps every stored surface id to its tenant.
+pub(crate) fn judge_provider_keys(
+    tenant_id: Option<&str>,
+    ids: &ProviderKeyIds,
+    owners: Option<&std::collections::HashMap<String, Vec<String>>>,
+    surface_tenants: &std::collections::HashMap<&str, Option<&str>>,
+    isolation: RuleMode,
+) -> Vec<ProviderKeyIssue> {
+    let mut issues = Vec::new();
+    let mut issue = |key_id: &str, kind| {
+        issues.push(ProviderKeyIssue {
+            key_id: key_id.to_string(),
+            kind,
+        })
+    };
+    let Some(owners) = owners else {
+        for key_id in ids.all() {
+            issue(key_id, ProviderKeyIssueKind::StoreUnavailable);
+        }
+        return issues;
+    };
+    for (key_id, legacy) in ids
+        .keys
+        .iter()
+        .map(|key_id| (key_id, false))
+        .chain(
+            ids.legacy_secrets
+                .iter()
+                .map(|key_id| (key_id, true)),
+        )
+    {
+        let Some(owner_ids) = owners.get(key_id) else {
+            if !legacy {
+                issue(key_id, ProviderKeyIssueKind::MissingKey);
+            }
+            continue;
+        };
+        for owner_id in owner_ids {
+            let Some(owner_tenant) = surface_tenants.get(owner_id.as_str()) else {
+                if !legacy {
+                    issue(key_id, ProviderKeyIssueKind::MissingOwner);
+                }
+                continue;
+            };
+            if !can_reference(tenant_id, *owner_tenant) {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::OtherTenant {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
+            } else if crate::tenancy::breaks_tenant_isolation(tenant_id, *owner_tenant) {
+                issue(
+                    key_id,
+                    ProviderKeyIssueKind::ApplianceKey {
+                        enforced: isolation.is_enforced(),
+                    },
+                );
+            }
+        }
+    }
+    issues
+}
+
+/// The surfaces owning each API Key Provider key, by key id.
+pub(crate) async fn provider_key_owners(
+    state: &IdentityApiState
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
+    provider_key_owners_in(
+        state
+            .api_key_store
+            .as_deref()
+            .ok_or_else(|| unavailable("API key"))?,
+    )
+    .await
+}
+
+/// [`provider_key_owners`] read from `store`.
+pub(crate) async fn provider_key_owners_in(
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
+    let mut owners: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for key in store
+        .list_all()
+        .await
+        .map_err(|error| internal("API key", error))?
+    {
+        owners
+            .entry(key.key_id)
+            .or_default()
+            .push(key.agent_id);
+    }
+    Ok(owners)
+}
+
 fn push_reference(
     references: &mut Vec<SurfaceReferenceKey>,
     kind: ResourceKind,
@@ -1677,7 +2077,7 @@ fn endpoint_id<'a>(
         .filter(|id| !id.is_empty())
 }
 
-fn inaccessible(label: &str) -> SurfaceApiError {
+pub(super) fn inaccessible(label: &str) -> SurfaceApiError {
     SurfaceApiError::BadRequest(format!("{label} reference is not accessible"))
 }
 
@@ -1685,7 +2085,7 @@ fn unavailable(label: &str) -> SurfaceApiError {
     SurfaceApiError::InternalError(format!("{label} store is not configured"))
 }
 
-fn internal(
+pub(super) fn internal(
     label: &str,
     error: impl std::fmt::Display,
 ) -> SurfaceApiError {
@@ -1839,6 +2239,72 @@ mod tests {
             RuleMode::Enforce
         );
         assert_eq!(reference_rule(&[], RuleMode::Warn, ResourceKind::Secrets, "old"), RuleMode::Enforce);
+    }
+
+    #[test]
+    fn provider_key_ids_are_collected_from_every_slot_that_derives_a_did_from_them() {
+        let from_api_key =
+            |id: &str| serde_json::from_value(serde_json::json!({"type": "from_api_key", "api_key_id": id})).unwrap();
+        let mut surface = AgentSurface::default();
+        surface.identity_slots.inbound = Some(from_api_key("atgk_inbound"));
+        surface
+            .identity_slots
+            .protected = Some(from_api_key("atgk_shared"));
+        surface
+            .identity_slots
+            .external = Some(from_api_key("plain-secret"));
+        surface
+            .target
+            .identity_injection =
+            serde_json::from_value(serde_json::json!({"type": "from_api_key", "api_key_id": "atgk_injected"})).unwrap();
+        surface.access_point.caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({"methods": [
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "atgk_shared"},
+                {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Other"}, "secret_id": "atgk_secret"}
+            ]}))
+            .unwrap(),
+        );
+        surface.transit = Some(crate::config::agent_surface::TransitConfig {
+            points: vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "partner-id", "alias": "partner", "target_endpoint": "https://partner.example",
+                    "protocol": "a2a", "managed_identity": {"type": "from_api_key", "api_key_id": "atgk_point"},
+                    "identity_injection": {"inject_vp": true, "type": "from_api_key", "api_key_id": "atgk_point_injection"}
+                }))
+                .unwrap(),
+            ],
+            outbound_listen_address: None,
+            shared: Default::default(),
+        });
+
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "variant-id", "alias": "variant", "name": "Variant",
+            "overrides": {"identity_slots": {"protected": {"type": "from_api_key", "api_key_id": "atgk_variant"}}}
+        }]))
+        .unwrap();
+
+        let keys = provider_key_ids(&surface)
+            .unwrap()
+            .keys;
+
+        assert_eq!(keys, ["atgk_injected", "atgk_point", "atgk_shared", "atgk_variant"]);
+        assert!(
+            provider_key_ids(&AgentSurface::default())
+                .unwrap()
+                .is_empty()
+        );
+        let mut untyped = AgentSurface::default();
+        untyped
+            .target
+            .identity_injection = serde_json::from_value(
+            serde_json::json!({"type": "from_mtls", "certificate_id": "cert", "api_key_id": "atgk_unread"}),
+        )
+        .unwrap();
+        assert!(
+            provider_key_ids(&untyped)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn legs_surface() -> AgentSurface {
@@ -3178,6 +3644,16 @@ mod tests {
                     serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
                         "payment_policy": {"type": "mpp", "enabled": true, "realm": "vendor",
                         "secret_key": "$MPP_SECRET_KEY"}}}),
+                ),
+                format!("{binding}consent_mode external charges callers nothing"),
+            ),
+            (
+                "an agent-pay payment",
+                target_surface(
+                    only.clone(),
+                    serde_json::json!({"target": {"endpoint": "https://203.0.113.30/mcp",
+                        "payment_policy": {"type": "agent_pay", "payment_gateway_id": "pay-gw",
+                        "payment_surface_id": "pay-1"}}}),
                 ),
                 format!("{binding}consent_mode external charges callers nothing"),
             ),

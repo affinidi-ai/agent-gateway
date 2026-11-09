@@ -439,6 +439,72 @@ async fn named_surface_exists_for_route_targeting_mock(
     create_a2a_surface_for_route_targeting_mock(world, &route, Some(&surface_name)).await;
 }
 
+/// Creates A2A surfaces served on `/<surface name>`, each paired with its
+/// managed agent. Every route is registered before the gateway starts, since
+/// it serves only the routes it started with. The managed agents share the
+/// primary mock target; the first one is the primary collaborator.
+async fn create_named_a2a_surfaces_targeting_mock(
+    world: &mut SurfaceWorld,
+    surfaces: &[(&str, &str)],
+) {
+    let routes: Vec<String> = surfaces
+        .iter()
+        .map(|(surface_name, _)| format!("/{surface_name}"))
+        .collect();
+    let route_refs: Vec<&str> = routes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let (_, primary_agent) = surfaces[0];
+    register_primary_managed_agent(world, primary_agent);
+    mock_agent_available_as_target(world);
+    crate::steps::when::configure_unseeded_routes(world, route_refs[0], &route_refs);
+    for ((surface_name, agent_name), route) in surfaces.iter().zip(&routes) {
+        if *agent_name != primary_agent {
+            world
+                .actors
+                .register_target_with_key(agent_name, TargetActorKind::ManagedAgent, surface_name);
+        }
+        world
+            .actors
+            .register_surface_with_target(surface_name, "a2a", Some(route), Some(agent_name));
+        let mut payload = crate::steps::when::build_primary_target_surface_payload(world, route).await;
+        payload["name"] = serde_json::json!(surface_name);
+        crate::steps::when::create_surface(world, payload).await;
+        let response = world
+            .admin_response
+            .as_ref()
+            .expect("admin_response must be set after surface setup");
+        assert_eq!(
+            response.status, 201,
+            "surface setup should create surface {surface_name:?}, got status {} body {}",
+            response.status, response.body
+        );
+        remember_named_surface_under_test_id(world, surface_name);
+    }
+}
+
+#[given(expr = "A2A surfaces {string} and {string} exist with managed agent {string} as their target")]
+async fn named_surfaces_exist_targeting_one_agent(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+    agent_name: String,
+) {
+    create_named_a2a_surfaces_targeting_mock(world, &[(&first, &agent_name), (&second, &agent_name)]).await;
+}
+
+#[given(expr = "A2A surfaces {string} and {string} exist with managed agents {string} and {string} as their targets")]
+async fn named_surfaces_exist_targeting_two_agents(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+    first_agent: String,
+    second_agent: String,
+) {
+    create_named_a2a_surfaces_targeting_mock(world, &[(&first, &first_agent), (&second, &second_agent)]).await;
+}
+
 #[given(expr = "surface {string} maps inbound header {string} to A2A metadata field {string}")]
 async fn surface_maps_inbound_header_to_a2a_metadata(
     world: &mut SurfaceWorld,
@@ -891,6 +957,46 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
+#[given(expr = "Transit Point {string} admits {int} request(s) per minute from each caller")]
+fn transit_point_admits_requests_per_minute_from_each_caller(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    requests: u32,
+) {
+    transit_point_config_mut(world, &transit_point).per_caller_rate_limit_per_minute = Some(requests);
+}
+
+#[given(expr = "caller {string} has reached the per-caller limit of Transit Point {string}")]
+async fn caller_has_reached_the_per_caller_limit_of_transit_point(
+    world: &mut SurfaceWorld,
+    caller: String,
+    transit_point: String,
+) {
+    let admitted = transit_point_config_mut(world, &transit_point)
+        .per_caller_rate_limit_per_minute
+        .unwrap_or_else(|| panic!("Transit Point '{transit_point}' must limit each caller before one can reach it"));
+    let agent = world
+        .actors
+        .targets()
+        .values()
+        .find(|target| target.kind == TargetActorKind::ManagedAgent)
+        .map(|target| target.key.clone())
+        .expect("the surface must have a managed agent to call the Transit Point");
+    for request in 1..=admitted {
+        crate::steps::when::ask_for_tools_through_transit_point_with_its_token(world, &agent, &transit_point).await;
+        let response = world
+            .caller_response
+            .as_ref()
+            .expect("the admitted request has a response");
+        assert!(
+            (200..300).contains(&response.status),
+            "expected admitted request {request} of {admitted} from caller '{caller}' to succeed, got status {} with body {}",
+            response.status,
+            response.body
+        );
+    }
+}
+
 #[given(expr = "the appliance lets transit tokens live up to {int} seconds")]
 fn appliance_lets_transit_tokens_live_up_to(
     world: &mut SurfaceWorld,
@@ -954,8 +1060,6 @@ fn transit_point_has_a_policy_allowing_only_a_caller(
     transit_point: String,
     caller: String,
 ) {
-    use sha2::Digest as _;
-
     let rego = format!(
         r#"package surface.policy
 
@@ -963,10 +1067,10 @@ default allow := false
 
 allow if {{
     input.transit.caller.verified
-    input.transit.caller.user_identity_hash == "{:x}"
+    input.transit.caller.user_identity_hash == "{}"
 }}
 "#,
-        sha2::Sha256::digest(caller.as_bytes())
+        caller_identity_hash(&caller)
     );
     transit_point_config_mut(world, &transit_point).policy = Some(PolicyDefinitionFixture::new(
         format!("bdd-transit-caller-{}", uuid::Uuid::new_v4()),
@@ -1143,14 +1247,19 @@ async fn managed_agent_holds_a_transit_token_living(
     ));
 }
 
+/// The identity hash a transit token carries for `caller` in these scenarios.
+pub(crate) fn caller_identity_hash(caller: &str) -> String {
+    use sha2::Digest as _;
+
+    format!("{:x}", sha2::Sha256::digest(caller.as_bytes()))
+}
+
 #[given(expr = "managed agent {string} holds a transit token naming caller {string}")]
 async fn managed_agent_holds_a_transit_token_naming_a_caller(
     world: &mut SurfaceWorld,
     agent_name: String,
     caller: String,
 ) {
-    use sha2::Digest as _;
-
     managed_agent_holds_the_access_points_transit_token(world, agent_name).await;
     let token = world
         .transit_token
@@ -1161,7 +1270,7 @@ async fn managed_agent_holds_a_transit_token_naming_a_caller(
         &token,
         serde_json::json!({
             "sub": format!("did:web:{caller}.example"),
-            "user_identity_hash": format!("{:x}", sha2::Sha256::digest(caller.as_bytes())),
+            "user_identity_hash": caller_identity_hash(&caller),
         }),
     ));
 }
@@ -1323,7 +1432,7 @@ allow if {{
     ));
 }
 
-fn transit_point_config_mut<'a>(
+pub(crate) fn transit_point_config_mut<'a>(
     world: &'a mut SurfaceWorld,
     transit_point: &str,
 ) -> &'a mut SurfaceTransitPointConfig {
@@ -2156,6 +2265,36 @@ fn managed_agent_is_failing_with_status(
     world.set_primary_target_response(response);
 }
 
+#[given(expr = "REST API {string} answers a weather report whose temperature is {string}")]
+fn rest_api_answers_weather_report_with_temperature(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    temperature: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        serde_json::json!({"city": "Paris", "temperature": temperature, "conditions": "Sunny"}),
+    );
+}
+
+#[given(expr = "REST API {string} is failing with status {int}")]
+fn rest_api_is_failing_with_status(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    status: u16,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    let mut response = MockResponse::json(serde_json::json!({ "error": format!("mock REST API status {status}") }));
+    response.status = status;
+    set_target_response_for_actor(world, &rest_api_name, response);
+}
+
 #[given(expr = "managed agent {string} responds with header {string} set to {string}")]
 fn managed_agent_responds_with_header(
     world: &mut SurfaceWorld,
@@ -2194,6 +2333,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
             audiences: Vec::new(),
+            forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
             header_name: "X-API-Key".to_string(),
@@ -2495,7 +2635,9 @@ fn configure_target_auth_secret(
     });
 }
 
-#[given(expr = "the surface injects target authentication from secret {string} with value {string} as header {string}")]
+#[given(
+    expr = "the gateway authenticates to the managed agent with secret {string} holding {string} in header {string}"
+)]
 fn surface_injects_target_auth_secret(
     world: &mut SurfaceWorld,
     secret_id: String,
@@ -2523,7 +2665,7 @@ fn configure_missing_target_auth(
 }
 
 #[given(
-    expr = "the surface injects target authentication from missing secret {string} as header {string} with fallback {string}"
+    expr = "the gateway authenticates to the managed agent with missing secret {string} in header {string}, falling back to {string}"
 )]
 fn surface_injects_missing_target_auth(
     world: &mut SurfaceWorld,
@@ -2614,11 +2756,19 @@ fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
     target_auth_provider(world).token_status = 401;
 }
 
-#[given(expr = "the target authentication fallback is {string}")]
-fn target_auth_provider_fallback(
+#[given(expr = "the gateway's authentication to the managed agent falls back to {string}")]
+fn target_auth_fallback(
     world: &mut SurfaceWorld,
     fallback: String,
 ) {
+    if let Some(secret) = world
+        .surface_config
+        .target_auth
+        .as_mut()
+    {
+        secret.fallback = fallback;
+        return;
+    }
     target_auth_provider(world).fallback = fallback;
 }
 
@@ -2650,13 +2800,32 @@ fn surface_belongs_to_tenant(
     world.surface_config.tenant_id = Some(tenant_id);
 }
 
+/// Warn is the default mode of every credential rule, so this states it rather than setting it.
+#[given(expr = "the gateway only warns on the credential rule {string}")]
+fn gateway_warns_on_credential_rule(
+    world: &mut SurfaceWorld,
+    rule: String,
+) {
+    assert!(
+        !world
+            .surface_config
+            .enforced_credential_rules
+            .contains(&rule),
+        "the credential rule {rule:?} is already enforced"
+    );
+    assert!(world.infra.is_none(), "the credential rule must be set before the gateway starts");
+}
+
 #[given(expr = "the gateway enforces the credential rule {string}")]
 fn gateway_enforces_credential_rule(
     world: &mut SurfaceWorld,
     rule: String,
 ) {
     assert!(
-        matches!(rule.as_str(), "token_endpoint_https" | "tenant_credential_isolation"),
+        matches!(
+            rule.as_str(),
+            "token_endpoint_https" | "tenant_credential_isolation" | "target_https" | "target_source_auth"
+        ),
         "unknown credential rule {rule:?}"
     );
     assert!(
@@ -2791,7 +2960,12 @@ async fn vp_audit_log_contains_policy_decision(world: &mut SurfaceWorld) {
         "schedule_meeting".to_string(),
     )
     .await;
-    wait_for_audit_events(world, "/v1/audit?limit=100").await;
+    crate::steps::then::expect_vp_audit_record(world, "the setup request's policy decision", |event| {
+        event["event"]
+            .get("policy_decision")
+            .is_some()
+    })
+    .await;
 }
 
 pub(crate) async fn enable_every_audit_event(world: &mut SurfaceWorld) {
@@ -3087,7 +3261,7 @@ async fn surface_has_response_policy_allowing_content_type(
 }
 
 #[given(expr = "managed agent {string} response contains the agent-identity extension")]
-fn managed_agent_response_has_identity(
+async fn managed_agent_response_has_identity(
     world: &mut SurfaceWorld,
     agent_name: String,
 ) {
@@ -3111,6 +3285,13 @@ fn managed_agent_response_has_identity(
             }
         }
     });
+    // Surfaces created through the admin API start the mock before this step.
+    if let Some(infra) = world.infra.as_ref() {
+        infra
+            .mock
+            .set_response(MockResponse::json(response.clone()))
+            .await;
+    }
     set_primary_target_response(world, response);
 }
 

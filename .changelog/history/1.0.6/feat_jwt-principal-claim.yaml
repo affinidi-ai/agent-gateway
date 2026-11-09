@@ -1,0 +1,31 @@
+branch: feat/jwt-principal-claim
+changes:
+  added:
+    - timestamp: '2026-11-04T13:00:00Z'
+      title: Name the claim that identifies a caller on a JWT verification strategy
+      description: >-
+        A JWT verification strategy has an optional principal_claim, default sub, whose value names
+        the caller. It is the subject of the caller's identity hash, so the transit token's
+        user_identity_hash, the keys of delegated credentials and the connect hint follow it. Token
+        exchange, jwt-bearer redemption and the modern consent sign-in check read the subject from
+        it too. A claim other than sub adds its
+        name to the identity hash and to the MCP bound subject, so one value in two claims is two
+        callers; a strategy without the setting keeps every hash it gave. Use oid for Microsoft
+        Entra, whose sub differs for each application, with the v2 issuer. A token without the
+        claim, or with a value that is not a non-empty string, names no caller. The claim is fixed
+        when the strategy is created: an update that names another claim is refused and one that
+        leaves it out keeps it. Claims that name a token, client, tenant, session or lifetime are
+        refused. A strategy stored with a refused claim, such as one edited by hand, is logged when
+        it loads, a surface save warns of it, and JWT source authentication through it answers 500.
+        An issuer names callers by one claim in a tenant scope for token exchange: STS refuses its
+        tokens while two strategies of the scope name it by different claims, and creating or
+        updating such a strategy, or saving a surface that accepts the issuer through both, warns.
+        For a
+        strategy naming another claim, the audit record keeps the token's sub and adds the claim's
+        value as principal, which the Credentials audit tab shows. The Edit JWT Verification
+        Strategy page has the field, read-only after creation.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -47,7 +47,7 @@ still accepts. Resource patterns limit which resource ids a token can reach, not
 holds, so they do not change the map: a resource-scoped token is still refused on unscoped writes
 even when the map says `true`. The response carries `Cache-Control: no-store` and
 `Vary: Authorization, Cookie` because its body depends on the caller's credential, which arrives in
-the `Authorization` header or the `session_token` cookie.
+the `Authorization` header or the `__Host-session_token` cookie.
 
 [`get_permissions`](../src/auth_manager/permissions.rs) defines the frontend-exposed key set. It is
 not an enumeration of every backend `Feature`: route-only capabilities can be enforced without
@@ -60,7 +60,7 @@ keys to `issuers.*`, so they are not valid access-token scopes.
 client can validate a bearer token and show who it is acting as. It takes no parameters and only reads
 the identity the session-auth middleware already resolved, so a caller can only inspect its own
 credential. It accepts a session token or an `agpat_` personal access token, sent as
-`Authorization: Bearer` or in the `session_token` cookie (the header wins when both are present). A
+`Authorization: Bearer` or in the `__Host-session_token` cookie (the header wins when both are present). A
 PAT's resource-scope headers (such as `x-external-account`) are not required or evaluated on this
 route. It returns `401` when the credential is missing, invalid or revoked, or its user is not
 approved, and `403` when:
@@ -97,6 +97,61 @@ The x402 (`/api/admin/x402/...`) and MPP (`/api/admin/mpp/...`) admin routers re
 both routers deny every request instead of serving unauthenticated. The built-in defaults grant
 `payments.view` and `payments.retry` to `poweruser` and `payments.edit` / `payments.delete` to
 `administrator`; the base `user` role holds no payments permission.
+
+The delegated payment ledger routes `GET /api/admin/payments`, `GET /api/admin/payments/{id}`,
+`GET /api/admin/payments/summary`, `GET /api/admin/payments/breakers/{payment_gateway_id}` and
+`GET /api/admin/payments/audit` (the `payment` records of the VP Audit Log, without their signed
+credential) also require `payments.view`, and deny every request when no auth backend is configured. A
+tenant-scoped caller sees only the rows of its own tenant's surfaces: a row recorded for an
+operator's surface or another tenant's is left out of the list, its `{id}` returns `404`, and
+no case status is asked for it, because a row names the resource, the transaction and the case
+of someone else's payer. An operator caller, with no tenant, sees every row. A resource-scoped
+token sees only the rows of the surfaces its scope allows. The summary counts only those rows; a
+tenant caller or scoped token reads a breaker only for a payment gateway one of them names, and
+an audit record only for a surface one of them belongs to (records of other surfaces are for
+operator callers). Each row records one payment gate call and is kept for
+`payment_ledger.retention_days` (seven by default) in `payments_ledger/`, beside the MPP transaction store (`_storage/payments_ledger/` by
+default), as append-only hourly segment files; the list serves the newest 50,000 rows. The detail
+of a held payment adds the live `case_status` agent-pay reports for its case, for a caller who
+may read the row. See [Taking the payment](CONFIGURATION_REFERENCE.md#taking-the-payment).
+
+## Gateways and payment gateways
+
+A remote gateway is either a peer (`role: "peer"`) or a payment gateway (`role: "payment"`,
+agent-pay). The two are managed by separate permissions and separate routes, so `gateways.*`
+never reaches a payment gateway and `payment_gateways.*` never reaches a peer:
+
+| Routes | Permissions |
+| --- | --- |
+| `/v1/gateways`, `/v1/gateways/{id}/…`, `/v1/gateways/{gateway_id}/connection-points`, `/v1/connection-points/…` | `gateways.view` / `gateways.edit` / `gateways.delete` |
+| `/v1/payment-gateways`, `/v1/payment-gateways/connect-via-oob`, `/v1/payment-gateways/{id}` (get, put, delete), `/v1/payment-gateways/{id}/ping`, `…/surfaces`, `…/surfaces/{surface_id}/payment-manifest`, `…/info` | `payment_gateways.view` / `payment_gateways.edit` / `payment_gateways.delete` |
+| `GET /v1/gateways/payment-providers` (the Surface Builder's payment gateway list) and `GET /v1/gateways/payment-logos/{sha256}` (payment method logos) | `payment_gateways.view` |
+| `POST /v1/gateways/{id}/payment-role` (turn a peer into a payment gateway) | `gateways.edit` and `payment_gateways.edit` |
+
+A route answers `404` for a gateway of the other role
+([`role_scope.rs`](../src/gateways/role_scope.rs)), and `/v1/connection-points/…` answers `404`
+for, and never lists, a payment gateway's connection points, so they can't be deleted, disabled or
+reconnected there; both checks run after the permission check, so a caller
+without the permission learns nothing about which ids exist. The built-in defaults grant
+`payment_gateways.view` to `user` and `payment_gateways.edit` / `payment_gateways.delete` to
+`administrator`. A token's resource scope treats both as `gateways` resources.
+
+## Maintenance and welcome routes
+
+`POST /v1/logs/truncate` removes the rotated `agent-gateway*.log*` files and keeps the current
+`agent-gateway.log`; `POST /v1/metrics/truncate` drops stored metrics older than the retention
+period. Both need `settings.edit`. Without an auth backend neither route is registered.
+
+`GET` and `PUT /v1/notifications/user-welcome-template` read and change the notification a user
+receives when their account is approved, and `POST /v1/notifications/send-welcome` sends a
+notification with the given title and text to the user named in the request. All three need
+`users.approve` and, without an auth backend, refuse every request with `403`.
+
+The built-in defaults grant `settings.edit` and `users.approve` to `administrator` only. A personal
+access token with feature scopes needs the permission among its scopes; one created without scopes
+follows its owner's role. The other `/v1/notifications` routes act on the caller's own
+notifications and need only a session (see
+[`INTEGRATIONS.md`](INTEGRATIONS.md#in-dashboard-notifications)).
 
 ## Dashboard log lines
 

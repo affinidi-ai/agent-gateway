@@ -81,7 +81,15 @@ pub fn transit_policy_definition_id(surface_id: &str) -> String {
 
 fn secret_fixtures(surface: &SurfaceSpec) -> Vec<SecretFixture> {
     let mut secrets = Vec::new();
-    if let Some(source_auth) = &surface.source_auth {
+    let transit_source_auth = surface
+        .transit_points
+        .iter()
+        .filter_map(|tp| tp.source_auth.as_ref());
+    for source_auth in surface
+        .source_auth
+        .iter()
+        .chain(transit_source_auth)
+    {
         let SourceAuthSpec::ApiKey { secret_id, valid_key, .. } = source_auth;
         secrets.push(SecretFixture::new(secret_id, valid_key));
     }
@@ -206,7 +214,9 @@ fn build_surface_fixture(
                     "listen_path": format!("/transit/{}", tp.alias),
                     "require_transit_token": tp.require_transit_token,
                 });
-                if !tp.require_transit_token {
+                if let Some(SourceAuthSpec::ApiKey { header_name, secret_id, .. }) = &tp.source_auth {
+                    point["source_auth"] = api_key_source_auth_method_json(header_name, secret_id);
+                } else if !tp.require_transit_token {
                     point["allow_unauthenticated_callers"] = serde_json::json!(true);
                 }
                 // A Transit Point only mints the surface's managed identity
@@ -214,10 +224,8 @@ fn build_surface_fixture(
                 if surface.managed_identity {
                     point["identity_injection"] = serde_json::json!({ "inject_vp": true });
                 }
-                // For `fabric://` targets the agent card is fetched from the
-                // gateway's own outbound listener. Pin the transit point's
-                // `listen_address` to that listener so card-fetch resolves to
-                // a reachable URL (mirrors what the dashboard persists).
+                // Pin a `fabric://` Transit Point to the gateway's outbound
+                // listener, as the dashboard persists it.
                 if let (true, Some(port)) = (
                     tp.target_endpoint
                         .starts_with("fabric://"),
