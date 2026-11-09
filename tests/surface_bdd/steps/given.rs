@@ -2332,7 +2332,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
         "JWT Bearer" => SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
-            audiences: Vec::new(),
+            audiences: vec!["bdd-test-audience".to_string()],
             forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {

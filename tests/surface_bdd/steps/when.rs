@@ -1977,6 +1977,7 @@ fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
 /// The audience a caller's token names: the resource of the surface's route
 /// when it publishes protected resource metadata, so a test token fails only
 /// for the flaw it was made with, and none otherwise.
+/// When neither exists, uses the configured JWT Bearer audiences.
 fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
     match world
         .surface_config
@@ -1987,7 +1988,17 @@ fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
             crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
             world.surface_config.route
         )),
-        None => serde_json::json!([]),
+        None => {
+            // Check if JWT Bearer is configured with audiences
+            if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig { audiences, .. })) =
+                &world.surface_config.source_auth
+            {
+                if !audiences.is_empty() {
+                    return serde_json::json!(audiences);
+                }
+            }
+            serde_json::json!([])
+        }
     }
 }
 
@@ -2115,7 +2126,9 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
     send_request_with_bearer_token(world, token).await;
 }
 
