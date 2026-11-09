@@ -811,7 +811,9 @@ pub(super) async fn call(
                     .is_none_or(|value| !validator.is_valid(value))
             })
     {
-        return Ok(CallToolResult::error(vec![ContentBlock::text("REST response does not match the tool output schema")]));
+        return Ok(CallToolResult::error(vec![ContentBlock::text(
+            "REST response does not match the tool output schema",
+        )]));
     }
     result.structured_content = structured;
     Ok(result)

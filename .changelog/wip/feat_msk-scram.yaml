@@ -9,7 +9,9 @@ changes:
         SCRAM-SHA-512), so the gateway can publish to Amazon MSK with SASL_SSL and
         SCRAM-SHA-512. TLS verifies the brokers against the host's system CA store. An
         endpoint without them keeps working as before: auth_type sasl is SASL_PLAINTEXT
-        with PLAIN, anything else plaintext, except that a legacy sasl endpoint stored without a password is now refused. A save with an unknown protocol or mechanism,
+        with PLAIN (plaintext when it has no sasl_username), anything else plaintext, except
+        that a legacy sasl endpoint stored without a password or with an empty sasl_username
+        is now refused, since Kafka never accepted either. A save with an unknown protocol or mechanism,
         or a SASL protocol without a mechanism, username or password, is refused with 400.
         The cached producer is rebuilt when either field changes. The dashboard's endpoint
         editor replaces its Authentication select with a Security protocol select offering all
