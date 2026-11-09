@@ -26,10 +26,13 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   hot adoption.
 - **Control-key rotation needs the gateway stopped.** The running connector holds the key in
   memory and the trust agent supersedes a DID's session when it authenticates again.
-- **The Compose and Kubernetes examples were validated for syntax, not run with containers.**
-- **There is no behaviour scenario for the bootstrap** under `tests/features/`: it needs a trust
-  agent step library. It is covered by unit tests against a mock trust agent and by live runs
-  against the real binaries (see _What was verified, and how_ in the runbook).
+- **The Kubernetes pod was validated for syntax only.** The Compose example is run with real
+  containers by `scripts/vta-bundled-compose-e2e.sh`; no cluster was available for the pod.
+- **Compose restarts must be ordered.** The sidecar joins the gateway's network namespace, so
+  restart the gateway first and the sidecar second. A plain `docker compose restart` fails
+  the sidecar and Docker's restart policy does not bring it back.
+- **The images need more than 8 GB to build.** `vti-specs-core` and the `agent-gateway` crate
+  are killed by the out-of-memory killer in an 8 GB Docker VM; 16 GB builds both.
 
 ## Tenancy and publication
 
@@ -40,8 +43,6 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   so a token a surface signs with a tenant's own trust agent key may not verify through it.
 - **Issuer records keep their private keys on the gateway's disk** and are not part of the
   key inventory.
-- **No behaviour scenario for the tenant check** on a surface's `signing.connection_id`
-  (covered by unit tests).
 
 ## Transports
 

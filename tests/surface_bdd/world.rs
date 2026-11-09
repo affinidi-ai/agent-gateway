@@ -105,6 +105,8 @@ pub struct SurfaceWorld {
     pub surface_under_test_id: Option<String>,
     /// Trust agent connection ids the gateway assigned, by the name a scenario gave them.
     pub trust_agent_connections: HashMap<String, String>,
+    /// The mock bundled trust agent of a scenario about the first-start bootstrap.
+    pub bundled_trust_agent: Option<crate::bdd_support::trust_agent::MockTrustAgent>,
     pub admin_response: Option<RecordedResponse>,
     /// The delegation audit trail as last read through the admin API.
     pub delegation_audit_trail: Option<RecordedResponse>,
@@ -179,6 +181,7 @@ impl SurfaceWorld {
             created_surface_id: None,
             surface_under_test_id: None,
             trust_agent_connections: HashMap::new(),
+            bundled_trust_agent: None,
             admin_response: None,
             delegation_audit_trail: None,
             surface_lookup_response: None,

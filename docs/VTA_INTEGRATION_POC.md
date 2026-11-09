@@ -325,15 +325,29 @@ gateway on it yourself). No code path differs.
 
 ### What was verified, and how
 
-`scripts/vta-bundled-e2e.sh` repeats it: it runs the real `vta` and `agent-gateway`
-binaries from zero in temporary directories (`VTA_BIN=… ./scripts/vta-bundled-e2e.sh`;
-it needs a built VTA and `make config-debug` once, and is not part of CI). It covers: first start with no manual step; restart keeping the same identity and
-creating no second key; a revoked gateway reported and **not** re-enrolled by
-the entrypoint; re-grant and restart recovering; a wiped sidecar reported as
-`vta_replaced` and recovered with `--vta-rebootstrap --yes`; a real
-`acl/swap-key` rotation; and a rotation interrupted after the swap finished at
-the next start. The Compose and Kubernetes files were validated for syntax only,
-not run with containers.
+Three layers, from the outside in:
+
+- **Real containers.** `scripts/vta-bundled-compose-e2e.sh` runs the shipped Compose example
+  with real images (`GATEWAY_IMAGE=… VTA_IMAGE=… ./scripts/vta-bundled-compose-e2e.sh`; not
+  part of CI). It checks first start with no manual grant, the shared loopback and the
+  shared-volume permissions, that nothing else on the network reaches the trust agent, and a
+  restart that keeps the same identity. It found three faults the other layers could not: the
+  gateway never received its mandatory backup key or certificates, the shared `/bootstrap`
+  volume was unwritable by both users, and a plain `docker compose restart` fails the sidecar.
+- **Real binaries.** `scripts/vta-bundled-e2e.sh` runs the real `vta` and `agent-gateway`
+  binaries from zero in temporary directories (`VTA_BIN=… ./scripts/vta-bundled-e2e.sh`; needs a
+  built VTA and `make config-debug` once; not part of CI). It covers: first start with no
+  manual step; restart keeping the same identity and creating no second key; a revoked gateway
+  reported and **not** re-enrolled by the entrypoint; re-grant and restart; and a real
+  `acl/swap-key` rotation. Also checked by hand: a wiped sidecar reported as `vta_replaced`
+  and recovered with `--vta-rebootstrap --yes`, and a rotation interrupted after the swap
+  finished at the next start.
+- **Behaviour scenarios and unit tests.** `tests/features/surface/trust_agent_bootstrap.feature`
+  (a connected, a waiting, a refused and an over-granted trust agent, through the real gateway
+  binary and a mock trust agent) and `trust_agent_signing.feature` (the tenant check), plus
+  unit tests against a mock trust agent for every state and recovery.
+
+The Kubernetes pod was validated for syntax only; no cluster was available.
 
 ## Bring up a local VTA (for the live e2e)
 
