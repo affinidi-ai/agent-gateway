@@ -13,6 +13,14 @@ changes:
         always long enough on an instrumented coverage run, where the suite reported no
         revocation at all. It now waits for the two to arrive, up to five seconds, and asserts
         the same thing about them. No behaviour changed.
+    - timestamp: '2026-11-09T14:30:00Z'
+      title: Retry the gateway-to-gateway image pulls when a registry refuses one
+      description: >-
+        The gateway-to-gateway scenarios pull a mediator image and a Valkey image before they
+        run, and both registries throttle anonymous pulls per source address, which hosted CI
+        runners share. One refusal failed the whole job. Each pull is now attempted up to four
+        times, waiting 15, 30 and 60 seconds, and the job fails only if every attempt is
+        refused.
   removed: []
   security: []
   breaking: []
