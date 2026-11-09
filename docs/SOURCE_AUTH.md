@@ -1312,7 +1312,7 @@ owning surface is gone, removes its record whether or not a stored surface names
 is not there answers `404` "API key not found: <key id>". On this node every surface naming the
 key is checked again on its next request and refused as `missing_key` (`503`) in either mode;
 other nodes see it at their next check (see below). Such a surface's Identity reads as
-Unconfigured until it names another key. The dashboard asks the operator to confirm a delete
+Unconfigured until it names another key, which gives the surface a new DID. The dashboard asks the operator to confirm a delete
 first; the API itself takes no confirmation.
 
 #### Provider keys when a surface goes live
@@ -1362,7 +1362,10 @@ keys is checked again on its next request.
 - In either mode, when the gateway boots Active or a Standby node becomes Active, it revokes
   the keys of surfaces deleted before deletes revoked them: every active key whose owning
   surface no longer exists, under the actor `surface-delete`, keeping the keys. It logs one
-  `INFO` line with the count; each revoked key is logged as a delete revokes it. It never
+  `INFO` line per key, `Revoked API key` with its `key_id` and `actor=surface-delete`, and one
+  with the count. Its revocations are permanent: no API restores a revoked key, and rolling back
+  the gateway does not either. A surface it leaves not ready gets a new DID when it is brought
+  back (see below). It never
   revokes a key whose owner any of these holds: a file in the agent surface folder, by name,
   whether or not it can be read; the agent surface store, at any status; the static gateway
   configuration; the DynamoDB configuration source, read again for this; or an API Key
@@ -1384,7 +1387,12 @@ keys is checked again on its next request.
 - In either mode, a new surface cannot take an id whose key folder holds any key record,
   readable or not, such as the kept keys of a deleted surface: the create answers `400` "Surface
   ID '…' is not available". The create reads only the key folder of that id, from disk; when
-  that folder cannot be read it answers `503` "API key store is unavailable". `POST
+  that folder cannot be read it answers `503` "API key store is unavailable". To free the id
+  of a deleted surface, delete each of its kept keys (`DELETE /v1/api-keys/{surface id}/{key
+  id}`) as a caller that may [clean up orphaned keys](ACCESS_TOKENS.md#orphaned-api-keys); a
+  tenant-, resource- or header-gated PAT cannot. A create with that id then answers `201`, and
+  the new surface derives new DIDs from its own new keys. A record the gateway cannot read is
+  not listed and cannot be deleted through the API, so it keeps the id taken. `POST
   /v1/surfaces` is the only way to create a surface that checks the id: a surface template is
   applied in the dashboard and saved through it, and `PUT` and `PATCH` answer `404` for an id
   with no surface. A surface that reaches the gateway another way is not checked: a file written
@@ -1422,7 +1430,9 @@ keys is checked again on its next request.
 - While the keys of a surface's key folder cannot be loaded, for example when the folder cannot
   be read, a key id that no loaded folder holds is judged `store_unavailable`, never as a missing
   key, since that folder may hold it: a surface naming it is not ready in either mode, and a key
-  id found in a loaded folder is judged as usual. A save that adds a reference to such an id
+  id found in a loaded folder is judged as usual. Surfaces whose key ids are all found keep
+  serving. A single key record that cannot be parsed or decrypted is dropped instead, so its key
+  reads as missing (`api_key_missing`). A save that adds a reference to such an id
   answers `503` "API key store is unavailable"; one the stored surface already named is kept.
   While any stored surface names a key id, a tenant reassignment of any resource, and its
   impact preview, are refused with the same message until the folder can be loaded. The gateway logs the folders once, by name.
@@ -1456,7 +1466,20 @@ only). The agent card preview of such a surface reports `unsupported_reason: not
 fetches nothing. The surface response's `access_point_status` stays `ready`, and the Audit Log
 reason is the one a closed surface without source authentication gets, so neither says why. The
 `WARN` line with `rule="provider_key_tenant"` always does; the credential policy report lists the
-surface too, but only at boot and on reload.
+surface too, but only at boot and on reload. Per surface, a `blocking` entry in
+[`api_key_references`](#closed-and-public-access-points) names the key that keeps it from
+serving, `serving_status` is `not_serving` while this node refuses it, and the Surface Builder
+rings the Identity that names a blocking key.
+
+A surface refused during a key folder or store outage serves again once the read succeeds, with
+the same DID. A surface refused for a revoked, missing or other surface's key, or under
+`enforce` for `missing_owner`, serves again once it names an active key of its own: select one
+in place of the refused key, or add a key to the surface and name it. Either
+gives the surface a new DID, since the DID is derived from the key id and every new key gets a
+new id. A revoked key cannot be rotated or restored, and a deleted one cannot come back. A
+recreated surface gets new DIDs too. Update whatever is bound to the old DID, such as Trust
+Registry and Trust Recorder entries, Trust Check lists, policies that match it, and partners
+that allow it.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,

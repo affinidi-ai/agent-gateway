@@ -313,8 +313,9 @@ Ownership changes are administrator-only: `GET
 reference would become incompatible, including a tenant surface or credential provider that
 would end up sending an appliance-wide secret or credential provider upstream (an existing
 one is only refused when `tenant_credential_isolation` is `enforce`). While a surface names an
-API Key Provider key id and no API key store is configured, both the impact read and the
-reassignment answer `409` "API key store is not configured"; see
+API Key Provider key id, both the impact read and the reassignment answer `409` "API key store
+is not configured" when no API key store is configured, and `409` "API key store is
+unavailable" while a key folder cannot be loaded; see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-keys). The self Gateway and built-in Surface
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
 child API keys and Connection Points move with their parent. A credential provider that any

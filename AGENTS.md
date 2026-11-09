@@ -169,7 +169,7 @@ The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
-says surfaces using the key become Unconfigured and stop serving, and deletes only after
+says surfaces using the key stop working until another key is picked, and deletes only after
 **Delete API key** in that dialog. Revoking one opens the same dialog component worded for
 revoke: surfaces using the key stop serving, the key can't be restored and a new key gives the
 surface a new DID; it revokes only after **Revoke API key**, and a failed revoke shows an error
