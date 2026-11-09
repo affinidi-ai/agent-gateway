@@ -24090,26 +24090,29 @@ mod fabric_send_tests {
         // Calls the forward handler directly, so the receive-side source auth 401 is skipped.
         let result = super::handle_fabric_request(
             peer.state.clone(),
-            "Fabric A2A",
-            axum::http::Method::POST,
-            "https://gateway.example/a2a"
-                .parse()
-                .unwrap(),
-            axum::http::HeaderMap::new(),
-            "127.0.0.1:12345".to_string(),
-            std::time::Instant::now(),
-            super::ConnectionGuard::new(None, None),
-            axum::body::Bytes::from(body.to_string()),
-            "trace-1".to_string(),
-            None,
-            None,
-            None,
-            None,
-            crate::mcp::meta::McpMetadataContext::default(),
-            None,
-            None,
-            None,
-            None,
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
         )
         .await;
 
