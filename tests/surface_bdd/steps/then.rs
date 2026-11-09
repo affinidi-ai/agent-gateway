@@ -961,6 +961,16 @@ fn response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWo
     assert_json_bodies_equal(get_response_body_value(world), &expected, "caller credential refusal");
 }
 
+#[then("the MCP response says only that the caller credential is missing or invalid")]
+fn mcp_response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    assert_eq!(body["jsonrpc"], "2.0", "MCP refusal must be a JSON-RPC 2.0 envelope: {body}");
+    assert_eq!(
+        body["error"]["message"], "Caller credential missing or invalid",
+        "MCP caller credential refusal: {body}"
+    );
+}
+
 #[then("the operator can still read the stored surface through the admin API")]
 fn fetching_surface_by_id_returns_stored_configuration(world: &mut SurfaceWorld) {
     let lookup = get_surface_lookup_response(world);
