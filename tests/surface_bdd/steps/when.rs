@@ -308,12 +308,23 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     };
     let temp_dir = create_project_temp_dir("surface-bdd-").expect("create surface temp dir");
 
-    let (jwks_server, jwks_files) = if matches!(
-        world
-            .surface_config
-            .source_auth,
-        Some(SurfaceSourceAuthConfig::JwtBearer(_))
-    ) {
+    let transit_point_uses_jwt = world
+        .surface_config
+        .transit_points
+        .iter()
+        .any(|point| {
+            point
+                .source_auth
+                .as_ref()
+                .is_some_and(|source_auth| source_auth["type"] == "jwt_bearer")
+        });
+    let (jwks_server, jwks_files) = if transit_point_uses_jwt
+        || matches!(
+            world
+                .surface_config
+                .source_auth,
+            Some(SurfaceSourceAuthConfig::JwtBearer(_))
+        ) {
         let jwks_server = JwksServer::start().await;
         let issuer = jwks_server.base_url.clone();
 
@@ -2171,6 +2182,19 @@ async fn request_with_token_issued_to_client(
     send_request_with_bearer_token(world, token).await;
 }
 
+#[when(expr = "the caller sends a request to the surface with the token issued to agent {string}")]
+async fn request_with_token_issued_to_agent(
+    world: &mut SurfaceWorld,
+    agent: String,
+) {
+    let token = world
+        .sts_issued_tokens
+        .get(&agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
+    send_request_with_bearer_token(world, token).await;
+}
+
 const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
 const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 
@@ -2743,6 +2767,31 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_header(
         &format!("/transit/{transit_point}"),
         body,
         vec![(header, value)],
+    )
+    .await;
+}
+
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with the token issued to agent {string}"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    agent: String,
+) {
+    let token = world
+        .sts_issued_tokens
+        .get(&agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        vec![("authorization".to_string(), format!("Bearer {token}"))],
     )
     .await;
 }

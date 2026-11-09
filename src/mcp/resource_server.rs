@@ -18,6 +18,7 @@ pub struct McpResourceServerConfig {
 pub struct ResourceServerAuthContext {
     pub issuer: std::sync::Arc<crate::identity::VCIssuer>,
     pub keys: std::sync::Arc<crate::jwt_bearer::JwksClient>,
+    pub sts_token_origins: Option<std::sync::Arc<dyn crate::sts::token_origin::StsTokenOrigins>>,
 }
 
 #[derive(Clone)]
@@ -167,8 +168,16 @@ impl ResourceServerAuthContext {
         profile
             .validate_network(network)
             .map_err(|_| ResourceTokenError::Unavailable)?;
+        let reach = self
+            .sts_token_origins
+            .as_deref()
+            .map(|origins| crate::sts::token_origin::TokenReach {
+                origins,
+                surface: &proxy.name,
+                tenant_id: proxy.tenant_id.as_deref(),
+            });
         authorization
-            .authenticate(headers, profile, &self.issuer, self.keys.clone())
+            .authenticate(headers, profile, &self.issuer, self.keys.clone(), reach)
             .await
             .map(Some)
     }
@@ -544,18 +553,21 @@ impl McpResourceServerConfig {
         protected_resource::validate_endpoint(&self.resource, public_origins, path)
     }
 
+    /// Verifies the caller's resource token and, with `reach`, refuses one
+    /// minted for a managed connection that may not reach the surface.
     pub async fn authenticate(
         &self,
         headers: &axum::http::HeaderMap,
         profile: &McpIssuerProfile,
         issuer: &crate::identity::VCIssuer,
         keys: std::sync::Arc<crate::jwt_bearer::JwksClient>,
+        reach: Option<crate::sts::token_origin::TokenReach<'_>>,
     ) -> Result<crate::source_auth::AuthenticatedIdentity, ResourceTokenError> {
         let jwks = issuer
             .signing_public_jwks()
             .await
             .map_err(|_| ResourceTokenError::Unavailable)?;
-        self.verify_token(headers, profile, &jwks, keys)
+        self.verify_token(headers, profile, &jwks, keys, reach)
             .await
     }
 
@@ -565,6 +577,7 @@ impl McpResourceServerConfig {
         profile: &McpIssuerProfile,
         jwks: &Value,
         keys: std::sync::Arc<crate::jwt_bearer::JwksClient>,
+        reach: Option<crate::sts::token_origin::TokenReach<'_>>,
     ) -> Result<crate::source_auth::AuthenticatedIdentity, ResourceTokenError> {
         let mut authorization = headers
             .get_all(header::AUTHORIZATION)
@@ -610,6 +623,15 @@ impl McpResourceServerConfig {
             .map_err(|_| ResourceTokenError::Unavailable)?
             .as_secs();
         self.validate_verified_claims(profile, &claims, now)?;
+        if let Some(reach) = reach {
+            reach
+                .ensure(&claims)
+                .await
+                .map_err(|refusal| match refusal {
+                    crate::sts::token_origin::ReachRefusal::Unavailable => ResourceTokenError::Unavailable,
+                    crate::sts::token_origin::ReachRefusal::Refused => ResourceTokenError::Invalid,
+                })?;
+        }
         let subject = claims
             .get("sub")
             .and_then(Value::as_str)
@@ -855,20 +877,20 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         assert_eq!(
             config
-                .verify_token(&headers, &profile, &jwks, keys.clone())
+                .verify_token(&headers, &profile, &jwks, keys.clone(), None)
                 .await,
             Err(ResourceTokenError::Missing)
         );
         headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", sign("at+jwt"))).unwrap());
         let identity = config
-            .verify_token(&headers, &profile, &jwks, keys.clone())
+            .verify_token(&headers, &profile, &jwks, keys.clone(), None)
             .await
             .unwrap();
         assert_eq!(identity.jwt_claims().unwrap()["sub"], "user");
         headers.append(header::AUTHORIZATION, HeaderValue::from_static("Bearer second"));
         assert_eq!(
             config
-                .verify_token(&headers, &profile, &jwks, keys.clone())
+                .verify_token(&headers, &profile, &jwks, keys.clone(), None)
                 .await,
             Err(ResourceTokenError::Invalid)
         );
@@ -886,11 +908,95 @@ mod tests {
             headers.insert(header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
             assert_eq!(
                 config
-                    .verify_token(&headers, &profile, &jwks, keys.clone())
+                    .verify_token(&headers, &profile, &jwks, keys.clone(), None)
                     .await,
                 Err(ResourceTokenError::Invalid)
             );
         }
+    }
+
+    /// The origin of each test token: `alpha` belongs to `tenant-a`, `global`
+    /// to no tenant, and `broken` cannot be read.
+    struct TenantOrigins;
+
+    #[async_trait::async_trait]
+    impl crate::sts::token_origin::StsTokenOrigins for TenantOrigins {
+        async fn origin(
+            &self,
+            claims: &Value,
+        ) -> anyhow::Result<crate::sts::token_origin::TokenOrigin> {
+            use crate::sts::token_origin::TokenOrigin;
+            Ok(match claims["client_id"].as_str() {
+                Some("alpha") => TokenOrigin::Connection {
+                    tenant_id: Some("tenant-a".into()),
+                },
+                Some("global") => TokenOrigin::Connection { tenant_id: None },
+                Some("broken") => anyhow::bail!("unreadable"),
+                _ => TokenOrigin::UnknownConnection,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resource_token_is_accepted_only_from_a_connection_that_may_reach_the_surface() {
+        use base64::Engine as _;
+        use ed25519_dalek::Signer as _;
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let jwks = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": "key-1", "x": encoding.encode(signing.verifying_key().as_bytes())}]});
+        let keys = std::sync::Arc::new(crate::jwt_bearer::JwksClient::new());
+        let config = McpResourceServerConfig {
+            resource: "https://gateway.example/mcp/".into(),
+            scopes: vec!["read".into()],
+        };
+        let profile = McpIssuerProfile {
+            issuer: "https://gateway.example/oauth2/mcp".into(),
+        };
+        let bearer = |client_id: Option<&str>| {
+            let mut claims = json!({"iss": profile.issuer, "sub": "user", "aud": config.resource, "exp": chrono::Utc::now().timestamp() + 60, "scope": "read"});
+            if let Some(client_id) = client_id {
+                claims["client_id"] = json!(client_id);
+            }
+            let header =
+                encoding.encode(serde_json::to_vec(&json!({"alg": "EdDSA", "typ": "at+jwt", "kid": "key-1"})).unwrap());
+            let payload = encoding.encode(serde_json::to_vec(&claims).unwrap());
+            let content = format!("{header}.{payload}");
+            let signature = encoding.encode(
+                signing
+                    .sign(content.as_bytes())
+                    .to_bytes(),
+            );
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {content}.{signature}")).unwrap(),
+            );
+            headers
+        };
+        let verify = |client_id: Option<&'static str>, tenant_id: Option<&'static str>| {
+            let (config, profile, jwks, keys) = (&config, &profile, &jwks, keys.clone());
+            let headers = bearer(client_id);
+            async move {
+                let reach = crate::sts::token_origin::TokenReach {
+                    origins: &TenantOrigins,
+                    surface: "surface-b",
+                    tenant_id,
+                };
+                config
+                    .verify_token(&headers, profile, jwks, keys, Some(reach))
+                    .await
+                    .map(|identity| identity.jwt_claims().unwrap()["sub"].clone())
+            }
+        };
+
+        assert_eq!(verify(Some("alpha"), Some("tenant-a")).await, Ok(json!("user")));
+        assert_eq!(verify(Some("alpha"), None).await, Ok(json!("user")));
+        assert_eq!(verify(Some("global"), Some("tenant-b")).await, Ok(json!("user")));
+        assert_eq!(verify(Some("alpha"), Some("tenant-b")).await, Err(ResourceTokenError::Invalid));
+        assert_eq!(verify(Some("deleted"), Some("tenant-a")).await, Err(ResourceTokenError::Invalid));
+        assert_eq!(verify(None, Some("tenant-a")).await, Err(ResourceTokenError::Invalid));
+        assert_eq!(verify(Some("broken"), Some("tenant-a")).await, Err(ResourceTokenError::Unavailable));
     }
 
     #[test]

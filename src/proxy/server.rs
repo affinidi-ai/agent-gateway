@@ -1321,6 +1321,9 @@ pub async fn build_port_router(
                         mcp_router.layer(axum::Extension(crate::mcp::resource_server::ResourceServerAuthContext {
                             issuer: issuer.clone(),
                             keys: Arc::new(crate::jwt_bearer::JwksClient::new()),
+                            sts_token_origins: source_auth_middleware
+                                .as_ref()
+                                .and_then(|middleware| middleware.sts_token_origins()),
                         }));
                 }
                 app = app.merge(mcp_router);

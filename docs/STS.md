@@ -100,6 +100,12 @@ nested as a second actor). A **legacy ID-JAG with no `act`** falls back to the
 redeeming `client_id` as the implicit actor, so old grants redeem unchanged.
 `IdJagClaims.act: Option<Value>` is extracted by `validate_id_jag`.
 
+Every access token and ID-JAG also carries `connection_id`, the record id of the
+managed connection it was minted for. Unlike `client_id`, which an administrator can
+rename and which can be reused once its connection is deleted, the record id never
+changes, so surfaces resolve a token's connection by it (see
+[Tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)).
+
 ## Token-exchange order
 
 In `handlers.rs`, `handle_token_exchange` runs: validate params → authenticate
@@ -258,6 +264,11 @@ Per-connection controls:
   `external_urls`. Every grant runs this ownership check: token exchange,
   ID-JAG issuance and jwt-bearer redemption, whether `allowed_audiences` is
   empty or lists the resource.
+  JWT Bearer audiences, static ones and surface agent DIDs alike, are not
+  owned: nothing shows that a surface serves a string it names, and surfaces
+  of several tenants may share one managed DID, so owning them would let one
+  tenant block another's minting. A token minted for one is refused where it
+  is used instead (see [Tenant check of STS tokens](SOURCE_AUTH.md#tenant-check-of-sts-tokens)).
 - `allowed_scopes`
 - `allowed_subject_token_types` — matched against the declared
   `subject_token_type`, except that an ID-JAG-typed token counts as `id-jag`.

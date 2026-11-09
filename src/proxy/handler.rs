@@ -2306,7 +2306,19 @@ async fn proxy_charged_request(
                 return Ok(authorization.challenge(error));
             }
             match authorization
-                .authenticate(&headers, profile, issuer, middleware.jwks_client())
+                .authenticate(
+                    &headers,
+                    profile,
+                    issuer,
+                    middleware.jwks_client(),
+                    middleware.token_reach(
+                        &channel_name,
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
+                )
                 .await
             {
                 Ok(identity) => Some(identity),
@@ -2376,6 +2388,10 @@ async fn proxy_charged_request(
                 surface_id: &state.surface.surface_id,
                 variant_id: state
                     .active_variant_id
+                    .as_deref(),
+                tenant_id: state
+                    .surface
+                    .tenant_id
                     .as_deref(),
             };
             let verified = if selection.ambiguous {
