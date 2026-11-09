@@ -93,6 +93,11 @@ pub struct SurfaceConfigBuilder {
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
+    /// `index.html` for every path no other route takes, as a deployed dashboard does.
+    pub serves_dashboard: bool,
+    /// Channel, MCP proxy and redirect prefixes `gateway.json` adds to the surface's.
+    pub gateway_prefixes: Vec<GatewayPrefixFixture>,
     /// API key records stored before the gateway starts.
     pub stored_api_keys: Vec<StoredApiKeyFixture>,
     /// Further stored surfaces, disabled, by id.
@@ -103,6 +108,14 @@ pub struct SurfaceConfigBuilder {
     pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The gateway starts in Standby mode.
     pub starts_standby: bool,
+}
+
+/// A prefix the operator adds to `gateway.json`.
+#[derive(Debug, Clone)]
+pub enum GatewayPrefixFixture {
+    Channel(String),
+    McpProxy(String),
+    Redirect { prefix: String, target: String },
 }
 
 /// An API key record stored before the gateway starts.
@@ -196,6 +209,8 @@ impl Default for SurfaceConfigBuilder {
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
+            serves_dashboard: false,
+            gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),
             other_stored_surfaces: Vec::new(),
             protected_identity_api_key_id: None,

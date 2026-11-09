@@ -716,7 +716,7 @@ fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-sta
 
 ## Payments page
 
-`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown on
+`/x402payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown on
 `payments.view` whether or not `agent_pay_delegation` is on (see _Feature flags_), is one list of payments, with no tabs, chart or audit trail view, and reads the
 append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
 `outcome` from the filter) and shows one row per payment check with an outcome badge; a
@@ -754,7 +754,7 @@ so a 401 expires the session. A
 read-only **Legacy x402/MPP** list appears below the payments only while the old
 x402/MPP endpoints still return rows: one row per transaction (the verification and
 settlement summaries merged, the settlement giving the status) with the x402 amount scaled
-by the token's decimals and shown in dollars. `/x402payments` redirects here and keeps its query string and hash. Test ids:
+by the token's decimals and shown in dollars. `/payments` is left free for gateway channels, which older configs put there. Test ids:
 `page-payments`, `payments-outcome-filter`, `payments-filter-input`, `payments-refresh-button`,
 `payments-row-<id>`, `payments-surface-link-<id>`, `payments-held-case-<id>`,
 `payments-details-button-<id>`, `payments-detail-modal`, `payments-detail-dismiss-button`,
@@ -1493,7 +1493,7 @@ Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFl
   one (`templateTakesPayments`); the Payment element's gateway picker shows no Add link
   (`addGatewayLink={null}`). A surface that already has a Payment element keeps it, rendered and
   editable, so opening and saving it never drops its `payment_policy`. The Payments page is not
-  gated: its sidebar entry and `/payments` (and `/x402payments`, which redirects to it) need only
+  gated: its sidebar entry and `/x402payments` need only
   `payments.view`, so the ledger and the legacy x402/MPP list stay readable with the flag off;
   only its empty state changes, naming the flag instead of the Payment element.
   Like `mediator_federation`, it is

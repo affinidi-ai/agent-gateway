@@ -4315,9 +4315,17 @@ fn warning_lines_containing(
     world: &SurfaceWorld,
     text: &str,
 ) -> Vec<String> {
+    log_lines_containing(world, "WARN", text)
+}
+
+fn log_lines_containing(
+    world: &SurfaceWorld,
+    level: &str,
+    text: &str,
+) -> Vec<String> {
     gateway_log(world)
         .lines()
-        .filter(|line| line.contains("WARN") && line.contains(text))
+        .filter(|line| line.contains(level) && line.contains(text))
         .map(str::to_string)
         .collect()
 }
@@ -4341,6 +4349,27 @@ fn gateway_log_has_no_warning(
 ) {
     let lines = warning_lines_containing(world, &text);
     assert!(lines.is_empty(), "the gateway log has warnings containing {text:?}: {lines:?}");
+}
+
+#[then(expr = "the gateway log has an error containing {string}")]
+fn gateway_log_has_error(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    assert!(
+        !log_lines_containing(world, "ERROR", &text).is_empty(),
+        "the gateway log has no error containing {text:?}:\n{}",
+        gateway_log(world)
+    );
+}
+
+#[then(expr = "the gateway log has no error containing {string}")]
+fn gateway_log_has_no_error(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let lines = log_lines_containing(world, "ERROR", &text);
+    assert!(lines.is_empty(), "the gateway log has errors containing {text:?}: {lines:?}");
 }
 
 #[then(expr = "the startup report names the {word} {string} as breaking the rule {string} in {word} mode")]

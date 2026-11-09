@@ -155,16 +155,18 @@ spa_reserved_routes() {
   ' "$1"
 }
 
-# Fails when a channel or proxy prefix in <gateway_json> shadows a dashboard
-# page, which makes the gateway exit at startup with a fatal banner (see
-# spa_collision_banner in src/proxy/paths.rs). Catching it while the env is
-# prepared saves a build and a start cycle. Nothing is rewritten: the developer
-# renames the prefix.
+# Warns when a prefix in <gateway_json> shadows a dashboard page. The gateway
+# starts anyway but does not serve that prefix, and logs it (see
+# spa_collision_warning in src/proxy/paths.rs); warning while the env is
+# prepared says so before the first request goes missing. Nothing is rewritten:
+# the developer renames the prefix.
 #
 # The comparison matches the runtime's: the first path segment of the prefix,
 # lowercased, against the reserved list — so /svc/payments is fine and
-# /Payments/v1 is not. The prefixes are the ones NetworkConfig::proxy_prefixes
-# checks, every channel prefix plus every route of type "proxy".
+# /Payments/v1 is not. The prefixes are the ones
+# NetworkConfig::dashboard_shadowing_prefixes returns: every channel and MCP
+# proxy prefix, every route of type "proxy", and every route of type "redirect"
+# that has a target.
 #
 # Usage: check_reserved_dashboard_routes <gateway_json>
 check_reserved_dashboard_routes() {
@@ -193,10 +195,13 @@ check_reserved_dashboard_routes() {
   local prefixes
   if ! prefixes=$(jq -r '
     [ (.channels // [])[]?         | .prefix? ]
-    + [ (.routes // {}) | to_entries[]? | select(.value.type == "proxy") | .value.prefix? ]
+    + [ (.mcp_proxies // [])[]?    | .prefix? ]
+    + [ (.routes // {}) | to_entries[]?
+        | select(.value.type == "proxy" or (.value.type == "redirect" and .value.target != null))
+        | .value.prefix? ]
     | .[] | select(type == "string")
   ' "${gateway_json}"); then
-    echo "⚠️  Could not read channel and proxy prefixes from gateway.json — skipping the reserved dashboard route check"
+    echo "⚠️  Could not read the prefixes from gateway.json — skipping the reserved dashboard route check"
     return 0
   fi
 
@@ -217,17 +222,17 @@ check_reserved_dashboard_routes() {
   done <<< "${prefixes}"
 
   if [[ -n "${collisions}" ]]; then
-    echo "❌ Reserved dashboard routes are shadowed by ${gateway_json}:"
+    echo "⚠️  Reserved dashboard routes are shadowed by ${gateway_json}:"
     printf '%s' "${collisions}"
-    echo "   The gateway refuses to start in this state, because these routes would"
-    echo "   replace dashboard pages with proxy 404s."
-    echo "   Fix: rename each offending prefix (a channel's prefix, or the prefix of a"
-    echo "   proxy route, in that gateway.json) to one that is not a dashboard page,"
+    echo "   The gateway starts, but does not serve these prefixes, since they would"
+    echo "   answer those dashboard pages instead of the dashboard."
+    echo "   Fix: rename each prefix (of a channel, an MCP proxy, or a proxy or redirect"
+    echo "   route, in that gateway.json) to one that is not a dashboard page,"
     echo "   e.g. '/svc/<name>'. Clients calling it must use the new prefix."
-    exit 1
+    return 0
   fi
 
-  echo "✅ No channel or proxy prefix shadows a reserved dashboard route"
+  echo "✅ No prefix in gateway.json shadows a reserved dashboard route"
 }
 
 # Default ports for non-local targets (docker, etc.)

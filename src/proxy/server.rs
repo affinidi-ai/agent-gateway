@@ -992,11 +992,9 @@ pub async fn build_port_router(
         }
     }
 
-    // Note: SPA-route collision validation is performed once at startup in
-    // server::orchestrator before any port is spawned, where a hard exit can
-    // be issued. We intentionally do NOT re-run it here so a hot-reload that
-    // introduces a collision rejects the reload (caller logs the error) but
-    // does not kill the live process.
+    // A channel, MCP proxy, proxy or redirect prefix that would hide a dashboard
+    // page is not registered; startup and reload log each one it skips.
+    let hides_dashboard_page = |prefix: &str| crate::proxy::paths::shadowed_dashboard_page(prefix).is_some();
 
     // Merge DID router first (at root level) to ensure did:web routes are accessible
     if let Some(ref did_router_ref) = did_router {
@@ -1015,6 +1013,11 @@ pub async fn build_port_router(
     let mut regular_routes = Vec::new();
 
     for (route_name, route_config) in &network_config.routes {
+        if matches!(route_config.route_type, crate::config::RouteType::Proxy | crate::config::RouteType::Redirect)
+            && hides_dashboard_page(&route_config.prefix)
+        {
+            continue;
+        }
         if route_config.route_type == crate::config::RouteType::Static && route_config.fallback {
             fallback_routes.push((route_name, route_config));
         } else {
@@ -1201,7 +1204,11 @@ pub async fn build_port_router(
     }
 
     // Add proxy routes for each channel prefix
-    for channel_prefix in &network_config.channels {
+    for channel_prefix in network_config
+        .channels
+        .iter()
+        .filter(|channel| !hides_dashboard_page(&channel.prefix))
+    {
         info!("Adding channel proxy route '{}' at prefix: {}", channel_prefix.name, channel_prefix.prefix);
 
         // Register this prefix for OpenTelemetry tracing
@@ -1262,7 +1269,10 @@ pub async fn build_port_router(
         // Shared SSE session manager for all MCP proxy routes
         let sse_session_mgr = crate::mcp::sse_server::SseSessionManager::new(None);
 
-        for mcp_proxy_prefix in mcp_proxies {
+        for mcp_proxy_prefix in mcp_proxies
+            .iter()
+            .filter(|proxy| !hides_dashboard_page(&proxy.prefix))
+        {
             info!("Adding MCP proxy route '{}' at prefix: {}", mcp_proxy_prefix.name, mcp_proxy_prefix.prefix);
 
             // Register this prefix for OpenTelemetry tracing

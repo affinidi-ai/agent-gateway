@@ -530,6 +530,20 @@ pub struct ChannelRoutingConfigResponse {
     pub gateway_base_url: Option<String>,
 }
 
+/// The prefixes the gateway serves, for the Surface Prefix dropdown: one that
+/// would hide a dashboard page is not registered, so it is not offered.
+fn served_prefixes(prefixes: &[crate::config::network::ChannelPrefix]) -> Vec<ChannelPrefixInfo> {
+    prefixes
+        .iter()
+        .filter(|c| crate::proxy::paths::shadowed_dashboard_page(&c.prefix).is_none())
+        .map(|c| ChannelPrefixInfo {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            prefix: c.prefix.clone(),
+        })
+        .collect()
+}
+
 /// Get channel routing configuration
 pub async fn get_surface_routing_config(
     State(state): State<IdentityApiState>
@@ -540,35 +554,16 @@ pub async fn get_surface_routing_config(
         .load_network_config()
         .map_err(|e| AppError::InternalError(format!("Failed to load network configuration: {}", e)))?;
 
-    // Load MCP proxy paths from the top-level `mcp_proxies` location
-    let mcp_proxy_paths = network_config
-        .mcp_proxies
-        .as_ref()
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|c| ChannelPrefixInfo {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    prefix: c.prefix.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     let config = ChannelRoutingConfigResponse {
         available_listen_addresses: network_config.get_inbound_external_urls(),
         available_outbound_listen_addresses: network_config.get_outbound_external_urls(),
-        channel_path_prefix: network_config
-            .get_channel_prefix_configs()
-            .iter()
-            .map(|c| ChannelPrefixInfo {
-                id: c.id.clone(),
-                name: c.name.clone(),
-                prefix: c.prefix.clone(),
-            })
-            .collect(),
-        mcp_proxy_path_prefix: mcp_proxy_paths,
+        channel_path_prefix: served_prefixes(network_config.get_channel_prefix_configs()),
+        mcp_proxy_path_prefix: served_prefixes(
+            network_config
+                .mcp_proxies
+                .as_deref()
+                .unwrap_or_default(),
+        ),
         oauth_callback_route: network_config
             .oauth_callback_route
             .clone(),
@@ -762,4 +757,32 @@ pub async fn get_networking_config(
             .client_auth
             .clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::served_prefixes;
+    use crate::config::network::ChannelPrefix;
+
+    fn prefix(path: &str) -> ChannelPrefix {
+        ChannelPrefix {
+            id: path
+                .trim_start_matches('/')
+                .into(),
+            name: path
+                .trim_start_matches('/')
+                .into(),
+            prefix: path.into(),
+        }
+    }
+
+    #[test]
+    fn the_surface_prefix_dropdown_offers_only_the_prefixes_the_gateway_serves() {
+        let offered: Vec<String> = served_prefixes(&[prefix("/payments"), prefix("/settings"), prefix("/agents")])
+            .into_iter()
+            .map(|info| info.prefix)
+            .collect();
+        assert_eq!(offered, vec!["/payments", "/agents"]);
+        assert!(served_prefixes(&[prefix("/policies/v1")]).is_empty());
+    }
 }
