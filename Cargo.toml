@@ -15,7 +15,7 @@ keywords = ["agents", "gateway", "identity", "mcp", "security"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.49.0", features = ["full"] }
-tokio-util = "=0.7.18"
+tokio-util = "0.7.18"
 
 # HTTP server and client
 hyper = { version = "1.8.1", features = ["full"] }
@@ -120,7 +120,9 @@ sha256 = "1.6"
 hmac = "0.12"
 hex = "0.4"
 zeroize = { version = "1.8", features = ["derive"] }
-affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["agent-names"] }
+affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = [
+    "agent-names",
+] }
 affinidi-messaging-sdk = "0.30.1"
 trust-tasks-rs = "0.24.8"
 
@@ -202,13 +204,14 @@ x402-chain-solana = { version = "1.1.3", features = [
 alloy = "2.5"
 solana-sdk = "3.0.0"
 
-rmcp = { version = "1.0", features = [
-    "client",
-    "client-side-sse",
-    "transport-streamable-http-client",
+# Model types and the server side only. The gateway serves MCP through rmcp-openapi and
+# calls MCP endpoints with its own Streamable HTTP client (eventsource-stream, below), so
+# rmcp's client transports are left off.
+rmcp = "3.9"
+rmcp-openapi = "0.32.1"
+rust_decimal = { version = "1.42", default-features = false, features = [
+    "std",
 ] }
-rmcp-openapi = "0.28.0"
-rust_decimal = { version = "1.42", default-features = false, features = ["std"] }
 
 # Stream helpers for MCP Streamable HTTP transport
 eventsource-stream = "0.2.3"

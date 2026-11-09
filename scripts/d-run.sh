@@ -38,7 +38,9 @@ docker network create agent-network 2>/dev/null || echo "Network agent-network a
 
 docker rm -f "${agent_name}" 2>/dev/null || true
 
-docker run \
+# Only the container needs the master key, so it is read here, from the file the
+# Docker environment was encrypted with, and not exported to the scripts.
+AG_MASTER_KEY="$(cat "${envs_dir}/master_encryption_key" 2>/dev/null || true)" docker run \
     --name="${agent_name}" \
     --interactive \
     --network agent-network \
@@ -56,5 +58,6 @@ docker run \
     --env AWS_REGION \
     --env AG_IDENTITY_HASH_PEPPER \
     --env AG_BACKUP_ENCRYPTION_KEY \
+    --env AG_MASTER_KEY \
     --workdir /app \
     "${tag}"

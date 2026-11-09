@@ -190,7 +190,7 @@ www-rebuild: ## Delete $(WWW_DIR)/build, rebuild UI, and refresh local env confi
 # Config Commands
 # ==============================================================================
 
-config-certs: ## Prepare TLS certificates and local identity pepper for development
+config-certs: ## Prepare TLS certificates, the local identity pepper and the backup and master keys for development
 	@echo "$(BLUE)🔐 Setting up TLS certificates...$(NC)"
 	@AG_IDENTITY_PEPPER_FILE="$(AG_IDENTITY_PEPPER_FILE)" AG_BACKUP_KEY_FILE="$(AG_BACKUP_KEY_FILE)" ./scripts/_certs.sh
 	@echo "$(GREEN)✅ TLS certificates ready!$(NC)"
