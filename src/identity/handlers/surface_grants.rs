@@ -706,6 +706,7 @@ where
         saved: outcome,
         stored: Box::pin(written(surfaces, surface_id.to_string(), after.map(binding_scopes))),
         kept: Vec::new(),
+        provider_gone: false,
     };
     remove_changed_binding_grants(removal, current.as_ref(), after, Some(Arc::clone(&lock)), Some(outcome)).await?;
     let written = write().await;

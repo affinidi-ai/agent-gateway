@@ -46,6 +46,19 @@ changes:
         of vendor calls in flight was not bounded overall. It now finishes one binding's
         revocations before it goes on to the next, and stops between bindings once the node is
         no longer active.
+    - timestamp: '2026-11-09T00:00:00Z'
+      title: Keep revoking a deleted provider's grants that the vendor could not take
+      description: >-
+        A revocation kept pending now carries a copy of its provider's configuration, so a
+        revocation that could not reach the vendor when the provider was deleted is tried again
+        by the retry and the daily sweep instead of being forgotten. A vendor that answers 429 or
+        a 5xx is retried like one that is unreachable.
+    - timestamp: '2026-11-09T00:00:00Z'
+      title: Decide a provider delete on the provider as it is once the lock is held
+      description: >-
+        A provider delete that waited for the lock decided on the provider it had read before
+        waiting. It now reads the provider again, so a delete of a provider already removed answers
+        404, and two creates of one provider slug at the same moment no longer both succeed.
   removed: []
   security: []
   breaking: []

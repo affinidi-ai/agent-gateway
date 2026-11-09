@@ -1902,7 +1902,8 @@ revocation reached the vendor, whatever the vendor answered, or the grant was ot
 and forgotten when the change is not saved and the grant is put back. A gateway that stops while revocations are in flight, as in a deploy, tries them again
 when it starts and each time it becomes active, and the daily sweep tries any left. A revocation
 the sweep decides is kept the same way, as a pending one. A revocation that could not reach its vendor
-(`unreachable`, the 30-second limit included) is kept and tried again the same way, at most five
+(`unreachable`, the 30-second limit included) or that the vendor refused for now (`429` or a `5xx`,
+recorded `refused`) is kept and tried again the same way, at most five
 times in all: its `token_revoked` event ends `,retry:pending` while it will be tried again and
 `,retry:exhausted` on the last, after which its tokens stay valid until they expire or the person
 removes the app at the vendor. A pending revocation whose grant the vault holds again, with any
@@ -2048,7 +2049,9 @@ provider, and answers; the grants are revoked afterwards, on a task of their own
 that provider's grants. The same task then decides the revocations the vault kept for that
 provider's earlier removals, pending or deferred to the daily sweep, while it still holds the
 provider: none of its grants is stored any more, so each is revoked. One that cannot reach its
-vendor then is not tried again, since its provider is gone. The provider lock is held while the bindings are checked and the grants
+vendor then is kept with a copy of its provider's configuration, secret references only, taken
+when it was kept, and is tried again by the retry and the daily sweep after the provider is
+gone. A kept revocation of a provider deleted before that copy existed is forgotten by the sweep. The provider lock is held while the bindings are checked and the grants
 and the provider deleted, never while a vendor is called, so a vendor that is slow or hangs
 keeps no surface write waiting. Surface creates, updates and deletes of every tenant do wait
 while the provider's grants are read, deleted and kept for revocation, and while the

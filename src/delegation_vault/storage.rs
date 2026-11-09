@@ -17,6 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+use crate::credential_providers::CredentialProvider;
 use crate::storage::filesystem::{StorageBackend, uncached_storage};
 
 mod consent;
@@ -261,10 +262,12 @@ pub trait DelegationVaultStorage: Send + Sync {
     /// it can be decided: its provider's revocation ends the person's whole
     /// authorization, and the vault could not tell whether another grant of
     /// theirs still uses it. The daily sweep decides. Kept encrypted, and only
-    /// while at-rest encryption is active.
+    /// while at-rest encryption is active. `provider` is kept with it, to
+    /// decide it with once the provider is deleted.
     async fn defer_revocation(
         &self,
         _grant: DelegatedGrant,
+        _provider: Option<CredentialProvider>,
     ) -> Result<()> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
@@ -1972,9 +1975,10 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     async fn defer_revocation(
         &self,
         grant: DelegatedGrant,
+        provider: Option<CredentialProvider>,
     ) -> Result<()> {
         self.require_encryption()?;
-        let deferred = DeferredRevocation::new(grant, Utc::now(), Deferral::AuthorizationInUse);
+        let deferred = DeferredRevocation::new(grant, Utc::now(), Deferral::AuthorizationInUse).with_provider(provider);
         self.deferred_revocations
             .save_atomic(&deferred)
             .await

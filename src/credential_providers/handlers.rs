@@ -641,33 +641,6 @@ pub async fn create_provider(
         return resp;
     }
 
-    // A provider's slug is unique within its tenant, and among untenanted providers.
-    match state
-        .store
-        .find_by_provider_id(provider.tenant_id.as_deref(), &provider.provider_id)
-        .await
-    {
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("provider_id '{}' already exists", provider.provider_id)
-                })),
-            )
-                .into_response();
-        }
-        Ok(None) => {}
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                error = %e,
-                "Failed to check for duplicate provider_id"
-            );
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
-                .into_response();
-        }
-    }
-
     if let Err(error) =
         validate_provider_settings(&state, &provider, None, &TokenEgress::from_environment(), &context, &scope).await
     {
@@ -755,6 +728,35 @@ pub async fn create_provider(
     if let Err(error) = refuse_gone_secrets(&state, &provider).await {
         return error.into_response();
     }
+    static SLUG_CHECK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_create_at_a_time = SLUG_CHECK.lock().await;
+    // A provider's slug is unique within its tenant, and among untenanted providers.
+    match state
+        .store
+        .find_by_provider_id(provider.tenant_id.as_deref(), &provider.provider_id)
+        .await
+    {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("provider_id '{}' already exists", provider.provider_id)
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                target: "credential_delegation",
+                error = %e,
+                "Failed to check for duplicate provider_id"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Internal server error"})))
+                .into_response();
+        }
+    }
+
     match state
         .store
         .create(provider.clone())
@@ -1093,6 +1095,54 @@ pub async fn delete_provider(
         .0
 }
 
+/// Provider `id` as stored now, when the caller of `context` and `scope` may
+/// delete it, or the answer that refuses. Read again once the provider lock is
+/// held, as a tenant move or another delete may have changed it while the
+/// caller waited for the lock.
+async fn deletable_provider(
+    state: &CredentialProviderState,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<CredentialProvider, Box<Response>> {
+    let not_found = || {
+        Box::new(
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
+                .into_response(),
+        )
+    };
+    let existing = match state.store.get(id).await {
+        Ok(Some(provider)) => provider,
+        Ok(None) => return Err(not_found()),
+        Err(error) => {
+            return Err(Box::new(
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error.to_string()})))
+                    .into_response(),
+            ));
+        }
+    };
+    if !can_access(existing.tenant_id.as_deref(), tenant_context(context))
+        || !scope_allows_resource(
+            resource_scope(scope),
+            tenant_context(context),
+            ResourceKind::CredentialProviders,
+            &existing.id,
+        )
+    {
+        return Err(not_found());
+    }
+    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(context)) {
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(existing)
+}
+
 /// Delete provider `id` for the caller of `context` and `scope`, naming
 /// `actor` in the audit of its grants' revocations. Returns the answer and,
 /// when the provider had grants, the task that revokes them. The provider
@@ -1107,51 +1157,17 @@ async fn remove_provider(
     scope: &Option<Extension<PatResourceScope>>,
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> (Response, Option<tokio::task::JoinHandle<()>>) {
-    let existing = match state.store.get(id).await {
-        Ok(Some(provider)) => provider,
-        Ok(None) => {
-            return (
-                (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
-                    .into_response(),
-                None,
-            );
-        }
-        Err(error) => {
-            return (
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": error.to_string()})))
-                    .into_response(),
-                None,
-            );
-        }
-    };
-    if !can_access(existing.tenant_id.as_deref(), tenant_context(context))
-        || !scope_allows_resource(
-            resource_scope(scope),
-            tenant_context(context),
-            ResourceKind::CredentialProviders,
-            &existing.id,
-        )
-    {
-        return (
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Credential provider not found"})))
-                .into_response(),
-            None,
-        );
-    }
-    if !can_mutate(existing.tenant_id.as_deref(), tenant_context(context)) {
-        return (
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "credential provider is outside this token's permitted scope" })),
-            )
-                .into_response(),
-            None,
-        );
+    if let Err(refused) = deletable_provider(state, id, context, scope).await {
+        return (*refused, None);
     }
     // Held, with the task that deletes the provider's grants, until the
     // provider is deleted, so no surface write binds it after the check below
     // found it unbound.
     let bindings = Arc::new(crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await);
+    let existing = match deletable_provider(state, id, context, scope).await {
+        Ok(provider) => provider,
+        Err(refused) => return (*refused, None),
+    };
     if let Err(refused) = refuse_bound_provider(state, &existing, tenant_context(context), resource_scope(scope)).await
     {
         return (refused.into_response(), None);
@@ -1161,6 +1177,7 @@ async fn remove_provider(
         saved: outcome,
         stored: Box::pin(provider_deleted(Arc::clone(&state.store), id.to_string())),
         kept: Vec::new(),
+        provider_gone: true,
     };
     let revocations = match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
         Ok(revocations) => revocations,
@@ -3645,6 +3662,30 @@ mod external_provider_tests {
         assert_eq!(stored(&state).await.len(), 2);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_creates_of_one_slug_store_one_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let statuses = futures::future::join_all((0..8).map(|_| {
+            let state = state.clone();
+            async move {
+                create(&state, "tenant-a", create_request(|_| {}))
+                    .await
+                    .0
+            }
+        }))
+        .await;
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CREATED)
+                .count(),
+            1,
+            "{statuses:?}"
+        );
+        assert_eq!(stored(&state).await.len(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_keeps_an_external_providers_client_but_may_rename_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -3800,6 +3841,44 @@ mod external_provider_tests {
         answer_once_revoked(remove_provider(state, id, &tenant("tenant-a"), &None, None).await).await
     }
 
+    /// A delete decides on the provider as it is once it holds the lock: one
+    /// moved to another tenant while it waited is not deleted by the caller
+    /// who could reach it before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_that_waited_for_the_lock_decides_on_the_provider_as_it_is_then() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = stored(&state).await[0]
+            .id
+            .clone();
+        let holding = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
+        let deleting = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                remove_provider(&state, &id, &tenant("tenant-a"), &None, None)
+                    .await
+                    .0
+                    .status()
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!deleting.is_finished(), "the delete waits for the lock");
+        let mut moved = stored(&state).await.remove(0);
+        moved.tenant_id = Some("tenant-b".into());
+        state
+            .store
+            .update(moved)
+            .await
+            .unwrap();
+        drop(holding);
+
+        assert_eq!(deleting.await.unwrap(), StatusCode::NOT_FOUND);
+        assert_eq!(stored(&state).await.len(), 1, "the provider is kept");
+    }
+
     /// The `DELETE` route itself, answering without waiting for the
     /// revocations it starts.
     async fn delete_route(
@@ -3941,7 +4020,7 @@ mod external_provider_tests {
             let mut removed = crate::delegation_vault::grants::tests::grant(&key, token);
             removed.id = key.record_id();
             vault
-                .defer_revocation(removed)
+                .defer_revocation(removed, None)
                 .await
                 .unwrap();
         }
@@ -3979,7 +4058,7 @@ mod external_provider_tests {
             .vault
             .as_ref()
             .unwrap()
-            .defer_revocation(removed)
+            .defer_revocation(removed, None)
             .await
             .unwrap();
         crate::storage::filesystem::init_global_encryption(crate::config::EncryptionConfig::default()).unwrap();
@@ -4083,7 +4162,7 @@ mod external_provider_tests {
             .vault
             .as_ref()
             .unwrap()
-            .defer_revocation(removed)
+            .defer_revocation(removed, None)
             .await
             .unwrap();
 

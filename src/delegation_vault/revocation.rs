@@ -50,6 +50,9 @@ pub enum RevocationOutcome {
     Revoked,
     /// The authorization server answered another status.
     Refused,
+    /// The authorization server answered 429 or 5xx: it has not decided, so
+    /// the revocation is tried again. Audited as `refused`.
+    RefusedForNow,
     /// The endpoint could not be reached, or the egress policy refused it.
     Unreachable,
     /// The provider names no revocation endpoint.
@@ -66,7 +69,7 @@ impl RevocationOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Revoked => "revoked",
-            Self::Refused => "refused",
+            Self::Refused | Self::RefusedForNow => "refused",
             Self::Unreachable => "unreachable",
             Self::NotSupported => "not_supported",
             Self::ClientUnavailable => "client_unavailable",
@@ -118,6 +121,24 @@ impl GrantRevocation {
             access_token: None,
             reason: None,
         }
+    }
+
+    /// Whether a token could not be revoked for a reason that may pass: the
+    /// endpoint was unreachable or answered 429 or 5xx, or the client's secret
+    /// could not be resolved just now.
+    fn should_retry(&self) -> bool {
+        let passing = |outcome: RevocationOutcome| {
+            matches!(
+                outcome,
+                RevocationOutcome::Unreachable
+                    | RevocationOutcome::RefusedForNow
+                    | RevocationOutcome::ClientUnavailable
+            )
+        };
+        passing(self.outcome)
+            || self
+                .access_token
+                .is_some_and(passing)
     }
 
     fn skipped(reason: &'static str) -> Self {
@@ -211,7 +232,10 @@ fn record_revocation(
             reason = revocation.reason,
             "A delegated grant is removed without revoking it at its authorization server"
         ),
-        RevocationOutcome::Refused | RevocationOutcome::Unreachable | RevocationOutcome::ClientUnavailable => {
+        RevocationOutcome::Refused
+        | RevocationOutcome::RefusedForNow
+        | RevocationOutcome::Unreachable
+        | RevocationOutcome::ClientUnavailable => {
             tracing::warn!(
                 target: "credential_delegation",
                 surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
@@ -274,6 +298,9 @@ pub struct ChangeOutcome {
     /// read before the change, which a provider's delete decides once it was
     /// saved ([`decide_kept`]).
     pub kept: Vec<DeferredRevocation>,
+    /// The change deletes the grants' provider: once it is saved, no other
+    /// grant of it is stored, so none is kept to be told apart from them.
+    pub provider_gone: bool,
 }
 
 /// Delete each of `grants`, as read, from the vault, which ends its release at
@@ -313,6 +340,9 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         .as_mut()
         .map(|outcome| std::mem::take(&mut outcome.kept))
         .unwrap_or_default();
+    let provider_gone = outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.provider_gone);
     let task = crate::audit::producer::spawn_audited(async move {
         let mut deleted = Vec::with_capacity(grants.len());
         let mut failure = None;
@@ -331,7 +361,7 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         let refused = failure.is_some();
         // The caller may be gone; what follows goes ahead all the same.
         let _ = report.send(failure);
-        let kept = keep_pending(revoker.vault.as_ref(), deleted).await;
+        let kept = keep_pending(revoker.vault.as_ref(), &revoker.providers, deleted).await;
         let revoke = match outcome {
             Some(_) if refused => false,
             Some(ChangeOutcome { saved, stored, .. }) => match saved.await {
@@ -343,11 +373,11 @@ pub async fn delete_then_revoke<Hold: Send + 'static>(
         if !revoke {
             let lost = put_back(&vault, kept, &revoker).await;
             drop(hold);
-            decide_each(lost, &revoker, None).await;
+            decide_each(lost, &revoker, None, false).await;
             return;
         }
         drop(hold);
-        decide_each(kept, &revoker, None).await;
+        decide_each(kept, &revoker, None, provider_gone).await;
         if !earlier.is_empty() {
             decide_kept(&vault, earlier, &revoker, chrono::Utc::now(), true).await;
         }
@@ -517,6 +547,7 @@ struct ToRevoke {
 /// same, and logged.
 async fn keep_pending(
     vault: Option<&Arc<dyn DelegationVaultStorage>>,
+    providers: &HashMap<String, CredentialProvider>,
     grants: Vec<DelegatedGrant>,
 ) -> Vec<ToRevoke> {
     let now = chrono::Utc::now();
@@ -524,7 +555,11 @@ async fn keep_pending(
     for grant in grants {
         let record = match vault {
             Some(vault) => {
-                let record = DeferredRevocation::new(grant.clone(), now, Deferral::Pending);
+                let record = DeferredRevocation::new(grant.clone(), now, Deferral::Pending).with_provider(
+                    providers
+                        .get(&grant.credential_provider_id)
+                        .cloned(),
+                );
                 match vault
                     .keep_revocation(&record)
                     .await
@@ -563,8 +598,8 @@ async fn revoke_each(
     revoker: &Revoker,
     note: Option<&'static str>,
 ) {
-    let items = keep_pending(revoker.vault.as_ref(), grants).await;
-    decide_each(items, revoker, note).await;
+    let items = keep_pending(revoker.vault.as_ref(), &revoker.providers, grants).await;
+    decide_each(items, revoker, note, false).await;
 }
 
 /// [`revoke_each`] for grants already kept as pending revocations, or that
@@ -575,6 +610,7 @@ async fn decide_each(
     items: Vec<ToRevoke>,
     revoker: &Revoker,
     note: Option<&'static str>,
+    provider_gone: bool,
 ) {
     let grants: Vec<DelegatedGrant> = items
         .iter()
@@ -599,7 +635,7 @@ async fn decide_each(
                 revoker.forget(kept).await;
                 return;
             };
-            let holds_another = if provider.revocation_ends_authorization {
+            let holds_another = if provider.revocation_ends_authorization && !provider_gone {
                 in_use.holds_another(&grant)
             } else {
                 Some(false)
@@ -625,7 +661,7 @@ async fn decide_each(
                     let deferred = match revoker.vault.as_ref() {
                         Some(vault) => {
                             vault
-                                .defer_revocation(grant.clone())
+                                .defer_revocation(grant.clone(), Some(provider.clone()))
                                 .await
                         }
                         None => Err(anyhow::anyhow!("No vault keeps the revocation for later")),
@@ -665,7 +701,7 @@ impl Revoker {
     /// Revoke `grant` at `provider`, then settle `kept`, its pending
     /// revocation, and audit the outcome: `kept` is forgotten once the
     /// revocation reached the vendor, whatever it answered; while it could not
-    /// (`unreachable`), it is kept, its attempts counted, and tried again
+    /// (`unreachable`, or refused for now with a `429` or `5xx`), it is kept, its attempts counted, and tried again
     /// ([`RETRY_PENDING`]), until the last of [`PENDING_REVOCATION_ATTEMPTS`]
     /// ([`RETRY_EXHAUSTED`]).
     async fn revoke_kept(
@@ -684,8 +720,10 @@ impl Revoker {
         )
         .await;
         let retry = match kept {
-            Some(mut kept) if revocation.outcome == RevocationOutcome::Unreachable => {
+            Some(mut kept) if revocation.should_retry() => {
                 kept.attempts += 1;
+                kept.provider
+                    .get_or_insert_with(|| provider.clone());
                 if kept.attempts >= PENDING_REVOCATION_ATTEMPTS {
                     tracing::warn!(
                         target: "credential_delegation",
@@ -998,7 +1036,7 @@ async fn retry_pending(
         }
     }
     tried += items.len();
-    decide_each(items, revoker, None).await;
+    decide_each(items, revoker, None, false).await;
     tried
 }
 
@@ -1200,6 +1238,14 @@ impl<'a> RevocationClient<'a> {
         }
         match request.send().await {
             Ok(response) if response.status().is_success() => RevocationOutcome::Revoked,
+            Ok(response)
+                if response
+                    .status()
+                    .is_server_error()
+                    || response.status().as_u16() == 429 =>
+            {
+                RevocationOutcome::RefusedForNow
+            }
             Ok(_) => RevocationOutcome::Refused,
             Err(_) => RevocationOutcome::Unreachable,
         }
@@ -2400,9 +2446,10 @@ pub(crate) mod tests {
         async fn defer_revocation(
             &self,
             grant: DelegatedGrant,
+            provider: Option<CredentialProvider>,
         ) -> anyhow::Result<()> {
             self.inner
-                .defer_revocation(grant)
+                .defer_revocation(grant, provider)
                 .await
         }
 
@@ -2854,6 +2901,7 @@ pub(crate) mod tests {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
                 kept: Vec::new(),
+                provider_gone: false,
             }),
         )
         .await
@@ -2884,6 +2932,7 @@ pub(crate) mod tests {
                 saved: outcome,
                 stored: Box::pin(std::future::pending()),
                 kept: Vec::new(),
+                provider_gone: false,
             }),
         )
         .await
@@ -2974,7 +3023,7 @@ pub(crate) mod tests {
         let (vault, _) = vault_with(&directory, 0).await;
         let key = GrantKey::owner(Some("tenant-a"), "surface", "hop", "provider");
         vault
-            .defer_revocation(account_grant(&key, "deferred", Some("account-1")))
+            .defer_revocation(account_grant(&key, "deferred", Some("account-1")), None)
             .await
             .unwrap();
         let revoker = Revoker {
@@ -3069,5 +3118,155 @@ pub(crate) mod tests {
             .join(super::super::storage::DEFERRED_REVOCATIONS_DIRECTORY);
         let written = std::fs::read_dir(&directory).map_or(0, |entries| entries.count());
         assert_eq!(written, 0, "nothing is written");
+    }
+
+    /// A vendor that answers 429 or 5xx has not decided, so its revocation is
+    /// kept and tried again, audited as `refused` all the same; any other
+    /// refusal is final.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendor_that_answers_busy_keeps_the_revocation_pending_and_another_refusal_does_not() {
+        for (status, retried) in [(429u16, true), (503, true), (400, false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let secrets = secrets_with(&directory, Some("tenant-a")).await;
+            let server = RecordingServer::start(status).await;
+            let (vault, grants) = vault_with(&directory, 1).await;
+            let revoker = Revoker {
+                providers: HashMap::from([("provider".to_string(), provider(Some(&server.url), "none", None))]),
+                secrets: Some(secrets),
+                exact_allowlist: Some(server.origin()),
+                actor: None,
+                vault: Some(vault.clone()),
+            };
+            let ((), events) = crate::audit::producer::capture(async {
+                delete_then_revoke(&vault, grants, revoker, (), None)
+                    .await
+                    .unwrap()
+                    .await
+                    .unwrap();
+            })
+            .await;
+            let expected = if retried {
+                "vendor_revocation:refused,access_token:refused,retry:pending"
+            } else {
+                "vendor_revocation:refused,access_token:refused"
+            };
+            assert_eq!(
+                events
+                    .iter()
+                    .filter_map(|event| event.detail.as_deref())
+                    .collect::<Vec<_>>(),
+                [expected],
+                "{status}"
+            );
+            assert_eq!(
+                pending_after_restart(&directory)
+                    .await
+                    .len(),
+                usize::from(retried),
+                "{status}"
+            );
+        }
+    }
+
+    /// A pending revocation keeps the provider it was made with, so it can be
+    /// decided once the provider is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_revocation_kept_pending_keeps_the_provider_it_was_made_with() {
+        let directory = tempfile::tempdir().unwrap();
+        let secrets = secrets_with(&directory, Some("tenant-a")).await;
+        let (vault, grants) = vault_with(&directory, 1).await;
+        let revoker = Revoker {
+            providers: HashMap::from([(
+                "provider".to_string(),
+                provider(Some("http://127.0.0.1:1/revoke"), "none", None),
+            )]),
+            secrets: Some(secrets),
+            exact_allowlist: Some("http://127.0.0.1:1".to_string()),
+            actor: None,
+            vault: Some(vault.clone()),
+        };
+        delete_then_revoke(&vault, grants, revoker, (), None)
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let kept = pending_after_restart(&directory).await;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0]
+                .provider
+                .as_ref()
+                .map(|provider| provider.id.as_str()),
+            Some("provider")
+        );
+        assert_eq!(
+            kept[0]
+                .provider
+                .as_ref()
+                .and_then(|provider| provider
+                    .revocation_endpoint
+                    .as_deref()),
+            Some("http://127.0.0.1:1/revoke")
+        );
+    }
+
+    /// When the change deletes the provider itself, no other grant of it
+    /// remains to share the vendor account's authorization, so the grants it
+    /// removes are revoked rather than left to the daily sweep, which could
+    /// no longer find their provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grants_of_a_deleted_provider_are_revoked_without_asking_whether_another_holds_the_account() {
+        for (provider_gone, revoked) in [(false, false), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let secrets = secrets_with(&directory, Some("tenant-a")).await;
+            let server = RecordingServer::start(200).await;
+            let (vault, _) = vault_with(&directory, 0).await;
+            let held = GrantKey::owner(Some("tenant-a"), "surface", "hop", "provider");
+            let removed = GrantKey::owner(Some("tenant-a"), "other-surface", "hop", "provider");
+            vault
+                .store_grant(account_grant(&held, "held", Some("account-1")))
+                .await
+                .unwrap();
+            let grant = vault
+                .store_grant(account_grant(&removed, "removed", Some("account-1")))
+                .await
+                .unwrap()
+                .grant;
+            let mut flagged = provider(Some(&server.url), "none", None);
+            flagged.revocation_ends_authorization = true;
+            let revoker = Revoker {
+                providers: HashMap::from([("provider".to_string(), flagged)]),
+                secrets: Some(secrets),
+                exact_allowlist: Some(server.origin()),
+                actor: None,
+                vault: Some(vault.clone()),
+            };
+            let (saved, outcome) = tokio::sync::oneshot::channel();
+            let task = delete_then_revoke(
+                &vault,
+                vec![grant],
+                revoker,
+                (),
+                Some(ChangeOutcome {
+                    saved: outcome,
+                    stored: Box::pin(std::future::pending()),
+                    kept: Vec::new(),
+                    provider_gone,
+                }),
+            )
+            .await
+            .unwrap();
+            saved.send(true).unwrap();
+            task.await.unwrap();
+
+            assert_eq!(
+                !server
+                    .revoked_tokens()
+                    .is_empty(),
+                revoked,
+                "provider_gone: {provider_gone}"
+            );
+        }
     }
 }

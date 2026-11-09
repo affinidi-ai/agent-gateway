@@ -308,7 +308,7 @@ pub fn record_use_in_background(
             .mark_grant_used(&id)
             .await
         {
-            tracing::debug!(
+            tracing::warn!(
                 target: "credential_delegation",
                 request_id = request_id.as_deref(),
                 surface_variant = surface_variant.as_deref(),

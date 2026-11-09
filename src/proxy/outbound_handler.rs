@@ -18020,7 +18020,14 @@ mod tests {
                 .unwrap();
             if subject == "owner" {
                 assert_eq!(kept.map(|grant| grant.access_token), Some("first".to_string()), "{subject}");
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                assert!(
+                    vault
+                        .deferred_revocations()
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "{subject}: no revocation is kept for it, pending or deferred"
+                );
                 assert!(
                     authorization_server
                         .requests()

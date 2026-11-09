@@ -307,7 +307,11 @@ impl Sweeper {
                 Ok(Some(provider)) => {
                     known.insert(id.clone(), provider);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if let Some(kept) = &deferral.provider {
+                        known.insert(id.clone(), kept.clone());
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         target: "credential_delegation",
@@ -916,7 +920,7 @@ mod tests {
             removed.id = key.record_id();
             sweeper
                 .vault
-                .defer_revocation(removed)
+                .defer_revocation(removed, None)
                 .await
                 .unwrap();
         }
@@ -1125,7 +1129,7 @@ mod tests {
         removed.vendor_subject = Some("account-1".into());
         sweeper
             .vault
-            .defer_revocation(removed)
+            .defer_revocation(removed, None)
             .await
             .unwrap();
         let report = sweeper
@@ -1303,6 +1307,80 @@ mod tests {
         assert!(
             vault
                 .grant_ids()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    async fn keep_pending_of_a_deleted_provider(
+        sweeper: &Sweeper,
+        server: &RecordingServer,
+        snapshot: bool,
+    ) {
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "hop", "gone");
+        let mut provider = crate::delegation_vault::revocation::tests::provider(Some(&server.url), "none", None);
+        provider.id = "gone".into();
+        let mut grant = crate::delegation_vault::grants::tests::grant(&key, "orphan");
+        grant.id = key.record_id();
+        grant.refresh_token = None;
+        let record = crate::delegation_vault::storage::DeferredRevocation::new(
+            grant,
+            Utc::now(),
+            crate::delegation_vault::storage::Deferral::Pending,
+        )
+        .with_provider(snapshot.then_some(provider));
+        sweeper
+            .vault
+            .keep_revocation(&record)
+            .await
+            .unwrap();
+    }
+
+    /// A revocation kept for a provider that has since been deleted is decided
+    /// with the provider it kept, not forgotten unrevoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_revokes_a_kept_revocation_of_a_deleted_provider_with_the_provider_it_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, false).await;
+        keep_pending_of_a_deleted_provider(&sweeper, &server, true).await;
+
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+
+        assert_eq!(report.deferred_revocations, 1);
+        assert_eq!(server.revoked_tokens(), ["orphan"]);
+        assert!(
+            sweeper
+                .vault
+                .deferred_revocations()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Without a provider to decide it with, a kept revocation of a deleted
+    /// provider is forgotten, as before providers were kept with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_forgets_a_kept_revocation_of_a_deleted_provider_that_kept_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = RecordingServer::start(200).await;
+        let sweeper = sweeper(&directory, &server, false).await;
+        keep_pending_of_a_deleted_provider(&sweeper, &server, false).await;
+
+        let report = sweeper
+            .sweep(Utc::now())
+            .await;
+
+        assert_eq!(report.deferred_revocations, 1);
+        assert!(server.requests().is_empty());
+        assert!(
+            sweeper
+                .vault
+                .deferred_revocations()
                 .await
                 .unwrap()
                 .is_empty()
