@@ -1,0 +1,20 @@
+branch: fix/audit-fixes
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-09T12:30:00Z'
+      title: Build rmcp without its Streamable HTTP client transports
+      description: >-
+        RUSTSEC-2026-0462: an rmcp Streamable HTTP client buffers a response body with no
+        bound, so an MCP server it calls can exhaust the gateway's memory. The gateway asked
+        for rmcp's `client`, `client-side-sse` and `transport-streamable-http-client`
+        features and used none of them: it serves MCP through rmcp-openapi, and the
+        Streamable HTTP client it calls MCP endpoints with is its own, on eventsource-stream
+        and reqwest. Those features are now off, so the affected transport is no longer
+        compiled into the gateway. The advisory is recorded in `.cargo/audit.toml` with that
+        reasoning, because the published fix is rmcp 3.9 and rmcp-openapi 0.28.1 still
+        requires rmcp 1.x; it comes off that list when rmcp-openapi moves on.
+  breaking: []
