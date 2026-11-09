@@ -5,8 +5,9 @@ source revision. If Affinidi hosts the appliance for you, use the hosted
 [Agent Gateway documentation](https://docs.affinidi.com/products/affinidi-trust-fabric/agent-gateway/)
 instead.
 
-Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar:
-it keeps its state in memory and saves it as JSON files on disk. The web dashboard is a
+Agent Gateway is a single process, `agent-gateway`. It needs no database and no sidecar
+(a [trust agent sidecar](#bundled-trust-agent-optional) is optional): it keeps its state in
+memory and saves it as JSON files on disk. The web dashboard is a
 folder of static files that the process serves.
 
 ## At a glance
@@ -21,6 +22,7 @@ folder of static files that the process serves.
 | [Secrets](#secrets-and-keys) | A backup encryption key, an encryption-at-rest key for real credentials, and `AG_IDENTITY_HASH_PEPPER` for more than one instance | Yes |
 | [Time](#time) | NTP on the host | Yes |
 | [Fabric](#fabric) | A DIDComm mediator | Only to connect gateways |
+| [Bundled trust agent](#bundled-trust-agent-optional) | A second container beside the gateway, with its own image, volume and secret | Only to sign through the bundled trust agent |
 
 ## Choose how to run it
 
@@ -233,3 +235,30 @@ The published mediator image is built for linux/arm64 only. Check that it matche
 host's architecture with
 `docker manifest inspect public.ecr.aws/affinidi/messaging-mediator:<tag>`. See
 [`FABRIC.md`](FABRIC.md).
+
+## Bundled trust agent (optional)
+
+To have the gateway sign through a Verifiable Trust Agent (VTA) that sets itself up with no
+operator action, run the trust agent as a second container next to the gateway. Without it the
+gateway signs with its own key, as before. The sidecar shares a host, a disk and an operator
+with the gateway, so it improves key management and is **not** an independent key custodian.
+
+What your deployment has to provide, whatever runs it (Compose, a Kubernetes Pod, an ECS task):
+
+| Need | Detail |
+| --- | --- |
+| A second image | The VTA, pinned by digest. Until `Capability::ContextCreate` is released, build it from `verifiable-trust-infrastructure` branch `gateway-integration`; a stock image refuses the gateway's grant. No image is published from this repository. |
+| One network namespace | The sidecar listens on its own loopback only and the gateway dials `127.0.0.1:8100`. Run both containers in one Pod or task, or with `network_mode: "service:gateway"`. Publish no port for it. |
+| A shared folder | `/bootstrap`, writable by both containers (they run as different users). It carries two public files, the gateway's control DID in and the sidecar's DID out. |
+| A persistent volume | `/var/lib/vta` for the sidecar's data. Losing it loses every key the sidecar holds; the recovery is a rotation, not a restore. |
+| Two secrets | The sidecar's seed passphrase (a mounted file) and the gateway's encryption-at-rest key, which is mandatory on this tier. |
+| Gateway configuration | The `[vta]` block from `config.bundled.toml` added to `config.toml`: `mode = "embedded"` and `auto_bootstrap = true`. |
+| Start order | Restart the gateway first and the sidecar second under Compose. In a Pod either can restart alone. |
+
+Start from the reference files in [`config/examples/vta-bundled/`](../config/examples/vta-bundled/):
+the Compose example has been run with real containers, and the Kubernetes Pod has only had its
+syntax checked. The first start, the states the gateway reports, recovery and rotation are in
+the [bundled sidecar runbook](VTA_INTEGRATION_POC.md#bundled-sidecar-runbook-vta-21), and what
+the integration does not do yet is in [`VTA_OPEN_ITEMS.md`](VTA_OPEN_ITEMS.md). To check a
+running deployment, `GET /v1/vta/status` reports `bootstrap.state` (`connected` when it works)
+and `custody_claim: false`.
