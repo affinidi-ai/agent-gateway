@@ -113,8 +113,9 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// (see [`caller_refusal`]), so in practice this builder is reached for
 /// server-side (500) failures.
 ///
-/// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] as its
-/// detail, so the reason the credential failed is never sent to the caller.
+/// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] and a
+/// server-side failure reports [`INTERNAL_ERROR_DETAIL`], so no reason or
+/// internal identifier is sent to the caller. Call sites log the reason.
 ///
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
@@ -131,9 +132,9 @@ pub fn deny_response(
     error: &SourceAuthError,
 ) -> Response {
     let detail = if error.is_caller_attributable() {
-        CALLER_CREDENTIAL_REFUSED.to_string()
+        CALLER_CREDENTIAL_REFUSED
     } else {
-        error.to_string()
+        INTERNAL_ERROR_DETAIL
     };
     let status = error.http_status();
     let title = error.problem_title();
@@ -142,14 +143,17 @@ pub fn deny_response(
     let challenge = status == StatusCode::UNAUTHORIZED;
 
     match protocol {
-        SurfaceProtocol::Mcp => mcp_deny(auth_config, &detail, status, title, challenge),
-        _ => a2a_deny(auth_config, &detail, status, title, challenge),
+        SurfaceProtocol::Mcp => mcp_deny(auth_config, detail, status, title, challenge),
+        _ => a2a_deny(auth_config, detail, status, title, challenge),
     }
 }
 
 /// What a caller refused for a missing or invalid credential is told. Why the
 /// credential failed is logged, never sent.
 pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invalid";
+
+/// What a caller is told when source authentication fails on the server side.
+pub const INTERNAL_ERROR_DETAIL: &str = "Source authentication could not be completed.";
 
 /// The `WWW-Authenticate` challenge an MCP JWT Bearer refusal carries.
 const MCP_BEARER_CHALLENGE: &str = "Bearer realm=\"agent-gateway\"";
@@ -392,6 +396,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("jwks fetch failed"),
+            "the internal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
@@ -499,5 +510,12 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("missing"),
+            "the config id reached the caller: {body}"
+        );
     }
 }

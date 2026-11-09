@@ -19,5 +19,11 @@ changes:
         the identity reads, so it is refused at save time instead of answering 500 per request.
         Stored surfaces that break the rule still load with a warning.
   removed: []
-  security: []
+  security:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Hide internal source authentication errors from 500 response bodies
+      description: >-
+        A caller that hit an internal source authentication failure received the underlying error
+        text in a 500 body. The body now carries a generic message only, and the full error is
+        logged on the gateway.
   breaking: []
