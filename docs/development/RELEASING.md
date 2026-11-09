@@ -5,6 +5,17 @@ workflows: [`release.yml`](../../.github/workflows/release.yml) ("Prepare releas
 [`publish-release.yml`](../../.github/workflows/publish-release.yml) ("Publish release"). There
 is no manual version bump and no tag created by hand.
 
+A release is two reviewed steps and one automatic step:
+
+```text
+Prepare release (manual, pick patch / minor / major)
+  -> PR "chore(release): prepare vX.Y.Z" (bot-opened, reviewed, merged to main)
+       -> Publish release: build binary, checksum, attest, tag vX.Y.Z, GitHub Release
+            -> the tag starts Container image:
+                 build amd64 + arm64, probe, scan, push by digest,
+                 merge into one manifest, tag X.Y.Z / X.Y / latest, attest
+```
+
 ## Required environment and secrets
 
 Both workflows run under the `release` GitHub Environment and need a GitHub App token to create
@@ -144,6 +155,44 @@ GitHub offers a manual run only for a workflow file that exists on the default b
 The build uses no layer cache, so each run compiles from scratch. The first publish creates the
 package; set its visibility to public in the organization's package settings if GitHub does not
 inherit it from the repository.
+
+The arm64 job builds with `CARGO_BUILD_FLAGS=-j2` and `CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1`
+because the crate runs out of memory on the arm64 runner with the defaults. It takes roughly
+twice as long as amd64 (about 40 minutes against about 24); amd64 is unchanged.
+
+### Testing the publish path before a release
+
+A version tag can only be created by the release app, so a branch cannot publish one. To exercise
+the whole publish path from a branch, use the manual run with `push_test_image` once the workflow
+is on the default branch. Before that, temporarily list the branch under `on.push.branches` and
+change the `type=sha,prefix=dryrun-` tag rule to `enable=${{ github.ref_type == 'branch' }}`, then
+revert both changes afterwards. Either way the manifest is tagged only `dryrun-<short sha>`. Remove the tag and the untagged digests it leaves behind from
+the package when the testing is done.
+
+### Trying an image locally
+
+The package is private until it is made public, so sign in to GHCR with a token that has
+`read:packages`:
+
+```sh
+gh auth token | docker login ghcr.io -u "$(gh api user --jq .login)" --password-stdin
+docker pull ghcr.io/affinidi-ai/agent-gateway:<tag>
+docker buildx imagetools inspect ghcr.io/affinidi-ai/agent-gateway:<tag>
+docker run --rm ghcr.io/affinidi-ai/agent-gateway:<tag> --help
+docker run --rm --entrypoint id ghcr.io/affinidi-ai/agent-gateway:<tag>
+```
+
+The manifest should list `linux/amd64` and `linux/arm64`, and `id` should report the non-root
+`lowPrivUser`. To run the gateway, generate the Docker environment and start it with that tag:
+
+```sh
+make config-docker
+TAG=ghcr.io/affinidi-ai/agent-gateway:<tag> ./scripts/d-run.sh
+```
+
+Then check `https://localhost:8443/api/v1/health`. Open the dashboard at exactly
+`https://localhost:8443`, because passkey login is pinned to that origin. Remove the container with
+`docker rm -f agent-gateway`.
 
 ## Changelog fragments
 
