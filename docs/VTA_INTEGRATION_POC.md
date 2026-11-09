@@ -288,6 +288,18 @@ sidecar's own seed is `encrypted_file` with `[hardened] enabled = true`, its
 passphrase supplied as a mounted secret and never read from config or the
 environment.
 
+### Restarting under Compose
+
+The sidecar joins the gateway's network namespace (`network_mode: "service:gateway"`),
+so restart the **gateway first and the sidecar second**:
+`docker compose restart gateway && docker compose restart vta`, or recreate both with
+`docker compose up -d --force-recreate`. A plain `docker compose restart` fails the
+sidecar with "cannot join network of a non running container", and Docker's restart
+policy does not bring it back. A one-shot `bootstrap-init` service makes the shared
+`/bootstrap` volume sticky and world-writable, because the gateway image's user and the
+VTA image's uid 1000 differ and a fresh named volume is root-owned. In the Kubernetes pod
+the containers share the pod's namespace, so either can restart on its own.
+
 ### Image, upgrade, backup and loss
 
 **Build the VTA image from `verifiable-trust-infrastructure` branch

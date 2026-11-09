@@ -132,6 +132,17 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T06:00:00Z'
+      title: Make the bundled sidecar compose example start with real containers
+      description: >-
+        Running the compose example with real images showed three faults, now
+        fixed. The gateway never received its mandatory backup encryption key
+        or the certificates it needs. The shared bootstrap folder was owned by
+        root while the gateway and the sidecar run as different users, so
+        neither could write it; a one-shot init service now makes it sticky and
+        world-writable. And the sidecar must be restarted after the gateway,
+        because it joins the gateway's network namespace; the supported
+        procedure is documented.
     - timestamp: '2026-11-08T23:30:00Z'
       title: Correct the bundled trust agent compose example and add a Kubernetes one
       description: >-

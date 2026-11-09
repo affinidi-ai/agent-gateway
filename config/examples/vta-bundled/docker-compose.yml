@@ -14,12 +14,22 @@
 # and nothing in the product may claim otherwise.
 #
 # Before the first `up`:
-#   mkdir -p secrets config
+#   mkdir -p secrets config certs
 #   openssl rand -base64 32 > secrets/vta_seed_passphrase   # encrypts the VTA's seed
 #   cp <your gateway config files> config/                   # add the [vta] block from
 #                                                            # config.bundled.toml to config.toml
+#   cp <your TLS cert.pem and key.pem> certs/
 #   export GATEWAY_IMAGE=...@sha256:...  VTA_IMAGE=...@sha256:...
 #   export TG_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+#   export AG_BACKUP_ENCRYPTION_KEY=<64 hex characters>  AG_IDENTITY_HASH_PEPPER=<random string>
+#
+# Restarting: the sidecar joins the gateway's network namespace, so restart the
+# gateway first and the sidecar second (`docker compose restart gateway && docker
+# compose restart vta`), or recreate both with `docker compose up -d
+# --force-recreate`. A plain `docker compose restart` fails the sidecar with
+# "cannot join network of a non running container", and Docker's restart policy
+# does not bring it back. (In the Kubernetes pod the containers share the pod's
+# namespace, so either container can restart on its own.)
 #
 # The VTA image must be built from `verifiable-trust-infrastructure` branch
 # `gateway-integration` until `Capability::ContextCreate` is released: a stock
@@ -41,21 +51,43 @@ secrets:
     file: ./secrets/vta_seed_passphrase
 
 services:
+  # The gateway and the sidecar run as different users (the gateway image's
+  # `lowPrivUser`, the VTA image's uid 1000), and a fresh named volume is owned by
+  # root, so neither could write the shared bootstrap folder. This one-shot makes
+  # it sticky and world-writable: each side can add and replace its own file and
+  # cannot touch the other's. It reuses the VTA image so no third image has to be
+  # pinned.
+  bootstrap-init:
+    image: ${VTA_IMAGE:?pin the VTA image by digest, built from gateway-integration}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c", "chmod 1777 /bootstrap"]
+    restart: "no"
+    volumes:
+      - bootstrap:/bootstrap
+
   gateway:
     # Pin by digest: an unpinned image is a supply-chain hole in the component
     # that authenticates to the one holding the signing keys.
     image: ${GATEWAY_IMAGE:?pin the gateway image by digest}
     restart: unless-stopped
+    depends_on:
+      bootstrap-init:
+        condition: service_completed_successfully
     ports:
       - "8443:8443"
     volumes:
       - gateway-storage:/app/_storage
       - bootstrap:/bootstrap
       - ./config:/app/config:ro
+      - ./certs:/app/certs:ro
     environment:
       # Encryption at rest is mandatory on this tier; startup fails closed
       # without it. Point `[encryption] key_env_var` at this variable.
       TG_ENCRYPTION_KEY: ${TG_ENCRYPTION_KEY:?set a 32-byte base64 key}
+      # Required by every gateway at startup; the names must match what
+      # `backup_encryption_key` in config.toml refers to.
+      AG_BACKUP_ENCRYPTION_KEY: ${AG_BACKUP_ENCRYPTION_KEY:?set the backup encryption key}
+      AG_IDENTITY_HASH_PEPPER: ${AG_IDENTITY_HASH_PEPPER:-}
 
   vta:
     image: ${VTA_IMAGE:?pin the VTA image by digest, built from gateway-integration}
