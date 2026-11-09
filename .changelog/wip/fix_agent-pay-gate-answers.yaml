@@ -2,13 +2,15 @@ branch: fix/agent-pay-gate-answers
 changes:
   added: []
   changed: []
-  fixed:
+  fixed: []
+  removed: []
+  security: []
+  breaking:
     - timestamp: '2026-11-08T12:00:00Z'
       title: Refuse to start when an MCP proxy or redirect route hides a dashboard page
       description: >-
         The startup check that stops a channel or proxy route from shadowing a dashboard page now
         also covers `mcp_proxies` prefixes and `redirect` routes, which are registered ahead of the
-        dashboard in the same way.
-  removed: []
-  security: []
-  breaking: []
+        dashboard in the same way. A configuration with such a prefix used to start with that
+        dashboard page broken; it now stops at startup with an error naming each prefix and the
+        page it hides. Rename the prefix, for example to `/svc/<name>`, and restart.
