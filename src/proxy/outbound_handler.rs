@@ -5830,10 +5830,21 @@ fn audit_connector_call(
     result: ConnectorCallResult,
 ) {
     use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+    // Every caller runs after the grant step resolved this binding from the
+    // same request-scoped snapshot: `ctx.surface` and `ctx.virtual_channel`
+    // are fixed for the request, so a configuration reload cannot empty it.
+    // Should it ever be absent, the dropped record is logged, never silent.
     let Some(binding) = ctx
         .surface
         .transit_point_external_credentials(&ctx.virtual_channel)
     else {
+        warn!(
+            target: "credential_delegation",
+            request_id = %ctx.request_id,
+            transit_point = %ctx.virtual_channel.id,
+            surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
+            "A connector call's Transit Point has no connector binding - its connector_call was not recorded"
+        );
         return;
     };
     crate::delegation_vault::audit::emit("connector_call", || {
@@ -5865,9 +5876,24 @@ fn audit_connector_call(
         event.mcp_tool_name = ctx
             .body_bytes
             .as_deref()
-            .and_then(crate::mcp::tool_analyzer::called_tool_name);
+            .and_then(crate::mcp::tool_analyzer::called_tool_name)
+            .map(|name| audited_tool_name(&name));
         event
     });
+}
+
+/// The most characters of a tool name a `connector_call` keeps, as the MCP
+/// specification bounds a tool name.
+const AUDITED_TOOL_NAME_MAX_CHARS: usize = 128;
+
+/// A caller-named tool as a `connector_call` records it: without control
+/// characters, and cut to [`AUDITED_TOOL_NAME_MAX_CHARS`]. For the record
+/// only: tool gating matches the name as the caller sent it.
+fn audited_tool_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(AUDITED_TOOL_NAME_MAX_CHARS)
+        .collect()
 }
 
 /// The class of an HTTP status: `2xx`, `4xx`, and so on.
@@ -17744,6 +17770,48 @@ mod tests {
 
         assert!(matches!(sent, Err(OutboundPipelineError::McpValidation(_))), "{sent:?}");
         assert!(connector_calls(&events).is_empty(), "{events:?}");
+    }
+
+    /// The tool a `connector_call` records is the caller's to name, so it is
+    /// kept without control characters and cut to 128 characters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connector_call_records_a_bounded_tool_name() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "access", 3600)
+            .await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+        let name = format!("create\n\u{1b}[31m_issue{}", "x".repeat(300));
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}})
+        .to_string();
+
+        let (sent, events) = crate::audit::producer::capture(async {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            ctx.body_bytes = Some(Bytes::from(body));
+            send_with_grant(&state, &mut ctx).await
+        })
+        .await;
+
+        sent.unwrap();
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        let recorded = calls[0]
+            .mcp_tool_name
+            .as_deref()
+            .unwrap();
+        assert_eq!(recorded.chars().count(), 128);
+        assert!(recorded.starts_with("create[31m_issuexxx"), "{recorded}");
+        assert!(
+            !recorded
+                .chars()
+                .any(char::is_control),
+            "{recorded:?}"
+        );
     }
 
     /// A vendor that answered is recorded as `forwarded` with that answer's

@@ -642,7 +642,8 @@ the `owner`'s, one account for every caller, or the caller's own.
 
 - `transit_point`: the Transit Point's id; `provider_id` the credential provider; `surface_id`,
   `channel_name` and `tenant_id` the surface and its tenant (absent for an appliance-wide
-  surface). `mcp_tool_name` names the tool an MCP `tools/call` asks for, never its arguments.
+  surface). `mcp_tool_name` names the tool an MCP `tools/call` asks for, never its arguments;
+  the caller chooses it, so it is kept without control characters and cut to 128 characters.
 - `outcome` `forwarded`: the call was sent with the grant and the vendor answered with this
   status; `status_class` is its class, `2xx` to `5xx`. The record is written when the vendor's
   status arrives, so it stands even if the gateway then refuses the answer (an MCP answer
