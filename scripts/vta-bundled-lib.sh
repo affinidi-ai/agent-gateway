@@ -27,14 +27,13 @@ s = s.replace("env://TRUST_GATEWAY_BACKUP_ENCRYPTION_KEY", "env://AG_BACKUP_ENCR
 s += open(work + "/config.bundled.toml").read()
 open(p, "w").write(s)
 
-# The local dev gateway.json carries legacy channel and proxy prefixes that
-# collide with the dashboard's pages once the image's dashboard is present, and a
-# dashboard path on the host. A deployment would not have either.
+# The local dev gateway.json carries a legacy `/payments` channel that collides with
+# the dashboard's Payments page, and a dashboard path on the host. A deployment would
+# have neither. The other channel prefixes stay: surfaces are served under them.
 import json
 gp = work + "/config/gateway.json"
 g = json.loads(open(gp).read().replace(repo + "/www/default/build", "/app/www").replace(repo + "/envs/local", "/app"))
-g["channels"] = []
-g["mcp_proxies"] = []
+g["channels"] = [ch for ch in g.get("channels", []) if ch.get("prefix") != "/payments"]
 open(gp, "w").write(json.dumps(g, indent=2))
 PY
   [[ -s "${work}/secrets/vta_seed_passphrase" ]] || openssl rand -base64 32 > "${work}/secrets/vta_seed_passphrase"
