@@ -1164,6 +1164,11 @@ anything itself:
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
   (`canRevoke`) or Verify (`canVerify`), since the server refuses both.
+- The connect wizard's last step offers **Use this agent for all signing**, pre-checked only
+  when the appliance has no default yet. A default is either a stored one
+  (`default_signing.connection_id` in `GET /v1/settings`) or the bundled trust agent
+  (`default_resolution.backend` of `GET /v1/vta/status` is `bundled`): connecting a second agent
+  must never silently repoint signing away from either.
 
 ## Connections page
 

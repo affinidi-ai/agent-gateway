@@ -132,6 +132,14 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T12:45:00Z'
+      title: Keep the bundled trust agent as default when connecting another agent
+      description: >-
+        The Trust Agent connect wizard pre-checked "Use this agent for all
+        signing" while the bundled sidecar was the appliance default, because
+        it only looked for a stored default. Finishing it would have silently
+        moved all signing off the sidecar. The wizard now treats the bundled
+        trust agent as an existing default and leaves the box unchecked.
     - timestamp: '2026-11-09T11:30:00Z'
       title: Let surfaces on the bundled trust agent issue identity credentials
       description: >-

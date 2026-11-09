@@ -40,9 +40,21 @@ import json, sys
 p = sys.argv[1]
 g = json.load(open(p))
 g["webauthn"] = {"rp_id": "localhost", "external_origin": "https://localhost:8443"}
-g["cors"] = sorted(set(g.get("cors", [])) | {"https://localhost:8443"})
+g["cors"] = sorted(set(g.get("cors", [])) | {"https://localhost:8443", "http://localhost:8080"})
+# The gateway names its own DID after an https external address when it has one, and
+# a trust agent resolves a localhost did:webvh over plain http only. With none, the
+# DID is named after the plain-http listener (localhost:8080), which a trust agent
+# in the gateway's network can fetch. The HTTPS listener and dashboard are unchanged.
+for listener in g.get("listeners", []):
+    listener["external_urls"] = [u for u in listener.get("external_urls", []) if not u.startswith("https://")]
 json.dump(g, open(p, "w"), indent=2)
 PY
+  cat > "${DIR}/docker-compose.override.yml" <<YML
+services:
+  gateway:
+    ports:
+      - "8080:8080"
+YML
   export_stack_env
   cat > "${DIR}/.env" <<ENV
 GATEWAY_IMAGE=${GATEWAY_IMAGE}
