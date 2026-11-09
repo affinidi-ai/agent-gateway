@@ -641,10 +641,12 @@ dependencies = [
 name = "agent-gateway"
 version = "1.0.6"
 dependencies = [
+ "affinidi-data-integrity",
  "affinidi-did-common 0.4.3",
  "affinidi-did-resolver-cache-sdk",
  "affinidi-messaging-didcomm",
  "affinidi-messaging-sdk",
+ "affinidi-secrets-resolver 0.5.12",
  "affinidi-tdk-common",
  "alloy",
  "anyhow",
@@ -726,7 +728,6 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_dynamo",
- "serde_jcs",
  "serde_json",
  "serde_json_canonicalizer",
  "serde_urlencoded",

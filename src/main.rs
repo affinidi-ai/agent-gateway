@@ -75,6 +75,7 @@ mod trust_registries;
 mod trust_registry_verification; // Trust Registry client and validation
 mod url_validation; // SSRF protection for user-supplied URLs
 mod vault_identity; // Vault identity generation for API keys and certificates
+mod vta; // Verifiable Trust Agent (VTA) signing connector — thin REST/Trust-Task client
 mod x402; // x402 protocol (HTTP Native Payments Protocol)
 
 #[cfg(test)]
@@ -123,6 +124,22 @@ struct Args {
     /// Decrypt a previously exported storage archive
     #[arg(long, value_name = "INPUT_FILE")]
     decrypt_export: Option<PathBuf>,
+
+    /// Forget the pinned bundled trust agent and retire its signing key, so the
+    /// next start bootstraps against whatever answers now. The recovery for a
+    /// replaced or emptied sidecar; shows what it would do unless --yes is given.
+    #[arg(long)]
+    vta_rebootstrap: bool,
+
+    /// Move this gateway's access entry on the bundled trust agent to a new
+    /// control did:key (acl/swap-key), with the same grant. Run with the gateway
+    /// stopped; shows what it would do unless --yes is given.
+    #[arg(long)]
+    vta_rotate_control_key: bool,
+
+    /// Confirm --vta-rebootstrap or --vta-rotate-control-key.
+    #[arg(long)]
+    yes: bool,
 
     /// Output path (used with --decrypt-export, defaults to export.zip)
     #[arg(long, value_name = "OUTPUT_FILE", default_value = "export.zip")]
@@ -306,6 +323,32 @@ async fn async_main() -> Result<()> {
     // Initialize global encryption config for all storage operations
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
+
+    if args.vta_rotate_control_key {
+        let issuer_storage = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .vc_keys,
+        );
+        let report = vta::bundled::rotate_control_key(&bootstrap_config.vta, &issuer_storage, args.yes)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
+
+    if args.vta_rebootstrap {
+        let issuer_storage = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .vc_keys,
+        );
+        let report = vta::bundled::rebootstrap(&issuer_storage, args.yes)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
 
     // Boot migration: decrypt any residual field-level ENC[...] values left by an
     // earlier build to plaintext, before any store is loaded into a model. Whole-file
@@ -1452,6 +1495,7 @@ fn render_default_bootstrap_toml(
         legacy_backup_encryption_keys: None,
         trust_registry: Default::default(),
         tenancy: Default::default(),
+        vta: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),

@@ -46,6 +46,7 @@ pub struct IdentityApiState {
     /// binding revokes and deletes.
     pub delegation_vault_store: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
     pub sts_client_store: Option<Arc<dyn crate::sts::store::StsClientStorage>>,
+    pub vta_connection_store: Option<Arc<dyn crate::vta::connections::VtaConnectionStorage>>,
     pub api_key_store: Option<Arc<dyn crate::api_keys::store::ApiKeyStore>>,
     /// Pre-resolved per-variant surface snapshots. Phase C scaffolding —
     /// kept in lockstep with `agent_surface_store` writes by

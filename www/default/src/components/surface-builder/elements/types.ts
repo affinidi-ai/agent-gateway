@@ -109,6 +109,28 @@ export interface SurfaceContext {
  * Each element reads from this to find its own nodes and returns a list of
  * payload slices that the registry deep-merges into the final payload.
  */
+/**
+ * Which backend signs for a surface, mirroring `SurfaceSigningConfig`.
+ *
+ * **Every field absent means inherit** the appliance default, which is why a
+ * surface that configures nothing must send no `signing` block at all rather
+ * than an empty one.
+ */
+export interface SurfaceSigning {
+  backend?: 'local' | 'vta' | 'hsm';
+  connection_id?: string;
+  context_id?: string;
+  key_id?: string;
+}
+
+/**
+ * `true` when nothing is set — semantically identical to no block at all,
+ * matching the backend's `is_empty()`.
+ */
+export const isSigningEmpty = (signing?: SurfaceSigning): boolean =>
+  !signing ||
+  (!signing.backend && !signing.connection_id && !signing.context_id && !signing.key_id);
+
 export interface PayloadContext {
   protocol: string;
   surfaceMeta: {
@@ -119,6 +141,7 @@ export interface PayloadContext {
     tags: string[];
     issuer_id?: string;
     status?: string;
+    signing?: SurfaceSigning;
   };
   allNodes: CanvasNode[];
   /** All nodes whose `type` matches the requested type. */

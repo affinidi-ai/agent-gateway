@@ -658,6 +658,9 @@ pub async fn oauth_callback(
                                 Some(workload_binding),
                                 None,
                                 None,
+                                // Appliance-wide: the delegation leg has no
+                                // surface-scoped signing key of its own.
+                                None,
                             )
                             .await
                         {

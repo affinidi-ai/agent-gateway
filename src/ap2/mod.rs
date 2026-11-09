@@ -70,6 +70,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
+use crate::identity::authority::CredentialAuthority;
 use credentials::transform_vdc_to_vc;
 use vdc::extract_vdc_from_message;
 
@@ -242,9 +243,11 @@ async fn create_vp_jwt_with_gateway(
         "jti": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
     });
 
-    // Sign VP with gateway's key using VCIssuer
-    let vp_jwt = vc_issuer
-        .sign_jwt_with_gateway_key(&vp_payload)
+    // Sign VP with gateway's key via the CredentialAuthority port (VTA-01) so
+    // the signing can move to a VTA without touching this call site.
+    let authority = crate::identity::authority::LocalCredentialAuthority::new(std::sync::Arc::clone(vc_issuer));
+    let vp_jwt = authority
+        .sign_token(&vp_payload)
         .await
         .context("Failed to sign VP with gateway key")?;
 

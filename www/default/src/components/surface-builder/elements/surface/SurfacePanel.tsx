@@ -8,6 +8,7 @@ import { formatDateTime, timeAgo } from '../../../../utils/stringUtils';
 import { getIssuers } from '../../../../utils/issuersCache';
 import type { Issuer } from '../../../../types';
 import FieldHelp from '../../../shared/FieldHelp';
+import { SurfaceSigningSection } from './SurfaceSigningSection';
 
 /**
  * Right-panel editor for the Surface element. Pulls its values from
@@ -58,6 +59,8 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
     setTerminateTraceId,
     setIssuerId,
     setDidwebvh,
+    signing,
+    setSigning,
     onSaveAsTemplate,
   } = meta;
 
@@ -145,6 +148,8 @@ const SurfacePanel: React.FC<ConfigPanelProps> = ({ hasAttemptedSave }) => {
             Owning issuer. Drives Trust Check / Trust Recorder authority defaults.
           </Form.Text>
         </Form.Group>
+
+        <SurfaceSigningSection signing={signing} setSigning={setSigning} disabled={disabled} />
       </div>
 
       <div className="config-section">

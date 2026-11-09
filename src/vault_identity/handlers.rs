@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 /// Extract the domain segment from an issuer DID, decoding encoded localhost ports.
-fn extract_domain_from_did(issuer_did: &str) -> String {
+pub(crate) fn extract_domain_from_did(issuer_did: &str) -> String {
     crate::identity::utils::extract_domain_from_did(issuer_did)
 }
 
@@ -174,6 +174,8 @@ pub async fn generate_did_webvh_identity(
         last_used_at: None,
         channel_usage: vec![],
         private_key: private_key_jwk,
+        vta_context_id: None,
+        vta_connection_id: None,
         channel_config_id: None,
         is_local: true,
         verified: true,

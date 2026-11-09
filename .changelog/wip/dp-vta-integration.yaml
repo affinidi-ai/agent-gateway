@@ -1,0 +1,540 @@
+branch: dp-vta-integration
+changes:
+  added:
+    - timestamp: '2026-11-08T23:45:00Z'
+      title: Show the bundled trust agent's bootstrap state on the Trust Agent page
+      description: >-
+        GET /v1/vta/status now reports how the bundled trust agent's first-start
+        bootstrap went (connected, waiting, refused, replaced, lost, revoked or
+        misconfigured), what to do about it, and who owns the trust agent
+        (unclaimed until a person claims it). The Trust Agent page's banner
+        shows it, and still never implies key custody for a bundled deployment.
+    - timestamp: '2026-11-08T23:00:00Z'
+      title: Rotate the gateway's trust agent control key without a new grant
+      description: >-
+        agent-gateway --vta-rotate-control-key --yes moves the gateway's
+        access entry on the bundled trust agent to a new control did:key with
+        acl/swap-key. The trust agent copies the entry exactly, so the grant
+        cannot widen, and the new key is stored as pending first, so a crash
+        part-way is finished at the next start. Run it with the gateway
+        stopped. It is hygiene, not recovery from a leak: whoever holds the
+        current key can rotate it away, and recovery is an operator re-grant.
+    - timestamp: '2026-11-08T22:30:00Z'
+      title: Recover from a replaced bundled trust agent with --vta-rebootstrap
+      description: >-
+        agent-gateway --vta-rebootstrap forgets the pinned bundled trust agent
+        and retires its signing key, which stays published so tokens it signed
+        still verify; the next start bootstraps again under a new key id.
+        Without --yes it only shows what it would do. It is never run
+        automatically: a new trust agent means new keys and DIDs.
+    - timestamp: '2026-11-08T22:00:00Z'
+      title: ⭐ Connect the bundled trust agent automatically on first start
+      description: >-
+        With [vta] mode = "embedded" and auto_bootstrap = true the gateway
+        writes its own did:key for the sidecar to enrol, waits for the
+        sidecar to publish its DID and pins it, authenticates, checks it holds
+        exactly the expected grant, and creates a non-exportable signing key,
+        with no operator action and no manual grant. A restart keeps the same
+        identity. A replaced, emptied or revoking sidecar is reported on
+        GET /v1/vta/status and never re-enrolled automatically; a gateway that
+        had been connected refuses to sign rather than switch issuer key, and
+        one that never connected signs locally.
+  changed:
+    - timestamp: '2026-11-08T21:30:00Z'
+      title: Stop granting raw sign to the gateway on a trust agent
+      description: >-
+        The grant command the gateway prints for a trust agent no longer names
+        the raw sign capability, because no gateway code path calls keys/sign;
+        it signs through sign-jws and sign-document. Existing grants that
+        still carry sign keep working. The gateway can now ask the agent
+        which capabilities it holds (auth/whoami) and refuse a bundled
+        grant that is wider than the one it was enrolled with.
+    - timestamp: '2026-11-08T21:00:00Z'
+      title: Authenticate to a bundled trust agent as a did:key by default
+      description: >-
+        A bundled trust agent is reached over loopback and cannot resolve the
+        gateway's public address, so the gateway no longer publishes a
+        did:webvh to authenticate to it. A new [vta] control_did_method
+        setting (did_key or did_webvh) chooses the DID explicitly; absent, a
+        bundled sidecar uses did_key and a separately-operated agent keeps
+        did_webvh. publish_auth_did is still read, and must agree with
+        control_did_method when both are set.
+    - timestamp: '2026-11-08T18:30:00Z'
+      title: Authenticate to a trust agent as a did:webvh by default
+      description: >-
+        New trust-agent connections and the [vta] block now authenticate as a
+        did:webvh the gateway publishes (at /vta-auth/{connection_id}/did.jsonl
+        for a connection), so the DID an operator grants stays the same when
+        the control key is replaced. The agent resolves the document on every
+        authentication, so the gateway must be reachable from it; set
+        publish_auth_did = false, or create the connection with
+        control_identity "did_key", to keep authenticating as a did:key.
+        Connections that already exist keep their did:key.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Issue trust-agent-signed tokens under the DID of the signing key
+      description: >-
+        Tokens and ID-JAGs signed through a trust agent now claim the did:key
+        of the key that signed them as their issuer, instead of the trust
+        agent's service DID. That DID's document never listed the key, so the
+        tokens only verified through the gateway's JWKS, and two gateways
+        sharing one trust agent claimed the same issuer. A did:key is the key
+        itself, so it cannot be repointed by anyone who controls the gateway.
+        Rotating the signing key now changes the issuer; the gateway still
+        accepts its own tokens from a retired or per-surface key. Verifiers
+        that pin the old issuer must be updated.
+    - timestamp: '2026-11-08T12:05:00Z'
+      title: Keep the local signing key by default; make the bundled trust agent opt-in
+      description: >-
+        The default signing backend is now the gateway's own key on every
+        install, new or existing. Choosing the bundled trust agent takes
+        default_backend = "bundled". Defaulting new installs to it put a second
+        service in every deployment, and inferring the choice from whether a
+        local key was on disk meant a rebuilt volume or a sidecar that was down
+        at startup could silently change which backend signed.
+    - timestamp: '2026-11-08T12:10:00Z'
+      title: Ask before disconnecting a trust agent that holds agent keys
+      description: >-
+        Revoking, deleting or disabling a trust-agent connection now fails with
+        a conflict while agents keep their key in it, naming how many, unless
+        the request acknowledges they will be stranded. Those agents cannot be
+        moved and would need re-onboarding with a new DID. The dashboard shows
+        the message and asks for a second click on Revoke. The setup guide
+        explains that there is no migration for existing agents.
+    - timestamp: '2026-11-08T10:00:00Z'
+      title: Sign agent credentials through a trust agent with its specified signing task
+      description: >-
+        An agent-identity credential issued through a connected trust agent is
+        now built by the gateway, exactly as it builds one it signs itself, and
+        signed by the trust agent's standard document-signing task instead of a
+        task made only for this integration. The credential names the agent's
+        own context as its issuer, and the trust agent signs it only with the
+        key behind that context, so it can no longer be made to sign as the
+        trust agent itself. The gateway checks the answer against what it asked
+        for, and refuses it if the key, the signer, the proof or the document
+        differ. Gateways that were connected before this must be granted again:
+        the permission to sign documents is separate from the general signing
+        permission, so a connection paired earlier still verifies and then
+        fails the first credential it signs. The setup guide has the new
+        command and the failure to look for.
+    - timestamp: '2026-11-08T10:05:00Z'
+      title: Sign an agent's presentation in its trust agent without holding its key
+      description: >-
+        An agent whose key lives in a trust agent now has its presentation
+        signed there too, by the same document-signing task as its credential,
+        so the gateway never has the private half. The trust agent finds the
+        signer in a controller member, which a presentation does not normally
+        carry, so the presentation sent for signing names the agent as both its
+        holder and its controller. The holder is still named, and the gateway's
+        own check, which reads the holder, is unchanged and still refuses a
+        proof made by anyone else. The one visible difference is that extra
+        member; a verifier elsewhere that rejects members it does not know would
+        refuse it. A challenge and a domain are now bound into the signed proof
+        rather than refused. The gateway will not sign if the agent's own
+        context is not the holder the presentation names.
+  fixed:
+    - timestamp: '2026-11-09T11:30:00Z'
+      title: Let surfaces on the bundled trust agent issue identity credentials
+      description: >-
+        A request through a surface that signs with the bundled sidecar logged
+        "context gateway has no DID" and carried no identity credential, because
+        the sidecar's gateway context was never given the signing identity a
+        credential is issued as. The bootstrap now gives it one when it connects,
+        once, and a restart leaves it alone.
+    - timestamp: '2026-11-09T09:30:00Z'
+      title: Show the bundled trust agent's connection as connected, not unpaired
+      description: >-
+        The Trust Agent page listed the bundled sidecar's connection as "Not
+        paired" next to a banner that said it was connected, because the record
+        is created as a draft and the automatic bootstrap never pairs it. The
+        connection API now reports that record's state from the bootstrap
+        itself, including why it is not connected, and the page no longer
+        offers Revoke or Verify buttons the server always refuses. Verifying
+        that record used to answer 502 and write an error into it.
+    - timestamp: '2026-11-09T06:00:00Z'
+      title: Make the bundled sidecar compose example start with real containers
+      description: >-
+        Running the compose example with real images showed three faults, now
+        fixed. The gateway never received its mandatory backup encryption key
+        or the certificates it needs. The shared bootstrap folder was owned by
+        root while the gateway and the sidecar run as different users, so
+        neither could write it; a one-shot init service now makes it sticky and
+        world-writable. And the sidecar must be restarted after the gateway,
+        because it joins the gateway's network namespace; the supported
+        procedure is documented.
+    - timestamp: '2026-11-08T23:30:00Z'
+      title: Correct the bundled trust agent compose example and add a Kubernetes one
+      description: >-
+        The compose example used settings the trust agent does not have
+        (VTA_LISTEN, VTA_DATA_DIR, port 3000, a health command) and put the
+        agent on a network where anything could reach it. It now shares the
+        gateway's network namespace so the agent listens on loopback only, uses
+        the agent's own port and health check, carries the shared bootstrap
+        volume and an encrypted seed secret, and needs no hand-made control key
+        or DID. A one-Pod Kubernetes example is added.
+    - timestamp: '2026-11-08T10:20:00Z'
+      title: Verify a trust-agent presentation bound to a challenge or domain
+      description: >-
+        A presentation signed by a trust agent can be bound to a challenge and a
+        domain, which become part of what is signed. The check the gateway used
+        for that kind of signature did not know about them: it dropped them and
+        then rebuilt bytes nobody had signed, so every such presentation failed,
+        however genuine. The gateway now checks the signature itself, including
+        both members, so a presentation bound to a challenge verifies and one
+        whose challenge or domain was changed afterwards, which is what replaying
+        it elsewhere would need, does not. Presentations that are not bound to
+        either verify exactly as before.
+    - timestamp: '2026-10-27T05:00:00Z'
+      title: Sign through a trust agent again by proving who is asking
+      description: >-
+        The trust agent requires every signing request to prove it came from
+        the gateway, not merely that a session exists. The gateway was sending
+        the request without that proof, so the agent refused all of them and
+        nothing could be signed through a connected agent at all. The proof is
+        now attached, and an external identity provider's grant is no longer
+        turned away when it is offered as proof of who someone is.
+    - timestamp: '2026-10-27T07:00:00Z'
+      title: Repair the System Settings screen and the new surface name default
+      description: >-
+        The System Settings screen had a duplicated block of Save and Reset
+        buttons and a missing closing tag, which stopped the dashboard being
+        built at all. Creating a surface also stopped treating a typed name
+        that matches the suggested one as still being the suggestion, so the
+        page claimed unsaved changes when nothing had been changed and the
+        name no longer followed a protocol switch. Both were a stray duplicate
+        left behind by a merge. The Key Management tab additionally no longer
+        takes the rest of the Secrets screen down with it when the key
+        inventory cannot be read; it reports the problem in its own tab.
+  removed: []
+  security:
+    - timestamp: '2026-11-09T00:00:00Z'
+      title: Refuse a surface that signs through another tenant's trust agent
+      description: >-
+        A surface's signing.connection_id (and each variant's) must now name a
+        trust agent connection its own tenant owns, or an appliance-wide one.
+        Before, only the connection record was tenant-checked, so a tenant
+        could point its surface at another tenant's connection and have its
+        tokens signed with that tenant's key. A connection that does not exist
+        is refused the same way, so the answer does not reveal which ids exist.
+    - timestamp: '2026-11-09T00:05:00Z'
+      title: Fail closed when a surface's mapped trust agent key is unavailable
+      description: >-
+        When the trust agent key a surface (or its variant or tenant) maps could
+        not be resolved, credential issuance used to log a warning and sign
+        with the appliance key, changing the issuer under callers and handing a
+        tenant's tokens to the operator's key. It now refuses. A surface that
+        maps nothing of its own still signs with the appliance key as before.
+    - timestamp: '2026-11-08T10:10:00Z'
+      title: Name a trust-agent context's identity only from a key it holds
+      description: >-
+        A gateway that provisions its own contexts could name any DID for a
+        context it had been granted access to. It may now name only the DID of
+        an active signing key that lives in that context, and only once, so a
+        context cannot be given an identity it does not control. The same
+        change removes the separate step that told the trust agent which key a
+        context signs credentials with: the context's identity is the key
+        itself, so there is nothing left to point at the wrong key.
+    - timestamp: '2026-10-27T02:00:00Z'
+      title: Remove an unreachable check from the self-issued token path
+      description: >-
+        A rule about which tokens the gateway will accept back from itself sat
+        behind an early exit, so it never ran while still appearing to be in
+        place. Reading it as live would mislead anyone reviewing how self-issued
+        tokens are handled. The unreachable code is gone and the rule is kept
+        alongside a note explaining why it is not applied: as written it would
+        refuse an exchange the gateway has supported since its first release.
+        Nothing changes for callers.
+    - timestamp: '2026-10-27T03:00:00Z'
+      title: Stop a signed document containing a number from aborting the gateway
+      description: >-
+        Preparing a document for signing used a canonicaliser that, in the way
+        this product is built, stops the whole process the moment the document
+        contains a number rather than reporting a problem. Numbers are present
+        in almost everything that gets signed, including the issue and expiry
+        times on every token, and in places the content comes from the caller.
+        The gateway now uses the same canonicaliser as the rest of the product,
+        which handles them, and a test covers it.
+    - timestamp: '2026-10-27T06:00:00Z'
+      title: Stop a published identity log or payment request from aborting the gateway
+      description: >-
+        The same canonicaliser fault reached three more places: reading an
+        identity log published by somebody else, creating and updating this
+        gateway's own identity logs, and preparing a payment request. The first
+        is the one that mattered most, because the document comes from outside
+        and a single number anywhere in it was enough to stop the gateway
+        rather than fail the check. All of them now use the canonicaliser the
+        rest of the product uses, and the old one is gone from the build.
+        Identities are unaffected: the canonical form both produce was
+        confirmed identical, and a test now pins the identifier a fixed log
+        entry produces so this cannot drift unnoticed.
+    - timestamp: '2026-10-27T04:00:00Z'
+      title: Reject an unsigned presentation whose proof list is empty
+      description: >-
+        A presentation that carried an empty list of signatures, rather than
+        none at all, passed the check meant to stop unsigned documents from
+        reaching a verification decision. It is now refused like any other
+        unsigned presentation, and a presentation carrying several signatures
+        has each of them checked for expiry instead of only the first.
+  breaking: []
+  internal:
+    - timestamp: '2026-10-23T07:00:00.000Z'
+      title: >-
+        ⭐ Let the gateway sign through a trust agent instead of holding keys itself
+      description: >-
+        The gateway can now be connected to a Verifiable Trust Agent and sign
+        through it, so the private keys it used to keep on its own disk no
+        longer need to be there. Connecting is optional and changes nothing for
+        anyone who does not do it: without a trust agent the gateway behaves
+        exactly as it did before, with the same keys in the same places.
+        What moves once connected: the key the gateway signs its own tokens and
+        credentials with, the keys of agents onboarded from that point on, and
+        the signed statement a gateway sends a peer gateway to say which issuer
+        it stands behind. Each agent gets its own
+        separate space inside the trust agent, so one agent's key can never
+        sign for another, and the
+        gateway asks for a signature when it needs one rather than holding
+        anything. Setting this up is a single approval step the operator
+        performs on their own trust agent; the gateway is never an
+        administrator of it and can create only the narrow space it was given,
+        never reach outside it, and never reconfigure what it has already set
+        up.
+        What this is worth, stated plainly: it turns many stealable keys into
+        one authority that can be withdrawn. It does not make impersonation
+        impossible while the gateway is running and compromised, because the
+        gateway is the party allowed to ask for signatures. What changes is
+        that the authority can be taken away, every use is attributable, and
+        nothing of value survives in a stolen disk copy or a backup.
+        What deliberately does not move: the key the gateway uses to identify
+        itself to the trust agent, which cannot live there without circularity;
+        the keys that decrypt messages addressed to this host, which an
+        attacker already on it would have anyway; and the certificate, single
+        sign-on and payment keys an operator supplies for their own systems.
+        Each of these decisions, and what an attacker holding each key could
+        actually produce, is listed in the key management inventory, which also
+        reports which keys should have moved and have not. Those answers are
+        calculated from the live setup rather than configured, so a deployment
+        cannot claim an assurance it has not earned.
+        Agents that already exist keep their current keys permanently. Moving
+        them would change their identifiers and invalidate credentials already
+        issued to them, so connecting a trust agent never changes an existing
+        agent, and the inventory answers which agents still hold a key here. An
+        operator guide covers connecting, what it changes, how to roll back,
+        and the limits of doing so: an agent created while connected cannot be
+        carried back, because the gateway never held its key.
+        More than one trust agent can be connected at a time, each with its own
+        address, identity and way of being reached, including one that is not
+        reachable from the internet at all. Every agent now records which trust
+        agent holds its key rather than assuming there is only one, so the day
+        a second one is added it is a setting rather than a rewrite of
+        everything stored before it. Choosing which trust agent a new agent
+        should go to is not yet exposed; today they all go to the one that is
+        configured, and an agent whose trust agent cannot be reached fails
+        rather than quietly signing somewhere else.
+        Publishing a stable identity for authenticating to the trust agent is
+        now something an operator turns on rather than something that happens
+        automatically. The trust agent looks that identity up every time the
+        gateway authenticates, so a gateway at an address it cannot reach would
+        stop being able to authenticate at all. The plain identifier derived
+        from the key needs no lookup and always works, so it stays the default,
+        and publishing is the upgrade for deployments that can be reached.
+        Connecting a trust agent that was configured in the gateway's own
+        configuration file can now be completed from the dashboard. Previously
+        the pairing screen could not show the identifier the operator has to
+        authorise, because that identifier is deliberately hidden from the logs
+        and the key behind it is encrypted on disk, leaving nowhere to read it
+        from. Where the configuration has no stable key, the screen now explains
+        that instead of showing an identifier that would stop being valid at the
+        next restart.
+        Choosing a different signing key per agent surface now takes effect.
+        The setting was read and checked at startup but never reached the code
+        that signs, so an operator could configure it, see no complaint, and
+        reasonably believe it was working while every surface kept signing with
+        the single appliance-wide key. A surface that chooses nothing is
+        unaffected and keeps using exactly the key it used before.
+        The appliance-wide choice now also applies to credentials issued
+        outside any single agent surface. It was being skipped there, so a
+        gateway configured to sign through its trust agent quietly kept signing
+        with its own key while the dashboard reported the agent — the failure
+        was invisible without decoding an issued credential.
+        Signing through a connected trust agent now names the key the agent
+        actually holds. It was naming the context instead, so every attempt was
+        refused with a message about a key the agent had never heard of.
+        A surface can now sign with a specific key inside a trust agent rather
+        than always the agent's current default. The choice was being accepted
+        and then ignored, so surfaces an operator had deliberately given
+        separate keys all shared one — losing the isolation that choosing them
+        separately was meant to provide.
+        Added an end-to-end check that signs through a trust agent connected
+        the way the dashboard connects one. The existing check used the
+        configuration-file route instead, which is why it kept passing while
+        the dashboard route was broken.
+        The signing backend for the whole appliance can now be chosen in the
+        dashboard and points at a trust agent connected there, instead of only
+        being settable by editing a configuration file and restarting. Changing
+        it takes effect immediately. A deployment that sets nothing keeps
+        signing exactly as it did.
+        Settings now offers a picker for that choice, listing the gateway's own
+        key alongside every connected trust agent. An agent that has been
+        connected but has no key yet is shown and explained rather than hidden,
+        so a half-finished setup reads as what it is instead of looking like a
+        failure.
+        A connected trust agent can now be given a signing key from the
+        dashboard. Until now nothing could create one — neither the dashboard
+        nor the agent's own command line — so an agent could be connected and
+        verified and still never sign, leaving the operator with no way to
+        finish the setup. The key is generated inside the agent and cannot be
+        exported from it.
+        A trust agent can now be connected from the dashboard. The Trust Agent
+        screen could list and pair agents but had no way to add one, so the
+        whole setup could only be started by calling the API directly. The
+        screen now asks for the agent's address, identity and context, then
+        goes straight into pairing.
+        The gateway now establishes its own trust-agent identity the first time
+        it starts and keeps the same one on every restart, storing it with the
+        rest of its protected key material. Previously, a configuration that did
+        not name a key file produced a brand-new identity on every restart,
+        which could never be authorised on a trust agent because whatever the
+        operator approved stopped being valid as soon as the gateway restarted.
+        That identity is now also readable by an authorised operator, so it can
+        be approved without hunting through logs.
+        Each agent surface can now choose its own signing key in the surface
+        editor, so different surfaces on one gateway can sign through different
+        trust agents. A surface that chooses nothing shows that it inherits the
+        appliance setting rather than displaying the value it would resolve to,
+        so it stays obvious which surfaces have been deliberately configured.
+        The whole sequence is now covered by a single test against a real trust
+        agent: the gateway publishes its identity, is granted once by an
+        operator, authenticates as that published identity, has a new agent
+        land and get its own separate space, and asks the agent to sign on that
+        agent's behalf, with the resulting signature checked against the
+        agent's own key. Writing it immediately found that the setup command
+        the gateway printed could not be run at all, because the command it
+        named does not accept the permissions it was passing, and that a
+        gateway which is not publicly reachable cannot use a published identity
+        at all, because a trust agent refuses to look up addresses on private
+        networks. Both are now fixed and written down respectively.
+        Connecting a trust agent is now a single pass. Previously a working
+        connection had to be assembled from three separate screens in three
+        places, and nothing said so: the connection reported itself as
+        connected while still being unable to sign, because pairing proves who
+        the gateway is to the agent but does not create the key that signs.
+        The connect wizard now creates that key itself, since a connection
+        without one is unusable everywhere and there was never a reason to
+        pair one and deliberately leave it keyless, and it offers to make the
+        agent the signing default for the whole appliance in the same step.
+        That offer is pre-selected only when nothing is set yet, so connecting
+        a second agent never quietly moves everything already running on the
+        first, and it names where to change the choice later. Both screens
+        remain exactly where they were for anyone who wants to inspect or
+        change the details afterwards.
+        A trust agent protects itself by refusing callers that ask too often,
+        and tells them exactly how long to wait. The gateway was ignoring that
+        and treating it as an outright failure, so a request that needed a
+        signature failed during a busy moment that a one-second pause would
+        have carried it through. It now waits as asked and tries once more,
+        with a ceiling on how long it will be told to wait so that a
+        misconfigured or hostile agent cannot hold a caller's request open.
+        Every other refusal is still taken at face value, because retrying a
+        decision the agent has already made only wastes the attempt.
+        The key the connect wizard creates is now covered against a real trust
+        agent: that it exists, that the public half is captured at the one
+        moment the agent will reveal it, that it can actually sign, and that
+        a token it signs names it. Creating a second key is also checked to
+        retire the first rather than discard it, since anything already signed
+        must keep verifying.
+        A gateway connected to a trust agent someone else runs can now be
+        allowed to create the per-agent spaces it needs, instead of being
+        refused before it ever asked. The refusal assumed that making such a
+        space requires full administrative control of the agent, which is only
+        true of a top-level one; the spaces a gateway makes sit underneath the
+        single space the operator already granted it, and the permission to
+        branch underneath is exactly what the operator approves during
+        connection. The agent decides, as it always did, and a gateway that
+        was not given that permission is still refused by the agent itself,
+        in its own words. Previously an operator who had deliberately granted
+        it was blocked anyway, and had to name every space by hand.
+        The credential carried inside a forwarded request is now signed by the
+        trust agent the operator connected in the dashboard. Until now that
+        one credential followed only the configuration file, so an operator
+        who connected an agent through the screens, made it the default, and
+        pointed a surface at a target still saw that credential signed by the
+        gateway's own key, with no indication why. The agent is now resolved
+        at the moment of signing rather than when the gateway starts, so
+        connecting one takes effect immediately instead of at the next
+        restart, and an installation with no agent behaves exactly as before.
+        If the connected agent is unreachable or has been revoked, the
+        credential is signed locally and the reason is recorded, because
+        refusing would fail the request a local signature can serve.
+        One caveat worth knowing: a space created by hand on the agent cannot
+        sign for itself until it has been given an identity, and the agent
+        refuses with that reason. The gateway now gives it one on first use,
+        using the same permission it was granted to create spaces at all, so
+        an operator who hands it a space does not have to know this.
+        An agent's own key can now also be held by the connected trust agent
+        without any configuration file, which is what keeps the gateway from
+        holding other parties' private keys. Because this is inferred from an
+        agent being the chosen default rather than asked for explicitly, and
+        because whether the gateway is allowed to create spaces cannot be
+        known until it tries, a refusal falls back to a key the gateway holds
+        and says so, rather than refusing to register the agent at all. Where
+        an operator asked for this in the configuration file, a refusal is
+        still fatal, because they asked for the stronger guarantee and
+        quietly giving them a weaker one would be worse than stopping.
+        Writing that uncovered a long-standing fault: once any agent held its
+        key in a trust agent, agents registered before that change could no
+        longer have their identity presented at all, because the gateway
+        stopped looking for the key it was still holding for them. That is
+        the exact situation the gradual migration was meant to support.
+        None of this reaches an installation that has not connected a trust
+        agent: it signs with the same keys, in the same places, and is not
+        asked about any of it. Nothing is attempted against an agent that is
+        not there, so its logs stay quiet rather than reporting a failure to
+        reach something it never had.
+        A surface that names its own trust agent now also uses it for the
+        credential carried inside the requests it forwards, not only for the
+        tokens it signs, and gets its own separate space there exactly as it
+        already did for those tokens. A surface that names nothing continues
+        to follow the appliance-wide choice, and an appliance that has chosen
+        nothing continues to sign locally, so this changes nothing for anyone
+        who has not opted in. Other routes a credential can travel are not
+        yet covered and keep following the appliance-wide choice.
+        The operator guide now carries a full walk-through of setting this up
+        by hand from an empty machine using only the screens, including how to
+        confirm that what signed a credential really was the connected agent
+        and not the gateway, and the handful of mistakes that produce
+        confusing errors along the way.
+        Three faults kept a surface's own choice of trust agent from ever
+        taking effect, each of which alone was enough to hide it. The choice
+        was not saved at all, so it reappeared as inherited after a reload.
+        The gateway believed a trust agent could not issue credentials, which
+        has not been true for some time, so it quietly declined to use one.
+        And a surface's choice was read only when the gateway started, so one
+        created or changed afterwards went on signing with the appliance-wide
+        key until someone restarted it. Nothing failed in any of these cases,
+        which is why nothing was reported. All three are fixed and covered by
+        tests that fail without the fix.
+    - timestamp: '2026-10-27T00:00:00Z'
+      title: Restore the trust-agent test build after the sign-jws request change
+      description: >-
+        The test suite stopped compiling after the sign-jws signing request
+        dropped its algorithm field and the agent identity record and
+        credential issuer grew display-name, origin, and trust-agent context
+        fields. The affected tests now build those records and call the
+        credential issuer with the current shapes, and two constants left
+        unused by the dropped request field were removed, so the whole tree
+        builds and its checks can run again.
+    - timestamp: '2026-10-27T01:00:00Z'
+      title: Refuse a trust-agent signature that was not made by the key we asked for
+      description: >-
+        The trust agent reports which key it signed with and which algorithm it
+        used. The gateway now checks both against what it asked for and refuses
+        the result when they disagree, rather than publishing a token or an
+        attestation under its own identity on the strength of a signature it
+        cannot account for. When the agent rejects a signing request, the
+        reason it gives is now included in the failure, so a refused call says
+        which part of the contract failed instead of only that something
+        returned an error; the agent's full reply still stays in the logs.
+        The setup guide records that permission to sign this way is a separate
+        one which the general signing permission does not cover, so an agent
+        connected before it existed must be granted it again. That shortfall
+        is otherwise invisible: pairing succeeds and only the first signature
+        fails.

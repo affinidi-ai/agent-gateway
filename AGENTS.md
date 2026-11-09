@@ -147,6 +147,11 @@ identified by the API key it presents, and blocks Save unless every Caller Conte
 Key or API Key Provider; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
+The Trust Agent page's tier banner shows the bundled trust agent's bootstrap state and owner when
+the sidecar connects itself, from `GET /v1/vta/status`, and never implies key custody for a
+bundled or local deployment; see _Trust Agent page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#trust-agent-page).
+
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
 The secret editor has one save button and never shows a stored secret value; see
@@ -327,6 +332,8 @@ Do not summarise these here. Update the owning document in the same change as th
 | Credential providers, delegation vault, consent modes                          | [`docs/CREDENTIAL_DELEGATION.md`](docs/CREDENTIAL_DELEGATION.md)     |
 | Terms, acceptance, consent-pending sessions                                    | [`docs/TERMS_AND_CONSENT.md`](docs/TERMS_AND_CONSENT.md)             |
 | Integrations, events, notifications, the event hook                            | [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)                       |
+| Trust agent (VTA) signing, key custody, per-surface keys                        | [`docs/VTA_INTEGRATION_POC.md`](docs/VTA_INTEGRATION_POC.md)         |
+| Trust agent open items and limitations                                         | [`docs/VTA_OPEN_ITEMS.md`](docs/VTA_OPEN_ITEMS.md)                   |
 
 # Ways of working
 

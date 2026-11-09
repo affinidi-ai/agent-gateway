@@ -122,6 +122,16 @@ flowchart LR
 | **Trust registry injection**              | Rules that attach trust-registry metadata to supported requests or responses.                                                                                                                                                                                       |
 | **Recorder status**                       | The last known outcome of a surface's Trust Recorder for one managed agent identity: Recorded, Partly recorded, Failed, Skipped or Not attempted yet. It is not a live check of the trust registry. See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status). |
 
+## Trust agent
+
+| Term | Meaning |
+| --- | --- |
+| **Trust agent** (VTA) | A Verifiable Trust Agent: a service that holds private keys and signs on request, within an access entry's grant. The gateway delegates its signing to one so that many stealable keys become one authority that can be withdrawn. It is a key-management improvement, not by itself a custody claim. _Avoid: signer, vault._ |
+| **Bundled trust agent** | A trust agent shipped as a sidecar in the gateway's own deployment unit and reached over loopback. It shares a host, a disk and an operator with the gateway, so it is **not** a key-custody tier (`custody_claim: false`). _Avoid: embedded trust agent, built-in VTA._ |
+| **Control key** | The key the gateway authenticates to a trust agent with. For a bundled trust agent it is a `did:key`, rotated with `agent-gateway --vta-rotate-control-key`. _Avoid: auth key, admin key._ |
+| **Bootstrap** | The gateway's first-start connection to a bundled trust agent: write its control DID, pin the trust agent's DID, authenticate, check the grant is exactly the expected one, create the signing key. Never re-enrols or re-creates anything by itself. |
+| **Unclaimed** | A bundled trust agent has no human owner until a person claims it; the gateway holds only a context-scoped entry, never super-admin. |
+
 ## Terms and consent
 
 | Term                        | Meaning                                                                                                                                                    |

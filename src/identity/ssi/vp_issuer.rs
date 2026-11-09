@@ -23,8 +23,14 @@ pub const DEFAULT_SIGNING_KEY_ID: &str = "key-2";
 
 /// Represents a presentation containing one or more Verifiable Credentials
 pub struct Credentials<'a> {
-    /// The holder's key for signing the presentation
-    pub holder_key: Cow<'a, JWK>,
+    /// The holder's key for signing the presentation.
+    ///
+    /// `None` when the holder's key lives in a Verifiable Trust Agent rather
+    /// than in this process (VTA-12). Optional rather than always-present
+    /// because an absent key is the *goal*: the gateway holding an agent's
+    /// private key is the custody this exists to remove, so the type should
+    /// make "we do not have it" expressible.
+    pub holder_key: Option<Cow<'a, JWK>>,
     /// The holder's did
     pub holder_did: Cow<'a, str>,
     /// The verifiable credentials to include in the presentation
@@ -33,6 +39,27 @@ pub struct Credentials<'a> {
     pub challenge: Option<Cow<'a, str>>,
     /// Optional domain for the presentation
     pub domain: Option<Cow<'a, str>>,
+}
+
+/// The unsigned presentation both signing paths put a proof on.
+///
+/// Shared so a VTA-signed presentation and a locally-signed one are the same
+/// document: if the two drifted, a verifier would be checking a proof over
+/// bytes that differ by signer, which is the kind of difference nobody notices
+/// until it fails in the field.
+pub fn build_unsigned_presentation(
+    holder_did: &str,
+    verifiable_credentials: &[Value],
+) -> Value {
+    json!({
+        "@context": [
+            "https://www.w3.org/ns/credentials/v2"
+        ],
+        "type": ["VerifiablePresentation"],
+        "holder": holder_did,
+        "verifiableCredential": verifiable_credentials,
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+    })
 }
 
 /// Payload types for VP issuance
@@ -200,18 +227,27 @@ impl VpIssuer for LocalVpIssuer {
     ) -> Result<Value> {
         let VpIssuerPayload::Credentials(pc) = payload;
 
-        let holder_key = pc.holder_key.as_ref().clone();
         let holder_did = pc.holder_did.as_ref();
+        // The local signer is the one path that genuinely needs the key. A
+        // holder with none is a VTA-backed agent that reached the wrong
+        // issuer — an error, not something to paper over.
+        let holder_key = pc
+            .holder_key
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no holder key for `{holder_did}`: this presentation must be signed by the \
+                     agent's trust agent, not locally"
+                )
+            })?
+            .as_ref()
+            .clone();
 
-        let presentation = json!({
-            "@context": [
-                "https://www.w3.org/ns/credentials/v2"
-            ],
-            "type": ["VerifiablePresentation"],
-            "holder": holder_did,
-            "verifiableCredential": pc.verifiable_credentials.as_ref(),
-            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        });
+        let presentation = build_unsigned_presentation(
+            holder_did,
+            pc.verifiable_credentials
+                .as_ref(),
+        );
 
         let challenge = pc
             .challenge
@@ -299,7 +335,7 @@ mod tests {
         holder_did: String,
     ) -> Credentials<'static> {
         Credentials {
-            holder_key: Cow::Owned(holder_key),
+            holder_key: Some(Cow::Owned(holder_key)),
             holder_did: Cow::Owned(holder_did),
             verifiable_credentials: Cow::Owned(vec![vc]),
             challenge: Some(Cow::Borrowed("test-challenge-123")),
@@ -392,7 +428,7 @@ mod tests {
         let vp_issuer = LocalVpIssuer::new(signer);
 
         let presentation_creds = Credentials {
-            holder_key: Cow::Owned(holder_key.clone()),
+            holder_key: Some(Cow::Owned(holder_key.clone())),
             holder_did: Cow::Owned(agent_did),
             verifiable_credentials: Cow::Owned(vec![signed_vc]),
             challenge: None,
@@ -435,7 +471,7 @@ mod tests {
         let vp_issuer = LocalVpIssuer::new(signer);
 
         let presentation_creds = Credentials {
-            holder_key: Cow::Owned(holder_key.clone()),
+            holder_key: Some(Cow::Owned(holder_key.clone())),
             holder_did: Cow::Owned(agent_did),
             verifiable_credentials: Cow::Owned(vec![signed_vc1, signed_vc2]),
             challenge: None,
@@ -474,7 +510,7 @@ mod tests {
         let vp_issuer = LocalVpIssuer::new(signer);
 
         let presentation_creds = Credentials {
-            holder_key: Cow::Owned(holder_key),
+            holder_key: Some(Cow::Owned(holder_key)),
             holder_did: Cow::Owned(expected_did_peer.clone()),
             verifiable_credentials: Cow::Owned(vec![signed_vc]),
             challenge: None,

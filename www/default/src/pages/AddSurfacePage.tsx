@@ -4,7 +4,7 @@ import { AgentSurface, apiClient } from '../api';
 import type { CanvasNode } from '../components/surface-builder/SurfaceCanvas';
 import type { SurfaceNodeType } from '../components/surface-builder/nodeTypes';
 import { getIncompleteReason } from '../components/surface-builder/SurfaceCanvas';
-import type { Protocol } from '../components/surface-builder/elements/types';
+import type { Protocol, SurfaceSigning } from '../components/surface-builder/elements/types';
 import { ALL_PROTOCOLS } from '../components/surface-builder/protocols';
 import { defaultSurfaceName } from '../components/surface-builder/surfaceNaming';
 import { registry, validateSurfacePayload } from '../components/surface-builder/elements';
@@ -71,6 +71,7 @@ function serializeDirtySignature(inputs: {
   terminateTraceId: boolean;
   issuerId: string;
   didwebvh: DidwebvhConfig;
+  signing?: SurfaceSigning;
   jsonOverride: string | null;
 }): string {
   return JSON.stringify(inputs);
@@ -127,6 +128,7 @@ const AddSurfacePage: React.FC = () => {
   const [terminateTraceId, setTerminateTraceId] = useState(false);
   const [issuerId, setIssuerId] = useState('');
   const [didwebvh, setDidwebvh] = useState<DidwebvhConfig>(DEFAULT_DIDWEBVH_CONFIG);
+  const [signing, setSigning] = useState<SurfaceSigning | undefined>(undefined);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -329,6 +331,7 @@ const AddSurfacePage: React.FC = () => {
         .filter(Boolean),
       protocol,
       status,
+      signing,
     }) as Partial<AgentSurface>;
     if (payload.access_point) {
       payload.access_point.publish_to_did_document = publishToDid;
@@ -363,6 +366,9 @@ const AddSurfacePage: React.FC = () => {
     status,
     publishToDid,
     terminateTraceId,
+    issuerId,
+    didwebvh,
+    signing,
   ]);
 
   const handleOpenFullscreenEditor = useCallback((nodeId: string) => {
@@ -531,6 +537,7 @@ const AddSurfacePage: React.FC = () => {
     terminateTraceId,
     issuerId,
     didwebvh,
+    signing,
     jsonOverride,
   });
 
@@ -618,6 +625,7 @@ const AddSurfacePage: React.FC = () => {
         setPublishToDid(payload.access_point?.publish_to_did_document ?? false);
         setTerminateTraceId(payload.access_point?.terminate_trace_id ?? false);
         setIssuerId(typeof payload.issuer_id === 'string' ? payload.issuer_id : '');
+        setSigning(payload.signing ?? undefined);
         const did = payload.access_point?.didwebvh_identity;
         if (did && typeof did === 'object') {
           setDidwebvh({
@@ -838,9 +846,11 @@ const AddSurfacePage: React.FC = () => {
           terminateTraceId,
           issuerId,
           didwebvh,
+          signing,
         }}
         setMeta={{
           setName: setTypedName,
+          setSigning,
           setDescription,
           setTagsCsv,
           setStatus,

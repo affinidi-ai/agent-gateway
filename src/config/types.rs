@@ -3145,6 +3145,11 @@ pub struct BootstrapConfig {
     #[serde(default)]
     pub tenancy: crate::tenancy::TenancyConfig,
 
+    /// Verifiable Trust Agent (VTA) integration. Off by default; when enabled
+    /// the gateway delegates credential/token signing to a VTA instead of using
+    /// its local issuer key. Startup-only. See `src/config/vta.rs`.
+    #[serde(default)]
+    pub vta: crate::config::vta::VtaConfig,
     /// Credential provider rules (`[credential_policy]`): https token endpoints,
     /// tenant credential isolation, and the exact http endpoints allowed.
     /// Startup-only; every rule defaults to `warn`.

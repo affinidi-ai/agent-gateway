@@ -1930,7 +1930,7 @@ fn compute_key_hash(public_key_jwk: &serde_json::Value) -> anyhow::Result<String
     use sha2::{Digest, Sha256};
 
     // Canonicalize the public key JWK using JCS (RFC 8785)
-    let canonical = serde_jcs::to_string(public_key_jwk).context("Failed to canonicalize public key")?;
+    let canonical = serde_json_canonicalizer::to_string(public_key_jwk).context("Failed to canonicalize public key")?;
 
     // Compute SHA-256 hash
     let mut hasher = Sha256::new();

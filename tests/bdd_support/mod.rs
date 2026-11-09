@@ -21,3 +21,4 @@ pub mod policies;
 pub mod sse_client;
 pub mod tags;
 pub mod temp;
+pub mod trust_agent;

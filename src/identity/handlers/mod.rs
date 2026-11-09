@@ -33,7 +33,7 @@ pub(crate) use credential_policy_report::report_credential_policy;
 pub use credentials::{
     get_did_document, issue_credential, resolve_did_document, resolve_did_document_spec, serve_agent_did_document,
     serve_gateway_did_document, serve_gateway_did_jsonl, serve_gateway_did_witness, serve_surface_did_jsonl,
-    serve_surface_did_witness,
+    serve_surface_did_witness, serve_vta_auth_did_jsonl, serve_vta_connection_auth_did_jsonl,
 };
 pub use debug_export::export_storage;
 pub use didcomm::{didcomm_endpoint, didcomm_ws_endpoint};

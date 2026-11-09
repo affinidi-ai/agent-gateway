@@ -80,6 +80,7 @@ const AddMediatorWizardPage = lazy(() => import('./AddMediatorWizardPage'));
 const AddTrustRegistryWizardPage = lazy(() => import('./AddTrustRegistryWizardPage'));
 const EditJwtVerificationStrategyPage = lazy(() => import('./EditJwtVerificationStrategyPage'));
 const EditStsClientPage = lazy(() => import('./EditStsClientPage'));
+const VtaConnectionsPage = lazy(() => import('./VtaConnectionsPage'));
 const EditAccessTokenPage = lazy(() => import('./EditAccessTokenPage'));
 const EditPolicyDefinitionPage = lazy(() => import('./SettingsPage/EditPolicyDefinitionPage'));
 const AuditPage = lazy(() => import('./AuditPage'));
@@ -853,6 +854,14 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   element={
                     <ProtectedRoute permission="sts_clients.edit">
                       <EditStsClientPage />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/trust-agent"
+                  element={
+                    <ProtectedRoute permission="vta_connections.view">
+                      <VtaConnectionsPage />
                     </ProtectedRoute>
                   }
                 />

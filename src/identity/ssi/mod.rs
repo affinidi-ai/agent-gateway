@@ -1,4 +1,5 @@
 pub mod context;
+pub mod di_jcs;
 pub mod did_utils;
 pub mod vc_issuer;
 pub mod verifier;

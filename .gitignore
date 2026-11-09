@@ -102,4 +102,6 @@ config/certs/openssl.cnf
 # python generated files
 *.py[cod]
 
+interop
+
 __pycache__/

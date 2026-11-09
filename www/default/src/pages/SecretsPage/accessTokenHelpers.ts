@@ -25,6 +25,7 @@ export const ACCESS_TOKEN_RESOURCE_KINDS = [
   'credential-providers',
   'jwt-verification-strategies',
   'sts-clients',
+  'vta-connections',
   'delegation-vault',
 ] as const;
 

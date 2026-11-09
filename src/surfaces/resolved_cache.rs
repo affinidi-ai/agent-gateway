@@ -329,6 +329,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            signing: None,
             trust_check_split: false,
             transit_point_source_auth: false,
         }
@@ -358,6 +359,7 @@ mod tests {
                 identity_slots: None,
                 outbound_credentials: None,
                 canvas: None,
+                signing: None,
             },
         }
     }

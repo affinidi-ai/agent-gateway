@@ -582,6 +582,9 @@ fn write_single_surface_config_inner(
         &surface_config.enforced_credential_rules,
         surface_config.token_request_timeout_secs,
     );
+    if let Some(setup) = &surface_config.bundled_trust_agent {
+        write_bundled_trust_agent(base_dir, setup);
+    }
     if surface_config.logs_audit_events {
         log_info(base_dir);
     } else if surface_config.keeps_gateway_log {
@@ -590,6 +593,26 @@ fn write_single_surface_config_inner(
     if surface_config.writes_log_directory {
         set_log_directory(base_dir);
     }
+}
+
+/// Appends the `[encryption]` and `[vta]` tables of a bundled gateway that bootstraps itself
+/// against `setup.base_url`. A bundled trust agent keeps its keys on the gateway's disk, so
+/// startup refuses it without encryption at rest.
+fn write_bundled_trust_agent(
+    base_dir: &Path,
+    setup: &super::single_surface_fixture::BundledTrustAgentSetup,
+) {
+    let path = base_dir.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str(&format!(
+        "\n[encryption]\nenabled = true\nkey_source = \"local\"\nkey_env_var = \"{}\"\n\n\
+         [vta]\nenabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{}\"\n\
+         bootstrap_dir = \"{}\"\nbootstrap_wait_secs = 2\n",
+        super::single_surface_fixture::BUNDLED_MASTER_KEY_ENV,
+        setup.base_url,
+        setup.bootstrap_dir.display(),
+    ));
+    std::fs::write(&path, config).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.
