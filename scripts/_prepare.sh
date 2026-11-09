@@ -8,6 +8,7 @@ set -e
 
 source "$(dirname "$0")/_env.sh"
 source "$(dirname "$0")/_portable.sh"
+source "$(dirname "$0")/_encryption_table.sh"
 
 # Values the sourced helpers above must provide.
 : "${envs_dir:?_env.sh must set envs_dir}"
@@ -37,6 +38,15 @@ target_dir="$2"
 
 current_dir=$(pwd)
 target_dir="${current_dir}/${target_dir}"
+
+# The kind of environment, from the target directory's own name, so the path
+# above it doesn't matter: envs/docker is a Docker one, envs/local, envs/local-N
+# and tmp/local-* are local ones.
+case "$(basename "${target_dir}")" in
+  docker*) env_kind=docker ;;
+  local*) env_kind=local ;;
+  *) env_kind=other ;;
+esac
 
 # ----------------------------------------------------------------------------
 # Port assignment
@@ -128,28 +138,13 @@ show_proxy_info() {
   echo ""
 }
 
-# Prints the [encryption] table of a config.toml: its header and every line up
-# to the next table header. Prints nothing when the file has no such table.
-encryption_table() {
-  awk '/^\[encryption\]/ { on=1; print; next } on && /^\[/ { on=0 } on { print }' "$1"
-}
-
-# Replaces the [encryption] table of a config.toml with the given one.
-# Usage: set_encryption_table <config_toml> <table>
-set_encryption_table() {
-  local file="$1" table="$2"
-  awk '/^\[encryption\]/ { skip=1; next } skip && /^\[/ { skip=0 } !skip { print }' "${file}" > "${file}.tmp"
-  printf '\n%s\n' "${table}" >> "${file}.tmp"
-  mv "${file}.tmp" "${file}"
-}
-
 # Default ports for non-local targets (docker, etc.)
 http_port=${3:-8080}
 https_port=${4:-8443}
 outbound_port=${DEFAULT_OUTBOUND_PORT}
 frontend_port=${DEFAULT_FRONTEND_PORT}
 
-if [[ "${target_dir}" == *"/local"* ]]; then
+if [[ "${env_kind}" == "local" ]]; then
   assign_ports "${target_dir}"
 fi
 
@@ -210,7 +205,7 @@ then
   echo "🦀 Building debug binary for bootstrap generation..."
   cargo build
 
-  if [[ "${target_dir}" == *"/local"* ]]
+  if [[ "${env_kind}" == "local" ]]
   then
     # ${agent_name}
     ./target/debug/agent-gateway \
@@ -219,7 +214,7 @@ then
       --cors-origins "http://localhost:${http_port},http://127.0.0.1:${http_port},http://0.0.0.0:${http_port},http://localhost:${frontend_port}" > "${target_dir}/config/config.toml"
   fi
 
-  if [[ "${target_dir}" == *"/docker"* ]]
+  if [[ "${env_kind}" == "docker" ]]
   then
     # ${agent_name}
     ./target/debug/agent-gateway \
@@ -245,19 +240,9 @@ then
       set_encryption_table "${config_toml}" "${previous_encryption}"
       echo "✅ [encryption] re-applied from config.toml.bak"
     fi
-  elif [[ "${target_dir}" == *"/local"* || "${target_dir}" == *"/docker"* ]]
+  elif [[ "${env_kind}" != "other" ]]
   then
-    if [[ "${target_dir}" == *"/local"* ]]
-    then
-      encryption_key_settings="key_source = \"file\"
-key_file = \"${master_key_file}\""
-    else
-      encryption_key_settings="key_source = \"environment\"
-key_env_var = \"AG_MASTER_KEY\""
-    fi
-    set_encryption_table "${config_toml}" "[encryption]
-enabled = true
-${encryption_key_settings}"
+    set_encryption_table "${config_toml}" "$(new_encryption_table "${env_kind}" "${master_key_file}")"
     echo "🔒 Encryption at rest enabled with ${master_key_file}"
   fi
 fi
@@ -282,10 +267,10 @@ fi
 if [[ ! -f "${target_dir}/config/gateway.json" ]]
 then
   # Determine which template to use (all local* instances share the local template)
-  if [[ "${target_dir}" == *"/local"* ]]
+  if [[ "${env_kind}" == "local" ]]
   then
     gateway_template="local"
-  elif [[ "${target_dir}" == *"/docker"* ]]
+  elif [[ "${env_kind}" == "docker" ]]
   then
     gateway_template="docker"
   else
@@ -295,7 +280,7 @@ then
   gateway_url=""          # full URL as entered, e.g. https://example.com:8443
   gateway_domain=""       # hostname only — no scheme, no port (used for rp_id)
   gateway_outbound_url="" # full URL for outbound listener (https://host:port)
-  if [[ "${target_dir}" == *"/local"* ]]
+  if [[ "${env_kind}" == "local" ]]
   then
     if [[ "${auto_accept}" == "true" ]]; then
       gateway_url=""
@@ -412,7 +397,7 @@ fi
 # from a previous run can never be served. Idempotent: matches both the
 # template placeholder ("www") and any previously-rewritten absolute path
 # pointing at www, www/build, or www/default/build.
-if [[ "${target_dir}" == *"/local"* && -f "${target_dir}/config/gateway.json" ]]
+if [[ "${env_kind}" == "local" && -f "${target_dir}/config/gateway.json" ]]
 then
   expected_path="${current_dir}/${WWW_DIR:-www/default}/build"
   gateway_json="${target_dir}/config/gateway.json"
@@ -541,7 +526,7 @@ done
 # Persist URL_LOCAL (always localhost) and URL_PROXY (gateway_url when
 # provided) to instance.env so 'make testkit-* x=<name> h=l|h=p' can resolve
 # the correct URL without guessing.
-if [[ "${target_dir}" == *"/local"* ]]; then
+if [[ "${env_kind}" == "local" ]]; then
   _testkit_local="http://localhost:${http_port}"
   if grep -q '^URL_LOCAL=' "${target_dir}/instance.env" 2>/dev/null; then
     sedi "s|^URL_LOCAL=.*|URL_LOCAL=${_testkit_local}|" "${target_dir}/instance.env"
