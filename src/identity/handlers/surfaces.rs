@@ -852,7 +852,9 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 ///
 /// Each enabled variant is validated as resolved, against the stored variant
 /// of the same alias, since it can override the caller authentication methods
-/// and the identity slots.
+/// and the identity slots. A variant with no enabled stored counterpart, one
+/// added, renamed or enabled again, is validated against the stored surface,
+/// whose settings it inherits.
 fn validate_source_auth(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -863,11 +865,13 @@ fn validate_source_auth(
         let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
             continue;
         };
-        let stored_resolved = stored.and_then(|stored| {
-            stored
-                .resolve_variant(Some(&variant.alias))
-                .ok()
-        });
+        let stored_resolved = stored
+            .and_then(|stored| {
+                stored
+                    .resolve_variant(Some(&variant.alias))
+                    .ok()
+            })
+            .or_else(|| stored.cloned());
         crate::config::validate_source_auth_config(&resolved, stored_resolved.as_ref())
             .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
     }
@@ -1126,6 +1130,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 
 /// The `Warning` headers (code 299) a save of `surface` answers with: its
 /// Access Point's ([`AgentSurface::access_point_warnings`]), then one naming
+/// each JWT bearer method stored without an audience
+/// ([`AgentSurface::unchecked_audience_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
@@ -1155,6 +1161,7 @@ async fn save_warnings(
     for warning in surface
         .access_point_warnings()
         .into_iter()
+        .chain(surface.unchecked_audience_warnings())
         .chain(
             crate::proxy::server::open_transit_points(&state.network_config, surface)
                 .iter()
@@ -1910,7 +1917,8 @@ fn inherited_target_binding_warnings(surface: &AgentSurface) -> Vec<String> {
 /// Access Point that publishes protected resource metadata accepts the resource
 /// of each route, so a Transit Point that names any of them is one. A caller of
 /// the Access Point could then call that Transit Point directly, with its
-/// credentials.
+/// credentials. An Access Point method whose `audience_claim` is not `aud`
+/// lists clients, not audiences, so it shares none.
 fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
     let views: Vec<_> = surface_views(surface)
         .into_iter()
@@ -1919,6 +1927,7 @@ fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
     let access_point: Vec<_> = views
         .iter()
         .flat_map(|(_, (access_point, _))| access_point.iter())
+        .filter(|method| method.audience_claim.is_aud())
         .collect();
     let mut warnings = Vec::new();
     for (variant, (_, transit_points)) in &views {
@@ -3916,13 +3925,14 @@ fn retain_protected_resource(
 
 /// A restored `protected_resource` the Access Point would no longer serve.
 /// When the setting itself no longer fits, after the dashboard switched the
-/// method, set `forward_header` or audiences, or moved the protocol off MCP, it
-/// is dropped with a warning: the client did not send it, and refusing the save
-/// over it would leave the client no way out. When it no longer fits the
-/// Access Point, for example after a route or listen address change, the save
-/// is refused instead: dropping it would leave the JWT Bearer method checking
-/// no audience, so the client must send a new resource or `null`. A setting
-/// sent in the request is validated and refused as usual.
+/// method, set `forward_header`, audiences or an `audience_claim` other than
+/// `aud`, or moved the protocol off MCP, it is dropped with a warning: the
+/// client did not send it, and refusing the save over it would leave the client
+/// no way out. The JWT Bearer method must then name an audience of its own, or
+/// the save is refused. When it no longer fits the Access Point, for example
+/// after a route or listen address change, the save is refused instead, so the
+/// client must send a new resource or `null`. A setting sent in the request is
+/// validated and refused as usual.
 fn settle_retained_protected_resources(
     surface: &mut AgentSurface,
     base_retained: bool,
@@ -3939,8 +3949,8 @@ fn settle_retained_protected_resources(
             warn!(
                 surface_id = %resolved.surface_id,
                 variant = alias.unwrap_or(""),
-                "Dropped a stored protected_resource the edited Access Point no longer supports; its JWT Bearer \
-                 method now checks audiences only if the edit set them"
+                "Dropped a stored protected_resource the edited Access Point no longer supports; the save is refused \
+                 unless its JWT Bearer method names an audience of its own"
             );
             return Ok(true);
         }
@@ -5589,9 +5599,15 @@ mod validation_tests {
         let audience = serde_json::json!([
             {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
         ]);
-        for (change, changed_methods) in
-            [("method", other_method), ("forward_header", forwarding), ("audiences", audience)]
-        {
+        let client_bound = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "audience_claim": "client_id"}
+        ]);
+        for (change, changed_methods) in [
+            ("method", other_method),
+            ("forward_header", forwarding),
+            ("audiences", audience),
+            ("audience_claim", client_bound),
+        ] {
             let changed: crate::config::agent_surface::CallerAuthentication =
                 serde_json::from_value(serde_json::json!({"methods": changed_methods})).unwrap();
             let mut switched = mcp_surface();
@@ -5902,6 +5918,29 @@ mod validation_tests {
         ] {
             assert!(shared_audience_warnings(&surface_with(transit_point_auth)).is_empty(), "{case}");
         }
+    }
+
+    /// An Access Point method that checks the client a token was issued to
+    /// lists clients, not audiences, so a Transit Point audience with the same
+    /// value is no overlap.
+    #[test]
+    fn a_client_bound_access_point_method_shares_no_audience_with_a_transit_point() {
+        let mut surface = surface_with_transit_points(
+            serde_json::json!([{ "alias": "crm", "target_endpoint": "https://crm.example",
+                "require_transit_token": false, "source_auth": { "type": "jwt_bearer",
+                    "jwt_verification_strategy_id": "entra", "audiences": ["app-1"] } }]),
+            serde_json::json!(null),
+        );
+        surface.variants.clear();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({ "methods": [{ "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "entra", "audiences": ["app-1"], "audience_claim": "client_id" }] }))
+            .unwrap(),
+        );
+
+        assert!(shared_audience_warnings(&surface).is_empty(), "{:?}", shared_audience_warnings(&surface));
     }
 
     /// An MCP Access Point that publishes protected resource metadata accepts

@@ -15,7 +15,7 @@ keywords = ["agents", "gateway", "identity", "mcp", "security"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.49.0", features = ["full"] }
-tokio-util = "=0.7.18"
+tokio-util = "0.7.18"
 
 # HTTP server and client
 hyper = { version = "1.8.1", features = ["full"] }
@@ -206,9 +206,9 @@ solana-sdk = "3.0.0"
 
 # Model types and the server side only. The gateway serves MCP through rmcp-openapi and
 # calls MCP endpoints with its own Streamable HTTP client (eventsource-stream, below), so
-# rmcp's client transports are left off: they carry RUSTSEC-2026-0462.
-rmcp = "1.0"
-rmcp-openapi = "0.28.0"
+# rmcp's client transports are left off.
+rmcp = "3.9"
+rmcp-openapi = "0.32.1"
 rust_decimal = { version = "1.42", default-features = false, features = [
     "std",
 ] }

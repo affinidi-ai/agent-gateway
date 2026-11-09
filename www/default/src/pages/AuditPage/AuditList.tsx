@@ -1,5 +1,6 @@
 import React from 'react';
 import AuditListItem from './AuditListItem';
+import { AppButton } from '../../components/shared/AppButton';
 import FieldHelp from '../../components/shared/FieldHelp';
 import type { UserNameResolver } from './eventNarrative';
 import type { AuditEntry } from './types';
@@ -11,6 +12,21 @@ interface AuditListProps {
   onSelect: (idx: number) => void;
   page: number;
   totalPages: number;
+  /**
+   * Whether the read's counts are lower bounds: it stopped before the end of
+   * the history, or met records it could not read. The page count then reads
+   * `of 687+`, and finding nothing means nothing was found in the records
+   * searched, not that the log is empty.
+   */
+  countsAreLowerBounds?: boolean;
+  /**
+   * Why the last read failed, when it did. The gateway answers a read it could
+   * not make with an error rather than an empty page, so the list says the
+   * records could not be read instead of claiming the log holds none.
+   */
+  error?: string | null;
+  /** Reads the log again, for the retry offered with the error. */
+  onRetry?: () => void;
   onPageChange: (updater: number | ((p: number) => number)) => void;
   /** Names the users policy changes were made by. */
   userName?: UserNameResolver;
@@ -24,6 +40,9 @@ const AuditList: React.FC<AuditListProps> = ({
   onSelect,
   page,
   totalPages,
+  countsAreLowerBounds = false,
+  error = null,
+  onRetry,
   onPageChange,
   userName,
 }) => {
@@ -45,6 +64,32 @@ const AuditList: React.FC<AuditListProps> = ({
     );
   }
 
+  // Before the empty state: a read that failed returned no records, which says
+  // nothing about what the log holds. Showing the empty state here would tell
+  // an administrator the gateway recorded nothing.
+  if (error) {
+    return (
+      <div className="alert alert-danger" role="alert" data-testid="audit-error">
+        <i className="fas fa-exclamation-circle me-2" aria-hidden="true" />
+        Failed to load audit log: {error}
+        {onRetry && (
+          <AppButton
+            variant="outline-danger"
+            size="sm"
+            className="ms-3"
+            data-testid="audit-error-retry"
+            onClick={onRetry}
+          >
+            Retry
+          </AppButton>
+        )}
+        <div className="small mt-2 mb-0">
+          No audit records could be read. That is not the same as the log holding none.
+        </div>
+      </div>
+    );
+  }
+
   if (filteredEntries.length === 0) {
     return (
       <div
@@ -62,16 +107,26 @@ const AuditList: React.FC<AuditListProps> = ({
         >
           <i className="fas fa-clipboard-list fa-2x text-primary" aria-hidden="true" />
         </div>
-        <p className="mb-1 fw-semibold">No governance events yet</p>
-        <p className="small mb-0" style={{ maxWidth: 360 }}>
-          Trigger an agent action, or enable VP Auditing{' '}
-          <FieldHelp testId="field-help-audit-empty-vp" ariaLabel="About VP Auditing">
-            VP Auditing records a signed Verifiable Presentation for every policy decision, trust
-            check, and credential injection so you can prove after the fact what the gateway allowed
-            or denied and why.
-          </FieldHelp>{' '}
-          in Settings › Security, to generate audit evidence.
-        </p>
+        {countsAreLowerBounds ? (
+          // The read did not return everything the history holds, so the log
+          // is not known to be empty and the advice below would be wrong.
+          <p className="mb-1 fw-semibold" data-testid="audit-empty-truncated">
+            No governance events found in the records searched.
+          </p>
+        ) : (
+          <>
+            <p className="mb-1 fw-semibold">No governance events yet</p>
+            <p className="small mb-0" style={{ maxWidth: 360 }}>
+              Trigger an agent action, or enable VP Auditing{' '}
+              <FieldHelp testId="field-help-audit-empty-vp" ariaLabel="About VP Auditing">
+                VP Auditing records a signed Verifiable Presentation for every policy decision,
+                trust check, and credential injection so you can prove after the fact what the
+                gateway allowed or denied and why.
+              </FieldHelp>{' '}
+              in Settings › Security, to generate audit evidence.
+            </p>
+          </>
+        )}
       </div>
     );
   }
@@ -98,6 +153,7 @@ const AuditList: React.FC<AuditListProps> = ({
         >
           <span className="small text-muted">
             Page {page} of {totalPages}
+            {countsAreLowerBounds ? '+' : ''}
           </span>
           <div>
             <button

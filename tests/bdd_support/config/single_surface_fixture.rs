@@ -359,6 +359,9 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    /// The claim `audiences` is matched against; `None` stores no
+    /// `audience_claim`, which the gateway reads as `aud`.
+    pub audience_claim: Option<String>,
     pub forward_header: bool,
 }
 
@@ -617,6 +620,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {

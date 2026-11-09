@@ -205,12 +205,13 @@ impl AgentSurface {
     }
 
     /// Whether any of the Access Point's caller-authentication methods
-    /// accepts a token minted for any service: a JWT bearer method without
-    /// `audiences` skips the audience check, unless the Access Point publishes
-    /// a protected resource, whose `resource` is then the only audience
-    /// accepted. Whoever holds a token of the issuer, for any of its relying
-    /// parties, is then a caller. No grant by binding is released to such
-    /// callers.
+    /// accepts a token minted for any service: a JWT bearer method stored
+    /// without `audiences` skips the audience check, and one whose
+    /// `audience_claim` is `azp` or `client_id` checks only the client the
+    /// token was issued to, unless the Access Point publishes a protected
+    /// resource, whose `resource` is then the only audience accepted. Whoever
+    /// holds a token of the issuer, for any of its relying parties, is then a
+    /// caller. No grant by binding is released to such callers.
     pub fn admits_tokens_for_any_audience(&self) -> bool {
         self.access_point
             .caller_authentication
@@ -224,9 +225,66 @@ impl AgentSurface {
                         .iter()
                         .any(|method| {
                             matches!(method, crate::source_auth::SourceAuthConfig::JwtBearer(config)
-                                if config.audiences.is_empty())
+                                if config.audiences.is_empty() || !config.audience_claim.is_aud())
                         })
             })
+    }
+
+    /// One warning for the surface, and for each variant that overrides its
+    /// caller authentication, naming each JWT bearer method stored without
+    /// `audiences` beside no protected resource. Such a method skips the
+    /// audience check; a save refuses a new one.
+    pub fn unchecked_audience_warnings(&self) -> Vec<String> {
+        let warnings = |view: &Self, place: String| -> Vec<String> {
+            if view
+                .protected_resource()
+                .is_some()
+            {
+                return Vec::new();
+            }
+            view.source_auth_methods()
+                .iter()
+                .filter_map(|method| match method {
+                    crate::source_auth::SourceAuthConfig::JwtBearer(config)
+                        if config.audiences.is_empty() && config.audience_claim.is_aud() =>
+                    {
+                        Some(format!(
+                            "{place}the Access Point's jwt_bearer method (strategy '{}') names no audience, so it \
+                             accepts a token its identity provider issued for any other service and the caller that \
+                             token names; list the audiences it accepts, or set audience_claim to client_id or azp for \
+                             an identity provider that issues no aud. A method without an audience is deprecated and \
+                             will be refused in the next major release, 2.0.0",
+                            config.jwt_verification_strategy_id
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let variants = self
+            .variants
+            .iter()
+            .filter(|variant| {
+                variant
+                    .overrides
+                    .access_point
+                    .as_ref()
+                    .is_some_and(|access_point| {
+                        access_point
+                            .caller_authentication
+                            .is_some()
+                    })
+            })
+            .filter_map(|variant| {
+                self.resolve_variant(Some(&variant.alias))
+                    .ok()
+                    .map(|view| warnings(&view, format!("variant '{}': ", variant.alias)))
+            })
+            .flatten();
+        warnings(self, String::new())
+            .into_iter()
+            .chain(variants)
+            .collect()
     }
 
     /// RFC 9728 settings of the Access Point's caller authentication.
@@ -355,6 +413,17 @@ impl AgentSurface {
                     Some(
                         "its jwt_bearer method names no audience, so it accepts a token the identity provider issued \
                          for another service",
+                    )
+                }
+                SourceAuthConfig::JwtBearer(jwt)
+                    if !jwt.audience_claim.is_aud()
+                        && self
+                            .protected_resource()
+                            .is_none() =>
+                {
+                    Some(
+                        "its jwt_bearer method checks the client a token was issued to, not its audience, so it \
+                         accepts a token the identity provider issued to that client for another service",
                     )
                 }
                 SourceAuthConfig::JwtBearer(_) => None,
@@ -1285,6 +1354,89 @@ mod tests {
         surface
     }
 
+    /// Grants by binding are withheld from callers of a JWT method that does
+    /// not bind the token to this gateway: one stored without audiences, or
+    /// one that checks only the client, unless a protected resource binds
+    /// `aud`.
+    #[test]
+    fn admits_tokens_for_any_audience_unless_aud_is_checked() {
+        let jwt = |extra: serde_json::Value| {
+            let mut method = serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["app-1"] });
+            method
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            surface_with_methods(serde_json::json!([method]))
+        };
+        for (case, surface, admits) in [
+            ("an audience", jwt(serde_json::json!({})), false),
+            ("no audience", jwt(serde_json::json!({ "audiences": [] })), true),
+            ("client_id", jwt(serde_json::json!({ "audience_claim": "client_id" })), true),
+            ("azp", jwt(serde_json::json!({ "audience_claim": "azp" })), true),
+        ] {
+            assert_eq!(surface.admits_tokens_for_any_audience(), admits, "{case}");
+            let mut bound = surface.clone();
+            bound
+                .access_point
+                .caller_authentication
+                .as_mut()
+                .unwrap()
+                .protected_resource = Some(crate::protocols::protected_resource::ProtectedResourceConfig {
+                resource: "https://gateway.example/mcp".to_string(),
+                authorization_servers: vec!["https://issuer.example".to_string()],
+                scopes: Vec::new(),
+            });
+            assert!(!bound.admits_tokens_for_any_audience(), "{case} beside a protected resource");
+        }
+    }
+
+    #[test]
+    fn unchecked_audience_warnings_name_each_stored_method_without_an_audience() {
+        let no_audience =
+            serde_json::json!({ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [] });
+        let mut surface = surface_with_methods(serde_json::json!([no_audience.clone()]));
+        surface.variants = serde_json::from_value(serde_json::json!([
+            { "id": "v-inherits", "name": "inherits", "alias": "inherits", "overrides": {} },
+            { "id": "v-own", "name": "own", "alias": "own", "overrides": { "access_point": { "caller_authentication": { "methods": [
+                { "type": "jwt_bearer", "jwt_verification_strategy_id": "partner", "audiences": [] }
+            ] } } } },
+            { "id": "v-fixed", "name": "fixed", "alias": "fixed", "overrides": { "access_point": { "caller_authentication": { "methods": [
+                { "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] }
+            ] } } } }
+        ]))
+        .unwrap();
+
+        let warnings = surface.unchecked_audience_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("the Access Point's jwt_bearer method (strategy 'idp') names no audience")
+                && warnings[0].contains("deprecated and will be refused in the next major release, 2.0.0"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].starts_with("variant 'own': the Access Point's jwt_bearer method (strategy 'partner')"),
+            "{}",
+            warnings[1]
+        );
+
+        let named = surface_with_methods(serde_json::json!([
+            { "type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["api://agent"] },
+            { "type": "jwt_bearer", "jwt_verification_strategy_id": "cognito", "audiences": ["app-1"],
+              "audience_claim": "client_id", "token_header": "X-Token" }
+        ]));
+        assert!(
+            named
+                .unchecked_audience_warnings()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn did_auth_config_is_found_at_any_position() {
         let surface = surface_with_methods(serde_json::json!([
@@ -1689,6 +1841,12 @@ mod tests {
                 false,
             ),
             ("a JWT naming no audience", surface_with_methods(json!([jwt(json!([]))])), false),
+            (
+                "a JWT checking only its client",
+                surface_with_methods(json!([{ "type": "jwt_bearer", "jwt_verification_strategy_id": "idp",
+                    "audiences": ["app-1"], "audience_claim": "client_id" }])),
+                false,
+            ),
             ("mTLS only", surface_with_methods(json!([mtls.clone()])), false),
             (
                 "an API key beside a JWT naming an audience",

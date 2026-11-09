@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use base64::Engine;
 use futures::TryStreamExt;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp_openapi::{ExtractedParameters, ToolGenerator, ToolMetadata};
 use serde_json::{Value, json};
 use url::Url;
@@ -763,7 +763,7 @@ pub(super) async fn call(
         .is_some_and(|mime| mime.type_() == mime::IMAGE)
     {
         (
-            vec![Content::image(
+            vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&body),
                 content_type.unwrap_or_default(),
             )],
@@ -795,7 +795,7 @@ pub(super) async fn call(
             }
             .to_mcp_content(),
         };
-        (vec![Content::text(content)], structured)
+        (vec![ContentBlock::text(content)], structured)
     };
     let mut result = if status.is_success() {
         CallToolResult::success(content)
@@ -811,7 +811,9 @@ pub(super) async fn call(
                     .is_none_or(|value| !validator.is_valid(value))
             })
     {
-        return Ok(CallToolResult::error(vec![Content::text("REST response does not match the tool output schema")]));
+        return Ok(CallToolResult::error(vec![ContentBlock::text(
+            "REST response does not match the tool output schema",
+        )]));
     }
     result.structured_content = structured;
     Ok(result)

@@ -1015,6 +1015,7 @@ fn build_bootstrap_config(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        audit: Default::default(),
     }
 }
 

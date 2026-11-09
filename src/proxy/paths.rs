@@ -398,6 +398,9 @@ pub fn is_public_request(
 /// Adding an entry stops every existing gateway whose configuration uses that
 /// segment from serving that prefix after the upgrade, so it needs a `breaking`
 /// changelog entry.
+///
+/// `scripts/_prepare.sh` reads these entries out of this file to warn during env
+/// preparation, so keep the declaration on one line.
 const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "access-tokens",
     "api-keys",

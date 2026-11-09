@@ -84,6 +84,7 @@ Each of these behaves differently from the obvious reading of the field.
 | `backup_encryption_key` | Required. The service does not start without a resolvable value. |
 | Unknown top-level keys | Ignored, not rejected. A misspelled key takes no effect and produces no error. |
 | `encryption.key_source = "local"` | Does not encrypt. It writes plaintext `ENC[0::…]` envelopes and is for development only. It does not count as encryption at rest for delegated grants by binding, so with it, as with `[encryption]` off, a binding with `consent_mode: external`, a Transit Point's or the Access Point Target's, is refused. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#grants-by-binding). |
+| `encryption.enabled` | `--generate-bootstrap` writes `[encryption]` with `enabled = false`, and a `config.toml` without the table runs unencrypted. Deployment tooling that builds `config.toml` from `--generate-bootstrap` replaces that table, so its output keeps encryption off and the table's shape stable. The development setup turns encryption on for an environment it creates: a local one reads the master key from `envs/master_encryption_key` (`key_source = "file"`), a Docker one from `AG_MASTER_KEY`. When it regenerates an existing `config.toml`, it keeps that file's `[encryption]` table. An existing environment that runs unencrypted stays unencrypted. To opt in, set `[encryption]` by hand (`enabled = true`, `key_source = "file"`, `key_file` = the absolute path of `envs/master_encryption_key` or of another file holding a 64-hex or base64 32-byte key) and restart; plaintext records are rewritten as `.json.enc` when they are loaded. |
 | `encryption.field_encryption_enabled` | Reserved and not wired to any field. Leave it false. |
 
 ## Surface transit settings that do nothing
@@ -160,6 +161,7 @@ The bootstrap file. Startup only; changes need a restart.
 | `[oob_connection]` | How long an out-of-band pairing invitation stays pending |
 | `[a2a]` | Default A2A revision, body size (`max_body_size`, at least 1 byte; `0` fails startup), timeouts, fabric timeouts and envelope lifetime, inbound cache sizing. See [`CONFIGURATION_RELOAD.md`](CONFIGURATION_RELOAD.md). |
 | `[logging]` | Level, JSON output, log directory. Log redaction is not read here; see [Log redaction](#log-redaction). |
+| `[audit]` | How the VP Audit Log file is rotated: `vp_audit_log_max_bytes` (default 8388608) and `vp_audit_log_keep` (default 0, keep every rotated file), and the advisory `vp_audit_log_soft_cap_bytes` the Audit page shows the history against (default 1073741824). See [Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding). |
 | `[extension_inspection]` | Whether to parse A2A extensions, and which URIs to watch |
 
 Fields and defaults are defined in [`src/config/bootstrap.rs`](../src/config/bootstrap.rs).
@@ -177,6 +179,9 @@ description that exists today.
 | `encryption.enabled` | Writes whole storage files as `.json.enc`. Losing the master key loses the data. |
 | `metrics_retention_minutes` | Parsed but not used. Retention is the value in `_storage/settings/settings.json`, set from the dashboard, which defaults to 360 minutes whatever this field says. |
 | `websocket_require_auth` | Off means an unauthenticated client can open the dashboard event stream. |
+| `audit.vp_audit_log_max_bytes` | Bytes the live VP Audit Log may reach before it is rotated (default 8388608). `0` switches rotation off and lets the live file grow without limit; any other value below 65536 fails startup, because a smaller cap rotates on nearly every record — holding the audit dispatcher up behind each rotation — while keeping almost no evidence. A read of `/v1/audit`, `/v1/delegation-audit` or `/v1/payments/audit` examines `vp_audit_log_max_bytes × (vp_audit_log_keep + 2)` bytes of the history, capped at 256 MiB; past that the response is marked `truncated` and its counts describe only the newest records. |
+| `audit.vp_audit_log_keep` | Rotated VP Audit Log files kept beside the live one, oldest deleted first. The default, `0`, keeps every rotated file: no audit record is deleted — the retention the gateway had before its log was rotated — and the history grows with the appliance's request rate until the disk fills, so give it disk and watch the space. On that default a read examines the newest 256 MiB and marks anything beyond it `truncated`, which the Audit page shows by rendering its counts as lower bounds (`1243+`); a separate `dropped_records` counts records in the history the read could not return at all, and makes the counts lower bounds the same way. A positive value bounds the history: records older than the newest `vp_audit_log_keep` rotated files are deleted outright and counted nowhere, so forward anything that must outlive them to a Governance Audit integration first. Lowering it from `0` deletes everything past the new bound in the next rotation, in one go under the writer's lock. Rotation itself is one rename plus one listing of the log directory, whatever the value is. |
+| `audit.vp_audit_log_soft_cap_bytes` | The size of the audit history the Audit page shows it growing against (default 1073741824, 1 GiB). **Advisory only: it changes no behaviour.** Nothing is deleted, no write is refused, no rotation happens and no startup fails because of it; the page marks the usage line once the history is past it and says what an operator can do. It exists because the default `vp_audit_log_keep = 0` never deletes anything, so the history otherwise grows unwatched. `0` shows the size with no mark. |
 | `did_cache.allow_private_hosts` | Off (the default) refuses `did:web` and `did:webvh` on loopback, private-network and link-local hosts. On is needed for a local stack whose mediator lives on `localhost`, and reopens SSRF through attacker-supplied DIDs, cloud metadata included, so keep it off wherever an instance metadata service is reachable. See [`POLICY.md`](POLICY.md#did-resolution-host-policy). |
 
 ## `gateway.json`
@@ -881,9 +886,16 @@ the breaker of a gateway a visible row names (`404` otherwise).
 filtered by `surface_id`, `stage` (`challenge_issued`, `verify_attempt`, `verified`, `failed`,
 `held`, `unconfirmed`, `authorized`, `voided`, `settled`, `settlement_failed`), `trace_id`,
 `since` and `until` (RFC 3339), and paged with `page` and `page_size` (default 50, at most 500):
-`{events, total, page, page_size, total_pages}`. An unknown stage or an unreadable time is `400`.
+`{events, total, page, page_size, total_pages, truncated, dropped_records}`. An unknown stage or an
+unreadable time is `400`.
 A record leaves with its `vp_fingerprint` only, never `vp_jwt`. It reads only what the log keeps,
-so it is empty unless the VP Audit Log selects the `payment` event. A tenant caller sees the
+so it is empty unless the VP Audit Log selects the `payment` event. The read walks the live log and
+the rotated files behind it, filters and pages inside that walk, and stops at the same scan limit
+as `/v1/audit`: `truncated: true` says the read stopped before the end of the history, and
+`dropped_records` counts the records in it the read could not return. Either makes `total` and
+`total_pages` lower bounds, and under `truncated` the oldest payment records may not be in them. There is no dashboard view of this endpoint;
+a consumer that shows these counts must read the flag and present them as lower bounds, the way the
+Audit page renders `1243+`. A tenant caller sees the
 records of surfaces whose ledger rows it may see; a record of a surface with no row in the ledger
 window, or with no surface, is shown to operator callers only.
 

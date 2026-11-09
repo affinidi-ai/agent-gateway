@@ -15,6 +15,8 @@ interface FilterOverflowMenuProps {
   facetLabel?: string;
   /** Whether to show count badges on menu items (default: true) */
   showBadge?: boolean;
+  /** Whether every count in the menu is a lower bound, shown with a trailing `+`. */
+  countsAreLowerBounds?: boolean;
   /** Current single-select value (optional); if set and in options, shows its label in trigger */
   currentValue?: string;
 }
@@ -31,6 +33,7 @@ export const FilterOverflowMenu: React.FC<FilterOverflowMenuProps> = ({
   onClear,
   facetLabel = 'More',
   showBadge = true,
+  countsAreLowerBounds = false,
   currentValue,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -160,10 +163,16 @@ export const FilterOverflowMenu: React.FC<FilterOverflowMenuProps> = ({
               )}
               <span style={{ fontSize: '0.8125rem', flex: 1 }}>{option.label}</span>
               {option.count === 0 && (
-                <span style={{ fontSize: '0.75rem', color: '#999', opacity: 0.7 }}>(0)</span>
+                <span style={{ fontSize: '0.75rem', color: '#999', opacity: 0.7 }}>
+                  ({countsAreLowerBounds ? '0+' : '0'})
+                </span>
               )}
               {showBadge && option.count !== undefined && option.count > 0 && (
-                <Badge value={option.count} tone="secondary" size="sm" />
+                <Badge
+                  value={countsAreLowerBounds ? `${option.count}+` : option.count}
+                  tone="secondary"
+                  size="sm"
+                />
               )}
             </label>
           ))}
