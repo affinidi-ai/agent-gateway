@@ -648,6 +648,7 @@ pub(super) async fn call(
         None,
     )
     .await
+    .map(|(result, _)| result)
 }
 
 /// A tool call of a Transit Point's MCP Proxy, with a grant by binding in
@@ -660,7 +661,8 @@ pub(super) async fn call(
 /// [`RestError::GrantRefused`], without its body, so the caller can refresh
 /// the grant or refuse the call with a fixed reason. `sent` is set just before
 /// the request goes out, once its URL, egress, headers and body passed every
-/// check, so a call refused by any of them is never taken as sent.
+/// check, so a call refused by any of them is never taken as sent. The tool's
+/// result comes with the status the backend answered.
 pub(super) async fn call_through_transit_point(
     base_url: &str,
     metadata: &ToolMetadata,
@@ -671,7 +673,7 @@ pub(super) async fn call_through_transit_point(
     grant_destination: Option<&url::Origin>,
     exact_allowlist: Option<&str>,
     sent: &std::sync::atomic::AtomicBool,
-) -> Result<CallToolResult, RestError> {
+) -> Result<(CallToolResult, reqwest::StatusCode), RestError> {
     send(
         base_url,
         metadata,
@@ -733,7 +735,7 @@ async fn send(
     egress: RestEgress<'_>,
     sent_token: Option<&SentServiceToken<'_>>,
     sent: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<CallToolResult, RestError> {
+) -> Result<(CallToolResult, reqwest::StatusCode), RestError> {
     if serde_json::to_vec(arguments)
         .map_err(|_| RestError::Arguments)?
         .len()
@@ -918,12 +920,13 @@ async fn send(
                     .is_none_or(|value| !validator.is_valid(value))
             })
     {
-        return Ok(CallToolResult::error(vec![ContentBlock::text(
-            "REST response does not match the tool output schema",
-        )]));
+        return Ok((
+            CallToolResult::error(vec![ContentBlock::text("REST response does not match the tool output schema")]),
+            status,
+        ));
     }
     result.structured_content = structured;
-    Ok(result)
+    Ok((result, status))
 }
 
 fn text_content(
@@ -1689,7 +1692,8 @@ mod tests {
         };
 
         let (answered, went_out) = sent(&destination, Some(&origin)).await;
-        assert_eq!(answered.unwrap().is_error, Some(false));
+        let (answered, status) = answered.unwrap();
+        assert_eq!((answered.is_error, status.as_u16()), (Some(false), 200));
         assert!(went_out);
         match sent(&destination, Some(&origin)).await {
             (Err(RestError::GrantRefused { status, challenges }), true) => {
@@ -1699,7 +1703,12 @@ mod tests {
             other => panic!("expected the refused grant, got {other:?}"),
         }
         let (forbidden, went_out) = sent(&destination, Some(&origin)).await;
-        assert_eq!(forbidden.unwrap().is_error, Some(true), "a 403 that is not about scope is the tool's own error");
+        let (forbidden, status) = forbidden.unwrap();
+        assert_eq!(
+            (forbidden.is_error, status.as_u16()),
+            (Some(true), 403),
+            "a 403 that is not about scope is the tool's own error, with the backend's status"
+        );
         assert!(went_out);
 
         let elsewhere = Url::parse("http://127.0.0.1:9")
@@ -1762,14 +1771,18 @@ mod tests {
         };
         let allowlist = Some(format!("{},{},{}", backend.origin(), elsewhere.origin(), redirecting.origin()));
 
-        let answered = call(backend.origin(), allowlist.clone())
+        let (answered, _) = call(backend.origin(), allowlist.clone())
             .await
             .unwrap();
         assert_eq!(answered.is_error, Some(false));
-        let refused = call(backend.origin(), allowlist.clone())
+        let (refused, status) = call(backend.origin(), allowlist.clone())
             .await
             .unwrap();
-        assert_eq!(refused.is_error, Some(true), "with no grant, a 401 is the tool's own error");
+        assert_eq!(
+            (refused.is_error, status.as_u16()),
+            (Some(true), 401),
+            "with no grant, a 401 is the tool's own error"
+        );
 
         let rebound = backend
             .origin()

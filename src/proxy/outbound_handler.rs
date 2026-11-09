@@ -503,6 +503,10 @@ pub struct OutboundPipelineContext {
     /// The grant by binding the request carries, so a vendor's `401` can be
     /// answered by a refresh and one retry.
     pub released_grant: Option<Box<ReleasedGrant>>,
+    /// The status a `proxy://` Transit Point's MCP Proxy's backend answered the
+    /// last tool call sent with, which the proxy answers the agent as a tool
+    /// result; `None` when no backend answered.
+    pub proxy_backend_status: Option<StatusCode>,
     /// Request path (used to build target URL).
     pub request_path: String,
     /// Protected agent identity resolved by `step_resolve_agent_identity`.
@@ -795,6 +799,7 @@ impl OutboundPipelineContext {
             delegated_credential_headers: HeaderMap::new(),
             grant_destination: None,
             released_grant: None,
+            proxy_backend_status: None,
             request_path,
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -6001,6 +6006,26 @@ fn audit_connector_call(
     });
 }
 
+/// Audit a call through a connector's Transit Point that the vendor answered
+/// as `connector_call` forwarded, with the class of the vendor's status: the
+/// `response`'s own, or for a `proxy://` Transit Point, that of its MCP
+/// Proxy's backend, which the proxy answers the agent as a tool result. A
+/// call through an MCP Proxy that no backend answered (an unknown tool, a URL
+/// or egress refusal, a failed connection, a redirect) records nothing.
+fn audit_connector_call_answered(
+    ctx: &OutboundPipelineContext,
+    response: &reqwest::Response,
+) {
+    let status = if is_mcp_proxy_transit_point(ctx) {
+        ctx.proxy_backend_status
+    } else {
+        Some(response.status())
+    };
+    if let Some(status) = status {
+        audit_connector_call(ctx, ConnectorCallResult::Forwarded { status });
+    }
+}
+
 /// The most characters of a tool name a `connector_call` keeps, as the MCP
 /// specification bounds a tool name.
 const AUDITED_TOOL_NAME_MAX_CHARS: usize = 128;
@@ -6218,6 +6243,7 @@ async fn step_forward_request_mcp_proxy(
     use crate::mcp_proxies::McpProxyStore;
     use crate::mcp_proxies::handlers::{McpProxyCallError, TransitProxyAnswer};
 
+    ctx.proxy_backend_status = None;
     if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
         return Err(refuse_mcp_proxy_transit(
             ctx,
@@ -6327,19 +6353,23 @@ async fn step_forward_request_mcp_proxy(
         Err(refused) => Err(refused),
     };
     match answer {
-        Ok(TransitProxyAnswer::Response(response)) => Ok(own_answer(
-            StatusCode::OK,
-            json_headers(),
-            response
-                .to_string()
-                .into_bytes(),
-        )),
+        Ok(TransitProxyAnswer::Response { response, backend_status }) => {
+            ctx.proxy_backend_status = backend_status;
+            Ok(own_answer(
+                StatusCode::OK,
+                json_headers(),
+                response
+                    .to_string()
+                    .into_bytes(),
+            ))
+        }
         Ok(TransitProxyAnswer::GrantRefused { status, challenges }) => {
             let mut headers = HeaderMap::new();
             for challenge in challenges {
                 headers.append(axum::http::header::WWW_AUTHENTICATE, challenge);
             }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
+            ctx.proxy_backend_status = Some(status);
             Ok(own_answer(status, headers, Vec::new()))
         }
         Err(McpProxyCallError::OutsideTargetBase) => {
@@ -7085,7 +7115,7 @@ async fn step_answer_a_refused_grant(
     match vendor_answer(response.status(), response.headers()) {
         VendorAnswer::Pass => {
             ctx.released_grant = Some(released);
-            audit_connector_call(ctx, ConnectorCallResult::Forwarded { status: response.status() });
+            audit_connector_call_answered(ctx, &response);
             return Ok(UpstreamResponse::Http(response));
         }
         VendorAnswer::Refuse(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
@@ -7148,7 +7178,7 @@ async fn step_answer_a_refused_grant(
         drop(retried);
         return Err(refuse_grant(ctx, refused.refusal, refused.reason));
     }
-    audit_connector_call(ctx, ConnectorCallResult::Forwarded { status: retried.status() });
+    audit_connector_call_answered(ctx, &retried);
     Ok(UpstreamResponse::Http(retried))
 }
 
@@ -8091,6 +8121,7 @@ mod tests {
             delegated_credential_headers: HeaderMap::new(),
             grant_destination: None,
             released_grant: None,
+            proxy_backend_status: None,
             request_path: "/outbound/surfaces/order/partner-a/message/send".to_string(),
             resolved_identity: ProtectedAgentIdentity::Anonymous,
             protocol: None,
@@ -18983,7 +19014,9 @@ mod tests {
         // Every state's proxy is the same, so one pin serves them all.
         let surface = pinned(&state, drive_surface(Some("owner"))).await;
         edit_drive_proxy(&state, |proxy| proxy.base_url = elsewhere_base.clone()).await;
-        let refused = answered(&state, &mut drive_call(&surface, search_files(1)))
+        // Pinned to the proxy as edited, so only its origin refuses the grant.
+        let pinned_elsewhere = pinned(&state, drive_surface(Some("owner"))).await;
+        let refused = answered(&state, &mut drive_call(&pinned_elsewhere, search_files(1)))
             .await
             .unwrap_err();
         assert_eq!(grant_refusal(&refused), Some(&GrantRefusal::ConnectorUnavailable), "another origin at release");
@@ -18994,6 +19027,9 @@ mod tests {
             .await
             .expect("the proxy sends to the resource when the grant is released");
         edit_drive_proxy(&state, |proxy| proxy.base_url = elsewhere_base.clone()).await;
+        // The request's surface pinned to the proxy as edited, so only the
+        // origin check of the forward step refuses it.
+        ctx.surface = Arc::new(pinned(&state, drive_surface(Some("owner"))).await);
         let refused = step_forward_request(&state, &mut ctx)
             .await
             .err()
@@ -19227,13 +19263,33 @@ mod tests {
 
     /// A grant's use (`token_injected`) is recorded only for a tool call that
     /// went out to the backend: one refused by the URL its arguments would
-    /// build, after the grant was released, records nothing.
+    /// build, after the grant was released, records nothing, and no
+    /// `connector_call` either, as no backend answered it. A call the backend
+    /// answered is recorded as `connector_call` with the class of the
+    /// backend's status, not the `200` the proxy answers the agent with.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proxy_tool_call_refused_before_it_is_sent_records_no_use_of_the_grant() {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
         use crate::delegation_vault::grants::GrantKey;
         use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let status_classes = |events: &[crate::delegation_vault::audit::DelegationAuditEvent]| {
+            connector_calls(events)
+                .into_iter()
+                .map(|event| match &event.event {
+                    DelegationAuditAction::ConnectorCall { outcome, status_class, .. } => {
+                        assert_eq!(*outcome, ConnectorCallOutcome::Forwarded);
+                        status_class.clone()
+                    }
+                    other => panic!("expected ConnectorCall, got {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
         let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
-        let vendor = RecordingServer::start_answering(vec![Answer::json(200, json!({"files": []}))]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::json(200, json!({"files": []})),
+            Answer::json(404, json!({"error": "no such file"})),
+        ])
+        .await;
         let directory = tempfile::tempdir().unwrap();
         let state = with_drive_proxy(
             fixture_grant_state(directory.path(), &authorization_server, &vendor).await,
@@ -19262,13 +19318,84 @@ mod tests {
         assert!(refused["error"].is_object(), "{refused}");
         assert!(ctx.released_grant.is_some(), "the grant was released for the call");
         assert_eq!(grants_injected(&events), 0, "a call refused before it is sent records no use");
+        assert!(status_classes(&events).is_empty(), "nor a connector_call: {events:?}");
         assert!(vendor.requests().is_empty(), "{:?}", vendor.requests());
 
         let (answer, events) =
             crate::audit::producer::capture(answered(&state, &mut drive_call(&surface, search_files(2)))).await;
         assert_eq!(answer.unwrap().1["result"]["isError"], false);
         assert_eq!(grants_injected(&events), 1, "a call that went out records its use once");
+        assert_eq!(status_classes(&events), [Some("2xx".to_string())]);
         assert_eq!(vendor_bearers(&vendor), ["Bearer granted"]);
+
+        let (answer, events) =
+            crate::audit::producer::capture(answered(&state, &mut drive_call(&surface, search_files(3)))).await;
+        let (status, missing) = answer.unwrap();
+        assert_eq!((status, missing["result"]["isError"].clone()), (reqwest::StatusCode::OK, json!(true)));
+        assert_eq!(
+            status_classes(&events),
+            [Some("4xx".to_string())],
+            "the backend's 404, not the proxy's 200 to the agent"
+        );
+    }
+
+    /// A `proxy://` Transit Point's backend that answers a tool call `403`
+    /// with an `insufficient_scope` challenge answers `scope_insufficient`,
+    /// naming the scope, as an `https` vendor's does: the challenge survives
+    /// the MCP Proxy, and the backend's body reaches neither the agent nor a
+    /// retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proxy_backends_insufficient_scope_is_answered_scope_insufficient() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(500)]).await;
+        let vendor = RecordingServer::start_answering(vec![
+            Answer::json(403, json!({"error": "backend-words-5c2e"}))
+                .with_header("WWW-Authenticate", r#"Bearer error="insufficient_scope", scope="drive.readonly""#),
+        ])
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_drive_proxy(
+            fixture_grant_state(directory.path(), &authorization_server, &vendor).await,
+            directory.path(),
+            None,
+            &format!("{}/drive/v3", vendor.origin()),
+        )
+        .await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "narrow", 3600)
+            .await;
+        let surface = pinned(&state, drive_surface(Some("owner"))).await;
+
+        let refused = answered(&state, &mut drive_call(&surface, search_files(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            grant_refusal(&refused),
+            Some(&GrantRefusal::ScopeInsufficient {
+                scope: Some("drive.readonly".into())
+            })
+        );
+        let response = refused.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["data"], json!({"reason": "scope_insufficient", "scope": "drive.readonly"}));
+        assert!(
+            !body
+                .to_string()
+                .contains("backend-words-5c2e"),
+            "{body}"
+        );
+        assert_eq!(vendor.requests().len(), 1, "no retry for a scope the grant lacks");
+        assert!(
+            authorization_server
+                .requests()
+                .is_empty(),
+            "and no refresh"
+        );
     }
 
     /// A `proxy://` Transit Point whose credential its MCP Proxy cannot send,

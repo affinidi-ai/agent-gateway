@@ -8,8 +8,11 @@ changes:
         host name, so every call failed. It is now answered by that MCP Proxy, one the surface
         may reference: initialize and tools/list from its spec, a notification accepted with
         nothing sent, and a tools/call through its REST backend, under the Transit Point's own
-        timeout and mcp_http limits; any method but POST answers 405 and a 2026-07-28 request
-        is refused with -32022 before any credential is prepared. Such a Transit Point speaks
+        timeout (or the surface's) and mcp_http limits; any method but POST answers 405 and a
+        2026-07-28 request is refused with -32022 before any credential is prepared. Every tool
+        call, with a grant or without, goes through pinned Strict egress: https only, internal
+        addresses refused after DNS resolution, the connection pinned, redirects refused and no
+        HTTP proxy. Such a Transit Point speaks
         MCP and sends its backend no target_auth and no delegated credential but a
         consent_mode external grant: a surface save refuses one that breaks this, on the
         surface and in every variant, and one stored outside the API is refused when called
@@ -29,7 +32,9 @@ changes:
         never for one its URL or Strict egress refused. A backend 401 that rejects the token
         gets one refresh and one retry through the proxy, and a refused grant answers
         connect_required, scope_insufficient or connector_unavailable, as on an https target,
-        without the backend's words.
+        without the backend's words. A connector_call audit record names the class of the
+        backend's status, not that of the MCP Proxy's answer to the agent, and a call no backend
+        answered records none.
     - timestamp: '2026-11-08T18:00:00Z'
       title: Answer every MCP Proxy with its grant_pin
       description: >-
@@ -66,32 +71,28 @@ changes:
         person's grant is used for and what the agent reads. Each proxy:// Transit Point's
         external binding is now pinned to the proxy's grant_pin
         (transit_credentials.mcp_proxy_pin). A save that sends the proxy's current grant_pin
-        pins the binding to it, one that sends any other pin is refused (400,
-        mcp_proxy_pin_not_current, naming the Transit Point), one that sends none keeps the
-        stored pin, so a save made for another reason (a PATCH, a variant change, a tenant
-        transfer) never approves an edited proxy, and a new binding is pinned to the proxy as
-        it is. While the proxy differs, the Transit Point answers nothing through it: connect
-        start answers 409, and initialize, tools/list and every call connector_unavailable, with
-        a log line naming the Transit Point and the proxy; the save answers a Warning header.
-        The pin is compared only with a proxy of the surface's own tenant.
+        pins the binding to it; one that sends none, or sends the stored pin back as the
+        dashboard does, keeps the stored pin, so a save made for another reason (a PATCH, a
+        variant change, a tenant transfer, a dashboard save) never approves an edited proxy;
+        one that sends any other pin is refused (400, mcp_proxy_pin_not_current, naming the
+        Transit Point); and a new binding is pinned to the proxy as it is. While the proxy
+        differs, or a binding stored outside the API has no pin, the Transit Point answers
+        nothing through it: connect start answers 409, telling the operator to save the surface
+        with the proxy's current grant_pin, and initialize, tools/list and every call
+        connector_unavailable, each refusal with a log line naming the Transit Point and the
+        proxy; the save answers a Warning header. The pin is compared only with a proxy of the
+        surface's own tenant, and a save fails (500) rather than drop a pin when the proxy
+        cannot be read.
     - timestamp: '2026-11-08T18:00:00Z'
       title: Refuse a grant through an MCP Proxy whose spec overrides the HTTP method
       description: >-
-        A header parameter named X-HTTP-Method-Override, X-HTTP-Method or X-Method-Override, in
-        any case, lets an agent ask many REST APIs, Google's among them, to run another method
-        than the operation's, turning an allowed tool into another behind the same tool name. A
-        proxy:// Transit Point with a grant binding is now refused when the surface is saved
-        (400), when a connect starts (409) and when a tool call is sent (connector_unavailable)
-        while its MCP Proxy's spec has a tool with such a parameter. The proxy's name and the
-        tool names it logs are now logged escaped.
-    - timestamp: '2026-11-08T12:00:00Z'
-      title: Send every tool call of a Transit Point's MCP Proxy through Strict egress
-      description: >-
-        A proxy:// Transit Point's tool call without a grant went through the OpenAPI
-        library's client, which follows redirects and vets no address at call time, so a
-        backend host rebound to an internal address, or redirecting to cloud metadata, was
-        reached. Every tool call of such a Transit Point, with a grant or without, now goes
-        through pinned Strict egress: https only, internal addresses refused after DNS
-        resolution, the connection pinned and redirects refused. The MCP method a caller sends
-        is logged escaped and cut short.
+        A header parameter named X-HTTP-Method-Override, X-HTTP-Method or X-Method-Override, or
+        a query parameter or request body field named _method or one of those, in any case,
+        lets an agent ask many REST APIs and web frameworks to run another method than the
+        operation's, turning an allowed tool into another behind the same tool name. A
+        proxy:// Transit Point with a grant binding is refused when the surface is saved (400),
+        when a connect starts (409) and when a tool call is sent (connector_unavailable) while
+        its MCP Proxy's spec has a tool with such a parameter. An MCP Proxy's name, the tool
+        names it logs and the MCP method a caller sends are now logged escaped, the method cut
+        short.
   breaking: []

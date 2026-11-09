@@ -7199,8 +7199,9 @@ mod validation_tests {
     /// A merge `PATCH` starts from the stored surface, so a stored pin it
     /// carries is not one it sent: a patch for another reason keeps the stored
     /// pin even after the MCP Proxy changed, and never approves the change. A
-    /// patch that sends the proxy's current pin pins the binding to it, and
-    /// one that sends another is refused.
+    /// patch that sends the proxy's current pin pins the binding to it, one
+    /// that sends the stored pin back keeps it, and one that sends another is
+    /// refused.
     #[tokio::test]
     async fn a_merge_patch_keeps_the_stored_mcp_proxy_pin_unless_it_sends_the_proxys_current_one() {
         use crate::mcp_proxies::McpProxyStore;
@@ -7276,8 +7277,15 @@ mod validation_tests {
             Some(edited.grant_pin()),
             "a patch that sends the proxy's current pin pins the binding to it"
         );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some(first.clone()))] } }))
+                .await
+                .unwrap(),
+            Some(first),
+            "a patch that sends the stored pin back keeps it, approving nothing"
+        );
         assert!(matches!(
-            patched(serde_json::json!({ "transit": { "points": [point(Some(first))] } })).await,
+            patched(serde_json::json!({ "transit": { "points": [point(Some("sha256:another".into()))] } })).await,
             Err(SurfaceApiError::BadRequestCode(super::super::surface_tenancy::MCP_PROXY_PIN_NOT_CURRENT, _))
         ));
     }

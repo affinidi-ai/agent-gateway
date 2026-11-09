@@ -220,9 +220,10 @@ fn pinned_proxy_id(point: &crate::config::agent_surface::TransitPoint) -> Option
 ///   proxy it wrote, or is refused if the proxy changed in between. Any other
 ///   pin is refused, naming the Transit Point: `400` with the code
 ///   [`MCP_PROXY_PIN_NOT_CURRENT`].
-/// - With none sent, the binding keeps the pin stored for it: that of the
-///   stored binding of the Transit Point of the same id through the same
-///   proxy. So a save made for another reason never approves an edit to the
+/// - With none sent, or the pin stored for the binding sent back, as a client
+///   that `GET`s the surface and `PUT`s it whole does, the binding keeps the
+///   pin stored for it: that of the stored binding of the Transit Point of the
+///   same id through the same proxy. So a save made for another reason never approves an edit to the
 ///   proxy: a kept pin the proxy no longer has leaves the Transit Point
 ///   refused until a save sends the proxy's current pin.
 /// - A binding with no pin stored, a new one, is pinned to the proxy as it is
@@ -245,10 +246,15 @@ pub(crate) async fn pin_mcp_proxy_grants(
     let mut current = std::collections::HashMap::with_capacity(ids.len());
     if let Some(store) = proxies {
         for id in ids {
-            if let Ok(Some(proxy)) = store.get(&id).await
-                && proxy.tenant_id == surface.tenant_id
-            {
-                current.insert(id, proxy.grant_pin());
+            match store.get(&id).await {
+                Ok(Some(proxy)) if proxy.tenant_id == surface.tenant_id => {
+                    current.insert(id, proxy.grant_pin());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(proxy_id = %id, error = %error, "Failed to read an MCP Proxy to pin a surface's grant");
+                    return Err(SurfaceApiError::InternalError(format!("Failed to read MCP Proxy '{id}'")));
+                }
             }
         }
     }
@@ -281,6 +287,8 @@ pub(crate) async fn pin_mcp_proxy_grants(
                 continue;
             };
             let now = current.get(&proxy);
+            let stored_pin = kept.get(&(id, proxy.clone()));
+            let sent = sent.filter(|sent| Some(sent) != stored_pin);
             binding.mcp_proxy_pin = match (sent, now) {
                 (Some(sent), Some(now)) if sent == *now => Some(sent),
                 (Some(_), Some(_)) => {
@@ -295,10 +303,7 @@ pub(crate) async fn pin_mcp_proxy_grants(
                     ));
                 }
                 (Some(_), None) => None,
-                (None, now) => kept
-                    .get(&(id, proxy))
-                    .or(now)
-                    .cloned(),
+                (None, now) => stored_pin.or(now).cloned(),
             };
         }
     }
@@ -4728,7 +4733,8 @@ mod tests {
     /// tenant transfer, or a `PUT` that leaves it out, keeps the binding's
     /// stored pin, even when the MCP Proxy has changed since: the save goes
     /// through, with a warning, and the Transit Point stays refused. A save that
-    /// sends the stored pin, now stale, is refused. A save that sends the
+    /// sends the stored pin back, as a dashboard `PUT` of the stored surface
+    /// does, keeps it alike; any other stale pin is refused. A save that sends the
     /// proxy's current pin pins the binding to it, and only then do the
     /// Transit Point's grants go through the edited proxy again. A binding
     /// that names another proxy than the stored one is a new binding.
@@ -4802,8 +4808,34 @@ mod tests {
         assert!(warnings[0].contains("'drive'") && warnings[0].contains("grant_pin"), "{warnings:?}");
 
         let mut echoed = stored.clone();
-        let (code, message) = refusal(pin_mcp_proxy_grants(&mut echoed, Some(&stored), Some(&proxies)).await);
-        assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "the stored pin, sent back after the proxy changed");
+        pin_mcp_proxy_grants(&mut echoed, Some(&stored), Some(&proxies))
+            .await
+            .expect("the stored pin, sent back after the proxy changed, is kept as if not sent");
+        assert_eq!(pins(&echoed), [Some(first.clone()), Some(first.clone())]);
+        assert_eq!(
+            check_proxy_pin(&edited, pins(&echoed)[0].as_deref()),
+            Err(PROXY_CHANGED),
+            "and approves nothing: the Transit Point stays refused"
+        );
+        assert_eq!(
+            stale_mcp_proxy_pin_warnings(Some(&proxies), &echoed)
+                .await
+                .len(),
+            2
+        );
+
+        let mut stale = stored.clone();
+        stale
+            .transit
+            .as_mut()
+            .unwrap()
+            .points[0]
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .mcp_proxy_pin = Some("sha256:another".into());
+        let (code, message) = refusal(pin_mcp_proxy_grants(&mut stale, Some(&stored), Some(&proxies)).await);
+        assert_eq!(code, MCP_PROXY_PIN_NOT_CURRENT, "a pin that is neither stored nor current");
         assert!(message.starts_with("transit.points[0] ('drive')"), "{message}");
 
         let mut approved = stored.clone();
@@ -4855,10 +4887,65 @@ mod tests {
         assert_eq!(pins(&moved)[0], Some(sheets.grant_pin()), "another proxy: a new binding, pinned as it is");
     }
 
+    /// An MCP Proxy store that cannot be read.
+    struct UnreadableProxies;
+
+    #[async_trait::async_trait]
+    impl McpProxyStore for UnreadableProxies {
+        async fn create(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<crate::mcp_proxies::types::McpProxy>> {
+            anyhow::bail!("unreadable")
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<crate::mcp_proxies::types::McpProxy>> {
+            anyhow::bail!("unreadable")
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+        async fn update(
+            &self,
+            _proxy: &crate::mcp_proxies::types::McpProxy,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unreadable")
+        }
+    }
+
+    /// A save whose MCP Proxy cannot be read fails, rather than treating the
+    /// proxy as missing and dropping the pin the write sent; the answer names
+    /// the proxy, never the store's error.
+    #[tokio::test]
+    async fn a_save_fails_when_its_mcp_proxy_cannot_be_read() {
+        let mut surface = surface_with_points(
+            serde_json::json!([proxy_point(
+                "drive",
+                sending_pin(external("external-a", Some("owner")), "sha256:sent")
+            )]),
+            serde_json::json!([]),
+            None,
+        );
+        match pin_mcp_proxy_grants(&mut surface, None, Some(&UnreadableProxies)).await {
+            Err(SurfaceApiError::InternalError(message)) => {
+                assert!(message.contains("'drive'") && !message.contains("unreadable"), "{message}");
+            }
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
     /// A grant binding is refused at save on a `proxy://` Transit Point whose
     /// MCP Proxy's spec has a tool with a method override header parameter,
-    /// in any case; a query parameter of that name is not a header, and
-    /// passes.
+    /// in any case, or a `_method` query parameter; another header, and a
+    /// header named `_method`, pass.
     #[tokio::test]
     async fn a_save_refuses_a_grant_through_an_mcp_proxy_whose_spec_overrides_the_method() {
         use crate::credential_providers::external::PROXY_OVERRIDES_THE_METHOD;
@@ -4897,7 +4984,16 @@ mod tests {
                 .expect_err(header);
             assert!(refused.ends_with(PROXY_OVERRIDES_THE_METHOD), "{header}: {refused}");
         }
-        for (name, location) in [("X-HTTP-Method-Override", "query"), ("X-Request-Reason", "header")] {
+        drive.openapi_spec = spec("_method", "query");
+        proxies
+            .update(&drive)
+            .await
+            .unwrap();
+        let refused = checked_through(&providers, surface(), GRANTS_KEPT, Some(&proxies))
+            .await
+            .expect_err("a _method query parameter");
+        assert!(refused.ends_with(PROXY_OVERRIDES_THE_METHOD), "{refused}");
+        for (name, location) in [("X-Request-Reason", "header"), ("_method", "header")] {
             drive.openapi_spec = spec(name, location);
             proxies
                 .update(&drive)

@@ -1178,8 +1178,8 @@ appliance-wide one for a tenant's surface. A surface save refuses a Transit Poin
 other, and a call to a missing proxy or one the surface may not reference answers `503` (`This
 Transit Point is unavailable`), with the reason in the log. The surface's own timeout, retry,
 circuit breaker and mirroring belong to its Access Point's Target and do not apply: the Transit
-Point's `networking.timeout` bounds the call, and its `mcp_http` the backend's request and
-answer.
+Point's `networking.timeout`, or the surface's timeout when the Transit Point sets none, bounds
+the call, and its `mcp_http` the backend's request and answer.
 
 Every tool call, with a grant or without, goes to the backend through pinned Strict egress, as a
 grant goes to an `https` target: `https` only, internal addresses (loopback, private ranges,
@@ -1200,7 +1200,7 @@ an `https` target's:
 | `protocol` | `mcp` |
 | The MCP Proxy | Of the surface's own tenant, exactly, and served only through surfaces (`direct_access: false`), so its backend is reached with the grant only through the Transit Point that holds it. A proxy anyone can call on its own route is refused |
 | Its `base_url` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource` |
-| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` (any case): many REST APIs, Google's among them, run the method such a header names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes |
+| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, and no tool with a query parameter or request body field named `_method` or one of those three (any case): many REST APIs, Google's among them, run the method such a header names, and web frameworks such as Rails, Laravel and Express's method-override run the one `_method` names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes |
 | Its pin | The proxy as it was when the binding was pinned: below |
 | `inject_as` | A header: `bearer_header` (the default) or `custom_header`, never `meta`. The grant is the call's only credential |
 | `target_auth` | None |
@@ -1226,26 +1226,28 @@ settles the pin of each such binding, on the surface and in each variant:
 | The write sends | The binding's pin |
 | --- | --- |
 | `mcp_proxy_pin` equal to the proxy's current `grant_pin` | That pin: the binding is pinned to the proxy as it is |
-| Any other `mcp_proxy_pin` (stale, or wrong) | The save is refused: `400`, `code` `mcp_proxy_pin_not_current`, naming the Transit Point (`transit.points[0] ('drive')`, or `variant 'beta' transit.points[0] ...`) and the proxy, never its spec |
-| No `mcp_proxy_pin`, and the binding has one stored | The stored pin, even when the proxy has changed since, so a save made for another reason never approves an edited proxy. The save answers a `Warning` header naming the Transit Point when the kept pin is stale |
+| Any other `mcp_proxy_pin` (stale, or wrong), but the one stored for the binding | The save is refused: `400`, `code` `mcp_proxy_pin_not_current`, naming the Transit Point (`transit.points[0] ('drive')`, or `variant 'beta' transit.points[0] ...`) and the proxy, never its spec |
+| No `mcp_proxy_pin`, or the one stored for the binding sent back, and the binding has one stored | The stored pin, even when the proxy has changed since, so a save made for another reason never approves an edited proxy. The save answers a `Warning` header naming the Transit Point when the kept pin is stale |
 | No `mcp_proxy_pin`, and the binding has none stored (a new binding, a variant copy, or one stored outside the API) | The proxy's current `grant_pin` |
 
 The stored binding is the one of the same Transit Point id that names the same proxy; a Transit
 Point moved to another proxy is a new binding. A merge `PATCH`, a variant create, update, patch,
 delete or promote, and a tenant transfer start from the stored surface, so a pin they carry from
 it is not one they sent: only a pin in the request body itself is compared. A client that `GET`s
-a surface and `PUT`s it back sends the stored pin; after the proxy changed, that save is
-refused, and leaving `mcp_proxy_pin` out keeps the stored pin. A pin is compared only with a
-proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
+a surface and `PUT`s it back, as the dashboard does, sends the stored pin, which is kept as if
+not sent: the save approves no edit to the proxy, and answers the `Warning` when it is stale.
+A tenant transfer of a surface with such a binding is refused (`409`), because its MCP Proxy is
+not of the new tenant. A pin is compared only with a proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
 and the save is refused as for any binding to such a proxy, so the answer tells nothing of
 another tenant's proxy. The gateway never stores a pin it did not compute or compare.
 
 While the proxy's `grant_pin` differs from the binding's pin, after any edit to one of the four
-(even whitespace in the spec), the Transit Point answers nothing through the proxy: the connect
+(even whitespace in the spec, so a renamed or added parameter as well), the Transit Point answers nothing through the proxy: the connect
 start answers `409`, and every `POST`, `initialize`, `tools/list` and notifications as well as a
 tool call, answers `connector_unavailable`, so an edited description or server name never
 reaches the agent either. The log names the Transit Point and the proxy
-(`mcp_proxy_changed_since_it_was_pinned`). A save that sends the proxy's current `grant_pin`
+(`mcp_proxy_changed_since_it_was_pinned`). A binding with no pin, as one stored outside the API,
+is refused the same way until a surface save pins it. A save that sends the proxy's current `grant_pin`
 pins it as it is. Fields outside the pin are shown to the agent by nothing on this path, or are
 checked on their own: `description`, `status` (a disabled proxy only refuses),
 `channel_prefix`, `endpoint_path`, the proxy's own `mcp_http` (the Transit Point's applies), the

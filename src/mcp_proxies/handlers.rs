@@ -2815,25 +2815,52 @@ fn proxy_server(
 /// `DELETE` behind the same tool name. Compared without case.
 pub const METHOD_OVERRIDE_HEADERS: [&str; 3] = ["X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"];
 
-/// Whether a tool of `server` has a header parameter named one of
-/// [`METHOD_OVERRIDE_HEADERS`]. The tools' parameter mappings are what a
-/// call's arguments are sent by (unknown arguments are refused), so they hold
-/// every header a tool call can send.
+/// The parameter that asks a web framework (Rails, Laravel, Express's
+/// method-override) to run another HTTP method, sent in the query or the
+/// body. Compared without case.
+const METHOD_OVERRIDE_PARAMETER: &str = "_method";
+
+/// Whether `name`, a parameter outside the headers, asks for another method:
+/// [`METHOD_OVERRIDE_PARAMETER`] or one of [`METHOD_OVERRIDE_HEADERS`].
+fn overrides_the_method(name: &str) -> bool {
+    std::iter::once(METHOD_OVERRIDE_PARAMETER)
+        .chain(METHOD_OVERRIDE_HEADERS)
+        .any(|override_name| override_name.eq_ignore_ascii_case(name))
+}
+
+/// Whether a tool of `server` can send a method override: a header parameter
+/// named one of [`METHOD_OVERRIDE_HEADERS`], or a query parameter or a field
+/// of its request body named as [`overrides_the_method`] reads. The tools'
+/// parameter mappings are what a call's arguments are sent by (unknown
+/// arguments are refused), so they hold every header and query parameter a
+/// tool call can send; the body's fields are those of its `request_body`
+/// schema.
 fn sends_a_method_override(server: &McpServer) -> bool {
     server
         .get_tool_names()
         .iter()
         .filter_map(|name| server.get_tool_metadata(name))
-        .flat_map(|metadata| {
-            metadata
+        .any(|metadata| {
+            let in_parameters = metadata
                 .parameter_mappings
                 .values()
-        })
-        .any(|mapping| {
-            mapping.location == "header"
-                && METHOD_OVERRIDE_HEADERS
-                    .iter()
-                    .any(|header| header.eq_ignore_ascii_case(&mapping.original_name))
+                .any(|mapping| match mapping.location.as_str() {
+                    "header" => METHOD_OVERRIDE_HEADERS
+                        .iter()
+                        .any(|header| header.eq_ignore_ascii_case(&mapping.original_name)),
+                    "query" => overrides_the_method(&mapping.original_name),
+                    _ => false,
+                });
+            let in_body = metadata
+                .parameters
+                .pointer("/properties/request_body/properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .any(|field| overrides_the_method(field))
+                });
+            in_parameters || in_body
         })
 }
 
@@ -2898,7 +2925,7 @@ pub fn prepare_mcp_request(
         None
     };
 
-    let (server, base_url) = proxy_server(proxy, default_headers.clone())?;
+    let (server, base_url) = proxy_server(proxy, None)?;
 
     let method = request
         .get("method")
@@ -3261,8 +3288,9 @@ pub struct ProxyGrant {
 /// What an MCP Proxy behind a Transit Point answered.
 #[derive(Debug)]
 pub enum TransitProxyAnswer {
-    /// The JSON-RPC response.
-    Response(serde_json::Value),
+    /// The JSON-RPC response, and for a tool call, the status its backend
+    /// answered with.
+    Response { response: serde_json::Value, backend_status: Option<reqwest::StatusCode> },
     /// The backend refused the grant a tool call carried, as
     /// [`crate::delegation_vault::release::vendor_answer`] reads its answer:
     /// its status and `WWW-Authenticate` challenges, never its body, so the
@@ -3297,9 +3325,9 @@ pub async fn serve_through_transit_point(
     sent: &std::sync::atomic::AtomicBool,
 ) -> Result<TransitProxyAnswer, McpProxyCallError> {
     let PreparedMcpRequest { server, request, call } = prepared;
-    let result = match call {
-        McpCall::Initialize => initialize_result(proxy),
-        McpCall::ToolsList => tools_list_result(proxy, &server),
+    let (result, backend_status) = match call {
+        McpCall::Initialize => (initialize_result(proxy), None),
+        McpCall::ToolsList => (tools_list_result(proxy, &server), None),
         McpCall::ToolsCall {
             tool_name,
             arguments,
@@ -3338,7 +3366,7 @@ pub async fn serve_through_transit_point(
             )
             .await
             {
-                Ok(result) => tool_call_result(result),
+                Ok((result, status)) => (tool_call_result(result), Some(status)),
                 Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
                     return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
                 }
@@ -3346,11 +3374,14 @@ pub async fn serve_through_transit_point(
             }
         }
     };
-    Ok(TransitProxyAnswer::Response(serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": request.get("id").cloned(),
-        "result": result
-    })))
+    Ok(TransitProxyAnswer::Response {
+        response: serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned(),
+            "result": result
+        }),
+        backend_status,
+    })
 }
 
 #[cfg(test)]
@@ -6497,28 +6528,64 @@ mod tests {
         assert_eq!((listed[0]["id"].clone(), listed[0]["grant_pin"].clone()), (serde_json::json!("drive"), renamed));
     }
 
-    /// A tool's header parameter named a method override header, in any
-    /// case, is found in a spec that loads; a query parameter of that name,
-    /// another header, and a spec that does not load are not one.
+    /// A method override is found, in any case, in a spec that loads: a
+    /// header parameter named a method override header, and a query parameter
+    /// or a request body field named `_method` or a method override header.
+    /// Another header, a path parameter of such a name, a header named
+    /// `_method`, and a spec that does not load are not one.
     #[test]
-    fn a_method_override_header_is_found_only_among_a_tools_headers() {
+    fn a_method_override_is_found_among_a_tools_headers_query_and_body() {
         let with = |name: &str, location: &str| {
             let mut proxy = owned("drive", None);
             proxy.openapi_spec = serde_json::json!({
                 "openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
-                "paths": {"/files": {"get": {"operationId": "search_files",
-                    "parameters": [{"name": name, "in": location, "schema": {"type": "string"}}],
+                "paths": {"/files/{id}": {"get": {"operationId": "search_files",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": name, "in": location, "schema": {"type": "string"}}
+                    ],
                     "responses": {"200": {"description": "Files"}}}}}
             })
             .to_string();
             proxy
         };
-        for name in ["X-HTTP-Method-Override", "x-http-method", "X-METHOD-OVERRIDE"] {
-            assert!(super::spec_sends_a_method_override(&with(name, "header")), "{name}");
+        let with_body_field = |name: &str, media_type: &str| {
+            let mut proxy = owned("drive", None);
+            proxy.openapi_spec = serde_json::json!({
+                "openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+                "paths": {"/files": {"post": {"operationId": "create_file",
+                    "requestBody": {"content": {media_type: {"schema": {"type": "object",
+                        "properties": {name: {"type": "string"}}}}}},
+                    "responses": {"200": {"description": "File"}}}}}
+            })
+            .to_string();
+            proxy
+        };
+        for (name, location) in [
+            ("X-HTTP-Method-Override", "header"),
+            ("x-http-method", "header"),
+            ("X-METHOD-OVERRIDE", "header"),
+            ("_method", "query"),
+            ("_METHOD", "query"),
+            ("X-HTTP-Method-Override", "query"),
+        ] {
+            assert!(super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
         }
-        for (name, location) in [("X-HTTP-Method-Override", "query"), ("X-Request-Reason", "header")] {
+        for media_type in ["application/x-www-form-urlencoded", "application/json"] {
+            for name in ["_method", "X-HTTP-Method"] {
+                assert!(
+                    super::spec_sends_a_method_override(&with_body_field(name, media_type)),
+                    "{name} in a {media_type} body"
+                );
+            }
+        }
+        for (name, location) in [("X-Request-Reason", "header"), ("_method", "header"), ("method", "query")] {
             assert!(!super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
         }
+        assert!(
+            !super::spec_sends_a_method_override(&with_body_field("title", "application/json")),
+            "another body field"
+        );
         let mut unloadable = owned("drive", None);
         unloadable.openapi_spec = "X-HTTP-Method-Override: [".into();
         assert!(!super::spec_sends_a_method_override(&unloadable), "a spec that does not load sends nothing");

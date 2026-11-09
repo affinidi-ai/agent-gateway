@@ -2193,9 +2193,11 @@ pub struct TransitCredentials {
     pub subject: Option<GrantSubject>,
     /// For a `consent_mode = external` binding on a Transit Point whose target
     /// is `proxy://<id>`: the [`crate::mcp_proxies::types::McpProxy::grant_pin`]
-    /// of that MCP Proxy when the surface was last saved. The gateway sets it
-    /// on every save, and clears it on every other binding; a value a write
-    /// sends is ignored. The grant goes through the proxy only while the
+    /// of that MCP Proxy the binding is pinned to. A write may send the proxy's
+    /// current `grant_pin`, or the pin stored for the binding, which is kept as
+    /// if not sent; any other value is refused. Leaving it out keeps the
+    /// stored pin, and a new binding is pinned to the proxy as it is. Cleared
+    /// on every other binding. The grant goes through the proxy only while the
     /// proxy's pin is still this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_proxy_pin: Option<String>,

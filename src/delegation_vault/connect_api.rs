@@ -422,12 +422,23 @@ pub async fn start_connect(
             Err(refused) => Err(refused),
         }
     };
-    if destination.is_err() {
-        return error(
-            StatusCode::CONFLICT,
-            "binding_not_servable",
-            "The binding's Transit Point or Target does not send grants to its provider's resource",
+    if let Err(reason) = destination {
+        warn!(
+            target: "credential_delegation",
+            surface_id = %surface.surface_id,
+            hop = %binding.hop,
+            provider_id = %provider.id,
+            proxy_id = ?crate::mcp_proxies::types::transit_proxy_id(&binding.target_endpoint),
+            reason,
+            "A connect was refused: the binding cannot send grants to its provider's resource"
         );
+        let message = if reason == crate::credential_providers::external::PROXY_CHANGED {
+            "The binding's MCP Proxy has changed since the surface was saved: save the surface with the proxy's \
+             current grant_pin as mcp_proxy_pin to pin the binding to it"
+        } else {
+            "The binding's Transit Point or Target does not send grants to its provider's resource"
+        };
+        return error(StatusCode::CONFLICT, "binding_not_servable", message);
     }
     if provider
         .callback_url
@@ -1630,7 +1641,8 @@ mod tests {
     /// take a method override header, or opened to direct callers, a binding never
     /// pinned, and a Transit Point that does not speak MCP, has a target_auth
     /// or puts the grant in `_meta`, are refused, so no consent is run for a
-    /// binding every call would refuse.
+    /// binding every call would refuse. A binding whose proxy changed since it
+    /// was pinned, or that was never pinned, is told a save re-pins it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proxy_transit_point_connects_only_while_every_call_to_it_could_carry_the_grant() {
         use crate::credential_providers::external::tests::grant_proxy;
@@ -1697,8 +1709,13 @@ mod tests {
                     (StatusCode::CONFLICT, json!("binding_not_servable")),
                     "{case}"
                 );
+                refused["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
             }
         };
+        let re_pin = "save the surface with the proxy's current grant_pin";
         save(point.clone(), true).await;
         let (status, started) = fixture
             .start(Some("tenant-a"), start.clone())
@@ -1706,7 +1723,8 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "{started}");
 
         save(point.clone(), false).await;
-        refused("a binding stored outside the API, never pinned").await;
+        let never_pinned = refused("a binding stored outside the API, never pinned").await;
+        assert!(never_pinned.contains(re_pin), "a binding without a pin is told to re-pin: {never_pinned}");
         let mut with_target_auth = point.clone();
         with_target_auth["target_auth"] =
             json!({"method": {"static_secret": {"secret_id": "vendor-key", "header_name": "x-key"}}});
@@ -1718,7 +1736,8 @@ mod tests {
             [("a target_auth", with_target_auth), ("protocol a2a", a2a), ("the grant in _meta", in_meta)]
         {
             save(point, true).await;
-            refused(case).await;
+            let message = refused(case).await;
+            assert!(!message.contains(re_pin), "{case}: a save would not fix it: {message}");
         }
 
         save(point.clone(), true).await;
@@ -1736,7 +1755,10 @@ mod tests {
                 .update(&proxy)
                 .await
                 .unwrap();
-            refused(case).await;
+            let message = refused(case).await;
+            if case == "other operations" {
+                assert!(message.contains(re_pin), "{case}: only a re-pinning save is needed: {message}");
+            }
         }
         let mut overriding = servable.clone();
         overriding.openapi_spec = r#"{"openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
