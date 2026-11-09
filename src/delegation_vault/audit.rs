@@ -211,6 +211,11 @@ pub struct DelegationAuditEvent {
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The tenant of the surface the record is about, on records that say
+    /// whose surface they are. Absent for an appliance-wide surface and on
+    /// records stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Serde default for `PolicyDecision.flow` so pre-existing audit entries (all of
@@ -511,6 +516,17 @@ pub struct SecretReferrerDetails {
     pub id: String,
 }
 
+/// What became of a call through a connector's Transit Point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorCallOutcome {
+    /// The call, carrying the grant, was sent and the vendor answered.
+    Forwarded,
+    /// The call was refused before it was forwarded, or its grant was refused
+    /// by the vendor.
+    Refused,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -621,6 +637,29 @@ pub enum DelegationAuditAction {
         blocking: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_ip: Option<String>,
+    },
+    /// A call through a Transit Point with a connector grant: forwarded to the
+    /// vendor, or refused before it was. Carries no argument, token or
+    /// vendor text.
+    ConnectorCall {
+        /// The Transit Point (hop) the call went through.
+        transit_point: String,
+        /// Whose grant the binding uses: the owner's, or the caller's own.
+        /// The record's `user_identity_hash` is the caller either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<crate::config::agent_surface::GrantSubject>,
+        outcome: ConnectorCallOutcome,
+        /// On `forwarded`: the class of the vendor's answer (`2xx`, `4xx`...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_class: Option<String>,
+        /// On `refused`: the fixed reason the caller was told
+        /// (`connect_required`, `scope_insufficient`, `connector_unavailable`)
+        /// or `caller_not_identified`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// On `refused`: the fixed cause inside that reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
     },
     RateLimited {
         scope: RateLimitScope,
@@ -1147,6 +1186,7 @@ pub fn audit_event(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     }
 }
 
@@ -1627,6 +1667,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::ElicitationTimedOut => "elicitation_timed_out",
         DelegationAuditAction::PaymentEvent(_) => "payment",
         DelegationAuditAction::AuthFailed { .. } => "auth_failed",
+        DelegationAuditAction::ConnectorCall { .. } => "connector_call",
         DelegationAuditAction::RateLimited { .. } => "rate_limited",
         DelegationAuditAction::RequestRejected { .. } => "request_rejected",
         DelegationAuditAction::IdentityBindingFailed { .. } => "identity_binding_failed",
@@ -2332,6 +2373,7 @@ pub fn audit_policy_decision(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     });
 }
 
@@ -2384,6 +2426,7 @@ pub fn audit_trust_check(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     });
 }
 
@@ -2429,6 +2472,7 @@ pub fn audit_trace_terminated(
         request_id: None,
         surface_variant: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
+        tenant_id: None,
     });
 }
 
@@ -3259,6 +3303,7 @@ mod tests {
             request_id: None,
             surface_variant: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
+            tenant_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":{\"trace_terminated\":"), "got: {}", json);
@@ -3832,6 +3877,7 @@ mod tests {
                 request_id: None,
                 surface_variant: None,
                 detail: None,
+                tenant_id: None,
             },
             DelegationAuditEvent {
                 event_id: None,
@@ -3873,6 +3919,7 @@ mod tests {
                 request_id: None,
                 surface_variant: None,
                 detail: None,
+                tenant_id: None,
             },
         ];
 
