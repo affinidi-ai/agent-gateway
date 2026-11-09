@@ -214,7 +214,7 @@ record that misses a required one.
 | `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
 | `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
-| `client_id_secret_ref` | Required with a `client_authentication`, and sent as `client_id` or inside the Basic credentials; not used without one | Required, sent as `client_id` |
+| `client_id_secret_ref` | Required with a `client_authentication`, and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
 | `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post`, refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication` | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
 | `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
@@ -233,7 +233,8 @@ and an unreachable one answers `"reachable": false` with the fixed error `token_
 not be reached`; the detail is only logged. It takes no client references, so it does not check
 a `client_authentication`; create and update do. JWK keys are not
 accepted. The provider API never returns the key or certificate; the list leaves out
-their references too.
+their references and the client references too, and shows a JWT Bearer provider's
+`client_authentication`.
 
 RFC 7523 makes client authentication optional in a JWT Bearer grant, and servers differ. A Google
 service account needs none. Ory Hydra answers a grant that names no client with 400

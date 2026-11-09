@@ -1,6 +1,6 @@
 import React from 'react';
 import FieldHelp from '../../components/shared/FieldHelp';
-import { ClientAuthentication } from './credentialProviderForm';
+import { CLIENT_AUTHENTICATION_LABELS, ClientAuthentication } from './credentialProviderForm';
 
 interface ClientAuthenticationSelectProps {
   value: ClientAuthentication;
@@ -9,9 +9,9 @@ interface ClientAuthenticationSelectProps {
 
 const OPTIONS: { value: ClientAuthentication; label: string }[] = [
   { value: '', label: 'Not sent (default)' },
-  { value: 'none', label: 'Client ID only (public client)' },
-  { value: 'client_secret_basic', label: 'HTTP Basic' },
-  { value: 'client_secret_post', label: 'Form body' },
+  { value: 'none', label: `${CLIENT_AUTHENTICATION_LABELS.none} (public client)` },
+  { value: 'client_secret_basic', label: CLIENT_AUTHENTICATION_LABELS.client_secret_basic },
+  { value: 'client_secret_post', label: CLIENT_AUTHENTICATION_LABELS.client_secret_post },
 ];
 
 /** How a JWT Bearer provider's OAuth client identifies itself with the grant. */
@@ -26,9 +26,8 @@ const ClientAuthenticationSelect: React.FC<ClientAuthenticationSelectProps> = ({
         Client authentication
       </label>
       <FieldHelp ariaLabel="About Client authentication" testId="field-help-client-authentication">
-        Leave this on Not sent unless the token server needs its client identified. HTTP Basic sends
-        the client ID and secret in the Authorization header, Form body sends them as form fields,
-        and Client ID only sends the client ID with no secret.
+        Client ID only sends the client ID with no secret. HTTP Basic sends the client ID and secret
+        in the Authorization header. Form body sends them as form fields.
       </FieldHelp>
     </div>
     <select

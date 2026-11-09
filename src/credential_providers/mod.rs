@@ -994,6 +994,8 @@ pub struct CredentialProviderListItem {
     pub jwt_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<GrantClientAuthentication>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issuer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1041,6 +1043,9 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             jwt_key_id: p.jwt.jwt_key_id.clone(),
             jwt_issuer: p.jwt.jwt_issuer.clone(),
             jwt_subject: p.jwt.jwt_subject.clone(),
+            client_authentication: p
+                .jwt
+                .client_authentication_method(),
             issuer: p.issuer.clone(),
             revocation_endpoint: p.revocation_endpoint.clone(),
             token_endpoint_auth_method: p.token_endpoint_auth_method,
@@ -1689,6 +1694,29 @@ mod tests {
         let text = item.to_string();
         assert!(!text.contains("KEY_REF_MARKER"));
         assert!(!text.contains("CERT_REF_MARKER"));
+    }
+
+    #[test]
+    fn list_item_shows_the_client_authentication_but_never_the_client_references() {
+        let mut provider = make_provider("Vertex", "vertex");
+        provider.provider_type = CredentialProviderType::OAuth2JwtBearer;
+        provider.client_id_secret_ref = Some("ID_REF_MARKER".into());
+        provider.client_secret_secret_ref = Some("SECRET_REF_MARKER".into());
+        let unset = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert!(
+            unset
+                .get("client_authentication")
+                .is_none()
+        );
+
+        provider
+            .jwt
+            .client_authentication = Some(GrantClientAuthentication::ClientSecretBasic);
+        let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
+        assert_eq!(item["client_authentication"], "client_secret_basic");
+        let text = item.to_string();
+        assert!(!text.contains("ID_REF_MARKER"));
+        assert!(!text.contains("SECRET_REF_MARKER"));
     }
 
     #[test]

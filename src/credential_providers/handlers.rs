@@ -507,6 +507,19 @@ fn blank_to_none(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+/// A blank client ID reference of a JWT Bearer provider, whose client ID is optional, is no
+/// reference. Any other type keeps it, and the secret check refuses it.
+fn client_id_reference(
+    provider_type: &CredentialProviderType,
+    reference: Option<String>,
+) -> Option<String> {
+    if *provider_type == CredentialProviderType::OAuth2JwtBearer {
+        blank_to_none(reference)
+    } else {
+        reference
+    }
+}
+
 /// Validate a set of named URL fields against the SSRF blocklist.
 /// Returns an error response on the first invalid URL, or `None` if all pass.
 fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
@@ -672,6 +685,11 @@ pub async fn create_provider(
     }
     req.client_secret_secret_ref = blank_to_none(
         req.client_secret_secret_ref
+            .take(),
+    );
+    req.client_id_secret_ref = client_id_reference(
+        &req.provider_type,
+        req.client_id_secret_ref
             .take(),
     );
     req.jwt = req.jwt.normalized();
@@ -1030,6 +1048,9 @@ pub async fn update_provider(
     }
 
     let previous = existing.clone();
+    let provider_type = req
+        .provider_type
+        .unwrap_or_else(|| existing.provider_type.clone());
     let updated = CredentialProvider {
         id: existing.id,
         tenant_id: existing.tenant_id,
@@ -1037,18 +1058,18 @@ pub async fn update_provider(
             .name
             .unwrap_or(existing.name),
         provider_id: existing.provider_id, // immutable
-        provider_type: req
-            .provider_type
-            .unwrap_or(existing.provider_type),
+        provider_type: provider_type.clone(),
         authorization_endpoint: req
             .authorization_endpoint
             .or(existing.authorization_endpoint),
         token_endpoint: req
             .token_endpoint
             .or(existing.token_endpoint),
-        client_id_secret_ref: req
-            .client_id_secret_ref
-            .or(existing.client_id_secret_ref),
+        client_id_secret_ref: client_id_reference(
+            &provider_type,
+            req.client_id_secret_ref
+                .or(existing.client_id_secret_ref),
+        ),
         // A blank reference in the request clears the stored one.
         client_secret_secret_ref: blank_to_none(
             req.client_secret_secret_ref
@@ -2848,6 +2869,90 @@ mod jwt_provider_tests {
             "the client ID reference stays stored, and unread"
         );
         assert_eq!(stored.client_secret_secret_ref, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_client_id_reference_of_a_jwt_bearer_provider_is_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let mut blank = jwt_bearer("blank");
+        blank["client_id_secret_ref"] = json!("  ");
+        let (status, response) = create(&state, blank).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let stored = state
+            .store
+            .find_by_provider_id(None, "blank")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id_secret_ref, None);
+
+        let (status, created) = create(&state, jwt_bearer_with_client("public", "none", false)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, response) = update(&state, &id, json!({"client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a method still needs its client ID: {response}");
+        assert_eq!(response["error"], "client_id_secret_ref is required for this provider type");
+
+        let (status, response) =
+            update(&state, &id, json!({"client_authentication": "", "client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(
+            response
+                .get("client_id_secret_ref")
+                .is_none()
+        );
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.client_id_secret_ref, None);
+        assert_eq!(
+            stored
+                .jwt
+                .client_authentication,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blank_client_id_reference_is_still_refused_on_a_client_credentials_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(
+            &state,
+            json!({
+                "name": "M2M", "provider_id": "m2m", "provider_type": "oauth2_client_credentials",
+                "token_endpoint": "https://oauth2.googleapis.com/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, response) = update(&state, &id, json!({"client_id_secret_ref": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "Secret reference is not accessible");
+        let stored = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .client_id_secret_ref
+                .as_deref(),
+            Some("CLIENT_ID")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -308,6 +308,21 @@ async fn operator_has_cleared_provider_client_authentication(world: &mut Surface
     assert_eq!(response.status, 200, "clearing the client authentication answered {}", response.body);
 }
 
+#[given("the operator has cleared the credential provider's client authentication and client ID")]
+async fn operator_has_cleared_provider_client_authentication_and_client_id(world: &mut SurfaceWorld) {
+    change_stored_provider(
+        world,
+        json!({ "client_authentication": "", "client_id_secret_ref": "", "client_secret_secret_ref": "" }),
+        None,
+    )
+    .await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the update was recorded");
+    assert_eq!(response.status, 200, "clearing the client authentication answered {}", response.body);
+}
+
 #[when(expr = "the operator changes the credential provider's client authentication to {string}")]
 async fn operator_changes_provider_client_authentication(
     world: &mut SurfaceWorld,

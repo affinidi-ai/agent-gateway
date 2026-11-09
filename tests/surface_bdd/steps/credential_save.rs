@@ -572,6 +572,34 @@ async fn operator_reassigns_surface(
     world.admin_response = Some(response);
 }
 
+#[when("the operator lists the credential providers")]
+async fn operator_lists_credential_providers(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/credential-providers", None).await;
+    world.admin_response = Some(response);
+}
+
+#[then(expr = "the credential provider list shows the client authentication {string} for provider {string}")]
+async fn provider_list_shows_client_authentication(
+    world: &mut SurfaceWorld,
+    authentication: String,
+    provider_id: String,
+) {
+    let expected = TargetAuthClientAuthentication::from_wording(&authentication).api_value();
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the operator listed the credential providers");
+    assert_eq!(response.status, 200, "listing credential providers: {}", response.body);
+    let provider = response
+        .body
+        .as_array()
+        .expect("the provider list is an array")
+        .iter()
+        .find(|provider| provider["provider_id"] == provider_id)
+        .unwrap_or_else(|| panic!("provider {provider_id} is not in the list: {}", response.body));
+    assert_eq!(provider["client_authentication"], json!(expected), "the list entry: {provider}");
+}
+
 #[then(expr = "the credential provider {string} is stored")]
 async fn credential_provider_is_stored(
     world: &mut SurfaceWorld,

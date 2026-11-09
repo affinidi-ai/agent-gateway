@@ -11,8 +11,10 @@ changes:
         no client. A provider that sets no client authentication sends the same client-less grant as
         before, whatever client references it stores, so stored providers behave as they did. Create
         and update refuse a method without the client references it sends and a client
-        authentication on any other provider type. The dashboard's credential provider editor offers
-        the choice.
+        authentication on any other provider type. An empty client ID reference clears it on a JWT
+        Bearer provider, so the dashboard's Not sent leaves no reference that blocks deleting its
+        secret. The provider list shows each provider's client authentication, and the dashboard's
+        credential provider editor offers the choice.
   changed: []
   fixed: []
   removed: []

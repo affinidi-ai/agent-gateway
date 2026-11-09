@@ -669,7 +669,27 @@ describe('EditCredentialProviderPage JWT Bearer client authentication', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(savedBody().client_authentication).toBe(''));
-    expect(savedBody()).not.toHaveProperty('client_id_secret_ref');
+    expect(savedBody().client_id_secret_ref).toBe('');
+  });
+
+  it('titles the client pickers of a JWT Bearer provider as a client identity', async () => {
+    renderJwt(jwtBearer({ client_authentication: 'none', client_id_secret_ref: 'HYDRA_ID' }));
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    expect(screen.getByTestId('credential-provider-client-heading')).toHaveTextContent(
+      'Client identity (secret references)'
+    );
+  });
+
+  it('keeps the OAuth heading on a Client Credentials provider', async () => {
+    renderJwt({
+      ...jwtBearer(),
+      provider_type: 'oauth2_client_credentials',
+      client_id_secret_ref: 'HYDRA_ID',
+    });
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    expect(screen.getByTestId('credential-provider-client-heading')).toHaveTextContent(
+      'OAuth Client Credentials (Secret References)'
+    );
   });
 
   it('does not offer client authentication on a Client Credentials provider', async () => {
@@ -803,7 +823,7 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     });
   });
 
-  it('drops stale client references of a JWT Bearer provider with no method', async () => {
+  it('clears stale client references of a JWT Bearer provider with no method', async () => {
     setup(
       '/credential-providers/p1',
       stored({ client_id_secret_ref: 'HYDRA_ID', client_secret_secret_ref: 'HYDRA_SECRET' })
@@ -815,7 +835,7 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     );
     const { body } = savedRequest('PUT');
     expect(body.client_authentication).toBe('');
-    expect(body).not.toHaveProperty('client_id_secret_ref');
+    expect(body.client_id_secret_ref).toBe('');
     expect(body.client_secret_secret_ref).toBe('');
   });
 });

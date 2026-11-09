@@ -141,3 +141,19 @@ Feature: JWT Bearer client authentication
     Then the admin API response status is 400
     And the admin API error response mentions "client_secret_secret_ref is not allowed"
     And the credential provider stores the client authentication "HTTP Basic"
+
+  Scenario: Clearing a provider's client authentication and client ID releases the client ID secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
+    And the credential provider authenticates its client with "the client ID only"
+    And the operator has cleared the credential provider's client authentication and client ID
+    When the operator deletes the secret "bdd-target-client-id"
+    Then the admin API response status is 204
+    And no secret "bdd-target-client-id" is stored
+
+  Scenario: The credential provider list shows a provider's client authentication
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
+    And the credential provider authenticates its client with "HTTP Basic"
+    When the operator lists the credential providers
+    Then the credential provider list shows the client authentication "HTTP Basic" for provider "bdd-target-provider"

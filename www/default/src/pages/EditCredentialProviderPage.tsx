@@ -729,9 +729,14 @@ const EditCredentialProviderPage: React.FC = () => {
                 {typeFields.clientId && (
                   <>
                     {form.provider_type !== 'oauth2_jwt_bearer' && <hr />}
-                    <h6 className="font-weight-bold text-primary mb-3">
-                      <i className="fas fa-key me-2"></i>OAuth Client Credentials (Secret
-                      References)
+                    <h6
+                      className="font-weight-bold text-primary mb-3"
+                      data-testid="credential-provider-client-heading"
+                    >
+                      <i className="fas fa-key me-2"></i>
+                      {form.provider_type === 'oauth2_jwt_bearer'
+                        ? 'Client identity (secret references)'
+                        : 'OAuth Client Credentials (Secret References)'}
                     </h6>
 
                     {/* Client ID Secret */}

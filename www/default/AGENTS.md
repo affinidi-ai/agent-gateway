@@ -1007,9 +1007,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   how the provider's OAuth client identifies itself with the grant: Not sent (default, no client
   identity, as Google expects), Client ID only (public client), HTTP Basic, or Form body. Any
   choice but Not sent shows the Client ID Secret picker, and HTTP Basic and Form body also show
-  the Client Secret picker, both required; the pickers are the ones Client Credentials uses. Save sends
+  the Client Secret picker, both required; the pickers are the ones Client Credentials uses, under
+  the heading "Client identity (secret references)" (`credential-provider-client-heading`). Save sends
   `client_authentication` (empty for Not sent), the client ID reference only while its picker
-  shows, and the client secret reference as chosen while its picker shows and empty otherwise.
+  shows (empty while it is hidden), and the client secret reference as chosen while its picker
+  shows and empty otherwise.
   **Client Credentials JWT** asks for Token Endpoint,
   Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
   secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
@@ -1023,9 +1025,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   `kid`; a Key ID overrides it. The gateway checks the key on save.
 - Save sends most fields the type does not use as empty, which the gateway reads as cleared, so
   switching a provider to Client Credentials JWT drops its client secret. The exceptions are the
-  client ID reference, which is omitted while its picker is hidden (a stale one stays stored and
-  is ignored), and `client_authentication`, which is always sent, empty for every type but JWT
-  Bearer.
+  client ID reference, which is omitted for every type but JWT Bearer while its picker is hidden
+  (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
+  secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
   `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
   rejects it (AADSTS901002), the form warns under Token Endpoint
@@ -1070,7 +1072,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
   description, default scopes and token refresh (`externalProviderUpdate`).
-- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module. A
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
+  shows a secondary badge after the type of a JWT Bearer provider that has a
+  `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
+  HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
 

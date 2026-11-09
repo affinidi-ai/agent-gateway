@@ -133,7 +133,7 @@ describe('credential provider form', () => {
     expect(withClient({ client_id_secret_ref: '', client_secret_secret_ref: '' })).toBeNull();
   });
 
-  it('sends a JWT Bearer provider without a client identity when no method is chosen', () => {
+  it('sends a JWT Bearer provider with an empty client ID reference when no method is chosen', () => {
     expect(
       providerCredentialFields({
         ...jwtBearer,
@@ -143,6 +143,7 @@ describe('credential provider form', () => {
     ).toEqual({
       token_endpoint: 'https://oauth2.googleapis.com/token',
       client_authentication: '',
+      client_id_secret_ref: '',
       client_secret_secret_ref: '',
       jwt_signing_key_secret_ref: 'SA_KEY',
       jwt_certificate_secret_ref: '',
@@ -172,6 +173,19 @@ describe('credential provider form', () => {
         client_secret_secret_ref: 'HYDRA_SECRET',
       });
     }
+  });
+
+  it('sends the client ID reference of a method that shows its picker, and omits it for other types without one', () => {
+    expect(
+      providerCredentialFields({
+        ...jwtBearer,
+        client_authentication: 'none',
+        client_id_secret_ref: 'HYDRA_ID',
+      }).client_id_secret_ref
+    ).toBe('HYDRA_ID');
+    expect(providerCredentialFields(form({ provider_type: 'api_key' }))).not.toHaveProperty(
+      'client_id_secret_ref'
+    );
   });
 
   it('sends an empty client authentication for every other provider type', () => {

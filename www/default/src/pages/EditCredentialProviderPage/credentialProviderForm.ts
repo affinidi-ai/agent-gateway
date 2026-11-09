@@ -7,6 +7,12 @@ export type CredentialProviderType =
 
 export type ClientAuthentication = '' | 'none' | 'client_secret_basic' | 'client_secret_post';
 
+export const CLIENT_AUTHENTICATION_LABELS: Record<Exclude<ClientAuthentication, ''>, string> = {
+  none: 'Client ID only',
+  client_secret_basic: 'HTTP Basic',
+  client_secret_post: 'Form body',
+};
+
 const CLIENT_AUTHENTICATIONS: ClientAuthentication[] = [
   'none',
   'client_secret_basic',
@@ -203,7 +209,9 @@ export function providerCredentialFields(
   if (fields.tokenEndpoint) body.token_endpoint = form.token_endpoint.trim();
   body.client_authentication =
     form.provider_type === 'oauth2_jwt_bearer' ? form.client_authentication : '';
-  if (fields.clientId) body.client_id_secret_ref = form.client_id_secret_ref;
+  if (fields.clientId || form.provider_type === 'oauth2_jwt_bearer') {
+    body.client_id_secret_ref = value(fields.clientId, form.client_id_secret_ref);
+  }
   if (fields.tokenEndpoint) {
     body.client_secret_secret_ref = value(fields.clientSecret, form.client_secret_secret_ref);
   }
