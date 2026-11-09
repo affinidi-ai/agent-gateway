@@ -147,6 +147,10 @@ pub struct SurfaceWorld {
     pub a2a_stream_ended: bool,
     /// The query of the last OAuth callback sent with a gateway-issued state.
     pub oauth_callback_query: Option<String>,
+    /// The binding cookie the consent start POST set for that callback.
+    pub oauth_binding_cookie: Option<String>,
+    /// The state the vendor got after the caller confirmed the consent start page.
+    pub oauth_confirmed_state: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
     /// A surface the operator is about to save through the admin API.
@@ -219,6 +223,8 @@ impl SurfaceWorld {
             a2a_stream_events: Vec::new(),
             a2a_stream_ended: false,
             oauth_callback_query: None,
+            oauth_binding_cookie: None,
+            oauth_confirmed_state: None,
             transit_token: None,
             surface_draft: None,
             personal_access_token_client: None,

@@ -48,6 +48,13 @@ pub struct SurfaceConfigBuilder {
     pub credential_delegation: Option<SurfaceCredentialDelegationConfig>,
     pub oauth_provider_base_url: Option<String>,
     pub oauth_callback_base_url: Option<String>,
+    /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
+    pub oauth_authorization_response_issuer: Option<String>,
+    /// OAuth providers the gateway has besides the surface's own, by provider id.
+    pub additional_oauth_providers: Vec<String>,
+    /// The surface's OAuth provider is stored as the admin API now creates one: with a
+    /// record id of its own, which its callback path ends in, instead of its provider id.
+    pub oauth_callback_path_ends_in_record_id: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -88,6 +95,25 @@ pub struct SurfaceConfigBuilder {
     pub writes_log_directory: bool,
 }
 
+impl SurfaceConfigBuilder {
+    /// The stored id of the credential provider `provider_id`, which is also the last
+    /// segment of its callback path.
+    pub fn provider_record_id(
+        &self,
+        provider_id: &str,
+    ) -> String {
+        let own = self
+            .credential_delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.provider_id == provider_id);
+        if own && self.oauth_callback_path_ends_in_record_id {
+            format!("0b6e4c2a-{provider_id}-record")
+        } else {
+            provider_id.to_string()
+        }
+    }
+}
+
 impl Default for SurfaceConfigBuilder {
     fn default() -> Self {
         Self {
@@ -125,6 +151,9 @@ impl Default for SurfaceConfigBuilder {
             credential_delegation: None,
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
+            oauth_authorization_response_issuer: None,
+            additional_oauth_providers: Vec::new(),
+            oauth_callback_path_ends_in_record_id: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,

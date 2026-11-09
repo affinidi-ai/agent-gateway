@@ -3624,6 +3624,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .oauth_callback_route
                     .clone(),
+                base_url.clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
                 identity_state
