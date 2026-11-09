@@ -345,7 +345,7 @@ jobs:
       # runner, which can exceed the public registry rate limit.
       - name: Pull BDD images
         run: |
-          docker pull "public.ecr.aws/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
+          docker pull "ghcr.io/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
           docker pull "valkey/valkey:${VALKEY_VERSION}"
 
       # The harness starts a DIDComm mediator per scenario from the public
