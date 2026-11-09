@@ -164,7 +164,7 @@ Feature: Protected agent card fetch over Fabric
     And managed agent "bravo" publishes an agent card naming DID "did:example:bravo"
     And surface "alpha" is configured with missing target authentication secret "bdd-missing-target-auth-secret" for header "x-target-api-key" and fallback reject
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    And surface "alpha" starts with a request policy that allows only requests whose Target agent card names DID "did:example:bravo"
+    And surface "alpha" has a request policy that allows only requests whose Target agent card names DID "did:example:bravo"
     When the caller sends a Fabric A2A request through gateway 1 surface "charlie"
     Then the response status is 403
     And managed agent "bravo" did not receive a GET request at path "/.well-known/agent.json"
@@ -176,7 +176,8 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "<path>"
-    Then managed agent "bravo" received a GET request at path "<forwarded path>"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "<forwarded path>"
     And the GET request at path "<forwarded path>" to managed agent "bravo" did not carry header "x-target-api-key"
 
     Examples:
@@ -192,7 +193,8 @@ Feature: Protected agent card fetch over Fabric
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/Agent-Card.json"
-    Then managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "/.well-known/Agent-Card.json"
     And the GET request at path "/.well-known/Agent-Card.json" to managed agent "bravo" did not carry header "x-target-api-key"
 
   Scenario: gateway 1 runs its surface policy on a POST to a path that only ends like an agent card

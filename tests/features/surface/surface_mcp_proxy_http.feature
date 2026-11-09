@@ -169,7 +169,7 @@ Feature: Routing through a proxy:// MCP target
     Given the gateway authenticates to the managed agent with missing secret "bdd-missing-target-secret" in header "x-target-api-key", falling back to "reject"
     When the caller invokes the MCP tool "get_weather" for city "Paris"
     Then the response status is 502
-    And the response says "Target authentication failed"
+    And the response mentions "Target authentication failed"
     And REST API "bravo" was not called
 
   Scenario: An authenticated caller gets the target credential on a proxy:// MCP target

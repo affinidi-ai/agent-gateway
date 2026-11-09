@@ -5997,7 +5997,7 @@ async fn process_charged_forward_request(
         ) {
             channel_warn!(config_id, "Refusing a request outside the Target base path: it would carry the Target credential");
             crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
-            return target_auth_failed_result(TARGET_AUTH_FAILED);
+            return target_auth_failed_result();
         }
         // Build a secrets store from the storage path passed via message context
         let secrets_store: Option<Arc<dyn crate::secrets::SecretsStore>> = match message
@@ -6053,7 +6053,7 @@ async fn process_charged_forward_request(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result(TARGET_AUTH_FAILED);
+                        return target_auth_failed_result();
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -8397,7 +8397,7 @@ fn fabric_mcp_tool_policy_error(
 }
 
 /// The 502 a Fabric receive answers when the Target credential cannot be sent.
-fn target_auth_failed_result(detail: &str) -> ProcessingResult {
+fn target_auth_failed_result() -> ProcessingResult {
     ProcessingResult::RequiresResponse {
         response_type: MessageType::ForwardResponse.to_string(),
         response_body: serde_json::json!({
@@ -8409,9 +8409,9 @@ fn target_auth_failed_result(detail: &str) -> ProcessingResult {
                 "type": "about:blank",
                 "title": "Bad Gateway",
                 "status": 502,
-                "detail": detail,
+                "detail": TARGET_AUTH_FAILED,
             }).to_string(),
-            "error": detail,
+            "error": TARGET_AUTH_FAILED,
         }),
     }
 }
@@ -9003,7 +9003,7 @@ async fn handle_mcp_proxy_forward(
                 crate::proxy::handler::record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return target_auth_failed_result(TARGET_AUTH_FAILED);
+                        return target_auth_failed_result();
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         channel_warn!(
@@ -9213,7 +9213,7 @@ async fn handle_mcp_proxy_forward(
             if let Some(target_auth) = surface.target_auth() {
                 crate::proxy::handler::record_target_auth_refusal(&audit_facts, None, target_auth);
             }
-            target_auth_failed_result(TARGET_AUTH_FAILED)
+            target_auth_failed_result()
         }
         Err(crate::mcp_proxies::handlers::McpProxyCallError::Failed(error_msg)) => {
             let config_id = surface

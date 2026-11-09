@@ -252,7 +252,8 @@ Feature: A2A HTTP surface forwarding and identity
   Scenario Outline: The target credential is not sent on a public discovery read that is not the agent card
     Given the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller sends a GET request to the surface route path "<path>"
-    Then managed agent "bravo" received a GET request at path "<forwarded path>"
+    Then the response status is 200
+    And managed agent "bravo" received a GET request at path "<forwarded path>"
     And managed agent "bravo" did not receive header "x-target-api-key"
 
     Examples:

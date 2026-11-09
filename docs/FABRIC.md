@@ -519,9 +519,9 @@ Two things differ from the direct path:
   fetch carries no caller credential, so on such a surface it gets `401` at the configured
   location.
 
-The card read for the GW2 policy input also presents `target.auth` as the gateway, resolving it
-from the gateway's secrets store rather than opening one per request, and drops a provider token
-the Target refuses as `invalid_token`, as the forward does. Under
+The card read for the receiving gateway's policy input also presents `target.auth` as the gateway,
+resolving it from the gateway's secrets store rather than opening one per request, and drops a
+provider token the Target refuses as `invalid_token`, as the forward does. Under
 `target.auth.fallback: passthrough` a credential that cannot be resolved reads the card without it.
 A Target that is not an `http(s)` URL, such as a `proxy://` MCP proxy, has no card to read, so no
 credential is resolved for it.

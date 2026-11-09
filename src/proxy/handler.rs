@@ -15620,7 +15620,7 @@ async fn handle_mcp_proxy_request_inner(
                 record_target_auth_failure(&audit_facts, None, target_auth, &e);
                 match target_auth.fallback {
                     crate::config::TargetAuthFallback::Reject => {
-                        return Err(create_error_response(StatusCode::BAD_GATEWAY, "Target authentication failed"));
+                        return Err(create_error_response(StatusCode::BAD_GATEWAY, TARGET_AUTH_FAILED));
                     }
                     crate::config::TargetAuthFallback::Passthrough => {
                         warn!(

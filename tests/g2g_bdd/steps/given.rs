@@ -1125,6 +1125,10 @@ async fn attach_request_policy(
         .unwrap_or_else(|error| panic!("attach {label} policy to surface '{surface_id}': {error:#}"));
 }
 
+/// The admin API refuses to save a surface whose Target authentication secret is
+/// missing, so on such a surface the policy is written into the gateway's
+/// configuration before it boots; on any other it is attached once the Fabric
+/// route is up.
 #[given(
     expr = "surface {string} has a request policy that allows only requests whose Target agent card names DID {string}"
 )]
@@ -1133,21 +1137,21 @@ async fn surface_has_card_did_request_policy(
     surface_name: String,
     did: String,
 ) {
-    attach_request_policy(world, &surface_name, "card-did", &card_did_policy_rule(&did)).await;
-}
-
-/// Writes the policy into the gateway's configuration before it boots, since the
-/// admin API refuses to save a surface whose Target authentication secret is missing.
-#[given(
-    expr = "surface {string} starts with a request policy that allows only requests whose Target agent card names DID {string}"
-)]
-async fn surface_starts_with_card_did_request_policy(
-    world: &mut G2gWorld,
-    surface_name: String,
-    did: String,
-) {
-    surface_spec_mut(world, &surface_name).target_policy_rego =
-        Some(format!("package surface.policy\n\n{}\n", card_did_policy_rule(&did)));
+    let rule = card_did_policy_rule(&did);
+    let surface = surface_spec_mut(world, &surface_name);
+    if surface
+        .target_auth
+        .as_ref()
+        .is_some_and(|auth| auth.secret_value.is_none())
+    {
+        surface.target_policy_rego = Some(format!("package surface.policy\n\n{rule}\n"));
+        assert!(
+            world.harness.is_none(),
+            "a policy on a surface whose Target secret is missing must be given before the fabric starts"
+        );
+    } else {
+        attach_request_policy(world, &surface_name, "card-did", &rule).await;
+    }
 }
 
 fn card_did_policy_rule(did: &str) -> String {

@@ -4290,15 +4290,6 @@ fn managed_agent_did_not_receive_method_request_at_path(
     );
 }
 
-#[then(expr = "the response says {string}")]
-fn response_says(
-    world: &mut SurfaceWorld,
-    expected: String,
-) {
-    let body = get_response_body_value(world).to_string();
-    assert!(body.contains(&expected), "response body {body:?} does not contain {expected:?}");
-}
-
 #[then(expr = "the agent card field {string} points to the gateway listen address")]
 fn agent_card_field_points_to_gateway(
     world: &mut SurfaceWorld,
