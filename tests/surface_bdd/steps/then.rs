@@ -939,6 +939,30 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
+#[then(expr = "the response says only that no surface is served at {string}")]
+fn response_says_only_no_surface_is_served_at(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    let expected = serde_json::json!({
+        "type": "about:blank",
+        "title": "Not Found",
+        "status": 404,
+        "code": "no_route",
+        "detail": format!(
+            "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+        )
+    });
+    assert_eq!(
+        get_response_headers_value(world)
+            .get("content-type")
+            .map(String::as_str),
+        Some("application/problem+json"),
+        "route miss refusal content type"
+    );
+    assert_json_bodies_equal(get_response_body_value(world), &expected, "route miss refusal");
+}
+
 #[then("the response says only that the Access Point is not available")]
 fn response_says_only_access_point_not_available(world: &mut SurfaceWorld) {
     let expected = serde_json::json!({

@@ -9995,10 +9995,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     404,
                     None,
                 );
-                return create_error_response(
-                    StatusCode::NOT_FOUND,
-                    &format!("No route configured for path: {}", path),
-                );
+                return no_route_response(&path);
             };
             crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
@@ -10130,12 +10127,29 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 404,
                 None,
             );
-            create_error_response(StatusCode::NOT_FOUND, &format!("No route configured for path: {}", path))
+            no_route_response(&path)
         }
     }
 }
 
 // Helper functions
+
+fn no_route_response(path: &str) -> Response {
+    let body = serde_json::json!({
+        "type": "about:blank",
+        "title": "Not Found",
+        "status": 404,
+        "code": "no_route",
+        "detail": format!(
+            "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+        ),
+    });
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "application/problem+json")
+        .body(Body::from(serde_json::to_string(&body).unwrap()))
+        .unwrap()
+}
 
 /// Format an error response body as a human-readable tail for the gateway log
 /// (e.g. ` | code=identity_did_failed | slot=protected_identity | channel=MCP Testkit 1 | detail=...`).
@@ -23492,8 +23506,121 @@ allow if {
 
         cache.remove(&surface.surface_id);
 
-        assert_eq!(send().await.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_no_route_response(send().await, "/retired-surface").await;
         assert_eq!(target.received().len(), 1, "a retired surface must not reach its target");
+    }
+
+    fn a2a_shaped_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "message/send",
+                    "params": {"message": {"role": "user", "parts": [{"text": "hello"}]}}
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn assert_no_route_response(
+        response: axum::response::Response,
+        path: &str,
+    ) {
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "about:blank",
+                "title": "Not Found",
+                "status": 404,
+                "code": "no_route",
+                "detail": format!(
+                    "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+                ),
+            })
+        );
+    }
+
+    async fn send_to_retired_surface(request: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let surface = mcp_surface("retired-surface", &target.url, None);
+        let mut router = direct_router_state(&bare_proxy_state(surface.clone(), None), surface.clone());
+        let cache = std::sync::Arc::new(crate::surfaces::ResolvedSurfaceCache::new());
+        cache
+            .upsert(&surface)
+            .unwrap();
+        cache.remove(&surface.surface_id);
+        router.resolved_surface_cache = cache;
+        super::multi_channel_proxy_handler(
+            axum::extract::ConnectInfo(
+                "127.0.0.1:12345"
+                    .parse()
+                    .unwrap(),
+            ),
+            axum::extract::State(router),
+            request,
+        )
+        .await
+    }
+
+    async fn send_to_unknown_path(request: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let surface = mcp_surface("known-surface", &target.url, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        send_to_surface(&state, surface, request).await
+    }
+
+    #[tokio::test]
+    async fn an_mcp_request_on_an_unknown_path_gets_the_neutral_no_route_response() {
+        let request = legacy_mcp_request(
+            "/missing-surface",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        assert_no_route_response(send_to_unknown_path(request).await, "/missing-surface").await;
+    }
+
+    #[tokio::test]
+    async fn an_a2a_request_on_an_unknown_path_gets_the_neutral_no_route_response() {
+        assert_no_route_response(
+            send_to_unknown_path(a2a_shaped_request("/missing-surface")).await,
+            "/missing-surface",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_mcp_request_on_a_retired_surface_gets_the_neutral_no_route_response() {
+        let request = legacy_mcp_request(
+            "/retired-surface",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        assert_no_route_response(send_to_retired_surface(request).await, "/retired-surface").await;
+    }
+
+    #[tokio::test]
+    async fn an_a2a_request_on_a_retired_surface_gets_the_neutral_no_route_response() {
+        assert_no_route_response(
+            send_to_retired_surface(a2a_shaped_request("/retired-surface")).await,
+            "/retired-surface",
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -1,0 +1,15 @@
+branch: fix/neutral-route-errors
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Answer route misses with a protocol-neutral 404
+      description: >-
+        A request on a surface route that no active surface serves now gets a 404
+        application/problem+json body with type about:blank and code: no_route, whose detail
+        names the path and says to check the entry point URL and that the surface is saved and
+        enabled. The body is the same for disabled, deleted and unknown surfaces.
+  removed: []
+  security: []
+  breaking: []

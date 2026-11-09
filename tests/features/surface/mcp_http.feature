@@ -183,3 +183,10 @@ Feature: HTTP MCP surface forwarding
     When the caller invokes MCP tool "delete_everything"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
+
+  Scenario: A disabled MCP surface answers with the protocol-neutral route-miss refusal
+    Given MCP surface "delta" exists for route "/smoke" with default MCP server "echo" and alternate MCP server "foxtrot"
+    And the operator has disabled the surface
+    When the caller sends a request to the surface path "/smoke/mcp"
+    Then the response status is 404
+    And the response says only that no surface is served at "/smoke/mcp"
