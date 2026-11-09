@@ -353,7 +353,7 @@ fn write_single_surface_config_inner(
                 DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
             };
             serde_json::json!({
-                "credential_provider_id": surface_config.oauth_provider_record_id(&delegation.provider_id),
+                "credential_provider_id": surface_config.provider_record_id(&delegation.provider_id),
                 "scopes": delegation.scopes,
                 "required_for": required_for,
                 "consent_mode": "on_demand",
@@ -895,7 +895,7 @@ fn oauth_provider_fixture(
         .oauth_provider_base_url
         .as_ref()
         .expect("OAuth provider base URL must be configured before writing credential provider fixture");
-    let record_id = surface_config.oauth_provider_record_id(provider_id);
+    let record_id = surface_config.provider_record_id(provider_id);
     CredentialProviderFixture {
         id: record_id.clone(),
         name: provider_id.to_string(),

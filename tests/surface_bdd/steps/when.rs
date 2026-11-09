@@ -239,7 +239,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         {
             let segment = world
                 .surface_config
-                .oauth_provider_record_id(&delegation.provider_id);
+                .provider_record_id(&delegation.provider_id);
             oauth_endpoint_allowlist.push(format!("{callback_base_url}/v1/identity/oauth/callback/{segment}"));
         }
         world
@@ -3375,7 +3375,7 @@ async fn send_oauth_callback_and_record(
     let infra = world.infra.as_ref().unwrap();
     let segment = world
         .surface_config
-        .oauth_provider_record_id(provider);
+        .provider_record_id(provider);
     let url = format!("http://127.0.0.1:{}/v1/identity/oauth/callback/{segment}?{query}", infra.gateway_port);
     let mut request = reqwest::Client::new().get(&url);
     if let Some(cookie) = cookie {

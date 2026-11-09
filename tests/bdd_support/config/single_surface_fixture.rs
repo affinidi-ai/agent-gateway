@@ -98,7 +98,7 @@ pub struct SurfaceConfigBuilder {
 impl SurfaceConfigBuilder {
     /// The stored id of the credential provider `provider_id`, which is also the last
     /// segment of its callback path.
-    pub fn oauth_provider_record_id(
+    pub fn provider_record_id(
         &self,
         provider_id: &str,
     ) -> String {
