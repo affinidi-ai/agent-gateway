@@ -216,15 +216,12 @@ const EditCredentialProviderPage: React.FC = () => {
     : '';
   const usesConsentFlow = !form.issuer && form.provider_type === 'oauth2_authorization_code';
   const takesCallbackUrl = usesConsentFlow && !!form.callback_host;
-  const shownCallbackUrl =
-    callbackUrl ||
-    (usesConsentFlow &&
-    !isNew &&
-    !form.callback_url &&
-    form.callback_path &&
-    routingConfig?.gateway_base_url
+  const storedRedirectUri =
+    form.callback_url ||
+    (form.callback_path && routingConfig?.gateway_base_url
       ? `${routingConfig.gateway_base_url}${form.callback_path}`
       : '');
+  const shownCallbackUrl = callbackUrl || (usesConsentFlow && !isNew ? storedRedirectUri : '');
 
   const handleSubmit = useCallback(
     async (e?: React.FormEvent) => {
@@ -334,7 +331,7 @@ const EditCredentialProviderPage: React.FC = () => {
             }
             showToast(
               'error',
-              `Provider created, but its Callback URL was not saved: ${message}. Choose the Callback URL Host and save again.`
+              `Provider created, but its Callback URL was not saved: ${message.replace(/\.$/, '')}. Choose the Callback URL Host and save again.`
             );
             navigate(`/credential-providers/${encodeURIComponent(createdId)}`);
           },
@@ -680,7 +677,10 @@ const EditCredentialProviderPage: React.FC = () => {
                       >
                         <i className="fas fa-info-circle me-2"></i>
                         The Callback URL is shown once the provider is created, since it ends in the
-                        id the gateway generates for the provider, not in its Provider ID.
+                        id the gateway generates for the provider, not in its Provider ID. If your
+                        OAuth provider asks for a redirect URI before it issues the client ID and
+                        secret, register a placeholder, create this provider, then replace the
+                        placeholder with the Callback URL shown on its page.
                       </div>
                     )}
 

@@ -102,6 +102,7 @@ changes:
         {oauth_callback_route}/{provider_id} path and vendor registrations. The dashboard
         creates the provider, then saves its Callback URL from the returned path, and opens the
         created provider so the URL to register is shown; a provider without a callback_url
-        shows the gateway's own Callback URL. Remedy for API clients: create without callback_url,
+        shows the gateway's own Callback URL, read from the new gateway_base_url field of
+        GET /v1/config/surface-routing. Remedy for API clients: create without callback_url,
         then PUT it ending in the returned callback_path, and register that redirect URI with
         the vendor.

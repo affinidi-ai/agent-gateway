@@ -744,14 +744,11 @@ mod tests {
         let name = consent::cookie_name(&cookie);
         consent::assert_refused(&swapped, StatusCode::BAD_REQUEST, Some(&name));
         consent::assert_refused(&unplain, StatusCode::BAD_REQUEST, Some(&name));
-        let named: Vec<_> = events
-            .iter()
-            .map(|event| match &event.event {
-                DelegationAuditAction::DelegationFailed { provider_id, .. } => provider_id.clone(),
-                _ => panic!("{event:?}"),
-            })
-            .collect();
-        assert_eq!(named, [Some("gitlab".to_string()), None], "only a plain slug from the path is recorded");
+        assert_eq!(
+            audited_providers(&events),
+            [Some("gitlab".to_string()), None],
+            "only a plain slug from the path is recorded"
+        );
 
         let mut external = fixture.provider();
         external.issuer = Some("https://vendor.example".to_string());
@@ -786,6 +783,17 @@ mod tests {
             .callback("github", &query, Some(&cookie))
             .await;
         assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
+    }
+
+    /// The provider each `delegation_failed` record in `events` names.
+    fn audited_providers(events: &[crate::delegation_vault::audit::DelegationAuditEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .map(|event| match &event.event {
+                DelegationAuditAction::DelegationFailed { provider_id, .. } => provider_id.clone(),
+                _ => panic!("{event:?}"),
+            })
+            .collect()
     }
 
     /// A provider whose callback path ends in its id, as a new provider's does,
@@ -828,6 +836,14 @@ mod tests {
         .await;
         consent::assert_refused(&at_slug, StatusCode::BAD_REQUEST, None);
         assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentProviderMismatch]);
+        let (cross_site, events) = capture(async {
+            fixture
+                .start_post_at(consent::PROVIDER_ID, &start_state, &[("origin", "https://other.example")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&cross_site, StatusCode::FORBIDDEN, None);
+        assert_eq!(audited_providers(&events), [Some("github".to_string())], "a start refusal names the slug");
         let started = fixture
             .start_post_at(consent::PROVIDER_ID, &start_state, &origin)
             .await;
@@ -863,15 +879,8 @@ mod tests {
         })
         .await;
         consent::assert_refused(&in_another_browser, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&cookie)));
-        let named: Vec<_> = events
-            .iter()
-            .map(|event| match &event.event {
-                DelegationAuditAction::DelegationFailed { provider_id, .. } => provider_id.clone(),
-                _ => panic!("{event:?}"),
-            })
-            .collect();
         assert_eq!(
-            named,
+            audited_providers(&events),
             [Some("github".to_string())],
             "a refusal at the id path names the provider by its slug, as its grant does"
         );

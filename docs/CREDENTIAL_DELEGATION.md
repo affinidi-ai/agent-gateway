@@ -1562,8 +1562,9 @@ never the state, the code, the cookie or `iss`. It is also recorded as a `delega
 audit event whose `reason` names the check, but only when the request carried a state this
 gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
 only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
-and the event name the provider by its `provider_id` when the path is the sealed provider's own
-callback path, as `consent_granted` does, and otherwise by the path's segment:
+and the event name the provider by its `provider_id` when the path's segment is the sealed
+state's own credential provider id, as it is at a callback path ending in that id, so they match
+`consent_granted`; otherwise they name it by the path's segment:
 
 | `reason` | Refused because |
 | --- | --- |

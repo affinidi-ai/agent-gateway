@@ -66,7 +66,7 @@ Feature: Credential rules when saving through the admin API
     Given the operator can use the admin API and no surface is configured for route "/example"
     When the operator reads the surface routing settings
     Then the admin API response status is 200
-    And the surface routing settings name the gateway's own base URL "https://localhost"
+    And the surface routing settings name the gateway's own https address as its base URL
 
   Scenario: An authorization code provider cannot be created with a callback URL
     Given the operator can use the admin API and no surface is configured for route "/example"

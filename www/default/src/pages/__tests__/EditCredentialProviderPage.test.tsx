@@ -390,6 +390,7 @@ describe('EditCredentialProviderPage callback URL', () => {
     render(
       <MemoryRouter initialEntries={['/credential-providers/new']}>
         <Routes>
+          <Route path="/credential-providers/new" element={<EditCredentialProviderPage />} />
           <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
         </Routes>
       </MemoryRouter>
@@ -493,6 +494,44 @@ describe('EditCredentialProviderPage callback URL', () => {
     expect(calls('POST')).toHaveLength(1);
     const [, [, retried]] = calls('PUT');
     expect(JSON.parse(retried.body).callback_url).toBe(
+      'https://gw.example/v1/identity/oauth/callback/cp-1'
+    );
+  });
+
+  it('keeps showing the stored Callback URL when the host is cleared, since it stays in use', async () => {
+    mockFetch.mockImplementation((url: string) => {
+      if (url === '/api/v1/config/surface-routing') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              available_listen_addresses: ['https://gw.example'],
+              gateway_base_url: 'https://gateway.example',
+            }),
+        });
+      }
+      if (url === '/api/v1/credential-providers/cp-1') {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({
+              ...CREATED,
+              callback_url: 'https://gw.example/v1/identity/oauth/callback/cp-1',
+            }),
+        });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/cp-1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    await screen.findByRole('option', { name: 'https://gw.example' });
+    chooseHost('');
+    expect(await screen.findByTestId('credential-provider-callback-url')).toHaveTextContent(
       'https://gw.example/v1/identity/oauth/callback/cp-1'
     );
   });

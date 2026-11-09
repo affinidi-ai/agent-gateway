@@ -145,11 +145,16 @@ async fn operator_reads_surface_routing_settings(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
-#[then(expr = "the surface routing settings name the gateway's own base URL {string}")]
-fn surface_routing_settings_name_gateway_base_url(
-    world: &mut SurfaceWorld,
-    base_url: String,
-) {
+#[then("the surface routing settings name the gateway's own https address as its base URL")]
+fn surface_routing_settings_name_gateway_base_url(world: &mut SurfaceWorld) {
+    let base_url = format!(
+        "https://localhost:{}",
+        world
+            .infra
+            .as_ref()
+            .expect("the gateway is running")
+            .gateway_port
+    );
     let response = world
         .admin_response
         .as_ref()

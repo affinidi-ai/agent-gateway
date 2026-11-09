@@ -980,14 +980,16 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`callbackUrlToSave`). Otherwise it is the chosen listen address followed by the provider's
   stored `callback_path` (`callbackUrlFor`). The preview, the copy button and Save all use it,
   because the gateway refuses a `callback_url` whose path does not end in the stored
-  `callback_path`, or that is not `https`. A stored provider with no `callback_url` and no listen
-  address chosen shows, in the same preview (`credential-provider-callback-url`), the redirect URI
-  it gets: `gateway_base_url` from `GET /config/surface-routing` followed by its `callback_path`;
-  that URL is not saved.
+  `callback_path`, or that is not `https`. A stored provider with no listen address chosen shows,
+  in the same preview (`credential-provider-callback-url`), the redirect URI it keeps: its stored
+  `callback_url`, or without one `gateway_base_url` from `GET /config/surface-routing` (the base
+  the gateway started with) followed by its `callback_path`; Save then sends no `callback_url`.
 - A new authorization code provider has no Callback URL until it is created: the gateway builds
   its `callback_path` from the id it generates for the provider (not the Provider ID slug) and
   refuses a `callback_url` on create. The editor shows a notice in its place
-  (`credential-provider-callback-url-after-create`) and creates the provider without one. With a
+  (`credential-provider-callback-url-after-create`), which says to register a placeholder redirect
+  URI with an OAuth provider that asks for one before it issues the client ID and secret, and to
+  replace it after create; the editor creates the provider without a `callback_url`. With a
   listen address chosen, it then saves that address followed by the returned `callback_path` with
   a PUT. Create refuses an http listen address before sending anything (`isHttpsAddress`), since
   the gateway refuses an http `callback_url`; the message says to choose an https address or

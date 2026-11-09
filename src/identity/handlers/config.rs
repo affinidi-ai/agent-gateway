@@ -526,10 +526,12 @@ pub struct ChannelRoutingConfigResponse {
     pub mcp_proxy_path_prefix: Vec<ChannelPrefixInfo>,
     /// OAuth callback route prefix (e.g. "/oauth/callback")
     pub oauth_callback_route: String,
-    /// The gateway's own base URL, `https://{did.domain}`: an authorization code
-    /// provider without a `callback_url` has this followed by its `callback_path`
-    /// as its redirect URI.
-    pub gateway_base_url: String,
+    /// The gateway's own base URL, `https://{did.domain}` as the gateway started
+    /// with it: an authorization code provider without a `callback_url` has this
+    /// followed by its `callback_path` as its redirect URI. Absent while the
+    /// gateway has no credential provider store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_base_url: Option<String>,
 }
 
 /// Get channel routing configuration
@@ -574,7 +576,7 @@ pub async fn get_surface_routing_config(
         oauth_callback_route: network_config
             .oauth_callback_route
             .clone(),
-        gateway_base_url: format!("https://{}", network_config.did.domain),
+        gateway_base_url: crate::proxy::server::get_gateway_base_url(),
     };
 
     Ok(Json(config))

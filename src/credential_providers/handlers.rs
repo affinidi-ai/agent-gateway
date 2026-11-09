@@ -2039,6 +2039,41 @@ mod jwt_provider_tests {
         assert_eq!(status, StatusCode::OK, "an update may make it conform: {body}");
     }
 
+    /// An update that turns a provider into a consent provider is checked
+    /// against the other providers' redirect URIs, like any update that gives a
+    /// consent provider a new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_retyped_to_consent_may_not_take_another_providers_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, first) = create(&state, authorization_code("github")).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let mut client_credentials = authorization_code("svc");
+        client_credentials["provider_type"] = json!("oauth2_client_credentials");
+        let (status, second) = create(&state, client_credentials).await;
+        assert_eq!(status, StatusCode::CREATED, "{second}");
+        let second_id = second["id"].as_str().unwrap();
+        let mut stored = state
+            .store
+            .get(second_id)
+            .await
+            .unwrap()
+            .unwrap();
+        stored.callback_path = first["callback_path"]
+            .as_str()
+            .unwrap()
+            .into();
+        state
+            .store
+            .update(stored)
+            .await
+            .unwrap();
+
+        let (status, body) = update(&state, second_id, json!({"provider_type": "oauth2_authorization_code"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+    }
+
     /// Each new consent provider's redirect URI ends in its own id, so tenants
     /// may use the same slug; an update may still not take a stored provider's
     /// redirect URI, as two providers stored with one slug path could.
