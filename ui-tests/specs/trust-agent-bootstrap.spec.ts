@@ -180,4 +180,40 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
       page.getByTestId("key-management-settings-signing-with"),
     ).toContainText("bundled");
   });
+
+  test("a surface can be pinned to the connected bundled trust agent", async ({
+    page,
+  }) => {
+    const bundledReady = {
+      ...bootstrapConnection,
+      keys: {
+        active: { key_id: "gateway-jwt-1", public_key: "z6MkBundledKey" },
+      },
+    };
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      route.fulfill({ json: [bundledReady] }),
+    );
+    await page.goto(`${BASE_URL}/surfaces/new`);
+    await page.getByText("A2A Surface Starter", { exact: true }).click();
+    await page
+      .locator("button:has(i.fa-arrow-right), button:has(svg)")
+      .nth(0)
+      .click();
+    await page
+      .getByRole("button", { name: "Got it" })
+      .click({ timeout: 5000 })
+      .catch(() => {});
+    await page.getByTestId("surface-node-surface").click();
+    const select = page.locator("#surface-signing-select");
+    await expect(
+      select.locator("option", { hasText: "Bundled trust agent" }),
+    ).toHaveCount(1);
+    await expect(
+      select.locator("option", { hasText: "not ready" }),
+    ).toHaveCount(0);
+    await select.selectOption({ label: "Bundled trust agent" });
+    await expect(select.locator("option:checked")).toHaveText(
+      "Bundled trust agent",
+    );
+  });
 });
