@@ -28,7 +28,7 @@ has five types, set by `provider_type`.
 | --- | --- | --- |
 | `oauth2_authorization_code` | Three-legged OAuth. The user signs in to the provider and approves the scopes. | Required, per user |
 | `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client with a client secret. | None |
-| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`; no client ID or secret. A Google service account for Vertex AI Agent Engine works this way. | None |
+| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`. It sends no client identity unless the provider sets a `client_authentication`. A Google service account for Vertex AI Agent Engine works this way; an Ory Hydra client, which Hydra needs identified, sets one. | None |
 | `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret. An Entra certificate credential (key named by certificate thumbprint) and an Ory `private_key_jwt` client (key named by `kid`) work this way. | None |
 | `api_key` | A static key resolved from the secrets store. No OAuth. | None |
 
@@ -213,8 +213,9 @@ record that misses a required one.
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
-| `client_id_secret_ref` | Not used | Required, sent as `client_id` |
-| `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
+| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
+| `client_id_secret_ref` | Required with a `client_authentication`, and sent as `client_id` or inside the Basic credentials; not used without one | Required, sent as `client_id` |
+| `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post`, refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication` | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
 | `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
@@ -229,13 +230,28 @@ endpoint through the same pinned client as a token request, so a loopback or clo
 endpoint answers 400 `token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata`
 without being contacted,
 and an unreachable one answers `"reachable": false` with the fixed error `token_endpoint could
-not be reached`; the detail is only logged. JWK keys are not
+not be reached`; the detail is only logged. It takes no client references, so it does not check
+a `client_authentication`; create and update do. JWK keys are not
 accepted. The provider API never returns the key or certificate; the list leaves out
 their references too.
 
+RFC 7523 makes client authentication optional in a JWT Bearer grant, and servers differ. A Google
+service account needs none. Ory Hydra answers a grant that names no client with 400
+`invalid_request`: set `none` for a public client, and `client_secret_basic` or
+`client_secret_post` to match the `token_endpoint_auth_method` the client is registered with. A
+provider that sets no client authentication keeps sending a client-less grant even when it stores client
+references, such as those left from another type. Create and update refuse a method whose
+references are missing: the client ID for every method, and the client secret for
+`client_secret_basic` and `client_secret_post`. A provider that sets a client authentication
+also names its scopes in the `scope` form field, which servers such as Hydra grant scopes from:
+without it Hydra issues an empty scope, and the gateway refuses a token whose scopes differ
+from those requested. A provider that sets no client authentication sends its scopes only in the assertion's
+`scope` claim, as before.
+
 Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, a random
 UUID `jti` so the issuer can refuse a replayed assertion, and for a client assertion `nbf`);
-only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, and in the `scope` form
+field too when the provider sets a `client_authentication`; a client assertion sends them in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
 `common`. An update that sends a reference or JWT field as an empty string clears it, which
 is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
@@ -276,7 +292,9 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
   of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
   of each secret the provider's type sends: the client ID and secret of `oauth2_client_credentials`,
-  the signing key and certificate of `oauth2_jwt_bearer`, and the client ID, signing key and
+  the signing key and certificate of `oauth2_jwt_bearer` (after its client ID, and its client
+  secret too for `client_secret_basic` and `client_secret_post`, when it sets a
+  `client_authentication`), and the client ID, signing key and
   certificate of `oauth2_client_credentials_jwt_auth`. Editing the provider, rotating one of
   those secrets or moving one to another tenant therefore requests a new token instead of
   reusing one issued under the old settings. A reference the type does not send, such as an

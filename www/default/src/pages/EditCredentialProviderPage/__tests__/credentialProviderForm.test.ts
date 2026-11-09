@@ -5,6 +5,7 @@ import {
   isHttpsAddress,
   ProviderFormValues,
   entraRejectsResource,
+  clientAuthenticationOf,
   jwtFieldsOf,
   jwtKeyUnidentified,
   missingProviderField,
@@ -19,6 +20,7 @@ function form(values: Partial<ProviderFormValues>): ProviderFormValues {
     client_id_secret_ref: 'CLIENT_ID',
     client_secret_secret_ref: 'CLIENT_SECRET',
     api_key_secret_ref: '',
+    client_authentication: '',
     ...EMPTY_JWT_FIELDS,
     ...values,
   };
@@ -57,6 +59,22 @@ describe('credential provider form', () => {
       jwtIssuer: true,
       jwtCertificate: false,
     });
+    expect(providerTypeFields('oauth2_jwt_bearer', 'none')).toMatchObject({
+      clientId: true,
+      clientSecret: false,
+    });
+    expect(providerTypeFields('oauth2_jwt_bearer', 'client_secret_basic')).toMatchObject({
+      clientId: true,
+      clientSecret: true,
+    });
+    expect(providerTypeFields('oauth2_jwt_bearer', 'client_secret_post')).toMatchObject({
+      clientId: true,
+      clientSecret: true,
+    });
+    expect(providerTypeFields('oauth2_client_credentials', 'none')).toMatchObject({
+      clientId: true,
+      clientSecret: true,
+    });
     expect(providerTypeFields('oauth2_client_credentials_jwt_auth')).toMatchObject({
       clientId: true,
       clientSecret: false,
@@ -88,9 +106,43 @@ describe('credential provider form', () => {
     );
   });
 
-  it('sends a JWT Bearer provider without client credentials', () => {
-    expect(providerCredentialFields(jwtBearer)).toEqual({
+  it('requires the client references the chosen client authentication needs', () => {
+    const withClient = (values: Partial<ProviderFormValues>) =>
+      missingProviderField({ ...jwtBearer, ...values });
+    expect(withClient({ client_authentication: 'none' })).toBe(
+      'Client ID secret is required for OAuth providers.'
+    );
+    expect(
+      withClient({ client_authentication: 'none', client_id_secret_ref: 'HYDRA_ID' })
+    ).toBeNull();
+    for (const method of ['client_secret_basic', 'client_secret_post'] as const) {
+      expect(withClient({ client_authentication: method, client_id_secret_ref: 'HYDRA_ID' })).toBe(
+        'Client Secret secret is required for OAuth providers.'
+      );
+      expect(withClient({ client_authentication: method })).toBe(
+        'Client ID secret is required for OAuth providers.'
+      );
+      expect(
+        withClient({
+          client_authentication: method,
+          client_id_secret_ref: 'HYDRA_ID',
+          client_secret_secret_ref: 'HYDRA_SECRET',
+        })
+      ).toBeNull();
+    }
+    expect(withClient({ client_id_secret_ref: '', client_secret_secret_ref: '' })).toBeNull();
+  });
+
+  it('sends a JWT Bearer provider without a client identity when no method is chosen', () => {
+    expect(
+      providerCredentialFields({
+        ...jwtBearer,
+        client_id_secret_ref: 'IGNORED',
+        client_secret_secret_ref: 'IGNORED',
+      })
+    ).toEqual({
       token_endpoint: 'https://oauth2.googleapis.com/token',
+      client_authentication: '',
       client_secret_secret_ref: '',
       jwt_signing_key_secret_ref: 'SA_KEY',
       jwt_certificate_secret_ref: '',
@@ -100,6 +152,40 @@ describe('credential provider form', () => {
       jwt_subject: 'user@example.com',
       jwt_signing_algorithm: undefined,
     });
+  });
+
+  it('sends the client references each JWT Bearer client authentication uses', () => {
+    const refs = { client_id_secret_ref: 'HYDRA_ID', client_secret_secret_ref: 'HYDRA_SECRET' };
+    expect(
+      providerCredentialFields({ ...jwtBearer, ...refs, client_authentication: 'none' })
+    ).toMatchObject({
+      client_authentication: 'none',
+      client_id_secret_ref: 'HYDRA_ID',
+      client_secret_secret_ref: '',
+    });
+    for (const method of ['client_secret_basic', 'client_secret_post'] as const) {
+      expect(
+        providerCredentialFields({ ...jwtBearer, ...refs, client_authentication: method })
+      ).toMatchObject({
+        client_authentication: method,
+        client_id_secret_ref: 'HYDRA_ID',
+        client_secret_secret_ref: 'HYDRA_SECRET',
+      });
+    }
+  });
+
+  it('sends an empty client authentication for every other provider type', () => {
+    expect(
+      providerCredentialFields(form({ client_authentication: 'client_secret_basic' }))
+    ).toMatchObject({
+      client_authentication: '',
+      client_id_secret_ref: 'CLIENT_ID',
+      client_secret_secret_ref: 'CLIENT_SECRET',
+    });
+    expect(providerCredentialFields(form({ provider_type: 'api_key' }))).toMatchObject({
+      client_authentication: '',
+    });
+    expect(providerCredentialFields(jwtAuth)).toMatchObject({ client_authentication: '' });
   });
 
   it('clears the client secret and issuer of a Client Credentials JWT provider', () => {
@@ -182,6 +268,15 @@ describe('credential provider form', () => {
       jwt_issuer: 'sa@example',
     });
     expect(jwtFieldsOf({ jwt_signing_algorithm: 'HS256' }).jwt_signing_algorithm).toBe('');
+  });
+
+  it('loads the client authentication of a stored provider and drops an unknown value', () => {
+    expect(clientAuthenticationOf({ client_authentication: 'client_secret_post' })).toBe(
+      'client_secret_post'
+    );
+    expect(clientAuthenticationOf({ client_authentication: 'none' })).toBe('none');
+    expect(clientAuthenticationOf({ client_authentication: 'private_key_jwt' })).toBe('');
+    expect(clientAuthenticationOf({})).toBe('');
   });
 });
 

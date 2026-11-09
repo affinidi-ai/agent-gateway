@@ -1,0 +1,20 @@
+branch: feat/jwt-client-auth
+changes:
+  added:
+    - timestamp: '2026-11-09T11:22:00Z'
+      title: Let a JWT Bearer provider identify its OAuth client to the token endpoint
+      description: >-
+        A JWT Bearer credential provider can set client_authentication to none (a public client),
+        client_secret_basic or client_secret_post, and its grant then carries the client ID, or the
+        client ID and secret, by HTTP Basic or in the form body, and its scopes in the scope form
+        field, which Hydra grants scopes from. Servers such as Ory Hydra refuse a grant that names
+        no client. A provider that sets no client authentication sends the same client-less grant as
+        before, whatever client references it stores, so stored providers behave as they did. Create
+        and update refuse a method without the client references it sends and a client
+        authentication on any other provider type. The dashboard's credential provider editor offers
+        the choice.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{ConsentRequired, OAuthState, OAuthTokenResponse};
 use crate::config::credential_policy::{RuleMode, credential_policy};
-use crate::credential_providers::CredentialProvider;
+use crate::credential_providers::{CredentialProvider, GrantClientAuthentication};
 use crate::identity::ssi::vc_issuer::VcSigner;
 use crate::secrets::SecretsStore;
 use std::sync::Arc;
@@ -683,14 +683,75 @@ async fn scoped_token_grant(
     if let Some(refresh_token) = refresh_token {
         params.push(("refresh_token", refresh_token));
     }
-    request_token(provider, endpoint, &params, refresh_token.is_some(), egress).await
+    request_token(provider, endpoint, &params, None, refresh_token.is_some(), egress).await
 }
 
 const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 const JWT_CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
+/// The client identity a JWT Bearer grant carries, resolved from the provider's secret
+/// references and held in zeroizing buffers until the request is sent.
+enum GrantClient {
+    /// A public client: `client_id` in the form body.
+    Public { id: String },
+    /// `client_id` and `client_secret` in the form body.
+    Post { id: String, secret: zeroize::Zeroizing<String> },
+    /// The `Authorization` header value of HTTP Basic client authentication.
+    Basic { authorization: zeroize::Zeroizing<String> },
+}
+
+/// The client identity the provider's client authentication sends with its grant, or `None`
+/// when it sets no client authentication, in which case its client references are not read.
+async fn grant_client(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<Option<GrantClient>> {
+    let Some(method) = provider
+        .jwt
+        .client_authentication_method()
+    else {
+        return Ok(None);
+    };
+    let id = resolve_secret(
+        provider,
+        secrets,
+        provider
+            .client_id_secret_ref
+            .as_deref()
+            .ok_or_else(|| misconfigured("Missing provider client"))?,
+        mode,
+    )
+    .await?;
+    if !method.uses_secret() {
+        return Ok(Some(GrantClient::Public { id }));
+    }
+    let secret = zeroize::Zeroizing::new(
+        resolve_secret(
+            provider,
+            secrets,
+            provider
+                .client_secret_secret_ref
+                .as_deref()
+                .ok_or_else(|| misconfigured("Missing provider client secret"))?,
+            mode,
+        )
+        .await?,
+    );
+    Ok(Some(if method == GrantClientAuthentication::ClientSecretBasic {
+        GrantClient::Basic {
+            authorization: super::revocation::basic_authorization(&id, &secret),
+        }
+    } else {
+        GrantClient::Post { id, secret }
+    }))
+}
+
 /// Fetch a token with a JWT Bearer grant (RFC 7523 section 2.1): the signed JWT is the
-/// grant, and no client credentials are sent.
+/// grant, and the client identifies itself only as the provider's client authentication
+/// says, not at all when it sets no client authentication. A provider that sets one also
+/// asks for its scopes in the `scope` form field, which servers such as Ory Hydra grant
+/// scopes from; one that sets none of them names its scopes only in the assertion's `scope` claim.
 pub async fn fetch_jwt_bearer_token(
     provider: &CredentialProvider,
     scopes: &[String],
@@ -698,6 +759,14 @@ pub async fn fetch_jwt_bearer_token(
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
+    let client = grant_client(
+        provider,
+        secrets,
+        egress
+            .policy
+            .tenant_credential_isolation,
+    )
+    .await?;
     let claims = super::jwt_assertion::grant_assertion_claims(provider, scopes, Utc::now().timestamp())
         .map_err(|e| misconfigured(e.to_string()))?;
     let assertion = signed_assertion(
@@ -709,11 +778,28 @@ pub async fn fetch_jwt_bearer_token(
             .tenant_credential_isolation,
     )
     .await?;
+    let scope = scopes.join(" ");
     let mut params = vec![("grant_type", JWT_BEARER_GRANT_TYPE), ("assertion", assertion.as_str())];
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, egress)
+    let authorization = match &client {
+        None => None,
+        Some(GrantClient::Public { id }) => {
+            params.push(("client_id", id.as_str()));
+            None
+        }
+        Some(GrantClient::Post { id, secret }) => {
+            params.push(("client_id", id.as_str()));
+            params.push(("client_secret", secret.as_str()));
+            None
+        }
+        Some(GrantClient::Basic { authorization }) => Some(authorization.as_str()),
+    };
+    if client.is_some() && !scope.is_empty() {
+        params.push(("scope", scope.as_str()));
+    }
+    request_token(provider, endpoint, &params, authorization, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -763,7 +849,7 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     if let Some(resource) = provider.resource.as_deref() {
         params.push(("resource", resource));
     }
-    request_token(provider, endpoint, &params, false, egress)
+    request_token(provider, endpoint, &params, None, false, egress)
         .await?
         .ok_or_else(|| anyhow!("Provider credential grant rejected"))
 }
@@ -1062,6 +1148,21 @@ pub(crate) enum TokenPostFailure {
     TimedOut,
 }
 
+/// `request` with `authorization` as its `Authorization` header, marked sensitive so that no
+/// debug output of the request shows it.
+fn with_sensitive_authorization(
+    request: reqwest::RequestBuilder,
+    authorization: &str,
+) -> reqwest::RequestBuilder {
+    match reqwest::header::HeaderValue::from_str(authorization) {
+        Ok(mut value) => {
+            value.set_sensitive(true);
+            request.header(reqwest::header::AUTHORIZATION, value)
+        }
+        Err(_) => request.header(reqwest::header::AUTHORIZATION, authorization),
+    }
+}
+
 /// POST `params` to the token endpoint `endpoint` through `client`, asking for
 /// JSON, with `authorization` as the `Authorization` header when one is given,
 /// and read the answer: at most [`MAX_TOKEN_RESPONSE_BYTES`] within
@@ -1092,7 +1193,7 @@ pub(crate) async fn post_token_request_within(
             .header(reqwest::header::ACCEPT, "application/json")
             .form(params);
         if let Some(authorization) = authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, authorization);
+            request = with_sensitive_authorization(request, authorization);
         }
         let mut response = request
             .send()
@@ -1192,9 +1293,10 @@ impl TokenPostFailure {
     }
 }
 
-/// POST a token request through the egress's pinned client ([`post_token_request_within`])
-/// and read its JSON response, the whole request within the egress timeout. The access
-/// token must be a non-empty Bearer with an `expires_in` of up to 366 days.
+/// POST a token request through the egress's pinned client ([`post_token_request_within`]),
+/// with `authorization` as its `Authorization` header when one is given, and read its JSON
+/// response, the whole request within the egress timeout. The access token must be a
+/// non-empty Bearer with an `expires_in` of up to 366 days.
 /// When `refresh` is set an `invalid_grant` answer is `Ok(None)`; any other refusal is
 /// an error, and only its OAuth `error` code is logged. A failed service token request that
 /// reached the endpoint is counted here; [`TokenRequestOutcome::Success`] is counted by the
@@ -1203,6 +1305,7 @@ async fn request_token(
     provider: &CredentialProvider,
     endpoint: &str,
     params: &[(&str, &str)],
+    authorization: Option<&str>,
     refresh: bool,
     egress: &TokenEgress,
 ) -> Result<Option<OAuthTokenResponse>> {
@@ -1213,7 +1316,7 @@ async fn request_token(
     let remaining = egress
         .timeout
         .saturating_sub(started.elapsed());
-    let answer = match post_token_request_within(&client, url.as_str(), params, None, remaining).await {
+    let answer = match post_token_request_within(&client, url.as_str(), params, authorization, remaining).await {
         Ok(answer) => answer,
         Err(failure) => {
             if !refresh {
@@ -2079,6 +2182,7 @@ mod tests {
             url: String,
             egress: TokenEgress,
             requests: tokio::sync::mpsc::Receiver<HashMap<String, String>>,
+            authorizations: tokio::sync::mpsc::UnboundedReceiver<Option<String>>,
             _server: tokio::task::JoinSet<()>,
         }
 
@@ -2087,11 +2191,21 @@ mod tests {
             body: Value,
         ) -> TokenEndpoint {
             let (sender, requests) = tokio::sync::mpsc::channel(4);
+            let (authorization_sender, authorizations) = tokio::sync::mpsc::unbounded_channel();
             let app = axum::Router::new().fallback(axum::routing::post(
-                move |axum::Form(form): axum::Form<HashMap<String, String>>| {
+                move |headers: axum::http::HeaderMap, axum::Form(form): axum::Form<HashMap<String, String>>| {
                     let sender = sender.clone();
+                    let authorization_sender = authorization_sender.clone();
                     let body = body.clone();
                     async move {
+                        authorization_sender
+                            .send(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_string),
+                            )
+                            .ok();
                         sender
                             .send(form)
                             .await
@@ -2118,6 +2232,7 @@ mod tests {
                 },
                 url,
                 requests,
+                authorizations,
                 _server: server,
             }
         }
@@ -2325,6 +2440,231 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(form["resource"], "https://api.example/");
+        }
+
+        #[test]
+        fn an_authorization_header_is_marked_sensitive() {
+            let request =
+                with_sensitive_authorization(reqwest::Client::new().post("http://127.0.0.1/token"), "Basic abc")
+                    .build()
+                    .unwrap();
+            let value = &request.headers()[reqwest::header::AUTHORIZATION];
+            assert_eq!(value, "Basic abc");
+            assert!(value.is_sensitive(), "the Authorization header is not marked sensitive");
+        }
+
+        fn bearer_with_client_references(client_authentication: Option<&str>) -> Value {
+            json!({
+                "provider_type": "oauth2_jwt_bearer",
+                "jwt_issuer": "agent@project.iam.gserviceaccount.com",
+                "jwt_subject": "admin@example.com",
+                "client_id_secret_ref": "CLIENT_ID",
+                "client_secret_secret_ref": "CLIENT_SECRET",
+                "client_authentication": client_authentication,
+            })
+        }
+
+        async fn grant_sent(client_authentication: Option<&str>) -> (HashMap<String, String>, Option<String>) {
+            let fixture = fixture().await;
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(&endpoint.url, bearer_with_client_references(client_authentication));
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            let form = endpoint
+                .requests
+                .recv()
+                .await
+                .unwrap();
+            let authorization = endpoint
+                .authorizations
+                .recv()
+                .await
+                .unwrap();
+            (form, authorization)
+        }
+
+        fn form_keys(form: &HashMap<String, String>) -> Vec<&str> {
+            let mut keys: Vec<_> = form
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        fn basic(
+            client_id: &str,
+            secret: &str,
+        ) -> String {
+            use base64::Engine;
+            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}")))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_jwt_bearer_grant_without_a_client_authentication_sends_no_client_identity() {
+            let (form, authorization) = grant_sent(None).await;
+            assert_eq!(form_keys(&form), ["assertion", "grant_type"]);
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_grant_with_a_client_authentication_also_asks_for_its_scopes_in_the_form_body() {
+            let fixture = fixture().await;
+            let scopes = vec!["read".to_string(), "write".to_string()];
+            for method in ["none", "client_secret_basic", "client_secret_post"] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let provider = provider(&endpoint.url, bearer_with_client_references(Some(method)));
+                fetch_jwt_bearer_token(&provider, &scopes, &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap();
+                let form = endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    form.get("scope")
+                        .map(String::as_str),
+                    Some("read write"),
+                    "{method}"
+                );
+                assert_eq!(
+                    claims(&form["assertion"], &fixture.key.public_pem, Algorithm::RS256, &endpoint.url)["scope"],
+                    "read write"
+                );
+            }
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let provider = provider(&endpoint.url, bearer_with_client_references(Some("none")));
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            assert!(
+                !endpoint
+                    .requests
+                    .recv()
+                    .await
+                    .unwrap()
+                    .contains_key("scope"),
+                "a grant with no scopes asks for none in the form body"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_public_client_sends_its_client_id_and_no_secret() {
+            let (form, authorization) = grant_sent(Some("none")).await;
+            assert_eq!(form_keys(&form), ["assertion", "client_id", "grant_type"]);
+            assert_eq!(form["client_id"], "client-123");
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_basic_sends_http_basic_and_no_client_field_in_the_form() {
+            let (form, authorization) = grant_sent(Some("client_secret_basic")).await;
+            assert_eq!(form_keys(&form), ["assertion", "grant_type"]);
+            assert_eq!(authorization, Some(basic("client-123", "client-secret")));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn client_secret_post_sends_the_client_id_and_secret_in_the_form() {
+            let (form, authorization) = grant_sent(Some("client_secret_post")).await;
+            assert_eq!(form_keys(&form), ["assertion", "client_id", "client_secret", "grant_type"]);
+            assert_eq!(form["client_id"], "client-123");
+            assert_eq!(form["client_secret"], "client-secret");
+            assert_eq!(authorization, None);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_basic_credential_form_urlencodes_the_client_id_and_secret_before_joining_them() {
+            let fixture = fixture().await;
+            for (secret_id, value) in [("ODD_ID", "client id"), ("ODD_SECRET", "p@ss:w+rd/%")] {
+                fixture
+                    .secrets
+                    .create(crate::secrets::CreateSecretRequest {
+                        tenant_id: None,
+                        name: secret_id.into(),
+                        secret_id: secret_id.into(),
+                        description: None,
+                        value: value.into(),
+                        secret_type: "General".into(),
+                        tags: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut endpoint = token_endpoint(200, issued()).await;
+            let mut body = bearer_with_client_references(Some("client_secret_basic"));
+            body["client_id_secret_ref"] = json!("ODD_ID");
+            body["client_secret_secret_ref"] = json!("ODD_SECRET");
+            let provider = provider(&endpoint.url, body);
+            fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                .await
+                .unwrap();
+            assert_eq!(
+                endpoint
+                    .authorizations
+                    .recv()
+                    .await
+                    .unwrap(),
+                Some(basic("client+id", "p%40ss%3Aw%2Brd%2F%25"))
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_client_authentication_without_the_references_it_needs_fails_before_any_request() {
+            let fixture = fixture().await;
+            for (method, reference, replacement) in [
+                ("none", "client_id_secret_ref", None),
+                ("client_secret_basic", "client_id_secret_ref", None),
+                ("client_secret_basic", "client_secret_secret_ref", None),
+                ("client_secret_post", "client_secret_secret_ref", None),
+                ("none", "client_id_secret_ref", Some("NO_SUCH_SECRET")),
+                ("client_secret_post", "client_secret_secret_ref", Some("NO_SUCH_SECRET")),
+            ] {
+                let mut endpoint = token_endpoint(200, issued()).await;
+                let mut body = bearer_with_client_references(Some(method));
+                match replacement {
+                    Some(secret_id) => body[reference] = json!(secret_id),
+                    None => {
+                        body.as_object_mut()
+                            .unwrap()
+                            .remove(reference);
+                    }
+                }
+                let provider = provider(&endpoint.url, body);
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .expect_err(&format!("{method} with {reference} {replacement:?} was sent"));
+                let text = format!("{error:#}");
+                assert!(!text.contains("client-secret"), "{text}");
+                assert!(
+                    endpoint
+                        .requests
+                        .try_recv()
+                        .is_err(),
+                    "{method} with {reference} {replacement:?} reached the token endpoint"
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_grant_never_shows_the_client_secret_or_the_basic_credential() {
+            let fixture = fixture().await;
+            for method in ["client_secret_basic", "client_secret_post"] {
+                let endpoint = token_endpoint(
+                    401,
+                    json!({"error": "invalid_client", "error_description": "client-secret was not accepted"}),
+                )
+                .await;
+                let provider = provider(&endpoint.url, bearer_with_client_references(Some(method)));
+                let error = fetch_jwt_bearer_token(&provider, &[], &fixture.secrets, &endpoint.egress)
+                    .await
+                    .unwrap_err();
+                let text = format!("{error:#}");
+                assert!(!text.contains("client-secret"), "{method}: {text}");
+                assert!(!text.contains(&basic("client-123", "client-secret")), "{method}: {text}");
+                assert!(!text.contains("was not accepted"), "{method}: {text}");
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

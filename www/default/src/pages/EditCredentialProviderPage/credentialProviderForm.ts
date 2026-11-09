@@ -5,6 +5,14 @@ export type CredentialProviderType =
   | 'oauth2_client_credentials_jwt_auth'
   | 'api_key';
 
+export type ClientAuthentication = '' | 'none' | 'client_secret_basic' | 'client_secret_post';
+
+const CLIENT_AUTHENTICATIONS: ClientAuthentication[] = [
+  'none',
+  'client_secret_basic',
+  'client_secret_post',
+];
+
 export type JwtSigningAlgorithm = 'RS256' | 'PS256' | 'ES256';
 
 export interface JwtFormFields {
@@ -42,8 +50,14 @@ export interface ProviderTypeFields {
   jwtCertificate: boolean;
 }
 
-/** Which inputs a provider type uses. */
-export function providerTypeFields(type: CredentialProviderType): ProviderTypeFields {
+/**
+ * Which inputs a provider type uses. A JWT Bearer provider uses client pickers only as its
+ * client authentication needs them.
+ */
+export function providerTypeFields(
+  type: CredentialProviderType,
+  clientAuthentication: ClientAuthentication = ''
+): ProviderTypeFields {
   switch (type) {
     case 'oauth2_authorization_code':
     case 'oauth2_client_credentials':
@@ -58,8 +72,10 @@ export function providerTypeFields(type: CredentialProviderType): ProviderTypeFi
     case 'oauth2_jwt_bearer':
       return {
         tokenEndpoint: true,
-        clientId: false,
-        clientSecret: false,
+        clientId: clientAuthentication !== '',
+        clientSecret:
+          clientAuthentication === 'client_secret_basic' ||
+          clientAuthentication === 'client_secret_post',
         jwt: true,
         jwtIssuer: true,
         jwtCertificate: false,
@@ -91,11 +107,12 @@ export interface ProviderFormValues extends JwtFormFields {
   client_id_secret_ref: string;
   client_secret_secret_ref: string;
   api_key_secret_ref: string;
+  client_authentication: ClientAuthentication;
 }
 
 /** The first missing required field of the form, as the message to show, or null. */
 export function missingProviderField(form: ProviderFormValues): string | null {
-  const fields = providerTypeFields(form.provider_type);
+  const fields = providerTypeFields(form.provider_type, form.client_authentication);
   if (fields.tokenEndpoint && !form.token_endpoint.trim()) {
     return 'Token endpoint is required for OAuth providers.';
   }
@@ -180,10 +197,12 @@ export function entraResourceMessage(resource: string): string {
 export function providerCredentialFields(
   form: ProviderFormValues
 ): Record<string, string | undefined> {
-  const fields = providerTypeFields(form.provider_type);
+  const fields = providerTypeFields(form.provider_type, form.client_authentication);
   const value = (enabled: boolean, raw: string) => (enabled ? raw.trim() : '');
   const body: Record<string, string | undefined> = {};
   if (fields.tokenEndpoint) body.token_endpoint = form.token_endpoint.trim();
+  body.client_authentication =
+    form.provider_type === 'oauth2_jwt_bearer' ? form.client_authentication : '';
   if (fields.clientId) body.client_id_secret_ref = form.client_id_secret_ref;
   if (fields.tokenEndpoint) {
     body.client_secret_secret_ref = value(fields.clientSecret, form.client_secret_secret_ref);
@@ -200,6 +219,11 @@ export function providerCredentialFields(
   body.jwt_signing_algorithm =
     algorithm && JWT_ALGORITHMS[form.provider_type]?.includes(algorithm) ? algorithm : undefined;
   return body;
+}
+
+/** The client authentication of a loaded provider record, empty when unset. */
+export function clientAuthenticationOf(data: Record<string, unknown>): ClientAuthentication {
+  return CLIENT_AUTHENTICATIONS.find(method => method === data.client_authentication) ?? '';
 }
 
 /** The JWT fields of a loaded provider record. */

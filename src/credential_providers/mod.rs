@@ -104,6 +104,32 @@ pub enum JwtSigningAlgorithm {
     ES256,
 }
 
+/// How the client of an `oauth2_jwt_bearer` grant identifies itself to the token endpoint
+/// (RFC 6749 section 2.3). A provider that sets no client authentication sends no client
+/// identity with its grant, as a Google service account does. `Unset` is what an empty string
+/// in a request means: it clears the stored setting and is never stored.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GrantClientAuthentication {
+    #[serde(rename = "")]
+    Unset,
+    /// A public client: its `client_id` in the form body, no secret.
+    #[serde(rename = "none")]
+    PublicClient,
+    /// HTTP Basic with the client id and secret.
+    #[serde(rename = "client_secret_basic")]
+    ClientSecretBasic,
+    /// The client id and secret in the form body.
+    #[serde(rename = "client_secret_post")]
+    ClientSecretPost,
+}
+
+impl GrantClientAuthentication {
+    /// Whether the client authenticates with a secret.
+    pub fn uses_secret(self) -> bool {
+        matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
+    }
+}
+
 /// The signed-JWT settings of the `oauth2_jwt_bearer` and
 /// `oauth2_client_credentials_jwt_auth` types. Key and certificate are secret
 /// references; the PEM values never leave the secrets store except to sign.
@@ -131,6 +157,11 @@ pub struct JwtAssertionSettings {
     /// `sub` claim of a JWT Bearer grant: required for a JWT Bearer provider (domain-wide delegation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt_subject: Option<String>,
+    /// How the client of a JWT Bearer grant identifies itself; unset sends no client identity
+    /// and leaves the client references unread. `oauth2_jwt_bearer` only, cleared by an empty
+    /// string in an update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_authentication: Option<GrantClientAuthentication>,
 }
 
 impl JwtAssertionSettings {
@@ -161,7 +192,16 @@ impl JwtAssertionSettings {
             jwt_subject: self
                 .jwt_subject
                 .or(existing.jwt_subject),
+            client_authentication: self
+                .client_authentication
+                .or(existing.client_authentication),
         }
+    }
+
+    /// The client authentication these settings set, `None` when they set none.
+    pub fn client_authentication_method(&self) -> Option<GrantClientAuthentication> {
+        self.client_authentication
+            .filter(|method| *method != GrantClientAuthentication::Unset)
     }
 
     /// Does a provider of `provider_type` need a `jwt_subject` these settings leave blank?
@@ -185,6 +225,7 @@ impl JwtAssertionSettings {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         }
+        let client_authentication = self.client_authentication_method();
         Self {
             jwt_signing_key_secret_ref: clean(self.jwt_signing_key_secret_ref),
             jwt_certificate_secret_ref: clean(self.jwt_certificate_secret_ref),
@@ -193,6 +234,7 @@ impl JwtAssertionSettings {
             jwt_key_id: clean(self.jwt_key_id),
             jwt_issuer: clean(self.jwt_issuer),
             jwt_subject: clean(self.jwt_subject),
+            client_authentication,
         }
     }
 }
@@ -395,16 +437,25 @@ impl CredentialProvider {
     }
 
     /// The secret ids a service token of this provider's type reads: the API key; the client
-    /// ID and secret; a JWT Bearer grant's signing key and certificate; or the client ID,
+    /// ID and secret; a JWT Bearer grant's signing key and certificate, preceded by the client
+    /// ID, and the client secret too when its client authentication uses one; or the client ID,
     /// signing key and certificate of a client authenticating with a JWT. A reference left
-    /// from another type is not among them, and an authorization code provider issues no
-    /// service token.
+    /// from another type, or a client reference of a JWT Bearer provider that sets no client
+    /// authentication, is not among them, and an authorization code provider issues no service
+    /// token.
     pub fn service_token_secret_refs(&self) -> Vec<&str> {
         let [client_id, client_secret, api_key, signing_key, certificate] = self.secret_ref_fields();
         match self.provider_type {
             CredentialProviderType::ApiKey => vec![api_key],
             CredentialProviderType::OAuth2ClientCredentials => vec![client_id, client_secret],
-            CredentialProviderType::OAuth2JwtBearer => vec![signing_key, certificate],
+            CredentialProviderType::OAuth2JwtBearer => match self
+                .jwt
+                .client_authentication_method()
+            {
+                None => vec![signing_key, certificate],
+                Some(method) if method.uses_secret() => vec![client_id, client_secret, signing_key, certificate],
+                Some(_) => vec![client_id, signing_key, certificate],
+            },
             CredentialProviderType::OAuth2ClientCredentialsJwtAuth => vec![client_id, signing_key, certificate],
             CredentialProviderType::OAuth2AuthorizationCode => Vec::new(),
         }
@@ -433,8 +484,8 @@ impl CredentialProvider {
 
     /// Each secret reference, paired with whether `previous` held it in the same field while
     /// this provider keeps the type and sends it to the same place: the token and
-    /// authorization endpoints, resource, additional parameters, default scopes and JWT issuer,
-    /// subject and audience.
+    /// authorization endpoints, resource, additional parameters, default scopes, JWT issuer,
+    /// subject and audience, and client authentication.
     fn secret_refs_kept_from(
         &self,
         previous: Option<&Self>,
@@ -450,6 +501,12 @@ impl CredentialProvider {
                     && self.jwt.jwt_issuer == previous.jwt.jwt_issuer
                     && self.jwt.jwt_subject == previous.jwt.jwt_subject
                     && self.jwt.jwt_audience == previous.jwt.jwt_audience
+                    && self
+                        .jwt
+                        .client_authentication_method()
+                        == previous
+                            .jwt
+                            .client_authentication_method()
             })
             .map(Self::secret_ref_fields)
             .unwrap_or_default();
@@ -1238,6 +1295,33 @@ mod tests {
     }
 
     #[test]
+    fn a_client_reference_left_on_a_provider_is_not_kept_once_a_client_authentication_sends_it() {
+        let stored: CredentialProvider = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "https://idp.example/token", "jwt_signing_key_secret_ref": "KEY",
+            "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET",
+            "jwt_issuer": "iss", "jwt_subject": "sub",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        let all_kept = vec![("ID", true), ("SECRET", true), ("KEY", true)];
+        let none_kept = vec![("ID", false), ("SECRET", false), ("KEY", false)];
+        assert_eq!(stored.secret_refs_kept_from(Some(&stored)), all_kept);
+
+        let mut sending = stored.clone();
+        sending
+            .jwt
+            .client_authentication = Some(GrantClientAuthentication::ClientSecretPost);
+        assert_eq!(sending.secret_refs_kept_from(Some(&sending)), all_kept);
+        assert_eq!(sending.secret_refs_kept_from(Some(&stored)), none_kept);
+        assert_eq!(
+            stored.secret_refs_kept_from(Some(&sending)),
+            none_kept,
+            "dropping the client authentication is a change of what the provider sends too"
+        );
+    }
+
+    #[test]
     fn a_provider_is_usable_by_a_surface_according_to_type_tenant_and_mode() {
         use crate::config::credential_policy::RuleMode::{Enforce, Warn};
         use crate::tenancy::SurfaceTenancy;
@@ -1518,6 +1602,7 @@ mod tests {
                 jwt_key_id: Some("key-1".into()),
                 jwt_issuer: Some("agent@project.iam.gserviceaccount.com".into()),
                 jwt_subject: Some("user@example.com".into()),
+                client_authentication: None,
             }
         );
         let value = serde_json::to_value(&provider).unwrap();
@@ -1592,6 +1677,7 @@ mod tests {
             jwt_key_id: Some("kid-1".into()),
             jwt_issuer: Some("sa@example.iam".into()),
             jwt_subject: Some("user@example.com".into()),
+            client_authentication: None,
         };
         let item = serde_json::to_value(CredentialProviderListItem::from(&provider)).unwrap();
         assert_eq!(item["provider_type"], "oauth2_jwt_bearer");
@@ -1629,6 +1715,86 @@ mod tests {
         );
         assert_eq!(merged.jwt_issuer.as_deref(), Some("new@example"));
         assert_eq!(merged.jwt_key_id, None);
+    }
+
+    #[test]
+    fn a_client_authentication_is_kept_unless_an_update_names_or_clears_it() {
+        let stored = JwtAssertionSettings {
+            client_authentication: Some(GrantClientAuthentication::ClientSecretBasic),
+            ..Default::default()
+        };
+        let sent = |value: &str| -> JwtAssertionSettings {
+            serde_json::from_value(serde_json::json!({ "client_authentication": value })).unwrap()
+        };
+        let kept = JwtAssertionSettings::default()
+            .or(stored.clone())
+            .normalized();
+        assert_eq!(kept.client_authentication, Some(GrantClientAuthentication::ClientSecretBasic));
+        let changed = sent("client_secret_post")
+            .or(stored.clone())
+            .normalized();
+        assert_eq!(changed.client_authentication, Some(GrantClientAuthentication::ClientSecretPost));
+        let cleared = sent("")
+            .or(stored)
+            .normalized();
+        assert_eq!(cleared.client_authentication, None);
+        assert_eq!(
+            sent("")
+                .normalized()
+                .client_authentication,
+            None
+        );
+    }
+
+    #[test]
+    fn client_authentication_uses_the_oauth_method_names_and_is_left_out_when_unset() {
+        use GrantClientAuthentication::*;
+        for (name, method) in [
+            ("none", PublicClient),
+            ("client_secret_basic", ClientSecretBasic),
+            ("client_secret_post", ClientSecretPost),
+        ] {
+            let settings: JwtAssertionSettings =
+                serde_json::from_value(serde_json::json!({ "client_authentication": name })).unwrap();
+            assert_eq!(settings.client_authentication, Some(method), "{name}");
+            assert_eq!(serde_json::to_value(&settings).unwrap()["client_authentication"], name);
+            assert_eq!(method.uses_secret(), name.starts_with("client_secret"), "{name}");
+        }
+        let unset = serde_json::to_value(JwtAssertionSettings::default()).unwrap();
+        assert!(
+            unset
+                .get("client_authentication")
+                .is_none()
+        );
+        for refused in ["private_key_jwt", "basic", "NONE"] {
+            assert!(
+                serde_json::from_value::<JwtAssertionSettings>(serde_json::json!({ "client_authentication": refused }))
+                    .is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jwt_bearer_service_token_reads_the_client_references_only_for_the_method_that_uses_them() {
+        let provider = |method: Option<&str>| -> CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": "oauth2_jwt_bearer",
+                "client_id_secret_ref": "ID", "client_secret_secret_ref": "SECRET",
+                "jwt_signing_key_secret_ref": "SIGNING", "jwt_certificate_secret_ref": "CERT",
+                "client_authentication": method,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for (method, expected) in [
+            (None, vec!["SIGNING", "CERT"]),
+            (Some("none"), vec!["ID", "SIGNING", "CERT"]),
+            (Some("client_secret_basic"), vec!["ID", "SECRET", "SIGNING", "CERT"]),
+            (Some("client_secret_post"), vec!["ID", "SECRET", "SIGNING", "CERT"]),
+        ] {
+            assert_eq!(provider(method).service_token_secret_refs(), expected, "{method:?}");
+        }
     }
 
     #[test]

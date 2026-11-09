@@ -1002,7 +1002,15 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 (`providerTypeFields`), the first missing required field, and the request fields.
 
 - **JWT Bearer** asks for Token Endpoint, Issuer, Subject, Signing Key, and optionally Key ID and
-  Audience, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
+  Audience, plus a **Client authentication** select
+  (`credential-provider-client-authentication-select`, `ClientAuthenticationSelect.tsx`) that says
+  how the provider's OAuth client identifies itself with the grant: Not sent (default, no client
+  identity, as Google expects), Client ID only (public client), HTTP Basic, or Form body. Any
+  choice but Not sent shows the Client ID Secret picker, and HTTP Basic and Form body also show
+  the Client Secret picker, both required; the pickers are the ones Client Credentials uses. Save sends
+  `client_authentication` (empty for Not sent), the client ID reference only while its picker
+  shows, and the client secret reference as chosen while its picker shows and empty otherwise.
+  **Client Credentials JWT** asks for Token Endpoint,
   Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
   secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
@@ -1013,8 +1021,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   the Secrets page and pastes the PEM, or a whole Google service account JSON key file (16 KiB
   at most), there. Key ID may stay empty for a JSON key, whose `private_key_id` is then sent as
   `kid`; a Key ID overrides it. The gateway checks the key on save.
-- Save sends a field the type does not use as empty, which the gateway reads as cleared, so
-  switching a provider to Client Credentials JWT drops its client secret.
+- Save sends most fields the type does not use as empty, which the gateway reads as cleared, so
+  switching a provider to Client Credentials JWT drops its client secret. The exceptions are the
+  client ID reference, which is omitted while its picker is hidden (a stale one stays stored and
+  is ignored), and `client_authentication`, which is always sent, empty for every type but JWT
+  Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
   `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
   rejects it (AADSTS901002), the form warns under Token Endpoint
