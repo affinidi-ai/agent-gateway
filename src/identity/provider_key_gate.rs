@@ -6,7 +6,7 @@
 //! a key id no loaded folder holds is not ready, and one naming key ids found elsewhere is judged
 //! as usual. A surface naming a revoked key is not ready in every mode.
 //! Verdicts are taken when a surface goes live and on the first request that finds none for the
-//! key ids the served surface names, and kept per surface id. Such a judgment lists the whole API
+//! key ids the served surface names, one request at a time per surface, and kept per surface id. Such a judgment lists the whole API
 //! key store and reads from disk the key folders of the surface and of the owners of the keys it
 //! names, so a key another node created or revoked is seen. A key id found then is judged again
 //! once its recheck is due, by one request at a time, from those folders alone, read from disk;
@@ -422,11 +422,14 @@ impl ProviderKeyGate {
         Some(listing.map(|owners| owners.keys))
     }
 
-    /// Drops the verdict of a surface that no longer serves.
+    /// Drops the verdict of a surface that no longer serves. A judgment already reading the
+    /// stores when this runs is not kept.
     pub fn forget(
         &self,
         surface_id: &str,
     ) {
+        self.changes
+            .fetch_add(1, Ordering::SeqCst);
         self.entries
             .remove(surface_id);
         self.rechecks
@@ -464,7 +467,9 @@ impl ProviderKeyGate {
     }
 
     /// Why a request to `surface`, as served, is refused because it derives a DID from a key id,
-    /// if it is. A served surface naming an id no verdict covers is judged now.
+    /// if it is. A served surface naming an id no verdict covers is judged now, one request at a
+    /// time per surface: a request that waited takes a verdict kept meanwhile only when it covers
+    /// its own tenant and key ids, and judges again otherwise.
     pub async fn refuses(
         &self,
         surface: &AgentSurface,
@@ -473,11 +478,16 @@ impl ProviderKeyGate {
         if ids.is_empty() {
             return None;
         }
-        if let Some(reason) = self
-            .entries
-            .get(&surface.surface_id)
-            .and_then(|entry| entry.decides(surface.tenant_id.as_deref(), &ids, Instant::now()))
-        {
+        if let Some(reason) = self.kept(surface, &ids) {
+            return reason;
+        }
+        let flight = self
+            .rechecks
+            .entry(surface.surface_id.clone())
+            .or_default()
+            .clone();
+        let _flight = flight.lock().await;
+        if let Some(reason) = self.kept(surface, &ids) {
             return reason;
         }
         if let Some(reason) = self
@@ -504,33 +514,34 @@ impl ProviderKeyGate {
         verdict.reason()
     }
 
-    /// Judges again, one request at a time per surface, the due key ids of a kept verdict that
-    /// were found in a key folder, from the key folders of the surface and of the surfaces read as
-    /// their owners, read from disk, without listing the whole store: owners stay valid, as key
-    /// ids are never reused, and a key folder this verdict does not read cannot refuse it. `None`
-    /// when no such verdict applies, or it no longer covers `ids` once merged, so the surface is
-    /// judged from a whole listing.
+    /// The kept verdict on `surface` when it covers its tenant and every id of `ids`, none of them
+    /// due for a recheck.
+    fn kept(
+        &self,
+        surface: &AgentSurface,
+        ids: &ProviderKeyIds,
+    ) -> Option<Option<NotReadyReason>> {
+        self.entries
+            .get(&surface.surface_id)?
+            .decides(surface.tenant_id.as_deref(), ids, Instant::now())
+    }
+
+    /// Judges again the due key ids of a kept verdict that were found in a key folder, from the
+    /// key folders of the surface and of the surfaces read as their owners, read from disk,
+    /// without listing the whole store: owners stay valid, as key ids are never reused, and a key
+    /// folder this verdict does not read cannot refuse it. `None` when no such verdict applies, or
+    /// it no longer covers `ids` once merged, so the surface is judged from a whole listing.
+    /// Called holding the surface's flight lock.
     async fn recheck_found(
         &self,
         surface: &AgentSurface,
         ids: &ProviderKeyIds,
     ) -> Option<Option<NotReadyReason>> {
         let tenant_id = surface.tenant_id.as_deref();
-        let flight = self
-            .rechecks
-            .entry(surface.surface_id.clone())
-            .or_default()
-            .clone();
-        let _flight = flight.lock().await;
-        let (due, mut folders) = {
-            let entry = self
-                .entries
-                .get(&surface.surface_id)?;
-            if let Some(reason) = entry.decides(tenant_id, ids, Instant::now()) {
-                return Some(reason);
-            }
-            entry.found_due(tenant_id, ids, Instant::now())?
-        };
+        let (due, mut folders) = self
+            .entries
+            .get(&surface.surface_id)?
+            .found_due(tenant_id, ids, Instant::now())?;
         folders.insert(surface.surface_id.clone());
         let changes = self.changes();
         let listing = self
@@ -1288,6 +1299,8 @@ mod tests {
         listings: Arc<AtomicUsize>,
         owner_changed_while_listing: Option<(&'static ProviderKeyGate, &'static str)>,
         key_changed_while_listing: Option<(&'static ProviderKeyGate, &'static str)>,
+        forgotten_while_listing: Option<(&'static ProviderKeyGate, &'static str)>,
+        revoked_after_disk_read: std::sync::Mutex<Option<(&'static ProviderKeyGate, &'static str, &'static str)>>,
         disk_reads: Arc<AtomicUsize>,
     }
 
@@ -1303,6 +1316,8 @@ mod tests {
                 listings: Arc::default(),
                 owner_changed_while_listing: None,
                 key_changed_while_listing: None,
+                forgotten_while_listing: None,
+                revoked_after_disk_read: std::sync::Mutex::default(),
                 disk_reads: Arc::default(),
             }
         }
@@ -1356,9 +1371,23 @@ mod tests {
         ) -> crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>> {
             self.disk_reads
                 .fetch_add(1, Ordering::SeqCst);
-            self.inner
+            let keys = self
+                .inner
                 .list_from_disk(agent_id)
-                .await
+                .await;
+            let revoke = self
+                .revoked_after_disk_read
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((gate, owner, key_id)) = revoke {
+                self.inner
+                    .revoke(owner, key_id, "test")
+                    .await
+                    .unwrap();
+                gate.key_changed(key_id);
+            }
+            keys
         }
 
         async fn list_all(&self) -> crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>> {
@@ -1376,6 +1405,9 @@ mod tests {
             }
             if let Some((gate, key_id)) = self.key_changed_while_listing {
                 gate.key_changed(key_id);
+            }
+            if let Some((gate, surface_id)) = self.forgotten_while_listing {
+                gate.forget(surface_id);
             }
             self.inner.list_all().await
         }
@@ -1915,6 +1947,100 @@ mod tests {
         assert_eq!(answers, vec![None; 5]);
         assert_eq!(disk_reads.load(Ordering::SeqCst) - before, 1, "one read of the one folder");
         assert_eq!(listings.load(Ordering::SeqCst), 1, "a recheck lists no whole store");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_with_no_kept_verdict_list_the_store_once() {
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+
+        let answers = futures::future::join_all((0..5).map(|_| enforced.gate.refuses(&own))).await;
+
+        assert_eq!(answers, vec![None; 5]);
+        assert_eq!(listings.load(Ordering::SeqCst), 1, "the requests that waited take the kept verdict");
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_to_a_variant_and_its_base_are_each_judged_for_their_own_keys() {
+        let enforced = gate().await;
+        let mut surface = naming("owner-a", "tenant-a", external(KEY_A));
+        surface.variants = serde_json::from_value(serde_json::json!([{
+            "id": "cross-id", "alias": "cross", "name": "Cross", "enabled": true,
+            "overrides": {"identity_slots": {"external": {"type": "from_api_key", "api_key_id": KEY_B}}}
+        }]))
+        .unwrap();
+        let base = base_view(&surface);
+        let variant = surface
+            .resolve_variant(Some("cross"))
+            .unwrap();
+
+        let answers = futures::future::join_all([
+            enforced.gate.refuses(&base),
+            enforced
+                .gate
+                .refuses(&variant),
+            enforced.gate.refuses(&base),
+        ])
+        .await;
+
+        assert_eq!(answers, vec![None, Some(NotReadyReason::ProviderKeyTenant), None]);
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_on_a_judgment_a_revoke_overtook_is_judged_again() {
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        *flaky
+            .revoked_after_disk_read
+            .lock()
+            .unwrap() = Some((enforced.gate, "owner-a", KEY_A));
+        let listings = flaky.listings.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+
+        let answers = futures::future::join_all((0..2).map(|_| enforced.gate.refuses(&own))).await;
+
+        assert_eq!(
+            answers,
+            vec![None, Some(NotReadyReason::ApiKeyRevoked)],
+            "the first read the key before the revoke; the second never takes that verdict"
+        );
+        assert_eq!(listings.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_judgment_the_surface_was_forgotten_during_is_not_kept() {
+        let enforced = gate().await;
+        let keys = FlakyKeys::failing(&enforced, 0);
+        enforced.gate.set_sources(
+            Some(Arc::new(FlakyKeys {
+                forgotten_while_listing: Some((enforced.gate, "owner-a")),
+                ..keys
+            })),
+            Some(enforced.surfaces.clone()),
+        );
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+
+        assert_eq!(
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            None
+        );
+        assert!(
+            !enforced
+                .gate
+                .has_verdict("owner-a"),
+            "a verdict read before the surface was forgotten is not kept"
+        );
     }
 
     #[tokio::test]
