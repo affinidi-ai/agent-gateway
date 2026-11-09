@@ -248,6 +248,7 @@ What your deployment has to provide, whatever runs it (Compose, a Kubernetes Pod
 | Need | Detail |
 | --- | --- |
 | A second image | The VTA, pinned by digest. Until `Capability::ContextCreate` is released, build it from `verifiable-trust-infrastructure` branch `gateway-integration`; a stock image refuses the gateway's grant. No image is published from this repository. |
+| The start script | The sidecar starts through `vta-entrypoint.sh` (with `vta-setup.base.toml` as its base config), not through the image's own command. It is not part of the VTA image, so the deployment must mount both files from `config/examples/vta-bundled/` and set it as the entrypoint. |
 | One network namespace | The sidecar listens on its own loopback only and the gateway dials `127.0.0.1:8100`. Run both containers in one Pod or task, or with `network_mode: "service:gateway"`. Publish no port for it. |
 | A shared folder | `/bootstrap`, writable by both containers (they run as different users). It carries two public files, the gateway's control DID in and the sidecar's DID out. |
 | A persistent volume | `/var/lib/vta` for the sidecar's data. Losing it loses every key the sidecar holds; the recovery is a rotation, not a restore. |
