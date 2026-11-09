@@ -124,16 +124,10 @@ impl GrantRevocation {
     }
 
     /// Whether a token could not be revoked for a reason that may pass: the
-    /// endpoint was unreachable or answered 429 or 5xx, or the client's secret
-    /// could not be resolved just now.
+    /// endpoint was unreachable or answered 429 or 5xx.
     fn should_retry(&self) -> bool {
         let passing = |outcome: RevocationOutcome| {
-            matches!(
-                outcome,
-                RevocationOutcome::Unreachable
-                    | RevocationOutcome::RefusedForNow
-                    | RevocationOutcome::ClientUnavailable
-            )
+            matches!(outcome, RevocationOutcome::Unreachable | RevocationOutcome::RefusedForNow)
         };
         passing(self.outcome)
             || self
@@ -3165,6 +3159,19 @@ pub(crate) mod tests {
                 usize::from(retried),
                 "{status}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_failure_that_may_pass_is_tried_again() {
+        for (outcome, retried) in [
+            (RevocationOutcome::Unreachable, true),
+            (RevocationOutcome::RefusedForNow, true),
+            (RevocationOutcome::ClientUnavailable, false),
+            (RevocationOutcome::Refused, false),
+            (RevocationOutcome::Revoked, false),
+        ] {
+            assert_eq!(GrantRevocation::failed(outcome).should_retry(), retried, "{outcome:?}");
         }
     }
 
