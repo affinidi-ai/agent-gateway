@@ -5530,6 +5530,20 @@ fn refuse_grant(
     }
 }
 
+/// Put a released grant by binding into the outbound request. A token that
+/// is not a valid header value refuses the call as `connector_unavailable`
+/// (`invalid_credential_header`), recorded as a `connector_call` like every
+/// other refusal of the grant.
+fn apply_grant_injections(
+    ctx: &mut OutboundPipelineContext,
+    injections: &[crate::proxy::credential_delegation::ResolvedCredentialInjection],
+) -> Result<(), OutboundPipelineError> {
+    if apply_credential_injections(ctx, injections).is_err() {
+        return Err(refuse_external_grant(ctx, "invalid_credential_header"));
+    }
+    Ok(())
+}
+
 /// Refuse a Transit Point request whose `consent_mode = external` grant
 /// cannot be released for a reason a new connect would not fix:
 /// `connector_unavailable`.
@@ -5735,7 +5749,7 @@ async fn step_inject_external_grant(
         .to_binding_injection();
     let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &grant.access_token);
     ctx.grant_destination = Some(destination);
-    apply_credential_injections(ctx, &injections)?;
+    apply_grant_injections(ctx, &injections)?;
     if grant.use_is_due(chrono::Utc::now()) {
         let vault = Arc::clone(vault);
         let id = grant.id.clone();
@@ -6666,7 +6680,7 @@ async fn step_answer_a_refused_grant(
         Err(refused) => return Err(refuse_grant(ctx, refused.refusal, refused.reason)),
     };
     let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &fresh.access_token);
-    apply_credential_injections(ctx, &injections)?;
+    apply_grant_injections(ctx, &injections)?;
     let caller = delegation_caller_hash(ctx).unwrap_or_default();
     audit_grant_injected(ctx, &caller, &provider, &fresh, subject);
     let retried = step_forward_request_http(state, ctx).await?;
@@ -17625,6 +17639,143 @@ mod tests {
                 assert_eq!(*outcome, ConnectorCallOutcome::Forwarded);
                 assert_eq!(status_class.as_deref(), Some("2xx"));
                 assert_eq!(*subject, Some(crate::config::agent_surface::GrantSubject::Owner));
+            }
+            other => panic!("expected ConnectorCall, got {other:?}"),
+        }
+    }
+
+    /// The reason and cause of a refused `connector_call`.
+    fn refused_reason_and_cause(event: &crate::delegation_vault::audit::DelegationAuditEvent) -> (String, String) {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+        match &event.event {
+            DelegationAuditAction::ConnectorCall {
+                outcome,
+                status_class,
+                reason,
+                cause,
+                ..
+            } => {
+                assert_eq!(*outcome, ConnectorCallOutcome::Refused);
+                assert_eq!(*status_class, None);
+                (reason.clone().unwrap(), cause.clone().unwrap())
+            }
+            other => panic!("expected ConnectorCall, got {other:?}"),
+        }
+    }
+
+    /// A stored grant whose token is not a valid header value refuses the call
+    /// as `connector_unavailable`, cause `invalid_credential_header`, recorded
+    /// as one `connector_call`; the token is never sent. (A token the token
+    /// endpoint answers is checked as a header there, so only a grant stored
+    /// otherwise reaches this.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_that_is_not_a_valid_header_is_refused_and_audited() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(
+            &state,
+            GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"),
+            "bad\u{1}token",
+            3600,
+        )
+        .await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+
+        let (sent, events) = crate::audit::producer::capture(async {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            send_with_grant(&state, &mut ctx).await
+        })
+        .await;
+
+        assert!(
+            matches!(
+                sent,
+                Err(OutboundPipelineError::GrantRefused {
+                    refusal: crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable,
+                    ..
+                })
+            ),
+            "{sent:?}"
+        );
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        assert_eq!(
+            refused_reason_and_cause(calls[0]),
+            ("connector_unavailable".to_string(), "invalid_credential_header".to_string())
+        );
+        assert!(vendor.requests().is_empty(), "the invalid token is never sent");
+    }
+
+    /// A `2026-07-28` MCP request to a Transit Point with external consent is
+    /// refused as an unsupported protocol version before any grant is looked
+    /// up, and records no `connector_call`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_2026_07_28_mcp_request_records_no_connector_call() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "access", 3600)
+            .await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+
+        let (sent, events) = crate::audit::producer::capture(async {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            ctx.mcp_classification = Some(crate::mcp::request_validation::McpRequestClassification::Modern(Box::new(
+                crate::mcp::request_validation::ValidatedModernMessage {
+                    protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),
+                    client_capabilities: None,
+                    client_info: None,
+                    method: "tools/call".into(),
+                    id: Some(json!(5)),
+                    kind: crate::mcp::request_validation::McpMessageKind::Request,
+                    params: Some(json!({"name": "echo"})),
+                },
+            )));
+            send_with_grant(&state, &mut ctx).await
+        })
+        .await;
+
+        assert!(matches!(sent, Err(OutboundPipelineError::McpValidation(_))), "{sent:?}");
+        assert!(connector_calls(&events).is_empty(), "{events:?}");
+    }
+
+    /// A vendor that answered is recorded as `forwarded` with that answer's
+    /// class even when the gateway then refuses the answer: here an MCP
+    /// answer compressed although none was accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_whose_answer_is_then_refused_is_still_audited_as_forwarded() {
+        use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+        let vendor =
+            RecordingServer::start_answering(vec![Answer::status(200).with_header("Content-Encoding", "gzip")]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor"), "access", 3600)
+            .await;
+        let surface = fixture_surface(&vendor, "owner", "mcp");
+
+        let (sent, events) = crate::audit::producer::capture(async {
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
+            send_with_grant(&state, &mut ctx).await
+        })
+        .await;
+
+        assert!(matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)), "{sent:?}");
+        let calls = connector_calls(&events);
+        assert_eq!(calls.len(), 1, "{events:?}");
+        match &calls[0].event {
+            DelegationAuditAction::ConnectorCall { outcome, status_class, .. } => {
+                assert_eq!(*outcome, ConnectorCallOutcome::Forwarded);
+                assert_eq!(status_class.as_deref(), Some("2xx"));
             }
             other => panic!("expected ConnectorCall, got {other:?}"),
         }

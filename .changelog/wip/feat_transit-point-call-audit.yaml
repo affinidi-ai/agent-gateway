@@ -5,7 +5,8 @@ changes:
       title: Audit each call through a connector's Transit Point
       description: >-
         A call through a Transit Point whose transit_credentials take a connector grant
-        (consent_mode external) is recorded as a connector_call audit event, once per call: the
+        (consent_mode external) is recorded as a connector_call audit event, once for each call
+        that reaches the grant step: the
         Transit Point, provider, surface and its tenant, the caller's identity hash, whose grant it
         is (the owner's or the caller's own), the tool an MCP tools/call names, and either
         forwarded with the class of the vendor's answer (2xx to 5xx) or refused with the fixed

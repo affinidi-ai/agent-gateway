@@ -996,10 +996,11 @@ and a provider with an `issuer` is bound by no other consent mode, on a Transit 
 in a variant's list as in the surface's, and refuses a Transit Point with `consent_mode:
 external` whose id is empty.
 
-Each call through such a Transit Point is audited `connector_call`: the Transit Point, provider,
-surface and its tenant, the caller's identity hash, whose grant it is (`subject`), the tool of an MCP
-`tools/call`, and either `forwarded` with the class of the vendor's answer or `refused` with the
-reason the caller was told and its cause. It carries no argument, token or text from the vendor.
+Each call through such a Transit Point that reaches its grant is audited `connector_call`: the
+Transit Point, provider, surface and its tenant, the caller's identity hash, whose grant it is
+(`subject`), the tool of an MCP `tools/call`, and either `forwarded` with the class of the vendor's
+answer or `refused` with the reason the caller was told and its cause. It carries no argument,
+token or text from the vendor.
 [`OBSERVABILITY.md`](OBSERVABILITY.md) lists the fields.
 
 A surface with such a binding cannot move to another tenant: the binding's provider must be of
