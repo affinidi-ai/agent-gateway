@@ -13,6 +13,7 @@ jest.mock('../../api', () => ({
   apiClient: {
     getApiKey: jest.fn(),
     deleteApiKey: jest.fn(),
+    revokeApiKey: jest.fn(),
   },
 }));
 
@@ -117,5 +118,77 @@ describe('ApiKeyDetailPage surface deleted', () => {
 
     expect(await screen.findByText('client-a')).toBeInTheDocument();
     expect(screen.queryByTestId('api-key-surface-deleted-info')).toBeNull();
+  });
+});
+
+describe('ApiKeyDetailPage revoke', () => {
+  const key = {
+    key_id: 'atgk_named',
+    agent_id: 'owner-a',
+    client_id: 'client-a',
+    status: 'active',
+    created_at: '2026-07-01T10:00:00Z',
+    labels: {},
+    issuer: { actor: 'admin', method: 'api' },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (apiClient.getApiKey as jest.Mock).mockResolvedValue(key);
+  });
+
+  const openDialog = async () => {
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: /Revoke/ }));
+    return screen.getByTestId('api-key-revoke-dialog');
+  };
+
+  it('asks for confirmation, then revokes and reloads the key', async () => {
+    (apiClient.revokeApiKey as jest.Mock).mockResolvedValue(undefined);
+    const dialog = await openDialog();
+
+    expect(dialog).toHaveTextContent('client-a');
+    expect(dialog).toHaveTextContent('Surfaces that use this key will stop serving');
+    expect(dialog).toHaveTextContent("A revoked key can't be restored");
+    expect(dialog).toHaveTextContent('gives the surface a new DID');
+    expect(apiClient.revokeApiKey).not.toHaveBeenCalled();
+    const loads = (apiClient.getApiKey as jest.Mock).mock.calls.length;
+
+    await userEvent.click(screen.getByTestId('api-key-revoke-dialog-confirm'));
+
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith('success', 'API key revoked'));
+    expect(apiClient.revokeApiKey).toHaveBeenCalledTimes(1);
+    expect(apiClient.revokeApiKey).toHaveBeenCalledWith('owner-a', 'atgk_named', 'dashboard');
+    await waitFor(() =>
+      expect((apiClient.getApiKey as jest.Mock).mock.calls.length).toBeGreaterThan(loads)
+    );
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['Cancel', () => screen.getByText('Cancel')],
+    ['the close button', () => screen.getByRole('button', { name: 'Close' })],
+  ])('revokes nothing on %s', async (_label, control) => {
+    await openDialog();
+    await userEvent.click(control());
+
+    expect(screen.queryByTestId('api-key-revoke-dialog')).toBeNull();
+    expect(apiClient.revokeApiKey).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('shows why a revoke failed in an error toast', async () => {
+    const message = 'Internal server error (500)';
+    (apiClient.revokeApiKey as jest.Mock).mockRejectedValue(new Error(message));
+    await openDialog();
+
+    await userEvent.click(screen.getByTestId('api-key-revoke-dialog-confirm'));
+
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith('error', `Revoke failed: ${message}`, {
+        autoRemove: false,
+      })
+    );
+    expect(screen.queryByTestId('api-key-revoke-dialog')).toBeNull();
   });
 });

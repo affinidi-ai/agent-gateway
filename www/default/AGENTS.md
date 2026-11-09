@@ -1049,7 +1049,7 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 ## API key delete
 
 The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
-(**Delete**) share `useApiKeyDelete` (`src/components/api-keys/ApiKeyDeleteDialog.tsx`). The
+(**Delete**) share `useApiKeyAction('delete', …)` (`src/components/api-keys/ApiKeyActionDialog.tsx`). The
 delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
 like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
 a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
@@ -1062,6 +1062,17 @@ close button delete nothing. The confirmation is the dashboard's; the API takes 
 with the toast "API key deleted", then the tab reloads its keys and the detail page returns to
 `/secrets`. A failed delete shows an error toast that stays until dismissed: "Delete failed:
 <gateway message> (<status>)", and the detail page stays open.
+
+**Revoke** works the same way through `useApiKeyAction('revoke', …)`: the API Keys tab's revoke
+button (`api-keys-revoke-button-<key id>`) and the detail page's **Revoke** send nothing and open
+`api-key-revoke-dialog`, the same dialog component with the title "Revoke API key" and the same
+red warning icon. Its body names the key's client id and key id and says that surfaces using the
+key will stop serving until another key is selected, that a revoked key can't be restored, and
+that selecting a new key gives the surface a new DID. **Revoke API key**
+(`api-key-revoke-dialog-confirm`, `btn-warning`) sends `POST /api-keys/{agent_id}/{key_id}/revoke`;
+**Cancel** and the close button send nothing. A revoke succeeds with the toast "API key revoked",
+then the tab reloads its keys and the detail page reloads the key. A failed revoke shows an error
+toast that stays until dismissed: "Revoke failed: <gateway message>".
 
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated

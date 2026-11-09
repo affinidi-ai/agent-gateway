@@ -4,7 +4,7 @@ import { apiClient, ApiKeyRecord, ApiKeyCreated } from '../api';
 import { useApp } from '../context/AppContext';
 import { showToast } from '../utils/toaster';
 import { formatDateTime } from '../utils/stringUtils';
-import { useApiKeyDelete } from '../components/api-keys/ApiKeyDeleteDialog';
+import { useApiKeyAction } from '../components/api-keys/ApiKeyActionDialog';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 
 const ApiKeyDetailPage: React.FC = () => {
@@ -51,16 +51,13 @@ const ApiKeyDetailPage: React.FC = () => {
     }
   };
 
-  const handleRevoke = async () => {
+  const { request: requestRevoke, dialog: revokeDialog } = useApiKeyAction('revoke', () =>
+    fetchApiKey()
+  );
+
+  const handleRevoke = () => {
     if (!agentId || !keyId) return;
-    try {
-      await apiClient.revokeApiKey(agentId, keyId, 'dashboard');
-      showToast('success', 'API key revoked');
-      fetchApiKey();
-    } catch (err: any) {
-      console.error('Failed to revoke API key:', err);
-      showToast('error', 'Failed to revoke API key');
-    }
+    requestRevoke(agentId, keyId, apiKey?.client_id);
   };
 
   const handleRotate = async () => {
@@ -76,7 +73,9 @@ const ApiKeyDetailPage: React.FC = () => {
     }
   };
 
-  const { requestDelete, dialog: deleteDialog } = useApiKeyDelete(() => navigate('/secrets'));
+  const { request: requestDelete, dialog: deleteDialog } = useApiKeyAction('delete', () =>
+    navigate('/secrets')
+  );
 
   const handleDelete = () => {
     if (!agentId || !keyId) return;
@@ -293,6 +292,7 @@ const ApiKeyDetailPage: React.FC = () => {
       </div>
 
       {deleteDialog}
+      {revokeDialog}
 
       {/* Rotated Key Secret Modal */}
       {rotatedKey && (

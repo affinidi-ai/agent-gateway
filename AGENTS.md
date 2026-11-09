@@ -170,8 +170,11 @@ _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor
 
 Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
 says surfaces using the key become Unconfigured and stop serving, and deletes only after
-**Delete API key** in that dialog; see _API key delete_ in
-[`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
+**Delete API key** in that dialog. Revoking one opens the same dialog component worded for
+revoke: surfaces using the key stop serving, the key can't be restored and a new key gives the
+surface a new DID; it revokes only after **Revoke API key**, and a failed revoke shows an error
+toast. See _API key
+delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
