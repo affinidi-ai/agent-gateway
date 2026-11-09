@@ -89,6 +89,9 @@ pub enum MockStream {
     /// Each element of the configured JSON array as one SSE `message` event,
     /// then the end of the body.
     Events,
+    /// The configured JSON string, base64-decoded, as the raw body: a file,
+    /// not JSON.
+    Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -522,6 +525,15 @@ async fn handler(
     let body = match response.stream {
         MockStream::None => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
         MockStream::Sse => Body::from(sse_event(&response_body_value)),
+        MockStream::Bytes => Body::from(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                response_body_value
+                    .as_str()
+                    .expect("a Bytes response is configured with a base64 JSON string"),
+            )
+            .expect("a Bytes response is configured with valid base64"),
+        ),
         MockStream::Events => {
             let events: Vec<u8> = response_body_value
                 .as_array()

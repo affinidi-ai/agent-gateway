@@ -843,8 +843,10 @@ each path parameter as one segment, and refuses a `base_url` with user info. It 
 response against the tool's output schema, so a response the schema does not admit is a tool
 error, "REST response does not match the tool output schema", where `rmcp-openapi`'s client
 returns it as a success. The result text of a response that is not JSON leaves out the response
-headers and the request body, a response body other than an image that is not UTF-8 text fails
-the call, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
+headers and the request body, a body that is not text (by its `Content-Type`, or text that is not
+UTF-8) is an embedded resource holding its bytes (see [`MCP_METADATA.md`](MCP_METADATA.md)),
+where `rmcp-openapi`'s client answers audio and video as "[Binary content: N bytes, ...]" and
+any other body that is not an image as text with its invalid bytes replaced, and a call the gateway refuses names its cause in the client's own words ("Invalid REST
 tool arguments", "REST tool execution failed", "REST tool response exceeds its configured limit")
 rather than `rmcp-openapi`'s (for example "1 invalid parameter(s)"). Like the 2026-07-28 path, it
 vets each call's backend with the policy the proxy's `base_url` was saved under (loopback and cloud

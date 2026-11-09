@@ -171,6 +171,15 @@ Feature: Routing through a proxy:// MCP target
     And the MCP tool result matches REST API "bravo" response
     And REST API "bravo" answered the same MCP tool result with and without the Target credential
 
+  Scenario: A credentialed tool call returns a file the REST API answers as an embedded resource
+    Given the surface requires "API Key" source authentication
+    And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
+    And REST API "bravo" answers a PDF document
+    When the caller invokes the MCP tool "get_weather_map" for city "Paris" with a valid API key
+    Then the response status is 200
+    And REST API "bravo" received "GET /weather/Paris/map"
+    And the MCP tool result is REST API "bravo"'s file as an embedded "application/pdf" resource
+
   Scenario: A legacy MCP proxy tool call answers the same failed tool result with and without the Target credential
     Given the surface requires "API Key" source authentication
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
