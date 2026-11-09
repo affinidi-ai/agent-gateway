@@ -41,6 +41,7 @@ use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::{AgentSurface, GrantSubject};
 use crate::credential_providers::CredentialProvider;
+use crate::credential_providers::scope_comparison::named_scopes;
 use crate::tenancy::{PatTenantContext, ResourceKind, can_mutate, scope_allows_resource};
 
 /// The most scopes a connect may ask for.
@@ -62,6 +63,46 @@ fn failed(
     reason: &'static str,
 ) -> Response {
     (status, Json(serde_json::json!({ "status": "failed", "reason": reason }))).into_response()
+}
+
+/// Why a claimed connect was not kept: the answer's status and fixed reason,
+/// and, for `scope_widened`, the scopes the vendor granted beyond those asked
+/// for, as [`named_scopes`] lets them be named.
+#[derive(Debug)]
+struct Unkept {
+    status: StatusCode,
+    reason: &'static str,
+    widened: Vec<String>,
+}
+
+impl From<(StatusCode, &'static str)> for Unkept {
+    fn from((status, reason): (StatusCode, &'static str)) -> Self {
+        Unkept {
+            status,
+            reason,
+            widened: Vec::new(),
+        }
+    }
+}
+
+impl Unkept {
+    /// The failed answer, naming the widened scopes when there are any: a
+    /// hint for the operator of which scopes the vendor added, in the
+    /// vendor's spelling, never its other words.
+    fn response(self) -> Response {
+        if self.widened.is_empty() {
+            return failed(self.status, self.reason);
+        }
+        (
+            self.status,
+            Json(serde_json::json!({
+                "status": "failed",
+                "reason": self.reason,
+                "widened_scopes": self.widened,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// Who calls the connect API, and what they may manage.
@@ -466,9 +507,9 @@ pub async fn complete_connect(
         }
     };
     let outcome = redeem(&state, &manager, &claimed, &request, provider).await;
-    let (status, reason) = match &outcome {
-        Ok(_) => (StatusCode::OK, "connected"),
-        Err((status, reason)) => (*status, *reason),
+    let (status, reason, widened) = match &outcome {
+        Ok(_) => (StatusCode::OK, "connected", &[][..]),
+        Err(unkept) => (unkept.status, unkept.reason, unkept.widened.as_slice()),
     };
     info!(
         target: "credential_delegation",
@@ -477,6 +518,7 @@ pub async fn complete_connect(
         hop = ?claimed.hop,
         credential_provider_id = %claimed.credential_provider_id,
         outcome = reason,
+        widened_scopes = ?widened,
         "External consent connect completed"
     );
     match outcome {
@@ -490,7 +532,7 @@ pub async fn complete_connect(
             })),
         )
             .into_response(),
-        Err((status, reason)) => failed(status, reason),
+        Err(unkept) => unkept.response(),
     }
 }
 
@@ -537,7 +579,7 @@ async fn redeem(
     connect: &PendingConnect,
     request: &CompleteConnectRequest,
     provider: CredentialProvider,
-) -> Result<DelegatedGrant, (StatusCode, &'static str)> {
+) -> Result<DelegatedGrant, Unkept> {
     let verifier = connect
         .code_verifier
         .as_deref()
@@ -577,20 +619,26 @@ async fn redeem(
     grant.id = key.record_id();
     grant.requested_scopes = Some(connect.scopes.clone());
     grant.vendor_subject = answer.subject;
-    if !provider
-        .scope_comparison
-        .widened(&connect.scopes, &grant.scopes)
-        .is_empty()
-    {
+    let (wider, widened) = {
+        let extra = provider
+            .scope_comparison
+            .widened(&connect.scopes, &grant.scopes);
+        (!extra.is_empty(), named_scopes(&extra))
+    };
+    if wider {
         revoke_unkept(state, &provider, grant, &manager.actor);
-        return Err((StatusCode::BAD_GATEWAY, "scope_widened"));
+        return Err(Unkept {
+            status: StatusCode::BAD_GATEWAY,
+            reason: "scope_widened",
+            widened,
+        });
     }
     let Some(surfaces) = state
         .agent_surface_store
         .as_ref()
     else {
         revoke_unkept(state, &provider, grant, &manager.actor);
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable"));
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
     };
     let stored = match crate::identity::handlers::surface_grants::store_grant_while_bound(
         &state.vault_store,
@@ -608,7 +656,8 @@ async fn redeem(
                 GrantNotStored::BindingRemoved => (StatusCode::CONFLICT, "binding_removed"),
                 GrantNotStored::BindingNarrowed => (StatusCode::CONFLICT, "binding_changed"),
                 GrantNotStored::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable"),
-            });
+            }
+            .into());
         }
     };
     if let Some(replaced) = stored.replaced {
@@ -1810,13 +1859,15 @@ mod tests {
     }
 
     /// A refused code, or an answer granting more than was asked, keeps no
-    /// grant; tokens granted beyond the request are revoked.
+    /// grant; tokens granted beyond the request are revoked. A wider answer
+    /// names the scopes beyond the request, those spelled as scope tokens
+    /// only, so the operator can see what the vendor added.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_or_wider_answer_keeps_no_grant() {
         let wider = Answer::json(
             200,
             json!({"access_token": "wide", "token_type": "Bearer", "refresh_token": "wide-refresh",
-                "scope": "read admin"}),
+                "scope": "read admin say\"hi\""}),
         );
         let fixture = Fixture::new(vec![
             Answer::json(400, json!({"error": "invalid_grant", "error_description": "vendor words"})),
@@ -1825,7 +1876,10 @@ mod tests {
         ])
         .await;
         let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
-        for reason in ["invalid_grant", "scope_widened"] {
+        for (reason, expected) in [
+            ("invalid_grant", json!({"status": "failed", "reason": "invalid_grant"})),
+            ("scope_widened", json!({"status": "failed", "reason": "scope_widened", "widened_scopes": ["admin"]})),
+        ] {
             let (_, started) = fixture
                 .start(Some("tenant-a"), owner_start())
                 .await;
@@ -1837,7 +1891,7 @@ mod tests {
                     json!({"code": "c", "iss": fixture.issuer()}),
                 )
                 .await;
-            assert_eq!((status, answer), (StatusCode::BAD_GATEWAY, json!({"status": "failed", "reason": reason})));
+            assert_eq!((status, answer), (StatusCode::BAD_GATEWAY, expected), "{reason}");
             assert!(
                 fixture
                     .state
