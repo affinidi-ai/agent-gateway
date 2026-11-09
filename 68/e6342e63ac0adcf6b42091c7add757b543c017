@@ -1,0 +1,19 @@
+Cargo.lock
+  s_09d9fb08a24a2a::t_22078480a0542c 53,55,58,108,110,114,118,145,147,176,750,1571,1582,1604,5246,6240,7223,7830,8457,9317,9356,9640,10234,10301,10322,11274-11283,11291,12051,12760,14698,14717,14885,15937
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "68e6342e63ac0adcf6b42091c7add757b543c017",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
