@@ -115,6 +115,10 @@ impl GatewayProcess {
         self
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub async fn wait_until_ready(&mut self) {
         self.try_wait_until_ready(Duration::from_secs(60))
             .await

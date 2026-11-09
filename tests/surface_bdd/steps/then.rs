@@ -4215,7 +4215,7 @@ async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, Stri
 }
 
 /// The gateway's log with terminal colour codes removed.
-fn gateway_log(world: &SurfaceWorld) -> String {
+pub(crate) fn gateway_log(world: &SurfaceWorld) -> String {
     let path = world
         .infra
         .as_ref()

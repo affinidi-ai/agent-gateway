@@ -8,6 +8,7 @@ pub use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::actors::{
     ActorRegistry, PRIMARY_COLLABORATOR_KEY, RuntimeRegistry, SECONDARY_COLLABORATOR_KEY, TargetActorKind,
 };
+use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
@@ -95,6 +96,8 @@ pub fn get_default_temp_dir() -> TempDir {
 pub struct SurfaceWorld {
     pub actors: ActorRegistry,
     pub collaborators: HashMap<String, MockCollaborator>,
+    /// A second gateway process on the same storage, and the operator's session on it.
+    pub other_node: Option<(GatewayProcess, AdminApiClient)>,
     pub infra: Option<ScenarioInfra>,
     pub surface_config: SurfaceConfigBuilder,
     pub sent_body: Option<serde_json::Value>,
@@ -170,6 +173,7 @@ impl SurfaceWorld {
         Self {
             actors: ActorRegistry::default(),
             collaborators: default_collaborators(default_response.clone()),
+            other_node: None,
             infra: None,
             surface_config: SurfaceConfigBuilder::default(),
             sent_body: None,
@@ -502,6 +506,8 @@ fn default_collaborators(default_response: serde_json::Value) -> HashMap<String,
 }
 
 pub struct ScenarioInfra {
+    /// Dropped first, so the scenario's directory can be removed.
+    pub _unreadable_key_folders: UnreadableKeyFolders,
     pub _temp_dir: TempDirGuard,
     pub gateway: GatewayProcess,
     pub mock: MockServer,

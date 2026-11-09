@@ -86,6 +86,26 @@ pub struct SurfaceConfigBuilder {
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// API key records stored before the gateway starts.
+    pub stored_api_keys: Vec<StoredApiKeyFixture>,
+    /// Further stored surfaces, disabled, by id.
+    pub other_stored_surfaces: Vec<String>,
+    /// The key id the seeded surface's protected Identity takes its DID from.
+    pub protected_identity_api_key_id: Option<String>,
+    /// When the API Key Provider's key was created; when the gateway starts if absent.
+    pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The gateway starts in Standby mode.
+    pub starts_standby: bool,
+}
+
+/// An API key record stored before the gateway starts.
+#[derive(Debug, Clone)]
+pub struct StoredApiKeyFixture {
+    pub owner: String,
+    pub key_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the gateway can load the owner's key folder.
+    pub loads: bool,
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -147,6 +167,11 @@ impl Default for SurfaceConfigBuilder {
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
+            stored_api_keys: Vec::new(),
+            other_stored_surfaces: Vec::new(),
+            protected_identity_api_key_id: None,
+            api_key_provider_key_created_at: None,
+            starts_standby: false,
         }
     }
 }
