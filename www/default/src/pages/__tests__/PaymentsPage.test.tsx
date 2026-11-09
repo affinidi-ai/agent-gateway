@@ -78,7 +78,7 @@ function mockApi({ x402 = [], mpp = [] }: LegacyData = {}) {
   });
 }
 
-const renderPage = (path = '/payments') =>
+const renderPage = (path = '/x402payments') =>
   render(
     <MemoryRouter initialEntries={[path]}>
       <PaymentsPage />
@@ -142,7 +142,7 @@ describe('PaymentsPage', () => {
 
   it('passes a surface filter from the URL', async () => {
     mockApi();
-    renderPage('/payments?surface_id=weather');
+    renderPage('/x402payments?surface_id=weather');
 
     expect(await screen.findByTestId('payments-surface-filter')).toHaveTextContent('weather');
     expect(mockList).toHaveBeenCalledWith({
@@ -327,7 +327,7 @@ describe('PaymentsPage — filters and failed refreshes', () => {
   it('names the surface in the empty state of a surface filter', async () => {
     mockApi();
     mockList.mockResolvedValue({ payments: [], total: 0 });
-    renderPage('/payments?surface_id=weather');
+    renderPage('/x402payments?surface_id=weather');
 
     expect(await screen.findByText('No payments match this filter')).toBeInTheDocument();
     expect(screen.getByText(/There are no payments for surface weather\./)).toBeInTheDocument();

@@ -6,7 +6,6 @@ import { PageTitleProvider } from '../context/PageTitleContext';
 
 // Load dashboard components - only when authenticated
 import Sidebar from '../components/Sidebar';
-import RedirectKeepingQuery from '../components/shared/RedirectKeepingQuery';
 import ProtectedRoute from '../components/ProtectedRoute';
 import AgentPayRoute from '../components/AgentPayRoute';
 import { connectionsPermissions, useAgentPayFlag } from '../utils/featureFlags';
@@ -591,14 +590,13 @@ const AppContent: React.FC<AuthenticatedAppProps> = ({ onLogout }) => {
                   }
                 />
                 <Route
-                  path="/payments"
+                  path="/x402payments"
                   element={
                     <ProtectedRoute permission="payments.view">
                       <PaymentsPage />
                     </ProtectedRoute>
                   }
                 />
-                <Route path="/x402payments" element={<RedirectKeepingQuery to="/payments" />} />
                 <Route
                   path="/secrets"
                   element={

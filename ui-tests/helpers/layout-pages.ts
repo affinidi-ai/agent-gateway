@@ -280,7 +280,7 @@ const SIDEBAR_PAGES: LayoutPage[] = [
     },
     {
         id: 'payments',
-        route: '/payments',
+        route: '/x402payments',
         testIds: [
             'page-payments',
             `payments-row-${FIXTURE_ID.payment}`,

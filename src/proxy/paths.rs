@@ -412,7 +412,6 @@ const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "notifications",
     "oidc-providers",
     "onboard",
-    "payments",
     "x402payments",
     "policies",
     "profile",
@@ -479,9 +478,7 @@ pub fn spa_collision_banner(collisions: &[(String, String)]) -> String {
          Fix: rename each offending prefix (a channel's or MCP proxy's\n\
          `prefix`, or the `prefix` of a proxy or redirect route, in your\n\
          gateway.json) to one that is not a dashboard page, e.g.\n\
-         '/svc/<name>', and restart. The\n\
-         dashboard's Payments page owns '/payments', so a channel on\n\
-         '/payments' must be renamed; clients that call it must use the\n\
+         '/svc/<name>', and restart; clients that call it must use the\n\
          new prefix.\n\
          ============================================================\n"
     )
@@ -748,27 +745,39 @@ mod tests {
     }
 
     #[test]
-    fn collision_detects_the_payments_page_and_its_legacy_redirect() {
-        let hits = check_spa_route_collisions(["/payments", "/payments/v1/report", "/x402payments"]);
-        assert_eq!(
-            hits,
-            vec![
-                ("/payments".to_string(), "/payments".to_string()),
-                ("/payments/v1/report".to_string(), "/payments".to_string()),
-                ("/x402payments".to_string(), "/x402payments".to_string()),
-            ]
-        );
+    fn the_payments_page_is_reserved_at_x402payments_and_payments_stays_free_for_channels() {
+        let hits = check_spa_route_collisions(["/x402payments", "/payments", "/payments/v1/report"]);
+        assert_eq!(hits, vec![("/x402payments".to_string(), "/x402payments".to_string())]);
+    }
+
+    #[test]
+    fn channels_shipped_in_existing_configs_never_shadow_a_dashboard_page() {
+        let shipped = [
+            "/payments",
+            "/cats",
+            "/agents",
+            "/routes",
+            "/mcp",
+            "/tools",
+            "/customer-support",
+            "/billing",
+            "/order-status",
+            "/product-catalog",
+            "/helpdesk",
+            "/inventory",
+        ];
+        assert_eq!(check_spa_route_collisions(shipped), Vec::<(String, String)>::new());
     }
 
     #[test]
     fn the_startup_error_names_each_prefix_the_page_it_shadows_and_the_rename() {
-        let banner = spa_collision_banner(&check_spa_route_collisions(["/payments", "/svc/x", "/policies/v1"]));
+        let banner = spa_collision_banner(&check_spa_route_collisions(["/x402payments", "/svc/x", "/policies/v1"]));
 
-        assert!(banner.contains("prefix '/payments' shadows the dashboard page '/payments'"), "{banner}");
+        assert!(banner.contains("prefix '/x402payments' shadows the dashboard page '/x402payments'"), "{banner}");
         assert!(banner.contains("prefix '/policies/v1' shadows the dashboard page '/policies'"), "{banner}");
         assert!(!banner.contains("'/svc/x'"), "{banner}");
         assert!(banner.contains("rename each offending prefix"), "{banner}");
-        assert!(banner.contains("'/payments' must be renamed"), "{banner}");
+        assert!(banner.contains("clients that call it must use the"), "{banner}");
     }
 
     #[test]

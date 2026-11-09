@@ -74,7 +74,7 @@ const Sidebar: React.FC = () => {
       id: 'payments',
       label: 'Payments',
       icon: 'fa-dollar-sign',
-      path: '/payments',
+      path: '/x402payments',
       permission: 'payments.view' as const,
     },
     {

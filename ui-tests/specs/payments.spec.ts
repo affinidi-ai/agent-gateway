@@ -393,7 +393,7 @@ test.describe("Payments page while agent-pay is off", () => {
     await mockLedgerApis(page, { legacy: true });
     await page.goto(`${BASE_URL}/x402payments`);
 
-    await expect(page).toHaveURL(/\/payments$/);
+    await expect(page).toHaveURL(/\/x402payments$/);
     await expect(page.getByTestId("nav-payments")).toBeVisible();
     await expect(page.getByTestId("page-payments")).toBeVisible();
     await expect(page.getByTestId("payments-row-pay-1")).toContainText("Paid");
@@ -408,13 +408,13 @@ test.describe("Payments page", () => {
     await withFeatureFlag(page, "agent_pay_delegation");
   });
 
-  test("the old route redirects here, and the ledger filters by outcome", async ({
+  test("the ledger filters by outcome", async ({
     page,
   }) => {
     await mockLedgerApis(page);
 
     await page.goto(`${BASE_URL}/x402payments`);
-    await expect(page).toHaveURL(/\/payments$/);
+    await expect(page).toHaveURL(/\/x402payments$/);
     await expect(page.getByTestId("page-payments")).toBeVisible();
 
     await expect(page.getByTestId("payments-row-pay-1")).toContainText("Paid");
@@ -428,14 +428,14 @@ test.describe("Payments page", () => {
     await expect(page.getByTestId("payments-row-pay-2")).toBeVisible();
   });
 
-  test("the old route keeps its query string when it redirects", async ({
+  test("a link with a surface_id filters the ledger by that surface", async ({
     page,
   }) => {
     await mockLedgerApis(page);
 
     await page.goto(`${BASE_URL}/x402payments?surface_id=weather`);
 
-    await expect(page).toHaveURL(/\/payments\?surface_id=weather$/);
+    await expect(page).toHaveURL(/\/x402payments\?surface_id=weather$/);
     await expect(page.getByTestId("payments-surface-filter")).toContainText(
       "weather",
     );
