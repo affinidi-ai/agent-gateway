@@ -1,0 +1,24 @@
+branch: fix/encrypt-storage-on-new-installs
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-06T12:30:00Z'
+      title: Encrypt storage at rest in new local and Docker environments
+      description: >-
+        Environments the development setup creates kept secrets, OAuth tokens and DID private
+        keys in plain JSON, because their generated config.toml had encryption at rest off.
+        make config-certs now also generates envs/master_encryption_key, and a config.toml
+        that the setup creates turns encryption at rest on: a local environment reads the key
+        from that file, and a Docker one from AG_MASTER_KEY, which make docker-run passes from
+        that file and docker-compose.yml passes through. Export it with
+        export AG_MASTER_KEY=$(cat envs/master_encryption_key) before docker compose up, and
+        keep the file, since storage encrypted under it cannot be read without it; if it goes
+        missing while encrypted storage is left under envs/, make config-certs stops instead
+        of generating a new key. Existing environments keep their setting, and a regenerated
+        config.toml keeps the [encryption] table of the one it replaces; an unencrypted one
+        opts in by setting [encryption] by hand. The output of --generate-bootstrap is
+        unchanged, so deployments built from it are not affected.
+  breaking: []

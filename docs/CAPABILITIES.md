@@ -519,8 +519,9 @@ infrastructure must provide, see [`DEPLOYMENT_REQUIREMENTS.md`](DEPLOYMENT_REQUI
 Secrets live in the gateway's secrets store, on disk or in AWS, and configuration refers
 to them rather than containing them: by environment variable, file, AWS Secrets Manager, or
 AWS Systems Manager Parameter Store. Stored records can be encrypted at rest with a master
-key from the environment, a file, or AWS KMS. Encryption at rest is off by default; enable
-it on any appliance that holds real credentials. See
+key from the environment, a file, or AWS KMS. A configuration from `--generate-bootstrap`
+has encryption at rest off, while the environments the development setup creates have it on;
+enable it on any appliance that holds real credentials. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#secret-references).
 
 ### Backup and export

@@ -77,7 +77,9 @@ server_mode = "active"
 # Encryption at rest
 [encryption]
 # Master switch: when enabled, whole JSON storage files on disk are encrypted (.json.enc)
-# and the configured encryption layers are loaded.
+# and the configured encryption layers are loaded. --generate-bootstrap writes false; the
+# development setup (make run-debug, make config-docker) turns it on for an environment it
+# creates. Losing the master key loses the data.
 enabled = false
 # Reserved: would additionally seal sensitive fields (private JWKs, private-key PEMs) as
 # ENC[...] inside the (decrypted) JSON. Not yet wired to any field — leave false.
