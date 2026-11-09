@@ -546,6 +546,19 @@ Owned tool catalogs are name-sorted and retain the available title,
 description, annotations, input schema and output schema. Modern REST execution
 reuses the OpenAPI library's parameter extraction and validation and returns
 structured JSON results, text or image content, and `isError` for HTTP failures.
+The bytes decide between text and file, not the `Content-Type`: a body that is
+valid UTF-8 is text whatever its type (JSON served as `application/octet-stream`
+or `application/x-amz-json-1.1` still yields structured results), and an empty
+body is the status text. A nonempty body that is neither an image nor UTF-8 is an
+embedded resource (`type: resource`) whose `blob` holds the body's bytes in base64
+and whose `mimeType` is the response's `Content-Type` (`application/octet-stream`
+when it sent none). Its `uri` is the backend URL called, without its query or
+fragment. A tool with a JSON output schema still answers it as a schema mismatch.
+The REST client bounds the body's bytes by `max_response_bytes` before encoding
+("REST tool response exceeds its configured limit"). A 2026-07-28 tool call also
+bounds the whole JSON-RPC response by it, base64 included, so an image or file
+larger than about three quarters of the limit is refused there as "MCP tool
+result exceeds the configured limit"; a legacy call has no such second bound.
 Argument failures are `400` / `-32602` before network execution;
 execution failures remain error tool results. Catalog locks are released
 before the REST call. Surface-backed dispatch runs after the shared request
@@ -608,7 +621,7 @@ with multipart fully bounded before sending. Request-body and parameter
 references are resolved only within the stored OpenAPI document with a fixed
 depth bound, never fetched over the network. Tests cover a real redirect
 destination, oversized streaming responses, credential conflicts, path escaping,
-images, forms and an actual owned multipart call. These checks do not
+images, binary files, forms and an actual owned multipart call. These checks do not
 establish full offline schema fidelity or complete client-security
 conformance, and the conformance harness scores owned endpoints only on the
 tool subset listed under [Conformance Harness](#conformance-harness).

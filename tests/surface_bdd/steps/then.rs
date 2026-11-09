@@ -3003,6 +3003,44 @@ fn mcp_tool_result_matches_rest_api_response(
     assert_mcp_tool_result_carries_rest_api_body(get_response_body_value(world), expected, &actor_name);
 }
 
+#[then(expr = "the MCP tool result is REST API {string}'s file as an embedded {string} resource")]
+fn mcp_tool_result_is_rest_api_file_as_embedded_resource(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+    mime_type: String,
+) {
+    let configured = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let expected = configured
+        .as_str()
+        .unwrap_or_else(|| panic!("REST API '{actor_name}' must be configured with a file. Configured: {configured}"));
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/type")
+            .and_then(|value| value.as_str()),
+        Some("resource"),
+        "expected an embedded resource. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/resource/mimeType")
+            .and_then(|value| value.as_str()),
+        Some(mime_type.as_str()),
+        "Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/resource/blob")
+            .and_then(|value| value.as_str()),
+        Some(expected),
+        "the file's bytes must arrive unchanged. Body: {body}"
+    );
+}
+
 #[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
 fn mcp_tool_result_without_target_credential_matches_rest_api_response(
     world: &mut SurfaceWorld,

@@ -751,17 +751,16 @@ pub(super) async fn call(
         }
         body.extend_from_slice(&chunk);
     }
-    let mime = content_type
-        .as_ref()
-        .and_then(|value| {
-            value
-                .parse::<mime::Mime>()
-                .ok()
-        });
-    let (content, structured) = if mime
-        .as_ref()
-        .is_some_and(|mime| mime.type_() == mime::IMAGE)
-    {
+    let is_image = !body.is_empty()
+        && content_type
+            .as_deref()
+            .and_then(|value| {
+                value
+                    .parse::<mime::Mime>()
+                    .ok()
+            })
+            .is_some_and(|mime| mime.type_() == mime::IMAGE);
+    let (content, structured) = if is_image {
         (
             vec![ContentBlock::image(
                 base64::engine::general_purpose::STANDARD.encode(&body),
@@ -770,32 +769,10 @@ pub(super) async fn call(
             None,
         )
     } else {
-        let body = String::from_utf8(body).map_err(|_| RestError::Execution)?;
-        let structured = metadata
-            .output_schema
-            .as_ref()
-            .and_then(|_| serde_json::from_str::<Value>(&body).ok())
-            .map(|body| json!({"status": status.as_u16(), "body": body}));
-        let content = match structured.as_ref() {
-            Some(structured) => serde_json::to_string(structured).map_err(|_| RestError::Execution)?,
-            None => rmcp_openapi::HttpResponse {
-                status_code: status.as_u16(),
-                status_text: status
-                    .canonical_reason()
-                    .unwrap_or("Unknown")
-                    .into(),
-                headers: HashMap::new(),
-                content_type,
-                body,
-                body_bytes: None,
-                is_success: status.is_success(),
-                request_method: metadata.method.clone(),
-                request_url: url.to_string(),
-                request_body: String::new(),
-            }
-            .to_mcp_content(),
-        };
-        (vec![ContentBlock::text(content)], structured)
+        match String::from_utf8(body) {
+            Ok(body) => text_content(metadata, &url, status, content_type, body)?,
+            Err(error) => (vec![binary_content(&url, content_type, error.as_bytes())], None),
+        }
     };
     let mut result = if status.is_success() {
         CallToolResult::success(content)
@@ -817,6 +794,60 @@ pub(super) async fn call(
     }
     result.structured_content = structured;
     Ok(result)
+}
+
+fn text_content(
+    metadata: &ToolMetadata,
+    url: &Url,
+    status: reqwest::StatusCode,
+    content_type: Option<String>,
+    body: String,
+) -> Result<(Vec<ContentBlock>, Option<Value>), RestError> {
+    let structured = metadata
+        .output_schema
+        .as_ref()
+        .and_then(|_| serde_json::from_str::<Value>(&body).ok())
+        .map(|body| json!({"status": status.as_u16(), "body": body}));
+    let content = match structured.as_ref() {
+        Some(structured) => serde_json::to_string(structured).map_err(|_| RestError::Execution)?,
+        None => rmcp_openapi::HttpResponse {
+            status_code: status.as_u16(),
+            status_text: status
+                .canonical_reason()
+                .unwrap_or("Unknown")
+                .into(),
+            headers: HashMap::new(),
+            content_type,
+            body,
+            body_bytes: None,
+            is_success: status.is_success(),
+            request_method: metadata.method.clone(),
+            request_url: url.to_string(),
+            request_body: String::new(),
+        }
+        .to_mcp_content(),
+    };
+    Ok((vec![ContentBlock::text(content)], structured))
+}
+
+fn resource_uri(url: &Url) -> String {
+    let mut url = url.clone();
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn binary_content(
+    url: &Url,
+    content_type: Option<String>,
+    body: &[u8],
+) -> ContentBlock {
+    ContentBlock::resource(rmcp::model::ResourceContents::BlobResourceContents {
+        uri: resource_uri(url),
+        mime_type: Some(content_type.unwrap_or_else(|| "application/octet-stream".into())),
+        blob: base64::engine::general_purpose::STANDARD.encode(body),
+        meta: None,
+    })
 }
 
 #[cfg(test)]
@@ -1229,5 +1260,252 @@ mod tests {
         .await
         .expect("oversized upstream must be dropped without waiting for EOF");
         tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn binary_rest_responses_arrive_as_embedded_resources_with_their_bytes() {
+        use axum::response::IntoResponse;
+
+        const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let app = axum::Router::new()
+            .route(
+                "/pdf",
+                axum::routing::get(|| async { ([("content-type", "application/pdf")], PDF).into_response() }),
+            )
+            .route(
+                "/untyped",
+                axum::routing::get(|| async {
+                    axum::http::Response::builder()
+                        .body(axum::body::Body::from(vec![0u8, 159, 146, 150]))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/latin1",
+                axum::routing::get(|| async {
+                    ([("content-type", "text/plain; charset=iso-8859-1")], vec![b'c', b'a', b'f', 0xe9]).into_response()
+                }),
+            )
+            .route(
+                "/denied",
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::FORBIDDEN, [("content-type", "application/pdf")], PDF).into_response()
+                }),
+            )
+            .route("/plain", axum::routing::get(|| async { "hello" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |path: &'static str| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                let result = call(
+                    &base,
+                    &metadata(path),
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result
+                        .structured_content
+                        .is_none()
+                );
+                serde_json::to_value(result).unwrap()
+            }
+        };
+        let blob = |value: &Value| {
+            base64::engine::general_purpose::STANDARD
+                .decode(
+                    value["content"][0]["resource"]["blob"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        for (path, mime, bytes, is_error) in [
+            ("/pdf", "application/pdf", PDF.to_vec(), false),
+            ("/untyped", "application/octet-stream", vec![0u8, 159, 146, 150], false),
+            ("/latin1", "text/plain; charset=iso-8859-1", vec![b'c', b'a', b'f', 0xe9], false),
+            ("/denied", "application/pdf", PDF.to_vec(), true),
+        ] {
+            let result = fetch(path).await;
+            assert_eq!(result["isError"], is_error, "{path}");
+            assert_eq!(
+                result["content"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(1),
+                "{path}"
+            );
+            assert_eq!(result["content"][0]["type"], "resource", "{path}");
+            assert_eq!(result["content"][0]["resource"]["mimeType"], mime, "{path}");
+            assert_eq!(result["content"][0]["resource"]["uri"], format!("{base}{path}"), "{path}");
+            assert_eq!(blob(&result), bytes, "{path}");
+        }
+        let mut schema_tool = metadata("/pdf");
+        schema_tool.output_schema = Some(json!({"type": "object"}));
+        let mismatched = call(
+            &base,
+            &schema_tool,
+            &json!({}),
+            &HeaderMap::new(),
+            &limits,
+            "application/json",
+            Some(base.as_str()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mismatched.is_error, Some(true), "a file is not the JSON the tool's output schema names");
+        let plain = fetch("/plain").await;
+        assert_eq!(plain["content"][0]["type"], "text");
+        assert!(
+            plain["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hello")
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn utf8_bodies_stay_text_whatever_their_content_type() {
+        use axum::response::IntoResponse;
+
+        let typed = |content_type: &'static str, body: &'static str| {
+            axum::routing::get(move || async move { ([("content-type", content_type)], body).into_response() })
+        };
+        let app = axum::Router::new()
+            .route("/octet-json", typed("application/octet-stream", r#"{"ok":true}"#))
+            .route("/amz-json", typed("application/x-amz-json-1.1", r#"{"ok":true}"#))
+            .route("/ascii-pdf", typed("application/pdf", "%PDF-1.4 plain"))
+            .route("/empty-pdf", typed("application/pdf", ""))
+            .route("/empty-png", typed("image/png", ""));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits = McpHttpConfig::default();
+        let fetch = |tool: ToolMetadata| {
+            let base = base.clone();
+            let limits = limits.clone();
+            async move {
+                call(
+                    &base,
+                    &tool,
+                    &json!({}),
+                    &HeaderMap::new(),
+                    &limits,
+                    "application/json",
+                    Some(base.as_str()),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for path in ["/octet-json", "/amz-json"] {
+            let mut tool = metadata(path);
+            tool.output_schema = Some(json!({"type": "object", "properties": {"body": {"type": "object"}}}));
+            let result = fetch(tool).await;
+            assert_eq!(result.is_error, Some(false), "{path}");
+            assert_eq!(result.structured_content, Some(json!({"status": 200, "body": {"ok": true}})), "{path}");
+        }
+        for (path, text) in
+            [("/ascii-pdf", "%PDF-1.4 plain"), ("/empty-pdf", "Status: 200 OK"), ("/empty-png", "Status: 200 OK")]
+        {
+            let result = serde_json::to_value(fetch(metadata(path)).await).unwrap();
+            assert_eq!(result["isError"], false, "{path}");
+            assert_eq!(result["content"][0]["type"], "text", "{path}");
+            assert!(
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(text),
+                "{path}: {result}"
+            );
+        }
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_rest_client_bounds_file_and_image_bytes_before_encoding() {
+        use axum::response::IntoResponse;
+
+        let sized = |content_type: &'static str, byte: u8, len: usize| {
+            axum::routing::get(
+                move || async move { ([("content-type", content_type)], vec![byte; len]).into_response() },
+            )
+        };
+        let app = axum::Router::new()
+            .route("/file-fits", sized("application/octet-stream", 0xff, 400))
+            .route("/file-over", sized("application/octet-stream", 0xff, 401))
+            .route("/image-fits", sized("image/png", 0xff, 400))
+            .route("/image-over", sized("image/png", 0xff, 401))
+            .route("/text-over", sized("text/plain", b'a', 401));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let limits: McpHttpConfig = serde_json::from_value(json!({"max_response_bytes": 400})).unwrap();
+        for (path, fits) in [
+            ("/file-fits", true),
+            ("/file-over", false),
+            ("/image-fits", true),
+            ("/image-over", false),
+            ("/text-over", false),
+        ] {
+            let result = call(
+                &base,
+                &metadata(path),
+                &json!({}),
+                &HeaderMap::new(),
+                &limits,
+                "application/json",
+                Some(base.as_str()),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_ok(), fits, "{path}");
+            if !fits {
+                assert!(matches!(result, Err(RestError::Limit)), "{path}");
+            }
+        }
+        tasks.shutdown().await;
+    }
+
+    #[test]
+    fn a_resource_names_its_backend_url_without_query_or_fragment() {
+        let url = Url::parse("https://www.example.com/download/files/abc?alt=media&key=k#part").unwrap();
+        assert_eq!(resource_uri(&url), "https://www.example.com/download/files/abc");
+        let root = Url::parse("https://www.example.com/?q=1").unwrap();
+        assert_eq!(resource_uri(&root), "https://www.example.com/");
     }
 }

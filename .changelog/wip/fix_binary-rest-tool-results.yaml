@@ -1,0 +1,23 @@
+branch: fix/binary-rest-tool-results
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Return binary REST tool answers as embedded resources with their bytes
+      description: >-
+        An MCP Proxy tool call sent by the gateway's own REST client (a 2026-07-28 call, or a
+        legacy call carrying the Target credential) failed with "REST tool execution failed"
+        whenever the REST API answered a body that was neither an image nor UTF-8 text, such as
+        a PDF or a zip file. Such a body is now an embedded resource whose blob holds the bytes in
+        base64 and whose mimeType is the response's Content-Type (application/octet-stream when
+        it sent none), named by the backend URL without its query. The bytes decide, not the
+        Content-Type: a UTF-8 body is answered as text as before whatever its type, so JSON served
+        as application/octet-stream still yields structured results, and an empty body is the
+        status text. A tool with a JSON output schema still answers a file as a schema mismatch.
+        The body's bytes count against max_response_bytes before encoding, and a 2026-07-28 call
+        also bounds its whole response, base64 included, by the same limit, so a file there can
+        be at most about three quarters of it.
+  removed: []
+  security: []
+  breaking: []
