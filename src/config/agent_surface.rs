@@ -1970,6 +1970,10 @@ impl TransitPoint {
                      issued for another service, such as the Access Point, is refused"
                 ))
             }
+            SourceAuthConfig::JwtBearer(config) if !config.audience_claim.is_aud() => Some(format!(
+                "Transit Point '{alias}' source_auth jwt_bearer audience_claim must be aud, so a token issued for \
+                 another service, such as the Access Point, is refused"
+            )),
             _ => None,
         }
     }
@@ -3836,6 +3840,11 @@ impl AgentSurface {
                                 the route they call as their audience"
                         .into());
                 }
+                if !jwt.audience_claim.is_aud() {
+                    return Err("requires JWT Bearer audience_claim aud: tokens must name the protected resource \
+                                of the route they call in aud"
+                        .into());
+                }
                 Ok(())
             }
             _ => Err("requires a first caller authentication method of JWT Bearer reading the Authorization \
@@ -4775,6 +4784,11 @@ mod tests {
             {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
         ]);
         assert!(rejected(&audience).contains("requires empty JWT Bearer audiences"));
+        let mut client_bound = forwarding.clone();
+        client_bound["access_point"]["caller_authentication"]["methods"] = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "audience_claim": "client_id"}
+        ]);
+        assert!(rejected(&client_bound).contains("requires JWT Bearer audience_claim aud"));
         let unknown_field = serde_json::json!({
             "methods": [], "protected_resource": {"resource": "https://gateway.example/mcp", "authorization_servers": [], "issuer": "x"}
         });
@@ -8641,6 +8655,21 @@ mod transit_point_caller_authentication_tests {
             "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["api://crm-transit"]
         }}));
         assert_eq!(named.unenforceable_caller_authentication(), None);
+        for claim in ["client_id", "azp"] {
+            let client_bound = point(json!({ "require_transit_token": false, "source_auth": {
+                "type": "jwt_bearer", "jwt_verification_strategy_id": "entra", "audiences": ["app-1"],
+                "audience_claim": claim
+            }}));
+            assert_eq!(
+                client_bound.unenforceable_caller_authentication(),
+                Some(
+                    "Transit Point 'partner' source_auth jwt_bearer audience_claim must be aud, so a token issued for \
+                     another service, such as the Access Point, is refused"
+                        .to_string()
+                ),
+                "{claim}"
+            );
+        }
     }
 
     #[test]

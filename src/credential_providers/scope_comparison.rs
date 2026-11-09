@@ -125,6 +125,32 @@ impl ScopeComparison {
 const GOOGLE_USERINFO_EMAIL: &str = "https://www.googleapis.com/auth/userinfo.email";
 const GOOGLE_USERINFO_PROFILE: &str = "https://www.googleapis.com/auth/userinfo.profile";
 
+/// The most scope names [`named_scopes`] passes on.
+pub const MAX_NAMED_SCOPES: usize = 16;
+/// The longest scope name [`named_scopes`] passes on, in bytes.
+pub const MAX_NAMED_SCOPE_BYTES: usize = 128;
+
+/// The scopes of `widened` that may be named in a log line or an answer: a
+/// vendor's words, so only those spelled entirely as an RFC 6749 section 3.3
+/// scope token (`%x21 / %x23-5B / %x5D-7E`: no space, quote, backslash or
+/// control character), 1 to [`MAX_NAMED_SCOPE_BYTES`] bytes, and at most
+/// [`MAX_NAMED_SCOPES`] of them, in the vendor's order. Any other is left out:
+/// what is named is only ever a hint of why a grant was refused.
+pub fn named_scopes(widened: &[&str]) -> Vec<String> {
+    widened
+        .iter()
+        .filter(|scope| {
+            !scope.is_empty()
+                && scope.len() <= MAX_NAMED_SCOPE_BYTES
+                && scope
+                    .bytes()
+                    .all(|byte| matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+        })
+        .take(MAX_NAMED_SCOPES)
+        .map(|scope| scope.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +258,26 @@ mod tests {
         );
         assert_eq!(ScopeComparison::Oidc.widened(&requested, &scopes("issues:read email")), ["email"]);
         assert_eq!(ScopeComparison::Oidc.widened(&requested, &scopes("Issues:Read")), ["Issues:Read"]);
+    }
+
+    /// A widened grant's scopes are named only when each is spelled as a
+    /// scope token: a quote, a backslash, a control character, an empty or
+    /// overlong name is left out, and at most `MAX_NAMED_SCOPES` are named.
+    #[test]
+    fn only_scope_tokens_are_named() {
+        assert_eq!(
+            named_scopes(&["identity", "tasks:read", "https://example.com/x", "a\"b", "a\\b", "a\nb", "", "é"]),
+            ["identity", "tasks:read", "https://example.com/x"]
+        );
+        let long = "s".repeat(MAX_NAMED_SCOPE_BYTES + 1);
+        assert!(named_scopes(&[long.as_str()]).is_empty());
+        let many: Vec<String> = (0..40)
+            .map(|n| format!("s{n}"))
+            .collect();
+        let many: Vec<&str> = many
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(named_scopes(&many).len(), MAX_NAMED_SCOPES);
     }
 }

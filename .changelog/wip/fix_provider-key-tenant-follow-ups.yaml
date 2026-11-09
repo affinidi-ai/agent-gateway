@@ -1,0 +1,247 @@
+branch: fix/provider-key-tenant-follow-ups
+changes:
+  added:
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Report the status of each API key a surface names in surface responses
+      description: >-
+        A surface read and the create, update and patch responses of a surface that names an
+        API Key Provider key id now carry a read-only api_key_references list, one key_id,
+        status and blocking per id in the base and every variant. status is active or revoked
+        for a key of the surface, missing when no key has the id, unavailable for another
+        surface's key, whose status is never reported, and unknown when the API key store
+        cannot be read or no loaded key folder holds the id while a folder cannot be loaded.
+        blocking comes from the same judgment that refuses requests, so it is true exactly when
+        the gateway refuses the surface for that id: for revoked and missing, for unavailable
+        when the key is revoked or tenant_credential_isolation is enforce (not for a legacy
+        Caller Context secret whose owning surface is gone), and never for active and unknown;
+        it says
+        whether the reference keeps the surface from serving. The surface's own key folder is
+        read from disk for it, so a key another node revoked is reported revoked at once. It is
+        computed by the gateway, so a tenant caller who cannot list API keys sees it too, and a
+        write body that sends it back has it dropped.
+    - timestamp: '2026-11-09T10:00:00Z'
+      title: Report whether this node serves a surface, and show when it refuses requests
+      description: >-
+        Beside api_key_references, surface responses carry a read-only serving_status: serving
+        or not_serving as this node's kept verdict on the surface's API key ids stands, and
+        not_judged while it keeps none. It is read from that verdict only, never from the API
+        key store, so it is per node and eventually consistent, and it gives no reason. A write
+        body that sends it back has it dropped. The surface page shows "This surface is refusing
+        requests" while it is not_serving.
+    - timestamp: '2026-11-05T19:00:00Z'
+      title: Flag an Identity whose API key was revoked or deleted in the Surface Builder
+      description: >-
+        The Surface Builder draws a red dashed ring and a short reason under a protected,
+        external or Transit Point Identity whose api_key_references entry is blocking: a
+        revoked or deleted key, or another surface's key that is revoked or under
+        tenant_credential_isolation enforce, in the base and every variant. The Identity panel names that state in the key
+        picker with a warning. The stored key stays selected, by name when it was revoked, as a
+        disabled option that cannot be picked again once changed. Save shows that warning as
+        an error and does not save until the Identity names an active key. The API key detail
+        page says "This API key is no longer in use because the associated surface has been
+        deleted." for a key whose surface was deleted.
+    - timestamp: '2026-11-09T10:10:00Z'
+      title: Keep Save open for another surface's API key under warn
+      description: >-
+        Under tenant_credential_isolation warn, an Identity whose stored key belongs to another
+        surface is not blocking, so the gateway keeps serving the surface. The Surface Builder
+        now matches it: the Identity panel shows a yellow notice asking for an active API key
+        of this surface, the canvas draws no ring, and Save saves. Under enforce the key is
+        blocking and Save stays blocked.
+    - timestamp: '2026-11-06T10:00:00Z'
+      title: Mark an identity Revoked when its API key or every surface it used is gone
+      description: >-
+        The dashboard identity list, on the stats response and the websocket update alike, now
+        carries revoked, true when the API key an identity's DID comes from is revoked or
+        deleted, or when every surface the identity is linked to was deleted, and
+        surface_deleted for the latter. A key store or surface store that cannot be read marks
+        nothing for that reason. The Identities page shows a red Revoked badge on the identity
+        and a deleted surface's id as plain text with a Deleted badge instead of a link, and
+        selecting a revoked identity, there or in the Dashboard's identity details, says it is no
+        longer in use. Revoking or deleting a key, or deleting a surface, re-sends the affected
+        identities in the next update; an update whose since is more than 24 hours old re-sends
+        every identity. An identity whose own surface was deleted while another surface it used
+        is live shows that live surface, the most recently used one.
+  changed:
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Let an unrestricted admin read an API key whose surface was deleted
+      description: >-
+        GET /v1/api-keys/{agent_id}/{key_id} now answers an unrestricted caller for a key whose
+        surface no longer exists, instead of 404, and every 200 answer carries surface_deleted,
+        true when the key's surface was deleted, so the dashboard can say the key is no longer
+        in use. Tenant-, resource- and header-gated callers still get 404 for such a key.
+    - timestamp: '2026-11-05T21:00:00Z'
+      title: Delete an API key a surface uses after confirming it in the dashboard
+      description: >-
+        Deleting an API key that a stored surface uses is allowed. The Secrets page and the API
+        key page open a confirmation dialog before every API key delete, saying that callers
+        presenting the key are refused and that surfaces using it stop working until another
+        key is picked, and delete only after Delete API key is clicked in that dialog. DELETE
+        /v1/api-keys/{agent_id}/{key_id} removes the key, also one whose owning surface is gone,
+        and a key that is not under the surface named in the path answers 404. Every surface
+        naming a deleted key answers 503 until it names another key of its own, which gives the
+        surface a new DID.
+    - timestamp: '2026-11-09T10:20:00Z'
+      title: Confirm an API key revoke in a dialog that names its effect on surfaces
+      description: >-
+        Revoke on the Secrets page and on the API key page now opens a confirmation dialog
+        instead of revoking at once, since a revoked key takes the surfaces using it out of
+        service. The dialog says those surfaces stop serving until another key is selected,
+        that a revoked key can't be restored, and that selecting a new key gives the surface a
+        new DID. The key is revoked only after Revoke API key is clicked; Cancel and close send
+        nothing, and a failed revoke shows an error toast.
+  fixed:
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Read the API key store once per boot or reload for the provider key check
+      description: >-
+        Boot and a configuration reload now check every surface that derives a DID from an API
+        key against one listing of the API key store, instead of listing the whole store once
+        per surface, and their credential policy report judges from the same listing. When that
+        listing fails, the report logs it once and lists each surface naming a key id as
+        store_unavailable instead of missing_key. When it leaves key folders out, the report
+        names them and lists a key id no loaded folder holds as store_unavailable.
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Stop re-reading an unreadable API key store on every request
+      description: >-
+        While the API key store cannot be read, a surface naming an API key id keeps its 503
+        verdict until the recheck interval passes, as a missing key's verdict is kept, so a
+        failing disk or share is read at most once per interval per surface.
+  removed: []
+  security:
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Revoke a surface's API keys when the surface is deleted
+      description: >-
+        Deleting a surface now revokes its active API keys and keeps their records, so they no
+        longer authenticate callers and the deleted surface's id stays tied to them. The
+        surface's key folder is read from disk, so keys another node created are revoked too.
+        Each revoke is logged per key id with actor surface-delete and is permanent. When the
+        folder cannot be read or a key cannot be revoked, the delete still succeeds and its
+        response carries an api_keys_left_active warning saying which keys stay active. A surface
+        still naming such a key stops serving until it names an active key of its own, which
+        gives it a new DID.
+    - timestamp: '2026-11-05T10:40:17Z'
+      title: Keep API key usage apart from the key record so it cannot undo a revoke
+      description: >-
+        An API key's last use is now written to its own file beside the key record, at most
+        once a minute per key and node, and never into the record, so recording a key's use
+        on one node can no longer write a revoked key back as active on any node. A failed
+        usage write is logged and the caller is still accepted. The API key list and detail
+        show the usage file's time, or a record's own last use from before this change. A key
+        revoked on another node stops authenticating here at this node's next cache refresh, or
+        with cache_refresh_interval_secs at its default of 0, at restart or promotion to
+        Active. A rotation re-reads the key from disk and refuses one another node revoked, and
+        key records are replaced atomically so concurrent writes cannot leave a partial record.
+    - timestamp: '2026-11-05T12:30:00Z'
+      title: Let a surface name only its own API keys in an Identity
+      description: >-
+        A from_api_key Identity, identity injection or Transit Point identity now saves only an
+        API key of the surface itself, as does a Caller Context API Key secret named like a key on
+        a surface whose inbound Identity is From API Key. A new reference to another surface's key,
+        of any tenant, answers 400, so no Identity can derive another surface's key DID. A reference
+        the stored surface already had is kept on save under warn. The provider key check reports
+        such a key as other_surface, and the Surface Builder key picker lists only the surface's
+        own active keys. A surface template drops every API key id it would carry, including an
+        API key shaped Caller Context secret and the Identity nodes of variant canvases.
+    - timestamp: '2026-11-05T16:30:00Z'
+      title: Refuse a surface save that adds a new reference to a revoked API key
+      description: >-
+        A create or save that adds a revoked API Key Provider key to an Identity slot, the
+        target identity injection, a Transit Point or a legacy Caller Context secret now answers
+        400 "API key '<key id>' is revoked; name an active API key of this surface", so a save
+        no longer accepts a surface that would not serve. Such a save reads the surface's own
+        key folder from disk, so a key another node revoked is refused at once; when that
+        folder cannot be read it answers 503 "API key store is unavailable". A key the surface
+        may not name for another reason keeps that rule's message, so the status of another
+        surface's key is not disclosed. A reference the stored surface already named is kept on
+        save, and the surface stays not ready until it names an active key, which gives it a
+        new DID.
+    - timestamp: '2026-11-05T22:00:00Z'
+      title: Revoke the API keys of surfaces deleted before the upgrade when going Active
+      description: >-
+        When the gateway boots Active or a Standby node becomes Active, it revokes every active
+        API key whose owning surface no longer exists, under the actor surface-delete. Before
+        it revokes any, it logs a WARN per owner it will revoke, naming the owner and its active
+        key ids. It then logs each revoked key with its key_id and actor=surface-delete, and how
+        many it revoked. The
+        revocations are permanent: no API restores a revoked key, and rolling back the gateway
+        does not either. Keys of surfaces deleted by an earlier release stayed active, so a
+        surface deriving its DID from one kept serving it under warn; it now answers 503 as
+        revoked_key until it names an active key of its own, which gives it a new DID. A
+        surface counts as existing when its file is in the agent surface folder, readable or
+        not, or when the surface store, the static configuration or the DynamoDB source holds
+        it; a key owner an API Key Provider of a surface names keeps its keys too, unlike a
+        surface delete, and so does an owner whose newest key was created within
+        cache_refresh_interval_secs (30 seconds when it is 0). When the API keys, the surface
+        folder or the DynamoDB source cannot all be read, or no surface is found at all,
+        nothing is revoked. A Standby node revokes nothing.
+  breaking:
+    - timestamp: '2026-11-05T12:30:00Z'
+      title: Take surfaces naming another surface's API key out of service under enforce
+      description: >-
+        Under tenant_credential_isolation enforce, a stored surface whose Identity names another
+        surface's API key, even one of its own tenant, is not ready after upgrade and answers 503,
+        and saving it unchanged answers 400. A stored surface naming a key whose owning surface
+        no longer exists is not ready under enforce too, as the key's tenant cannot be told.
+        Under warn such a surface keeps serving and is logged as other_surface. The Surface
+        Builder marks an Identity that names a blocking key. To fix such a surface, add an API
+        key to it and save it naming that key, which gives the surface a new DID; update
+        whatever is bound to the old one. To set up a new surface, create it, add its API key,
+        then save it naming that key.
+    - timestamp: '2026-11-05T20:00:00Z'
+      title: ⭐ Refuse requests to a surface that names a revoked API key, under warn too
+      description: >-
+        A surface whose Identity slot, target identity injection, Transit Point or legacy Caller
+        Context secret names a revoked API Key Provider key is not ready in both
+        tenant_credential_isolation modes and answers every request with 503, on the direct
+        path, over Fabric and on its Transit Points, with no agent card preview. Its DID is
+        derived from the key id with no key lookup, so before, a revoked key kept its surface's
+        DID and a stored surface naming one served under warn. This includes a key of a
+        deleted surface: deleting a surface revokes its keys, and the gateway revokes the keys
+        of surfaces deleted before the upgrade when it becomes Active. The node that revokes
+        the key refuses the next request; other nodes reread the key's status from disk on the
+        first request after cache_refresh_interval_secs, or after 30 seconds when it is 0. The
+        refusal is logged with reason api_key_revoked. To find affected surfaces, read the
+        credential policy report at boot or reload (revoked_key) and the WARN lines with
+        rule="provider_key_tenant" and not_ready=true; per surface, api_key_references marks
+        the key blocking and serving_status reads not_serving, and the Surface Builder marks an
+        Identity that names it. To bring a surface back, select an active API key of that
+        surface and save it. The surface then gets a new DID, since the DID comes from the key
+        id and a revoked key can't be restored; update whatever is bound to the old one.
+        Rotating a key keeps its surface serving.
+    - timestamp: '2026-11-05T21:00:00Z'
+      title: Stop serving a stored surface that names an API key that no longer exists
+      description: >-
+        After the upgrade, a stored surface whose Identity slot, target identity injection or
+        Transit Point names an API Key Provider key id that no key has answers every request
+        with 503 under tenant_credential_isolation warn as well as enforce, logged with reason
+        api_key_missing and reported as missing_key with not_ready true. Before, such a surface
+        kept serving the DID of a key that was gone. A legacy Caller Context secret with no key
+        of its id stays a plain secret. To keep such a surface serving, select an existing API
+        key of that surface and save it, which gives the surface a new DID; the Surface Builder
+        marks an Identity that names the missing key.
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Refuse surfaces naming a key id that an unreadable key folder may hold
+      description: >-
+        While an API key folder cannot be read, a surface naming a key id that no loaded folder
+        holds answers every request with 503, logged with reason api_key_store_unavailable, in
+        either tenant_credential_isolation mode, since the unread folder may hold another
+        tenant's key. Before, such a key read as missing and its surface kept serving. Surfaces
+        whose key ids are all found keep serving; when the API key store itself cannot be read,
+        every surface naming a key id answers 503. While a folder is unread, a save that adds
+        such an id answers 503 "API key store is unavailable", api_key_references reports it
+        unknown, tenant reassignment and its impact preview answer 409 while any surface names
+        a key id, and boot and reload name the unread folders. A single key record that cannot
+        be parsed or decrypted is dropped instead, and its key reads as missing (api_key_missing).
+        Once the folder can be read, the surfaces serve again at the next check after
+        cache_refresh_interval_secs (30 seconds when it is 0).
+    - timestamp: '2026-11-05T09:35:33Z'
+      title: Refuse a new surface whose id still holds API key records
+      description: >-
+        POST /v1/surfaces with an id whose API key folder holds any key record, readable or
+        not, such as the keys kept from a deleted surface, answers 400 "Surface ID '<id>' is
+        not available" in either mode, and 503 "API key store is unavailable" when that folder
+        cannot be read, so a new surface cannot take over another surface's keys and the DIDs
+        derived from them. A client that deletes and recreates a surface under a fixed id is
+        refused. To free the id, an unrestricted caller deletes each kept key with DELETE
+        /v1/api-keys/{surface id}/{key id}; the create then answers 201, and the recreated
+        surface gets new DIDs from its new keys.

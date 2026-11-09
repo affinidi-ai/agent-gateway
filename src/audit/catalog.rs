@@ -92,6 +92,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Delegation,
     ),
     event(
+        "connector_call",
+        "Connector Call",
+        "A call through a connector's Transit Point was forwarded with a grant, or refused before it was",
+        Delegation,
+    ),
+    event(
         "token_refreshed",
         "Token Refreshed",
         "An expired delegated credential was refreshed and injected",
@@ -204,6 +210,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "A secret was deleted with force, whether or not surfaces, providers or proxies still used it",
         Auth,
     ),
+    event(
+        "delegation_failed",
+        "Delegation Failed",
+        "An OAuth consent start or callback was refused, with the reason",
+        Delegation,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -291,6 +303,7 @@ mod tests {
         }
         for delegation in [
             "token_injected",
+            "connector_call",
             "token_refreshed",
             "token_not_found",
             "token_revoked",
@@ -310,7 +323,7 @@ mod tests {
 
     #[test]
     fn record_types_the_gateway_does_not_produce_are_not_offered() {
-        for unproduced in ["delegation_failed", "request_failed", "request_completed"] {
+        for unproduced in ["request_failed", "request_completed"] {
             assert_eq!(event_bit(unproduced), None, "{unproduced}");
         }
     }

@@ -17,17 +17,41 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use crate::audit::log_files;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
 use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
 static AUDIT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Bytes of the history one read examines, from the rotation `[audit]`
+/// configured at startup. Set beside [`AUDIT_PATH`], which the same reads use,
+/// so a read never takes it from a rotation the pipeline does not run with.
+static AUDIT_SCAN_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// The advisory size of the history `[audit] vp_audit_log_soft_cap_bytes` asks
+/// to be told about, reported beside the history's size on an audit page.
+static AUDIT_SOFT_CAP_BYTES: OnceLock<u64> = OnceLock::new();
+
+/// Bytes the audit history takes on disk, as the running VP Audit Log sink
+/// keeps it: measured once when it opens the log, then followed as records are
+/// appended and as retention deletes. `u64::MAX` means no sink has published
+/// one yet — a Standby node, or before the pipeline starts — and a read then
+/// measures the directory itself.
+static AUDIT_HISTORY_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Publishes the size of the audit history for the audit pages to report.
+/// Called by [`crate::audit::audit_log_sink::AuditLogSink`], the only writer.
+pub fn publish_history_bytes(bytes: u64) {
+    AUDIT_HISTORY_BYTES.store(bytes, Ordering::Relaxed);
+}
 
 /// The audit pipeline, run only while the node is Active.
 static AUDIT_PIPELINE: OnceLock<PipelineControl> = OnceLock::new();
@@ -187,6 +211,11 @@ pub struct DelegationAuditEvent {
     /// Additional context
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The tenant of the surface the record is about, on records that say
+    /// whose surface they are. Absent for an appliance-wide surface and on
+    /// records stored before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Serde default for `PolicyDecision.flow` so pre-existing audit entries (all of
@@ -487,6 +516,17 @@ pub struct SecretReferrerDetails {
     pub id: String,
 }
 
+/// What became of a call through a connector's Transit Point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectorCallOutcome {
+    /// The call, carrying the grant, was sent and the vendor answered.
+    Forwarded,
+    /// The call was refused before it was forwarded, or its grant was refused
+    /// by the vendor.
+    Refused,
+}
+
 /// The type of delegation audit action
 // Records are built only for wanted events and serialized straight away, so
 // the size of the `PolicyDecision` variant costs nothing worth boxing for.
@@ -597,6 +637,29 @@ pub enum DelegationAuditAction {
         blocking: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_ip: Option<String>,
+    },
+    /// A call through a Transit Point with a connector grant: forwarded to the
+    /// vendor, or refused before it was. Carries no argument, token or
+    /// vendor text.
+    ConnectorCall {
+        /// The Transit Point (hop) the call went through.
+        transit_point: String,
+        /// Whose grant the binding uses: the owner's, or the caller's own.
+        /// The record's `user_identity_hash` is the caller either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<crate::config::agent_surface::GrantSubject>,
+        outcome: ConnectorCallOutcome,
+        /// On `forwarded`: the class of the vendor's answer (`2xx`, `4xx`...).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_class: Option<String>,
+        /// On `refused`: the fixed reason the caller was told
+        /// (`connect_required`, `scope_insufficient`, `connector_unavailable`)
+        /// or `caller_not_identified`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// On `refused`: the fixed cause inside that reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
     },
     RateLimited {
         scope: RateLimitScope,
@@ -866,30 +929,49 @@ fn embedded_decision_matches(
             .is_some()
 }
 
-fn enrich_policy_decisions_from_signed_vps(events: &mut [DelegationAuditEvent]) {
-    let mut embedded_decisions = Vec::new();
-    for event in events.iter() {
-        let Some(trace_id) = event.trace_id.clone() else {
-            continue;
-        };
-        let Some(vp_jwt) = event.vp_jwt.as_deref() else {
-            continue;
-        };
-        let Some(value) = decode_vp_value(vp_jwt) else {
-            continue;
-        };
-        let mut decisions = Vec::new();
-        collect_policy_decisions(&value, &mut decisions);
-        embedded_decisions.extend(
-            decisions
-                .into_iter()
-                .map(|decision| TracePolicyDecisionEvidence {
-                    trace_id: trace_id.clone(),
-                    decision,
-                }),
-        );
-    }
+/// The policy decisions embedded in one record's signed VP, if it carries one.
+/// Decoding a VP is the most expensive step of an audit read, so it runs only
+/// for the records a page needs it for.
+fn trace_evidence_of(
+    trace_id: &str,
+    vp_jwt: &str,
+    out: &mut Vec<TracePolicyDecisionEvidence>,
+) {
+    let Some(value) = decode_vp_value(vp_jwt) else {
+        return;
+    };
+    let mut decisions = Vec::new();
+    collect_policy_decisions(&value, &mut decisions);
+    out.extend(
+        decisions
+            .into_iter()
+            .map(|decision| TracePolicyDecisionEvidence {
+                trace_id: trace_id.to_string(),
+                decision,
+            }),
+    );
+}
 
+/// Whether this record is a policy decision whose policy version or content
+/// hash is missing, so the signed VP of its trace would fill it in.
+fn needs_trace_evidence(event: &DelegationAuditEvent) -> bool {
+    matches!(
+        &event.event,
+        DelegationAuditAction::PolicyDecision {
+            policy_version,
+            policy_content_hash,
+            ..
+        } if policy_version.is_none() || policy_content_hash.is_none()
+    ) && event.trace_id.is_some()
+}
+
+/// Fills in the policy version and content hash of the policy decisions in
+/// `events` from the evidence embedded in their trace's signed VP, for rows
+/// written before those fields existed.
+fn apply_trace_evidence(
+    events: &mut [DelegationAuditEvent],
+    embedded_decisions: &[TracePolicyDecisionEvidence],
+) {
     if embedded_decisions.is_empty() {
         return;
     }
@@ -948,11 +1030,15 @@ fn enrich_policy_decisions_from_signed_vps(events: &mut [DelegationAuditEvent]) 
 }
 
 /// Sets up the audit pipeline with the VP Audit Log at
-/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, and
-/// starts it unless the node is in Standby: only the Active node writes the
-/// journal (see [`set_audit_pipeline_mode`]). Call once at startup from the
-/// orchestrator.
-pub async fn init_audit_logger(log_directory: Option<&str>) {
+/// `{log_directory}/delegation-audit.jsonl` and the journal next to it, rotated
+/// as `audit` says, and starts it unless the node is in Standby: only the
+/// Active node writes the journal (see [`set_audit_pipeline_mode`]). Call once
+/// at startup from the orchestrator.
+pub async fn init_audit_logger(
+    log_directory: Option<&str>,
+    audit: &crate::config::AuditConfig,
+) {
+    let rotation = audit.rotation();
     let dir = log_directory
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("_storage/audit"));
@@ -964,7 +1050,9 @@ pub async fn init_audit_logger(log_directory: Option<&str>) {
         warn!(target: "credential_delegation", "Audit pipeline already set up");
         return;
     }
-    let control = AUDIT_PIPELINE.get_or_init(|| PipelineControl::process_wide(dir, audit_path));
+    let _ = AUDIT_SCAN_BYTES.set(rotation.scan_budget());
+    let _ = AUDIT_SOFT_CAP_BYTES.set(audit.vp_audit_log_soft_cap_bytes);
+    let control = AUDIT_PIPELINE.get_or_init(|| PipelineControl::process_wide(dir, audit_path, rotation));
     if crate::server::mode::is_standby() {
         set_audit_pipeline_started(false);
         info!(target: "credential_delegation", "Standby mode: audit pipeline not started until the node becomes active");
@@ -1098,6 +1186,7 @@ pub fn audit_event(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     }
 }
 
@@ -1533,6 +1622,24 @@ pub struct AuditLogPage {
     /// **before** the category filter so a dropdown can show how many entries
     /// each category holds regardless of which one is currently selected.
     pub category_counts: std::collections::BTreeMap<String, usize>,
+    /// Whether the read stopped before the end of the audit history — its scan
+    /// budget ran out, or a rotated file is missing or unreadable — so `total`,
+    /// `total_pages` and `category_counts` describe the records it reached
+    /// rather than the whole history.
+    pub truncated: bool,
+    /// Lines the read met in the history and could not return as records: one
+    /// longer than the walk's line buffer, or one an interrupted append left
+    /// half-written. The counts are lower bounds by this many, and the records
+    /// are not in the page. Counted apart from `truncated`, because the read
+    /// did reach the end of the history.
+    pub dropped_records: usize,
+    /// Bytes the audit history takes on disk: the live log and every rotated
+    /// file beside it.
+    pub history_bytes: u64,
+    /// The size an operator asked to be told about
+    /// (`[audit] vp_audit_log_soft_cap_bytes`), or `0` when none is set.
+    /// Advisory: nothing happens when the history passes it.
+    pub soft_cap_bytes: u64,
 }
 
 /// Return the stable category string for an audit action.
@@ -1560,6 +1667,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::ElicitationTimedOut => "elicitation_timed_out",
         DelegationAuditAction::PaymentEvent(_) => "payment",
         DelegationAuditAction::AuthFailed { .. } => "auth_failed",
+        DelegationAuditAction::ConnectorCall { .. } => "connector_call",
         DelegationAuditAction::RateLimited { .. } => "rate_limited",
         DelegationAuditAction::RequestRejected { .. } => "request_rejected",
         DelegationAuditAction::IdentityBindingFailed { .. } => "identity_binding_failed",
@@ -1577,19 +1685,6 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
         DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
     }
-}
-
-/// Tally per-category event counts (via [`action_category`]) across a set of
-/// events. Used by [`read_audit_log`] to report how many entries each category
-/// holds, computed before the category filter is applied.
-pub fn tally_categories(events: &[DelegationAuditEvent]) -> std::collections::BTreeMap<String, usize> {
-    let mut counts = std::collections::BTreeMap::new();
-    for event in events {
-        *counts
-            .entry(action_category(&event.event).to_string())
-            .or_insert(0) += 1;
-    }
-    counts
 }
 
 /// Filters for [`read_audit_log`]. All are applied **before** pagination and
@@ -1611,9 +1706,231 @@ pub struct AuditLogFilter<'a> {
     pub exclude_vp_audit: bool,
 }
 
-/// Read the audit log file with pagination (newest first). Every [`AuditLogFilter`]
+/// Owned [`AuditLogFilter`], so a read can carry its filters onto a blocking
+/// thread.
+#[derive(Debug, Default, Clone)]
+struct OwnedAuditLogFilter {
+    text: Option<String>,
+    category: Option<String>,
+    flow: Option<String>,
+    scope: Option<String>,
+    decision: Option<String>,
+    exclude_vp_audit: bool,
+}
+
+impl From<AuditLogFilter<'_>> for OwnedAuditLogFilter {
+    fn from(opts: AuditLogFilter<'_>) -> Self {
+        Self {
+            text: opts.text.map(String::from),
+            category: opts
+                .category
+                .map(String::from),
+            flow: opts.flow.map(String::from),
+            scope: opts.scope.map(String::from),
+            decision: opts
+                .decision
+                .map(String::from),
+            exclude_vp_audit: opts.exclude_vp_audit,
+        }
+    }
+}
+
+/// The filters one read applies to each record as it walks the history,
+/// prepared once for the whole walk.
+struct PreparedFilter<'a> {
+    text: Option<String>,
+    categories: std::collections::HashSet<&'a str>,
+    flow: Option<&'a str>,
+    scope: Option<&'a str>,
+    decision: Option<&'a str>,
+    exclude_vp_audit: bool,
+    /// Whether a refinement restricts the view to policy decisions, so a line
+    /// that does not name one is dropped before it is parsed.
+    policy_decisions_only: bool,
+}
+
+/// The stored tag of [`DelegationAuditAction::PolicyDecision`]. Every policy
+/// decision carries it, so a line without it is not one.
+const POLICY_DECISION_TAG: &str = "\"policy_decision\"";
+
+/// What one stored line was to a read: a record it keeps, a record a filter
+/// drops, or a line it could not read as a record at all. The last is told
+/// apart from the others so a page can say that what it counted is not
+/// everything the history holds.
+// The kept record is moved straight into the page being built, so boxing it
+// here would cost an allocation per record read to save nothing.
+#[allow(clippy::large_enum_variant)]
+enum Tallied {
+    Kept(DelegationAuditEvent),
+    Filtered,
+    Unreadable,
+}
+
+impl<'a> PreparedFilter<'a> {
+    fn new(filter: &'a OwnedAuditLogFilter) -> Self {
+        let refinement = |value: &'a Option<String>| {
+            value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            text: filter
+                .text
+                .as_ref()
+                .map(|text| text.to_lowercase()),
+            categories: filter
+                .category
+                .as_deref()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|category| !category.is_empty())
+                .collect(),
+            flow: refinement(&filter.flow),
+            scope: refinement(&filter.scope),
+            decision: refinement(&filter.decision),
+            exclude_vp_audit: filter.exclude_vp_audit,
+            policy_decisions_only: refinement(&filter.flow).is_some()
+                || refinement(&filter.scope).is_some()
+                || refinement(&filter.decision).is_some(),
+        }
+    }
+
+    /// The record this stored line holds, unless one of the filters applied
+    /// before the category tally drops it. The text filter matches the line as
+    /// it is stored, so a record no view keeps costs no parse.
+    fn tallied(
+        &self,
+        line: &str,
+    ) -> Tallied {
+        if let Some(text) = &self.text
+            && !line
+                .to_lowercase()
+                .contains(text)
+        {
+            return Tallied::Filtered;
+        }
+        // A view of policy decisions parses only the lines that name one: on a
+        // busy history most records are something else, and parsing each of
+        // them to drop it is the bulk of what a page load costs. The same
+        // shortcut must not be taken for the category filter, however cheap it
+        // looks: the tally below runs before `in_category`, so the counts
+        // describe every category of the records the other filters kept, and
+        // skipping the unselected ones would make each of their counts read 0
+        // exactly while an operator is choosing which to filter to.
+        if self.policy_decisions_only && !line.contains(POLICY_DECISION_TAG) {
+            return Tallied::Filtered;
+        }
+        // A line left half-written by a crash is not a record and is not
+        // counted as one; the page says so rather than passing silently over
+        // evidence it could not read.
+        let Ok(event) = serde_json::from_str::<DelegationAuditEvent>(line) else {
+            return Tallied::Unreadable;
+        };
+        if self.exclude_vp_audit && event.event.is_vp_audit() {
+            return Tallied::Filtered;
+        }
+        // Policy-decision refinements (flow / scope / decision). When any is
+        // set the view is restricted to matching PolicyDecision records, so
+        // they compose with the category filter and drive the counts and
+        // pagination consistently.
+        if self.flow.is_some() || self.scope.is_some() || self.decision.is_some() {
+            let DelegationAuditAction::PolicyDecision { flow, scope, decision, .. } = &event.event else {
+                return Tallied::Filtered;
+            };
+            let kept = self
+                .flow
+                .is_none_or(|wanted| flow == wanted)
+                && self
+                    .scope
+                    .is_none_or(|wanted| scope == wanted)
+                && self
+                    .decision
+                    .is_none_or(|wanted| decision == wanted);
+            if !kept {
+                return Tallied::Filtered;
+            }
+        }
+        Tallied::Kept(event)
+    }
+
+    /// Whether the category filter keeps `event`. Applied after the tally, so
+    /// `total` and `total_pages` follow the selected category while
+    /// `category_counts` still describes every category. A comma-separated list
+    /// is an OR set; a blank one filters nothing.
+    fn in_category(
+        &self,
+        event: &DelegationAuditEvent,
+    ) -> bool {
+        self.categories.is_empty()
+            || self
+                .categories
+                .contains(action_category(&event.event))
+    }
+}
+
+/// How many reads walk the audit log at once. Parsing the history is the most
+/// expensive thing the gateway does off the request path, so concurrent
+/// readers — a second dashboard tab, or a filter changed while a page is still
+/// loading — wait for each other instead of multiplying that cost. The permit
+/// belongs to the blocking read, not to the request that asked for it: a
+/// request cancelled mid-read (a disconnect, a reload) leaves the read running,
+/// and it must still bar the next one until it is done.
+static AUDIT_READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Runs one audit read on a blocking thread, holding a permit of `reads` for as
+/// long as the read runs rather than for as long as the caller waits for it.
+async fn under_read_permit<T: Send + 'static>(
+    reads: &'static tokio::sync::Semaphore,
+    read: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let permit = reads.acquire().await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        read()
+    })
+    .await?)
+}
+
+/// Bytes of the history one read examines, from the rotation the pipeline was
+/// started with, or the default rotation's budget before startup set one.
+fn scan_bytes() -> u64 {
+    AUDIT_SCAN_BYTES
+        .get()
+        .copied()
+        .unwrap_or_else(|| log_files::Rotation::default().scan_budget())
+}
+
+/// The size of the history an operator asked to be told about, or the built-in
+/// one before startup set it. Advisory: nothing is enforced at it.
+fn soft_cap_bytes() -> u64 {
+    AUDIT_SOFT_CAP_BYTES
+        .get()
+        .copied()
+        .unwrap_or(log_files::HISTORY_SOFT_CAP_BYTES)
+}
+
+/// Bytes the audit history takes on disk: the running sink's count, which
+/// costs nothing to read, or the directory itself while no sink has published
+/// one. Called on the blocking thread, because the fallback lists the audit
+/// directory.
+fn history_bytes_of(path: &Path) -> u64 {
+    match AUDIT_HISTORY_BYTES.load(Ordering::Relaxed) {
+        u64::MAX => log_files::history_bytes(path),
+        published => published,
+    }
+}
+
+/// Read the audit log with pagination (newest first). Every [`AuditLogFilter`]
 /// is applied **before** pagination and the category tally so `total`,
 /// `total_pages`, and `category_counts` stay consistent with the returned page.
+///
+/// A read walks back from the live log through the rotated files, holding only
+/// the page it returns, so it costs the same memory whatever the history has
+/// grown to. It examines [`log_files::Rotation::scan_budget`] bytes of the
+/// history, which covers every file a configured rotation keeps;
+/// [`AuditLogPage::truncated`] says a read stopped before the end of the
+/// history, in which case the counts describe the part it reached.
 pub async fn read_audit_log(
     page: usize,
     page_size: usize,
@@ -1621,137 +1938,373 @@ pub async fn read_audit_log(
 ) -> anyhow::Result<AuditLogPage> {
     let path = AUDIT_PATH
         .get()
-        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?;
+        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?
+        .clone();
+    let filter = OwnedAuditLogFilter::from(opts);
 
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_default();
+    under_read_permit(&AUDIT_READS, move || {
+        let history_bytes = history_bytes_of(&path);
+        read_audit_window(&path, page, page_size, &filter, scan_bytes(), soft_cap_bytes(), history_bytes)
+    })
+    .await?
+}
 
-    // Parse all lines most-recent first. Text filtering happens after VP-backed
-    // policy evidence enrichment so full-hash searches can match hydrated
-    // PolicyDecision rows even when the original JSONL row predated the fields.
-    let mut events: Vec<DelegationAuditEvent> = content
-        .lines()
-        .rev()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            serde_json::from_str::<DelegationAuditEvent>(line).ok()
-        })
-        .collect();
+/// Walk the audit history into one page. Runs on a blocking thread: the
+/// history is read, parsed and filtered off the async runtime, so audit reads
+/// never hold up proxy traffic.
+///
+/// Every filter but the category one is applied to each record as it is met, so
+/// the counts and the page describe the same set, and only the page's own
+/// records are kept: the page itself, and the last `page_size` matches, which
+/// are the page a request past the end of the log clamps to. Memory therefore
+/// follows the page size, not the size of the history.
+///
+/// The walk stops after `scan_bytes` of the history and says so through
+/// [`AuditLogPage::truncated`], which a missing rotated file also sets: `total`
+/// and `category_counts` are then exact for the records the walk saw, and not
+/// for the whole history.
+fn read_audit_window(
+    path: &Path,
+    page: usize,
+    page_size: usize,
+    filter: &OwnedAuditLogFilter,
+    scan_bytes: u64,
+    soft_cap_bytes: u64,
+    history_bytes: u64,
+) -> anyhow::Result<AuditLogPage> {
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+    let prepared = PreparedFilter::new(filter);
+    let start = page
+        .saturating_sub(1)
+        .saturating_mul(page_size);
 
-    enrich_policy_decisions_from_signed_vps(&mut events);
-
-    if let Some(filter_lower) = opts
-        .text
-        .map(|f| f.to_lowercase())
-    {
-        events.retain(|event| {
-            serde_json::to_string(event)
-                .map(|json| {
-                    json.to_lowercase()
-                        .contains(&filter_lower)
-                })
-                .unwrap_or(false)
-        });
-    }
-
-    // Drop VP-audit events (policy decisions / trust checks) up front so the
-    // count, pagination, and category tally all reflect the same filtered set.
-    if opts.exclude_vp_audit {
-        events.retain(|event| !event.event.is_vp_audit());
-    }
-
-    // Policy-decision refinement filters (flow / scope / decision). When any is
-    // set the view is restricted to matching PolicyDecision events (non
-    // policy-decision events are dropped), so these compose with the category
-    // filter and drive the counts/pagination consistently.
-    let flow_f = opts
-        .flow
-        .filter(|s| !s.is_empty());
-    let scope_f = opts
-        .scope
-        .filter(|s| !s.is_empty());
-    let decision_f = opts
-        .decision
-        .filter(|s| !s.is_empty());
-    if flow_f.is_some() || scope_f.is_some() || decision_f.is_some() {
-        events.retain(|event| match &event.event {
-            DelegationAuditAction::PolicyDecision { flow, scope, decision, .. } => {
-                flow_f.is_none_or(|f| flow == f)
-                    && scope_f.is_none_or(|s| scope == s)
-                    && decision_f.is_none_or(|d| decision == d)
-            }
-            _ => false,
-        });
-    }
-
-    // Tally per-category counts across the (text + refinement) filtered set,
-    // before the category filter narrows it, so the caller can label each
-    // category with its count regardless of the current category selection.
-    let category_counts = tally_categories(&events);
-
-    // Apply the category filter after counting so total/total_pages reflect the
-    // selected category while category_counts still reflect every category. A
-    // comma-separated list is treated as an OR set (any matching category is
-    // kept); an empty/blank list applies no category filter.
-    if let Some(cat) = opts.category {
-        let wanted: std::collections::HashSet<&str> = cat
-            .split(',')
-            .map(|c| c.trim())
-            .filter(|c| !c.is_empty())
-            .collect();
-        if !wanted.is_empty() {
-            events.retain(|event| wanted.contains(action_category(&event.event)));
+    let mut lines = log_files::HistoryLines::open(path);
+    let mut truncated = false;
+    let mut category_counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    let mut page_events: Vec<DelegationAuditEvent> = Vec::new();
+    let mut last_page: std::collections::VecDeque<DelegationAuditEvent> = std::collections::VecDeque::new();
+    let mut unreadable = 0usize;
+    loop {
+        // Charged in the history's own bytes, which is what the budget is
+        // written in: the lines the walk dropped or passed over cost it too.
+        // Checked before the next line is read, so a budget smaller than the
+        // newest record still returns that record.
+        if lines.consumed() > scan_bytes {
+            truncated = true;
+            break;
         }
+        let Some(line) = lines.next_line()? else {
+            break;
+        };
+        let event = match prepared.tallied(line.trim()) {
+            Tallied::Kept(event) => event,
+            Tallied::Filtered => continue,
+            Tallied::Unreadable => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        *category_counts
+            .entry(action_category(&event.event).to_string())
+            .or_insert(0) += 1;
+        if !prepared.in_category(&event) {
+            continue;
+        }
+        if total >= start && page_events.len() < page_size {
+            page_events.push(event.clone());
+        }
+        total += 1;
+        if last_page.len() == page_size {
+            last_page.pop_front();
+        }
+        last_page.push_back(event);
+    }
+    // Read after the walk, not before: a rotated file the walk could not open
+    // is only met as it reaches it.
+    truncated |= lines.gap();
+    let dropped_records = lines
+        .dropped()
+        .saturating_add(unreadable);
+    if dropped_records > 0 {
+        warn!(
+            target: "credential_delegation",
+            dropped_records,
+            "Lines of the VP Audit Log could not be read as records; the page's counts are lower bounds"
+        );
     }
 
-    let total = events.len();
     let total_pages = if total == 0 {
         1
     } else {
         total.div_ceil(page_size)
     };
     let clamped_page = page.clamp(1, total_pages);
-    let start = (clamped_page - 1) * page_size;
-    let page_events: Vec<DelegationAuditEvent> = events
-        .drain(start..)
-        .take(page_size)
-        .collect();
+    let mut events = if clamped_page == page {
+        page_events
+    } else {
+        let on_last_page = total - (clamped_page - 1) * page_size;
+        let from = last_page.len() - on_last_page;
+        Vec::from(last_page.split_off(from))
+    };
+
+    enrich_page_from_signed_vps(path, &mut events, scan_bytes)?;
 
     Ok(AuditLogPage {
-        events: page_events,
+        events,
         total,
         page: clamped_page,
         page_size,
         total_pages,
         category_counts,
+        truncated,
+        dropped_records,
+        history_bytes,
+        soft_cap_bytes,
     })
 }
 
-/// The `payment` records in VP Audit Log `content`, newest first.
-fn payment_events_in(content: &str) -> Vec<DelegationAuditEvent> {
-    content
-        .lines()
-        .rev()
-        .filter(|line| line.contains("\"payment_event\""))
-        .filter_map(|line| serde_json::from_str::<DelegationAuditEvent>(line.trim()).ok())
-        .filter(|event| matches!(event.event, DelegationAuditAction::PaymentEvent(_)))
+/// Most embedded decisions one page collects, so a trace whose VP carries an
+/// unexpected number of them cannot grow a read without bound.
+const MAX_TRACE_EVIDENCE: usize = 1024;
+
+/// The traces whose signed VP a page still needs. An empty trace id is left
+/// out: it names no trace, and looking for it as a substring would match every
+/// line and decode a VP for each one.
+fn traces_needing_evidence(events: &[DelegationAuditEvent]) -> std::collections::HashSet<String> {
+    events
+        .iter()
+        .filter(|event| needs_trace_evidence(event))
+        .filter_map(|event| event.trace_id.clone())
+        .filter(|trace| !trace.is_empty())
         .collect()
 }
 
-/// The `payment` records the VP Audit Log keeps, newest first. Empty before the
-/// audit pipeline is set up or while the log does not exist.
-pub async fn read_payment_events() -> Vec<DelegationAuditEvent> {
-    let Some(path) = AUDIT_PATH.get() else {
-        return Vec::new();
+#[derive(serde::Deserialize)]
+struct TraceVpCarrier {
+    #[serde(default)]
+    trace_id: Option<String>,
+    #[serde(default)]
+    vp_jwt: Option<String>,
+}
+
+/// Fills in the policy version and content hash of the page's policy decisions
+/// from the signed VP of each one's trace, for rows written before those fields
+/// existed. Only the traces of the page's own rows are looked for, and only a
+/// line that names one of them and carries a VP is parsed, so a page decodes at
+/// most one VP per row it shows rather than one per record in the history.
+///
+/// This is a second walk of the same history, under the same budget as the
+/// first: the traces it looks for are only known once the page has been
+/// selected. It stops as soon as every trace it wants has been found, which on
+/// a page of recent rows is within a few records of where it started, because a
+/// trace's signed presentation is written in the same request as its decision.
+/// A page whose rows are old is the case that costs a second walk, and it costs
+/// it only while such rows are on the page.
+fn enrich_page_from_signed_vps(
+    path: &Path,
+    events: &mut [DelegationAuditEvent],
+    scan_bytes: u64,
+) -> anyhow::Result<()> {
+    let traces = traces_needing_evidence(events);
+    if traces.is_empty() {
+        return Ok(());
+    }
+
+    let mut lines = log_files::HistoryLines::open(path);
+    let mut embedded_decisions = Vec::new();
+    let mut found: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while found.len() < traces.len() && embedded_decisions.len() < MAX_TRACE_EVIDENCE {
+        if lines.consumed() > scan_bytes {
+            break;
+        }
+        let Some(line) = lines.next_line()? else {
+            break;
+        };
+        if !line.contains("\"vp_jwt\"")
+            || !traces
+                .iter()
+                .any(|trace| line.contains(trace.as_str()))
+        {
+            continue;
+        }
+        let Ok(carrier) = serde_json::from_str::<TraceVpCarrier>(line.trim()) else {
+            continue;
+        };
+        let (Some(trace_id), Some(vp_jwt)) = (carrier.trace_id, carrier.vp_jwt) else {
+            continue;
+        };
+        let Some(wanted) = traces.get(&trace_id) else {
+            continue;
+        };
+        found.insert(wanted.as_str());
+        trace_evidence_of(&trace_id, &vp_jwt, &mut embedded_decisions);
+    }
+
+    apply_trace_evidence(events, &embedded_decisions);
+    Ok(())
+}
+
+/// The stored tag of [`DelegationAuditAction::PaymentEvent`]. Every payment
+/// record carries it, so a line without it is not one.
+const PAYMENT_EVENT_TAG: &str = "\"payment_event\"";
+
+/// One page of the `payment` records of the audit history, newest first.
+pub struct PaymentEventsPage {
+    pub events: Vec<DelegationAuditEvent>,
+    pub total: usize,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_pages: usize,
+    /// Whether the walk stopped before the end of the history, so `total`
+    /// describes the records it reached rather than every payment record the
+    /// appliance kept.
+    pub truncated: bool,
+    /// Lines the walk met and could not return as records; the counts are
+    /// lower bounds by this many. See [`AuditLogPage::dropped_records`].
+    pub dropped_records: usize,
+}
+
+impl PaymentEventsPage {
+    /// The empty page a caller gets before the audit pipeline is set up, or
+    /// when the read failed. `truncated` then says the page is not the whole
+    /// history rather than letting nothing pass for everything.
+    fn empty(
+        page: usize,
+        page_size: usize,
+        truncated: bool,
+    ) -> Self {
+        Self {
+            events: Vec::new(),
+            total: 0,
+            page: page.max(1),
+            page_size: page_size.max(1),
+            total_pages: 1,
+            truncated,
+            dropped_records: 0,
+        }
+    }
+}
+
+/// Walks the audit history for the `payment` records `keep` admits, newest
+/// first, into one page: the live log, then back through the rotated files,
+/// one line at a time, parsing only the lines that name a payment record, and
+/// stopping after `scan_bytes` of the history.
+///
+/// Only the page asked for and the last `page_size` matches are held, so the
+/// memory a payments read costs follows the page and not the history — the
+/// same bound [`read_audit_window`] keeps, by the same means. The two walks
+/// are deliberately separate for now: folding them into one reader is the
+/// right end state, and the moment for it is when `total` stops being counted
+/// by walking at all.
+fn payment_events_in(
+    path: &Path,
+    scan_bytes: u64,
+    page: usize,
+    page_size: usize,
+    keep: &dyn Fn(&DelegationAuditEvent) -> bool,
+) -> anyhow::Result<PaymentEventsPage> {
+    let page = page.max(1);
+    let page_size = page_size.max(1);
+    let start = page
+        .saturating_sub(1)
+        .saturating_mul(page_size);
+
+    let mut lines = log_files::HistoryLines::open(path);
+    let mut truncated = false;
+    let mut total = 0usize;
+    let mut unreadable = 0usize;
+    let mut page_events: Vec<DelegationAuditEvent> = Vec::new();
+    let mut last_page: std::collections::VecDeque<DelegationAuditEvent> = std::collections::VecDeque::new();
+    loop {
+        if lines.consumed() > scan_bytes {
+            truncated = true;
+            break;
+        }
+        let Some(line) = lines.next_line()? else {
+            break;
+        };
+        if !line.contains(PAYMENT_EVENT_TAG) {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<DelegationAuditEvent>(line.trim()) else {
+            unreadable += 1;
+            continue;
+        };
+        if !matches!(event.event, DelegationAuditAction::PaymentEvent(_)) || !keep(&event) {
+            continue;
+        }
+        if total >= start && page_events.len() < page_size {
+            page_events.push(event.clone());
+        }
+        total += 1;
+        if last_page.len() == page_size {
+            last_page.pop_front();
+        }
+        last_page.push_back(event);
+    }
+    truncated |= lines.gap();
+    let dropped_records = lines
+        .dropped()
+        .saturating_add(unreadable);
+    if dropped_records > 0 {
+        warn!(
+            target: "credential_delegation",
+            dropped_records,
+            "Lines of the VP Audit Log could not be read as records; the payments page's counts are lower bounds"
+        );
+    }
+
+    let total_pages = if total == 0 {
+        1
+    } else {
+        total.div_ceil(page_size)
     };
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .unwrap_or_default();
-    payment_events_in(&content)
+    let clamped_page = page.clamp(1, total_pages);
+    let events = if clamped_page == page {
+        page_events
+    } else {
+        let on_last_page = total - (clamped_page - 1) * page_size;
+        let from = last_page.len() - on_last_page;
+        Vec::from(last_page.split_off(from))
+    };
+
+    Ok(PaymentEventsPage {
+        events,
+        total,
+        page: clamped_page,
+        page_size,
+        total_pages,
+        truncated,
+        dropped_records,
+    })
+}
+
+/// One page of the `payment` records the VP Audit Log keeps, newest first,
+/// read under the permit audit reads share and on a blocking thread. `keep`
+/// decides which records the caller may see, inside the walk, so the page and
+/// `total` describe the same set. Empty before the audit pipeline is set up,
+/// while the log does not exist, or when the read failed — which is reported
+/// as truncated, so a payments view never presents what it could not read as
+/// the whole history.
+pub async fn read_payment_events(
+    page: usize,
+    page_size: usize,
+    keep: impl Fn(&DelegationAuditEvent) -> bool + Send + 'static,
+) -> PaymentEventsPage {
+    let Some(path) = AUDIT_PATH.get().cloned() else {
+        return PaymentEventsPage::empty(page, page_size, false);
+    };
+    let read =
+        under_read_permit(&AUDIT_READS, move || payment_events_in(&path, scan_bytes(), page, page_size, &keep)).await;
+    match read {
+        Ok(Ok(events)) => events,
+        Ok(Err(e)) | Err(e) => {
+            warn!(target: "credential_delegation", error = %e, "Failed to read the VP Audit Log's payments");
+            PaymentEventsPage::empty(page, page_size, true)
+        }
+    }
 }
 
 /// Emit a policy-decision audit record (`decision` is `allow`, `deny` or
@@ -1820,6 +2373,7 @@ pub fn audit_policy_decision(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     });
 }
 
@@ -1872,6 +2426,7 @@ pub fn audit_trust_check(
         request_id: None,
         surface_variant: None,
         detail: None,
+        tenant_id: None,
     });
 }
 
@@ -1917,12 +2472,565 @@ pub fn audit_trace_terminated(
         request_id: None,
         surface_variant: None,
         detail: Some(format!("downstream_trace_id={downstream_trace_id}")),
+        tenant_id: None,
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_line(provider: &str) -> String {
+        let event = audit_event(DelegationAuditAction::TokenInjected, None, None, Some(provider), None);
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    /// A record the Credential Delegation Audit Log discards: it belongs to the
+    /// VP Audit Log, and one per request is the bulk of a busy history.
+    fn vp_audit_line() -> String {
+        let event = audit_event(
+            DelegationAuditAction::TraceTerminated {
+                own_trace_id: "own".to_string(),
+                downstream_trace_id: "down".to_string(),
+                flow: "fabric".to_string(),
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    /// A policy decision whose stored row predates the policy version and
+    /// content hash fields, so a page has to take them from its trace's VP.
+    fn policy_decision_line(trace_id: &str) -> String {
+        let mut event = audit_event(
+            DelegationAuditAction::PolicyDecision {
+                scope: "surface".to_string(),
+                flow: "fabric".to_string(),
+                policy_id: "surface.policy".to_string(),
+                policy_name: None,
+                policy_definition_id: Some("surface-def-1".to_string()),
+                decision: "allow".to_string(),
+                deny_reason: None,
+                surface_id: Some("surface-1".to_string()),
+                caller_did: None,
+                http_method: None,
+                http_path: None,
+                policy_version: None,
+                policy_content_hash: None,
+                removed_tools: None,
+            },
+            None,
+            None,
+            None,
+            None,
+        );
+        event.trace_id = Some(trace_id.to_string());
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    /// The `vp_injected` record carrying the signed evidence for `trace_id`.
+    fn vp_evidence_line(trace_id: &str) -> String {
+        let vp = signed_vp_with_policy_decision();
+        let mut event = audit_event(DelegationAuditAction::VpInjected, None, None, None, None);
+        event.trace_id = Some(trace_id.to_string());
+        event.vp_jwt = Some(vp);
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    fn delegation_only() -> OwnedAuditLogFilter {
+        OwnedAuditLogFilter {
+            exclude_vp_audit: true,
+            ..Default::default()
+        }
+    }
+
+    fn whole_history() -> u64 {
+        log_files::MAX_SCAN_BYTES
+    }
+
+    /// A read on the built-in advisory size, which only the test below asserts
+    /// about; it shadows [`super::read_audit_window`] so the other tests read
+    /// as what they are about.
+    fn read_audit_window(
+        path: &Path,
+        page: usize,
+        page_size: usize,
+        filter: &OwnedAuditLogFilter,
+        scan_bytes: u64,
+    ) -> anyhow::Result<AuditLogPage> {
+        super::read_audit_window(
+            path,
+            page,
+            page_size,
+            filter,
+            scan_bytes,
+            log_files::HISTORY_SOFT_CAP_BYTES,
+            log_files::history_bytes(path),
+        )
+    }
+
+    /// A stored `payment` record of the trace `trace-<id>`.
+    fn payment_line(id: &str) -> String {
+        let mut event = audit_event(
+            DelegationAuditAction::PaymentEvent(Box::new(PaymentEventDetails {
+                rail: PaymentRail::X402,
+                stage: PaymentStage::Verified,
+                transaction_id: id.to_string(),
+                amount: None,
+                currency: None,
+                method: None,
+                payer: None,
+                error: None,
+                delegated: true,
+                payment_gateway_id: None,
+                payment_surface_id: None,
+                remote_status: None,
+                delegation: None,
+            })),
+            None,
+            None,
+            None,
+            Some("s-1"),
+        );
+        event.trace_id = Some(format!("trace-{id}"));
+        format!("{}\n", serde_json::to_string(&event).unwrap())
+    }
+
+    fn payment_lines(count: usize) -> String {
+        (0..count)
+            .map(|n| payment_line(&n.to_string()))
+            .collect()
+    }
+
+    /// One page of the payment records of the history at `path`, with every
+    /// record visible to the caller.
+    fn payments(
+        path: &Path,
+        scan_bytes: u64,
+        page: usize,
+        page_size: usize,
+    ) -> PaymentEventsPage {
+        payment_events_in(path, scan_bytes, page, page_size, &|_| true).unwrap()
+    }
+
+    fn payment_traces(page: &PaymentEventsPage) -> Vec<&str> {
+        page.events
+            .iter()
+            .filter_map(|event| event.trace_id.as_deref())
+            .collect()
+    }
+
+    fn written(
+        dir: &tempfile::TempDir,
+        contents: &str,
+    ) -> PathBuf {
+        let path = dir
+            .path()
+            .join("delegation-audit.jsonl");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_read_returns_the_newest_records_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("first"), audit_line("second")));
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.total_pages, 1);
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            page.events[1]
+                .provider_id
+                .as_deref(),
+            Some("first")
+        );
+        assert!(!page.truncated, "the whole history was walked");
+    }
+
+    #[test]
+    fn a_filter_finds_its_records_behind_a_flood_of_records_it_discards() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let noise: String = (0..200)
+            .map(|_| vp_audit_line())
+            .collect();
+        let path = written(&dir, &format!("{}{noise}", audit_line("delegated")));
+
+        let page = read_audit_window(&path, 1, 10, &delegation_only(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 1, "the record behind the discarded ones is still found");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("delegated")
+        );
+        let counts = &page.category_counts;
+        assert_eq!(counts.get("token_injected"), Some(&1));
+        assert_eq!(counts.get("trace_terminated"), None, "a record the filter drops is counted nowhere");
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn a_text_search_finds_a_rare_term_far_back_in_the_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let noise: String = (0..200)
+            .map(|_| vp_audit_line())
+            .collect();
+        let path = written(&dir, &format!("{}{noise}", audit_line("needle-provider")));
+        let filter = OwnedAuditLogFilter {
+            text: Some("NEEDLE-provider".to_string()),
+            ..Default::default()
+        };
+
+        let page = read_audit_window(&path, 1, 10, &filter, whole_history()).unwrap();
+
+        assert_eq!(page.total, 1, "the search is not limited to the newest records");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("needle-provider")
+        );
+    }
+
+    #[test]
+    fn a_text_search_for_a_term_no_record_holds_finds_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &audit_line("delegated"));
+        let filter = OwnedAuditLogFilter {
+            text: Some("no-such-provider".to_string()),
+            ..Default::default()
+        };
+
+        let page = read_audit_window(&path, 1, 10, &filter, whole_history()).unwrap();
+
+        assert_eq!(page.total, 0);
+        assert_eq!(page.total_pages, 1);
+        assert!(page.events.is_empty());
+        let counts = &page.category_counts;
+        assert!(counts.is_empty(), "nothing is counted");
+    }
+
+    #[test]
+    fn a_read_walks_back_into_the_rotated_files_for_the_records_it_wants() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &vp_audit_line());
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), audit_line("rotated-out")).unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &delegation_only(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 1, "the live log held nothing this view keeps");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("rotated-out")
+        );
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn a_page_reports_the_size_of_the_history_against_the_advisory_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let live = audit_line("live");
+        let rotated = audit_line("rotated");
+        let path = written(&dir, &live);
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), &rotated).unwrap();
+
+        let measured = log_files::history_bytes(&path);
+        let page =
+            super::read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history(), 4096, measured)
+                .unwrap();
+
+        assert_eq!(measured, (live.len() + rotated.len()) as u64, "the size is the live log plus every rotated file");
+        assert_eq!(page.history_bytes, measured, "and the page reports what it was given");
+        assert_eq!(page.soft_cap_bytes, 4096, "the advisory size is reported as configured");
+    }
+
+    #[test]
+    fn a_record_the_read_could_not_read_is_counted_without_calling_the_read_partial() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // The half-written line an append interrupted by a crash leaves at the
+        // end of the live log.
+        let crashed = audit_line("half-written");
+        let path = written(&dir, &format!("{}{}", audit_line("whole"), &crashed[..crashed.len() / 2]));
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 1, "the record beside it is still counted");
+        assert_eq!(page.dropped_records, 1, "the fragment is counted as a record the read could not return");
+        assert!(
+            !page.truncated,
+            "the read reached the end of the history, so it is not reported as having stopped early"
+        );
+    }
+
+    #[test]
+    fn a_read_stops_at_its_scan_budget_and_reports_partial_counts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let newest = audit_line("second");
+        // One byte under the newest record: the walk stops once it has consumed
+        // *more* than the budget, so a budget it has not yet exceeded always
+        // returns the record it is reading, however small that budget is.
+        let budget = newest.len() as u64 - 1;
+        let path = written(&dir, &format!("{}{newest}", audit_line("first")));
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), budget).unwrap();
+
+        assert_eq!(page.total, 1, "only the records the walk reached are counted");
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("second")
+        );
+        assert!(page.truncated, "the history held more than the budget");
+        assert_eq!(page.dropped_records, 0, "stopping early is not a record the read could not read");
+    }
+
+    #[test]
+    fn a_budget_that_ends_with_the_history_is_not_reported_as_truncated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let contents = format!("{}{}", audit_line("first"), audit_line("second"));
+        let budget = contents.len() as u64;
+        let path = written(&dir, &contents);
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), "").unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), budget).unwrap();
+
+        assert_eq!(page.total, 2);
+        assert!(!page.truncated, "an empty older file is not more history");
+    }
+
+    #[test]
+    fn a_missing_rotated_file_is_read_past_and_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &audit_line("live"));
+        // `.2` is missing from the middle of the history, as a crash during a
+        // rotation leaves it.
+        std::fs::write(PathBuf::from(format!("{}.3", path.display())), audit_line("newest rotated")).unwrap();
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), audit_line("behind the gap")).unwrap();
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 3, "the records behind the gap are still counted");
+        assert_eq!(
+            page.events[2]
+                .provider_id
+                .as_deref(),
+            Some("behind the gap")
+        );
+        assert!(page.truncated, "the missing file is not in any count");
+    }
+
+    #[test]
+    fn the_category_tally_spans_every_category_while_the_page_follows_the_filter() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("delegated"), vp_audit_line()));
+        let filter = OwnedAuditLogFilter {
+            category: Some("token_injected".to_string()),
+            ..Default::default()
+        };
+
+        let page = read_audit_window(&path, 1, 10, &filter, whole_history()).unwrap();
+
+        let counts = &page.category_counts;
+        assert_eq!(page.total, 1, "the page holds the selected category only");
+        assert_eq!(counts.get("token_injected"), Some(&1));
+        assert_eq!(counts.get("trace_terminated"), Some(&1), "the tally still counts the categories the filter hides");
+    }
+
+    #[test]
+    fn a_refinement_filter_keeps_only_the_policy_decisions_that_match() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("delegated"), policy_decision_line("trace-1")));
+        let matching = OwnedAuditLogFilter {
+            decision: Some("allow".to_string()),
+            ..Default::default()
+        };
+        let other = OwnedAuditLogFilter {
+            decision: Some("deny".to_string()),
+            ..Default::default()
+        };
+
+        let allowed = read_audit_window(&path, 1, 10, &matching, whole_history()).unwrap();
+        let denied = read_audit_window(&path, 1, 10, &other, whole_history()).unwrap();
+
+        assert_eq!(allowed.total, 1, "only the matching policy decision is kept");
+        let counts = &allowed.category_counts;
+        assert_eq!(counts.get("policy_decision"), Some(&1));
+        assert_eq!(
+            counts.get("token_injected"),
+            None,
+            "a record that is not a policy decision is dropped before it is parsed"
+        );
+        assert_eq!(denied.total, 0, "no record has the other decision");
+    }
+
+    #[test]
+    fn a_page_in_range_holds_its_own_slice_of_the_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let records: String = (0..5)
+            .map(|n| audit_line(&format!("record-{n}")))
+            .collect();
+        let path = written(&dir, &records);
+
+        let page = read_audit_window(&path, 2, 2, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 5);
+        assert_eq!(page.total_pages, 3);
+        assert_eq!(page.page, 2);
+        let shown: Vec<Option<&str>> = page
+            .events
+            .iter()
+            .map(|event| event.provider_id.as_deref())
+            .collect();
+        assert_eq!(shown, vec![Some("record-2"), Some("record-1")], "newest first, second page");
+    }
+
+    #[test]
+    fn a_page_past_the_end_clamps_to_the_last_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let records: String = (0..5)
+            .map(|n| audit_line(&format!("record-{n}")))
+            .collect();
+        let path = written(&dir, &records);
+
+        let page = read_audit_window(&path, 9, 2, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.page, 3, "the page is clamped to the last one");
+        assert_eq!(page.total, 5);
+        let shown: Vec<Option<&str>> = page
+            .events
+            .iter()
+            .map(|event| event.provider_id.as_deref())
+            .collect();
+        assert_eq!(shown, vec![Some("record-0")], "the last page holds the oldest record alone");
+    }
+
+    #[test]
+    fn a_page_decision_takes_its_policy_version_from_a_vp_outside_the_page() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let filler: String = (0..5)
+            .map(|n| audit_line(&format!("record-{n}")))
+            .collect();
+        let path =
+            written(&dir, &format!("{}{filler}{}", vp_evidence_line("trace-1"), policy_decision_line("trace-1")));
+
+        let page = read_audit_window(&path, 1, 1, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.events.len(), 1, "the page holds the policy decision alone");
+        match &page.events[0].event {
+            DelegationAuditAction::PolicyDecision {
+                policy_version,
+                policy_content_hash,
+                ..
+            } => {
+                assert_eq!(*policy_version, Some(4));
+                assert_eq!(policy_content_hash.as_deref(), Some("sha256:abc123"));
+            }
+            other => panic!("expected policy decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_the_traces_a_page_still_needs_are_looked_for() {
+        let decision = |trace: Option<&str>| {
+            let line = policy_decision_line(trace.unwrap_or_default());
+            let mut event: DelegationAuditEvent = serde_json::from_str(line.trim()).unwrap();
+            event.trace_id = trace.map(str::to_string);
+            event
+        };
+        let stored = {
+            let mut event = decision(Some("trace-done"));
+            if let DelegationAuditAction::PolicyDecision {
+                policy_version,
+                policy_content_hash,
+                ..
+            } = &mut event.event
+            {
+                *policy_version = Some(4);
+                *policy_content_hash = Some("sha256:abc123".to_string());
+            }
+            event
+        };
+        let events = vec![decision(Some("trace-1")), decision(Some("")), decision(None), stored];
+
+        let traces = traces_needing_evidence(&events);
+
+        assert_eq!(traces, std::collections::HashSet::from(["trace-1".to_string()]));
+    }
+
+    #[test]
+    fn a_page_without_a_policy_decision_needing_evidence_is_returned_as_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", vp_evidence_line("trace-1"), audit_line("delegated")));
+
+        let page = read_audit_window(&path, 1, 1, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.events[0]
+                .provider_id
+                .as_deref(),
+            Some("delegated"),
+            "the newest record is returned untouched"
+        );
+    }
+
+    #[test]
+    fn a_page_reports_whether_the_whole_history_was_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &audit_line("delegated"));
+
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+        let body = serde_json::to_value(&page).unwrap();
+
+        assert_eq!(body["truncated"], serde_json::json!(false), "the field reaches the API");
+        assert_eq!(body["total"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_request_holds_the_read_permit_until_the_read_is_done() {
+        static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let (started, has_started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+
+        let reading = tokio::spawn(async move {
+            under_read_permit(&READS, move || {
+                let _ = started.send(());
+                let _ = released.recv();
+            })
+            .await
+        });
+        has_started
+            .await
+            .expect("the read reached its blocking work");
+        reading.abort();
+
+        assert!(READS.try_acquire().is_err(), "the permit is held by the read the cancelled request started");
+
+        release.send(()).unwrap();
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(5), READS.acquire()).await;
+
+        assert!(
+            waited
+                .expect("the permit is released once the read finishes")
+                .is_ok(),
+            "the next read may start"
+        );
+    }
 
     #[test]
     fn test_audit_event_builder_fills_fields() {
@@ -2195,6 +3303,7 @@ mod tests {
             request_id: None,
             surface_variant: None,
             detail: Some("downstream_trace_id=down-456".to_string()),
+            tenant_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":{\"trace_terminated\":"), "got: {}", json);
@@ -2257,27 +3366,105 @@ mod tests {
         };
         let mut other = audit_event(DelegationAuditAction::VpInjected, None, None, None, Some("s-1"));
         other.detail = Some("\"payment_event\" in a detail".to_string());
-        let content = [
-            payment("old"),
-            serde_json::to_string(&other).unwrap(),
-            "not json \"payment_event\"".to_string(),
-            payment("new"),
-        ]
-        .join("\n");
+        let dir = tempfile::TempDir::new().unwrap();
+        // The oldest record is in a rotated file, as it is on an appliance
+        // that has been taking payments for a while.
+        let path = written(
+            &dir,
+            &[serde_json::to_string(&other).unwrap(), "not json \"payment_event\"".to_string(), payment("new")]
+                .join("\n"),
+        );
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), format!("{}\n", payment("old"))).unwrap();
 
-        let events = payment_events_in(&content);
+        let read = payments(&path, whole_history(), 1, 50);
 
-        let traces: Vec<_> = events
-            .iter()
-            .map(|event| {
-                event
-                    .trace_id
-                    .as_deref()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(traces, vec!["trace-new", "trace-old"]);
-        assert!(payment_events_in("").is_empty());
+        assert_eq!(payment_traces(&read), vec!["trace-new", "trace-old"], "a rotated payment record is in the view");
+        assert_eq!(read.total, 2, "both are counted");
+        assert_eq!(read.dropped_records, 1, "the line that is not a record is counted, not passed over");
+        assert!(!read.truncated, "the walk still reached the end of the history");
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let empty = payments(&written(&elsewhere, ""), whole_history(), 1, 50);
+        assert!(empty.events.is_empty(), "a log with no payment records reads as none");
+        assert!(!empty.truncated, "and says so as the whole history");
+        assert_eq!(empty.dropped_records, 0);
+    }
+
+    #[test]
+    fn a_payments_page_holds_its_own_slice_and_clamps_past_the_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &payment_lines(5));
+
+        let first = payments(&path, whole_history(), 1, 2);
+        let past_the_end = payments(&path, whole_history(), 9, 2);
+
+        assert_eq!(payment_traces(&first), vec!["trace-4", "trace-3"], "newest first");
+        assert_eq!((first.total, first.total_pages, first.page), (5, 3, 1));
+        assert_eq!(payment_traces(&past_the_end), vec!["trace-0"], "the last page, not an empty one");
+        assert_eq!(past_the_end.page, 3, "a page past the end clamps to the last");
+    }
+
+    #[test]
+    fn a_payments_read_counts_only_the_records_its_caller_may_see() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &payment_lines(4));
+
+        let page = payment_events_in(&path, whole_history(), 1, 50, &|event| {
+            event
+                .trace_id
+                .as_deref()
+                .is_some_and(|trace| trace == "trace-1" || trace == "trace-3")
+        })
+        .unwrap();
+
+        assert_eq!(payment_traces(&page), vec!["trace-3", "trace-1"]);
+        assert_eq!(page.total, 2, "the records the caller may not see are in no count");
+    }
+
+    #[test]
+    fn a_payment_read_that_stops_at_its_budget_reports_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let newest = audit_line("second");
+        let path = written(&dir, &format!("{}{newest}", audit_line("first")));
+
+        let read = payments(&path, newest.len() as u64, 1, 50);
+
+        assert!(read.events.is_empty(), "neither record is a payment record");
+        assert!(read.truncated, "the history held more than the budget");
+    }
+
+    #[test]
+    fn the_audit_read_and_the_payments_read_agree_on_the_same_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Payment records in the live log and in a rotated file, with records
+        // of other kinds between them.
+        let path = written(&dir, &format!("{}{}{}", audit_line("noise"), payment_lines(3), vp_audit_line()));
+        std::fs::write(PathBuf::from(format!("{}.1", path.display())), payment_line("rotated")).unwrap();
+
+        let audit = read_audit_window(
+            &path,
+            1,
+            50,
+            &OwnedAuditLogFilter {
+                category: Some("payment".to_string()),
+                ..Default::default()
+            },
+            whole_history(),
+        )
+        .unwrap();
+        let payments = payments(&path, whole_history(), 1, 50);
+
+        assert_eq!(audit.total, payments.total, "the two reads count the same payment records");
+        assert_eq!(
+            audit
+                .events
+                .iter()
+                .filter_map(|event| event.trace_id.as_deref())
+                .collect::<Vec<_>>(),
+            payment_traces(&payments),
+            "and hand them back in the same order"
+        );
+        assert_eq!(audit.truncated, payments.truncated, "and agree on whether they saw all of it");
+        assert_eq!(audit.dropped_records, payments.dropped_records, "and on how many records neither could read");
     }
 
     #[test]
@@ -2609,43 +3796,22 @@ mod tests {
     }
 
     #[test]
-    fn test_tally_categories_counts_per_category() {
-        let mk = |action: DelegationAuditAction| audit_event(action, None, None, None, None);
-        let events = vec![
-            mk(DelegationAuditAction::ConsentGranted),
-            mk(DelegationAuditAction::ConsentGranted),
-            mk(DelegationAuditAction::TokenInjected),
-            mk(DelegationAuditAction::PolicyDecision {
-                scope: "gateway".to_string(),
-                flow: "access_point".to_string(),
-                policy_id: "pol-1".to_string(),
-                policy_name: None,
-                policy_definition_id: None,
-                decision: "allow".to_string(),
-                deny_reason: None,
-                surface_id: None,
-                caller_did: None,
-                http_method: None,
-                http_path: None,
-                policy_version: None,
-                policy_content_hash: None,
-                removed_tools: None,
-            }),
-        ];
+    fn the_category_tally_counts_every_record_the_walk_sees() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let consent = audit_event(DelegationAuditAction::ConsentGranted, None, None, None, None);
+        let consent = format!("{}\n", serde_json::to_string(&consent).unwrap());
+        let path =
+            written(&dir, &format!("{consent}{consent}{}{}", audit_line("delegated"), policy_decision_line("trace-1")));
 
-        let counts = tally_categories(&events);
+        let page = read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history()).unwrap();
+
+        let counts = &page.category_counts;
+        assert_eq!(page.total, 4);
         assert_eq!(counts.get("consent_granted"), Some(&2));
         assert_eq!(counts.get("token_injected"), Some(&1));
         assert_eq!(counts.get("policy_decision"), Some(&1));
-        // Untriggered categories are absent, not zero.
-        assert_eq!(counts.get("trust_check"), None);
-        // Sum of counts equals the total event count.
-        assert_eq!(counts.values().sum::<usize>(), events.len());
-    }
-
-    #[test]
-    fn test_tally_categories_empty_is_empty() {
-        assert!(tally_categories(&[]).is_empty());
+        assert_eq!(counts.get("trust_check"), None, "an untriggered category is absent, not zero");
+        assert_eq!(counts.values().sum::<usize>(), page.total);
     }
 
     fn unsigned_jwt(payload: serde_json::Value) -> String {
@@ -2654,8 +3820,9 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
-    #[test]
-    fn enriches_policy_decision_from_same_trace_signed_vp() {
+    /// A signed VP carrying the policy decision a proxied call was governed by,
+    /// with the policy version and content hash an older stored row lacks.
+    fn signed_vp_with_policy_decision() -> String {
         let nested_vc = unsigned_jwt(serde_json::json!({
             "credentialSubject": {
                 "workloadBinding": {
@@ -2674,11 +3841,16 @@ mod tests {
                 }
             }
         }));
-        let vp = unsigned_jwt(serde_json::json!({
+        unsigned_jwt(serde_json::json!({
             "vp": {
                 "verifiableCredential": [nested_vc]
             }
-        }));
+        }))
+    }
+
+    #[test]
+    fn enriches_policy_decision_from_same_trace_signed_vp() {
+        let vp = signed_vp_with_policy_decision();
         let mut events = vec![
             DelegationAuditEvent {
                 event_id: None,
@@ -2705,6 +3877,7 @@ mod tests {
                 request_id: None,
                 surface_variant: None,
                 detail: None,
+                tenant_id: None,
             },
             DelegationAuditEvent {
                 event_id: None,
@@ -2746,10 +3919,13 @@ mod tests {
                 request_id: None,
                 surface_variant: None,
                 detail: None,
+                tenant_id: None,
             },
         ];
 
-        enrich_policy_decisions_from_signed_vps(&mut events);
+        let mut evidence = Vec::new();
+        trace_evidence_of("trace-1", &signed_vp_with_policy_decision(), &mut evidence);
+        apply_trace_evidence(&mut events, &evidence);
 
         match &events[1].event {
             DelegationAuditAction::PolicyDecision {

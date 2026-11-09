@@ -6,6 +6,7 @@ Feature: Inbound identity derived from a JWT claim
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
     And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface <credential condition>
     Then the response status is 401
@@ -42,6 +43,7 @@ Feature: Inbound identity derived from a JWT claim
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
     And the surface derives the inbound identity from a JWT claim
+    And the surface accepts JWT audience "bdd-test-audience"
     And the operator has created the surface for route "/example"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200

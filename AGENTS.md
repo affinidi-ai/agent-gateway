@@ -144,13 +144,38 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
 identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; see _Surface Builder_ in
+Key or API Key Provider; the protected and external Identities' key picker lists only the
+surface's own active keys; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A protected, external or Transit Point Identity whose API key reference is `blocking`
+(`api_key_references`: a revoked or deleted key, or another surface's key that is revoked or
+under `enforce`) is
+drawn unconfigured, with a red dashed ring and a
+short reason under the node on the canvas and the full warning in its panel, and Save shows that warning as an error until it names an active key. Another surface's key that does
+not block gets only a yellow notice in the panel and saves. The surface page says "This surface
+is refusing requests" while `serving_status` is `not_serving`. The API key detail page says a
+key of a deleted surface is no longer in use. See _Surface Builder_ and
+[_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
 
+The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ssl`,
+`sasl_plaintext` or `sasl_ssl`) and, for a SASL one, the SASL mechanism (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`); see
+_Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
+says surfaces using the key stop working until another key is picked, and deletes only after
+**Delete API key** in that dialog. Revoking one opens the same dialog component worded for
+revoke: surfaces using the key stop serving, the key can't be restored and a new key gives the
+surface a new DID; it revokes only after **Revoke API key**, and a failed revoke shows an error
+toast. See _API key
+delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
@@ -161,7 +186,13 @@ claim other than `sub`; see _Credentials audit tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credentials-audit-tab).
 
 The credential provider editor shows the inputs of the chosen type, picks the JWT signing key
-and certificate from the secrets store, and target authentication on a Managed Agent or Transit
+and certificate from the secrets store, keeps an authorization code provider's stored Callback URL
+while its host is unchanged and it conforms (`https`, path ending in the stored `callback_path`)
+and otherwise builds it from the stored `callback_path` (when creating, it saves the
+Callback URL in a second request once the gateway returns the path it built from the id it
+generated for the provider, then opens that provider, also when the second request fails; a
+stored provider without a Callback URL shows the gateway's own one), and target
+authentication on a Managed Agent or Transit
 Point can take its credential from a credential provider; see _Credential provider editor_ and
 _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
@@ -186,6 +217,17 @@ The Audit Log names the surface variant of each request record and describes `re
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
 
+An audit response says what a read did not return in two fields: `truncated` (it stopped before
+the end of the history) and `dropped_records` (the history holds records it could not read).
+Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+number from that read with a trailing `+`, an empty page of such a read says the records searched
+held none rather than that the log is empty, and nothing else changes. A read the gateway could
+not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
+`[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
+`utils/formatBytes.ts`; see _Audit page: partial reads and
+log size_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-partial-reads-and-log-size).
+
 The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
@@ -195,6 +237,12 @@ Count column, and lists a managed agent DID shared by several surfaces once, as 
 with its surface count and every one of its surfaces; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
+The Identities page marks an identity whose API key was revoked or deleted, or whose every
+surface was deleted, with a red "Revoked" badge, shows a deleted surface as plain text with a
+"Deleted" badge and no link, and selecting a revoked identity says it is no longer in use; see
+_Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
 and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
@@ -202,6 +250,11 @@ and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 The Caller Context element lists its caller authentication methods in order, in the sidebar and
 in the fullscreen editor, each row with a Configure button that opens that method's settings;
 see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+A JWT Bearer Caller Context method requires Accepted Audiences, keeps one stored without them
+until it is changed, and has an **Audience Claim** select (`aud`, `client_id`, `azp`) for identity
+providers that issue no `aud`; see _Caller Context methods_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
 authorization server discovery (`caller_authentication.protected_resource`), and Save removes

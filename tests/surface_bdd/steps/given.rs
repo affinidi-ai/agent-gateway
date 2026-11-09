@@ -2281,6 +2281,83 @@ fn rest_api_answers_weather_report_with_temperature(
     );
 }
 
+#[given(expr = "REST API {string} answers a PDF document")]
+fn rest_api_answers_pdf_document(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+) {
+    const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n";
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/pdf".to_string())]),
+            body: serde_json::Value::String(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PDF)),
+            stream: MockStream::Bytes,
+        },
+    );
+}
+
+#[given(expr = "REST API {string} answers a file of {int} bytes")]
+fn rest_api_answers_file_of_size(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    size: usize,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), "application/octet-stream".to_string())]),
+            body: serde_json::Value::String(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                vec![0xffu8; size],
+            )),
+            stream: MockStream::Bytes,
+        },
+    );
+}
+
+#[given(expr = "the surface limits MCP responses to {int} bytes")]
+fn surface_limits_mcp_responses(
+    world: &mut SurfaceWorld,
+    max_response_bytes: usize,
+) {
+    world
+        .surface_config
+        .mcp_http
+        .get_or_insert_with(|| serde_json::json!({}))["max_response_bytes"] = serde_json::json!(max_response_bytes);
+}
+
+#[given(expr = "REST API {string} answers its weather as {string}")]
+fn rest_api_answers_weather_as_content_type(
+    world: &mut SurfaceWorld,
+    rest_api_name: String,
+    content_type: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&rest_api_name, TargetActorKind::RestApi);
+    set_target_response_for_actor(
+        world,
+        &rest_api_name,
+        MockResponse {
+            status: 200,
+            headers: HashMap::from([("content-type".to_string(), content_type)]),
+            body: serde_json::json!({"city": "Paris", "temperature": 21, "conditions": "Sunny"}),
+            stream: MockStream::None,
+        },
+    );
+}
+
 #[given(expr = "REST API {string} is failing with status {int}")]
 fn rest_api_is_failing_with_status(
     world: &mut SurfaceWorld,
@@ -2332,7 +2409,8 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
         "JWT Bearer" => SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
-            audiences: vec!["bdd-test-audience".to_string()],
+            audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
@@ -2999,6 +3077,94 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
+/// The live VP Audit Log of the running gateway: beside its logs when the
+/// scenario configured a log directory, and under `_storage/audit` otherwise,
+/// which the gateway resolves against the base folder it runs in. The rotated
+/// files sit beside it as `delegation-audit.jsonl.<position>`, counting up
+/// from `.1`.
+fn vp_audit_log_path(world: &SurfaceWorld) -> std::path::PathBuf {
+    let base = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running before its VP Audit Log is reached")
+        ._temp_dir
+        .path();
+    if world
+        .surface_config
+        .writes_log_directory
+    {
+        base.join("_storage/logs/delegation-audit.jsonl")
+    } else {
+        base.join("_storage/audit/delegation-audit.jsonl")
+    }
+}
+
+fn rotated_vp_audit_log_path(
+    world: &SurfaceWorld,
+    position: usize,
+) -> std::path::PathBuf {
+    let live = vp_audit_log_path(world);
+    live.with_file_name(format!("delegation-audit.jsonl.{position}"))
+}
+
+/// One credential injection as the VP Audit Log stores it: a single JSON line,
+/// closed by its newline.
+fn stored_credential_injection(trace_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "timestamp": "2026-11-07T10:00:00Z",
+            "event": "token_injected",
+            "trace_id": trace_id,
+            "provider_id": "calendar",
+            "provider_name": "Calendar",
+            "via_fabric": false,
+        })
+    )
+}
+
+fn write_rotated_vp_audit_log_file(
+    world: &SurfaceWorld,
+    position: usize,
+    trace_id: &str,
+) {
+    let path = rotated_vp_audit_log_path(world, position);
+    std::fs::write(&path, stored_credential_injection(trace_id))
+        .unwrap_or_else(|error| panic!("rotated VP Audit Log file {} must be written: {error}", path.display()));
+}
+
+#[given(expr = "a rotated VP Audit Log file holds a credential injection with trace {string}")]
+fn rotated_vp_audit_log_file_holds_a_credential_injection(
+    world: &mut SurfaceWorld,
+    trace_id: String,
+) {
+    write_rotated_vp_audit_log_file(world, 1, &trace_id);
+}
+
+/// Positions run consecutively while the history is whole, so leaving `.2` out
+/// is what a crash during a rotation, or a file deleted beside the gateway,
+/// leaves behind: the records it held are in no file a read can reach.
+#[given("a rotated VP Audit Log file is missing from the middle of the history")]
+fn rotated_vp_audit_log_file_is_missing_from_the_middle(world: &mut SurfaceWorld) {
+    write_rotated_vp_audit_log_file(world, 1, "gap-oldest-trace");
+    write_rotated_vp_audit_log_file(world, 3, "gap-newest-trace");
+}
+
+/// The half-written line an append interrupted by a crash or a power loss
+/// leaves at the end of the live log.
+#[given("the VP Audit Log holds a line that is not a record")]
+fn vp_audit_log_holds_a_line_that_is_not_a_record(world: &mut SurfaceWorld) {
+    use std::io::Write;
+
+    let path = vp_audit_log_path(world);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("the VP Audit Log at {} must be open for appending: {error}", path.display()));
+    file.write_all(b"{\"timestamp\":\"2026-11-07T10:00:00Z\",\"ev\n")
+        .unwrap_or_else(|error| panic!("the half-written record must be appended: {error}"));
+}
+
 #[given(
     expr = "the Credential Delegation Audit Log contains a token injection for caller {string} with email {string} and name {string}"
 )]
@@ -3606,6 +3772,27 @@ fn surface_accepts_jwt_audience(
     }
 }
 
+/// The JWT Bearer method checks the `client_id` a token was issued to, as for
+/// an identity provider whose tokens carry no audience.
+#[given(expr = "the surface accepts JWT Bearer tokens issued to client {string}")]
+fn surface_accepts_jwt_bearer_tokens_issued_to_client(
+    world: &mut SurfaceWorld,
+    client: String,
+) {
+    match world
+        .surface_config
+        .source_auth
+        .as_mut()
+        .expect("JWT source authentication must be configured before naming its clients")
+    {
+        SurfaceSourceAuthConfig::JwtBearer(config) => {
+            config.audiences = vec![client];
+            config.audience_claim = Some("client_id".to_string());
+        }
+        _ => panic!("JWT source authentication must be configured before naming its clients"),
+    }
+}
+
 #[given(expr = "the surface has an explicit inbound identity slot for MCP requiring selected identity field {string}")]
 fn surface_has_inbound_identity_requiring_selected_field(
     world: &mut SurfaceWorld,
@@ -3654,6 +3841,76 @@ async fn oauth_provider_ready_to_exchange_code(
             "scope": "calendar.read calendar.write"
         })))
         .await;
+}
+
+#[given(expr = "OAuth provider {string} records authorization response issuer {string}")]
+fn oauth_provider_records_authorization_response_issuer(
+    world: &mut SurfaceWorld,
+    provider: String,
+    issuer: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "an authorization response issuer is recorded only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_authorization_response_issuer = Some(issuer);
+}
+
+#[given(expr = "OAuth provider {string} has a callback path ending in the id the gateway gave it")]
+fn oauth_provider_callback_path_ends_in_its_id(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "only the surface's own OAuth provider is stored with a callback path ending in its id"
+    );
+    world
+        .surface_config
+        .oauth_callback_path_ends_in_record_id = true;
+}
+
+#[given(expr = "the gateway has OAuth provider {string}")]
+fn gateway_has_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    world
+        .surface_config
+        .additional_oauth_providers
+        .push(provider);
+}
+
+#[given(expr = "caller {string} has confirmed the consent start page for provider {string}")]
+async fn caller_has_confirmed_consent_start_page(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let (state, _cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
+    world.oauth_confirmed_state = Some(state);
 }
 
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]

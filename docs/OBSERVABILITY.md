@@ -255,7 +255,7 @@ receiving gateway records the variant the sending route's `fabric://` Target pin
 (`fabric://<gateway>/<surface>$<alias>`), else its own default variant's alias, else `_base_`. The
 caller's URL alias never selects the receiving gateway's variant (see
 [Which variant serves a request over Fabric](FABRIC.md#which-variant-serves-a-request-over-fabric)). Records outside surface requests carry none: management API
-records, `consent_granted` (the OAuth callback), settlement-worker `payment` records, config
+records, `consent_granted` and `delegation_failed` (the OAuth consent start page and callback), settlement-worker `payment` records, config
 reloads and traffic refused before a surface matched. A `policy_decision` of gateway scope on a
 surface request carries the variant it applied to; the policy itself is the same for every
 surface and variant. Records written before this field existed have none.
@@ -364,12 +364,19 @@ endpoint URL.
 | `rule` | `token_endpoint_https`, `tenant_credential_isolation`, `jwt_subject`, `target_https` or `target_source_auth` |
 | `enforced` | `true` when that rule's mode is `enforce`, so the configuration is also refused at runtime |
 
-A surface that derives a DID from an API Key Provider key it may not use, or whose key or
-owning surface is gone, is reported under its own rule, one `WARN` line per key id, with
-`subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue` (`other_tenant`,
-`appliance_key`, `missing_key`, `missing_owner` or `store_unavailable`) and `not_ready`, which
-is `true` when the surface is refused at runtime; see
+A surface that derives a DID from an API Key Provider key it may not use, a revoked key, or a
+key whose key or owning surface is gone, is reported under its own rule, one `WARN` line per key
+id, with `subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, `issue`
+(`revoked_key`, `other_tenant`, `appliance_key`, `other_surface`, `missing_key`,
+`missing_owner` or `store_unavailable`) and `not_ready`, which is `true` when the surface is
+refused at runtime (always for `revoked_key` and `missing_key`); see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
+The report judges from the API key listing the provider key check of the same boot or reload
+read. When that listing fails, the report logs one `WARN` line with
+`reason=api_key_store_unavailable` and lists every surface naming a key id as
+`store_unavailable`. When a key folder cannot be loaded, it logs one `WARN` line with
+`reason=api_key_store_unavailable` and the `skipped` folders, and lists as `store_unavailable`
+only the key ids no loaded folder holds.
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
@@ -419,6 +426,169 @@ the caller the receiving surface verified as `caller` and the paired gateway tha
 request as `caller.peer_gateway` (its issuer DID, else its Remote gateway record id). A
 `vp_injected` record of a Fabric request also carries `via_fabric: true`, with the DID of the
 agent its presentation is for as `agent_did`.
+
+**File size.** The VP Audit Log is rotated: once the live file reaches
+`[audit] vp_audit_log_max_bytes` (8 MiB by default) it is renamed to the next free position,
+`delegation-audit.jsonl.<n>`, counting up from `.1`, and a fresh live file is started. The
+highest position is the most recently rotated. The files already rotated are never touched again:
+however long the history has grown, a rotation is one rename of the live file plus one listing of
+the log directory to find the next free position, and an interrupted rotation leaves no gap
+behind. The position is read from the directory rather than counted in memory so that a rename
+can never land on a file that is already there and destroy the records in it.
+
+**Retention.** By default `[audit] vp_audit_log_keep` is `0`: every rotated file is kept, so no
+audit record is ever deleted. Rotation changes how the history is laid out on disk, not how much
+of it the appliance keeps. The history therefore grows with the appliance's request rate — give
+it the disk, because an audit log that fills the disk stops being written — and a read reports
+`truncated` once it is larger than the 256 MiB one read examines (see _Reads_ below).
+
+Because nothing is deleted by default, an audit response carries the size of the history on disk
+(`history_bytes`, the live log plus every rotated file) and the advisory
+`[audit] vp_audit_log_soft_cap_bytes` (`soft_cap_bytes`, 1 GiB by default, `0` for none). The
+Audit page shows the one against the other. The soft cap enforces nothing: no record is deleted,
+no write is refused and no rotation happens at it, and the history keeps growing past it. It is
+there so an operator sees the growth and decides what to do — forward to a Governance Audit
+integration, or bound the history below.
+
+The size is measured once, by listing the directory, when the gateway opens the log; from then on
+the writer keeps it as it appends and as retention deletes, so reporting it costs a page load
+nothing. Deleting a rotated file beside the gateway makes the figure read high until the next
+start-up; it is what the appliance is using, and nothing is enforced on it.
+
+Set `vp_audit_log_keep` to a positive number to bound the history instead: only the newest that
+many rotated files are kept, and the records in the files that fall out are **deleted outright**,
+with the loss counted nowhere. Lowering it from `0` deletes everything past the new bound in the
+next rotation, in one go under the writer's lock. The gateway's own copy of the audit history then reaches back only
+as far as those files do at the appliance's request rate, and a flood of request events shortens
+it further. Forward the records you must keep for longer to a Governance Audit integration, which
+keeps them wherever it delivers them, before bounding the history here.
+
+A `vp_audit_log_max_bytes` of `0` switches rotation off and lets the live file grow without limit;
+any other value must be at least 64 KiB, or the gateway refuses to start, because a smaller one
+rotates on nearly every record while keeping almost no evidence. Both settings are startup-only;
+see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml).
+
+A rotation that fails — a full disk, a permission change on the log directory, something squatting
+on the next position — is logged when the failure starts, once an hour while it continues, and
+once more when rotation succeeds again. While it lasts the live log grows past its cap, and the
+rotation is tried again once a minute rather than on every record, so a broken disk does not make
+each appended record pay a sync, a reopen and a directory scan. A failed sync before a rotation
+holds the rotation back and is reported to the dispatcher as a failed commit, so the records it
+covers are written again rather than counted as durable.
+
+**Reads.** `/v1/audit`, `/v1/delegation-audit` and the payment records behind
+`/v1/payments/audit` read on a blocking thread, one read at a time.
+A read walks the history backwards — the live file, then each rotated file from the highest
+position down — one line at a time, filters and counts each record as it meets it, and keeps only
+the page it returns. Its
+memory therefore follows the page size, not the size of the history: a page of 25 records holds
+25 records whether the history is 1 MiB or 1 GiB. Concurrent readers, a second dashboard tab or a
+filter changed while a page is still loading, wait for each other instead of each running a walk.
+The permit belongs to the read rather than to the request that asked for it, so a request
+cancelled mid-read still bars the next read until the walk it started has finished.
+
+A page load costs time in proportion to the history retained, not to the page: every line up to
+the scan limit is examined, and the lines a filter cannot rule out by substring are parsed. A
+category or text filter still walks every line up to that limit — a category filter cannot skip
+the records it hides, because `category_counts` describes every category of the records the other
+filters kept — while a view restricted to policy decisions (`flow`, `scope` or `decision`) parses
+only the lines that name one. Keeping the whole
+history (`vp_audit_log_keep = 0`) therefore makes the Audit page slower as the appliance ages,
+up to the fixed cost of the 256 MiB scan limit. A page holding policy decisions written before
+the policy version and content hash fields existed costs a second walk under the same limit, to
+find the signed presentations those rows take the two values from; it stops as soon as it has
+found them, which on recent rows is within a few records.
+
+Because every filter is applied inside the walk, a search or a category filter reaches every
+record the walk examines and is not cut short by a flood of records it discards. `total`,
+`total_pages` and `category_counts` are counted in the same walk: `category_counts` spans every
+category of the records the other filters kept, and `total` follows the selected category. The
+record shown for a policy decision written before the policy version and content hash fields
+existed takes them from its trace's signed VP, which is decoded only for the rows the page
+returns; a text search matches the record as it is stored, so searching for a value only that
+decoding fills in — a policy version or content hash on one of those older rows — does not find
+it.
+
+That second walk is bounded twice over: by the same scan limit as the first, and by 1024 embedded
+policy decisions collected across the whole page, so one trace whose presentation carries an
+unexpected number of them cannot grow a read. Both bounds mean **such a row can come back with no
+policy version and no content hash**, and which rows are filled in depends on the order the
+history is in rather than on the row: the walk stops at whichever presentations it reaches first,
+and stops early once it has found every trace the page asked for. A row shows the two fields
+itself, with no walk involved, whenever they were recorded with it, which is every policy decision
+written since those fields existed. An absent version or hash on an older row therefore means the
+read did not reach that row's presentation, never that the decision was made without a policy.
+Filtering the read to that row's `trace_id` gives the walk one trace to look for and no other
+page to share its 1024 with, so it is the way to see such a row enriched — unless its presentation
+lies beyond the scan limit, which no filter moves.
+
+One limit bounds the walk: a read examines `vp_audit_log_max_bytes` × (`vp_audit_log_keep` + 2)
+bytes of the history, capped at 256 MiB, counted in the history's own bytes — the lines it drops
+or passes over cost it too. With the default rotation — 8 MiB files and every one of them kept —
+the cap is what applies, so a read examines the newest 256 MiB.
+
+`truncated: true` means the read **stopped before the end of the history**: its scan limit ran
+out, or it met a rotated file that is missing or unreadable. `total`, `total_pages` and
+`category_counts` then describe what it reached and no more.
+
+`dropped_records` counts, separately, the records **in** the history that the read could not
+return: a line too long for the walk's line buffer, and a line that is not a record — the
+half-written fragment an append interrupted by a crash or a power loss leaves behind. Such a
+fragment stays in the history: with the default retention nothing is ever deleted, so it marks
+every read until enough newer records push it out of the scanned window. It says the history
+holds something the gateway cannot read, which is a historical event rather than an ongoing
+fault, and it is counted apart from `truncated` so the two cannot be confused. Each read logs the
+count once.
+
+**Either one makes the counts lower bounds**, and the dashboard shows them as such.
+
+`truncated: true` is a normal condition on a long-running appliance, not an exotic one. A read
+reaches its limit when:
+
+- the history is larger than 256 MiB and `vp_audit_log_keep` is `0` (the default), which any
+  appliance reaches eventually;
+- `vp_audit_log_max_bytes` × (`vp_audit_log_keep` + 2) is above 256 MiB — about 25.6 MiB of
+  `vp_audit_log_max_bytes` with a `vp_audit_log_keep` of 8 is already there;
+- `vp_audit_log_max_bytes` is `0`, so the live file is never rotated and grows past the cap;
+- the log was already larger than the cap when rotation was first switched on, because the whole
+  of it becomes the first rotated file;
+- a run of failed rotations let the live file grow past the cap.
+
+It is also set, whatever the size of the history, when a rotated file is missing from the middle
+of it (a crash during a rotation) or cannot be read (a permission change, a backup tool): the
+walk reads past such a file to the records behind it, logs it once, and says the history it
+returned is incomplete, rather than failing the read and hiding a live log that reads perfectly
+well.
+
+Only the live log fails a read, and it does so in two cases: when it cannot be opened (a
+permission change), and when it is not a regular file at all — a directory, a FIFO or a socket at
+its path. Both mean the gateway cannot read its own audit log, so the read is answered with `500`
+rather than with the rotated history alone presented as the whole of it. Neither is reported as a
+gap: `truncated` also means the scan limit ran out, a normal successful partial read, so a
+misconfigured appliance would be indistinguishable from a busy one.
+
+A single line that does not fit the walk's 1 MiB line buffer — which the gateway never
+writes — is skipped, and only that line: the records read beside it are still returned, including
+the one whose newline closes the chunk the oversized line starts in. No file can cost a read more
+than that buffer and the two 64 KiB chunks it is measured across, however it was damaged or
+edited, and a rotated name that is not a regular file is passed over rather than opened — only
+the rotated names, the live log's own being the case above. A line
+the walk skipped, and a line that does not parse as a record, are counted in `dropped_records`:
+a page never counts a record it could not read as absent.
+
+A read that fails is answered with `500` by both audit endpoints, with the JSON body
+`{"error": "Failed to read the audit log"}`; what failed stays in the gateway's own log. Neither
+answers an unreadable log with an empty page, which would assert that the administrator is looking
+at all of the evidence.
+
+A page read with `truncated: true` or a non-zero `dropped_records` shows every number that came
+from the walk as a lower bound: the Audit page and the Credentials → Audit tab render the record
+total, the pager's page count and each category chip's count with a trailing `+` (`1243+`,
+`Page 5 of 687+`), and nothing else about them changes. A partial count is therefore never
+presented as a complete one, and an empty page of such a read says that the records searched held
+none rather than that the log is empty. `/api/admin/payments/audit` carries both fields for its
+own counts; it has no dashboard view, so a consumer that shows those counts must present them as
+lower bounds the same way.
 
 **Request events.** Raised at the Access Point on the direct, MCP-proxy and fabric paths, and
 at a Transit Point where an event below says so.
@@ -502,7 +672,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
     receive for a request whose caller the receiving surface did not verify),
     `access_point_not_ready` (a closed Access Point without source authentication, logged with
     `reason=no source authentication`, or a surface that derives a DID from an API key it may
-    not use, logged with `reason=provider_key_tenant` or, while the API key store cannot be read,
+    not use, logged with `reason=provider_key_tenant`, from a revoked API key, logged with
+    `reason=api_key_revoked`, from an API key id no key has, logged with
+    `reason=api_key_missing`, or, while the API key store cannot be read,
     `reason=api_key_store_unavailable`, answers every request with `503`, on the direct path and
     over Fabric; see [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live)), for a request to a Target bound by
     external consent refused before anything is sent `target_path_refused` (`400`, a path the
@@ -634,6 +806,38 @@ for which writes.
 
 A `2026-07-28` MCP proxy tool call whose path parameter makes a URL segment `.` or `..` (or an ambiguous one above a non-root `base_url` path) is answered `400` with `-32602` "Invalid tool arguments" before anything is sent, and writes no request event.
 
+**Connector calls.** A call through a Transit Point whose `transit_credentials` take a connector
+grant (`consent_mode: external`) is recorded as `connector_call` (group Delegation), once for each
+call that reaches the grant step. It answers who used whose account: `user_identity_hash` is the
+caller's identity hash whichever account the grant is, and `subject` says whether the grant was
+the `owner`'s, one account for every caller, or the caller's own.
+
+- `transit_point`: the Transit Point's id; `provider_id` the credential provider; `surface_id`,
+  `channel_name` and `tenant_id` the surface and its tenant (absent for an appliance-wide
+  surface). `mcp_tool_name` names the tool an MCP `tools/call` asks for, never its arguments;
+  the caller chooses it, so it is kept without control characters and cut to 128 characters.
+- `outcome` `forwarded`: the call was sent with the grant and the vendor answered with this
+  status; `status_class` is its class, `2xx` to `5xx`. The record is written when the vendor's
+  status arrives, so it stands even if the gateway then refuses the answer (an MCP answer
+  compressed although none was accepted, or a body that times out, is too large or cannot be
+  read) and the caller is answered with an error: the vendor has acted on the call. A call the
+  vendor rejected for its token and the gateway retried with a refreshed one is one record,
+  carrying the retry's answer. The call's earlier `token_injected` records, one per send,
+  remain. A call that got no answer from the vendor at all records no `connector_call`.
+- `outcome` `refused`: the call was refused, before it was forwarded or because the vendor
+  rejected the grant; `reason` is the fixed reason the caller was told (`connect_required`,
+  `scope_insufficient`, `connector_unavailable`) or `caller_not_identified`, and `cause` the
+  fixed cause inside it, as the gateway's log names it (for example `provider_of_another_tenant`,
+  `grant_beyond_the_bindings_scopes`, `invalid_credential_header`).
+- The record names the caller by the hash alone: no `caller` context, argument, token or text
+  from the vendor. The Access Point's Target grant keeps its own records (`token_injected`,
+  `request_rejected`).
+- A call refused before the grant step records no `connector_call`: for example by its transit
+  token, the hop limit, the trust check, a policy, the Transit Point's rate limit (recorded as
+  `rate_limited`) or its tool gate (recorded as `policy_decision`). A `2026-07-28` MCP request is
+  refused at the start of the grant step, before any grant is looked up, with `-32022`
+  "Unsupported protocol version", and records none either.
+
 **Volume.** Request events are unbounded by design: each is recorded once per request, with no
 aggregation or sampling. `auth_failed` and the routing `request_rejected` are recorded before
 the surface rate limit is checked, and `rate_limited` once for every request the limit refuses,
@@ -664,7 +868,9 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   event set mixes audit and other events gets each event as its own message, never values of
   one inside the other.
 
-**Delivery.** No record is lost by the gateway except in the counted cases below.
+**Delivery.** No record is lost on its way to a sink except in the counted cases below. What a
+sink does with a record afterwards is the sink's own: the VP Audit Log deletes its oldest
+records as it rotates, and that is not counted here (see _File size_ above).
 
 - *Producing.* The producer (`src/audit/producer.rs`) is the only place a record is finalised.
   It checks the selections first (one atomic read), gives the record an `event_id` (UUID v4),
@@ -722,7 +928,8 @@ administrator-only by default (see [`INTEGRATIONS.md`](INTEGRATIONS.md#managemen
   integration retry policy still applies inside each attempt. Delivery is
   at-least-once: a record may be delivered again after a restart, so receivers should
   deduplicate on `event_id`. The VP Audit Log does this itself for the records at the end of
-  its file.
+  its history, walking back into the rotated files — past one missing from the middle, or one it
+  cannot read — so a log rotated just before a restart still recognises them.
 - *Sinks coming and going.* A new sink reads from the start of the journal; no record is
   addressed to a sink before it exists, so it misses nothing. An integration that is disabled,
   whose endpoint is disabled, or whose event set no longer holds audit events is paused: it
@@ -836,7 +1043,8 @@ template sends the default event envelope, whose `data` is the record:
 ```
 
 Kafka producers belong to the endpoint: every integration and test send on one endpoint shares
-it. It is rebuilt when the brokers or SASL settings change and dropped when the endpoint is
+it. It is rebuilt when the brokers, security protocol or SASL settings change and dropped
+when the endpoint is
 changed or deleted; the Kinesis, Pulsar and Redis Streams publishers still open a client per
 record.
 

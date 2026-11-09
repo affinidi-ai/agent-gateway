@@ -159,6 +159,11 @@ you open any listener:
   private one. Failed attempts are not throttled, so protect such a listener with your load
   balancer or firewall too. See
   [Reachable from other hosts](SOURCE_AUTH.md#reachable-from-other-hosts).
+- **Send the OAuth consent routes to one gateway process.** A used consent start link is
+  remembered only by the process that used it, so with several replicas behind one callback
+  URL, a start link can be confirmed once on each. Route `{oauth_callback_route}/*` (by
+  default `/v1/identity/oauth/callback/*`) to a single process. See
+  [Consent flow](CREDENTIAL_DELEGATION.md#consent-flow).
 
 You also need:
 
@@ -206,7 +211,7 @@ proxy as before.
 | Secret | Required | How to set it |
 | --- | --- | --- |
 | `backup_encryption_key` | Yes. The gateway does not start without it. | 64 hex characters, for example `openssl rand -hex 32`. Prefer `file://` with a mounted secret, so the key does not appear in the process environment or `docker inspect`. |
-| Encryption-at-rest key | When the gateway holds real credentials | A 32-byte key. Encryption at rest is off by default, so `_storage/` holds secrets in plain text until you turn it on. Choose the key source before the gateway stores data. See [Secrets and encryption at rest](CAPABILITIES.md#secrets-and-encryption-at-rest). |
+| Encryption-at-rest key | When the gateway holds real credentials | A 32-byte key. A configuration from `--generate-bootstrap` has encryption at rest off, so `_storage/` holds secrets in plain text until you turn it on. The development setup turns it on for the environments it creates. Choose the key source before the gateway stores data. See [Secrets and encryption at rest](CAPABILITIES.md#secrets-and-encryption-at-rest). |
 | `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance or keep grants by binding (`consent_mode: external`); otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. |
 
 Store the backup key and the encryption-at-rest key away from the backups. Losing either

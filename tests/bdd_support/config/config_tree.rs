@@ -94,6 +94,7 @@ pub struct ApiKeyProviderFixture {
     pub key_id: String,
     pub client_id: String,
     pub secret: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -111,6 +112,7 @@ pub struct CredentialProviderFixture {
     pub callback_url: Option<String>,
     pub token_refresh_enabled: bool,
     pub api_key_secret_ref: Option<String>,
+    pub authorization_response_issuer: Option<String>,
     /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
     pub jwt_settings: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -131,6 +133,7 @@ impl ApiKeyProviderFixture {
             key_id: key_id.into(),
             client_id: client_id.into(),
             secret: secret.into(),
+            created_at: Utc::now(),
         }
     }
 }
@@ -334,6 +337,7 @@ pub fn write_gateway_config_tree(
             &api_key_provider.key_id,
             &api_key_provider.client_id,
             &api_key_provider.secret,
+            api_key_provider.created_at,
         );
     }
 
@@ -501,6 +505,9 @@ fn write_credential_provider_fixture(
     }
     if let Some(secret_ref) = &provider.api_key_secret_ref {
         value["api_key_secret_ref"] = serde_json::json!(secret_ref);
+    }
+    if let Some(issuer) = &provider.authorization_response_issuer {
+        value["authorization_response_issuer"] = serde_json::json!(issuer);
     }
     if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
         for (name, setting) in settings {

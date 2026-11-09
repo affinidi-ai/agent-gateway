@@ -90,6 +90,55 @@ delete the gateway refuses (an integration endpoint that references the secret, 
 the token's scope, a failed lookup) and a delete outside a management request record nothing.
 See [`OBSERVABILITY.md`](OBSERVABILITY.md#governance-audit-forwarding) for the record.
 
+### Redirect URI and issuer of an authorization code provider
+
+An `oauth2_authorization_code` provider without an `issuer` grants its credential through the
+gateway's [consent flow](#consent-flow). Its redirect URI is its `callback_url`, or, without
+one, the gateway's `https://{did.domain}` followed by its `callback_path`, which the gateway
+sets at create to `{oauth_callback_route}/{id}`, the provider's own id, and never changes. Each
+new provider's redirect URI is therefore its own, whatever its tenant and `provider_id`. Providers
+stored before keep their `{oauth_callback_route}/{provider_id}` path, so their vendor
+registrations still match.
+
+Create refuses such a provider's `callback_url` with `400`, since its `callback_path` is not known
+until the create returns it; set the `callback_url` with an update. An update that changes the
+redirect URI refuses with `400`:
+
+- a `callback_url` that is not an `https` URL with a host, or carries credentials, a query or a
+  fragment, or whose path does not end in the provider's `callback_path`; a reverse proxy prefix
+  before it is kept, so `https://gw.example/prefix/v1/identity/oauth/callback/{id}` is accepted
+  for `/v1/identity/oauth/callback/{id}`. The path comparison is exact and case-sensitive;
+- a redirect URI that another such provider, of any tenant, already has. Two providers stored
+  with the same `provider_id` path, in different tenants, can share one.
+
+Create, and an update that changes either, also refuse with `400` an `authorization_endpoint` or
+`additional_params` that break the rules in [The start page](#the-start-page). A provider without
+an `authorization_endpoint` is accepted but gets no consent link.
+
+An update that keeps the stored redirect URI, or the stored `authorization_endpoint` and
+`additional_params`, is not checked against those rules, so a stored provider that breaks them
+can still be renamed or otherwise edited before it is fixed.
+
+A stored provider that breaks either rule gets no consent link (the binding is unavailable, see
+[When a credential cannot be resolved](#when-a-credential-cannot-be-resolved)) and is refused at the
+start page with `redirect_uri_invalid` until it is fixed. When two stored providers share a
+redirect URI, both fail closed, and the gateway logs an `ERROR` at startup and on every
+configuration reload naming each such pair by provider id. A stored provider whose redirect URI
+or authorization endpoint breaks the rules here or in [The start page](#the-start-page) is
+logged the same way, as an `ERROR` naming its provider id and the rule it breaks, never its
+URLs or parameters. The remedy is to give one of them a
+`callback_url` on a distinct host, or to recreate it, which gives it a path of its own; either
+way, register the new redirect URI with the vendor. A tenant move changes neither rule's outcome, so
+it is not checked again.
+
+`authorization_response_issuer` is the `iss` (RFC 9207) the provider's authorization server puts
+on its authorization responses, set by the operator through the API, for example
+`https://github.com/login/oauth` for GitHub. When set, the callback requires that exact `iss`;
+unset, `iss` is ignored. It is accepted only on an `oauth2_authorization_code` provider without
+an `issuer`, as an `https` URL with a host and no query or fragment, on create and update; an
+update with a blank value clears it. It does not make the provider an external consent provider
+and no metadata is fetched for it.
+
 ### https token endpoints
 
 Every type except `api_key` sends its client secret, assertion or code to the token endpoint,
@@ -622,15 +671,16 @@ header saying so.
 The switch releases anything only when the receiving surface verifies a per-user credential on
 each Fabric request. Only two kinds of caller authentication can tell a partner's users apart: a
 resource token (`mcp_http.authorization`), and a `jwt_bearer` method that names an audience (its
-own `audiences`, or the resource `protected_resource` binds) through a JWT verification strategy
-that names an issuer. Every other method the Access Point lists must be one of them, or mTLS,
+own `audiences`, or the resource `protected_resource` binds), matched against `aud`, through a JWT
+verification strategy that names an issuer. Every other method the Access Point lists must be one of them, or mTLS,
 which never verifies a request over Fabric and so leaves it with no verified caller. The
 receiving surface normally verifies the credential the peer's `target_auth` presents. With
 `api_key`, the identity hash is the secret's id, so every key in that secret, the partner's and
 those of the surface's direct callers alike, would be one caller with one grant; an
 `api_key_provider` key names the client that holds it; a `did_auth` session names the DID that
-signed in, not the user a partner acts for; and a `jwt_bearer` method with no audience accepts a
-token the identity provider issued for another service. A save of a Transit Point that sets the
+signed in, not the user a partner acts for; and a `jwt_bearer` method with no audience, or one
+whose `audience_claim` is `client_id` or `azp`, accepts a token the identity provider issued for
+another service. A save of a Transit Point that sets the
 switch where the surface's caller authentication, on the surface or in the variant the Transit
 Point belongs to, cannot tell users apart is accepted with a `Warning` header saying so, and the
 Transit Point releases nothing to Fabric callers there. A JWT whose `sub` is the end user, with
@@ -996,6 +1046,13 @@ and a provider with an `issuer` is bound by no other consent mode, on a Transit 
 in a variant's list as in the surface's, and refuses a Transit Point with `consent_mode:
 external` whose id is empty.
 
+Each call through such a Transit Point that reaches its grant is audited `connector_call`: the
+Transit Point, provider, surface and its tenant, the caller's identity hash, whose grant it is
+(`subject`), the tool of an MCP `tools/call`, and either `forwarded` with the class of the vendor's
+answer or `refused` with the reason the caller was told and its cause. It carries no argument,
+token or text from the vendor.
+[`OBSERVABILITY.md`](OBSERVABILITY.md) lists the fields.
+
 A surface with such a binding cannot move to another tenant: the binding's provider must be of
 the surface's own tenant, and a bound provider cannot move ([Deleting a
 provider](#deleting-a-provider)), so the reassignment answers `409`. Remove the binding, which
@@ -1004,9 +1061,9 @@ removes and revokes its grants, move the surface and the provider, then bind it 
 A binding with external consent, on a Transit Point or the Access Point Target, needs callers
 authenticated by something the gateway can check. A surface whose Access Point, in its base or
 any variant, has a `did_auth` method without `allowed_dids`, which accepts any DID that signs
-its challenge, or a `jwt_bearer` method without `audiences` while it publishes no
-`protected_resource` (which binds the audience), so that a token its issuer minted for any
-other service is accepted, is refused such a binding, `owner` or `caller`. A `caller` binding is
+its challenge, or a `jwt_bearer` method without `audiences`, or whose `audience_claim` is
+`client_id` or `azp`, while it publishes no `protected_resource` (which binds the audience), so
+that a token its issuer minted for any other service is accepted, is refused such a binding, `owner` or `caller`. A `caller` binding is
 also refused on a surface whose Access Point takes the gateway's resource access tokens
 (`mcp_http.authorization`): they name a caller by the subject its sign-in stated, under the
 gateway's issuer, so callers of two identity providers with the same subject would share a
@@ -1045,15 +1102,19 @@ When the vendor answers `401` with a `Bearer` challenge that rejects the token
 (`error="invalid_token"`), the gateway refreshes the grant, single-flight, and sends the call
 once more with the new token; an MCP server checks the token before it acts, so a `401` means
 nothing ran. When another call has refreshed the grant, or the person has connected again,
-meanwhile, that grant is used without a refresh. A grant that cannot be refreshed, or a refresh
-token the authorization server refuses (`invalid_grant`), removes the grant, revoking it at the
-vendor, and the call answers `connect_required`; but only while the grant still holds the token
+meanwhile, that grant is used without a refresh. A refresh token the authorization server
+refuses (`invalid_grant`) removes the grant, revoking it at the vendor, and so does a caller's
+grant that cannot be refreshed; an owner's grant that cannot be refreshed is kept. Either way the
+call answers `connect_required`; a removal happens only while the grant still holds the token
 the vendor refused, so a grant refreshed or connected again meanwhile is kept, and the call
 answers `connector_unavailable` instead. A second `401`, to the call sent again with a token the
 authorization server has just issued or another call or a reconnect has just stored, refuses
 that request, not the connection: the grant is kept, nothing is revoked, and the call answers
 `connector_unavailable`. Any caller of an owner binding can send a request a resource refuses,
-so no such answer ends the owner's grant; a dead authorization shows at the next refresh. A
+so no such answer ends the owner's grant; a dead authorization shows at the next refresh. An
+owner's grant the vendor keeps refusing is still sent with each call, and each call answers
+`connect_required`, until the owner connects again or its access token expires; one whose token
+never expires lasts until a reconnect, or until the grant is [removed](#removing-grants). A
 `401` without such a challenge, as a front proxy, a firewall or a path that is not the vendor's
 answers, or with one that names no `error`, which RFC 6750 keeps for a request that carried no
 token, is not taken for a refused token: the grant is kept and the call answers
@@ -1109,7 +1170,7 @@ API, the grants report and their removal take `"hop": "target"`.
 | `inject_as` | `bearer_header` or `custom_header`. The grant goes in a header, which replaces any of the same name; `meta`, which would put it in the body, is refused |
 | The only binding | `outbound_credentials` holds no other binding, and the surface has no Transit Points, its own or a variant's: `outbound_credentials` would apply on every Transit Point |
 | In place of every other credential | The Target has no `target.auth`, and the Access Point does not forward the caller's JWT (`forward_header`). The caller's own `Authorization`, and the header its credential came in, never reach the vendor |
-| Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
+| Callers | Authenticated by something the gateway can check, as on a Transit Point ([above](#external-consent-on-a-transit-point)): no `did_auth` without `allowed_dids`, no `jwt_bearer` without `audiences` or with an `audience_claim` other than `aud` unless the Access Point publishes `protected_resource`, and for `subject: caller` no `mcp_http.authorization` |
 | No presentation of the agent | No identity VP (`target.identity_injection.inject_vp`, or `identity_slots.inbound`), no enabled `target.workload_binding`, and the surface's DID, if it has one, injected in a header rather than `protocol_native`. A presentation of the managed agent, minted without an audience or a nonce, would describe the agent to the vendor, which could present it elsewhere |
 | No custom metadata | No enabled `target.custom_metadata`, which would send the vendor values of the gateway's, secrets-store references among them, in `_meta` or `X-Gateway-*` headers beside the grant |
 | No payment | No enabled `target.payment_policy`, x402 or MPP, local or delegated. A payment is settled before the surface's policy and before the grant is released, and the release can still be refused (no grant, a refused refresh, a Fabric caller); settling it later would hide it from the policies that read it |
@@ -1166,7 +1227,8 @@ At run time a request to the Target:
   counted against `external_consent_refresh_refusals`; a `403` whose challenge says
   `insufficient_scope` answers `scope_insufficient`; anything a new connect would not fix
   answers `connector_unavailable` and keeps the grant;
-- marks the grant used and audits it `token_injected`, with the binding's subject in the detail
+- marks the grant used, at most hourly as every release does, and audits it `token_injected`,
+  with the binding's subject in the detail
   (`grant_by_binding:owner:target` or `grant_by_binding:caller:target`), under the identity hash
   of the caller it was released for, on the first send and on the one retry alike;
 - is answered, when refused, before anything is sent, with the fixed reasons of the table above:
@@ -1329,9 +1391,12 @@ the delegation audit records `elicitation_declined`, `elicitation_cancelled` or
 A binding that applies but whose credential cannot be resolved refuses the request rather
 than forwarding it without the credential. That covers a deleted or unreadable provider, an
 API key whose secret cannot be read, a failed client-credentials token request, a vault read
-error, consent that is needed but cannot be asked for because no authorization URL can be
-built, for example when the provider has no `authorization_endpoint`, and an `elicit` prompt
-that fails as described above. A failed token request records `client_credentials_failed`,
+error, consent that is needed but cannot be asked for because no consent link can be minted,
+and an `elicit` prompt that fails as described above. A consent link is minted only when its
+start POST could complete: the provider's redirect URI follows the rules in
+[Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider)
+and no other provider has it, its client ID can be read, and its authorization URL can be built
+(see [The start page](#the-start-page)); otherwise the binding records `provider_unavailable`. A failed token request records `client_credentials_failed`,
 `jwt_bearer_failed` or `client_credentials_jwt_auth_failed` by provider type. An Access Point and
 Fabric receive answer `503`: on an MCP surface a JSON-RPC error (`-32603`, `Delegated
 credentials unavailable`) carrying the request's id, otherwise an `application/problem+json`
@@ -1408,10 +1473,15 @@ sequenceDiagram
     participant API as Third-party API
     A->>G: Outbound request
     Note over G: Vault lookup for this agent,<br/>user, and provider: none found
-    G-->>A: 401 consent_required, with the authorization URL
+    G-->>A: 401 consent_required, with the consent start URL<br/>({redirect URI}/start?state=start state)
+    U->>G: GET the consent start page
+    G-->>U: Agent, surface, provider and scopes, with a Continue button
+    U->>G: POST the start page (same origin)
+    Note over G: Make 32 random bytes, seal a callback state<br/>holding their SHA-256 and the PKCE verifier,<br/>build the provider URL, claim the start state
+    G-->>U: 302 to the provider, Set-Cookie __Host-ag_consent_<id>
     U->>P: Sign in and approve the scopes
-    P->>G: Redirect to the OAuth callback with a code
-    Note over G: Check the state, exchange the code<br/>with the PKCE verifier, store the token
+    P->>G: Redirect to the OAuth callback with a code and the cookie
+    Note over G: Check the state, the path, the provider,<br/>the cookie and iss, claim the state,<br/>exchange the code, store the token
     A->>G: Retry
     Note over G: Vault lookup: found
     G->>API: Request with the injected token
@@ -1419,31 +1489,147 @@ sequenceDiagram
     G-->>A: Response
 ```
 
-The authorization URL uses PKCE with the `S256` challenge method. The `state` parameter is
-an `OAuthState` carrying the agent DID, the user identity hash, the surface, the provider,
-a random nonce, an expiry, and the PKCE code verifier. The callback therefore needs no
-server-side session to know which request it completes.
+The `consent_required` answer and the MCP elicitation carry the gateway's consent start page,
+not the provider's authorization URL: `{redirect URI}/start?state=…`, where the redirect URI is
+the provider's `callback_url`, or the gateway's `https://{did.domain}` followed by its
+`callback_path`. An agent that checked the authorization URL's host for the provider's will
+find the gateway's instead, and a provider's mobile-app handoff no longer starts from that link.
+
+### The start page
+
+`GET {callback_path}/start` shows the agent DID, the surface, the provider
+and the scopes, with a button that POSTs the page back. It claims nothing and sets no cookie,
+so a link scanner or a chat unfurler may fetch it any number of times. It is sent with
+`Cache-Control: no-store`, `Referrer-Policy: same-origin`, `X-Frame-Options: DENY` and a
+`Content-Security-Policy` with `frame-ancestors 'none'`, so another site cannot frame it.
+
+The POST is accepted only as the person's click on the start page: the browser's
+`Sec-Fetch-Site: same-origin`, `Sec-Fetch-User: ?1` and `Sec-Fetch-Dest: document`, or, from a
+browser that sends no fetch metadata, an `Origin` equal to the redirect URI's origin. Any other
+POST, including one with neither header, with `Origin: null`, or without `Sec-Fetch-User: ?1`, is
+refused with `403`, so neither another site's form nor script on the gateway's own origin can
+skip the page. The POST then:
+
+1. makes 32 random bytes and a PKCE verifier, and seals a callback state with a fresh nonce,
+   the verifier and the bytes' SHA-256, expiring at the start state's expiry or ten minutes
+   from now, whichever is sooner;
+2. builds the provider's authorization URL, with the client ID read from the secrets store; a
+   POST refused here leaves the start state unused;
+3. claims the start state's nonce, so a second POST of the same link is refused with `400`;
+4. answers `302` to the provider's authorization URL, with `Cache-Control: no-store`,
+   `Referrer-Policy: no-referrer` and the bytes, base64url-encoded, in the cookie
+   `__Host-ag_consent_<id>`, where `<id>` is the first 16 characters of the base64url SHA-256 the
+   callback state holds, with `Path=/`, no `Domain`, `Secure; HttpOnly; SameSite=Lax` and a `Max-Age` of the callback
+   state's remaining lifetime. `__Host-` keeps the cookie on the gateway's own host, so a sibling
+   subdomain cannot set one, and each consent has a cookie of its own, so two consents started
+   in one browser both complete.
+
+The binding cookie never leaves the gateway. On every listener, inbound and outbound, a request
+loses any `ag_consent…` cookie (with or without a `__Secure-` or `__Host-` prefix) before a
+handler reads its headers, so no Access Point, Transit Point, MCP or A2A proxy, Fabric send or
+card fetch forwards it, and a response loses any such `Set-Cookie` the gateway did not write
+itself, so no managed agent, target or Fabric peer can set one in the person's browser. The
+callback alone reads the cookies taken.
+
+The provider's `authorization_endpoint` must be an `https` URL with a host and no credentials or fragment;
+it and `additional_params` together hold at most 32 parameters, none of `response_type`,
+`client_id`, `redirect_uri`, `scope`, `state`, `code_challenge` or `code_challenge_method`, none
+repeated, with names of at most 128 bytes and values of at most 2048. The URL uses PKCE with the
+`S256` challenge method.
+
+### The callback
+
+Every check runs before the code is exchanged:
+
+- the `state` is a callback state this gateway sealed, not expired, carrying a browser binding;
+  a start state, or any state without a browser binding, is refused;
+- the provider the state names still has that id and slug, is `oauth2_authorization_code`, has
+  no `issuer`, and its `callback_path` ends in the callback's path segment;
+- the browser presents the state's own cookie, `__Host-ag_consent_<id>`, whose SHA-256,
+  compared in constant time, is the state's (no other consent cookie is read): a callback URL opened in another browser, forwarded or leaked, is
+  refused with `403`;
+- when the provider has an `authorization_response_issuer`, the callback carries that exact `iss`
+  (RFC 9207); without one, `iss` is ignored;
+- a `code` is present, and the state's nonce has not been used.
+
+A provider's `error` answer is refused too, and logged only when it is `[A-Za-z0-9_]{1,128}`;
+`error_description` is never shown or logged. Every refusal, at the start page, its POST or the
+callback, shows the same fixed page, which reflects nothing from the request, the provider or an
+error, with `400` (or `403` as above), `Cache-Control: no-store` and `Referrer-Policy:
+no-referrer`; at the callback, when the state names its cookie, that cookie is cleared, and no
+other cookie is set. Every refusal is logged as a `WARN` with the reason and the provider only,
+never the state, the code, the cookie or `iss`. It is also recorded as a `delegation_failed`
+audit event whose `reason` names the check, but only when the request carried a state this
+gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
+only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
+and the event name the provider by its `provider_id` when the path's segment is the sealed
+state's own credential provider id, as it is at a callback path ending in that id, so they match
+`consent_granted`; otherwise they name it by the path's segment:
+
+| `reason` | Refused because |
+| --- | --- |
+| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of the other stage, or the start POST's binding cookie cannot be sent |
+| `consent_state_reused` | The start state or callback state was already used on this process |
+| `consent_provider_mismatch` | The path's last segment is not that of the state's provider's `callback_path`, or that provider is gone or changed |
+| `browser_binding_mismatch` | The callback has no binding cookie, or another browser's |
+| `iss_missing`, `iss_mismatch` | The callback lacks, or differs from, the provider's `authorization_response_issuer` |
+| `consent_response_invalid` | The callback is malformed, carries no code, or an `error` outside `[A-Za-z0-9_]{1,128}` |
+| `consent_denied` | The provider answered with an `error` |
+| `redirect_uri_invalid` | The provider's redirect URI breaks the rules in [Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider) or is another provider's |
+| `authorization_url_invalid` | The provider's authorization endpoint or `additional_params` break the rules in [The start page](#the-start-page) |
+| `cross_site_consent_start` | The start POST did not come from the start page's origin |
+| `credentials_unavailable` | The provider or its client ID could not be read |
+| `token_exchange_failed` | The provider's token endpoint refused or failed the exchange |
+| `vault_store_rejected` | The token was obtained but could not be stored (`500`) |
+
+Once the state is claimed the code is exchanged; an exchange that fails uses the state up, as
+it uses up the code. A callback refused before the claim leaves the state unused, but the
+refusal clears the browser's binding cookie, so the person starts the consent again from the
+agent rather than reopening the same callback.
+
+### What the start page and the cookie protect against
+
+They stop a forwarded or leaked callback URL or provider URL from storing a grant once the
+person has opened the start page, a second opener of a start link already used, link scanners
+using up a link, a callback whose path names another provider, a missing or wrong `iss` from a
+provider whose operator recorded its issuer, and content spoofing through reflected error text.
+A sibling subdomain cannot plant a binding cookie (`__Host-`), a managed agent, target or peer
+cannot set one with `Set-Cookie`, and none is forwarded to them.
+
+They do not stop a person who opens and confirms a start link someone else sent them, nor
+someone who opens a forwarded start link before its intended person: the browser that confirms
+the start page first is the one the grant is bound to, and the grant is stored under the agent
+and user the link was made for. The start page names the agent, surface and provider so a
+person can notice a link that is not theirs. Single use of start and callback states is
+remembered per gateway process, for 15 minutes, so a restart or another replica behind the same
+callback URL does not know a state was used; see
+[Network](DEPLOYMENT_REQUIREMENTS.md#network). Script served on the gateway's own origin, such
+as the dashboard, could still set a binding cookie, since `__Host-` only keeps other hosts out,
+though in a browser that sends fetch metadata it cannot confirm a start page without the
+person's click.
+
+### State
+
+`state` is an `OAuthState` carrying the agent DID, the user identity hash, the surface, the
+provider, the scopes, a random nonce and an expiry; the callback state adds the PKCE code
+verifier and the browser binding. The callback therefore needs no server-side session to know
+which request it completes.
 
 `state` is always sealed with AES-256-GCM before it is base64url-encoded, so neither the
-provider nor anyone else who sees the authorization URL can read it (the PKCE code verifier
-included) or forge one naming a different agent or user. When encryption at rest is
-enabled, its key seals the state; otherwise a key derived from `AG_IDENTITY_HASH_PEPPER`
-does, so gateways that share the pepper can open each other's states. The callback refuses
-a `state` this gateway did not seal, an expired one, and one whose nonce was already used
-([`encode_oauth_state`, `decode_oauth_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
-It also refuses a `state` that names another provider than its path, without using it up, and
-records and completes the consent under the provider the `state` names.
-Used nonces are remembered in the gateway process for 15 minutes, longer than a state
-lives, so a restart or a different gateway instance does not know about them. A state is
-used up only when its credential is stored, so a callback that fails before then, for
-example at the token exchange, can be retried with the same state.
+provider nor anyone else who sees a URL can read it (the PKCE code verifier included) or forge
+one naming a different agent or user. When encryption at rest is enabled, its key seals the
+state; otherwise a key derived from `AG_IDENTITY_HASH_PEPPER` does, so gateways that share the
+pepper can open each other's states
+([`encode_oauth_state`, `decode_start_state`, `decode_callback_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
 
 The code exchange, the legacy and `2026-07-28` refresh, and the `2026-07-28` consent exchange
 use the same pinned client as service tokens (see _Service tokens_): redirects are not
 followed, and a token endpoint resolving to a blocked address is refused before any request.
 
-The callback lands on `/v1/identity/oauth/callback` unless `gateway.json` sets
-`oauth_callback_route`. On success the gateway stores the
+The start page and the callback live under `/v1/identity/oauth/callback` unless `gateway.json`
+sets `oauth_callback_route`; a reverse proxy in front of the gateway must forward both
+`{route}/{segment}` and `{route}/{segment}/start`, where `{segment}` is the provider's id for a
+new provider and its `provider_id` for one stored before. On success the gateway stores the
 token and issues a `DelegationCredential`, a verifiable credential recording the
 delegation chain, kept with the token as `delegation_vc`.
 
@@ -1785,7 +1971,12 @@ only decides, by the file names, which claim came first. Then:
 Tokens obtained but not kept, because the scopes were wider, or the binding was removed or
 narrowed while the person consented, are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
 "expires_at"}`, or `{"status": "failed", "reason"}` with a fixed reason; the authorization
-server's words are never echoed or logged.
+server's words are never echoed or logged, with one exception. A `scope_widened` answer adds
+`widened_scopes`, the scopes granted beyond those asked for (as the provider compares them), so
+the operator can see what the vendor added and set the provider's comparison: only names spelled
+entirely as RFC 6749 scope tokens (`%x21 / %x23-5B / %x5D-7E`, so no space, quote, backslash or
+control character), 1 to 128 bytes each and at most 16, in the vendor's order; any other is left
+out. The connect's log line names the same, and a refresh refused for a wider grant logs them too.
 
 | Status | `reason` | When |
 | --- | --- | --- |
@@ -1824,12 +2015,24 @@ Who may call it:
 - The node that serves the admin API completes connects: the surface's lock serialises that
   node only.
 
+The gateway does not authenticate the person who connects: the calling system does, and the
+gateway keeps the grant for the `principal` it names. The calling system must:
+
+- name as `principal` the person signed in to it, computed from the token they signed in with
+  ([Computing the identity hash outside the gateway](#computing-the-identity-hash-outside-the-gateway)),
+  never a value the browser sends;
+- bind the authorization request's `state` to that person's browser session, and complete a
+  connect only from a redirect that returns it in the session that started it, so a code another
+  person obtained is never kept under this principal;
+- start a connect for an `owner` binding only for the binding's owner, since every caller of the
+  binding acts with the account connected.
+
 ### Revoking grants at the vendor
 
 A grant by binding is removed when [its provider is deleted](#deleting-a-provider), [a surface
 change removes its binding](#when-a-binding-is-removed), it is [removed through the
-API](#removing-grants), a connect replaces it, the vendor refuses its token and it cannot be
-refreshed ([External consent on a Transit Point](#external-consent-on-a-transit-point)), or [the
+API](#removing-grants), a connect replaces it, the vendor refuses a caller's token and it cannot
+be refreshed ([External consent on a Transit Point](#external-consent-on-a-transit-point)), or [the
 daily sweep](#the-daily-sweep) finds it can never be released; tokens a connect or a refresh
 obtained but no grant keeps are revoked too. Each is revoked at its authorization server (RFC 7009,
 [`src/delegation_vault/revocation.rs`](../src/delegation_vault/revocation.rs)) at the provider's
@@ -1878,7 +2081,8 @@ revocation reached the vendor, whatever the vendor answered, or the grant was ot
 and forgotten when the change is not saved and the grant is put back. A gateway that stops while revocations are in flight, as in a deploy, tries them again
 when it starts and each time it becomes active, and the daily sweep tries any left. A revocation
 the sweep decides is kept the same way, as a pending one. A revocation that could not reach its vendor
-(`unreachable`, the 30-second limit included) is kept and tried again the same way, at most five
+(`unreachable`, the 30-second limit included) or that the vendor refused for now (`429` or a `5xx`,
+recorded `refused`) is kept and tried again the same way, at most five
 times in all: its `token_revoked` event ends `,retry:pending` while it will be tried again and
 `,retry:exhausted` on the last, after which its tokens stay valid until they expire or the person
 removes the app at the vendor. A pending revocation whose grant the vault holds again, with any
@@ -2021,14 +2225,22 @@ delete, of any type, answers `503` and keeps the provider.
 
 A permitted delete of a provider with an `issuer` deletes every grant made with it, then the
 provider, and answers; the grants are revoked afterwards, on a task of their own, reading only
-that provider's grants. The provider lock is held while the bindings are checked and the grants
+that provider's grants. The same task then decides the revocations the vault kept for that
+provider's earlier removals, pending or deferred to the daily sweep, while it still holds the
+provider: none of its grants is stored any more, so each is revoked. One that cannot reach its
+vendor then is kept with a copy of its provider's configuration, secret references only, taken
+when it was kept, and is tried again by the retry and the daily sweep after the provider is
+gone. A kept revocation of a provider deleted before that copy existed is forgotten by the sweep. The provider lock is held while the bindings are checked and the grants
 and the provider deleted, never while a vendor is called, so a vendor that is slow or hangs
 keeps no surface write waiting. Surface creates, updates and deletes of every tenant do wait
-while the provider's grants are read, deleted and kept for revocation; with KMS envelope
+while the provider's grants are read, deleted and kept for revocation, and while the
+revocations the vault kept are read; with KMS envelope
 encryption each grant read and each kept is a round trip to the key service, so deleting a
 provider with many grants holds up surface writes for that long. A delete dropped part way puts the grants
 back when the provider is still stored, and revokes them when it is gone. It answers `503` and keeps the provider when the
-vault cannot list or delete the grants, when the grants stored were written under another
+vault cannot list or delete the grants, or read every revocation it kept (the answer names
+that case: while one cannot be read, as with at-rest encryption off, it could never be revoked
+once the provider is gone), when the grants stored were written under another
 identity hash pepper, and when one of its grants cannot be read, for example because at-rest
 encryption is now off: it could not be revoked. The answer names that grant. Make it readable
 again, or [purge it](#removing-grants), then delete the provider. Another
@@ -2119,10 +2331,12 @@ removal left to it (`deferred`, [Revoking grants at the vendor](#revoking-grants
 with their providers, revoking each whose vendor account no other stored grant holds, and each
 that waited 30 days, as pending revocations, so one that cannot reach its vendor is kept and
 tried again; and it tries again the pending revocations kept, which the gateway also tries when
-it starts and each time it becomes active; while a provider of theirs cannot be read, none is decided. The sweep goes binding by binding, found by
+it starts and each time it becomes active; those whose provider cannot be read wait for the next
+sweep, and the others are decided. The sweep goes binding by binding, found by
 file name: it reads one of the binding's grants to learn its surface, takes the surface's lock,
 and only then reads the binding's grants and decides, so a grant the person connected again
-while the sweep waited is the one it decides on. Every grant is decrypted once or twice a day. A
+while the sweep waited is the one it decides on. It finishes revoking one binding's removals
+before it goes on to the next, and stops between bindings once the node is no longer active. Every grant is decrypted once or twice a day. A
 grant that cannot be read is left, and counted, for an operator to remove. A binding whose
 surface or provider cannot be read is left as it is, and counted as skipped, until the next
 sweep: a provider store that fails is never taken for a provider that is gone. The log line

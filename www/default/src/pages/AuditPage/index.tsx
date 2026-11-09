@@ -7,6 +7,7 @@ import AuditForwardButton from './AuditForwardButton';
 import AuditFilters from './AuditFilters';
 import AuditInfoBanner from './AuditInfoBanner';
 import AuditList from './AuditList';
+import AuditLogSize from './AuditLogSize';
 import { policyChange } from './auditHelpers';
 import { useAuditLog } from './useAuditLog';
 import { useUserNames } from './useUserNames';
@@ -54,6 +55,15 @@ const AuditPage: React.FC = () => {
   const selectedIdx = audit.expandedIdx ?? 0;
   const selectedEntry = audit.filteredEntries[selectedIdx] ?? null;
 
+  // A read that stopped before the end of the history, or that met records it
+  // could not read, counted less than the history holds, so every number it
+  // produced is a lower bound.
+  const total = audit.countsAreLowerBounds ? `${audit.total}+` : audit.total;
+
+  // A read that failed returned no records, so Refresh has to stay usable: it
+  // is the way back from the error.
+  const refreshDisabled = audit.total === 0 && audit.error === null;
+
   const changePage = (updater: number | ((p: number) => number)) => {
     audit.setExpandedIdx(null);
     audit.setPage(updater);
@@ -97,18 +107,19 @@ const AuditPage: React.FC = () => {
         onFlowChange={audit.setFlowFilter}
         scopeFilter={audit.scopeFilter}
         onScopeChange={audit.setScopeFilter}
+        countsAreLowerBounds={audit.countsAreLowerBounds}
       />
 
       <div className="card shadow audit-card">
         <div className="card-header audit-card-header py-3 d-flex justify-content-between align-items-center flex-wrap">
           <h6 className="m-0 font-weight-bold text-primary mr-3">
             <i className="fas fa-clipboard-list mr-1"></i> Audit Log
-            {audit.total > 0 && (
+            {(audit.total > 0 || audit.countsAreLowerBounds) && (
               <Badge
-                value={audit.total}
+                value={total}
                 className="ms-2"
                 data-testid="audit-total-badge"
-                ariaLabel={`${audit.total} total audit entries`}
+                ariaLabel={`${total} total audit entries`}
               />
             )}
           </h6>
@@ -117,7 +128,7 @@ const AuditPage: React.FC = () => {
             <AppButton
               variant="primary"
               size="md"
-              disabled={audit.total === 0}
+              disabled={refreshDisabled}
               onClick={audit.reload}
               data-testid="audit-refresh"
               iconStart={<i className="fas fa-sync-alt me-1" aria-hidden="true" />}
@@ -129,6 +140,7 @@ const AuditPage: React.FC = () => {
 
         <div className="card-body audit-card-body">
           <AuditInfoBanner open={infoOpen} onToggle={() => setInfoOpen(o => !o)} />
+          <AuditLogSize historyBytes={audit.historyBytes} softCapBytes={audit.softCapBytes} />
           <div className="audit-shell" ref={shellRef}>
             <div className="audit-shell-list" ref={listRef}>
               <AuditList
@@ -138,6 +150,9 @@ const AuditPage: React.FC = () => {
                 onSelect={selectEntry}
                 page={audit.page}
                 totalPages={audit.totalPages}
+                countsAreLowerBounds={audit.countsAreLowerBounds}
+                error={audit.error}
+                onRetry={audit.reload}
                 onPageChange={changePage}
                 userName={userName}
               />

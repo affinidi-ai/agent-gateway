@@ -43,7 +43,36 @@ NC := $(shell printf '\033[0m')
 RUST_LLVM_MAJOR := $(shell rustc -vV 2>/dev/null | sed -n 's/^LLVM version: \([0-9][0-9]*\).*/\1/p')
 RUST_LLVM_PREFIX := $(firstword $(wildcard /opt/homebrew/opt/llvm@$(RUST_LLVM_MAJOR) /usr/local/opt/llvm@$(RUST_LLVM_MAJOR)))
 RUST_LLVM_DEPS := $(if $(RUST_LLVM_MAJOR),llvm@$(RUST_LLVM_MAJOR),llvm)
-RUST_DEPS := sccache keith/formulae/ld64.lld protobuf xmlsec1 cmake libxml2 $(RUST_LLVM_DEPS)
+RUST_DEPS := sccache keith/formulae/ld64.lld protobuf xmlsec1 cmake libxml2 cyrus-sasl openssl@3 $(RUST_LLVM_DEPS)
+# librdkafka is configured by cmake, which finds neither Homebrew's keg-only
+# cyrus-sasl nor its OpenSSL on its own. Exported rather than passed per target,
+# because the configure step runs in a build script under cargo.
+BREW_SASL_PREFIX := $(firstword $(wildcard /opt/homebrew/opt/cyrus-sasl /usr/local/opt/cyrus-sasl))
+BREW_OPENSSL_PREFIX := $(firstword $(wildcard /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3))
+ifeq ($(findstring $(BREW_SASL_PREFIX)/lib/pkgconfig,$(PKG_CONFIG_PATH)),)
+ifneq ($(BREW_SASL_PREFIX),)
+export PKG_CONFIG_PATH := $(BREW_SASL_PREFIX)/lib/pkgconfig$(if $(PKG_CONFIG_PATH),:$(PKG_CONFIG_PATH))
+endif
+endif
+ifneq ($(BREW_OPENSSL_PREFIX),)
+export OPENSSL_ROOT_DIR := $(BREW_OPENSSL_PREFIX)
+# OPENSSL_ROOT_DIR steers cmake only. openssl-sys resolves separately, through
+# pkg-config, and Homebrew's openssl@4 wins there — but OpenSSL 4 removed the
+# ENGINE API that librdkafka calls, so the link then fails on undefined
+# _ENGINE_* symbols. OPENSSL_DIR makes openssl-sys use the same OpenSSL cmake
+# was pointed at.
+export OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
+# openssl-sys reads the target-scoped name first, which is the one that has to
+# win on Apple Silicon.
+export AARCH64_APPLE_DARWIN_OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
+export X86_64_APPLE_DARWIN_OPENSSL_DIR := $(BREW_OPENSSL_PREFIX)
+# The cmake crate blanks CMAKE_PREFIX_PATH in the child unless it is set here,
+# so cmake's find_package(OpenSSL) never reaches Homebrew without this. Guarded
+# so a sub-make does not prepend the prefix a second time.
+ifeq ($(findstring $(BREW_OPENSSL_PREFIX),$(CMAKE_PREFIX_PATH)),)
+export CMAKE_PREFIX_PATH := $(BREW_OPENSSL_PREFIX)$(if $(CMAKE_PREFIX_PATH),:$(CMAKE_PREFIX_PATH))
+endif
+endif
 CARGO_TOOLS := cargo-llvm-cov cargo-nextest cargo-audit cargo-deny cargo-watch
 DEPS := jq mdbook plantuml pre-commit gitleaks
 COVERAGE_THRESHOLD ?= 37
@@ -94,7 +123,9 @@ install-rust-deps: ## Install Rust build toolchain dependencies (sccache, lld, e
 
 verify-rust-deps: ## Verify Rust build toolchain dependencies (sccache, lld, etc.)
 	@echo "$(BLUE)📦 Verifying Rust build dependencies...$(NC)"
-	@brew ls --version $(RUST_DEPS) 2>/dev/null || (echo "$(RED)❌ Rust dependencies are not installed. Please run 'make install-rust-deps' to install them.$(NC)" && exit 1)
+	@if command -v brew >/dev/null 2>&1; then \
+		brew ls --version $(RUST_DEPS) >/dev/null 2>&1 || { echo "$(RED)❌ Rust dependencies are not installed. Please run 'make install-rust-deps' to install them.$(NC)"; exit 1; }; \
+	fi
 	@for tool in $(CARGO_TOOLS); do \
 		command -v $$tool >/dev/null 2>&1 || (echo "$(RED)❌ $$tool not found. Please run 'make install-rust-deps' to install it.$(NC)" && exit 1); \
 	done
@@ -159,7 +190,7 @@ www-rebuild: ## Delete $(WWW_DIR)/build, rebuild UI, and refresh local env confi
 # Config Commands
 # ==============================================================================
 
-config-certs: ## Prepare TLS certificates and local identity pepper for development
+config-certs: ## Prepare TLS certificates, the local identity pepper and the backup and master keys for development
 	@echo "$(BLUE)🔐 Setting up TLS certificates...$(NC)"
 	@AG_IDENTITY_PEPPER_FILE="$(AG_IDENTITY_PEPPER_FILE)" AG_BACKUP_KEY_FILE="$(AG_BACKUP_KEY_FILE)" ./scripts/_certs.sh
 	@echo "$(GREEN)✅ TLS certificates ready!$(NC)"
@@ -391,7 +422,7 @@ ui-test-report: ## Open the latest UI test HTML report
 # Code Quality Commands
 # ==============================================================================
 
-clippy: ## Run Clippy linter (autofix)
+clippy: verify-rust-deps ## Run Clippy linter (autofix)
 	@echo "$(BLUE)📎 Running Clippy...$(NC)"
 	@cargo clippy --all-targets --all-features --fix --allow-dirty -- -D warnings
 	@echo "$(GREEN)✅ Clippy passed!$(NC)"
@@ -478,7 +509,7 @@ audit-fix: ## Update Rust and frontend deps to patched versions and re-audit
 	@(cd $(WWW_DIR) && npm install --silent && npm audit fix --omit=dev 2>/dev/null) || true
 	@echo "$(GREEN)✅ Security audit fixed!$(NC)"
 
-check: ## Run cargo check for fast compilation verification
+check: verify-rust-deps ## Run cargo check for fast compilation verification
 	@echo "$(BLUE)🔍 Running cargo check...$(NC)"
 	@cargo check --all-targets --all-features
 	@echo "$(GREEN)✅ Check passed!$(NC)"
@@ -589,6 +620,7 @@ LOCAL_CHECKS := "frontend=node-local" "backend=clippy audit cargo-build"
 LOCAL_TESTS := "backend-tests=test"
 local: ## Run all local checks with autofix: fmt, then the frontend and backend checks side by side, then the tests (PARALLEL=0: one at a time); ends with the time taken
 	@$(MAKE) fmt
+	@$(MAKE) verify-rust-deps
 	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Checks" $(LOCAL_CHECKS)
 	@MAKE="$(MAKE)" PARALLEL=$(PARALLEL) bash scripts/local/parallel.sh "Tests" $(LOCAL_TESTS)
 	@secs=$$(( $$(date +%s) - $(LOCAL_STARTED) )); \

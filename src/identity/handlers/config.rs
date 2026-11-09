@@ -129,9 +129,10 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     }
 
     let new_config_result = load_base_gateway_config(state).await;
-    let (new_config_result, surfaces_count) = inject_surfaces_into_config(state, new_config_result).await;
+    let (new_config_result, surfaces_count, provider_key_listing) =
+        inject_surfaces_into_config(state, new_config_result).await;
 
-    super::report_credential_policy(state).await;
+    super::report_credential_policy(state, provider_key_listing).await;
 
     let (channels_count, is_fallback, warning) = state
         .channel_manager
@@ -153,6 +154,24 @@ async fn reload(state: &IdentityApiState) -> anyhow::Result<(usize, usize, bool,
     Ok((channels_count, surfaces_count, is_fallback, warning))
 }
 
+/// The gateway configuration stored in the DynamoDB table of `bootstrap`, read now; an error
+/// when no table is named or the table cannot be read.
+pub(crate) async fn load_dynamodb_config(bootstrap: &crate::config::BootstrapConfig) -> anyhow::Result<GatewayConfig> {
+    let table_name = bootstrap
+        .dynamodb_table
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DynamoDB table name not specified"))?;
+    info!("Reading channels from DynamoDB table: {}", table_name);
+    crate::storage::DynamoDbConfigStore::new(
+        table_name.clone(),
+        bootstrap.aws_region.clone(),
+        bootstrap.aws_profile.clone(),
+    )
+    .await?
+    .load_config()
+    .await
+}
+
 /// Build the base `GatewayConfig` from the configured channel source
 /// (DynamoDB or the local filesystem channel store).
 async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Arc<GatewayConfig>> {
@@ -162,34 +181,8 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
         .as_str()
     {
         "dynamodb" => {
-            let table_name = match state
-                .bootstrap_config
-                .dynamodb_table
-                .as_ref()
-            {
-                Some(name) => name,
-                None => {
-                    return Err(anyhow::anyhow!("DynamoDB table name not specified"));
-                }
-            };
-
-            info!("Reloading channels from DynamoDB table: {}", table_name);
-
             async {
-                let store = crate::storage::DynamoDbConfigStore::new(
-                    table_name.clone(),
-                    state
-                        .bootstrap_config
-                        .aws_region
-                        .clone(),
-                    state
-                        .bootstrap_config
-                        .aws_profile
-                        .clone(),
-                )
-                .await?;
-
-                let mut config = store.load_config().await?;
+                let mut config = load_dynamodb_config(&state.bootstrap_config).await?;
                 crate::config::fall_back_to_first_source_auth_methods_in_memory(&mut config.surfaces);
 
                 info!("Using TLS, A2A, logging, and extension inspection configurations from bootstrap config");
@@ -332,13 +325,15 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
 }
 
 /// Append every active `AgentSurface` to the config as a runtime
-/// `ChannelMapping`. Returns the (possibly enriched) config result and the
-/// number of surfaces that were injected.
+/// `ChannelMapping`. Returns the (possibly enriched) config result, the
+/// number of surfaces that were injected, and the API key listing the
+/// provider key check of the active surfaces read, if it read one.
 async fn inject_surfaces_into_config(
     state: &IdentityApiState,
     config_result: anyhow::Result<Arc<GatewayConfig>>,
-) -> (anyhow::Result<Arc<GatewayConfig>>, usize) {
+) -> (anyhow::Result<Arc<GatewayConfig>>, usize, Option<crate::identity::provider_key_gate::KeyOwnersListing>) {
     let mut surfaces_count = 0;
+    let mut provider_key_listing = None;
     let result = match config_result {
         Ok(config) => {
             if let Some(ref surface_store) = state.agent_surface_store {
@@ -349,13 +344,14 @@ async fn inject_surfaces_into_config(
                             .iter()
                             .map(|s| s.surface_id.clone())
                             .collect();
-                        for surface in &surfaces {
-                            if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
-                                continue;
-                            }
-                            crate::identity::provider_key_gate::gate()
-                                .admit(surface)
-                                .await;
+                        let active: Vec<_> = surfaces
+                            .iter()
+                            .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
+                            .collect();
+                        provider_key_listing = crate::identity::provider_key_gate::gate()
+                            .admit_all(active.iter().copied())
+                            .await;
+                        for surface in active {
                             if existing_surface_ids.contains(&surface.surface_id) {
                                 continue;
                             }
@@ -378,7 +374,7 @@ async fn inject_surfaces_into_config(
         }
         Err(e) => Err(e),
     };
-    (result, surfaces_count)
+    (result, surfaces_count, provider_key_listing)
 }
 
 /// Response for single channel reload
@@ -526,6 +522,26 @@ pub struct ChannelRoutingConfigResponse {
     pub mcp_proxy_path_prefix: Vec<ChannelPrefixInfo>,
     /// OAuth callback route prefix (e.g. "/oauth/callback")
     pub oauth_callback_route: String,
+    /// The gateway's own base URL, `https://{did.domain}` as the gateway started
+    /// with it: an authorization code provider without a `callback_url` has this
+    /// followed by its `callback_path` as its redirect URI. Absent while the
+    /// gateway has no credential provider store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_base_url: Option<String>,
+}
+
+/// The prefixes the gateway serves, for the Surface Prefix dropdown: one that
+/// would hide a dashboard page is not registered, so it is not offered.
+fn served_prefixes(prefixes: &[crate::config::network::ChannelPrefix]) -> Vec<ChannelPrefixInfo> {
+    prefixes
+        .iter()
+        .filter(|c| crate::proxy::paths::shadowed_dashboard_page(&c.prefix).is_none())
+        .map(|c| ChannelPrefixInfo {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            prefix: c.prefix.clone(),
+        })
+        .collect()
 }
 
 /// Get channel routing configuration
@@ -538,38 +554,20 @@ pub async fn get_surface_routing_config(
         .load_network_config()
         .map_err(|e| AppError::InternalError(format!("Failed to load network configuration: {}", e)))?;
 
-    // Load MCP proxy paths from the top-level `mcp_proxies` location
-    let mcp_proxy_paths = network_config
-        .mcp_proxies
-        .as_ref()
-        .map(|paths| {
-            paths
-                .iter()
-                .map(|c| ChannelPrefixInfo {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    prefix: c.prefix.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     let config = ChannelRoutingConfigResponse {
         available_listen_addresses: network_config.get_inbound_external_urls(),
         available_outbound_listen_addresses: network_config.get_outbound_external_urls(),
-        channel_path_prefix: network_config
-            .get_channel_prefix_configs()
-            .iter()
-            .map(|c| ChannelPrefixInfo {
-                id: c.id.clone(),
-                name: c.name.clone(),
-                prefix: c.prefix.clone(),
-            })
-            .collect(),
-        mcp_proxy_path_prefix: mcp_proxy_paths,
+        channel_path_prefix: served_prefixes(network_config.get_channel_prefix_configs()),
+        mcp_proxy_path_prefix: served_prefixes(
+            network_config
+                .mcp_proxies
+                .as_deref()
+                .unwrap_or_default(),
+        ),
         oauth_callback_route: network_config
             .oauth_callback_route
             .clone(),
+        gateway_base_url: crate::proxy::server::get_gateway_base_url(),
     };
 
     Ok(Json(config))
@@ -759,4 +757,32 @@ pub async fn get_networking_config(
             .client_auth
             .clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::served_prefixes;
+    use crate::config::network::ChannelPrefix;
+
+    fn prefix(path: &str) -> ChannelPrefix {
+        ChannelPrefix {
+            id: path
+                .trim_start_matches('/')
+                .into(),
+            name: path
+                .trim_start_matches('/')
+                .into(),
+            prefix: path.into(),
+        }
+    }
+
+    #[test]
+    fn the_surface_prefix_dropdown_offers_only_the_prefixes_the_gateway_serves() {
+        let offered: Vec<String> = served_prefixes(&[prefix("/payments"), prefix("/settings"), prefix("/agents")])
+            .into_iter()
+            .map(|info| info.prefix)
+            .collect();
+        assert_eq!(offered, vec!["/payments", "/agents"]);
+        assert!(served_prefixes(&[prefix("/policies/v1")]).is_empty());
+    }
 }

@@ -82,6 +82,8 @@ Use this when the backend is already running and you only need the dashboard dev
 | `make config-debug-dev` | Prepare local debug configuration without a static dashboard build |
 | `make config-release` | Prepare the release environment |
 
+Preparation refuses an environment whose `config/gateway.json` has a channel prefix, or a `proxy` route prefix, whose first path segment is a dashboard page: the gateway exits at startup on those, because it would answer a reload of that page with a proxy `404`. The message names each offending prefix and the page it shadows; rename the prefix (for `/payments`, to something such as `/svc/payments`) and the clients that call it, then rerun. Nothing is rewritten for you. The reserved pages are read from `SPA_RESERVED_TOP_LEVEL` in [`src/proxy/paths.rs`](../../src/proxy/paths.rs), the same list the gateway checks; when that list cannot be read, preparation says so and leaves the check to startup.
+
 ## Named Instances
 
 Run isolated local instances by supplying `x`:
@@ -128,12 +130,19 @@ itself, so run that first:
 ```bash
 make config-docker                                   # 1. generate envs/docker/{config,certs}
 export AG_BACKUP_ENCRYPTION_KEY=$(openssl rand -hex 32)   # 2. required 64-hex key
-docker compose up                                    # 3. run
+export AG_MASTER_KEY=$(cat envs/master_encryption_key)    # 3. key for encryption at rest
+docker compose up                                    # 4. run
 ```
 
 If you skip step 1, compose stops immediately with `bind source path does not
-exist` instead of a cryptic in-container error. Keep the key exported for every
+exist` instead of a cryptic in-container error. Keep the backup key exported for every
 `docker compose` command (including `down`).
+
+A config that `make config-docker` creates encrypts storage at rest with the master key
+from `AG_MASTER_KEY`, and the gateway refuses to start without it. Export the same
+value every time: storage encrypted under one key cannot be read with another.
+`make docker-run` passes it from `envs/master_encryption_key` itself, whatever
+`AG_MASTER_KEY` your shell holds.
 
 ### Accessing the gateway
 
@@ -376,7 +385,7 @@ Paste the contents of `private.pem` when prompted, followed by an empty line. Th
 
 Full backup and restore are management operations exposed by the running Gateway and dashboard. They require a configured backup encryption key. Retain that key under your organization's key-management and recovery policy; losing it makes the encrypted backup unusable. The legacy `.tgwbak` extension written by earlier builds is still accepted on restore.
 
-See the dashboard's backup and restore controls for the running instance. Review the storage and encryption settings before relying on backups in an operational environment. Encryption at rest is a separate option and is disabled by default.
+See the dashboard's backup and restore controls for the running instance. Review the storage and encryption settings before relying on backups in an operational environment. Encryption at rest is a separate option: environments created by the setup targets turn it on, and a configuration from `--generate-bootstrap` has it off.
 
 ## Related Documentation
 

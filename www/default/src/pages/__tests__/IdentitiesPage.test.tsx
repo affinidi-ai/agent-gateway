@@ -868,6 +868,56 @@ describe('IdentitiesPage', () => {
       expect(await screen.findByTestId('surface-builder')).toBeInTheDocument();
     });
 
+    it('shows a red Revoked badge for an identity whose API key was revoked or deleted', async () => {
+      const revoked = { ...managedOld, revoked: true };
+      renderWithStats([revoked, managedNew], [{ config_id: 'surface-1', name: 'OXYGEN' }]);
+
+      const revokedRow = await screen.findByTestId('identities-row-did:key:managed-old');
+      const liveRow = screen.getByTestId('identities-row-did:key:managed-new');
+      const badge = within(revokedRow).getByTestId('identities-revoked-badge');
+      expect(badge).toHaveTextContent('Revoked');
+      expect(badge).toHaveClass('badge', 'text-bg-danger');
+      expect(badge).not.toHaveClass('app-badge');
+      expect(within(liveRow).queryByTestId('identities-revoked-badge')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identity-revoked-info')).not.toBeInTheDocument();
+
+      fireEvent.click(liveRow);
+      expect(screen.queryByTestId('identity-revoked-info')).not.toBeInTheDocument();
+
+      fireEvent.click(revokedRow);
+      expect(await screen.findByTestId('identity-revoked-info')).toHaveTextContent(
+        'This identity is no longer in use: its API key was revoked or deleted, or its surface was deleted.'
+      );
+      expect(screen.getAllByTestId('identity-revoked-info')).toHaveLength(1);
+    });
+
+    it('shows a deleted surface as plain text with a Deleted badge, no link, and a Revoked identity', async () => {
+      const gone = {
+        ...managedOld,
+        surface_id: 'surface-gone',
+        surface_name: undefined,
+        display_name: undefined,
+        display_name_source: undefined,
+        surface_deleted: true,
+        revoked: true,
+      };
+      renderWithStats([gone, managedNew], [{ config_id: 'surface-1', name: 'OXYGEN' }]);
+
+      const goneRow = await screen.findByTestId('identities-row-did:key:managed-old');
+      const liveRow = screen.getByTestId('identities-row-did:key:managed-new');
+      const deletedSurface = within(goneRow).getByTestId('identities-surface-deleted');
+      expect(deletedSurface).toHaveTextContent('surface-gone');
+      expect(
+        within(deletedSurface).getByTestId('identities-surface-deleted-badge')
+      ).toHaveTextContent('Deleted');
+      expect(within(goneRow).queryByTestId('identities-surface-link')).not.toBeInTheDocument();
+      expect(within(goneRow).getByTestId('identities-revoked-badge')).toHaveTextContent('Revoked');
+      expect(
+        within(liveRow).queryByTestId('identities-surface-deleted-badge')
+      ).not.toBeInTheDocument();
+      expect(within(liveRow).getByTestId('identities-surface-link')).toHaveTextContent('OXYGEN');
+    });
+
     it('offers no unnamed-only filter and lists unnamed and resolving rows', async () => {
       renderWithStats([managedNew, callerNamed, callerUnnamed, callerPending]);
 

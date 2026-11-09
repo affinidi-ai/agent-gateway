@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth_manager::middleware::AuthGuardOk;
 use crate::auth_manager::pat::{PatContext, PatDelegationContext, PatResourceScope};
 use crate::config::agent_surface::{AccessPointStatus, AgentSurface, SharedTransitConfig, TransitConfig};
+use crate::identity::handlers::surface_tenancy::{ApiKeyReference, surface_api_key_references};
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::{
@@ -509,7 +510,7 @@ where
             .await
             .map_err(IntoResponse::into_response)?;
         let mut sent = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-        if drop_access_point_status(&mut sent) {
+        if drop_read_only_fields(&mut sent) {
             bytes = serde_json::to_vec(&sent)
                 .map_err(|error| SurfaceApiError::InternalError(error.to_string()).into_response())?
                 .into();
@@ -523,14 +524,17 @@ where
     }
 }
 
-/// Removes the read-only `access_point_status` of a [`SurfaceResponse`] from
-/// a write body, so a client can send back what a read or a save returned.
-/// Whether it was there.
-fn drop_access_point_status(body: &mut serde_json::Value) -> bool {
+/// Removes the read-only `access_point_status`, `api_key_references` and
+/// `serving_status` of a [`SurfaceResponse`] from a write body, so a client can
+/// send back what a read or a save returned. Whether any was there.
+fn drop_read_only_fields(body: &mut serde_json::Value) -> bool {
     body.as_object_mut()
         .is_some_and(|body| {
-            body.remove("access_point_status")
-                .is_some()
+            ["access_point_status", "api_key_references", "serving_status"]
+                .into_iter()
+                .filter(|field| body.remove(*field).is_some())
+                .count()
+                > 0
         })
 }
 
@@ -852,7 +856,9 @@ fn validate_workload_binding_config(surface: &AgentSurface) -> Result<(), Surfac
 ///
 /// Each enabled variant is validated as resolved, against the stored variant
 /// of the same alias, since it can override the caller authentication methods
-/// and the identity slots.
+/// and the identity slots. A variant with no enabled stored counterpart, one
+/// added, renamed or enabled again, is validated against the stored surface,
+/// whose settings it inherits.
 fn validate_source_auth(
     surface: &AgentSurface,
     stored: Option<&AgentSurface>,
@@ -863,11 +869,13 @@ fn validate_source_auth(
         let Ok(resolved) = surface.resolve_variant(Some(&variant.alias)) else {
             continue;
         };
-        let stored_resolved = stored.and_then(|stored| {
-            stored
-                .resolve_variant(Some(&variant.alias))
-                .ok()
-        });
+        let stored_resolved = stored
+            .and_then(|stored| {
+                stored
+                    .resolve_variant(Some(&variant.alias))
+                    .ok()
+            })
+            .or_else(|| stored.cloned());
         crate::config::validate_source_auth_config(&resolved, stored_resolved.as_ref())
             .map_err(|e| SurfaceApiError::BadRequest(format!("variant '{}': {e}", variant.alias)))?;
     }
@@ -1126,6 +1134,8 @@ type SavedSurface = (axum::http::HeaderMap, Json<SurfaceSaveResponse<SurfaceResp
 
 /// The `Warning` headers (code 299) a save of `surface` answers with: its
 /// Access Point's ([`AgentSurface::access_point_warnings`]), then one naming
+/// each JWT bearer method stored without an audience
+/// ([`AgentSurface::unchecked_audience_warnings`]), then one naming
 /// each Transit Point that serves callers it does not authenticate where other hosts reach it, each
 /// that accepts the Access Point's own tokens ([`shared_audience_warnings`]),
 /// each whose JWT verification strategy names an issuer the surface also
@@ -1155,6 +1165,7 @@ async fn save_warnings(
     for warning in surface
         .access_point_warnings()
         .into_iter()
+        .chain(surface.unchecked_audience_warnings())
         .chain(
             crate::proxy::server::open_transit_points(&state.network_config, surface)
                 .iter()
@@ -1910,7 +1921,8 @@ fn inherited_target_binding_warnings(surface: &AgentSurface) -> Vec<String> {
 /// Access Point that publishes protected resource metadata accepts the resource
 /// of each route, so a Transit Point that names any of them is one. A caller of
 /// the Access Point could then call that Transit Point directly, with its
-/// credentials.
+/// credentials. An Access Point method whose `audience_claim` is not `aud`
+/// lists clients, not audiences, so it shares none.
 fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
     let views: Vec<_> = surface_views(surface)
         .into_iter()
@@ -1919,6 +1931,7 @@ fn shared_audience_warnings(surface: &AgentSurface) -> Vec<String> {
     let access_point: Vec<_> = views
         .iter()
         .flat_map(|(_, (access_point, _))| access_point.iter())
+        .filter(|method| method.audience_claim.is_aud())
         .collect();
     let mut warnings = Vec::new();
     for (variant, (_, transit_points)) in &views {
@@ -2371,7 +2384,7 @@ pub async fn get_surface(
                     &surface.surface_id,
                 ) =>
         {
-            Ok(Json(surface.into()))
+            Ok(Json(SurfaceResponse::with_api_key_references(&state, surface).await))
         }
         Some(_) => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
         None => Err(SurfaceApiError::NotFound(format!("Surface '{}' not found", surface_id))),
@@ -3190,6 +3203,7 @@ pub async fn create_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("Surface with ID '{}' already exists", surface.surface_id)));
     }
+    super::surface_tenancy::refuse_id_owning_api_keys(&state, &surface.surface_id).await?;
 
     // Enforce the appliance surface limit (per-type plus the total) before persisting.
     crate::config::enforce_add("surfaces.agent")
@@ -3218,7 +3232,11 @@ pub async fn create_surface(
 
     apply_surface_change(&state, SurfaceChange::Upsert(&surface)).await;
 
-    Ok((StatusCode::CREATED, save_warnings(&state, &surface).await, SurfaceSaveResponse::new(surface.into(), warnings)))
+    Ok((
+        StatusCode::CREATED,
+        save_warnings(&state, &surface).await,
+        SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, surface).await, warnings),
+    ))
 }
 
 /// Whether `access_point` in a PUT body removes its discovery setting.
@@ -3317,7 +3335,10 @@ pub async fn update_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
+    Ok((
+        save_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
+    ))
 }
 
 /// PUT carries the whole record, so an omitted
@@ -3916,13 +3937,14 @@ fn retain_protected_resource(
 
 /// A restored `protected_resource` the Access Point would no longer serve.
 /// When the setting itself no longer fits, after the dashboard switched the
-/// method, set `forward_header` or audiences, or moved the protocol off MCP, it
-/// is dropped with a warning: the client did not send it, and refusing the save
-/// over it would leave the client no way out. When it no longer fits the
-/// Access Point, for example after a route or listen address change, the save
-/// is refused instead: dropping it would leave the JWT Bearer method checking
-/// no audience, so the client must send a new resource or `null`. A setting
-/// sent in the request is validated and refused as usual.
+/// method, set `forward_header`, audiences or an `audience_claim` other than
+/// `aud`, or moved the protocol off MCP, it is dropped with a warning: the
+/// client did not send it, and refusing the save over it would leave the client
+/// no way out. The JWT Bearer method must then name an audience of its own, or
+/// the save is refused. When it no longer fits the Access Point, for example
+/// after a route or listen address change, the save is refused instead, so the
+/// client must send a new resource or `null`. A setting sent in the request is
+/// validated and refused as usual.
 fn settle_retained_protected_resources(
     surface: &mut AgentSurface,
     base_retained: bool,
@@ -3939,8 +3961,8 @@ fn settle_retained_protected_resources(
             warn!(
                 surface_id = %resolved.surface_id,
                 variant = alias.unwrap_or(""),
-                "Dropped a stored protected_resource the edited Access Point no longer supports; its JWT Bearer \
-                 method now checks audiences only if the edit set them"
+                "Dropped a stored protected_resource the edited Access Point no longer supports; the save is refused \
+                 unless its JWT Bearer method names an audience of its own"
             );
             return Ok(true);
         }
@@ -4264,7 +4286,7 @@ pub async fn patch_surface(
     }
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
-    drop_access_point_status(&mut patch);
+    drop_read_only_fields(&mut patch);
     if !patch.is_object() {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     }
@@ -4308,7 +4330,10 @@ pub async fn patch_surface(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
+    Ok((
+        save_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
+    ))
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -4337,7 +4362,7 @@ pub async fn patch_variant(
     }
     let mut patch: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| SurfaceApiError::BadRequest(format!("PATCH body is not valid JSON: {}", e)))?;
-    drop_access_point_status(&mut patch);
+    drop_read_only_fields(&mut patch);
     let Some(patch_obj) = patch.as_object_mut() else {
         return Err(SurfaceApiError::BadRequest("PATCH body must be a JSON object at the top level".to_string()));
     };
@@ -4404,7 +4429,29 @@ pub async fn patch_variant(
         management_actor(&caller, &delegation).as_ref(),
     )
     .await?;
-    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
+    Ok((
+        save_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
+    ))
+}
+
+/// Revokes every active API key of the deleted surface `surface_id`
+/// ([`super::deleted_surface_api_keys::revoke_api_keys_of`]), and the warning naming the keys
+/// that stay active, if any.
+async fn revoke_api_keys_of_deleted_surface(
+    state: &IdentityApiState,
+    surface_id: &str,
+) -> Option<SurfaceWarning> {
+    let api_keys = state
+        .api_key_store
+        .as_deref()?;
+    super::deleted_surface_api_keys::revoke_api_keys_of(api_keys, surface_id)
+        .await
+        .warning()
+        .map(|message| SurfaceWarning {
+            code: "api_keys_left_active",
+            message,
+        })
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -4454,6 +4501,10 @@ pub async fn delete_surface(
             .await?;
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
+            let warnings: Vec<_> = revoke_api_keys_of_deleted_surface(&state, &surface_id)
+                .await
+                .into_iter()
+                .collect();
 
             if let Some(recorder_status) = global_store() {
                 recorder_status
@@ -4465,6 +4516,7 @@ pub async fn delete_surface(
             Ok(Json(DeleteSurfaceResponse {
                 success: true,
                 message: format!("Surface '{}' deleted", surface_id),
+                warnings,
             }))
         }
         Some(surface)
@@ -4482,13 +4534,19 @@ pub async fn delete_surface(
 }
 
 /// A surface, or one of its variants, as the admin API returns it, with the
-/// status of the Access Point it serves. The status is derived on every
-/// response, never stored, and dropped from a write body that sends it back.
+/// status of the Access Point it serves and, on a single surface read or save,
+/// how each API key it names stands and whether this node's kept verdict on
+/// those keys lets it serve. All are derived on every response, never stored,
+/// and dropped from a write body that sends them back.
 #[derive(Debug, Serialize)]
 pub struct SurfaceResponse<T> {
     #[serde(flatten)]
     pub resource: T,
     pub access_point_status: AccessPointStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_references: Option<Vec<ApiKeyReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_status: Option<crate::identity::provider_key_gate::ServingStatus>,
 }
 
 impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
@@ -4497,7 +4555,28 @@ impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
     fn from(surface: AgentSurface) -> Self {
         Self {
             access_point_status: surface.served_access_point_status(),
+            api_key_references: None,
+            serving_status: None,
             resource: surface,
+        }
+    }
+}
+
+impl SurfaceResponse<AgentSurface> {
+    /// `surface` with the [`ApiKeyReference`]s of its base and every variant
+    /// and, when it names a key id, its serving status on this node.
+    async fn with_api_key_references(
+        state: &IdentityApiState,
+        surface: AgentSurface,
+    ) -> Self {
+        let api_key_references = surface_api_key_references(state, &surface).await;
+        let serving_status = api_key_references
+            .as_ref()
+            .map(|_| crate::identity::provider_key_gate::gate().serving_status(&surface));
+        Self {
+            api_key_references,
+            serving_status,
+            ..surface.into()
         }
     }
 }
@@ -4514,6 +4593,8 @@ impl SurfaceResponse<SurfaceVariant> {
                 .serve_selected(Some(&variant))
                 .surface
                 .access_point_status(),
+            api_key_references: None,
+            serving_status: None,
             resource: variant,
         }
     }
@@ -4523,6 +4604,8 @@ impl SurfaceResponse<SurfaceVariant> {
 pub struct DeleteSurfaceResponse {
     pub success: bool,
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SurfaceWarning>,
 }
 
 /// Action being applied to the running gateway after a surface mutation.
@@ -5335,6 +5418,7 @@ pub async fn delete_variant(
     Ok(Json(DeleteSurfaceResponse {
         success: true,
         message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
+        warnings: Vec::new(),
     }))
 }
 
@@ -5396,7 +5480,10 @@ pub async fn promote_variant_to_default(
 
     info!("Promoted variant '{}' (id={}) to default on surface '{}'", variant_alias, variant_id, surface_id);
 
-    Ok((save_warnings(&state, &saved).await, SurfaceSaveResponse::new(saved.into(), warnings)))
+    Ok((
+        save_warnings(&state, &saved).await,
+        SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
+    ))
 }
 
 /// `GET /v1/surfaces/{id}/variants/{alias}/resolved`
@@ -5589,9 +5676,15 @@ mod validation_tests {
         let audience = serde_json::json!([
             {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": ["https://gateway.example/mcp"]}
         ]);
-        for (change, changed_methods) in
-            [("method", other_method), ("forward_header", forwarding), ("audiences", audience)]
-        {
+        let client_bound = serde_json::json!([
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": [], "audience_claim": "client_id"}
+        ]);
+        for (change, changed_methods) in [
+            ("method", other_method),
+            ("forward_header", forwarding),
+            ("audiences", audience),
+            ("audience_claim", client_bound),
+        ] {
             let changed: crate::config::agent_surface::CallerAuthentication =
                 serde_json::from_value(serde_json::json!({"methods": changed_methods})).unwrap();
             let mut switched = mcp_surface();
@@ -5902,6 +5995,29 @@ mod validation_tests {
         ] {
             assert!(shared_audience_warnings(&surface_with(transit_point_auth)).is_empty(), "{case}");
         }
+    }
+
+    /// An Access Point method that checks the client a token was issued to
+    /// lists clients, not audiences, so a Transit Point audience with the same
+    /// value is no overlap.
+    #[test]
+    fn a_client_bound_access_point_method_shares_no_audience_with_a_transit_point() {
+        let mut surface = surface_with_transit_points(
+            serde_json::json!([{ "alias": "crm", "target_endpoint": "https://crm.example",
+                "require_transit_token": false, "source_auth": { "type": "jwt_bearer",
+                    "jwt_verification_strategy_id": "entra", "audiences": ["app-1"] } }]),
+            serde_json::json!(null),
+        );
+        surface.variants.clear();
+        surface
+            .access_point
+            .caller_authentication = Some(
+            serde_json::from_value(serde_json::json!({ "methods": [{ "type": "jwt_bearer",
+                "jwt_verification_strategy_id": "entra", "audiences": ["app-1"], "audience_claim": "client_id" }] }))
+            .unwrap(),
+        );
+
+        assert!(shared_audience_warnings(&surface).is_empty(), "{:?}", shared_audience_warnings(&surface));
     }
 
     /// An MCP Access Point that publishes protected resource metadata accepts
@@ -10876,6 +10992,31 @@ mod tests {
     }
 
     #[test]
+    fn test_surface_response_carries_a_serving_status_only_beside_its_api_key_references() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "saved", "name": "saved",
+            "access_point": {"listen_address": "http://localhost:8080", "route": "/agent", "protocol": "a2a"},
+            "target": {"endpoint": "http://localhost:8081"}
+        }))
+        .unwrap();
+        let plain = serde_json::to_value(SurfaceResponse::from(surface.clone())).unwrap();
+        let judged = serde_json::to_value(SurfaceResponse {
+            serving_status: Some(crate::identity::provider_key_gate::ServingStatus::NotServing),
+            ..SurfaceResponse::from(surface)
+        })
+        .unwrap();
+
+        assert!(
+            plain
+                .get("serving_status")
+                .is_none(),
+            "{plain}"
+        );
+        assert_eq!(judged["serving_status"], "not_serving");
+        assert_eq!(judged["access_point_status"], plain["access_point_status"], "the Access Point status is unchanged");
+    }
+
+    #[test]
     fn test_variant_response_reports_the_status_of_that_variant() {
         let api_key = serde_json::json!({"methods": [{"type": "api_key",
             "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}]});
@@ -10904,13 +11045,22 @@ mod tests {
     }
 
     #[test]
-    fn test_write_body_sent_back_from_a_response_loses_only_its_access_point_status() {
+    fn test_write_body_sent_back_from_a_response_loses_only_its_read_only_fields() {
         let mut sent = serde_json::json!({"name": "saved", "access_point_status": "ready"});
-        assert!(drop_access_point_status(&mut sent));
+        assert!(drop_read_only_fields(&mut sent));
         assert_eq!(sent, serde_json::json!({"name": "saved"}));
-        assert!(!drop_access_point_status(&mut sent));
+        assert!(!drop_read_only_fields(&mut sent));
+        let mut references = serde_json::json!({
+            "name": "saved", "api_key_references": [{"key_id": "atgk_a", "status": "revoked", "blocking": true}],
+            "serving_status": "not_serving"
+        });
+        assert!(drop_read_only_fields(&mut references));
+        assert_eq!(references, serde_json::json!({"name": "saved"}));
+        let mut serving = serde_json::json!({"name": "saved", "serving_status": "serving"});
+        assert!(drop_read_only_fields(&mut serving));
+        assert_eq!(serving, serde_json::json!({"name": "saved"}));
         let mut not_an_object = serde_json::json!(["access_point_status"]);
-        assert!(!drop_access_point_status(&mut not_an_object));
+        assert!(!drop_read_only_fields(&mut not_an_object));
     }
 
     fn entry(registry: &str) -> TrustRecorderEntry {

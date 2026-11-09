@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::bdd_support::config::DEFAULT_HEADER_METADATA_EXTENSION_URI;
 use crate::bdd_support::config::a2a_proxy::A2aProxyFixture;
 use crate::bdd_support::config::agent_surface::AgentSurfaceFixture;
+use crate::bdd_support::config::api_keys::{UnreadableKeyFolders, write_unloadable_api_key_fixture};
 use crate::bdd_support::config::config_tree::{
     ApiKeyProviderFixture, CredentialProviderFixture, GatewayBootstrapFixture, JwtVerificationStrategyFixture,
     PolicyDefinitionFixture, SecretFixture, write_gateway_config_tree,
@@ -11,9 +12,9 @@ use crate::bdd_support::config::config_tree::{
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
-    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
-    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig, SurfaceTransitPointConfig,
-    TargetAuthProviderGrant,
+    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, GatewayPrefixFixture,
+    PROTECTED_RESOURCE_PUBLIC_ORIGIN, SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig,
+    SurfaceTransitPointConfig, TargetAuthProviderGrant,
 };
 use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
@@ -264,7 +265,7 @@ fn write_single_surface_config_inner(
         surface_config
             .protocol
             .clone(),
-        effective_target_url,
+        effective_target_url.clone(),
     );
     if let Some(proxy) = &surface_config.mcp_proxy_target {
         surface_fixture = surface_fixture.with_mcp_proxy_id(&proxy.proxy_id);
@@ -353,7 +354,7 @@ fn write_single_surface_config_inner(
                 DelegatedCredentialInjection::Meta { field } => serde_json::json!({ "type": "meta", "field": field }),
             };
             serde_json::json!({
-                "credential_provider_id": delegation.provider_id,
+                "credential_provider_id": surface_config.provider_record_id(&delegation.provider_id),
                 "scopes": delegation.scopes,
                 "required_for": required_for,
                 "consent_mode": "on_demand",
@@ -491,6 +492,48 @@ fn write_single_surface_config_inner(
         surface_fixture = surface_fixture.with_identity_slot("inbound", inbound_slot);
     }
 
+    if let Some(key_id) = &surface_config.protected_identity_api_key_id {
+        surface_fixture = surface_fixture
+            .with_identity_slot("protected", serde_json::json!({"type": "from_api_key", "api_key_id": key_id}));
+    }
+    for surface_id in &surface_config.other_stored_surfaces {
+        let mut other = AgentSurfaceFixture::new(
+            surface_id,
+            surface_id,
+            "Another stored surface",
+            format!("http://localhost:{gateway_port}"),
+            format!("/{surface_id}"),
+            surface_config
+                .protocol
+                .clone(),
+            effective_target_url.clone(),
+        );
+        other.status = "disabled".to_string();
+        other.tenant_id = surface_config
+            .tenant_id
+            .clone();
+        config_tree
+            .agent_surfaces
+            .insert(surface_id.clone(), other);
+    }
+    for key in surface_config
+        .stored_api_keys
+        .iter()
+        .filter(|key| key.loads)
+    {
+        let mut record = ApiKeyProviderFixture::new(
+            format!("stored-key-{}", key.key_id),
+            &key.owner,
+            &key.key_id,
+            "bdd-client",
+            format!("bdd-secret-{}", key.key_id),
+        );
+        record.created_at = key.created_at;
+        config_tree
+            .api_key_providers
+            .insert(record.id.clone(), record);
+    }
+
     if surface_config.seed_surface {
         config_tree
             .agent_surfaces
@@ -576,6 +619,9 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if surface_config.starts_standby {
+        start_standby(base_dir);
+    }
     if surface_config
         .protected_resource
         .is_some()
@@ -601,6 +647,75 @@ fn write_single_surface_config_inner(
     if surface_config.writes_log_directory {
         set_log_directory(base_dir);
     }
+    if surface_config.serves_dashboard {
+        serve_dashboard(base_dir);
+    }
+    add_gateway_prefixes(base_dir, &surface_config.gateway_prefixes);
+}
+
+/// The text of the dashboard build's `index.html`, which every dashboard page serves.
+pub const DASHBOARD_PAGE_MARKER: &str = "<title>BDD dashboard</title>";
+
+/// Writes a dashboard build to `www/` and serves it at `/` as the fallback route,
+/// as a deployed gateway does.
+fn serve_dashboard(base_dir: &Path) {
+    let www = base_dir.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), format!("<!doctype html><html><head>{DASHBOARD_PAGE_MARKER}</head></html>"))
+        .unwrap();
+    edit_gateway_json(base_dir, |gateway| {
+        gateway["routes"]["dashboard"] = serde_json::json!({
+            "type": "static", "prefix": "/", "path": www.display().to_string(), "fallback": true
+        });
+    });
+}
+
+/// Adds channel, MCP proxy and redirect prefixes to `gateway.json`.
+pub fn add_gateway_prefixes(
+    base_dir: &Path,
+    prefixes: &[GatewayPrefixFixture],
+) {
+    if prefixes.is_empty() {
+        return;
+    }
+    edit_gateway_json(base_dir, |gateway| {
+        for (index, prefix) in prefixes.iter().enumerate() {
+            let id = format!("bdd-prefix-{index}");
+            match prefix {
+                GatewayPrefixFixture::Channel(path) => push(gateway, "channels", &id, path),
+                GatewayPrefixFixture::McpProxy(path) => push(gateway, "mcp_proxies", &id, path),
+                GatewayPrefixFixture::Redirect { prefix, target } => {
+                    gateway["routes"][id.as_str()] =
+                        serde_json::json!({"type": "redirect", "prefix": prefix, "target": target});
+                }
+            }
+        }
+    });
+
+    fn push(
+        gateway: &mut serde_json::Value,
+        list: &str,
+        id: &str,
+        prefix: &str,
+    ) {
+        if gateway[list].is_null() {
+            gateway[list] = serde_json::json!([]);
+        }
+        gateway[list]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("gateway.json {list} must be a list"))
+            .push(serde_json::json!({"id": id, "name": id, "prefix": prefix}));
+    }
+}
+
+fn edit_gateway_json(
+    base_dir: &Path,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut gateway);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.
@@ -609,6 +724,63 @@ fn log_info(base_dir: &Path) {
     let config = std::fs::read_to_string(&path).unwrap();
     assert!(config.contains("level = \"error\""), "the gateway config must set the log level");
     std::fs::write(&path, config.replacen("level = \"error\"", "level = \"info\"", 1)).unwrap();
+}
+
+/// Writes the stored API keys of `surface_config` whose folders cannot be loaded, last, since it
+/// leaves their folders unreadable until the returned guard is dropped.
+pub fn write_unloadable_api_keys(
+    base_dir: &Path,
+    surface_config: &SurfaceConfigBuilder,
+) -> UnreadableKeyFolders {
+    UnreadableKeyFolders(
+        surface_config
+            .stored_api_keys
+            .iter()
+            .filter(|key| !key.loads)
+            .map(|key| write_unloadable_api_key_fixture(&base_dir.join("_storage/api_keys"), &key.owner, &key.key_id))
+            .collect(),
+    )
+}
+
+/// Writes the configuration of a second gateway node listening on `port` over the storage of the
+/// gateway configured in `base_dir`, and returns its `config.toml`.
+pub fn write_second_node_config(
+    base_dir: &Path,
+    port: u16,
+) -> std::path::PathBuf {
+    let gateway_path = base_dir.join("gateway.json");
+    let second_gateway_path = base_dir.join("gateway-second-node.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&gateway_path).unwrap()).unwrap();
+    let origin = format!("http://localhost:{port}");
+    gateway["listeners"][0]["port"] = serde_json::json!(port);
+    gateway["listeners"][0]["external_urls"] = serde_json::json!([origin]);
+    gateway["webauthn"]["external_origin"] = serde_json::json!(origin);
+    std::fs::write(&second_gateway_path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
+    let config = std::fs::read_to_string(base_dir.join("config.toml")).unwrap();
+    let first = gateway_path
+        .display()
+        .to_string();
+    assert!(config.contains(&first), "the gateway config must name its gateway.json");
+    let second_config_path = base_dir.join("config-second-node.toml");
+    std::fs::write(
+        &second_config_path,
+        config.replacen(
+            &first,
+            &second_gateway_path
+                .display()
+                .to_string(),
+            1,
+        ),
+    )
+    .unwrap();
+    second_config_path
+}
+
+/// Starts the gateway in Standby mode.
+fn start_standby(base_dir: &Path) {
+    let path = base_dir.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("server_mode = \"standby\"\n{config}")).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `warn`.
@@ -761,11 +933,12 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
             CredentialProviderKind::OAuth2AuthorizationCode => {
-                secrets.push(SecretFixture::new(format!("bdd-{}-client-id", delegation.provider_id), "bdd-client-id"));
-                secrets.push(SecretFixture::new(
-                    format!("bdd-{}-client-secret", delegation.provider_id),
-                    "bdd-client-secret",
-                ));
+                for provider_id in
+                    std::iter::once(&delegation.provider_id).chain(&surface_config.additional_oauth_providers)
+                {
+                    secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-id"), "bdd-client-id"));
+                    secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-secret"), "bdd-client-secret"));
+                }
             }
             CredentialProviderKind::ApiKey { secret_id, secret_value } => {
                 secrets.push(SecretFixture::new(secret_id, secret_value));
@@ -784,13 +957,17 @@ fn api_key_provider_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<ApiKe
         .chain(&surface_config.additional_source_auth)
     {
         if let SurfaceSourceAuthConfig::ApiKeyProvider(config) = auth {
-            api_key_providers.push(ApiKeyProviderFixture::new(
+            let mut provider = ApiKeyProviderFixture::new(
                 format!("key-provider-{}-{}", config.agent_id, config.key_id),
                 &config.agent_id,
                 &config.key_id,
                 &config.client_id,
                 &config.valid_key,
-            ));
+            );
+            if let Some(created_at) = surface_config.api_key_provider_key_created_at {
+                provider.created_at = created_at;
+            }
+            api_key_providers.push(provider);
         }
     }
     api_key_providers
@@ -833,6 +1010,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
         callback_url: None,
         token_refresh_enabled: false,
         api_key_secret_ref: None,
+        authorization_response_issuer: None,
         jwt_settings: (!client_credentials).then(|| {
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
@@ -852,36 +1030,26 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
     };
     let now = chrono::Utc::now();
     let provider_id = delegation.provider_id.clone();
-    let provider = match &delegation.provider_kind {
-        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => return Vec::new(),
+    match &delegation.provider_kind {
+        CredentialProviderKind::Unknown | CredentialProviderKind::ClientCredentials => Vec::new(),
         CredentialProviderKind::OAuth2AuthorizationCode => {
-            let base_url = surface_config
-                .oauth_provider_base_url
-                .as_ref()
-                .expect("OAuth provider base URL must be configured before writing credential provider fixture");
-            CredentialProviderFixture {
-                id: provider_id.clone(),
-                name: provider_id.clone(),
-                provider_id: provider_id.clone(),
-                provider_type: "oauth2_authorization_code".to_string(),
-                authorization_endpoint: Some(format!("{base_url}/authorize")),
-                token_endpoint: Some(format!("{base_url}/token")),
-                client_id_secret_ref: Some(format!("bdd-{provider_id}-client-id")),
-                client_secret_secret_ref: Some(format!("bdd-{provider_id}-client-secret")),
-                default_scopes: delegation.scopes.clone(),
-                callback_path: format!("/v1/identity/oauth/callback/{provider_id}"),
-                callback_url: surface_config
-                    .oauth_callback_base_url
-                    .as_ref()
-                    .map(|base| format!("{base}/v1/identity/oauth/callback/{provider_id}")),
-                token_refresh_enabled: true,
-                api_key_secret_ref: None,
-                jwt_settings: None,
-                created_at: now,
-                updated_at: now,
-            }
+            let mut providers = vec![oauth_provider_fixture(
+                surface_config,
+                &provider_id,
+                delegation.scopes.clone(),
+                surface_config
+                    .oauth_authorization_response_issuer
+                    .clone(),
+            )];
+            providers.extend(
+                surface_config
+                    .additional_oauth_providers
+                    .iter()
+                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None)),
+            );
+            providers
         }
-        CredentialProviderKind::ApiKey { secret_id, .. } => CredentialProviderFixture {
+        CredentialProviderKind::ApiKey { secret_id, .. } => vec![CredentialProviderFixture {
             id: provider_id.clone(),
             name: provider_id.clone(),
             provider_id: provider_id.clone(),
@@ -895,12 +1063,48 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             callback_url: None,
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
+            authorization_response_issuer: None,
             jwt_settings: None,
             created_at: now,
             updated_at: now,
-        },
-    };
-    vec![provider]
+        }],
+    }
+}
+
+fn oauth_provider_fixture(
+    surface_config: &SurfaceConfigBuilder,
+    provider_id: &str,
+    default_scopes: Vec<String>,
+    authorization_response_issuer: Option<String>,
+) -> CredentialProviderFixture {
+    let now = chrono::Utc::now();
+    let base_url = surface_config
+        .oauth_provider_base_url
+        .as_ref()
+        .expect("OAuth provider base URL must be configured before writing credential provider fixture");
+    let record_id = surface_config.provider_record_id(provider_id);
+    CredentialProviderFixture {
+        id: record_id.clone(),
+        name: provider_id.to_string(),
+        provider_id: provider_id.to_string(),
+        provider_type: "oauth2_authorization_code".to_string(),
+        authorization_endpoint: Some(format!("{base_url}/authorize")),
+        token_endpoint: Some(format!("{base_url}/token")),
+        client_id_secret_ref: Some(format!("bdd-{provider_id}-client-id")),
+        client_secret_secret_ref: Some(format!("bdd-{provider_id}-client-secret")),
+        default_scopes,
+        callback_path: format!("/v1/identity/oauth/callback/{record_id}"),
+        callback_url: surface_config
+            .oauth_callback_base_url
+            .as_ref()
+            .map(|base| format!("{base}/v1/identity/oauth/callback/{record_id}")),
+        token_refresh_enabled: true,
+        api_key_secret_ref: None,
+        authorization_response_issuer,
+        jwt_settings: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn policy_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<PolicyDefinitionFixture> {

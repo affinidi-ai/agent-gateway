@@ -9,6 +9,9 @@ fi
 echo "Running mediator configuration fixtures..."
 "$(dirname "${BASH_SOURCE[0]}")/mediator/test-reconcile-mediator-config.sh"
 
+echo "Running encryption setup fixtures..."
+"$(dirname "${BASH_SOURCE[0]}")/test-encryption-setup.sh"
+
 echo "Running cargo fmt..."
 cargo fmt --all --check
 

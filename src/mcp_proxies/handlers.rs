@@ -4631,6 +4631,80 @@ mod tests {
         assert_eq!(error.id, Some(json!("owned")));
     }
 
+    #[tokio::test]
+    async fn owned_modern_file_results_count_against_the_limit_once_encoded() {
+        use axum::response::IntoResponse;
+        use serde_json::json;
+
+        let app = axum::Router::new().route(
+            "/file/{size}",
+            axum::routing::get(|axum::extract::Path(size): axum::extract::Path<usize>| async move {
+                ([("content-type", "application/octet-stream")], vec![0xffu8; size]).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let proxy = McpProxy::new(
+            "File tool".into(),
+            String::new(),
+            base,
+            json!({
+                "openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {
+                    "/file/{size}": {"get": {
+                        "operationId": "file",
+                        "parameters": [{"name": "size", "in": "path", "required": true, "schema": {"type": "integer"}}],
+                        "responses": {"200": {"description": "OK"}}
+                    }}
+                }
+            })
+            .to_string(),
+            "/mcp".into(),
+            "/file-tool".into(),
+        );
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
+            "surface_id": "surface-files", "name": "Surface files",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/files", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)},
+            "mcp_http": {"max_response_bytes": 4096}
+        }))
+        .unwrap();
+        let manager = super::McpServerManager::new();
+        manager
+            .create_server(&proxy)
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let versions = crate::mcp::request_validation::MODERN_ONLY_POLICY;
+        let call = |size: usize| {
+            let mut request = owned_modern_request("tools/list");
+            request.method = "tools/call".to_string();
+            request.params = Some(json!({"name": "file", "arguments": {"size": size}}));
+            let prepared = client
+                .post(format!("proxy://{}", proxy.id))
+                .body("{}")
+                .build()
+                .unwrap();
+            let (proxy, surface, client) = (&proxy, &surface, &client);
+            async move {
+                super::handle_modern_surface_request(proxy, surface, &request, prepared, client, versions, None).await
+            }
+        };
+        let fits = call(1500).await.unwrap();
+        assert_eq!(fits["result"]["content"][0]["type"], "resource");
+        let error = call(3073).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.message, "MCP tool result exceeds the configured limit");
+        tasks.shutdown().await;
+    }
+
     /// A tool whose operation takes a cookie sends the REST API that cookie
     /// alone, even when the caller sent its own `Cookie`.
     #[tokio::test]
@@ -6345,6 +6419,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::surfaces::AgentSurfaceStore for SurfaceStore {
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.get(surface_id).await
+        }
+
         async fn save(
             &self,
             _surface: &crate::config::agent_surface::AgentSurface,

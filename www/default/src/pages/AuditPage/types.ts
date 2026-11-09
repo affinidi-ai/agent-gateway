@@ -177,6 +177,21 @@ export interface AuditResponse {
   page: number;
   limit: number;
   category_counts?: Record<string, number>;
+  /**
+   * Whether the read stopped before the end of the audit history, so `total`
+   * and `category_counts` describe the records it reached.
+   */
+  truncated?: boolean;
+  /**
+   * Records the history holds that the read could not return — a line too long
+   * to assemble, or one an interrupted append left half-written. The counts are
+   * lower bounds by this many even when the read reached the end.
+   */
+  dropped_records?: number;
+  /** Bytes the audit history takes on disk: the live log and the rotated files. */
+  history_bytes?: number;
+  /** Advisory size the history is shown against; `0` for none. Nothing is enforced at it. */
+  soft_cap_bytes?: number;
 }
 
 export interface WorkloadIntent {
