@@ -1163,7 +1163,7 @@ anything itself:
 - The connections table below it reads `GET /v1/vta/connections`. The `vta-bootstrap` record is
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
-  (`canRevoke`), since the server refuses to revoke it. Verify stays.
+  (`canRevoke`) or Verify (`canVerify`), since the server refuses both.
 
 ## Connections page
 

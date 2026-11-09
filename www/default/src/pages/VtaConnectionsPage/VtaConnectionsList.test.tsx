@@ -40,14 +40,15 @@ describe('VtaConnectionsList', () => {
     expect(screen.queryByText(/Not paired/)).not.toBeInTheDocument();
   });
 
-  it('offers no Revoke on the bootstrap connection, which the server refuses to revoke', () => {
+  it('offers no Revoke or Verify on the bootstrap connection, which the server refuses both', () => {
     renderList([connection('vta-bootstrap', 'connected')]);
     expect(screen.queryByRole('button', { name: 'Revoke' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Verify' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Verify' })).not.toBeInTheDocument();
   });
 
-  it('still offers Revoke on a connection the operator paired', () => {
+  it('still offers Verify and Revoke on a connection the operator paired', () => {
     renderList([connection('customer-1', 'connected')]);
     expect(screen.getByRole('button', { name: 'Revoke' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Verify' })).toBeInTheDocument();
   });
 });

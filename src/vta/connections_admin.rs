@@ -806,6 +806,17 @@ pub async fn verify_connection(
         Err(e) => return e.into_response(),
     };
 
+    // The bootstrap record has no control key of its own (it authenticates as
+    // the `[vta]` block's), and a second login as the same DID would make the
+    // VTA supersede the session that signs. Its state is the bootstrap's.
+    if connection.is_bootstrap() {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the bootstrap connection is managed by the [vta] configuration block"),
+        )
+            .into_response();
+    }
+
     let Some(registry) = state.registry.clone() else {
         return (StatusCode::SERVICE_UNAVAILABLE, ErrorBody::json("VTA connections are not active on this gateway"))
             .into_response();

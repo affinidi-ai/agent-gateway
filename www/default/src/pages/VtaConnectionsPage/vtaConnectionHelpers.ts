@@ -54,9 +54,13 @@ export function presentPairing(state: PairingState): PairingPresentation {
 /** The record the `[vta]` block, and so the bundled sidecar, is shown as. */
 export const BOOTSTRAP_CONNECTION_ID = 'vta-bootstrap';
 
-/** The server refuses to revoke it: the `[vta]` block is the only way to change it. */
+/** The server refuses to revoke or verify it: the `[vta]` block is the only way to change it. */
 export function canRevoke(connection: VtaConnection): boolean {
   return connection.id !== BOOTSTRAP_CONNECTION_ID && connection.pairing.state !== 'revoked';
+}
+
+export function canVerify(connection: VtaConnection): boolean {
+  return connection.id !== BOOTSTRAP_CONNECTION_ID;
 }
 
 export function isUsable(connection: VtaConnection): boolean {

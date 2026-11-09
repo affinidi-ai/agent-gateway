@@ -5,6 +5,7 @@ import {
   TRANSPORT_LABELS,
   isOverPrivileged,
   canRevoke,
+  canVerify,
   isUsable,
   presentPairing,
 } from './vtaConnectionHelpers';
@@ -99,7 +100,7 @@ export const VtaConnectionsList: React.FC<VtaConnectionsListProps> = ({
                   : '—'}
               </td>
               <td onClick={event => event.stopPropagation()}>
-                {canEdit && (
+                {canEdit && canVerify(connection) && (
                   <AppButton
                     variant="outline-primary"
                     size="sm"

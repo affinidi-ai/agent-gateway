@@ -56,6 +56,12 @@ async fn operator_lists_trust_agent_connections(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
+#[when("the operator verifies the bundled trust agent connection")]
+async fn operator_verifies_bundled_connection(world: &mut SurfaceWorld) {
+    let response = send(world, Method::POST, "/v1/vta/connections/vta-bootstrap/verify", None).await;
+    world.admin_response = Some(response);
+}
+
 fn bootstrap_connection(world: &SurfaceWorld) -> &serde_json::Value {
     let body = &world
         .admin_response

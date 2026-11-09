@@ -68,7 +68,7 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
     await expect(page.getByTestId("vta-bootstrap-advice")).toHaveCount(0);
   });
 
-  test("the bundled agent's connection row reads Connected and offers no Revoke", async ({
+  test("the bundled agent's connection row reads Connected and offers no Verify or Revoke", async ({
     page,
   }) => {
     await openTrustAgent(page, {
@@ -82,7 +82,7 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
     await expect(row).toContainText("Connected");
     await expect(row).not.toContainText("Not paired");
     await expect(row.getByRole("button", { name: "Revoke" })).toHaveCount(0);
-    await expect(row.getByRole("button", { name: "Verify" })).toBeVisible();
+    await expect(row.getByRole("button", { name: "Verify" })).toHaveCount(0);
   });
 
   test("a revoked gateway shows what to do and that signing is refused", async ({

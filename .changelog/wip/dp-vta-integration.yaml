@@ -140,7 +140,8 @@ changes:
         is created as a draft and the automatic bootstrap never pairs it. The
         connection API now reports that record's state from the bootstrap
         itself, including why it is not connected, and the page no longer
-        offers a Revoke button the server always refuses.
+        offers Revoke or Verify buttons the server always refuses. Verifying
+        that record used to answer 502 and write an error into it.
     - timestamp: '2026-11-09T06:00:00Z'
       title: Make the bundled sidecar compose example start with real containers
       description: >-

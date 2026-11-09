@@ -23,6 +23,12 @@ Feature: A bundled trust agent connects itself on first start
     And the bootstrap connection is shown as connected
     And the bootstrap connection shows the bundled grant and no error
 
+  Scenario: Verifying the bundled trust agent's connection is refused, so signing is not interrupted
+    Given a bundled trust agent that has enrolled the gateway
+    When the operator verifies the bundled trust agent connection
+    Then the admin API response status is 409
+    And the trust agent was asked to create 1 signing key
+
   Scenario: A trust agent that has not published its identity is waited for, and signing stays local
     Given a bundled trust agent that has not published its identity
     When the operator reads the trust agent status
