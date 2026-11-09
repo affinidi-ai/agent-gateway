@@ -110,17 +110,17 @@ describe('credential provider form', () => {
     const withClient = (values: Partial<ProviderFormValues>) =>
       missingProviderField({ ...jwtBearer, ...values });
     expect(withClient({ client_authentication: 'none' })).toBe(
-      'Client ID secret is required for OAuth providers.'
+      'Client ID secret is required for this client authentication.'
     );
     expect(
       withClient({ client_authentication: 'none', client_id_secret_ref: 'HYDRA_ID' })
     ).toBeNull();
     for (const method of ['client_secret_basic', 'client_secret_post'] as const) {
       expect(withClient({ client_authentication: method, client_id_secret_ref: 'HYDRA_ID' })).toBe(
-        'Client Secret secret is required for OAuth providers.'
+        'Client Secret secret is required for HTTP Basic and Form body.'
       );
       expect(withClient({ client_authentication: method })).toBe(
-        'Client ID secret is required for OAuth providers.'
+        'Client ID secret is required for this client authentication.'
       );
       expect(
         withClient({

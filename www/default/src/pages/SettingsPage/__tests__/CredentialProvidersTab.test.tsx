@@ -96,6 +96,13 @@ describe('CredentialProvidersTab', () => {
       expect(badge).toHaveClass('text-bg-secondary');
     });
 
+    it('shows no badge for a client authentication the dashboard does not know', async () => {
+      await renderList([jwt('odd', { client_authentication: 'private_key_jwt' })]);
+      expect(
+        screen.queryByTestId('credential-provider-client-authentication-badge')
+      ).not.toBeInTheDocument();
+    });
+
     it('shows no badge without a client authentication or on another type', async () => {
       await renderList([
         jwt('google', {}),

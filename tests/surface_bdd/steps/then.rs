@@ -4527,7 +4527,6 @@ async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut
         .first()
         .expect("the token endpoint received a grant");
     assert_eq!(grant["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
-    assert!(!grant.contains_key("client_secret"), "a JWT Bearer grant sends no client secret");
     let token_endpoint = world
         .surface_config
         .target_auth_provider

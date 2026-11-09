@@ -1004,10 +1004,12 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 - **JWT Bearer** asks for Token Endpoint, Issuer, Subject, Signing Key, and optionally Key ID and
   Audience, plus a **Client authentication** select
   (`credential-provider-client-authentication-select`, `ClientAuthenticationSelect.tsx`) that says
-  how the provider's OAuth client identifies itself with the grant: Not sent (default, no client
-  identity, as Google expects), Client ID only (public client), HTTP Basic, or Form body. Any
-  choice but Not sent shows the Client ID Secret picker, and HTTP Basic and Form body also show
-  the Client Secret picker, both required; the pickers are the ones Client Credentials uses, under
+  how the provider's OAuth client identifies itself with the grant: "Not sent (default)" (no client
+  identity, as Google expects), "Client ID only (public client)", "HTTP Basic", or "Form body". Its
+  explanation sits behind its `FieldHelp` (`field-help-client-authentication`), with no permanent
+  text under the select. Any choice but Not sent shows the Client ID Secret picker, and HTTP Basic
+  and Form body also show the Client Secret picker, both required (the messages name the client
+  authentication, not "OAuth providers"); the pickers are the ones Client Credentials uses, under
   the heading "Client identity (secret references)" (`credential-provider-client-heading`). Save sends
   `client_authentication` (empty for Not sent), the client ID reference only while its picker
   shows (empty while it is hidden), and the client secret reference as chosen while its picker

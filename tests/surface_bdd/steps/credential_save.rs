@@ -428,7 +428,7 @@ async fn operator_created_appliance_surface(
 }
 
 #[when(
-    expr = "the operator creates the credential provider {string} with token endpoint {string} using secrets {string} and {string}, authenticating its client by {string}"
+    expr = "the operator creates the credential provider {string} with token endpoint {string} using secrets {string} and {string}, authenticating its client with {string}"
 )]
 async fn operator_creates_provider_authenticating_its_client(
     world: &mut SurfaceWorld,
@@ -493,7 +493,7 @@ async fn operator_creates_jwt_bearer_provider_with_subject(
 }
 
 #[when(
-    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client by {string} with the client ID secret {string}"
+    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client with {string} with the client ID secret {string}"
 )]
 async fn operator_creates_jwt_bearer_provider_with_client_id_secret(
     world: &mut SurfaceWorld,
@@ -513,7 +513,7 @@ async fn operator_creates_jwt_bearer_provider_with_client_id_secret(
 }
 
 #[when(
-    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client by {string} with the client ID secret {string} and the client secret {string}"
+    expr = "the operator creates the JWT Bearer provider {string} using the secret {string} with subject {string}, authenticating its client with {string} with the client ID secret {string} and the client secret {string}"
 )]
 async fn operator_creates_jwt_bearer_provider_with_client_id_and_client_secret(
     world: &mut SurfaceWorld,

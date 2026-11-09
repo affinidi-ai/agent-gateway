@@ -153,6 +153,7 @@ Feature: A2A HTTP surface forwarding and identity
     Then the response status is 200
     And managed agent "bravo" received header "authorization" with value "Bearer bdd-target-provider-token"
     And the credential provider received a JWT Bearer grant signed with the provider key
+    And the credential provider's latest token request has no client ID or secret in its form body
 
   Scenario: A forwarded request presents a provider-issued target credential
     Given the gateway authenticates to the managed agent with a client credentials provider

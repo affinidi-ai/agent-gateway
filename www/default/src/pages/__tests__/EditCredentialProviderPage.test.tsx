@@ -584,9 +584,9 @@ describe('EditCredentialProviderPage JWT Bearer client authentication', () => {
     ...extra,
   });
 
-  const renderJwt = (record: Record<string, unknown>) => {
+  const renderJwt = (record: Record<string, unknown>, putResponse: object = { ok: true }) => {
     mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
-      if (init?.method === 'PUT') return Promise.resolve({ ok: true });
+      if (init?.method === 'PUT') return Promise.resolve(putResponse);
       if (url.startsWith('/api/v1/credential-providers/')) {
         return Promise.resolve({ ok: true, json: () => Promise.resolve(record) });
       }
@@ -670,6 +670,38 @@ describe('EditCredentialProviderPage JWT Bearer client authentication', () => {
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(savedBody().client_authentication).toBe(''));
     expect(savedBody().client_id_secret_ref).toBe('');
+  });
+
+  it('clears the client secret when switching from HTTP Basic to Client ID only', async () => {
+    renderJwt(
+      jwtBearer({
+        client_authentication: 'client_secret_basic',
+        client_id_secret_ref: 'HYDRA_ID',
+        client_secret_secret_ref: 'HYDRA_SECRET',
+      })
+    );
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    fireEvent.change(select(), { target: { value: 'none' } });
+    expect(screen.queryByRole('combobox', { name: /^Client Secret/ })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(savedBody().client_authentication).toBe('none'));
+    expect(savedBody()).toMatchObject({
+      client_id_secret_ref: 'HYDRA_ID',
+      client_secret_secret_ref: '',
+    });
+  });
+
+  it('shows the API refusal of a save on the page', async () => {
+    renderJwt(jwtBearer({ client_authentication: 'none', client_id_secret_ref: 'HYDRA_ID' }), {
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve('{"error":"token_endpoint must be an https URL"}'),
+    });
+    await screen.findByDisplayValue('https://hydra.example/oauth2/token');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    expect(await screen.findByText(/token_endpoint must be an https URL/)).toBeInTheDocument();
   });
 
   it('titles the client pickers of a JWT Bearer provider as a client identity', async () => {

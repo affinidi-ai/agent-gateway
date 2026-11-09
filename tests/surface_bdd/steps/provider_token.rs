@@ -332,14 +332,31 @@ async fn operator_changes_provider_client_authentication(
     change_stored_provider(world, json!({ "client_authentication": method }), None).await;
 }
 
-#[then(expr = "the credential provider stores the client authentication {string}")]
+#[then(expr = "the stored credential provider has the client authentication {string}")]
 async fn stored_provider_has_client_authentication(
     world: &mut SurfaceWorld,
     authentication: String,
 ) {
     let expected = TargetAuthClientAuthentication::from_wording(&authentication).api_value();
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["client_authentication"], json!(expected), "the stored provider: {stored}");
+}
+
+#[then("the stored credential provider has no client authentication")]
+async fn stored_provider_has_no_client_authentication(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    assert!(
+        stored
+            .get("client_authentication")
+            .is_none(),
+        "the stored provider: {stored}"
+    );
+}
+
+/// The Target's credential provider as the admin API returns it.
+async fn stored_target_auth_provider(world: &mut SurfaceWorld) -> Value {
     ensure_admin_session(world).await;
-    let response = world
+    world
         .admin_client
         .as_ref()
         .expect("admin client must exist")
@@ -349,8 +366,8 @@ async fn stored_provider_has_client_authentication(
             None,
         )
         .await
-        .expect("read the credential provider through the admin API");
-    assert_eq!(response.body["client_authentication"], json!(expected), "the stored provider: {}", response.body);
+        .expect("read the credential provider through the admin API")
+        .body
 }
 
 #[then(expr = "the credential provider stores the subject {string}")]
@@ -477,7 +494,7 @@ async fn latest_token_request_carries_client_id(
     );
 }
 
-#[then("the credential provider's latest token request carries no client ID or secret")]
+#[then("the credential provider's latest token request has no client ID or secret in its form body")]
 async fn latest_token_request_carries_no_client_identity(world: &mut SurfaceWorld) {
     let grant = latest_token_request(world).await;
     for field in ["client_id", "client_secret"] {

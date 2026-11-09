@@ -107,7 +107,10 @@ pub enum JwtSigningAlgorithm {
 /// How the client of an `oauth2_jwt_bearer` grant identifies itself to the token endpoint
 /// (RFC 6749 section 2.3). A provider that sets no client authentication sends no client
 /// identity with its grant, as a Google service account does. `Unset` is what an empty string
-/// in a request means: it clears the stored setting and is never stored.
+/// in a request means: it clears the stored setting and is never stored. It is separate from
+/// [`TokenEndpointAuthMethod`], which an external consent provider's metadata names and which
+/// includes `private_key_jwt`: a JWT Bearer grant's client never signs a second JWT, and this
+/// setting needs the empty string that clears it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GrantClientAuthentication {
     #[serde(rename = "")]
@@ -124,6 +127,16 @@ pub enum GrantClientAuthentication {
 }
 
 impl GrantClientAuthentication {
+    /// The method's name in a request, empty for `Unset`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unset => "",
+            Self::PublicClient => "none",
+            Self::ClientSecretBasic => "client_secret_basic",
+            Self::ClientSecretPost => "client_secret_post",
+        }
+    }
+
     /// Whether the client authenticates with a secret.
     pub fn uses_secret(self) -> bool {
         matches!(self, Self::ClientSecretBasic | Self::ClientSecretPost)
@@ -1786,8 +1799,10 @@ mod tests {
                 serde_json::from_value(serde_json::json!({ "client_authentication": name })).unwrap();
             assert_eq!(settings.client_authentication, Some(method), "{name}");
             assert_eq!(serde_json::to_value(&settings).unwrap()["client_authentication"], name);
+            assert_eq!(method.as_str(), name);
             assert_eq!(method.uses_secret(), name.starts_with("client_secret"), "{name}");
         }
+        assert_eq!(serde_json::to_value(Unset).unwrap(), Unset.as_str());
         let unset = serde_json::to_value(JwtAssertionSettings::default()).unwrap();
         assert!(
             unset

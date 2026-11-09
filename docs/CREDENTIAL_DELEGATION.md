@@ -154,6 +154,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | --- | --- | --- |
 | Create, or an update that sets a new token endpoint or turns an `api_key` provider into an OAuth type | 400 `token_endpoint must be an https URL` | The same |
 | Update that keeps a stored http endpoint | Saved | 400 |
+| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent no client secret before | 400 `token_endpoint must be an https URL` | The same |
 | `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
 | Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
 
@@ -165,6 +166,11 @@ http provider logs a warning, and a legacy binding's audit detail gains
 already cached, the legacy code exchange and refresh fail with `token_endpoint must be an https
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
+
+In `warn` mode a stored http provider therefore cannot start sending a client secret. Setting
+`client_authentication` to `none`, clearing it, or switching between `client_secret_basic` and
+`client_secret_post` is still saved. Listing the endpoint in `insecure_token_endpoints` allows
+the change on purpose.
 
 ### Provider secrets belong to the provider's tenant
 
@@ -213,9 +219,9 @@ record that misses a required one.
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
-| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
-| `client_id_secret_ref` | Required with a `client_authentication`, and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
-| `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post`, refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication` | Refused, so a misconfiguration cannot fall back to a client secret |
+| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it. An update that changes `provider_type` away from `oauth2_jwt_bearer` and omits it drops the stored value | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
+| `client_id_secret_ref` | Required with a `client_authentication` (400 `client_id_secret_ref is required for this client_authentication`), and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
+| `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post` (400 `client_secret_secret_ref is required for this client_authentication`), refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication` | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
 | `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
@@ -248,6 +254,33 @@ also names its scopes in the `scope` form field, which servers such as Hydra gra
 without it Hydra issues an empty scope, and the gateway refuses a token whose scopes differ
 from those requested. A provider that sets no client authentication sends its scopes only in the assertion's
 `scope` claim, as before.
+
+#### Ory Hydra
+
+Register the OAuth client in Hydra with the JWT bearer grant type
+`urn:ietf:params:oauth:grant-type:jwt-bearer` and a `token_endpoint_auth_method` that matches the
+provider's `client_authentication`:
+
+| `client_authentication` | The gateway sends | Register the client with |
+| --- | --- | --- |
+| unset | No client identity | Not accepted by Hydra: it answers 400 `invalid_request` |
+| `none` | `client_id` in the form body | `token_endpoint_auth_method` `none` |
+| `client_secret_basic` | HTTP Basic with the client ID and secret | `client_secret_basic` |
+| `client_secret_post` | `client_id` and `client_secret` in the form body | `client_secret_post` |
+
+Hydra also needs a trust relationship for the assertion's issuer (the provider's `jwt_issuer`):
+its public key, the subject, and the scopes it may grant. Hydra refuses a grant that names no
+client, so a Hydra provider must set a `client_authentication`.
+
+A 401 `invalid_client` from the token endpoint usually means the provider's
+`client_authentication` does not match how the client is registered, or the client ID or secret
+is wrong. The warning "Provider token request rejected" carries a `client_authentication` field
+(`none`, `client_secret_basic`, `client_secret_post` or `unset`) next to the HTTP status and the
+OAuth error code.
+
+Existing providers are unchanged: their `client_authentication` is unset and they send the same
+grant as before. A gateway without the setting ignores it, and its next save of that provider
+drops it.
 
 Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, a random
 UUID `jti` so the issuer can refuse a replayed assertion, and for a client assertion `nbf`);

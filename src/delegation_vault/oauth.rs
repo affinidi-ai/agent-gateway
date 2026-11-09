@@ -635,32 +635,11 @@ async fn scoped_token_grant(
         None if refresh_token.is_some() => return Err(misconfigured("Missing refresh resource")),
         None => None,
     };
-    let client_id = resolve_secret(
-        provider,
-        secrets,
-        provider
-            .client_id_secret_ref
-            .as_deref()
-            .ok_or_else(|| misconfigured("Missing provider client"))?,
-        egress
-            .policy
-            .tenant_credential_isolation,
-    )
-    .await?;
-    let client_secret = zeroize::Zeroizing::new(
-        resolve_secret(
-            provider,
-            secrets,
-            provider
-                .client_secret_secret_ref
-                .as_deref()
-                .ok_or_else(|| misconfigured("Missing provider client secret"))?,
-            egress
-                .policy
-                .tenant_credential_isolation,
-        )
-        .await?,
-    );
+    let mode = egress
+        .policy
+        .tenant_credential_isolation;
+    let client_id = provider_client_id(provider, secrets, mode).await?;
+    let client_secret = provider_client_secret(provider, secrets, mode).await?;
     let scope = scopes.join(" ");
     let mut params = vec![
         (
@@ -700,6 +679,32 @@ enum GrantClient {
     Basic { authorization: zeroize::Zeroizing<String> },
 }
 
+/// The client ID the provider's `client_id_secret_ref` names.
+async fn provider_client_id(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<String> {
+    let reference = provider
+        .client_id_secret_ref
+        .as_deref()
+        .ok_or_else(|| misconfigured("Missing provider client"))?;
+    Ok(resolve_secret(provider, secrets, reference, mode).await?)
+}
+
+/// The client secret the provider's `client_secret_secret_ref` names.
+async fn provider_client_secret(
+    provider: &CredentialProvider,
+    secrets: &Arc<dyn SecretsStore>,
+    mode: RuleMode,
+) -> Result<zeroize::Zeroizing<String>> {
+    let reference = provider
+        .client_secret_secret_ref
+        .as_deref()
+        .ok_or_else(|| misconfigured("Missing provider client secret"))?;
+    Ok(zeroize::Zeroizing::new(resolve_secret(provider, secrets, reference, mode).await?))
+}
+
 /// The client identity the provider's client authentication sends with its grant, or `None`
 /// when it sets no client authentication, in which case its client references are not read.
 async fn grant_client(
@@ -713,31 +718,11 @@ async fn grant_client(
     else {
         return Ok(None);
     };
-    let id = resolve_secret(
-        provider,
-        secrets,
-        provider
-            .client_id_secret_ref
-            .as_deref()
-            .ok_or_else(|| misconfigured("Missing provider client"))?,
-        mode,
-    )
-    .await?;
+    let id = provider_client_id(provider, secrets, mode).await?;
     if !method.uses_secret() {
         return Ok(Some(GrantClient::Public { id }));
     }
-    let secret = zeroize::Zeroizing::new(
-        resolve_secret(
-            provider,
-            secrets,
-            provider
-                .client_secret_secret_ref
-                .as_deref()
-                .ok_or_else(|| misconfigured("Missing provider client secret"))?,
-            mode,
-        )
-        .await?,
-    );
+    let secret = provider_client_secret(provider, secrets, mode).await?;
     Ok(Some(if method == GrantClientAuthentication::ClientSecretBasic {
         GrantClient::Basic {
             authorization: super::revocation::basic_authorization(&id, &secret),
@@ -813,13 +798,9 @@ pub async fn fetch_client_credentials_jwt_auth_token(
     egress: &TokenEgress,
 ) -> Result<OAuthTokenResponse> {
     let endpoint = validated_token_endpoint(provider, egress)?;
-    let client_id = resolve_secret(
+    let client_id = provider_client_id(
         provider,
         secrets,
-        provider
-            .client_id_secret_ref
-            .as_deref()
-            .ok_or_else(|| misconfigured("Missing provider client"))?,
         egress
             .policy
             .tenant_credential_isolation,
@@ -1351,6 +1332,10 @@ fn read_token_answer(
             provider_id = %provider.provider_id,
             status = %status,
             reason = %token_error_code(&String::from_utf8_lossy(&bytes)),
+            client_authentication = provider
+                .jwt
+                .client_authentication_method()
+                .map_or("unset", GrantClientAuthentication::as_str),
             "Provider token request rejected"
         );
     }

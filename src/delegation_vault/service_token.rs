@@ -2337,6 +2337,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotating_the_client_id_of_a_public_jwt_bearer_client_requests_a_new_token() {
+        let fixture = Fixture::new().await;
+        let provider = fixture
+            .provider(jwt_bearer_with_client(Some("none")))
+            .await;
+        let now = Utc::now();
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        fixture
+            .rotate("CLIENT_ID", "rotated-client")
+            .await;
+        fixture.respond(json!({"access_token": "after-rotation", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&provider, &["read"], now)
+                    .await
+            ),
+            ("after-rotation".into(), Freshness::Fresh)
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["client_id"], "rotated-client");
+        assert!(!requests[1].contains_key("client_secret"), "{:?}", requests[1].keys());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changing_the_client_authentication_of_a_jwt_bearer_provider_requests_a_new_token() {
+        let fixture = Fixture::new().await;
+        let public = fixture
+            .provider(jwt_bearer_with_client(Some("none")))
+            .await;
+        let now = Utc::now();
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&public, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Fresh)
+        );
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&public, &["read"], now)
+                    .await
+            ),
+            ("issued".into(), Freshness::Cached)
+        );
+        let mut post = public.clone();
+        post.jwt.client_authentication = Some(crate::credential_providers::GrantClientAuthentication::ClientSecretPost);
+        let post = fixture
+            .providers
+            .update(post)
+            .await
+            .unwrap();
+        fixture.respond(json!({"access_token": "after-change", "token_type": "Bearer", "expires_in": 3600}));
+        assert_eq!(
+            issued(
+                fixture
+                    .acquire(&post, &["read"], now)
+                    .await
+            ),
+            ("after-change".into(), Freshness::Fresh)
+        );
+        let requests = fixture.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].contains_key("client_secret"), "{:?}", requests[0].keys());
+        assert!(requests[1].contains_key("client_secret"), "{:?}", requests[1].keys());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_references_of_a_jwt_bearer_provider_without_a_client_authentication_are_not_read_or_keyed() {
         let fixture = Fixture::new().await;
         let provider = fixture

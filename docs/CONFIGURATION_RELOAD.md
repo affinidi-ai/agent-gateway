@@ -285,7 +285,7 @@ needs a restart.
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
 configurations that break `token_endpoint_https` or `tenant_credential_isolation` are refused on
-save, while ones that break `target_https` or `target_source_auth` are saved with a warning.
+save (for `token_endpoint_https`, this includes an update that makes a kept http provider start sending a client secret, see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints)), while ones that break `target_https` or `target_source_auth` are saved with a warning.
 `"enforce"` refuses all of them on save and also at runtime. For `tenant_credential_isolation`
 that means a tenant surface sending an appliance-wide secret or credential provider; for
 `target_https` and `target_source_auth`, a request whose Target credential breaks the rule goes

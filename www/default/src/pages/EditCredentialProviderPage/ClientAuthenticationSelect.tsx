@@ -26,8 +26,9 @@ const ClientAuthenticationSelect: React.FC<ClientAuthenticationSelectProps> = ({
         Client authentication
       </label>
       <FieldHelp ariaLabel="About Client authentication" testId="field-help-client-authentication">
-        Client ID only sends the client ID with no secret. HTTP Basic sends the client ID and secret
-        in the Authorization header. Form body sends them as form fields.
+        Leave Not sent unless the token server needs its client identified. Client ID only sends the
+        client ID with no secret. HTTP Basic sends the client ID and secret in the Authorization
+        header. Form body sends them as form fields. Any choice shows the client pickers below.
       </FieldHelp>
     </div>
     <select
@@ -44,10 +45,6 @@ const ClientAuthenticationSelect: React.FC<ClientAuthenticationSelectProps> = ({
         </option>
       ))}
     </select>
-    <small className="form-text text-muted">
-      Leave Not sent unless the token server needs its client identified. Choosing another option
-      shows the client pickers below.
-    </small>
   </div>
 );
 

@@ -122,11 +122,16 @@ export function missingProviderField(form: ProviderFormValues): string | null {
   if (fields.tokenEndpoint && !form.token_endpoint.trim()) {
     return 'Token endpoint is required for OAuth providers.';
   }
+  const jwtBearer = form.provider_type === 'oauth2_jwt_bearer';
   if (fields.clientId && !form.client_id_secret_ref) {
-    return 'Client ID secret is required for OAuth providers.';
+    return jwtBearer
+      ? 'Client ID secret is required for this client authentication.'
+      : 'Client ID secret is required for OAuth providers.';
   }
   if (fields.clientSecret && !form.client_secret_secret_ref) {
-    return 'Client Secret secret is required for OAuth providers.';
+    return jwtBearer
+      ? 'Client Secret secret is required for HTTP Basic and Form body.'
+      : 'Client Secret secret is required for OAuth providers.';
   }
   if (fields.jwtIssuer && !form.jwt_issuer.trim()) {
     return 'Issuer is required for JWT Bearer providers.';

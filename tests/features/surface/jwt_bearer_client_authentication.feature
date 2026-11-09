@@ -12,7 +12,7 @@ Feature: JWT Bearer client authentication
     When the caller sends a request to the surface
     Then the response status is 200
     And the credential provider received 1 token request
-    And the credential provider's latest token request carries no client ID or secret
+    And the credential provider's latest token request has no client ID or secret in its form body
     And the credential provider's latest token request carries no HTTP Basic credentials
 
   Scenario: A public client sends its client ID and no secret
@@ -35,7 +35,7 @@ Feature: JWT Bearer client authentication
     And the credential provider received 1 token request
     And the credential provider received a JWT Bearer grant signed with the provider key
     And the credential provider's latest token request carries HTTP Basic credentials for client "bdd-target-client" and secret "bdd-target-client-secret-value"
-    And the credential provider's latest token request carries no client ID or secret
+    And the credential provider's latest token request has no client ID or secret in its form body
 
   Scenario: A confidential client sends its client ID and secret in the form body
     Given an A2A surface targeting managed agent "bravo"
@@ -44,6 +44,7 @@ Feature: JWT Bearer client authentication
     When the caller sends a request to the surface
     Then the response status is 200
     And the credential provider received 1 token request
+    And the credential provider received a JWT Bearer grant signed with the provider key
     And the credential provider's latest token request carries client ID "bdd-target-client"
     And the credential provider's latest token request carries client secret "bdd-target-client-secret-value"
     And the credential provider's latest token request carries no HTTP Basic credentials
@@ -85,7 +86,7 @@ Feature: JWT Bearer client authentication
     And the appliance holds the signing key "bdd-signing-key"
     And the appliance holds the secret "bdd-client-id"
     And the appliance holds the secret "bdd-client-secret"
-    When the operator creates the JWT Bearer provider "with-basic" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client by "HTTP Basic" with the client ID secret "bdd-client-id" and the client secret "bdd-client-secret"
+    When the operator creates the JWT Bearer provider "with-basic" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client with "HTTP Basic" with the client ID secret "bdd-client-id" and the client secret "bdd-client-secret"
     Then the admin API response status is 201
     And the credential provider "with-basic" is stored
 
@@ -93,7 +94,7 @@ Feature: JWT Bearer client authentication
     Given the operator can use the admin API and no surface is configured for route "/example"
     And the appliance holds the signing key "bdd-signing-key"
     And the appliance holds the secret "bdd-client-id"
-    When the operator creates the JWT Bearer provider "<provider>" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client by "<authentication>" with the client ID secret "bdd-client-id"
+    When the operator creates the JWT Bearer provider "<provider>" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client with "<authentication>" with the client ID secret "bdd-client-id"
     Then the admin API response status is 400
     And the admin API error response mentions "client_secret_secret_ref is required"
     And no credential provider "<provider>" is stored
@@ -108,7 +109,7 @@ Feature: JWT Bearer client authentication
     And the appliance holds the signing key "bdd-signing-key"
     And the appliance holds the secret "bdd-client-id"
     And the appliance holds the secret "bdd-client-secret"
-    When the operator creates the JWT Bearer provider "public-with-secret" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client by "the client ID only" with the client ID secret "bdd-client-id" and the client secret "bdd-client-secret"
+    When the operator creates the JWT Bearer provider "public-with-secret" using the secret "bdd-signing-key" with subject "svc@example.com", authenticating its client with "the client ID only" with the client ID secret "bdd-client-id" and the client secret "bdd-client-secret"
     Then the admin API response status is 400
     And the admin API error response mentions "client_secret_secret_ref is not allowed"
     And no credential provider "public-with-secret" is stored
@@ -117,7 +118,7 @@ Feature: JWT Bearer client authentication
     Given the operator can use the admin API and no surface is configured for route "/example"
     And the appliance holds the secret "bdd-client-id"
     And the appliance holds the secret "bdd-client-secret"
-    When the operator creates the credential provider "m2m" with token endpoint "https://192.0.2.1/token" using secrets "bdd-client-id" and "bdd-client-secret", authenticating its client by "HTTP Basic"
+    When the operator creates the credential provider "m2m" with token endpoint "https://192.0.2.1/token" using secrets "bdd-client-id" and "bdd-client-secret", authenticating its client with "HTTP Basic"
     Then the admin API response status is 400
     And the admin API error response mentions "only for oauth2_jwt_bearer"
     And no credential provider "m2m" is stored
@@ -131,7 +132,18 @@ Feature: JWT Bearer client authentication
     When the caller sends a request to the surface
     Then the response status is 200
     And the credential provider received 2 token requests
-    And the credential provider's latest token request carries no client ID or secret
+    And the credential provider's latest token request has no client ID or secret in its form body
+    And the credential provider's latest token request carries no HTTP Basic credentials
+
+  Scenario: A provider with a plain http token endpoint is refused a client authentication that sends its client secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
+    And the credential provider stores a client ID and a client secret but sets no client authentication
+    And the credential provider has a plain http token endpoint
+    When the operator changes the credential provider's client authentication to "HTTP Basic"
+    Then the admin API response status is 400
+    And the admin API error response mentions "token_endpoint must be an https URL"
+    And the stored credential provider has no client authentication
 
   Scenario: A stored provider is refused a public client authentication while it stores a client secret
     Given an A2A surface targeting managed agent "bravo"
@@ -140,7 +152,7 @@ Feature: JWT Bearer client authentication
     When the operator changes the credential provider's client authentication to "the client ID only"
     Then the admin API response status is 400
     And the admin API error response mentions "client_secret_secret_ref is not allowed"
-    And the credential provider stores the client authentication "HTTP Basic"
+    And the stored credential provider has the client authentication "HTTP Basic"
 
   Scenario: Clearing a provider's client authentication and client ID releases the client ID secret
     Given an A2A surface targeting managed agent "bravo"
