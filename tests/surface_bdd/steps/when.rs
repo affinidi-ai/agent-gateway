@@ -1994,13 +1994,13 @@ fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
             world.surface_config.route
         )),
         None => {
-            // Check if JWT Bearer is configured with audiences
-            if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig { audiences, .. })) =
-                &world.surface_config.source_auth
+            // Check if JWT Bearer configured with audiences
+            if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig { audiences, .. })) = &world
+                .surface_config
+                .source_auth
+                && !audiences.is_empty()
             {
-                if !audiences.is_empty() {
-                    return serde_json::json!(audiences);
-                }
+                return serde_json::json!(audiences);
             }
             serde_json::json!([])
         }
