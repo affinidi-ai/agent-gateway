@@ -17,6 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+use crate::credential_providers::CredentialProvider;
 use crate::storage::filesystem::{StorageBackend, uncached_storage};
 
 mod consent;
@@ -261,10 +262,12 @@ pub trait DelegationVaultStorage: Send + Sync {
     /// it can be decided: its provider's revocation ends the person's whole
     /// authorization, and the vault could not tell whether another grant of
     /// theirs still uses it. The daily sweep decides. Kept encrypted, and only
-    /// while at-rest encryption is active.
+    /// while at-rest encryption is active. `provider` is kept with it, to
+    /// decide it with once the provider is deleted.
     async fn defer_revocation(
         &self,
         _grant: DelegatedGrant,
+        _provider: Option<CredentialProvider>,
     ) -> Result<()> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
@@ -277,6 +280,13 @@ pub trait DelegationVaultStorage: Send + Sync {
         &self,
         _revocation: &DeferredRevocation,
     ) -> Result<()> {
+        anyhow::bail!("This vault does not keep grants by binding")
+    }
+
+    /// Every revocation deferred, oldest first, or an error when any cannot be
+    /// read ([`super::grants::UnreadableKeptRevocation`]), for a caller that
+    /// must see them all.
+    async fn every_deferred_revocation(&self) -> Result<Vec<DeferredRevocation>> {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
@@ -306,7 +316,8 @@ pub trait DelegationVaultStorage: Send + Sync {
         anyhow::bail!("This vault does not keep grants by binding")
     }
 
-    /// Record that a grant was used, when the vault is not busy.
+    /// Record that a grant was used, when the vault is not busy and its last
+    /// recorded use is old enough ([`DelegatedGrant::use_is_due`]).
     async fn mark_grant_used(
         &self,
         _id: &str,
@@ -891,6 +902,46 @@ impl FileSystemDelegationVaultStore {
             }
         }
         Ok(grants)
+    }
+
+    /// Every revocation deferred, oldest first. One that cannot be read is an
+    /// error when `strict`, and is otherwise left out and logged.
+    async fn read_deferred_revocations(
+        &self,
+        strict: bool,
+    ) -> Result<Vec<DeferredRevocation>> {
+        let ids =
+            ids_with_prefix(&self.deferred_revocations_directory, "", deferred_revocation::is_deferred_revocation_id)
+                .await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if strict && !self.encrypted {
+            return Err(super::grants::UnreadableKeptRevocation { revocation_id: ids[0].clone() }.into());
+        }
+        self.require_encryption()?;
+        let mut deferred = Vec::new();
+        for id in ids {
+            match self
+                .deferred_revocations
+                .get(&id)
+                .await
+            {
+                Ok(Some(revocation)) => deferred.push(revocation),
+                Ok(None) => {}
+                Err(_) if strict => {
+                    return Err(super::grants::UnreadableKeptRevocation { revocation_id: id }.into());
+                }
+                Err(error) => warn!(
+                    target: "credential_delegation",
+                    deferred_revocation_id = %id,
+                    error = ?error.to_string(),
+                    "A deferred revocation cannot be read now; it is tried again at the next sweep"
+                ),
+            }
+        }
+        deferred.sort_by_key(|revocation| revocation.deferred_at);
+        Ok(deferred)
     }
 
     fn require_encryption(&self) -> Result<()> {
@@ -1709,7 +1760,9 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
         let id = id.to_string();
         let recorded = self
             .try_mutate(move |store| async move {
-                if let Some(mut grant) = store.grants.get(&id).await? {
+                if let Some(mut grant) = store.grants.get(&id).await?
+                    && grant.use_is_due(Utc::now())
+                {
                     grant.last_used_at = Some(Utc::now());
                     store
                         .grants
@@ -1922,9 +1975,10 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
     async fn defer_revocation(
         &self,
         grant: DelegatedGrant,
+        provider: Option<CredentialProvider>,
     ) -> Result<()> {
         self.require_encryption()?;
-        let deferred = DeferredRevocation::new(grant, Utc::now(), Deferral::AuthorizationInUse);
+        let deferred = DeferredRevocation::new(grant, Utc::now(), Deferral::AuthorizationInUse).with_provider(provider);
         self.deferred_revocations
             .save_atomic(&deferred)
             .await
@@ -1953,30 +2007,14 @@ impl DelegationVaultStorage for FileSystemDelegationVaultStore {
             .context("Failed to keep a delegated grant's revocation")
     }
 
+    async fn every_deferred_revocation(&self) -> Result<Vec<DeferredRevocation>> {
+        self.read_deferred_revocations(true)
+            .await
+    }
+
     async fn deferred_revocations(&self) -> Result<Vec<DeferredRevocation>> {
-        self.require_encryption()?;
-        let mut deferred = Vec::new();
-        for id in
-            ids_with_prefix(&self.deferred_revocations_directory, "", deferred_revocation::is_deferred_revocation_id)
-                .await?
-        {
-            match self
-                .deferred_revocations
-                .get(&id)
-                .await
-            {
-                Ok(Some(revocation)) => deferred.push(revocation),
-                Ok(None) => {}
-                Err(error) => warn!(
-                    target: "credential_delegation",
-                    deferred_revocation_id = %id,
-                    error = ?error.to_string(),
-                    "A deferred revocation cannot be read now; it is tried again at the next sweep"
-                ),
-            }
-        }
-        deferred.sort_by_key(|revocation| revocation.deferred_at);
-        Ok(deferred)
+        self.read_deferred_revocations(false)
+            .await
     }
 
     async fn forget_deferred_revocation(
@@ -4133,6 +4171,33 @@ mod tests {
                 .unwrap()
                 .last_used_at
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn using_a_grant_again_within_the_interval_keeps_its_recorded_use() {
+        use crate::delegation_vault::grants::tests::{grant, key};
+        let directory = tempfile::tempdir().unwrap();
+        let vault = encrypted_vault(directory.path()).await;
+        let recent = Utc::now() - chrono::Duration::seconds(60);
+        let mut used = grant(&key(), "access");
+        used.last_used_at = Some(recent);
+        vault
+            .store_grant(used)
+            .await
+            .unwrap();
+        vault
+            .mark_grant_used(&key().record_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            vault
+                .grant(&key())
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used_at,
+            Some(recent)
         );
     }
 

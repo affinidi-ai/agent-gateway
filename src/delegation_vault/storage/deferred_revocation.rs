@@ -14,6 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::credential_providers::CredentialProvider;
 use crate::delegation_vault::grants::DelegatedGrant;
 use crate::storage::filesystem::StorableEntity;
 
@@ -52,6 +53,11 @@ pub struct DeferredRevocation {
     /// How many times a pending revocation could not reach its vendor.
     #[serde(default)]
     pub attempts: u32,
+    /// The grant's provider as it was when the revocation was kept, so the
+    /// revocation can still be decided once the provider is deleted. Holds
+    /// secret references, never secret values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<CredentialProvider>,
 }
 
 impl std::fmt::Debug for DeferredRevocation {
@@ -66,6 +72,13 @@ impl std::fmt::Debug for DeferredRevocation {
             .field("deferred_at", &self.deferred_at)
             .field("deferral", &self.deferral)
             .field("attempts", &self.attempts)
+            .field(
+                "provider",
+                &self
+                    .provider
+                    .as_ref()
+                    .map(|provider| &provider.id),
+            )
             .finish()
     }
 }
@@ -93,7 +106,18 @@ impl DeferredRevocation {
             deferred_at: now,
             deferral,
             attempts: 0,
+            provider: None,
         }
+    }
+
+    /// This revocation, keeping `provider` to decide it with once the
+    /// provider is deleted.
+    pub fn with_provider(
+        mut self,
+        provider: Option<CredentialProvider>,
+    ) -> Self {
+        self.provider = provider;
+        self
     }
 }
 

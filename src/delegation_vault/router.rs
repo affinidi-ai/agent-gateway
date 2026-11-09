@@ -193,6 +193,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::credential_providers::storage::CredentialProviderStorage for StubProviderStore {
+        async fn get_checked(
+            &self,
+            id: &str,
+        ) -> anyhow::Result<Option<crate::credential_providers::CredentialProvider>> {
+            self.get(id).await
+        }
+
         async fn create(
             &self,
             _provider: CredentialProvider,

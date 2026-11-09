@@ -998,8 +998,9 @@ impl TargetGrantRoute {
     }
 
     /// Record that `grant` is injected into a request released for
-    /// `released`'s caller: mark it used, and audit it under that caller's
-    /// identity hash, whichever subject the binding has.
+    /// `released`'s caller: mark it used, at most once per use interval and
+    /// on its own task, and audit it under that caller's identity hash,
+    /// whichever subject the binding has.
     async fn injected(
         &self,
         surface: &AgentSurface,
@@ -1007,18 +1008,7 @@ impl TargetGrantRoute {
         released: &ReleasedTargetGrant,
         grant: &DelegatedGrant,
     ) {
-        if let Err(error) = release
-            .vault
-            .mark_grant_used(&grant.id)
-            .await
-        {
-            tracing::debug!(
-                target: "credential_delegation",
-                surface_id = %surface.surface_id,
-                error = %error,
-                "Failed to record a grant's use"
-            );
-        }
+        crate::delegation_vault::release::record_use_in_background(release.vault, grant, None);
         self.audit_injected(surface, &released.principal, released.caller.clone(), grant);
     }
 
@@ -1082,8 +1072,9 @@ impl TargetGrantRoute {
     /// challenge rejects the token (`invalid_token`) gets one refresh,
     /// single-flight, and one retry of `retry`, the request as it was sent,
     /// with the new token, a target checking the token before it acts; a grant
-    /// that cannot be refreshed, or whose refresh token is refused, is removed
-    /// and revoked while it still holds the token refused, and answers
+    /// whose refresh token is refused, or a caller's grant that cannot be
+    /// refreshed, is removed and revoked while it still holds the token
+    /// refused, and an owner's that cannot be refreshed is kept; each answers
     /// `connect_required`. A second `401` refuses this request,
     /// `connector_unavailable`, and keeps the fresh grant. A `401` without
     /// such a challenge, a refresh that fails for a reason a new connect would
