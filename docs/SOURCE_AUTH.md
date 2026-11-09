@@ -1424,8 +1424,8 @@ keys is checked again on its next request.
   key, since that folder may hold it: a surface naming it is not ready in either mode, and a key
   id found in a loaded folder is judged as usual. A save that adds a reference to such an id
   answers `503` "API key store is unavailable"; one the stored surface already named is kept.
-  Tenant reassignment of a surface naming a key id is refused with the same message until the
-  folder can be loaded. The gateway logs the folders once, by name.
+  While any stored surface names a key id, a tenant reassignment of any resource, and its
+  impact preview, are refused with the same message until the folder can be loaded. The gateway logs the folders once, by name.
 - Boot and a configuration reload read the API key store once for all the surfaces they bring
   live, and their credential policy report judges from that same listing. While that listing
   fails, the report logs one warning and lists every surface naming a key id as
