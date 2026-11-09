@@ -524,19 +524,17 @@ where
     }
 }
 
-/// Removes the read-only `access_point_status` and `api_key_references` of a
-/// [`SurfaceResponse`] from a write body, so a client can send back what a
-/// read or a save returned. Whether either was there.
+/// Removes the read-only `access_point_status`, `api_key_references` and
+/// `serving_status` of a [`SurfaceResponse`] from a write body, so a client can
+/// send back what a read or a save returned. Whether any was there.
 fn drop_read_only_fields(body: &mut serde_json::Value) -> bool {
     body.as_object_mut()
         .is_some_and(|body| {
-            let status = body
-                .remove("access_point_status")
-                .is_some();
-            let references = body
-                .remove("api_key_references")
-                .is_some();
-            status || references
+            ["access_point_status", "api_key_references", "serving_status"]
+                .into_iter()
+                .filter(|field| body.remove(*field).is_some())
+                .count()
+                > 0
         })
 }
 
@@ -4525,8 +4523,9 @@ pub async fn delete_surface(
 
 /// A surface, or one of its variants, as the admin API returns it, with the
 /// status of the Access Point it serves and, on a single surface read or save,
-/// how each API key it names stands. Both are derived on every response, never
-/// stored, and dropped from a write body that sends them back.
+/// how each API key it names stands and whether this node's kept verdict on
+/// those keys lets it serve. All are derived on every response, never stored,
+/// and dropped from a write body that sends them back.
 #[derive(Debug, Serialize)]
 pub struct SurfaceResponse<T> {
     #[serde(flatten)]
@@ -4534,6 +4533,8 @@ pub struct SurfaceResponse<T> {
     pub access_point_status: AccessPointStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_references: Option<Vec<ApiKeyReference>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_status: Option<crate::identity::provider_key_gate::ServingStatus>,
 }
 
 impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
@@ -4543,20 +4544,26 @@ impl From<AgentSurface> for SurfaceResponse<AgentSurface> {
         Self {
             access_point_status: surface.served_access_point_status(),
             api_key_references: None,
+            serving_status: None,
             resource: surface,
         }
     }
 }
 
 impl SurfaceResponse<AgentSurface> {
-    /// `surface` with the [`ApiKeyReference`]s of its base and every variant.
+    /// `surface` with the [`ApiKeyReference`]s of its base and every variant
+    /// and, when it names a key id, its serving status on this node.
     async fn with_api_key_references(
         state: &IdentityApiState,
         surface: AgentSurface,
     ) -> Self {
         let api_key_references = surface_api_key_references(state, &surface).await;
+        let serving_status = api_key_references
+            .as_ref()
+            .map(|_| crate::identity::provider_key_gate::gate().serving_status(&surface));
         Self {
             api_key_references,
+            serving_status,
             ..surface.into()
         }
     }
@@ -4575,6 +4582,7 @@ impl SurfaceResponse<SurfaceVariant> {
                 .surface
                 .access_point_status(),
             api_key_references: None,
+            serving_status: None,
             resource: variant,
         }
     }
@@ -10969,6 +10977,31 @@ mod tests {
     }
 
     #[test]
+    fn test_surface_response_carries_a_serving_status_only_beside_its_api_key_references() {
+        let surface: AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "saved", "name": "saved",
+            "access_point": {"listen_address": "http://localhost:8080", "route": "/agent", "protocol": "a2a"},
+            "target": {"endpoint": "http://localhost:8081"}
+        }))
+        .unwrap();
+        let plain = serde_json::to_value(SurfaceResponse::from(surface.clone())).unwrap();
+        let judged = serde_json::to_value(SurfaceResponse {
+            serving_status: Some(crate::identity::provider_key_gate::ServingStatus::NotServing),
+            ..SurfaceResponse::from(surface)
+        })
+        .unwrap();
+
+        assert!(
+            plain
+                .get("serving_status")
+                .is_none(),
+            "{plain}"
+        );
+        assert_eq!(judged["serving_status"], "not_serving");
+        assert_eq!(judged["access_point_status"], plain["access_point_status"], "the Access Point status is unchanged");
+    }
+
+    #[test]
     fn test_variant_response_reports_the_status_of_that_variant() {
         let api_key = serde_json::json!({"methods": [{"type": "api_key",
             "extraction": {"source": "http_header", "field": "x-api-key"}, "secret_id": "key"}]});
@@ -11003,10 +11036,14 @@ mod tests {
         assert_eq!(sent, serde_json::json!({"name": "saved"}));
         assert!(!drop_read_only_fields(&mut sent));
         let mut references = serde_json::json!({
-            "name": "saved", "api_key_references": [{"key_id": "atgk_a", "status": "revoked"}]
+            "name": "saved", "api_key_references": [{"key_id": "atgk_a", "status": "revoked", "blocking": true}],
+            "serving_status": "not_serving"
         });
         assert!(drop_read_only_fields(&mut references));
         assert_eq!(references, serde_json::json!({"name": "saved"}));
+        let mut serving = serde_json::json!({"name": "saved", "serving_status": "serving"});
+        assert!(drop_read_only_fields(&mut serving));
+        assert_eq!(serving, serde_json::json!({"name": "saved"}));
         let mut not_an_object = serde_json::json!(["access_point_status"]);
         assert!(!drop_read_only_fields(&mut not_an_object));
     }

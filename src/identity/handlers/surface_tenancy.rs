@@ -2220,11 +2220,15 @@ pub enum ApiKeyReferenceStatus {
     Unknown,
 }
 
-/// An API Key Provider key id a surface names and how it stands.
+/// An API Key Provider key id a surface names, how it stands, and whether the surface must name
+/// another key before it serves (`blocking`): for a key of this surface when it is revoked or
+/// missing, for a key of another surface exactly when `tenant_credential_isolation` is `enforce`,
+/// and never while the store cannot tell.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ApiKeyReference {
     pub key_id: String,
     pub status: ApiKeyReferenceStatus,
+    pub blocking: bool,
 }
 
 /// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` names, judged as
@@ -2235,6 +2239,7 @@ pub(crate) fn api_key_references(
     surface_id: &str,
     ids: &ProviderKeyIds,
     listing: Option<&KeyListing>,
+    isolation: RuleMode,
 ) -> Vec<ApiKeyReference> {
     let mut references: Vec<_> = ids
         .keys
@@ -2263,7 +2268,16 @@ pub(crate) fn api_key_references(
                     KeyStatus::Found(_) => ApiKeyReferenceStatus::Active,
                 },
             };
-            Some(ApiKeyReference { key_id: key_id.clone(), status })
+            let blocking = match status {
+                ApiKeyReferenceStatus::Revoked | ApiKeyReferenceStatus::Missing => true,
+                ApiKeyReferenceStatus::Unavailable => isolation.is_enforced(),
+                ApiKeyReferenceStatus::Active | ApiKeyReferenceStatus::Unknown => false,
+            };
+            Some(ApiKeyReference {
+                key_id: key_id.clone(),
+                status,
+                blocking,
+            })
         })
         .collect();
     references.sort_by(|a, b| a.key_id.cmp(&b.key_id));
@@ -2290,7 +2304,12 @@ pub(crate) async fn surface_api_key_references(
             .ok(),
         None => None,
     };
-    Some(api_key_references(&surface.surface_id, &ids, listing.as_ref()))
+    Some(api_key_references(
+        &surface.surface_id,
+        &ids,
+        listing.as_ref(),
+        crate::config::credential_policy::credential_policy().tenant_credential_isolation,
+    ))
 }
 
 #[cfg(test)]
@@ -2698,10 +2717,13 @@ mod tests {
             ("atgk_legacy_own".to_string(), vec!["own".to_string()]),
         ]))
         .with(&["atgk_revoked", "atgk_foreign_revoked"], &[]);
-        let reference = |key_id: &str, status| ApiKeyReference { key_id: key_id.into(), status };
+        let reference = |key_id: &str, status| (key_id.to_string(), status);
 
         assert_eq!(
-            api_key_references("own", &ids, Some(&listing)),
+            api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
+                .into_iter()
+                .map(|reference| (reference.key_id, reference.status))
+                .collect::<Vec<_>>(),
             vec![
                 reference("atgk_active", ApiKeyReferenceStatus::Active),
                 reference("atgk_foreign", ApiKeyReferenceStatus::Unavailable),
@@ -2712,16 +2734,68 @@ mod tests {
             ]
         );
         assert_eq!(
-            api_key_references("own", &ids, None)
+            api_key_references("own", &ids, None, RuleMode::Warn)
                 .into_iter()
                 .map(|reference| reference.status)
                 .collect::<Vec<_>>(),
             vec![ApiKeyReferenceStatus::Unknown; 7],
             "the store being unavailable makes every id unknown, as the gate's store_unavailable"
         );
+    }
+
+    #[test]
+    fn an_api_key_reference_blocks_what_the_gate_refuses_whatever_the_mode_or_by_the_mode_for_another_surfaces_key() {
+        let ids = ProviderKeyIds {
+            keys: vec![
+                "atgk_active".into(),
+                "atgk_foreign".into(),
+                "atgk_foreign_revoked".into(),
+                "atgk_missing".into(),
+                "atgk_revoked".into(),
+            ],
+            legacy_secrets: vec!["atgk_legacy_revoked".into()],
+        };
+        let listing = KeyListing::from(std::collections::HashMap::from([
+            ("atgk_active".to_string(), vec!["own".to_string()]),
+            ("atgk_revoked".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+            ("atgk_foreign_revoked".to_string(), vec!["other".to_string()]),
+            ("atgk_legacy_revoked".to_string(), vec!["own".to_string()]),
+        ]))
+        .with(&["atgk_revoked", "atgk_foreign_revoked", "atgk_legacy_revoked"], &[]);
+        let blocking = |listing: &KeyListing, mode| {
+            api_key_references("own", &ids, Some(listing), mode)
+                .into_iter()
+                .filter(|reference| reference.blocking)
+                .map(|reference| reference.key_id)
+                .collect::<Vec<_>>()
+        };
+        let own_breaches = ["atgk_legacy_revoked", "atgk_missing", "atgk_revoked"];
+
+        assert_eq!(blocking(&listing, RuleMode::Warn), own_breaches);
         assert_eq!(
-            serde_json::to_value(reference("atgk_x", ApiKeyReferenceStatus::Unavailable)).unwrap(),
-            serde_json::json!({"key_id": "atgk_x", "status": "unavailable"})
+            blocking(&listing, RuleMode::Enforce),
+            ["atgk_foreign", "atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_missing", "atgk_revoked"]
+        );
+        assert_eq!(
+            blocking(
+                &listing
+                    .clone()
+                    .with(&[], &["locked"]),
+                RuleMode::Enforce
+            ),
+            ["atgk_foreign", "atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_revoked"],
+            "an unknown id does not block"
+        );
+        assert!(
+            api_key_references("own", &ids, None, RuleMode::Enforce)
+                .iter()
+                .all(|reference| !reference.blocking),
+            "nothing blocks while the store cannot be read"
+        );
+        assert_eq!(
+            serde_json::to_value(&api_key_references("own", &ids, Some(&listing), RuleMode::Warn)[0]).unwrap(),
+            serde_json::json!({"key_id": "atgk_active", "status": "active", "blocking": false})
         );
     }
 
@@ -2789,7 +2863,7 @@ mod tests {
             keys: vec!["atgk_own".into(), "atgk_unknown".into()],
             legacy_secrets: vec!["atgk_legacy".into()],
         };
-        let statuses: Vec<_> = api_key_references("own", &ids, Some(&partial_listing()))
+        let statuses: Vec<_> = api_key_references("own", &ids, Some(&partial_listing()), RuleMode::Warn)
             .into_iter()
             .map(|reference| (reference.key_id, reference.status))
             .collect();
@@ -2875,7 +2949,7 @@ mod tests {
         assert!(!cached.is_revoked(&revoked), "node B's cache is stale");
         assert!(listing.is_revoked(&revoked), "the save is judged from the folder as stored");
         assert_eq!(listing.owners_of(&added), ["own".to_string()], "a key another node added is found");
-        let statuses: Vec<_> = api_key_references("own", &ids, Some(&listing))
+        let statuses: Vec<_> = api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
             .into_iter()
             .map(|reference| (reference.key_id, reference.status))
             .collect();

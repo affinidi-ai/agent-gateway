@@ -110,14 +110,27 @@ impl Entry {
         ids: &ProviderKeyIds,
         now: Instant,
     ) -> Option<Option<NotReadyReason>> {
+        ids.all()
+            .all(|id| {
+                self.recheck
+                    .get(id)
+                    .is_none_or(|at| now < *at)
+            })
+            .then(|| self.verdict(tenant_id, ids))
+            .flatten()
+    }
+
+    /// Whether the entry judged every id of `ids` for `tenant_id`, due for a recheck or not, and
+    /// if so why the surface is refused, if it is.
+    fn verdict(
+        &self,
+        tenant_id: Option<&str>,
+        ids: &ProviderKeyIds,
+    ) -> Option<Option<NotReadyReason>> {
         (self.tenant_id.as_deref() == tenant_id
-            && ids.all().all(|id| {
-                self.judged.contains(id)
-                    && self
-                        .recheck
-                        .get(id)
-                        .is_none_or(|at| now < *at)
-            }))
+            && ids
+                .all()
+                .all(|id| self.judged.contains(id)))
         .then(|| {
             let any = |set: &HashSet<String>| {
                 ids.all()
@@ -291,6 +304,16 @@ fn refusal(
     } else {
         refused.then_some(NotReadyReason::ProviderKeyTenant)
     }
+}
+
+/// Whether this node's kept verdict lets a surface naming key ids serve, without saying why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingStatus {
+    Serving,
+    NotServing,
+    /// No verdict covers the surface's tenant and key ids yet.
+    NotJudged,
 }
 
 #[derive(Default)]
@@ -566,6 +589,25 @@ impl ProviderKeyGate {
     fn changes(&self) -> u64 {
         self.changes
             .load(Ordering::SeqCst)
+    }
+
+    /// Whether the verdict this node keeps lets `surface`, as served (a resolved view, or a
+    /// surface with variants in every view), serve. Reads only the kept verdict, never the stores,
+    /// and a verdict due for a recheck still counts.
+    pub fn serving_status(
+        &self,
+        surface: &AgentSurface,
+    ) -> ServingStatus {
+        let ids = served_provider_key_ids(surface).unwrap_or_else(|_| ids_of(surface));
+        match self
+            .entries
+            .get(&surface.surface_id)
+            .and_then(|entry| entry.verdict(surface.tenant_id.as_deref(), &ids))
+        {
+            Some(None) => ServingStatus::Serving,
+            Some(Some(_)) => ServingStatus::NotServing,
+            None => ServingStatus::NotJudged,
+        }
     }
 
     /// The reason a kept verdict refuses `surface` as served (a resolved view, or a surface with
@@ -2040,6 +2082,85 @@ mod tests {
                 .gate
                 .has_verdict("owner-a"),
             "a verdict read before the surface was forgotten is not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_serving_status_reads_only_the_kept_verdict() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let enforced = gate().await;
+        let flaky = Arc::new(FlakyKeys::failing(&enforced, 0));
+        let listings = flaky.listings.clone();
+        let disk_reads = flaky.disk_reads.clone();
+        enforced
+            .gate
+            .set_sources(Some(flaky), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+
+        assert_eq!(
+            enforced
+                .gate
+                .serving_status(&own),
+            ServingStatus::NotJudged
+        );
+        assert_eq!((listings.load(Ordering::SeqCst), disk_reads.load(Ordering::SeqCst)), (0, 0));
+        assert!(
+            !enforced
+                .gate
+                .has_verdict("owner-a"),
+            "reading the status judges nothing"
+        );
+
+        enforced
+            .gate
+            .admit(&own)
+            .await;
+        assert_eq!(
+            enforced
+                .gate
+                .serving_status(&own),
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            enforced
+                .gate
+                .serving_status(&naming("owner-a", "tenant-b", external(KEY_A))),
+            ServingStatus::NotJudged,
+            "a verdict for another tenant does not count"
+        );
+        due_now(enforced.gate, "owner-a");
+        assert_eq!(
+            enforced
+                .gate
+                .serving_status(&own),
+            ServingStatus::Serving,
+            "a verdict due for a recheck still counts"
+        );
+
+        enforced
+            .api_keys
+            .revoke("owner-a", KEY_A, "test")
+            .await
+            .unwrap();
+        enforced
+            .gate
+            .key_changed(KEY_A);
+        enforced
+            .gate
+            .refuses(&own)
+            .await;
+        let reads = (listings.load(Ordering::SeqCst), disk_reads.load(Ordering::SeqCst));
+        assert_eq!(
+            enforced
+                .gate
+                .serving_status(&own),
+            ServingStatus::NotServing
+        );
+        assert_eq!((listings.load(Ordering::SeqCst), disk_reads.load(Ordering::SeqCst)), reads);
+        assert_eq!(
+            serde_json::to_value([ServingStatus::Serving, ServingStatus::NotServing, ServingStatus::NotJudged])
+                .unwrap(),
+            serde_json::json!(["serving", "not_serving", "not_judged"])
         );
     }
 

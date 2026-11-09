@@ -333,7 +333,7 @@ the surface serves: a surface refused for its API Key Provider keys stays `ready
 
 A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
 surface that names an API Key Provider key id, in its base or any variant, also carry a
-read-only `api_key_references`: one `{ "key_id", "status" }` per distinct id, sorted by id,
+read-only `api_key_references`: one `{ "key_id", "status", "blocking" }` per distinct id, sorted by id,
 with the ids the gate checks (a legacy Caller Context secret only when a key of that id
 exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
 has the id, `unavailable` for a key of any other surface, whose status is never reported,
@@ -343,7 +343,15 @@ same-tenant key of another surface that still serves under `warn` is `unavailabl
 surface names only its own keys. The field is absent when the surface names no key id, and on
 the surface list and variant responses. The surface's own key folder is read from disk for it,
 so a key of the surface another node revoked, deleted or created is reported as stored; when
-that folder cannot be read, its keys are `unknown`.
+that folder cannot be read, its keys are `unknown`. `blocking` is `true` for a `revoked` or
+`missing` key, and for an `unavailable` key exactly when `tenant_credential_isolation` is
+`enforce`; it is `false` for an `active` or `unknown` one.
+
+Beside `api_key_references`, the same responses carry a read-only `serving_status`: `serving` or
+`not_serving` as the verdict this node keeps on the surface's key ids stands, without saying
+why, and `not_judged` while it keeps none. It is read only from that kept verdict, never from
+the API key store, so it is per node and eventually consistent, and it is not part of
+`access_point_status`.
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -361,7 +369,7 @@ in `Warning` headers (code 299), before the Transit Point warnings described bel
 Access Point is public, when it or an enabled variant is not ready (a variant's warning is
 prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
 admits every caller. A write request that sends a response back unchanged has its top-level
-`access_point_status` and `api_key_references` dropped before parsing.
+`access_point_status`, `api_key_references` and `serving_status` dropped before parsing.
 
 A gateway rolled back to a release without these fields cannot load the surfaces that store
 them, which is every surface created after the upgrade; see

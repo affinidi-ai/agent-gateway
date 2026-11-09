@@ -168,11 +168,15 @@ fn surface_reports_api_key_status(
         .as_ref()
         .expect("the surface was read")
         .body;
-    let expected = json!({"key_id": key_id, "status": status});
     let references = surface["api_key_references"]
         .as_array()
         .unwrap_or_else(|| panic!("the surface reports no api_key_references: {surface}"));
-    assert!(references.contains(&expected), "expected API key {name:?} reported as {status:?}, got {references:?}");
+    assert!(
+        references
+            .iter()
+            .any(|reference| reference["key_id"] == json!(key_id) && reference["status"] == json!(status)),
+        "expected API key {name:?} reported as {status:?}, got {references:?}"
+    );
 }
 
 #[then(expr = "the admin API error response does not mention {string}")]
