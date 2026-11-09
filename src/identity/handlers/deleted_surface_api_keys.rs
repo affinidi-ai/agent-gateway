@@ -16,15 +16,47 @@ use crate::tenancy::ResourceKind;
 /// The actor a deleted surface's API keys are revoked under.
 const SURFACE_DELETE_ACTOR: &str = "surface-delete";
 
+/// What [`revoke_api_keys_of`] did with the API keys of a deleted surface.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Revocation {
+    /// How many keys it revoked; a key revoked meanwhile is not counted.
+    pub revoked: usize,
+    /// The ids of the keys it could not revoke, which stay active.
+    pub left_active: Vec<String>,
+    /// Whether the key folder could not be read, so none of its keys was revoked.
+    pub folder_unreadable: bool,
+}
+
+impl Revocation {
+    /// The warning a surface delete answers with while keys of the surface stay active.
+    pub(crate) fn warning(&self) -> Option<String> {
+        if self.folder_unreadable {
+            Some(
+                "The API keys of this surface could not be read, so none was revoked; they stay active until a \
+                 gateway node next becomes Active or they are revoked or deleted"
+                    .to_string(),
+            )
+        } else if !self.left_active.is_empty() {
+            Some(format!(
+                "API keys {} of this surface could not be revoked; they stay active until a gateway node next \
+                 becomes Active or they are revoked or deleted",
+                self.left_active.join(", ")
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 /// Revokes every active API key of the surface `owner`, read from its key folder on disk so keys
-/// another node created are revoked too, and returns how many it revoked. The keys are kept, so
-/// the surface id still owns them and cannot be taken by a new surface. A key record in the folder
-/// naming another owner is left alone, and a key revoked meanwhile is not counted. A folder that
-/// cannot be read, or a key that cannot be revoked, is logged.
+/// another node created are revoked too. The keys are kept, so the surface id still owns them and
+/// cannot be taken by a new surface. A key record in the folder naming another owner is left
+/// alone. A folder that cannot be read, or a key that cannot be revoked, is logged and reported in
+/// the returned [`Revocation`].
 pub(crate) async fn revoke_api_keys_of(
     api_keys: &dyn ApiKeyStore,
     owner: &str,
-) -> usize {
+) -> Revocation {
     let keys = match api_keys
         .list_from_disk(owner)
         .await
@@ -32,10 +64,13 @@ pub(crate) async fn revoke_api_keys_of(
         Ok(keys) => keys,
         Err(error) => {
             error!(surface = %owner, %error, "Could not read the API keys of a deleted surface to revoke them");
-            return 0;
+            return Revocation {
+                folder_unreadable: true,
+                ..Revocation::default()
+            };
         }
     };
-    let mut revoked = 0;
+    let mut revocation = Revocation::default();
     for key in keys
         .into_iter()
         .filter(|key| key.agent_id == owner && key.status == ApiKeyStatus::Active)
@@ -47,17 +82,20 @@ pub(crate) async fn revoke_api_keys_of(
             Ok(()) => {
                 crate::identity::provider_key_gate::gate().key_changed(&key.key_id);
                 crate::observability::dashboard::record_api_key_withdrawn(&key.key_id);
-                revoked += 1;
+                revocation.revoked += 1;
             }
             Err(crate::api_keys::ApiKeyError::AlreadyRevoked { .. }) => {
                 debug!(surface = %owner, key_id = %key.key_id, "An API key of a deleted surface was revoked meanwhile")
             }
             Err(error) => {
-                error!(surface = %owner, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface")
+                error!(surface = %owner, key_id = %key.key_id, %error, "Could not revoke an API key of a deleted surface");
+                revocation
+                    .left_active
+                    .push(key.key_id);
             }
         }
     }
-    revoked
+    revocation
 }
 
 /// Revokes every active API key whose owner is neither a surface of any source the gateway
@@ -141,7 +179,9 @@ async fn revoke_api_keys_of_unknown_owners(
             warn!(revoked, "Stopped revoking the API keys of deleted surfaces: the node is no longer Active");
             return Some(revoked);
         }
-        revoked += revoke_api_keys_of(api_keys, owner).await;
+        revoked += revoke_api_keys_of(api_keys, owner)
+            .await
+            .revoked;
     }
     info!(revoked, deferred, "Revoked the API keys of surfaces that no longer exist");
     Some(revoked)
@@ -425,9 +465,16 @@ mod tests {
         let other_node = create(&store(&directory).await, "deleted-surface").await;
         let neighbour = create(&keys, "live-surface").await;
 
-        let revoked = revoke_api_keys_of(&keys, "deleted-surface").await;
+        let revocation = revoke_api_keys_of(&keys, "deleted-surface").await;
 
-        assert_eq!(revoked, 2);
+        assert_eq!(
+            revocation,
+            Revocation {
+                revoked: 2,
+                ..Revocation::default()
+            }
+        );
+        assert_eq!(revocation.warning(), None, "nothing stays active");
         let fresh = store(&directory).await;
         for key_id in [&own, &other_node] {
             assert_eq!(
@@ -439,11 +486,15 @@ mod tests {
             );
         }
         assert_eq!(status(&fresh, "live-surface", &neighbour).await, (ApiKeyStatus::Active, None));
-        assert_eq!(revoke_api_keys_of(&keys, "deleted-surface").await, 0, "a second delete revokes nothing");
+        assert_eq!(
+            revoke_api_keys_of(&keys, "deleted-surface").await,
+            Revocation::default(),
+            "a second delete revokes nothing"
+        );
     }
 
     #[tokio::test]
-    async fn a_deleted_surface_whose_key_folder_cannot_be_read_revokes_nothing() {
+    async fn a_deleted_surface_whose_key_folder_cannot_be_read_revokes_nothing_and_says_so() {
         use std::os::unix::fs::PermissionsExt as _;
         let directory = tempfile::TempDir::new().unwrap();
         let keys = store(&directory).await;
@@ -457,11 +508,42 @@ mod tests {
             return;
         }
 
-        let revoked = revoke_api_keys_of(&keys, "locked-surface").await;
+        let revocation = revoke_api_keys_of(&keys, "locked-surface").await;
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(revoked, 0);
+        assert_eq!(
+            revocation,
+            Revocation {
+                folder_unreadable: true,
+                ..Revocation::default()
+            }
+        );
+        assert!(
+            revocation
+                .warning()
+                .is_some_and(|warning| warning.contains("could not be read, so none was revoked")),
+            "{revocation:?}"
+        );
         assert_eq!(status(&store(&directory).await, "locked-surface", &key).await, (ApiKeyStatus::Active, None));
+    }
+
+    #[test]
+    fn a_revocation_warns_naming_the_keys_it_left_active() {
+        let revocation = Revocation {
+            revoked: 1,
+            left_active: vec!["atgk_one".into(), "atgk_two".into()],
+            folder_unreadable: false,
+        };
+
+        assert_eq!(
+            revocation
+                .warning()
+                .as_deref(),
+            Some(
+                "API keys atgk_one, atgk_two of this surface could not be revoked; they stay active until a gateway \
+                 node next becomes Active or they are revoked or deleted"
+            )
+        );
     }
 
     #[tokio::test]

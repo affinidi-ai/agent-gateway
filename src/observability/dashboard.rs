@@ -33,26 +33,39 @@ pub fn init_start_time() {
     PROXY_START_TIME.get_or_init(SystemTime::now);
 }
 
-static DELETED_SURFACES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>> =
-    std::sync::LazyLock::new(Default::default);
+type ChangedAt = std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>>;
+
+/// How long a surface delete or API key withdrawal is kept for dashboard deltas; a delta whose
+/// `since` is older re-sends every identity ([`identities_changed_since`]).
+const WITHDRAWN_MEMORY: chrono::TimeDelta = chrono::TimeDelta::hours(24);
+
+/// Notes `id` as changed now in `changes`, forgetting what changed longer than
+/// [`WITHDRAWN_MEMORY`] ago.
+fn record_changed(
+    changes: &ChangedAt,
+    id: &str,
+) {
+    if let Ok(mut changes) = changes.lock() {
+        let now = Utc::now();
+        changes.retain(|_, at| now - *at < WITHDRAWN_MEMORY);
+        changes.insert(id.to_string(), now);
+    }
+}
+
+static DELETED_SURFACES: ChangedAt = std::sync::LazyLock::new(Default::default);
 
 /// Notes that this node deleted `surface_id`, so the next dashboard delta re-sends the
 /// identities linked to it.
 pub(crate) fn record_surface_deleted(surface_id: &str) {
-    if let Ok(mut deleted) = DELETED_SURFACES.lock() {
-        deleted.insert(surface_id.to_string(), Utc::now());
-    }
+    record_changed(&DELETED_SURFACES, surface_id);
 }
 
-static WITHDRAWN_API_KEYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, DateTime<Utc>>>> =
-    std::sync::LazyLock::new(Default::default);
+static WITHDRAWN_API_KEYS: ChangedAt = std::sync::LazyLock::new(Default::default);
 
 /// Notes that this node revoked or deleted the API key `key_id`, so the next dashboard delta
 /// re-sends the identities whose DID comes from it.
 pub(crate) fn record_api_key_withdrawn(key_id: &str) {
-    if let Ok(mut revoked) = WITHDRAWN_API_KEYS.lock() {
-        revoked.insert(key_id.to_string(), Utc::now());
-    }
+    record_changed(&WITHDRAWN_API_KEYS, key_id);
 }
 
 fn api_keys_withdrawn_since(since: DateTime<Utc>) -> std::collections::HashSet<String> {
@@ -2099,7 +2112,9 @@ fn linked_surface_deleted(
 
 /// Identities created, last used, whose caller or target Agent Card name changed, whose
 /// Trust Recorder status changed, whose last linked surface this node deleted, or
-/// revoked when this node revoked or deleted their API key, after `since`.
+/// revoked when this node revoked or deleted their API key, after `since`; every identity when
+/// `since` is older than [`WITHDRAWN_MEMORY`], as the deletes and withdrawals before it are
+/// forgotten.
 /// Newly issued identities have `last_used_at = None` until the first usage
 /// event, so falling back to `created_at` surfaces them on the very first
 /// request that creates them.
@@ -2110,6 +2125,9 @@ pub(crate) fn identities_changed_since(
     renamed_surfaces: &std::collections::HashSet<String>,
     recorder_changed_dids: &std::collections::HashSet<String>,
 ) -> Vec<IdentityInfo> {
+    if Utc::now() - since >= WITHDRAWN_MEMORY {
+        return identities;
+    }
     let deleted_surfaces = &surfaces_deleted_since(since);
     let withdrawn_api_keys = &api_keys_withdrawn_since(since);
     identities
@@ -2941,6 +2959,30 @@ fn strip_ansi_codes(s: &str) -> String {
 mod tests {
     use super::parse_plain_text_log_entry;
 
+    #[test]
+    fn a_recorded_change_forgets_changes_older_than_the_memory() {
+        static CHANGES: super::ChangedAt = std::sync::LazyLock::new(Default::default);
+        let now = chrono::Utc::now();
+        CHANGES
+            .lock()
+            .unwrap()
+            .extend([
+                ("stale".to_string(), now - super::WITHDRAWN_MEMORY - chrono::TimeDelta::minutes(1)),
+                ("recent".to_string(), now - chrono::TimeDelta::hours(1)),
+            ]);
+
+        super::record_changed(&CHANGES, "new");
+
+        let mut kept: Vec<_> = CHANGES
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        kept.sort();
+        assert_eq!(kept, ["new", "recent"]);
+    }
+
     mod identity_naming {
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
@@ -3197,6 +3239,28 @@ mod tests {
             let delta = identities_changed_since(rows().await, since, &none, &none, &none);
             assert_eq!(delta.len(), 1);
             assert!(delta[0].surface_deleted);
+        }
+
+        #[tokio::test]
+        async fn test_a_delta_older_than_the_withdrawal_memory_resends_every_identity() {
+            let since = Utc::now() - super::super::WITHDRAWN_MEMORY - chrono::Duration::minutes(1);
+            let mut unchanged = managed("did:example:neon", "neon-unchanged");
+            unchanged.last_used_at = Some(since - chrono::Duration::hours(1));
+            let rows = list(vec![unchanged], &[], &names())
+                .await
+                .into_values()
+                .collect::<Vec<_>>();
+            let none = HashSet::new();
+
+            let delta = identities_changed_since(rows, since, &none, &none, &none);
+
+            assert_eq!(
+                delta
+                    .iter()
+                    .map(|identity| identity.did.as_str())
+                    .collect::<Vec<_>>(),
+                ["did:example:neon"]
+            );
         }
 
         #[tokio::test]

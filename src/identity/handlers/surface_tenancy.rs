@@ -2222,8 +2222,9 @@ pub enum ApiKeyReferenceStatus {
 
 /// An API Key Provider key id a surface names, how it stands, and whether the surface must name
 /// another key before it serves (`blocking`): for a key of this surface when it is revoked or
-/// missing, for a key of another surface exactly when `tenant_credential_isolation` is `enforce`,
-/// and never while the store cannot tell.
+/// missing, for a key of another surface when it is revoked or `tenant_credential_isolation` is
+/// `enforce`, and never while the store cannot tell. Another surface's revoked key stays
+/// `unavailable`, as the surface's `serving_status` already shows it does not serve.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct ApiKeyReference {
     pub key_id: String,
@@ -2270,7 +2271,9 @@ pub(crate) fn api_key_references(
             };
             let blocking = match status {
                 ApiKeyReferenceStatus::Revoked | ApiKeyReferenceStatus::Missing => true,
-                ApiKeyReferenceStatus::Unavailable => isolation.is_enforced(),
+                ApiKeyReferenceStatus::Unavailable => {
+                    isolation.is_enforced() || listing.is_some_and(|listing| listing.is_revoked(key_id))
+                }
                 ApiKeyReferenceStatus::Active | ApiKeyReferenceStatus::Unknown => false,
             };
             Some(ApiKeyReference {
@@ -2770,9 +2773,19 @@ mod tests {
                 .map(|reference| reference.key_id)
                 .collect::<Vec<_>>()
         };
-        let own_breaches = ["atgk_legacy_revoked", "atgk_missing", "atgk_revoked"];
-
-        assert_eq!(blocking(&listing, RuleMode::Warn), own_breaches);
+        assert_eq!(
+            blocking(&listing, RuleMode::Warn),
+            ["atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_missing", "atgk_revoked"],
+            "another surface's revoked key blocks under warn, as the gate refuses it"
+        );
+        assert_eq!(
+            api_key_references("own", &ids, Some(&listing), RuleMode::Warn)
+                .into_iter()
+                .find(|reference| reference.key_id == "atgk_foreign_revoked")
+                .map(|reference| reference.status),
+            Some(ApiKeyReferenceStatus::Unavailable),
+            "another surface's revoked key still reports no status"
+        );
         assert_eq!(
             blocking(&listing, RuleMode::Enforce),
             ["atgk_foreign", "atgk_foreign_revoked", "atgk_legacy_revoked", "atgk_missing", "atgk_revoked"]

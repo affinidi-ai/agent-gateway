@@ -412,7 +412,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   responses carry `api_key_references` (`key_id`, `status` and `blocking`), passed to the panels and the
   canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). The
   gateway sets `blocking` on `revoked` and `missing`, and on `unavailable` (another surface's
-  key) only while `tenant_credential_isolation` is `enforce`; the dashboard follows `blocking`
+  key) when that key is revoked or while `tenant_credential_isolation` is `enforce`; the dashboard follows `blocking`
   and does not work it out itself. A
   protected, external or Transit Point From API Key Identity whose current `api_key_id` is
   `blocking` gets the canvas's red `unconfigured-ring` (red, dashed

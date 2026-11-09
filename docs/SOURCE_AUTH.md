@@ -344,8 +344,10 @@ surface names only its own keys. The field is absent when the surface names no k
 the surface list and variant responses. The surface's own key folder is read from disk for it,
 so a key of the surface another node revoked, deleted or created is reported as stored; when
 that folder cannot be read, its keys are `unknown`. `blocking` is `true` for a `revoked` or
-`missing` key, and for an `unavailable` key exactly when `tenant_credential_isolation` is
-`enforce`; it is `false` for an `active` or `unknown` one.
+`missing` key, and for an `unavailable` key when that key is revoked, as the gate refuses a
+revoked key in both modes, or when `tenant_credential_isolation` is `enforce`; it is `false` for
+an `active` or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
+`serving_status` already shows that it does not serve.
 
 Beside `api_key_references`, the same responses carry a read-only `serving_status`: `serving` or
 `not_serving` as the verdict this node keeps on the surface's key ids stands, without saying
@@ -1355,8 +1357,11 @@ keys is checked again on its next request.
   serves, logged, under `warn`.
 - In either mode, deleting a surface revokes its API keys (actor `surface-delete`) and keeps
   them, so a surface naming the key of a deleted surface stops serving. The delete reads the
-  surface's key folder from disk, so keys another node created are revoked too; a folder that
-  cannot be read is logged as an error naming the surface and its keys stay active. A key record
+  surface's key folder from disk, so keys another node created are revoked too. A folder that
+  cannot be read, or a key that cannot be revoked, is logged as an error naming the surface, and
+  those keys stay active: the delete still answers `200` with `success: true`, and its body carries
+  a `warnings` entry with code `api_keys_left_active` saying none was revoked or naming the keys
+  left active. The next sweep below revokes them. A key record
   in the folder that names another surface as its owner is not revoked by the delete, and keeps
   the id taken.
 - In either mode, when the gateway boots Active or a Standby node becomes Active, it revokes

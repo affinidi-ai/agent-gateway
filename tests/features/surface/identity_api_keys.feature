@@ -190,6 +190,12 @@ Feature: API keys an Identity takes its DID from
     Then the admin API response status is 200
     And the operator reads API key "alpha" as revoked, with its surface deleted
 
+  Scenario: Deleting a surface whose API key folder fails to load warns that its keys stay active
+    Given the surface's API key "foxtrot" sits in a key folder that fails to load
+    When the operator deletes the surface
+    Then the admin API response status is 200
+    And the admin API response warns "could not be read, so none was revoked"
+
   Scenario: A new surface cannot take the id of a deleted surface that kept API keys
     Given the surface has an API key "alpha"
     And the operator has deleted the surface

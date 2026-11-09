@@ -10,8 +10,8 @@ changes:
         for a key of the surface, missing when no key has the id, unavailable for another
         surface's key, whose status is never reported, and unknown when the API key store
         cannot be read or no loaded key folder holds the id while a folder cannot be loaded.
-        blocking is true for revoked and missing, true for unavailable only when
-        tenant_credential_isolation is enforce, and false for active and unknown, so it says
+        blocking is true for revoked and missing, true for unavailable when the key is revoked
+        or tenant_credential_isolation is enforce, and false for active and unknown, so it says
         whether the reference keeps the surface from serving. The surface's own key folder is
         read from disk for it, so a key another node revoked is reported revoked at once. It is
         computed by the gateway, so a tenant caller who cannot list API keys sees it too, and a
@@ -30,8 +30,8 @@ changes:
       description: >-
         The Surface Builder draws a red dashed ring and a short reason under a protected,
         external or Transit Point Identity whose api_key_references entry is blocking: a
-        revoked or deleted key, or another surface's key under tenant_credential_isolation
-        enforce, in the base and every variant. The Identity panel names that state in the key
+        revoked or deleted key, or another surface's key that is revoked or under
+        tenant_credential_isolation enforce, in the base and every variant. The Identity panel names that state in the key
         picker with a warning. The stored key stays selected, by name when it was revoked, as a
         disabled option that cannot be picked again once changed. Save shows that warning as
         an error and does not save until the Identity names an active key. The API key detail
@@ -56,8 +56,9 @@ changes:
         and a deleted surface's id as plain text with a Deleted badge instead of a link, and
         selecting a revoked identity, there or in the Dashboard's identity details, says it is no
         longer in use. Revoking or deleting a key, or deleting a surface, re-sends the affected
-        identities in the next update. An identity whose own surface was deleted while another
-        surface it used is live shows that live surface, the most recently used one.
+        identities in the next update; an update whose since is more than 24 hours old re-sends
+        every identity. An identity whose own surface was deleted while another surface it used
+        is live shows that live surface, the most recently used one.
   changed:
     - timestamp: '2026-11-05T18:00:00Z'
       title: Let an unrestricted admin read an API key whose surface was deleted
@@ -110,7 +111,9 @@ changes:
         Deleting a surface now revokes its active API keys and keeps their records, so they no
         longer authenticate callers and the deleted surface's id stays tied to them. The
         surface's key folder is read from disk, so keys another node created are revoked too.
-        Each revoke is logged per key id with actor surface-delete and is permanent. A surface
+        Each revoke is logged per key id with actor surface-delete and is permanent. When the
+        folder cannot be read or a key cannot be revoked, the delete still succeeds and its
+        response carries an api_keys_left_active warning saying which keys stay active. A surface
         still naming such a key stops serving until it names an active key of its own, which
         gives it a new DID.
     - timestamp: '2026-11-05T10:40:17Z'

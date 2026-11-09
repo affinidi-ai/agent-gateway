@@ -4436,14 +4436,22 @@ pub async fn patch_variant(
 }
 
 /// Revokes every active API key of the deleted surface `surface_id`
-/// ([`super::deleted_surface_api_keys::revoke_api_keys_of`]).
+/// ([`super::deleted_surface_api_keys::revoke_api_keys_of`]), and the warning naming the keys
+/// that stay active, if any.
 async fn revoke_api_keys_of_deleted_surface(
     state: &IdentityApiState,
     surface_id: &str,
-) {
-    if let Some(api_keys) = state.api_key_store.as_deref() {
-        super::deleted_surface_api_keys::revoke_api_keys_of(api_keys, surface_id).await;
-    }
+) -> Option<SurfaceWarning> {
+    let api_keys = state
+        .api_key_store
+        .as_deref()?;
+    super::deleted_surface_api_keys::revoke_api_keys_of(api_keys, surface_id)
+        .await
+        .warning()
+        .map(|message| SurfaceWarning {
+            code: "api_keys_left_active",
+            message,
+        })
 }
 
 /// Delete an agent surface (hard delete: removes from cache + filesystem).
@@ -4493,7 +4501,10 @@ pub async fn delete_surface(
             .await?;
 
             info!("Deleted agent surface '{}' (surface_id={})", surface.name, surface_id);
-            revoke_api_keys_of_deleted_surface(&state, &surface_id).await;
+            let warnings: Vec<_> = revoke_api_keys_of_deleted_surface(&state, &surface_id)
+                .await
+                .into_iter()
+                .collect();
 
             if let Some(recorder_status) = global_store() {
                 recorder_status
@@ -4505,6 +4516,7 @@ pub async fn delete_surface(
             Ok(Json(DeleteSurfaceResponse {
                 success: true,
                 message: format!("Surface '{}' deleted", surface_id),
+                warnings,
             }))
         }
         Some(surface)
@@ -4592,6 +4604,8 @@ impl SurfaceResponse<SurfaceVariant> {
 pub struct DeleteSurfaceResponse {
     pub success: bool,
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<SurfaceWarning>,
 }
 
 /// Action being applied to the running gateway after a surface mutation.
@@ -5404,6 +5418,7 @@ pub async fn delete_variant(
     Ok(Json(DeleteSurfaceResponse {
         success: true,
         message: format!("Variant '{}' deleted from surface '{}'", variant_id, surface_id),
+        warnings: Vec::new(),
     }))
 }
 

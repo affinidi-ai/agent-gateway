@@ -166,6 +166,16 @@ fn api_key_in_folder_that_fails_to_load(
     store_api_key(world, &owner, &name, a_day_ago(), false);
 }
 
+#[given(expr = "the surface's API key {string} sits in a key folder that fails to load")]
+fn surface_api_key_in_folder_that_fails_to_load(
+    world: &mut SurfaceWorld,
+    name: String,
+) {
+    let owner = surface_id(world);
+    world.surface_under_test_id = Some(owner.clone());
+    store_api_key(world, &owner, &name, a_day_ago(), false);
+}
+
 #[given(expr = "the surface was stored with its protected Identity taking its DID from API key {string}")]
 fn surface_was_stored_naming_api_key(
     world: &mut SurfaceWorld,
@@ -239,6 +249,7 @@ async fn send_through_other_node(
     path: &str,
     body: Option<&Value>,
 ) -> RecordedResponse {
+    let request = method.to_string();
     world
         .other_node
         .as_ref()
@@ -246,7 +257,7 @@ async fn send_through_other_node(
         .1
         .send_recorded_json(method, path, body)
         .await
-        .unwrap_or_else(|error| panic!("{path} through the other node: {error}"))
+        .unwrap_or_else(|error| panic!("{request} request through the other node failed: {error}"))
 }
 
 #[given(expr = "the operator has revoked API key {string} through the other node")]
@@ -409,6 +420,30 @@ async fn operator_reads_api_key_revoked_with_surface_deleted(
     assert_eq!(response.status, 200, "reading API key {name:?}: {}", response.body);
     assert_eq!(response.body["status"], "revoked", "{}", response.body);
     assert_eq!(response.body["surface_deleted"], true, "{}", response.body);
+}
+
+#[then(expr = "the admin API response warns {string}")]
+fn admin_api_response_warns(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &world
+        .admin_response
+        .as_ref()
+        .expect("the admin API answered")
+        .body;
+    let warned = body["warnings"]
+        .as_array()
+        .is_some_and(|warnings| {
+            warnings
+                .iter()
+                .any(|warning| {
+                    warning["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&expected))
+                })
+        });
+    assert!(warned, "no warning mentions {expected:?}: {body}");
 }
 
 #[then("no surface with the deleted surface's id is stored")]
