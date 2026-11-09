@@ -37,10 +37,19 @@ fi
 
 # Generate a persistent master key (hex, 32 bytes) for encryption at rest. Every
 # environment scripts/_prepare.sh creates encrypts its storage with it. Keep it:
-# without it the storage it encrypted cannot be read.
+# without it the storage it encrypted cannot be read. A missing key is not replaced
+# while encrypted storage is left, since a new key cannot read it.
 master_key_file="${envs_dir}/master_encryption_key"
 if [[ ! -s "${master_key_file}" ]]
 then
+  encrypted_file="$(find "${envs_dir}" -path '*/_storage/*' -name '*.enc' -print 2>/dev/null | head -n 1)"
+  if [[ -n "${encrypted_file}" ]]
+  then
+    echo "❌ ${master_key_file} is missing, but storage under ${envs_dir} is encrypted (${encrypted_file})."
+    echo "   A new key cannot read it. Restore the key to ${master_key_file}, or move the"
+    echo "   encrypted environments out of ${envs_dir}, then run 'make config-certs' again."
+    exit 1
+  fi
   (umask 077 && openssl rand -hex 32 > "${master_key_file}")
   chmod 600 "${master_key_file}"
   echo "🔑 Generated local master encryption key (${master_key_file})"
