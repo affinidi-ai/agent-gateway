@@ -4551,8 +4551,8 @@ fn fabric_receive_refuses_a_surface_naming_another_tenants_provider_key_when_enf
 
 /// Over Fabric, a surface stored naming another tenant's API Key Provider key is not ready
 /// under `tenant_credential_isolation: enforce` and refuses with `503` before the Target; one
-/// naming its own tenant's key is served. The verdict is taken on the first request, as no
-/// apply ran for the surfaces.
+/// naming its own key is served until that key is revoked. The verdict is taken on the first
+/// request, as no apply ran for the surfaces.
 async fn provider_key_fabric_flow() {
     use std::sync::Arc;
 
@@ -4600,23 +4600,22 @@ async fn provider_key_fabric_flow() {
         serde_json::from_value::<AgentSurface>(surface).unwrap()
     };
     for stored in [
-        surface("owner-a", "tenant-a", None),
+        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
         surface("owner-b", "tenant-b", None),
         surface("names-cross", "tenant-a", Some("atgk_fabric_b")),
-        surface("names-own", "tenant-a", Some("atgk_fabric_a")),
     ] {
         store
             .save(&stored)
             .await
             .unwrap();
     }
-    for (owner, key_id) in [("owner-a", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
+    for (owner, key_id) in [("names-own", "atgk_fabric_a"), ("owner-b", "atgk_fabric_b")] {
         api_keys
             .create_with_material(owner, key_id.to_string(), format!("atgs_{key_id}"), "client", None, "test")
             .await
             .unwrap();
     }
-    crate::identity::provider_key_gate::gate().set_sources(Some(api_keys), Some(store));
+    crate::identity::provider_key_gate::gate().set_sources(Some(api_keys.clone()), Some(store));
     super::init_source_auth_middleware(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
         Arc::new(crate::didauth::DidAuthSessionStore::new()),
         Arc::new(
@@ -4683,6 +4682,15 @@ async fn provider_key_fabric_flow() {
     let served = send("names-own").await;
     assert_eq!(served["status"], 200, "{served}");
     assert_eq!(reached(), 1);
+
+    api_keys
+        .revoke("names-own", "atgk_fabric_a", "test")
+        .await
+        .unwrap();
+    crate::identity::provider_key_gate::gate().key_changed("atgk_fabric_a");
+    let revoked = send("names-own").await;
+    assert_eq!(revoked["status"], 503, "its own key revoked: {revoked}");
+    assert_eq!(reached(), 1, "a surface naming a revoked key never reaches the Target");
 }
 
 #[test]

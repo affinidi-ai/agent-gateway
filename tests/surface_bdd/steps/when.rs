@@ -237,8 +237,10 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
             .surface_config
             .credential_delegation
         {
-            oauth_endpoint_allowlist
-                .push(format!("{callback_base_url}/v1/identity/oauth/callback/{}", delegation.provider_id));
+            let segment = world
+                .surface_config
+                .provider_record_id(&delegation.provider_id);
+            oauth_endpoint_allowlist.push(format!("{callback_base_url}/v1/identity/oauth/callback/{segment}"));
         }
         world
             .surface_config
@@ -382,6 +384,8 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         .expect("Affinidi Terms cache should be written");
     }
 
+    let unreadable_key_folders =
+        config::single_surface_writer::write_unloadable_api_keys(temp_dir.path(), &world.surface_config);
     let config_path = temp_dir
         .path()
         .join("config.toml");
@@ -441,6 +445,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     drop(outbound_port_reservation);
 
     world.infra = Some(ScenarioInfra {
+        _unreadable_key_folders: unreadable_key_folders,
         _temp_dir: TempDirGuard::new(temp_dir, "surface-bdd"),
         gateway,
         mock,
@@ -3215,13 +3220,86 @@ pub(crate) async fn oauth_provider_redirects_back_with_valid_code(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
-    let state = latest_consent_state(world, &provider);
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("code", "bdd-valid-code")
-        .append_pair("state", &state)
-        .finish();
-    send_oauth_callback_and_record(world, &provider, &query).await;
+    redirect_back_after_confirming_start_page(world, &provider, &provider, &[]).await;
+}
+
+#[when(expr = "OAuth provider {string} redirects the caller back with a valid authorization code and issuer {string}")]
+async fn oauth_provider_redirects_back_with_valid_code_and_issuer(
+    world: &mut SurfaceWorld,
+    provider: String,
+    issuer: String,
+) {
+    redirect_back_after_confirming_start_page(world, &provider, &provider, &[("iss", &issuer)]).await;
+}
+
+#[when(expr = "OAuth provider {string} redirects the caller back to the callback URL of OAuth provider {string}")]
+async fn oauth_provider_redirects_back_to_another_providers_callback(
+    world: &mut SurfaceWorld,
+    provider: String,
+    callback_provider: String,
+) {
+    redirect_back_after_confirming_start_page(world, &provider, &callback_provider, &[]).await;
+}
+
+#[when(expr = "OAuth provider {string} redirects another browser back with a valid authorization code")]
+async fn oauth_provider_redirects_another_browser_back(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let state = world
+        .oauth_confirmed_state
+        .clone()
+        .expect("the caller confirmed the consent start page first");
+    send_oauth_callback_and_record(world, &provider, &valid_code_query(&state, &[]), None).await;
+}
+
+/// Confirm `provider`'s consent start page in the caller's browser, then send
+/// that browser to `callback_provider`'s callback with a valid code, the
+/// vendor's state and `extra` query parameters.
+async fn redirect_back_after_confirming_start_page(
+    world: &mut SurfaceWorld,
+    provider: &str,
+    callback_provider: &str,
+    extra: &[(&str, &str)],
+) {
+    let (state, cookie) = confirm_consent_start_page(world, provider).await;
+    let query = valid_code_query(&state, extra);
+    send_oauth_callback_and_record(world, callback_provider, &query, Some(&cookie)).await;
     world.oauth_callback_query = Some(query);
+    world.oauth_binding_cookie = Some(cookie);
+}
+
+fn valid_code_query(
+    state: &str,
+    extra: &[(&str, &str)],
+) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("code", "bdd-valid-code")
+        .append_pair("state", state);
+    for (name, value) in extra {
+        query.append_pair(name, value);
+    }
+    query.finish()
+}
+
+#[when(expr = "a page on another site confirms the consent start page for OAuth provider {string}")]
+async fn another_site_confirms_consent_start_page(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let start = latest_consent_start_url(world, &provider);
+    let state = query_value(&start, "state");
+    let mut action = start;
+    action.set_query(None);
+    let response = no_redirect_client()
+        .post(action)
+        .header("origin", "https://another-site.example")
+        .form(&[("state", state.as_str())])
+        .send()
+        .await
+        .expect("post the consent start page from another site");
+    record_html_response(world, response).await;
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back again with the same state")]
@@ -3233,7 +3311,10 @@ async fn oauth_provider_redirects_back_again_with_the_same_state(
         .oauth_callback_query
         .clone()
         .expect("an earlier OAuth callback with a gateway-issued state");
-    send_oauth_callback_and_record(world, &provider, &query).await;
+    let cookie = world
+        .oauth_binding_cookie
+        .clone();
+    send_oauth_callback_and_record(world, &provider, &query, cookie.as_deref()).await;
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with a forged state parameter")]
@@ -3257,7 +3338,7 @@ async fn oauth_provider_redirects_with_forged_state(
         .append_pair("code", "bdd-attacker-code")
         .append_pair("state", &state)
         .finish();
-    send_oauth_callback_and_record(world, &provider, &query).await;
+    send_oauth_callback_and_record(world, &provider, &query, None).await;
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with an invalid state parameter")]
@@ -3266,7 +3347,7 @@ async fn oauth_provider_redirects_with_invalid_state(
     provider: String,
 ) {
     ensure_gateway_running(world).await;
-    send_oauth_callback_and_record(world, &provider, "code=bdd-valid-code&state=bdd-invalid-state").await;
+    send_oauth_callback_and_record(world, &provider, "code=bdd-valid-code&state=bdd-invalid-state", None).await;
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with an expired state parameter")]
@@ -3275,7 +3356,7 @@ async fn oauth_provider_redirects_with_expired_state(
     provider: String,
 ) {
     ensure_gateway_running(world).await;
-    send_oauth_callback_and_record(world, &provider, "code=bdd-valid-code&state=bdd-expired-state").await;
+    send_oauth_callback_and_record(world, &provider, "code=bdd-valid-code&state=bdd-expired-state", None).await;
 }
 
 #[when(expr = "OAuth provider {string} redirects the caller back with a provider error")]
@@ -3284,37 +3365,113 @@ async fn oauth_provider_redirects_with_provider_error(
     provider: String,
 ) {
     ensure_gateway_running(world).await;
-    send_oauth_callback_and_record(world, &provider, "error=access_denied&error_description=bdd-denied").await;
+    send_oauth_callback_and_record(world, &provider, "error=access_denied&error_description=bdd-denied", None).await;
 }
 
 async fn send_oauth_callback_and_record(
     world: &mut SurfaceWorld,
     provider: &str,
     query: &str,
+    cookie: Option<&str>,
 ) {
     ensure_gateway_running(world).await;
     let infra = world.infra.as_ref().unwrap();
-    let url = format!("http://127.0.0.1:{}/v1/identity/oauth/callback/{provider}?{query}", infra.gateway_port);
-    let resp = reqwest::Client::new()
-        .get(&url)
+    let segment = world
+        .surface_config
+        .provider_record_id(provider);
+    let url = format!("http://127.0.0.1:{}/v1/identity/oauth/callback/{segment}?{query}", infra.gateway_port);
+    let mut request = reqwest::Client::new().get(&url);
+    if let Some(cookie) = cookie {
+        request = request.header("cookie", cookie);
+    }
+    let resp = request
         .send()
         .await
         .expect("send OAuth callback");
+    record_html_response(world, resp).await;
+    record_replacement_mock_observation(world).await;
+}
+
+async fn record_html_response(
+    world: &mut SurfaceWorld,
+    resp: reqwest::Response,
+) {
     let status = resp.status().as_u16();
     let headers = collect_headers(resp.headers());
     let text = resp
         .text()
         .await
-        .expect("read OAuth callback response");
+        .expect("read the gateway's response");
     let body = serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "text": text }));
     world.caller_response = Some(RecordedResponse { status, headers, body });
-    record_replacement_mock_observation(world).await;
 }
 
-fn latest_consent_state(
+fn no_redirect_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("build a client that does not follow redirects")
+}
+
+/// Confirm the consent start page of the latest consent_required answer, as
+/// the person's browser does, and return the callback state the gateway sent
+/// to the vendor and the binding cookie it set, as its `name=value` pair.
+pub(crate) async fn confirm_consent_start_page(
     world: &SurfaceWorld,
     provider: &str,
+) -> (String, String) {
+    let start = latest_consent_start_url(world, provider);
+    let origin = start
+        .origin()
+        .ascii_serialization();
+    let state = query_value(&start, "state");
+    let client = no_redirect_client();
+    let page = client
+        .get(start.clone())
+        .send()
+        .await
+        .expect("open the consent start page");
+    assert_eq!(page.status().as_u16(), 200, "the consent start page opens");
+    let mut action = start.clone();
+    action.set_query(None);
+    let started = client
+        .post(action)
+        .header("origin", origin)
+        .form(&[("state", state.as_str())])
+        .send()
+        .await
+        .expect("confirm the consent start page");
+    assert_eq!(started.status().as_u16(), 302, "the consent start POST sends the browser to the vendor");
+    let cookie = started
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .filter(|pair| pair.starts_with("__Host-ag_consent_"))
+        .expect("the consent start POST sets the binding cookie")
+        .to_string();
+    let vendor = started
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(|location| url::Url::parse(location).expect("the vendor URL is a URL"))
+        .expect("the consent start POST names the vendor URL");
+    (query_value(&vendor, "state"), cookie)
+}
+
+fn query_value(
+    url: &url::Url,
+    name: &str,
 ) -> String {
+    url.query_pairs()
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+        .unwrap_or_else(|| panic!("{url} should carry {name}"))
+}
+
+fn latest_consent_start_url(
+    world: &SurfaceWorld,
+    provider: &str,
+) -> url::Url {
     let body = get_response_body_for_when(world);
     let authorization_url = body
         .get("consent_required")
@@ -3330,10 +3487,7 @@ fn latest_consent_state(
         .and_then(|entry| entry.get("authorization_url"))
         .and_then(|url| url.as_str())
         .unwrap_or_else(|| panic!("expected consent_required authorization_url for provider '{provider}', got {body}"));
-    let url = url::Url::parse(authorization_url).expect("authorization_url should be a URL");
-    url.query_pairs()
-        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
-        .unwrap_or_else(|| panic!("authorization_url should contain state query parameter: {authorization_url}"))
+    url::Url::parse(authorization_url).expect("authorization_url should be a URL")
 }
 
 fn get_response_body_for_when(world: &SurfaceWorld) -> &serde_json::Value {

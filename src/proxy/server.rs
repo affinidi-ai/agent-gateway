@@ -1448,6 +1448,9 @@ pub async fn build_port_router(
         }
     }
 
+    // The consent binding cookie is never forwarded and never set by an upstream.
+    let app = app.layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
+
     // Add OpenTelemetry tracing middleware for all proxy requests
     let app = app.layer(axum::middleware::from_fn(crate::observability::trace_http_request));
 
@@ -1914,6 +1917,7 @@ pub async fn build_outbound_port_router(
         );
     }
 
+    let app = app.layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
     let app = app.layer(axum::middleware::from_fn(crate::observability::trace_http_request));
     let app = app.layer(axum::middleware::from_fn(crate::observability::access_log));
     let app = app.layer(axum::middleware::from_fn_with_state(

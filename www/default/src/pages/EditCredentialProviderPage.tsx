@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import { formatApiError } from '../utils/apiError';
+import { showToast } from '../utils/toaster';
 import AddResourceLink from '../components/shared/AddResourceLink';
 import FieldHelp from '../components/shared/FieldHelp';
 import { Link } from '../components/shared/Link';
@@ -23,6 +24,9 @@ import {
   missingProviderField,
   providerCredentialFields,
   providerTypeFields,
+  callbackUrlFor,
+  callbackUrlToSave,
+  isHttpsAddress,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
 interface CredentialProviderForm extends JwtFormFields {
@@ -39,6 +43,10 @@ interface CredentialProviderForm extends JwtFormFields {
   additional_params: string;
   description: string;
   callback_host: string;
+  /** The callback path the gateway stored for an existing provider; empty for a new one. */
+  callback_path: string;
+  /** The callback URL stored for an existing provider; empty for a new one. */
+  callback_url: string;
   /** The stored resource, shown only through the Entra warning; never sent on save. */
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
@@ -47,7 +55,8 @@ interface CredentialProviderForm extends JwtFormFields {
 
 interface RoutingConfig {
   available_listen_addresses: string[];
-  oauth_callback_route: string;
+  /** `https://{did.domain}`: the redirect URI's base for a provider without a callback URL. */
+  gateway_base_url?: string;
 }
 
 const EMPTY_FORM: CredentialProviderForm = {
@@ -64,6 +73,8 @@ const EMPTY_FORM: CredentialProviderForm = {
   additional_params: '',
   description: '',
   callback_host: '',
+  callback_path: '',
+  callback_url: '',
   resource: '',
   issuer: '',
   ...EMPTY_JWT_FIELDS,
@@ -161,6 +172,8 @@ const EditCredentialProviderPage: React.FC = () => {
           : '',
         description: data.description ?? '',
         callback_host: callbackHost,
+        callback_path: data.callback_path ?? '',
+        callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
         ...jwtFieldsOf(data),
@@ -194,6 +207,22 @@ const EditCredentialProviderPage: React.FC = () => {
     }
   };
 
+  const callbackUrl = form.callback_host
+    ? callbackUrlToSave({
+        storedUrl: form.callback_url,
+        host: form.callback_host,
+        storedPath: form.callback_path,
+      })
+    : '';
+  const usesConsentFlow = !form.issuer && form.provider_type === 'oauth2_authorization_code';
+  const takesCallbackUrl = usesConsentFlow && !!form.callback_host;
+  const storedRedirectUri =
+    form.callback_url ||
+    (form.callback_path && routingConfig?.gateway_base_url
+      ? `${routingConfig.gateway_base_url}${form.callback_path}`
+      : '');
+  const shownCallbackUrl = callbackUrl || (usesConsentFlow && !isNew ? storedRedirectUri : '');
+
   const handleSubmit = useCallback(
     async (e?: React.FormEvent) => {
       if (e) e.preventDefault();
@@ -222,6 +251,13 @@ const EditCredentialProviderPage: React.FC = () => {
         }
       }
 
+      if (isNew && takesCallbackUrl && !isHttpsAddress(form.callback_host)) {
+        setError(
+          "The Callback URL Host must be an https address, since the gateway refuses an http Callback URL. Choose an https listen address, or leave the Callback URL Host unselected to use the gateway's own URL, shown once the provider is created."
+        );
+        return;
+      }
+
       setError(null);
 
       const scopes = form.default_scopes
@@ -248,44 +284,62 @@ const EditCredentialProviderPage: React.FC = () => {
         body.additional_params = additionalParams;
       }
 
-      // Build callback_url from host + path for authorization_code providers
-      if (
-        !form.issuer &&
-        form.provider_type === 'oauth2_authorization_code' &&
-        form.callback_host &&
-        routingConfig
-      ) {
-        const callbackPath = `${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-        body.callback_url = `${form.callback_host}${callbackPath}`;
+      if (takesCallbackUrl && callbackUrl) {
+        body.callback_url = callbackUrl;
       }
 
+      const send = async (url: string, method: string, payload: unknown) => {
+        const response = await apiClient.fetch(url, {
+          method,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(formatApiError(response.status, text, response.statusText));
+        }
+        return response;
+      };
+
+      let createdId: string | null = null;
       await run(
         async () => {
-          const url = isNew
-            ? '/api/v1/credential-providers'
-            : `/api/v1/credential-providers/${encodeURIComponent(id!)}`;
-          const method = isNew ? 'POST' : 'PUT';
-
-          const response = await apiClient.fetch(url, {
-            method,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-
-          if (!response.ok) {
-            const text = await response.text();
-            throw new Error(formatApiError(response.status, text, response.statusText));
+          if (!isNew) {
+            await send(`/api/v1/credential-providers/${encodeURIComponent(id!)}`, 'PUT', body);
+            return;
+          }
+          const created = await (await send('/api/v1/credential-providers', 'POST', body)).json();
+          createdId = created.id;
+          if (takesCallbackUrl) {
+            await send(`/api/v1/credential-providers/${encodeURIComponent(created.id)}`, 'PUT', {
+              callback_url: callbackUrlFor(form.callback_host, created.callback_path),
+            });
           }
         },
         {
           successMessage: isNew ? 'Provider created' : 'Provider updated',
-          redirectTo: '/settings?tab=credential-providers',
-          onError: setError,
+          redirectTo: isNew && usesConsentFlow ? undefined : '/settings?tab=credential-providers',
+          onSuccess: () => {
+            if (isNew && usesConsentFlow && createdId !== null) {
+              navigate(`/credential-providers/${encodeURIComponent(createdId)}`);
+            }
+          },
+          onError: message => {
+            if (createdId === null) {
+              setError(message);
+              return;
+            }
+            showToast(
+              'error',
+              `Provider created, but its Callback URL was not saved: ${message.replace(/\.$/, '')}. Choose the Callback URL Host and save again.`
+            );
+            navigate(`/credential-providers/${encodeURIComponent(createdId)}`);
+          },
           errorMessage: 'Save failed',
         }
       );
     },
-    [form, isNew, id, run]
+    [callbackUrl, takesCallbackUrl, usesConsentFlow, form, isNew, id, run, navigate]
   );
 
   // Keyboard shortcut: Ctrl+S / Cmd+S to save
@@ -559,8 +613,9 @@ const EditCredentialProviderPage: React.FC = () => {
                         testId="field-help-callback-host"
                       >
                         Most setups only have one option; if there are several, pick the one your
-                        OAuth provider can actually reach from the outside. Register this exact URL
-                        as an allowed redirect URI with your OAuth provider before saving.
+                        OAuth provider can actually reach from the outside. Register the Callback
+                        URL shown for this provider as an allowed redirect URI with your OAuth
+                        provider.
                       </FieldHelp>
                     </div>
                     <select
@@ -594,12 +649,9 @@ const EditCredentialProviderPage: React.FC = () => {
                     </small>
 
                     <label htmlFor="provider_id" className="mt-3">
-                      Callback URL Route <span className="text-danger">*</span>
+                      Provider ID <span className="text-danger">*</span>
                     </label>
                     <div className="input-group">
-                      <span className="input-group-text" style={{ fontSize: '13px' }}>
-                        {routingConfig?.oauth_callback_route ?? '...'}/
-                      </span>
                       <input
                         id="provider_id"
                         name="provider_id"
@@ -613,22 +665,39 @@ const EditCredentialProviderPage: React.FC = () => {
                       />
                     </div>
                     <small className="form-text text-muted">
-                      Route suffix for the callback URL. Only letters, numbers, dashes, and
-                      underscores. Auto-derived from name. Immutable after creation.
+                      Only letters, numbers, dashes, and underscores. Auto-derived from name.
+                      Immutable after creation.
                     </small>
 
-                    {form.callback_host && form.provider_id.trim() && routingConfig && (
-                      <div className="alert alert-success mt-2 mb-0" style={{ fontSize: '14px' }}>
+                    {isNew && usesConsentFlow && (
+                      <div
+                        className="alert alert-info mt-2 mb-0"
+                        style={{ fontSize: '14px' }}
+                        data-testid="credential-provider-callback-url-after-create"
+                      >
                         <i className="fas fa-info-circle me-2"></i>
-                        <strong>Callback URL:</strong>{' '}
-                        {`${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`}
+                        The Callback URL is shown once the provider is created, since it ends in the
+                        id the gateway generates for the provider, not in its Provider ID. If your
+                        OAuth provider asks for a redirect URI before it issues the client ID and
+                        secret, register a placeholder, create this provider, then replace the
+                        placeholder with the Callback URL shown on its page.
+                      </div>
+                    )}
+
+                    {shownCallbackUrl && (
+                      <div
+                        className="alert alert-success mt-2 mb-0"
+                        style={{ fontSize: '14px' }}
+                        data-testid="credential-provider-callback-url"
+                      >
+                        <i className="fas fa-info-circle me-2"></i>
+                        <strong>Callback URL:</strong> {shownCallbackUrl}
                         <button
                           type="button"
                           className="btn btn-xs ms-2"
                           style={{ padding: '2px 6px', fontSize: '11px', outline: 'none' }}
                           onClick={e => {
-                            const url = `${form.callback_host}${routingConfig.oauth_callback_route}/${encodeURIComponent(form.provider_id.trim())}`;
-                            navigator.clipboard.writeText(url);
+                            navigator.clipboard.writeText(shownCallbackUrl);
                             const btn = e.currentTarget as HTMLButtonElement;
                             const originalHtml = btn.innerHTML;
                             btn.innerHTML = '<i class="fas fa-check"></i>';

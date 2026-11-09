@@ -9409,6 +9409,7 @@ mod tests {
                     "id": "provider", "name": "Provider", "provider_id": "provider",
                     "authorization_endpoint": "https://provider.example/authorize",
                     "client_id_secret_ref": "provider-client-id",
+                    "callback_path": "/v1/identity/oauth/callback/provider",
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
                 .unwrap(),
@@ -10668,6 +10669,7 @@ mod tests {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
             let mut surface = (*ctx.surface).clone();
+            surface.surface_id = "owner-a".into();
             surface.tenant_id = Some("tenant-a".into());
             let mut point = ctx.virtual_channel.clone();
             point.managed_identity =
@@ -10701,8 +10703,58 @@ mod tests {
             step_provider_key_gate(&mut own)
                 .await
                 .is_ok(),
-            "its own tenant's key is served"
+            "its own key is served"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_naming_its_surfaces_revoked_api_key_refuses_every_request_in_both_modes() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+                &[("owner-a", Some("tenant-a"))],
+                &[("owner-a", "atgk_transit_a")],
+            )
+            .await;
+            crate::config::credential_policy::use_thread_credential_policy(
+                crate::config::credential_policy::CredentialPolicyConfig {
+                    tenant_credential_isolation: mode,
+                    ..Default::default()
+                },
+            );
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            let mut surface = (*ctx.surface).clone();
+            surface.surface_id = "owner-a".into();
+            surface.tenant_id = Some("tenant-a".into());
+            let mut point = ctx.virtual_channel.clone();
+            point.managed_identity =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": "atgk_transit_a"})).unwrap());
+            surface.transit = Some(crate::config::agent_surface::TransitConfig {
+                points: vec![point],
+                outbound_listen_address: None,
+                shared: Default::default(),
+            });
+            ctx.surface = Arc::new(surface);
+            assert!(
+                step_provider_key_gate(&mut ctx)
+                    .await
+                    .is_ok(),
+                "{mode:?}: an active key is served"
+            );
+
+            gate.api_keys
+                .revoke("owner-a", "atgk_transit_a", "test")
+                .await
+                .unwrap();
+            gate.gate
+                .key_changed("atgk_transit_a");
+            let error = step_provider_key_gate(&mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{mode:?}");
+        }
     }
 
     #[tokio::test]
@@ -21874,7 +21926,8 @@ mod tests {
             json!({"id": "broken-key", "name": "Broken key", "provider_id": "broken-key",
                 "provider_type": "api_key", "api_key_secret_ref": "missing-secret"}),
             json!({"id": "consent", "name": "Consent", "provider_id": "consent",
-                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id"}),
+                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id",
+                "callback_path": "/v1/identity/oauth/callback/consent"}),
         ] {
             let mut provider = provider;
             provider["created_at"] = json!("2026-10-01T00:00:00Z");
@@ -22134,6 +22187,7 @@ mod tests {
                         "id": provider, "name": provider, "provider_id": provider, "tenant_id": tenant,
                         "authorization_endpoint": "https://provider.example/authorize",
                         "client_id_secret_ref": "client-id",
+                        "callback_path": format!("/v1/identity/oauth/callback/{provider}"),
                         "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -22257,13 +22311,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/consent-required");
         assert_eq!(body["consent_required"][0]["provider_name"], "Consent");
-        assert!(
+        let start = url::Url::parse(
             body["consent_required"][0]["authorization_url"]
                 .as_str()
-                .unwrap()
-                .starts_with("https://provider.example/authorize?"),
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            start
+                .origin()
+                .ascii_serialization(),
+            "https://gateway.example",
             "{body}"
         );
+        assert_eq!(start.path(), "/v1/identity/oauth/callback/consent/start", "{body}");
+        let state = start
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let state = crate::delegation_vault::oauth::decode_start_state(&state).expect("a sealed start state");
+        assert_eq!((state.provider_id.as_str(), state.browser_binding), ("consent", None));
         assert_eq!(
             body.as_object()
                 .unwrap()

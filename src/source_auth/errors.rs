@@ -206,7 +206,8 @@ pub fn access_point_unavailable(
 
 /// Why an Access Point is not ready: it is closed and authenticates no caller
 /// ([`AgentSurface::refuses_every_request`]), or it derives a DID from an API
-/// key it may not use ([`crate::identity::provider_key_gate`]).
+/// key it may not use, that is revoked, or that does not exist
+/// ([`crate::identity::provider_key_gate`]).
 ///
 /// [`AgentSurface::refuses_every_request`]: crate::config::agent_surface::AgentSurface::refuses_every_request
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +215,8 @@ pub enum NotReadyReason {
     NoSourceAuthentication,
     ProviderKeyTenant,
     ApiKeyStoreUnavailable,
+    ApiKeyRevoked,
+    ApiKeyMissing,
 }
 
 impl NotReadyReason {
@@ -222,6 +225,8 @@ impl NotReadyReason {
             Self::NoSourceAuthentication => "no source authentication",
             Self::ProviderKeyTenant => crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE,
             Self::ApiKeyStoreUnavailable => crate::identity::provider_key_gate::API_KEY_STORE_UNAVAILABLE,
+            Self::ApiKeyRevoked => crate::identity::provider_key_gate::API_KEY_REVOKED,
+            Self::ApiKeyMissing => crate::identity::provider_key_gate::API_KEY_MISSING,
         }
     }
 
@@ -335,6 +340,36 @@ mod tests {
             .await
             .expect("read body");
         serde_json::from_slice(&bytes).expect("parse problem+json")
+    }
+
+    #[tokio::test]
+    async fn an_access_point_whose_surface_names_its_revoked_api_key_is_not_ready_for_that_reason() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        let gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+            &[("own", Some("tenant-a"))],
+            &[("own", "atgk_errors_own")],
+        )
+        .await;
+        crate::config::credential_policy::use_thread_credential_policy(Default::default());
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "own", "name": "own", "tenant_id": "tenant-a",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/own", "protocol": "a2a", "public": true},
+            "target": {"endpoint": "http://127.0.0.1:9"},
+            "identity_slots": {"external": {"type": "from_api_key", "api_key_id": "atgk_errors_own"}}
+        }))
+        .unwrap();
+        assert_eq!(NotReadyReason::of(&surface).await, None, "an active own key is ready");
+
+        gate.api_keys
+            .revoke("own", "atgk_errors_own", "test")
+            .await
+            .unwrap();
+        gate.gate
+            .key_changed("atgk_errors_own");
+
+        let reason = NotReadyReason::of(&surface).await;
+        assert_eq!(reason, Some(NotReadyReason::ApiKeyRevoked));
+        assert_eq!(reason.unwrap().as_str(), "api_key_revoked");
     }
 
     #[test]

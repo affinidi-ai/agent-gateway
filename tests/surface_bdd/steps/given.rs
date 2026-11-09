@@ -3759,6 +3759,76 @@ async fn oauth_provider_ready_to_exchange_code(
         .await;
 }
 
+#[given(expr = "OAuth provider {string} records authorization response issuer {string}")]
+fn oauth_provider_records_authorization_response_issuer(
+    world: &mut SurfaceWorld,
+    provider: String,
+    issuer: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "an authorization response issuer is recorded only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_authorization_response_issuer = Some(issuer);
+}
+
+#[given(expr = "OAuth provider {string} has a callback path ending in the id the gateway gave it")]
+fn oauth_provider_callback_path_ends_in_its_id(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let delegated = world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .map(|delegation| {
+            delegation
+                .provider_id
+                .as_str()
+        });
+    assert_eq!(
+        delegated,
+        Some(provider.as_str()),
+        "only the surface's own OAuth provider is stored with a callback path ending in its id"
+    );
+    world
+        .surface_config
+        .oauth_callback_path_ends_in_record_id = true;
+}
+
+#[given(expr = "the gateway has OAuth provider {string}")]
+fn gateway_has_oauth_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    world
+        .surface_config
+        .additional_oauth_providers
+        .push(provider);
+}
+
+#[given(expr = "caller {string} has confirmed the consent start page for provider {string}")]
+async fn caller_has_confirmed_consent_start_page(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    provider: String,
+) {
+    let (state, _cookie) = crate::steps::when::confirm_consent_start_page(world, &provider).await;
+    world.oauth_confirmed_state = Some(state);
+}
+
 #[given(expr = "caller {string} has been asked to complete OAuth consent for provider {string}")]
 async fn caller_has_been_asked_to_complete_oauth_consent(
     world: &mut SurfaceWorld,
