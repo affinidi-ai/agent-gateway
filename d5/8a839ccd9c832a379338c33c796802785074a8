@@ -1,0 +1,681 @@
+.changelog/wip/component-test-deprecation.yaml
+  s_09d9fb08a24a2a::t_7b464f2b17ddf1 1-18
+.changelog/wip/feat_agent-pay-int.yaml
+  s_09d9fb08a24a2a::t_f03b8f8ad8512d 1-333
+.changelog/wip/feat_transit-point-call-audit.yaml
+  s_09d9fb08a24a2a::t_1f94afd8c269e3 1-29
+.changelog/wip/fix_clippy-rust-1-99.yaml
+  s_09d9fb08a24a2a::t_4c07a404c22383 1-8
+.changelog/wip/fix_hash-session-file-names.yaml
+  s_09d9fb08a24a2a::t_2095ba90897c85 1-21
+.changelog/wip/fix_name-conflict-on-identities.yaml
+  s_09d9fb08a24a2a::t_7fc9c83378d239 1-45
+.changelog/wip/fix_pr-181-review-follow-ups.yaml
+  s_09d9fb08a24a2a::t_b0724dc395256a 1-43
+.changelog/wip/increase-rust-version.yaml
+  s_09d9fb08a24a2a::t_2ead197f70c1d3 1-15
+.github/workflows/checks.yml
+  s_09d9fb08a24a2a::t_0d90f5e7217627 68,95
+.github/workflows/ci.yml
+  s_09d9fb08a24a2a::t_430655c11ee836 184,228,291,337,389,459
+.github/workflows/publish-release.yml
+  s_09d9fb08a24a2a::t_5289c13e0b93f5 103
+.gitignore
+  s_09d9fb08a24a2a::t_7f5e486fa78a33 104-105
+AGENTS.md
+  s_09d9fb08a24a2a::t_5c6492723e72e6 66-70,89-119,133-136,177-180,193-197,230,279-304,322,337-340,373
+ARCHITECTURE.md
+  s_09d9fb08a24a2a::t_540aaac747ef93 96,100,110-113,116-120,126-127,130-134,152,163,223-227,230-235,353,415-417,424,456
+CONTEXT.md
+  s_09d9fb08a24a2a::t_acf79d75e612eb 28,112-113,166-172
+CONTRIBUTING.md
+  s_09d9fb08a24a2a::t_8345db513f8bed 9,34-36,40-41,56
+Cargo.toml
+  s_09d9fb08a24a2a::t_d7f08d27ddeb49 6,134,201-202
+Dockerfile
+  s_09d9fb08a24a2a::t_310fbc90cfa536 18
+Dockerfile.dev
+  s_09d9fb08a24a2a::t_f1dbb65b73bf2e 21
+Makefile
+  s_09d9fb08a24a2a::t_2cbe70cad99bcf 11
+README.md
+  s_09d9fb08a24a2a::t_4e334dc2d80898 7,43-44,110,171
+config/examples/README.md
+  s_09d9fb08a24a2a::t_34a5234be22617 25,31
+config/examples/agent_surface_templates/partial_agent_pay_payment_wall.json
+  s_09d9fb08a24a2a::t_08877ca54becf4 4-6,10,21-26
+config/examples/gateway.example.json
+  s_09d9fb08a24a2a::t_0e078cbbca29f5 71-73
+config/examples/limits.example.json
+  s_09d9fb08a24a2a::t_dfafd7d8d8adac 75,83-87
+docs/CAPABILITIES.md
+  s_09d9fb08a24a2a::t_3ddc91e6d68095 45,298-311,317,319-321,323-327,330-336,369,489-490
+docs/CONFIGURATION_REFERENCE.md
+  s_09d9fb08a24a2a::t_7649f6950c9e20 27-28,185,190,199-200,202,410,413,426-435,437,474-965
+docs/CREDENTIAL_DELEGATION.md
+  s_09d9fb08a24a2a::t_eb10168b22689b 999-1005
+docs/DEPLOYMENT_REQUIREMENTS.md
+  s_09d9fb08a24a2a::t_8cc32c467ade05 184-185
+docs/FABRIC.md
+  s_09d9fb08a24a2a::t_9d4eb6c9c6ec5d 46-49,147-157,266-281,285-287,296,320-325,430-441,486,671-675
+docs/INTEGRATIONS.md
+  s_09d9fb08a24a2a::t_dfe38f48dfe0dc 114,117-120,140-174,201-202,701,709
+docs/MCP_METADATA.md
+  s_09d9fb08a24a2a::t_c2b3757a8378b8 588-592,857-869,876-893,896-929,945-954,958-963,968,2170,2180,2182
+docs/OBSERVABILITY.md
+  s_09d9fb08a24a2a::t_76dba4ce3e849f 69-136,637-668,837-840
+docs/PER_GATEWAY_MEDIATOR_FEDERATION.md
+  s_09d9fb08a24a2a::t_53db015cb2fbdb 128,130-133,211-212
+docs/POLICY.md
+  s_09d9fb08a24a2a::t_37f57e32b5f546 37-54,562-569,611-618,645-657
+docs/PROTOCOLS.md
+  s_09d9fb08a24a2a::t_0cc476abd7120e 17,92,175,180-182,225-226,736-737,1019-1051
+docs/RBAC.md
+  s_09d9fb08a24a2a::t_ae5dc53e5061c5 101-138
+docs/SOURCE_AUTH.md
+  s_09d9fb08a24a2a::t_c0067eb5db2a50 425-430,1307-1309,1464-1492,1515-1516
+docs/development/DEVELOPMENT.md
+  s_09d9fb08a24a2a::t_243600d742f21a 263,287
+docs/development/GETTING_STARTED.md
+  s_09d9fb08a24a2a::t_3a81b21f743d3d 30
+docs/development/TESTING.md
+  s_09d9fb08a24a2a::t_ebaa8b1f6d7dbe 3-4,14-15,17,21,34-35,41-42,67-72,76-79,85-86,99-132,136,179-180
+scripts/_prepare.sh
+  s_09d9fb08a24a2a::t_bbbc28aa511b06 484-485
+scripts/x402/README.md
+  s_09d9fb08a24a2a::t_9b618b94bead4a 1,3,7-9,260,267
+src/a2a_proxies/runtime.rs
+  s_09d9fb08a24a2a::t_274c28236ba933 46-59,63,68,75,84,87,90-92,96-98,101-109,111-126,154
+src/a2a_proxies/target_adapter.rs
+  s_09d9fb08a24a2a::t_13eeb9b50f3a20 10,93-97,99-107,113,116-117
+src/audit/catalog.rs
+  s_09d9fb08a24a2a::t_5788983ed118c0 94-99,140,300
+src/auth/session.rs
+  s_09d9fb08a24a2a::t_63ed63f9b7fe8d 10-11,14-16,34,36-38,40,50-51,55,74-76,81-88,91,98,100,103-104,109-111,115-116,173,252,314,326,344,350,354,358-360,364-365,372,378,382,386-388,392,406,417,426-439,441-544,561,571,597,621
+src/auth_manager/permissions.rs
+  s_09d9fb08a24a2a::t_42acf54b9f6ede 41-43,171-173,285-287
+src/component_tests/a2a_flow_e2e.rs
+  s_09d9fb08a24a2a::t_58a65fbb65c76f 1940,1942-1943,1956-1957,2118-2119,2129-2130,2143,2149-2150
+src/component_tests/a2a_proxy_e2e.rs
+  s_09d9fb08a24a2a::t_62f8530f921659 1460-1643
+src/component_tests/agent_pay_gate_e2e.rs
+  s_09d9fb08a24a2a::t_f0ef7e3adb731c 1-718
+src/component_tests/helpers/mod.rs
+  s_09d9fb08a24a2a::t_2a618f9a7abb18 180-192,206-216,241-257,350-354,370,374,1064,1066,1085,1096
+src/component_tests/identity_e2e.rs
+  s_09d9fb08a24a2a::t_0c69190ade0fc5 2504
+src/component_tests/identity_naming_e2e.rs
+  s_09d9fb08a24a2a::t_09e4e7077f0a1d 98,168,187,221,234-242,244-245,247-254,256-258,278,347,376,388
+src/component_tests/mcp_policy_e2e.rs
+  s_09d9fb08a24a2a::t_e961c5c5e46092 1489-1490,1545-1551,1565
+src/component_tests/mcp_subscription_scope.rs
+  s_09d9fb08a24a2a::t_eda3023938a08c 108
+src/component_tests/mod.rs
+  s_09d9fb08a24a2a::t_e8c5d498ac4cb6 8,49-242
+src/component_tests/tr_naming_e2e.rs
+  s_09d9fb08a24a2a::t_382370866dc385 156,165,170
+src/config/agent_surface.rs
+  s_09d9fb08a24a2a::t_cc14694b64717f 739-745,747,750-766,768,770-1081,2369-2373,2381-2382,2594-2692,8798-9317
+src/config/agent_surface_accessors.rs
+  s_09d9fb08a24a2a::t_d7e6425d9f685e 281-304,730,735,737-760,762-829,1215-1278,1511-1537
+src/config/network.rs
+  s_09d9fb08a24a2a::t_1d6b1c4a4b6626 119-126,223,269-284,762-810,1074-1095
+src/config/proxy.rs
+  s_09d9fb08a24a2a::t_ed411dd052ad6d 287,289-291,295-302
+src/config/types.rs
+  s_09d9fb08a24a2a::t_31100b5eed5905 1317-1404,1753,1757-1758,1797-1799,1817-1818,2062-2101,2106-2127,2214-2225,2246-2247,2252,2254,2734,4778-4829
+src/credential_providers/handlers.rs
+  s_09d9fb08a24a2a::t_084f80d6431fc3 1155,1157,1166,1201-1244,1259,1261,1268,1280-1284,1304,1309,1318-1321,1324,1327,1345,4263-4301
+src/delegation_vault/audit.rs
+  s_09d9fb08a24a2a::t_6fe4428fb580ea 190-194,230-239,246-250,287-333,495-505,604-606,617-639,1140,1603,1775-1797,1864,1917,1963,2242,2276-2327,2344,2384,2753,2795
+src/delegation_vault/revocation.rs
+  s_09d9fb08a24a2a::t_6d3e3d3e47d9b6 1339-1340,1353,1363-1371,1480-1482
+src/delegation_vault/service_token.rs
+  s_09d9fb08a24a2a::t_f3e9bc3fb02e00 793
+src/didauth/handlers.rs
+  s_09d9fb08a24a2a::t_5767995ddfb28f 253,260,268
+src/didauth/sessions.rs
+  s_09d9fb08a24a2a::t_717bde6a621bc6 13-14,25,27-31,68-69,73,143-145,152-158,225-230,324-325,336,341,361,364,371,448,458,469-497,499-520,524-590,601,604,608,621,627,631,646-649,663-664,667,670,703
+src/gateways/agent_pay_flag.rs
+  s_09d9fb08a24a2a::t_1f9bc240575633 1,3-6,8-14,16,18-20,23-28,31-33,36-40,43-50,57-72,76-78,81-86,89-92
+src/gateways/connection_points/account_watch.rs
+  s_09d9fb08a24a2a::t_e246e0fe6872a0 20,50-51,98,113-118,121,125-126,222,295,299,303,306,311,315-331
+src/gateways/connection_points/handlers.rs
+  s_09d9fb08a24a2a::t_c024bf7d23e8c0 17,475-476,483-484,1661,1748-1759,1769-1770,1774-1780,1786,1802,1861,1865-1883,1946-2037,2553-2622
+src/gateways/connection_points/message_processor.rs
+  s_09d9fb08a24a2a::t_6d96e25c19f4f9 153-159,527-539,578-580,1567-1574,1577-1583,1587-1593,1595,1597-1608,1610-1614,1618-1621,2248,2273,2335,4128-4129,4154-4155,4157-4395,4400,4519,4725-4729,4753-4756,4883-4885,5024,5152-5161,5163,5219,5271-5308,5322,5339,5489-5498,5537,5555-5559,5564-5569,5699-5700,5722-5723,5860-5865,6314-6385,6443,6455,6578,6686-6689,6704-6711,8352-8353,8412-8443,8634,8646-8647,8874-8926,9105-9121,9123-9143,9145-9146,9148-9160,9162-9174,9176-9184,9186,9188-9189,9191-9200,9204,9206-9208,9210-9217,9219-9233,9237-9243,9407-9461,11037,11047-11112,11864,12500-12507,12510-12515,12517-12529,12533-12542,12544-12599,12603-12612
+src/gateways/connection_points/message_processor/mcp_receive_tests.rs
+  s_09d9fb08a24a2a::t_6d5d4cd2ba86eb 80-89,362,1151,1643-1682,1685,1690-1698,1700-1707,1709-1769,1779-1781,1783-1788,1803-1807,1809-1816,1826-1845,1847-1850,2286,2336,2450-2507,2958,3084,3216-3727
+src/gateways/connection_points/message_processor/target_grant_tests.rs
+  s_09d9fb08a24a2a::t_c1d17e48e1e1ac 22-23
+src/gateways/connection_points/mod.rs
+  s_09d9fb08a24a2a::t_2c4e3dcc54d8c6 20-23
+src/gateways/connection_points/ws_listener.rs
+  s_09d9fb08a24a2a::t_7682853ee48897 26,42-45,69,104-106,662,843,882,973,1204-1223,1301-1317,1883-1884,1886,2205-2259,2733-2742,2960,2962-2965,3638,3895,4753-4770,5352-5454
+src/gateways/filesystem.rs
+  s_09d9fb08a24a2a::t_8d53e16ba770a7 7,10-18,87-151,320-437
+src/gateways/gateway_info.rs
+  s_09d9fb08a24a2a::t_7196a526459427 1-4,8-18,21-26,28,30,32,35-40,43,48-50,55-66,68-78,83-84,87-121,123-128,130-152
+src/gateways/handlers.rs
+  s_09d9fb08a24a2a::t_c81fc36dcddbcf 12,18,20,123-127,134-148,214-229,240-243,251,255,260,291-294,300-304,320-324,373-377,412,441-443,716,740,807-841,927-1157,1242-1498,1700,2699,2704,2742-2743,2796-2801,3243,3609,3634-3635,3642,3870-3874,3938-3941,4011-4076,4081,4084,4098,4100,4103,4129,4132-4133,4136,4144-4145,4148-4151,4153-4250,4252-4272,4274-4356,4393-4517,4528-4530,4533-4535,4547-4548,4553,4562,4565,4568-4569,4578-4581
+src/gateways/mod.rs
+  s_09d9fb08a24a2a::t_77689c1b7f7446 1,6,10-12,14,20,25-27
+src/gateways/payment_case.rs
+  s_09d9fb08a24a2a::t_3859d618ab5536 1-129
+src/gateways/payment_logos.rs
+  s_09d9fb08a24a2a::t_59e2c48a234874 1-36,39-100,102-107,110,112-132,134-141,144-155,157-161,164-186,189-193,195,198-222,224-225,227-230,232-237,239-243,245-287,289-291,293,299-316,318,322-330,334-336,338,340-345,348-349,353-360,362-364,366,368-375,377-395,397-399,401-402,404-409,411-423,427-441,443-461
+src/gateways/payment_manifest.rs
+  s_09d9fb08a24a2a::t_a703be8907d635 1-2,4-7,10-26,28-37,40-44,47-55,57-61,64-76,79-83,86-97,100-103,105-112,115-189,191,195-201,204-211,216-319,321-354,357-358,364,367-391,395-420,422-435,437-446,450-457,459-462,466-471,473-475,477,482-484,486-499,503-509,511-536,538-549,553-560,562-570,572-589
+src/gateways/role_scope.rs
+  s_09d9fb08a24a2a::t_b6df531bbc5d8e 1-7,10-11,13,15,18,20-21,23-28,31-37,40-58,60,62-65,71-76,78-126,129,132-135,139-140,142-145,148-151,156-157,159-160,162-167
+src/gateways/test_helpers.rs
+  s_09d9fb08a24a2a::t_1b67ba7ab9c7f3 86
+src/gateways/types.rs
+  s_09d9fb08a24a2a::t_242d4dcf2b1d28 40-60,191-193,254,290-293
+src/gateways/usage.rs
+  s_09d9fb08a24a2a::t_db6b686a6a34ad 1-3,5,7,9-10,12-17,20-30,32-35,39-70,74-85,92-112,116-130,133-141,145-146,148-177,181-191
+src/identity/display_name.rs
+  s_09d9fb08a24a2a::t_7ffc9a4f02d339 97,109,122-138,147,150-165,172-174,186,198-201,236,241,256-267,280-283,287,291-304,389,392,418-459,466,470-491,607-608,614,618,625,629,648,650,672-673,676,684-687,689,696,701-776,784,797,800,807,819,821,825,832,844,846,856,863-921,926,930
+src/identity/filesystem.rs
+  s_09d9fb08a24a2a::t_9672f858ffcf1e 29-33,152-183,351,376,443,478,936,954-1054
+src/identity/handlers/policy_validation.rs
+  s_09d9fb08a24a2a::t_7617c7754da261 5-23,25,27-31,33-46,51-117,161-186,189-192,196-238,240-247,249-264,268-309,311-343
+src/identity/handlers/surface_tenancy.rs
+  s_09d9fb08a24a2a::t_d8389258aa7e91 1545-1547,3650-3659
+src/identity/handlers/surfaces.rs
+  s_09d9fb08a24a2a::t_55b1e1c5f750a8 1125,2226-2227,2237-2240,2242,2270,2282-2283,2287-2312,2519-2535,2537-2546,2548,2550,2553-2572,2576-2578,2581,2584-2592,2595,2597,2599-2600,2603-2649,2652-2677,2679,2681-2761,2764-2780,2782-2798,2801-2825,2827-2831,2833-2880,2882-2928,3057-3060,3157,3221,3309,3320,4089,4143,4167,4199,4300,4311,4396,4407,4438,4893-4895,5010-5013,5080,5100,5102,5104-5108,5125,5240,5266-5269,5385,5399,9108-9149,9154,9252-9272,10064-10776
+src/identity/provider_key_gate.rs
+  s_09d9fb08a24a2a::t_c0538887313523 896
+src/identity/router.rs
+  s_09d9fb08a24a2a::t_5513b5d595a9cf 132,968,979-983,992,999,1006,1019,1026,1032,1034-1079,1086,1167,1174,1190,1201,1212,1219-1222,1229-1261,1266,1275,1302,1343,1353-1364,1369-1374,1577-1583,1921-1926,2376-2387
+src/identity/store.rs
+  s_09d9fb08a24a2a::t_806474fa9e7b91 43-44,49
+src/identity/test_helpers.rs
+  s_09d9fb08a24a2a::t_2ca9124d00a6ec 53,62-92,149,153,155,157,247,250,314
+src/identity/vc_issuer.rs
+  s_09d9fb08a24a2a::t_9eb3d5b24a2ae8 73-80,199,863,896,939,943-947,980,986-994,1000,1007-1008,1013,1018,1039-1040,2611,2749,2751,2755,2760,2770,2782-2808,2890,2893
+src/integrations/audit_integration_triggers.rs
+  s_09d9fb08a24a2a::t_7e188487d1ae7d 22-34,37-38,388-429,552,615,623-630
+src/integrations/delivery/values.rs
+  s_09d9fb08a24a2a::t_6084ad2812c343 137-146
+src/integrations/events.rs
+  s_09d9fb08a24a2a::t_d625c5f8818830 64,94,100-134,209-213,225,248-267,313-316,441-504,600-609
+src/integrations/gateway_integration_triggers.rs
+  s_09d9fb08a24a2a::t_f2322b9c515dba 48,82
+src/integrations/migration/received.rs
+  s_09d9fb08a24a2a::t_af1990091a1cc7 5-7,21-32,148-154,357,434-453
+src/integrations/mod.rs
+  s_09d9fb08a24a2a::t_7b17ce8f43ae59 17
+src/integrations/payment_gate_integration_triggers.rs
+  s_09d9fb08a24a2a::t_7ce8466256fa13 1-339
+src/main.rs
+  s_09d9fb08a24a2a::t_3c7d1ba6572313 58,462,571-576
+src/mcp/continuations/protected.rs
+  s_09d9fb08a24a2a::t_62ce3c51a1c48a 217-236,242-244,263-283
+src/mcp/errors.rs
+  s_09d9fb08a24a2a::t_4da7cb45e69b3a 90-99
+src/mcp_proxies/handlers.rs
+  s_09d9fb08a24a2a::t_55d84b1ca1a66d 568-569,582,585-588,600,605-643,670-676,681,692-730,732-742,745,822-826,837,884-885,887-888,897-906,984,990,1012,1019,2620,2759-2782,2786-2787,2843-2864,2866-2889,2892-2895,2897-2898,2900-2943,2961,2989-2994,2998,3008-3010,3090,3172-3173,3185-3200,3319,3409,3646,3666,5533,5545,5581,5649-5658,6326,6333,6344-6529,6593-6640
+src/mediators/federation.rs
+  s_09d9fb08a24a2a::t_7cb9a3f081dcc6 7,14
+src/mediators/utils.rs
+  s_09d9fb08a24a2a::t_f6037c4d8128f3 54-135,137-138,340-342,650-674
+src/messages/message_types.rs
+  s_09d9fb08a24a2a::t_37f55ccb55cbc4 48-57,137-148,228-239,290-301,411-469
+src/metrics/backends/cloudwatch.rs
+  s_09d9fb08a24a2a::t_5fb64845b4a7e4 16-75,87,118,256-264,545-546,563-566,581-584,606-707
+src/metrics/backends/file.rs
+  s_09d9fb08a24a2a::t_86df3231a0b959 15-17,22-43,61-62,92-142
+src/metrics/backends/metric_names.rs
+  s_09d9fb08a24a2a::t_47e6d85f884161 42-48,129-131,155-157
+src/metrics/backends/opentelemetry_backend.rs
+  s_09d9fb08a24a2a::t_dce650a5ccf89a 46-88,196-210,362-367,377-511
+src/metrics/backends/prometheus.rs
+  s_09d9fb08a24a2a::t_d688eedbb7e047 210-263,715-804,1038-1041,1044-1082
+src/mpp/admin_api.rs
+  s_09d9fb08a24a2a::t_45b5517b4984b7 173,186-188,220-223
+src/mpp/challenge.rs
+  s_09d9fb08a24a2a::t_929e6f0ec90cdc 1-2,6
+src/mpp/mod.rs
+  s_09d9fb08a24a2a::t_15b672b0088b3c 1,3-8
+src/mpp/payment_challenge.rs
+  s_09d9fb08a24a2a::t_0fbc9479f180ce 1
+src/mpp/transaction_store.rs
+  s_09d9fb08a24a2a::t_11f2a44d78f54c 3-5,189-212,214,216-223,227,229-232,234-244,254-256,272,287,313,322-327
+src/observability/dashboard.rs
+  s_09d9fb08a24a2a::t_9c7043889c3188 14,24-26,314-315,318-328,390-396,1533-1536,2112-2116,2168-2189,2193-2202,2210,2252,2254,2276-2284,2291-2292,2297,2301-2312,2315-2333,2455-2458,2752-2754,2795,3006-3082,3168-3174,3176,3180-3185,3188-3189,3191-3197,3199,3204-3238,3246,3335-3338
+src/observability/http_trace.rs
+  s_09d9fb08a24a2a::t_82224c205fa4bb 30-85,292-300,312-313,318-319,401-402,419-420,435-442,527-559
+src/observability/identity_view.rs
+  s_09d9fb08a24a2a::t_57338b9a6c1682 122-123,150,157,263-264,267-268,353
+src/observability/mod.rs
+  s_09d9fb08a24a2a::t_4594ee535c2f09 28-29
+src/observability/trace_registry.rs
+  s_09d9fb08a24a2a::t_07c8ca3918a5b8 19
+src/payments_ledger/admin_api.rs
+  s_09d9fb08a24a2a::t_0bc0df829792a2 1,3-11,13-21,23-29,31-127,129-156,158,162-225,228-256,259-306,308-328,330-402,405-407,410-420,426-437,441-472,475-484,486-561,563-569,572-582,584-668,670-706,710-881,883-916,918-942,945-965,969-1013,1017-1031,1034-1056
+src/payments_ledger/caller_api.rs
+  s_09d9fb08a24a2a::t_a6a983313ea0c0 1-3,5,7,9,11,13-16,18-37,39-76,82-83,85-95,97-104,107-112,115-124,128-132,135-136,138-173
+src/payments_ledger/case_status.rs
+  s_09d9fb08a24a2a::t_b3ebf63981e9ef 1-28,31-36,38-41,43-46,48-50,52,54-56,58-65,67-74,76-78,81-93,97-98,100-105,108-110,112-134,136-147,149-155,160-176,178-198,200-206,208-234,236-247,249,251-268,270-304,307-315,317-323,325-338,340-346,350-355,357-360
+src/payments_ledger/mod.rs
+  s_09d9fb08a24a2a::t_94a2ffa4ffdfd7 1-3,5-48,51-55,58-68,73-78,81-85,88,90-95,97-165,167-214,216,219-220,223-262,267-275,277-281,284-289,292,294-304,308-314,317-339,341-342,344,346-352,354,356-358,360-367,369-381,383-397,399-400,402-420,422,424-427,429,431-449,451-454,456,458-470,472-485,488-519,522-528,530,532-536,539-542,546-572,576-584,586-588,590-591,593-597,599-636,638-646,650-659,661-671,673-676,678-692,696-703,705-709,711-722,724-729,731-737,740-746,748-754,756,758-760
+src/payments_ledger/settlement.rs
+  s_09d9fb08a24a2a::t_6267fa45759c41 1-1461
+src/payments_ledger/store.rs
+  s_09d9fb08a24a2a::t_9b6e1a55b4cc4a 1-2053
+src/policies/circuit_breaker.rs
+  s_09d9fb08a24a2a::t_71ef6780136d3e 52-71,96-97,99-102,257-320
+src/policies/gateway_manager.rs
+  s_09d9fb08a24a2a::t_6420735b60e759 488
+src/proxy/card_preview.rs
+  s_09d9fb08a24a2a::t_5ca6efa36dcc1f 814-815,1138
+src/proxy/credential_delegation/modern.rs
+  s_09d9fb08a24a2a::t_83573fb05b5fa8 512,935-937,939,943,949
+src/proxy/fabric_forward.rs
+  s_09d9fb08a24a2a::t_1053c1d897e933 36-38,58-60,71-232,268-270,765-772,778,840-841,861-862,864-865,879-882,884,891-896,903-1134,1147,1551
+src/proxy/handler.rs
+  s_09d9fb08a24a2a::t_7a6adbb6d57043 32,1357-1359,1526-1541,1544-1550,1552,1554-1555,1557-1568,1570,1572-1644,1646,1868-1881,1891-1892,1900-1925,2691-2721,2726,2728-2732,2734,2736-2738,2742-2745,2747-2766,2770-2792,2794-2803,3059,3084-3175,3263,3318,3684,3688-3689,3781-3801,3838,4048-4068,4443-4459,4471,4549-4565,4584-4592,4601-4609,4678-4694,6188-6197,6201-6202,6221-6291,6322-6324,6345-6347,6349-6352,6362-6371,6747,6754,7348-7432,7626,7645,7671-7673,7707-7712,7742-7749,7831-7835,7838-7842,7858-7862,7897,7905,8182,8262-8265,9491-9507,10727-10728,10802-10804,10807,10810,10819,10822-10850,10852-10872,11551-11557,11854-11862,11924,11945-11947,11949-11952,11962-11963,11967-11971,12580-12620,12736-12738,12862-12865,12884,12944-12945,12947-12953,14420,14428,14430-14432,15279-15287,15290-15291,15293-15325,15327-15343,15597-15607,15609-15664,16036-16078,18048-18049,18075,19214-19231,19296-19311,19332,20709-20710,20854,20921,21319-21320,21323-21324,21332-21343,21346-21349,21353-21371,21373-21450,21452-21464,21466-21469,21471-21474,22518,23602,23608-23610,23634-23635,23646-23674,23680-23696,23727-23730,23732-23741,23744,23801,23947-23969,24013-24037,24140-24162,24181-24196,24199-24271,24273-24361,24364-24956,24981-24982,24987,24989,24996,25075-25104
+src/proxy/handler/agent_card.rs
+  s_09d9fb08a24a2a::t_b201c5b25d84a1 10,21-22,550,552,554,556-557,562,564-571,866-909,911,918,929,934-990
+src/proxy/handler/agent_pay_gate.rs
+  s_09d9fb08a24a2a::t_de6581929e2260 1-6803
+src/proxy/handler/agent_pay_gate/consumed.rs
+  s_09d9fb08a24a2a::t_55f2f359dcfea3 1-4,6-33,36-38,41-48,51-62,65-109,113-134,137-177,180-183,185,187,189-192,195-199,201-241,243,245-253,255-257,261,263-264,267-269,272-278,281-284,287-298,301-416,419-429,432-445,448-503,506-516,519-528,530,532-550,552-556,558,561-567,570-585,587-596,599-607,610-619,626-636,640-649,653-664,668-680,684-687,689-690,692-693,695-697,699,703-715,719-744,747-755,759-768,772-793,797-828,832-847,850-885,887-898
+src/proxy/handler/agent_pay_gate/streamed.rs
+  s_09d9fb08a24a2a::t_dbb52c835552de 1-30,33-44,48-80,84-87,89-93,97-113,115,117-119,121-125,127-130,132-134,139-144,147-157,160-240,247-251,255-258,262-269,273-289,293-298,302-305
+src/proxy/handler/surface_payment.rs
+  s_09d9fb08a24a2a::t_b48a95e978da77 1,3-4,6-10,12-30,34-49,51,53-59,61-63,66-68,72-73,84-85,90,104,115-119,121-132,138,140-146,148-149,152-153,156,158,162,166-179,183-186,188-189,196,201,208-209,213-215,219-220,222-227,229-231
+src/proxy/handler/target_grant_tests.rs
+  s_09d9fb08a24a2a::t_bd9ba15455d19e 736-848,1530-1533,1541,1543,1548-1549,1552-1556,1570
+src/proxy/outbound_handler.rs
+  s_09d9fb08a24a2a::t_e615960e1a0c63 3189-3191,3193,3197,3200-3219,3221,3223-3233,3236-3237,3239-3254,3256-3280,3396-3399,4040-4042,5520-5526,5533-5546,5638-5644,5752,5815-5909,6175,6182-6184,6665,6709,6724,7334-7336,7367-7370,15783-15791,15875-15898,17476-17851
+src/proxy/paths.rs
+  s_09d9fb08a24a2a::t_8d449ee558957c 415,430,462-488,746-781
+src/proxy/server.rs
+  s_09d9fb08a24a2a::t_baafce1cc6f556 19-20,1327,1383
+src/proxy/target_grant.rs
+  s_09d9fb08a24a2a::t_67ac1641951a9a 25,327,341,352-358,361-362,367-368,371,379-386,389-414,417-425,429-432,434-444,448-451,454-467,611-612,616-625,629-630,632,642,647,656,660,667,677,684,687,690,693,696,699,706,709,712,721,729,740,757,910,930,946,951,958,974-977,982,1096,1102,1107,1114-1116,1119,1122,1126,1144,1149,1160,1162
+src/rbac/mod.rs
+  s_09d9fb08a24a2a::t_b0a265549f2ead 113-115,164,236-240,365-367,564-565
+src/server/orchestrator.rs
+  s_09d9fb08a24a2a::t_cb1f7029ed4b08 13,177-178,180-191,309-346,349,667,933-938,1039-1080,1381-1386,1701-1731,3450-3479,3555-3564,3983,3985,4560,4759,4779-4785,4787,4808-4809,4887-4954
+src/server/websocket.rs
+  s_09d9fb08a24a2a::t_39fa4c4734b3c7 631
+src/source_auth/middleware.rs
+  s_09d9fb08a24a2a::t_c60833838b6cf0 752,1261,1275,1328,1345,1361,1374,1409,1412,1416,1418,1466,1469,1474,1476,1511,1513,1523,1527,1546,1548,1558,1565
+src/storage/filesystem.rs
+  s_09d9fb08a24a2a::t_a6c6420c566bc9 460-467,1610-1667,1674-1685,1687-1688,1690-1693,1697-1699,3301-3307,3535-3582
+src/storage/settings_store.rs
+  s_09d9fb08a24a2a::t_4998f172f63e6a 30-43,451-486,681,739-813
+src/sts/policy.rs
+  s_09d9fb08a24a2a::t_c9f2b68798b79a 131
+src/surface_context/mod.rs
+  s_09d9fb08a24a2a::t_5a2ceb07fa07c9 736-739,741-745,747
+src/surface_templates/types.rs
+  s_09d9fb08a24a2a::t_d02a15de5323f5 317-345
+src/trust_registries/reference_fields.rs
+  s_09d9fb08a24a2a::t_9449554203fb37 18-20,450-451,455,457-465,542-553,661,1094-1095,1107-1130,1137,1144
+src/trust_registry_verification/trust_recorder.rs
+  s_09d9fb08a24a2a::t_176cd01bfdc56d 895,898,901
+src/x402/delegate.rs
+  s_09d9fb08a24a2a::t_393fdbc07dec8f 1,3-6,8-25,27-28,35-82,93,96,98,100-117,132-152,155,162-167,169,172-203,205-219,221-246,249-263,268-299,364,594-607,611-623,627-650,654-695,699-792,794-827
+src/x402/embedded_facilitator.rs
+  s_09d9fb08a24a2a::t_b64316c8dd46ba 813,818,826
+src/x402/gateway_facilitator_service.rs
+  s_09d9fb08a24a2a::t_f3eba2fca616d6 3-4,10,50-57,252
+src/x402/middleware.rs
+  s_09d9fb08a24a2a::t_30cabb1af119d0 1-2,4,6-12,14-19,22-24,26-27,37,45-46,50-57,61-62,66-86,88,90-94,96-100,102-110,112-116,118-120,122-123,125-133,135-139,141-150,152,154-159,162-163,346,348-359,362-371,375-378,383,389-393,397,399-400,405,407,409,412-413,416-417
+src/x402/mod.rs
+  s_09d9fb08a24a2a::t_aba9b168c4bc49 1,3-9,32,39
+src/x402/settlement.rs
+  s_09d9fb08a24a2a::t_dec30a62b5d12d 972,980-981
+src/x402/transaction_store.rs
+  s_09d9fb08a24a2a::t_394450699fde4e 9,47,303-304,953-968,1014-1025,1027-1028,1035
+src/x402/verification.rs
+  s_09d9fb08a24a2a::t_281dba1f81eace 3,5-13,265-269
+tests/bdd_support/json_rpc.rs
+  s_09d9fb08a24a2a::t_9a9f8a2df54ef4 294-315
+tests/bdd_support/policies.rs
+  s_09d9fb08a24a2a::t_d2711c88514a83 131-146
+tests/features/g2g/federation.feature
+  s_09d9fb08a24a2a::t_c9e7d6e21bc4aa 11-24
+tests/features/g2g/transit_point_trust_check_over_fabric.feature
+  s_09d9fb08a24a2a::t_3a45a29a51b709 17
+tests/features/surface/identities_naming.feature
+  s_09d9fb08a24a2a::t_583b55a828eb48 18-39
+tests/g2g_bdd/steps/given.rs
+  s_09d9fb08a24a2a::t_bcf7ebf4007032 16-17,25,477,481-488,892-936
+tests/g2g_bdd/steps/then.rs
+  s_09d9fb08a24a2a::t_a56c5424daf218 765-766,772,775-778
+tests/g2g_bdd/world.rs
+  s_09d9fb08a24a2a::t_ae7fe27dbab80b 86-87,109,502-508,754-795
+tests/surface_bdd/steps/given.rs
+  s_09d9fb08a24a2a::t_87b5ae9e01ba74 442-507,3264,3288-3294
+tests/surface_bdd/steps/identities.rs
+  s_09d9fb08a24a2a::t_1d6478f0773dd7 32-207,273-279,303-337
+ui-tests/README.md
+  s_09d9fb08a24a2a::t_856b8b4976d1e1 271-272
+ui-tests/helpers/featureFlags.ts
+  s_09d9fb08a24a2a::t_42d093fb2d28e2 1-26
+ui-tests/helpers/index.ts
+  s_09d9fb08a24a2a::t_5a562666f73347 10
+ui-tests/helpers/layout-fixtures.ts
+  s_09d9fb08a24a2a::t_156e0d3353a65a 45-46,229-246,583-602,608,619-620,629,639-640,822
+ui-tests/helpers/layout-pages.ts
+  s_09d9fb08a24a2a::t_3339f2a235cfc9 56,283-289,291-292,294
+ui-tests/specs/identity-shared-did.spec.ts
+  s_09d9fb08a24a2a::t_1ee40f1751d860 1-126
+ui-tests/specs/payment-gateways.spec.ts
+  s_09d9fb08a24a2a::t_5505aae9958b8f 1-216
+ui-tests/specs/payments.spec.ts
+  s_09d9fb08a24a2a::t_9269f96c28ed35 1-497
+www/default/AGENTS.md
+  s_09d9fb08a24a2a::t_79ab881f185b12 70-74,110-214,223-261,343-346,657-711,800,1058-1061,1069-1091,1096-1100,1102-1110,1123,1129-1249,1275-1280,1310-1329
+www/default/src/api.errors.test.ts
+  s_09d9fb08a24a2a::t_de69c7f8535fd5 30-45
+www/default/src/api.payments.test.ts
+  s_09d9fb08a24a2a::t_f15f842c6002c9 1-172
+www/default/src/api.surfaces.test.ts
+  s_09d9fb08a24a2a::t_8aba42c2bc6a0d 1-270
+www/default/src/api.ts
+  s_09d9fb08a24a2a::t_7d5d72289053a1 9,12-15,23,30,32,35,40-41,46-47,151,155-162,191,203-204,595-647,1374,1435-1442,1536-1638,1674
+www/default/src/components/AgentPayRoute.tsx
+  s_09d9fb08a24a2a::t_ec874bd39d4d81 2-3,5-13,16
+www/default/src/components/Header.tsx
+  s_09d9fb08a24a2a::t_84088aeee7424a 161-162
+www/default/src/components/ProtectedRoute.tsx
+  s_09d9fb08a24a2a::t_3cbe9fd38d9c10 8-9,20-21
+www/default/src/components/Sidebar.tsx
+  s_09d9fb08a24a2a::t_817bbd5f787ff9 4,77,90
+www/default/src/components/__tests__/ProtectedRoute.test.tsx
+  s_09d9fb08a24a2a::t_512b718fc96b6f 1-54
+www/default/src/components/__tests__/Sidebar.integrations.test.tsx
+  s_09d9fb08a24a2a::t_bfcd6820a0164b 14-15,18,23-26,50-92
+www/default/src/components/gateway-add-via-oob/CompleteStep.tsx
+  s_09d9fb08a24a2a::t_57bee05987fa4c 4-15,19,22-27,29,40,42,53,55,63
+www/default/src/components/gateway-add-via-oob/ConnectStep.tsx
+  s_09d9fb08a24a2a::t_ebdbc1c39acd25 15-17,30-31,58,94,97,103,127,138,148
+www/default/src/components/gateway-add-via-oob/EnterDetailsStep.tsx
+  s_09d9fb08a24a2a::t_d5d8fcd457db30 13-29,42,52,54,85,93,96,100,103-107,121,127,131,146,160,221,231
+www/default/src/components/gateway-add-via-oob/EnterOOBLinkStep.tsx
+  s_09d9fb08a24a2a::t_a99285970c5618 5-18,25,34,36,80,87,91,110,130,151,153,163,175,185
+www/default/src/components/gateway-add-via-oob/__tests__/ConnectStep.test.tsx
+  s_09d9fb08a24a2a::t_14410b718f772c 15,18,52-65
+www/default/src/components/gateway-add-via-oob/__tests__/EnterDetailsStep.test.tsx
+  s_09d9fb08a24a2a::t_fa3a8e15ed94fb 112-151
+www/default/src/components/gateways/GatewayStatusCell.tsx
+  s_09d9fb08a24a2a::t_a4009f63363968 1-67
+www/default/src/components/gateways/UseAsPaymentGatewayButton.tsx
+  s_09d9fb08a24a2a::t_90368a47c5db01 1-88
+www/default/src/components/gateways/__tests__/GatewayStatusCell.test.tsx
+  s_09d9fb08a24a2a::t_f99f61e2e6d93d 1-47
+www/default/src/components/gateways/__tests__/UseAsPaymentGatewayButton.test.tsx
+  s_09d9fb08a24a2a::t_dcdc81d9e9ba50 1-133
+www/default/src/components/payment-gateways/PaymentGatewayOfferSummary.tsx
+  s_09d9fb08a24a2a::t_2515b03010d49c 1-44
+www/default/src/components/payment-gateways/__tests__/PaymentGatewayOfferSummary.test.tsx
+  s_09d9fb08a24a2a::t_e552959d8090b8 1-53
+www/default/src/components/payment-gateways/pingPaymentGateway.ts
+  s_09d9fb08a24a2a::t_3d2e185d15b3bc 1-23
+www/default/src/components/payment-gateways/usePaymentGatewayInfo.ts
+  s_09d9fb08a24a2a::t_27d92459ab6159 1-73
+www/default/src/components/shared/RedirectKeepingQuery.tsx
+  s_09d9fb08a24a2a::t_2a5d144a7456d4 1-10
+www/default/src/components/shared/WizardProgress.tsx
+  s_09d9fb08a24a2a::t_a90e88e6904de8 1-45
+www/default/src/components/shared/__tests__/RedirectKeepingQuery.test.tsx
+  s_09d9fb08a24a2a::t_61dccd8c6730c6 1-39
+www/default/src/components/shared/__tests__/WizardProgress.test.tsx
+  s_09d9fb08a24a2a::t_398d52c2d812f1 1-35
+www/default/src/components/surface-builder/ConfigEditorFullscreen.tsx
+  s_09d9fb08a24a2a::t_de6cb931360cad 52-67
+www/default/src/components/surface-builder/ElementPalette.tsx
+  s_09d9fb08a24a2a::t_f1b149d2732667 6,44-47,68,70-75
+www/default/src/components/surface-builder/NodeConfigPanel.tsx
+  s_09d9fb08a24a2a::t_b824b2331db91c 217-233
+www/default/src/components/surface-builder/__tests__/SurfaceFormShell.agentCard.test.tsx
+  s_09d9fb08a24a2a::t_5f1b1db0d82985 13-15
+www/default/src/components/surface-builder/__tests__/accessPointReadiness.test.tsx
+  s_09d9fb08a24a2a::t_2a66f8781e6473 28-30
+www/default/src/components/surface-builder/agent-card/__tests__/AgentCardTab.test.tsx
+  s_09d9fb08a24a2a::t_047691dddc3319 545-546,552
+www/default/src/components/surface-builder/dependencyWarningVisibility.ts
+  s_09d9fb08a24a2a::t_2db103b8acad7e 5-6,8-9
+www/default/src/components/surface-builder/elements/__tests__/element-roundtrip.test.ts
+  s_09d9fb08a24a2a::t_a3fd579d0968c2 132-135,139-143,146-149
+www/default/src/components/surface-builder/elements/__tests__/gateway-surface-picker.test.tsx
+  s_09d9fb08a24a2a::t_f7868039c3e24c 1-315
+www/default/src/components/surface-builder/elements/__tests__/payment-agent-pay.test.ts
+  s_09d9fb08a24a2a::t_f3922d0dc1b059 2-4,11-13,17,20-51,54-63,65,68-69,72-86,90-100,104-106,109,111-117,120-121,123,126,131,134-145,149-182,191,193-196,198,200-205,208-279,281-351
+www/default/src/components/surface-builder/elements/__tests__/payment-manifest-logos.test.tsx
+  s_09d9fb08a24a2a::t_005af0d955bcd1 1-71
+www/default/src/components/surface-builder/elements/__tests__/payment-panel.test.tsx
+  s_09d9fb08a24a2a::t_07eefa45b2cf74 1-539
+www/default/src/components/surface-builder/elements/__tests__/payment-save-gate.test.ts
+  s_09d9fb08a24a2a::t_593b85ec67ba5c 1-91
+www/default/src/components/surface-builder/elements/__tests__/payment-save-warnings.test.ts
+  s_09d9fb08a24a2a::t_0041fee5074863 1-53
+www/default/src/components/surface-builder/elements/__tests__/payment-snapshot-flow.test.ts
+  s_09d9fb08a24a2a::t_88240534ac1dd0 1-142
+www/default/src/components/surface-builder/elements/__tests__/payment-tool-picker.test.tsx
+  s_09d9fb08a24a2a::t_c1e15540050af1 1-614
+www/default/src/components/surface-builder/elements/__tests__/payment-triggers-editor.test.tsx
+  s_09d9fb08a24a2a::t_9220e2e45a4786 1-464
+www/default/src/components/surface-builder/elements/__tests__/payment-warning-visibility.test.ts
+  s_09d9fb08a24a2a::t_fd5624bd096fee 6-8,19-25
+www/default/src/components/surface-builder/elements/__tests__/registry.test.ts
+  s_09d9fb08a24a2a::t_9efe424f40db34 84,86-88,108,110,112,116-117,164-175,206-215,221-229,241-250,375,382-383,390-392,397,399,713-717
+www/default/src/components/surface-builder/elements/__tests__/transit-point-agent-card-location.test.tsx
+  s_09d9fb08a24a2a::t_a4d06da498f4dc 1-75
+www/default/src/components/surface-builder/elements/__tests__/transit-point-payment.test.ts
+  s_09d9fb08a24a2a::t_5b1b67a698e54e 1-36
+www/default/src/components/surface-builder/elements/__tests__/transit-point-protocol-filter.test.ts
+  s_09d9fb08a24a2a::t_2687fc745c5fe1 2-7,32-37,39-40,42-48,50-51,53-90,92-98,101-103,106-107
+www/default/src/components/surface-builder/elements/_shared/GatewaySurfacePicker.tsx
+  s_09d9fb08a24a2a::t_e23fb67ea5e286 1-246
+www/default/src/components/surface-builder/elements/_shared/mcpToolDiscovery.ts
+  s_09d9fb08a24a2a::t_e0d970252d9e76 1-2,4-7,10-16,19-33,36-38,40-41,43,45-48,51-91,94-106,108-112,114-143
+www/default/src/components/surface-builder/elements/_shared/useGatewaySurfaces.ts
+  s_09d9fb08a24a2a::t_0e39b51279a12c 1-202
+www/default/src/components/surface-builder/elements/managed-agent/ManagedAgentPanel.tsx
+  s_09d9fb08a24a2a::t_8b6c13c23cb57e 1,10-16,45-56,58-79,109-114,140,142,182,186,189,208-219,225-237,239-240,242-256,449-451
+www/default/src/components/surface-builder/elements/managed-agent/definition.ts
+  s_09d9fb08a24a2a::t_f13bf067cb3575 9,58-59,130-131,133-135
+www/default/src/components/surface-builder/elements/mcp-tool-gating/McpToolGatingFullscreen.tsx
+  s_09d9fb08a24a2a::t_be6d685586e047 227-228
+www/default/src/components/surface-builder/elements/mcp-tool-gating/McpToolGatingPanel.tsx
+  s_09d9fb08a24a2a::t_e4e68ca7208adf 12-14
+www/default/src/components/surface-builder/elements/payment/McpTriggerEditor.tsx
+  s_09d9fb08a24a2a::t_7c43671ff01d87 2-24,26-30,33-38,41-53,55-83,85-96,100-125,127-137,139-164,166-173,175-225,227-234,236-238,240-258,260-277,279-322,324-333,335-363,365-385,388-390,392-393,395-404,409
+www/default/src/components/surface-builder/elements/payment/PatternList.tsx
+  s_09d9fb08a24a2a::t_83faf2fdacb6f7 1-88
+www/default/src/components/surface-builder/elements/payment/PaymentManifestPreview.tsx
+  s_09d9fb08a24a2a::t_53704e14c1aa07 1-160
+www/default/src/components/surface-builder/elements/payment/PaymentPanel.tsx
+  s_09d9fb08a24a2a::t_3b61bf504ff398 1,5-68,71,77-78,80-97,99-113,115-116,118-120,123-124,127-128,131,133,135-136,138,141-143,145-169,173-180,182,186-229,231-297
+www/default/src/components/surface-builder/elements/payment/PaymentTriggersEditor.tsx
+  s_09d9fb08a24a2a::t_e9d2a26e630699 1-3,5-59,61-66,71-77,80-82,84,87-100,102-139,142,144-156,158-172,174,176-181,183-202,204-214,216-221,223-226,228-229,235
+www/default/src/components/surface-builder/elements/payment/definition.ts
+  s_09d9fb08a24a2a::t_8ca594470d501e 3,5,7-27,32-33,58-69,71-79,81-83,86-90,96,102-104,106,109-111,113,116,118-119,122,125-127,130,133-135,137,140-144,148,150-157,159-162,164-165,167-181,183-187,189-190,193-208,210
+www/default/src/components/surface-builder/elements/payment/manifest.ts
+  s_09d9fb08a24a2a::t_2991742cb2fcc2 1-61
+www/default/src/components/surface-builder/elements/payment/policy.ts
+  s_09d9fb08a24a2a::t_6013d846a5cf46 1-79
+www/default/src/components/surface-builder/elements/payment/saveWarnings.ts
+  s_09d9fb08a24a2a::t_65b4857e77036a 1-18
+www/default/src/components/surface-builder/elements/payment/triggers.ts
+  s_09d9fb08a24a2a::t_885aad1c26e272 1-209
+www/default/src/components/surface-builder/elements/payment/types.ts
+  s_09d9fb08a24a2a::t_961b5b122d2710 1-19
+www/default/src/components/surface-builder/elements/payment/usePaymentManifest.ts
+  s_09d9fb08a24a2a::t_f285033ab33196 1-105
+www/default/src/components/surface-builder/elements/registry.ts
+  s_09d9fb08a24a2a::t_704e7eaa690708 79-80,82,84,96-97,100,690-691
+www/default/src/components/surface-builder/elements/target-variant/definition.ts
+  s_09d9fb08a24a2a::t_1498cbd4f4f8f8 10-12
+www/default/src/components/surface-builder/elements/transit-point/TransitPointPanel.tsx
+  s_09d9fb08a24a2a::t_6481e17894788a 1,3,22-28,35,38-49,65,141-147,149-154,156-165,167-177,229-249,251,253,255,264-269,271,274,277,279-287,292-326,330,333-359,507-508
+www/default/src/components/surface-builder/elements/transit-point/factory.ts
+  s_09d9fb08a24a2a::t_abc6261c685f9e 9-12,149,197-202
+www/default/src/components/surface-builder/templates/TemplatesPanel.tsx
+  s_09d9fb08a24a2a::t_e4a7a3395476e4 22-27,77,156-157,159
+www/default/src/components/surface-builder/templates/__tests__/templateSort.test.ts
+  s_09d9fb08a24a2a::t_fd996689c279c5 7,108-139
+www/default/src/components/surface-builder/templates/templateSort.ts
+  s_09d9fb08a24a2a::t_1da1ac6955a623 65-77
+www/default/src/components/surface-builder/variants/__tests__/resolve.test.ts
+  s_09d9fb08a24a2a::t_e35dc8f8938a49 65,73
+www/default/src/context/AppContext.tsx
+  s_09d9fb08a24a2a::t_79f01c9ecf1c05 525-539,1251,1379-1380
+www/default/src/context/PermissionsContext.tsx
+  s_09d9fb08a24a2a::t_b6746058feba34 26-28
+www/default/src/pages/AddGatewayViaOOBWizardPage.tsx
+  s_09d9fb08a24a2a::t_8fc4a2ed93eb2d 4,142,175
+www/default/src/pages/AddPaymentGatewayWizardPage.tsx
+  s_09d9fb08a24a2a::t_ddfd2e3bcdb2db 1-165
+www/default/src/pages/AddPaymentGatewayWizardPage/AwaitApprovalStep.tsx
+  s_09d9fb08a24a2a::t_4bc4dba126c98c 1-141
+www/default/src/pages/AddPaymentGatewayWizardPage/VerifyPaymentGatewayStep.tsx
+  s_09d9fb08a24a2a::t_f2cf95ec7068b6 1-131
+www/default/src/pages/AddPaymentGatewayWizardPage/__tests__/AddPaymentGatewayWizardPage.test.tsx
+  s_09d9fb08a24a2a::t_8b75ec3090ee17 1-230
+www/default/src/pages/AddPaymentGatewayWizardPage/wording.ts
+  s_09d9fb08a24a2a::t_2613503fdb41d8 1-25
+www/default/src/pages/AddSurfacePage.tsx
+  s_09d9fb08a24a2a::t_c04158fe0c828d 47,475,478-480,483
+www/default/src/pages/AddTrustRegistryWizardPage.tsx
+  s_09d9fb08a24a2a::t_1e44db5f96dc83 4,150
+www/default/src/pages/AuthenticatedApp.tsx
+  s_09d9fb08a24a2a::t_d282b1455c0e40 9,11-12,76-77,141,318-322,381-410,594,601
+www/default/src/pages/ConnectionsPage.tsx
+  s_09d9fb08a24a2a::t_73e45e4d52a2c2 5-6,9,12,19,23-30,32-34,41,55-61,119,123-158
+www/default/src/pages/EditGatewayPage.tsx
+  s_09d9fb08a24a2a::t_d6d871660a9e49 17,32-33,140,371-383
+www/default/src/pages/GatewaysPage.tsx
+  s_09d9fb08a24a2a::t_e81177eb9a2631 9-10,16-17,28,50,479,566-572
+www/default/src/pages/IdentitiesPage.tsx
+  s_09d9fb08a24a2a::t_49734a9720138d 17,20-21,31-35,145,168,476,494-495,511,531-532,540-542,556-557,559-561,703-706,805
+www/default/src/pages/IdentitiesPage/IdentityNameCell.tsx
+  s_09d9fb08a24a2a::t_92a0b602ef2f09 5,14,21-22,81-82,84-88,92-105,124-143,145-146
+www/default/src/pages/IdentitiesPage/IdentityRecorderChip.tsx
+  s_09d9fb08a24a2a::t_31defcb6e9c66b 4,15,18-21,26-30,62,70,77
+www/default/src/pages/IdentitiesPage/IdentitySurfaceCell.tsx
+  s_09d9fb08a24a2a::t_16b2905c55cc5e 1-45
+www/default/src/pages/IdentitiesPage/__tests__/IdentityNameCell.test.tsx
+  s_09d9fb08a24a2a::t_ec5e1adeacc140 12-16,76,106-107,109-113,115-178,210,217
+www/default/src/pages/IdentitiesPage/__tests__/IdentityRecorderChip.test.tsx
+  s_09d9fb08a24a2a::t_5b4f6e03ad5d14 114-140
+www/default/src/pages/IdentitiesPage/__tests__/useIdentityRows.test.ts
+  s_09d9fb08a24a2a::t_27e47db90d5fdb 64-133
+www/default/src/pages/IdentitiesPage/sharedManagedDid.ts
+  s_09d9fb08a24a2a::t_a9846067b00dbe 1-8
+www/default/src/pages/IdentitiesPage/useIdentityRows.ts
+  s_09d9fb08a24a2a::t_feb2d16d1c5a28 4,8,29,44,69,77-90,100,105,108,116
+www/default/src/pages/PaymentGatewayDetailPage.tsx
+  s_09d9fb08a24a2a::t_4a1a82e8a29fbc 1-162
+www/default/src/pages/PaymentGatewayDetailPage/HealthSection.tsx
+  s_09d9fb08a24a2a::t_1d62f06f8bc24a 1-8,10-16,18-22,25-26,28,32-67,73
+www/default/src/pages/PaymentGatewayDetailPage/OverviewSection.tsx
+  s_09d9fb08a24a2a::t_2104a21c9ade9a 1-190
+www/default/src/pages/PaymentGatewayDetailPage/PaymentSurfacesSection.tsx
+  s_09d9fb08a24a2a::t_810b31fa4cafa8 1-129
+www/default/src/pages/PaymentGatewayDetailPage/UsedBySection.tsx
+  s_09d9fb08a24a2a::t_626a1f648bdd49 1-5,7-10,15-17,19-20,25,28-75,79
+www/default/src/pages/PaymentGatewayDetailPage/__tests__/PaymentGatewayDetailPage.test.tsx
+  s_09d9fb08a24a2a::t_2896abe9198536 1-312
+www/default/src/pages/PaymentGatewayDetailPage/__tests__/usedBy.test.ts
+  s_09d9fb08a24a2a::t_45298b4c051ade 1-82
+www/default/src/pages/PaymentGatewayDetailPage/usePaymentGateway.ts
+  s_09d9fb08a24a2a::t_03ebded0f31baa 1-24,26-44
+www/default/src/pages/PaymentGatewayDetailPage/usedBy.ts
+  s_09d9fb08a24a2a::t_e8fa8bdf418acc 1-35
+www/default/src/pages/PaymentGatewaysPage.tsx
+  s_09d9fb08a24a2a::t_9c68ad37b1ce1d 1-203
+www/default/src/pages/PaymentGatewaysPage/PaymentGatewayOfferCell.tsx
+  s_09d9fb08a24a2a::t_b525e18f6b47b7 1-53
+www/default/src/pages/PaymentGatewaysPage/PaymentGatewaysTable.tsx
+  s_09d9fb08a24a2a::t_69f22226d3e577 1-122
+www/default/src/pages/PaymentGatewaysPage/__tests__/PaymentGatewaysPage.test.tsx
+  s_09d9fb08a24a2a::t_4586e0df891c6f 1-293
+www/default/src/pages/PaymentGatewaysPage/usePaymentGateways.ts
+  s_09d9fb08a24a2a::t_ff8573c1a16205 1-48
+www/default/src/pages/PaymentsPage.tsx
+  s_09d9fb08a24a2a::t_7cc9d6ae60b66a 1-2,9-29,32-50,52-53,57-58,60,62,64,66,70,77,82-89,92-109,113-117,120,126-135,137-165,168-180,183,185-187,189-198,200-201,203-208
+www/default/src/pages/PaymentsPage/LegacyPaymentsTab.tsx
+  s_09d9fb08a24a2a::t_8395db9c8937ed 1-48
+www/default/src/pages/PaymentsPage/PaymentCaseStatus.tsx
+  s_09d9fb08a24a2a::t_29190b491d5bb7 1-98
+www/default/src/pages/PaymentsPage/PaymentDetailModal.tsx
+  s_09d9fb08a24a2a::t_b217b859d8d0e4 1-181
+www/default/src/pages/PaymentsPage/PaymentLedgerTable.tsx
+  s_09d9fb08a24a2a::t_16f2e11d7f7e62 1-113
+www/default/src/pages/PaymentsPage/ledger.ts
+  s_09d9fb08a24a2a::t_9bcbde70f986ba 1-55
+www/default/src/pages/PaymentsPage/legacy.ts
+  s_09d9fb08a24a2a::t_315e059ff29436 1-110
+www/default/src/pages/PaymentsPage/settlementFields.tsx
+  s_09d9fb08a24a2a::t_757cf1c16a0acd 1-92
+www/default/src/pages/PaymentsPage/usePaymentGatewayNames.ts
+  s_09d9fb08a24a2a::t_4ef02f570b0704 1-27
+www/default/src/pages/PaymentsPage/usePaymentLedger.ts
+  s_09d9fb08a24a2a::t_46ae1a4de777d8 1-76
+www/default/src/pages/PaymentsPage/usePaymentRow.ts
+  s_09d9fb08a24a2a::t_6ef5bb401f9d7b 1-35
+www/default/src/pages/PoliciesPage.tsx
+  s_09d9fb08a24a2a::t_218ed35f65b542 7,10,39
+www/default/src/pages/SettingsPage/SystemTab.tsx
+  s_09d9fb08a24a2a::t_151c621c1eeeec 411-415,419-420
+www/default/src/pages/SettingsPage/__tests__/SystemTab.test.tsx
+  s_09d9fb08a24a2a::t_e6df2f5231f7fe 30-33,35-39,45-49,53-72,94,98
+www/default/src/pages/SurfaceDetailPage.tsx
+  s_09d9fb08a24a2a::t_0ff62e12376a87 52,1291-1301,1392-1394,1686-1690
+www/default/src/pages/__tests__/ConnectionsPage.test.tsx
+  s_09d9fb08a24a2a::t_88aa1cbe748cd5 1-122
+www/default/src/pages/__tests__/IdentitiesPage.test.tsx
+  s_09d9fb08a24a2a::t_d9fa6282dea3f1 871,874-876,882-885,887-957,960,967,970,973-974,980-1017
+www/default/src/pages/__tests__/PaymentsPage.test.tsx
+  s_09d9fb08a24a2a::t_cfe39169c7320a 2,6,8-9,14-16,20,22-23,26-32,34-56,58,61-83,88-407,410-411,413-817,820-821,823-825
+www/default/src/pages/__tests__/PoliciesPage.test.tsx
+  s_09d9fb08a24a2a::t_c69821682686aa 15,24
+www/default/src/routes.ts
+  s_09d9fb08a24a2a::t_7dfe1d09bb4ee4 10-11,14-21
+www/default/src/types.ts
+  s_09d9fb08a24a2a::t_13c97fb58f0bc5 203-204,206-211,489,524,780-784,970-1169
+www/default/src/utils/__tests__/deepLinks.test.ts
+  s_09d9fb08a24a2a::t_b57ca2b044afff 13-14
+www/default/src/utils/__tests__/featureFlags.test.tsx
+  s_09d9fb08a24a2a::t_74cbe496a4142f 1-82
+www/default/src/utils/__tests__/gateways.test.ts
+  s_09d9fb08a24a2a::t_5191ef9371b9f7 25-33
+www/default/src/utils/__tests__/peerLastSeen.test.tsx
+  s_09d9fb08a24a2a::t_ea1cb07ec6db57 1-22
+www/default/src/utils/apiError.test.ts
+  s_09d9fb08a24a2a::t_2d4e70f9560790 1,92-113
+www/default/src/utils/apiError.ts
+  s_09d9fb08a24a2a::t_2ae685dc5f920a 80-92
+www/default/src/utils/connectionHealth.tsx
+  s_09d9fb08a24a2a::t_e239cd68ff3abe 2,108-132
+www/default/src/utils/deepLinks.ts
+  s_09d9fb08a24a2a::t_9c82f5a1f4d9ff 15
+www/default/src/utils/featureFlags.ts
+  s_09d9fb08a24a2a::t_76820173a40117 1-7,9-10,12-15,17-19
+www/default/src/utils/gateways.ts
+  s_09d9fb08a24a2a::t_814ba87dbd1514 1-8,15-35,44-45,50-55,63-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d58a839ccd9c832a379338c33c796802785074a8",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
