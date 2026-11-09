@@ -12,6 +12,7 @@ import { CertificateKind } from '../types';
 export const deepLinks = {
   agentSurface: '/surfaces/new',
   remoteGateway: '/gateways/connect',
+  paymentGateway: '/payment-gateways/connect',
   secret: '/secrets/new',
   apiKey: '/secrets?tab=api-keys',
   certificate: (kind?: CertificateKind): string =>

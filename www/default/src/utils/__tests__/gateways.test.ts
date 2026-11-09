@@ -22,6 +22,15 @@ describe('isSelectableRemoteGateway', () => {
     expect(isSelectableRemoteGateway({ gateway_type: 'remote', status: 'failed' })).toBe(false);
   });
 
+  it('rejects a payment gateway, which is never a Fabric route', () => {
+    expect(
+      isSelectableRemoteGateway({ gateway_type: 'remote', status: 'active', role: 'payment' })
+    ).toBe(false);
+    expect(
+      isSelectableRemoteGateway({ gateway_type: 'remote', status: 'active', role: 'peer' })
+    ).toBe(true);
+  });
+
   it('rejects when fields are missing', () => {
     expect(isSelectableRemoteGateway({})).toBe(false);
     expect(isSelectableRemoteGateway({ gateway_type: 'remote' })).toBe(false);

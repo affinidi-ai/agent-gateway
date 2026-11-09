@@ -1152,9 +1152,9 @@ async fn remove_provider(
     // provider is deleted, so no surface write binds it after the check below
     // found it unbound.
     let bindings = Arc::new(crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await);
-    if let Err(response) = refuse_bound_provider(state, &existing, tenant_context(context), resource_scope(scope)).await
+    if let Err(refused) = refuse_bound_provider(state, &existing, tenant_context(context), resource_scope(scope)).await
     {
-        return (response, None);
+        return (refused.into_response(), None);
     }
     let (deleted, outcome) = tokio::sync::oneshot::channel();
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {
@@ -1163,7 +1163,7 @@ async fn remove_provider(
     };
     let revocations = match remove_provider_grants(state, &existing, actor, Arc::clone(&bindings), outcome).await {
         Ok(revocations) => revocations,
-        Err(response) => return (response, None),
+        Err(refused) => return (refused.into_response(), None),
     };
     let result = state.store.delete(id).await;
     let _ = deleted.send(result.is_ok());
@@ -1198,8 +1198,50 @@ async fn provider_deleted(
     !matches!(store.get(&id).await, Ok(Some(_)))
 }
 
-fn unavailable(message: &'static str) -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": message }))).into_response()
+/// Why a credential provider is kept rather than deleted.
+#[derive(Debug, thiserror::Error)]
+enum ProviderDeleteError {
+    #[error("Agent surfaces are unavailable, so the provider's bindings cannot be checked")]
+    SurfacesUnavailable,
+    #[error("The delegation vault is unavailable, so the provider's grants cannot be removed")]
+    VaultUnavailable,
+    #[error(
+        "The provider's delegated grant {grant_id} cannot be read ({reason}), so it can be neither revoked nor \
+         removed and the provider is kept. Make it readable again (for at-rest encryption, enable [encryption] with \
+         the key it was written under), or have an operator purge it with DELETE \
+         /api/v1/delegation-vault/grants/{grant_id}, which leaves it unrevoked at the vendor, then delete the provider"
+    )]
+    UnreadableGrant { grant_id: String, reason: String },
+    #[error(
+        "The delegated grants stored were written under another identity hash pepper, so the provider's grants \
+         cannot be found; restore the AG_IDENTITY_HASH_PEPPER they were written under, or have an operator purge them"
+    )]
+    PepperMismatch,
+    /// A surface binds the provider; `surface_id` names it when the caller
+    /// may see it.
+    #[error("The credential provider is bound by an agent surface; remove the binding first")]
+    InUse { surface_id: Option<String> },
+}
+
+impl IntoResponse for ProviderDeleteError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InUse { ref surface_id } => {
+                let mut body = serde_json::json!({ "error": self.to_string(), "code": "provider_in_use" });
+                if let Some(surface_id) = surface_id {
+                    body["surface_id"] = serde_json::json!(surface_id);
+                }
+                (StatusCode::CONFLICT, Json(body)).into_response()
+            }
+            Self::SurfacesUnavailable
+            | Self::VaultUnavailable
+            | Self::UnreadableGrant { .. }
+            | Self::PepperMismatch => {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": self.to_string() })))
+                    .into_response()
+            }
+        }
+    }
 }
 
 /// Refuse to delete a provider a surface binds, in its base or a variant,
@@ -1214,16 +1256,16 @@ async fn refuse_bound_provider(
     provider: &CredentialProvider,
     context: Option<&PatTenantContext>,
     scope: Option<&PatResourceScope>,
-) -> Result<(), Response> {
+) -> Result<(), ProviderDeleteError> {
     let Some(surfaces) = state.surfaces.as_ref() else {
-        return Err(unavailable("Agent surfaces are unavailable, so the provider's bindings cannot be checked"));
+        return Err(ProviderDeleteError::SurfacesUnavailable);
     };
     let surfaces = surfaces
         .list_all()
         .await
         .map_err(|error| {
             warn!(target: "credential_delegation", error = %error, "Failed to list surfaces for a provider delete");
-            unavailable("Agent surfaces are unavailable, so the provider's bindings cannot be checked")
+            ProviderDeleteError::SurfacesUnavailable
         })?;
     let bound_by = surfaces
         .iter()
@@ -1235,16 +1277,11 @@ async fn refuse_bound_provider(
     let Some(surface) = bound_by else {
         return Ok(());
     };
-    let mut body = serde_json::json!({
-        "error": "The credential provider is bound by an agent surface; remove the binding first",
-        "code": "provider_in_use",
-    });
-    if can_access(surface.tenant_id.as_deref(), context)
-        && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id)
-    {
-        body["surface_id"] = serde_json::json!(surface.surface_id);
-    }
-    Err((StatusCode::CONFLICT, Json(body)).into_response())
+    let visible = can_access(surface.tenant_id.as_deref(), context)
+        && scope_allows_resource(scope, context, ResourceKind::Surfaces, &surface.surface_id);
+    Err(ProviderDeleteError::InUse {
+        surface_id: visible.then(|| surface.surface_id.clone()),
+    })
 }
 
 /// Delete every grant by binding made with an external consent provider being
@@ -1264,12 +1301,12 @@ async fn remove_provider_grants(
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
     bindings: Arc<tokio::sync::RwLockWriteGuard<'static, ()>>,
     outcome: crate::delegation_vault::revocation::ChangeOutcome,
-) -> Result<Option<tokio::task::JoinHandle<()>>, Response> {
+) -> Result<Option<tokio::task::JoinHandle<()>>, ProviderDeleteError> {
     if !provider.is_external_consent() {
         return Ok(None);
     }
     let Some(vault) = state.vault.as_ref() else {
-        return Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"));
+        return Err(ProviderDeleteError::VaultUnavailable);
     };
     let grants = match vault
         .provider_grants(&provider.id)
@@ -1278,27 +1315,16 @@ async fn remove_provider_grants(
         Ok(grants) => grants,
         Err(error) => {
             if let Some(unreadable) = error.downcast_ref::<crate::delegation_vault::grants::UnreadableGrant>() {
-                let message = format!(
-                    "The provider's delegated grant {} cannot be read ({}), so it can be neither revoked nor removed \
-                     and the provider is kept. Make it readable again (for at-rest encryption, enable [encryption] \
-                     with the key it was written under), or have an operator purge it with DELETE \
-                     /api/v1/delegation-vault/grants/{}, which leaves it unrevoked at the vendor, then delete the \
-                     provider",
-                    unreadable.grant_id, unreadable.reason, unreadable.grant_id
-                );
-                return Err(
-                    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": message }))).into_response()
-                );
+                return Err(ProviderDeleteError::UnreadableGrant {
+                    grant_id: unreadable.grant_id.clone(),
+                    reason: unreadable.reason.to_string(),
+                });
             }
             if error.is::<crate::delegation_vault::grants::PepperMismatch>() {
-                return Err(unavailable(
-                    "The delegated grants stored were written under another identity hash pepper, so the provider's \
-                     grants cannot be found; restore the AG_IDENTITY_HASH_PEPPER they were written under, or have \
-                     an operator purge them",
-                ));
+                return Err(ProviderDeleteError::PepperMismatch);
             }
             warn!(target: "credential_delegation", error = %error, "Failed to list a provider's grants");
-            return Err(unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed"));
+            return Err(ProviderDeleteError::VaultUnavailable);
         }
     };
     if grants.is_empty() {
@@ -1316,7 +1342,7 @@ async fn remove_provider_grants(
         .map(Some)
         .map_err(|error| {
             warn!(target: "credential_delegation", error = %error, "Failed to delete a provider's grant");
-            unavailable("The delegation vault is unavailable, so the provider's grants cannot be removed")
+            ProviderDeleteError::VaultUnavailable
         })
 }
 
@@ -4232,6 +4258,45 @@ mod external_provider_tests {
         std::fs::write(file(&other), "not a grant").unwrap();
         let (status, body) = delete(&state, "provider").await;
         assert_eq!(status, StatusCode::NO_CONTENT, "another provider's unreadable grant blocks nothing: {body}");
+    }
+
+    /// A provider whose bindings or grants cannot be checked is kept: without
+    /// the surface store, or without the delegation vault, its delete answers
+    /// `503`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_provider_whose_bindings_or_grants_cannot_be_checked_is_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = crate::delegation_vault::revocation::tests::RecordingServer::start(200).await;
+        let state = delete_state(&directory, &server).await;
+        for (case, state, error) in [
+            (
+                "no surface store",
+                CredentialProviderState {
+                    surfaces: None,
+                    ..state.clone()
+                },
+                "Agent surfaces are unavailable, so the provider's bindings cannot be checked",
+            ),
+            (
+                "no delegation vault",
+                CredentialProviderState { vault: None, ..state.clone() },
+                "The delegation vault is unavailable, so the provider's grants cannot be removed",
+            ),
+        ] {
+            let (status, body) = delete(&state, "provider").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{case}: {body}");
+            assert_eq!(body, serde_json::json!({ "error": error }), "{case}");
+            assert!(
+                state
+                    .store
+                    .get("provider")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{case}: the provider is kept"
+            );
+        }
+        assert!(server.requests().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

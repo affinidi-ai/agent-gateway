@@ -43,6 +43,10 @@ the duration of a callback, avoiding a manager-to-listener-to-manager strong-ref
 Each Connection Point maintains a persistent DIDComm connection through its mediator. The listener
 authenticates, registers the receive ACL, receives encrypted envelopes, decrypts them, and dispatches
 them by DIDComm message type. Applicable messages are persisted and connection metrics are updated.
+The metrics keep, in memory, when the paired peer gateway was last heard from: an authenticated
+message whose sender is the DID on the Connection Point's gateway, or a pong to a gateway ping.
+`GET /v1/gateways` reports the latest per gateway as `peer_last_seen_at`, absent until the peer
+has been heard from since the process started.
 A forwarded G2G request also emits a dashboard `PayloadCaptured` event through the payload-capture
 helper.
 
@@ -140,7 +144,17 @@ recovery and its listener read that record by id, never a mediator found by DID.
 `DIDCommMessaging` service endpoint names a mediator other than the sender's own, the send is wrapped
 in a `routing/2.0/forward` addressed to the sender's mediator, which relays it. Otherwise it is sent
 directly. The route does not depend on the feature flag. Fabric stream frames and the x402
-facilitator always send directly.
+settle messages for stored payments always send directly. Delegated `agent_pay` payment
+requests are ordinary fabric forwards and are routed like any other send.
+
+The gateway is not an x402 facilitator for its peers. An incoming `x402/verify-request` is
+answered `{"valid": false, "error": "facilitator_disabled"}` and an `x402/settle-request`
+`{"settled": false, "error": "facilitator_disabled"}`; a deferred-settlement record
+(`action: "record"`) is dropped without a reply. Nothing is verified, settled or recorded,
+whatever `facilitator_mode.facilitator_via_fabric` says. This gateway sends no verify request, so
+an `x402/verify-response` is dropped without touching the transaction store. Settle responses to
+its own requests are still handled, and the settlement worker still drains x402 payments already
+in its transaction store.
 
 ## Peer issuer DIDs
 
@@ -249,11 +263,28 @@ Management API: `GET /v1/gateways/{id}` (`gateways.view`) exposes `issuer_did`,
 attested issuer; `POST /v1/gateways/{id}/trusted-issuers` and
 `DELETE /v1/gateways/{id}/trusted-issuers/{issuer_did}` manage operator trust.
 
+## Mediator account ACL
+
+Each listener sets its Connection Point's mediator account ACL on every connect
+(`mediators::utils::apply_inbound_acl`, chosen by `ws_listener::inbound_acl_for`). A paired
+Connection Point (OOB responder or acceptor) admits only its peer: the account is explicit-allow
+with anonymous receipt off, and its access list holds exactly the peer's DID. That DID is the secure
+DID recorded on the Connection Point at pairing (`acceptor_secure_did` or `inviter_secure_did`),
+else the DID on its remote gateway record, because a pairing's gateway record can still carry the
+peer's temporary DID when the listener starts; with neither, the account stays open to every
+sender and a warning names the Connection Point, so a pairing made before peer DIDs were recorded
+keeps working. Every other
+Connection Point (an invitation endpoint, a pairing's temporary listener, a legacy one) stays open
+to every sender, since it does not serve a single known peer. The mediator's own replies are not
+subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
+change is logged and the listener continues; the account check below restores it.
+
 ## Runtime health behavior
 
 After a Gateway Ping timeout, the Gateway checks its mediator account. It reauthenticates and
-reregisters if the account has disappeared, or restores the receive list when the account remains
-but its ACL has been reset.
+reregisters if the account has disappeared, or re-applies the Connection Point's ACL when the
+account remains but its access-list mode is not the one that ACL sets (explicit-allow for a paired
+Connection Point, explicit-deny for an open one).
 
 Every connected Connection Point also runs this check on its own account every 30 seconds. A
 mediator can lose accounts while the connections stay open, for example when its store is flushed
@@ -262,7 +293,7 @@ missing account with `e.p.delivery.refused`. Without the periodic check, a gatew
 receives would stay unreachable.
 
 Four Connection Points are checked at a time, so one slow mediator does not hold up the others.
-Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-opening a receive list up to
+Each probe waits up to 5 seconds, a restart up to 20 seconds, and re-applying an ACL up to
 10 seconds; a repair that fails is tried again at the next check and logged at `warn`. An account
 that cannot be read changes nothing. When that happens on consecutive checks it is logged at
 `warn` on the second, then at doubling intervals, so a check that cannot reach its mediator is
@@ -285,6 +316,12 @@ reaches over Fabric ([`Gateway::exposes_surface`](../src/gateways/types.rs)):
 The same check applies to buffered `forward-request` traffic, framed-stream Opens, and the
 `get-channels` capability query, which lists only the surfaces the sender may reach. The tenant rule
 applies on top of every mode.
+
+A payment gateway (`role: payment`) is created with `none`, and turning a peer into one, by hand
+or by the startup migration, sets `none`; its exposure cannot be changed afterwards, because `/v1/gateways/{id}/exposed-surfaces`
+does not act on payment gateways. The `gateway-info` query
+(`https://affinidi.com/atm/client-actions/gateway-info`) asks agent-pay for its summary; this
+gateway, not being a payment gateway, answers one with `{"info": null}`.
 
 Records written before the mode existed have no `exposure_mode`. On boot,
 [`migrate_exposure_modes`](../src/gateways/filesystem.rs) persists `all` for a record with an empty
@@ -390,17 +427,18 @@ request received by the destination gateway:
 6. Build policy input containing the authenticated sending Gateway and any source-auth result. An
    identity presentation is attributed to the caller only when its issuer is one of the sending
    connection's issuers (see [Peer issuer DIDs](#peer-issuer-dids)).
-7. Run Gateway policy, payment verification, caller identity extraction, MCP per-tool policy, Trust
-   Check, surface policy, and MCP tool gating in that order where configured.
-8. Forward to the local surface Target. When the surface has Transit Points and the Target is an
-   HTTP or HTTPS URL, the request carries a transit token this gateway issued for it, naming the
-   peer, the hop count and, when step 5 verified one, the caller the surface's own source
-   authentication verified, so the agent can call its own Transit Points (see
-   [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as an agent
-   card fetch, carries none, nor does a request relayed to an MCP Target over the legacy HTTP+SSE
-   transport. The surface's `target.auth` goes only with a request whose caller was vetted, and
-   with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured card
-   location, the sending gateway's own card fetch; any other discovery read, the
+7. Run Gateway policy, caller identity extraction, MCP per-tool policy, Trust Check, surface
+   policy, and MCP tool gating in that order where configured.
+8. Take the payment of a chargeable request through agent-pay, last, once every refusal that does
+   not depend on payment has been made. Then forward to the local surface Target. When the surface
+   has Transit Points and the Target is an HTTP or HTTPS URL, the request carries a transit token
+   this gateway issued for it, naming the peer, the hop count and, when step 5 verified one, the
+   caller the surface's own source authentication verified, so the agent can call its own Transit
+   Points (see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#transit-token)). A public discovery `GET`, such as
+   an agent card fetch, carries none, nor does a request relayed to an MCP Target over the legacy
+   HTTP+SSE transport. The surface's `target.auth` goes only with a request whose caller was
+   vetted, and with a `GET` of exactly `/.well-known/agent-card.json` or the surface's configured
+   card location, the sending gateway's own card fetch; any other discovery read, the
    `/.well-known/agent.json` fallback included, gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
@@ -445,8 +483,7 @@ unless the sending route's `fabric://` Target pins one of its variants:
 `fabric://<gateway>/<surface>$<alias>`. A pinned alias is sent with the request, as
 `active_variant_alias` (and `virtual_channel_alias`) on a buffered `ForwardRequest` and as the
 `variant_alias` of a framed stream's `Open`, and the receiving gateway serves and records that
-variant. The `ForwardRequest` an Access Point resends after MPP auto-pay pays a `402` carries the
-same alias. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
+variant. This applies to an Access Point's Target and to a Transit Point's endpoint alike. To send
 one variant of the sending surface to a particular peer variant, override that variant's Target
 with the pinned URL. A pinned alias the receiving surface doesn't have, or has disabled, is refused
 there (`unknown_variant` or `variant_disabled`); the sending gateway passes the `404` on to its
@@ -631,7 +668,11 @@ not through the Transit Point, with a count of 1 and a trace id of its own. It r
 its Target credential when it has one, and falls back to `/.well-known/agent.json`, which the
 remote reads as a public discovery read without that credential; a remote Target that serves its
 card only at the legacy path and requires its credential there is reported as
-`AGENT_CARD_UNAVAILABLE`.
+`AGENT_CARD_UNAVAILABLE`. A `404` or `503` the remote gateway answers itself (an unknown or
+inactive surface) ends the read without the fallback. See [`POLICY.md`](POLICY.md) for which reads are
+cached. An Access Point with a `fabric://` Target gives its surface policy the card it serves,
+built in process: one read over Fabric at its card location, uncached, within
+`a2a.timeout_seconds` or the surface's shorter request timeout.
 The limit bounds a chain of Transit Point calls through gateways that follow these rules, with
 the agent sending the token it was given each time; two agents that call each other's Access
 Points are not bounded by it, nor are agents that keep calling through any of the resets above.

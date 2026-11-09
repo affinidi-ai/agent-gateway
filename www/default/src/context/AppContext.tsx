@@ -522,6 +522,21 @@ interface AppContextType {
 export const AppContext = createContext<AppContextType | undefined>(undefined);
 AppContext.displayName = 'AppContext';
 
+/** Used when the settings cannot be loaded: every feature flag reads off. */
+export const FALLBACK_SETTINGS: Settings = {
+  badge_threshold: 5,
+  metrics_retention: 6,
+  task_activity_window: 60,
+  connections_window: 60,
+  latency_window: 60,
+  onboarding_channel_ttl_seconds: 30,
+  refresh_interval_seconds: 5,
+  log_timestamp_format: 'local',
+  bucket_seconds: 30,
+  payments_min_display: 10,
+  feature_flags: {},
+};
+
 export const useApp = (): AppContextType => {
   const context = useContext(AppContext);
   if (!context) {
@@ -1233,22 +1248,7 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
           payload: error instanceof Error ? error.message : 'Failed to load settings',
         });
         // Set default settings to prevent app crash
-        dispatch({
-          type: 'SET_SETTINGS',
-          payload: {
-            badge_threshold: 5,
-            metrics_retention: 6,
-            task_activity_window: 60,
-            connections_window: 60,
-            latency_window: 60,
-            onboarding_channel_ttl_seconds: 30,
-            refresh_interval_seconds: 5,
-            log_timestamp_format: 'local',
-            bucket_seconds: 30,
-            payments_min_display: 10,
-            feature_flags: {},
-          },
-        });
+        dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }
@@ -1376,6 +1376,8 @@ export const AppProvider: React.FC<AppProviderProps> = ({ children }) => {
           type: 'SET_ERROR',
           payload: error instanceof Error ? error.message : 'Failed to load settings',
         });
+        // Every flag reads off, and pages waiting for the settings render.
+        dispatch({ type: 'SET_SETTINGS', payload: FALLBACK_SETTINGS });
       } finally {
         dispatch({ type: 'SET_LOADING', payload: { key: 'settings', value: false } });
       }

@@ -77,3 +77,16 @@ export function getErrorMessage(err: unknown, fallback = 'Request failed'): stri
   }
   return fallback;
 }
+
+/** Machine-readable error code from a response body: `code`, else a snake_case `error`. */
+export function extractErrorCode(body: string | null | undefined): string | undefined {
+  try {
+    const obj = JSON.parse((body ?? '').trim()) as Record<string, unknown> | null;
+    if (!obj || typeof obj !== 'object') return undefined;
+    if (typeof obj.code === 'string' && obj.code) return obj.code;
+    if (typeof obj.error === 'string' && /^[a-z][a-z0-9_]*$/.test(obj.error)) return obj.error;
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}

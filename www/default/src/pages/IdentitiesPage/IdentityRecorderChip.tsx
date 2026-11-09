@@ -1,7 +1,7 @@
 import React, { useId } from 'react';
 import { OverlayTrigger, Tooltip } from 'react-bootstrap';
 import { TrustRecorderStateBadge } from '../../components/trust-recorder/TrustRecorderStateBadge';
-import type { TrustRecorderStatus } from '../../types';
+import type { ManagedSurfaceRef, TrustRecorderStatus } from '../../types';
 import {
   formatTrustRecorderAttemptTime,
   formatTrustRecorderCounts,
@@ -12,13 +12,22 @@ import {
 
 interface IdentityRecorderChipProps {
   status?: TrustRecorderStatus;
+  surface?: ManagedSurfaceRef;
 }
 
-const TrustRecorderStatusDetails: React.FC<{ status: TrustRecorderStatus }> = ({ status }) => {
+const TrustRecorderStatusDetails: React.FC<{
+  status: TrustRecorderStatus;
+  surface?: ManagedSurfaceRef;
+}> = ({ status, surface }) => {
   const attemptTime = trustRecorderAttemptTime(status);
   const reason = trustRecorderReasonText(status.reason);
   return (
     <div data-testid="identities-recorder-tooltip">
+      {surface && (
+        <p className="fw-bold" data-testid="identities-recorder-surface">
+          Recorder on {surface.surface_name}
+        </p>
+      )}
       <p data-testid="identities-recorder-last-attempt">
         {attemptTime
           ? `Last attempt: ${formatTrustRecorderAttemptTime(attemptTime)}`
@@ -50,7 +59,7 @@ const TrustRecorderStatusDetails: React.FC<{ status: TrustRecorderStatus }> = ({
   );
 };
 
-export const IdentityRecorderChip: React.FC<IdentityRecorderChipProps> = ({ status }) => {
+export const IdentityRecorderChip: React.FC<IdentityRecorderChipProps> = ({ status, surface }) => {
   const tooltipId = useId();
   if (!status) return null;
   return (
@@ -58,14 +67,14 @@ export const IdentityRecorderChip: React.FC<IdentityRecorderChipProps> = ({ stat
       placement="auto"
       overlay={
         <Tooltip id={tooltipId} className="field-help-tooltip">
-          <TrustRecorderStatusDetails status={status} />
+          <TrustRecorderStatusDetails status={status} surface={surface} />
         </Tooltip>
       }
     >
       <button
         type="button"
         className="btn btn-link p-0 border-0 text-decoration-none align-baseline"
-        aria-label={`Trust Recorder status: ${trustRecorderStateLabel(status.state)}`}
+        aria-label={`Trust Recorder status${surface ? ` on ${surface.surface_name}` : ''}: ${trustRecorderStateLabel(status.state)}`}
         onClick={event => event.stopPropagation()}
         data-testid={`identities-recorder-chip-${status.state}`}
       >

@@ -439,6 +439,72 @@ async fn named_surface_exists_for_route_targeting_mock(
     create_a2a_surface_for_route_targeting_mock(world, &route, Some(&surface_name)).await;
 }
 
+/// Creates A2A surfaces served on `/<surface name>`, each paired with its
+/// managed agent. Every route is registered before the gateway starts, since
+/// it serves only the routes it started with. The managed agents share the
+/// primary mock target; the first one is the primary collaborator.
+async fn create_named_a2a_surfaces_targeting_mock(
+    world: &mut SurfaceWorld,
+    surfaces: &[(&str, &str)],
+) {
+    let routes: Vec<String> = surfaces
+        .iter()
+        .map(|(surface_name, _)| format!("/{surface_name}"))
+        .collect();
+    let route_refs: Vec<&str> = routes
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let (_, primary_agent) = surfaces[0];
+    register_primary_managed_agent(world, primary_agent);
+    mock_agent_available_as_target(world);
+    crate::steps::when::configure_unseeded_routes(world, route_refs[0], &route_refs);
+    for ((surface_name, agent_name), route) in surfaces.iter().zip(&routes) {
+        if *agent_name != primary_agent {
+            world
+                .actors
+                .register_target_with_key(agent_name, TargetActorKind::ManagedAgent, surface_name);
+        }
+        world
+            .actors
+            .register_surface_with_target(surface_name, "a2a", Some(route), Some(agent_name));
+        let mut payload = crate::steps::when::build_primary_target_surface_payload(world, route).await;
+        payload["name"] = serde_json::json!(surface_name);
+        crate::steps::when::create_surface(world, payload).await;
+        let response = world
+            .admin_response
+            .as_ref()
+            .expect("admin_response must be set after surface setup");
+        assert_eq!(
+            response.status, 201,
+            "surface setup should create surface {surface_name:?}, got status {} body {}",
+            response.status, response.body
+        );
+        remember_named_surface_under_test_id(world, surface_name);
+    }
+}
+
+#[given(expr = "A2A surfaces {string} and {string} exist with managed agent {string} as their target")]
+async fn named_surfaces_exist_targeting_one_agent(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+    agent_name: String,
+) {
+    create_named_a2a_surfaces_targeting_mock(world, &[(&first, &agent_name), (&second, &agent_name)]).await;
+}
+
+#[given(expr = "A2A surfaces {string} and {string} exist with managed agents {string} and {string} as their targets")]
+async fn named_surfaces_exist_targeting_two_agents(
+    world: &mut SurfaceWorld,
+    first: String,
+    second: String,
+    first_agent: String,
+    second_agent: String,
+) {
+    create_named_a2a_surfaces_targeting_mock(world, &[(&first, &first_agent), (&second, &second_agent)]).await;
+}
+
 #[given(expr = "surface {string} maps inbound header {string} to A2A metadata field {string}")]
 async fn surface_maps_inbound_header_to_a2a_metadata(
     world: &mut SurfaceWorld,
@@ -3195,7 +3261,7 @@ async fn surface_has_response_policy_allowing_content_type(
 }
 
 #[given(expr = "managed agent {string} response contains the agent-identity extension")]
-fn managed_agent_response_has_identity(
+async fn managed_agent_response_has_identity(
     world: &mut SurfaceWorld,
     agent_name: String,
 ) {
@@ -3219,6 +3285,13 @@ fn managed_agent_response_has_identity(
             }
         }
     });
+    // Surfaces created through the admin API start the mock before this step.
+    if let Some(infra) = world.infra.as_ref() {
+        infra
+            .mock
+            .set_response(MockResponse::json(response.clone()))
+            .await;
+    }
     set_primary_target_response(world, response);
 }
 

@@ -2501,6 +2501,7 @@ fn write_self_gateway_denying_asserted_did(gateways_dir: &str) {
         gateway_type: GatewayType::SelfGateway,
         status: GatewayStatus::Active,
         creation_type: GatewayCreationType::User,
+        role: crate::gateways::types::GatewayRole::Peer,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         exposed_channels: Vec::new(),

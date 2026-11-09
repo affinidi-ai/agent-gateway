@@ -17,7 +17,7 @@ use trust_tasks_rs::specs::messaging::account::get::v0_1::Account;
 
 use super::ws_listener::{ConnectionPointListenerManager, ConnectionStatus, ListenerInfo};
 use crate::comm::didcomm::client::DIDCommClient;
-use crate::mediators::utils::set_acl_to_allow_everything_and_more;
+use crate::mediators::utils::{InboundAcl, apply_inbound_acl};
 
 const ACCOUNT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -47,7 +47,8 @@ pub(crate) enum AccountRepair {
     /// The mediator no longer has the account: restart the listener so it
     /// re-authenticates and re-registers.
     RestartListener,
-    /// The account exists but its receive list is closed: re-open it.
+    /// The account exists but its access-list mode is not the one the
+    /// connection point should have: re-apply its inbound ACL.
     ReopenReceiveList,
 }
 
@@ -94,7 +95,7 @@ impl MediatorAccount for ListenerSession {
         &self,
         listener: &ListenerInfo,
     ) -> Result<(), String> {
-        set_acl_to_allow_everything_and_more(listener.client.atm(), Arc::clone(listener.client.profile())).await
+        apply_inbound_acl(listener.client.atm(), Arc::clone(listener.client.profile()), &listener.inbound_acl).await
     }
 }
 
@@ -109,15 +110,20 @@ pub(crate) async fn probe_own_account(client: &DIDCommClient) -> AccountProbe {
     .await
 }
 
-pub(crate) fn account_repair(probe: &AccountProbe) -> AccountRepair {
+/// What `probe` of a connection point whose account should carry `intended`
+/// calls for.
+pub(crate) fn account_repair(
+    probe: &AccountProbe,
+    intended: &InboundAcl,
+) -> AccountRepair {
     match probe {
         Ok(Ok(account)) => {
-            let receive_list_open = account
+            let as_intended = account
                 .acl
                 .access_list_mode
                 .as_ref()
-                .is_some_and(|mode| mode.to_string() == "explicitDeny");
-            if receive_list_open {
+                .is_some_and(|mode| mode.to_string() == intended.access_list_mode());
+            if as_intended {
                 AccountRepair::Nothing
             } else {
                 AccountRepair::ReopenReceiveList
@@ -213,7 +219,7 @@ async fn check_listener(
     }
 
     let probe = mediator.probe(listener).await;
-    let repair = account_repair(&probe);
+    let repair = account_repair(&probe, &listener.inbound_acl);
     let repaired = match repair {
         AccountRepair::Nothing if !matches!(probe, Ok(Ok(_))) => {
             debug!(connection_point = %listener.name, "Could not read the mediator account; leaving the listener as it is");
@@ -286,29 +292,43 @@ mod tests {
     async fn only_a_missing_account_restarts_the_listener() {
         let missing =
             probe_error(ATMError::ProblemReport(ACCOUNT_NOT_FOUND_CODE.into(), "gone".into(), "false".into()));
-        assert_eq!(account_repair(&missing), AccountRepair::RestartListener);
+        assert_eq!(account_repair(&missing, &InboundAcl::Open), AccountRepair::RestartListener);
 
         let other_report =
             probe_error(ATMError::ProblemReport("e.p.access_list.denied".into(), "denied".into(), "false".into()));
-        assert_eq!(account_repair(&other_report), AccountRepair::Nothing);
+        assert_eq!(account_repair(&other_report, &InboundAcl::Open), AccountRepair::Nothing);
 
         let near_miss =
             probe_error(ATMError::ProblemReport("e.p.account.not_found_else".into(), "other".into(), "false".into()));
-        assert_eq!(account_repair(&near_miss), AccountRepair::Nothing);
+        assert_eq!(account_repair(&near_miss, &InboundAcl::Open), AccountRepair::Nothing);
 
         let transport = probe_error(ATMError::TransportError("connection reset".into()));
-        assert_eq!(account_repair(&transport), AccountRepair::Nothing);
+        assert_eq!(account_repair(&transport, &InboundAcl::Open), AccountRepair::Nothing);
 
         let probe_timed_out: AccountProbe = Err(tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
             .await
             .unwrap_err());
-        assert_eq!(account_repair(&probe_timed_out), AccountRepair::Nothing);
+        assert_eq!(account_repair(&probe_timed_out, &InboundAcl::Open), AccountRepair::Nothing);
     }
 
     #[test]
-    fn only_a_closed_receive_list_is_reopened() {
-        assert_eq!(account_repair(&probed_account("explicitDeny")), AccountRepair::Nothing);
-        assert_eq!(account_repair(&probed_account("explicitAllow")), AccountRepair::ReopenReceiveList);
+    fn only_a_closed_receive_list_is_reopened_on_an_open_connection_point() {
+        assert_eq!(account_repair(&probed_account("explicitDeny"), &InboundAcl::Open), AccountRepair::Nothing);
+        assert_eq!(
+            account_repair(&probed_account("explicitAllow"), &InboundAcl::Open),
+            AccountRepair::ReopenReceiveList
+        );
+    }
+
+    #[test]
+    fn a_paired_connection_point_keeps_its_peer_only_list_and_regains_it_when_opened() {
+        let peer_only = InboundAcl::Peers(vec!["did:example:peer".into()]);
+        assert_eq!(account_repair(&probed_account("explicitAllow"), &peer_only), AccountRepair::Nothing);
+        assert_eq!(
+            account_repair(&probed_account("explicitDeny"), &peer_only),
+            AccountRepair::ReopenReceiveList,
+            "an account opened to everyone is narrowed back to its peer"
+        );
     }
 
     /// A mediator that answers every probe with `probe`, and counts the

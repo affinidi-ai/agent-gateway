@@ -106,7 +106,6 @@ rbac = "rbac.json"
 limits = "limits.json"
 saml = "saml.json"
 x402 = "x402.json"
-x402_proxy = "x402-proxy.json"
 agent_surface_templates_dir = "agent_surface_templates"
 
 # Storage paths

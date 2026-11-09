@@ -25,6 +25,9 @@ jest.mock('../elements/trust-check/MigratedTrustChecksSummary', () => ({
   __esModule: true,
   default: () => null,
 }));
+jest.mock('../../../utils/featureFlags', () => ({
+  useAgentPayFlag: () => ({ enabled: false, loaded: true }),
+}));
 
 const NOT_READY = 'Not ready for external access';
 const SAVE_TO_ACTIVATE = 'Not ready for external access. Save to activate.';

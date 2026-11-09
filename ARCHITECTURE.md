@@ -93,11 +93,11 @@ flowchart TB
     end
     subgraph G["Gateway plane"]
         direction LR
-        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"] --> B5["Delegated<br/>agent_pay payment"]
+        B0[Agent context] --> B1["Appliance-wide<br/>gateway policy"] --> B2[Gateway OPA] --> B3[AP2 gate] --> B4["A2A version and<br/>request validation"]
     end
     subgraph P["Before forwarding"]
         direction LR
-        P1[Egress check] --> P2[Body-size re-check] --> P3["Local x402 / MPP"] --> P4[MCP tool policies]
+        P1[Egress check] --> P2[Body-size re-check] --> P4[MCP tool policies]
     end
     subgraph C["Caller context"]
         direction LR
@@ -107,21 +107,31 @@ flowchart TB
         direction LR
         D1[Access Point OPA] --> D2["Appliance-wide<br/>surface policy"] --> D3[Surface OPA] --> D4["MCP tool gating, tools/call"]
     end
+    subgraph Y["Consent"]
+        direction LR
+        Y1["Consent preparation<br/>(modern MCP)"]
+    end
     subgraph O["Request preparation"]
         direction LR
-        O1[Headers] --> O2[Transit token] --> O3[MCP custom metadata] --> O4[Credential delegation] --> O5[VP injection]
+        O1[Headers] --> O2[Transit token] --> O3[MCP custom metadata] --> O4["Target authentication,<br/>credential delegation"] --> O5[VP injection]
+    end
+    subgraph Z["Payment"]
+        direction LR
+        Z1["Circuit breaker<br/>check"] --> Z2["Delegated<br/>agent_pay payment"]
     end
     subgraph F["Forward and respond"]
         direction LR
         F1[Forward] --> F2["Resolve protected<br/>identity"] --> F3["Response processing,<br/>tools/list filter"] --> F4[Metrics]
     end
-    E --> G --> P --> C --> S --> O --> F
-    B5 -. fabric:// Target .-> FP["Fabric paywall,<br/>MCP tool policies"] --> FB([Fabric dispatch])
+    E --> G --> P --> C --> S --> Y --> O --> Z --> F
+    B4 -. fabric:// Target .-> FP["Surface OPA, MCP tool<br/>gating, target auth,<br/>agent_pay payment"] --> FB([Fabric dispatch])
 ```
 
-A `fabric://` Target leaves after the delegated payment. It then runs its own paywall
-(skipped when the delegated payment already decided) and, for MCP, the MCP tool policies,
-before fabric dispatch. Version negotiation and request validation run on the sending gateway, before
+A `fabric://` Target leaves after request validation. It then runs its own surface policy
+and, for MCP, the MCP tool policies and gating, target authentication and credential delegation,
+and only then the delegated payment, just before fabric dispatch. Payment is the last step on every
+path, so a request is never charged and then refused for a reason that does not depend on payment.
+Version negotiation and request validation run on the sending gateway, before
 that; the fabric receive pipeline does not run them again.
 
 Each stage is driven from `handler.rs`; the column below names the module holding the
@@ -139,10 +149,8 @@ logic.
 | Gateway OPA | The appliance-level policy gate | [`src/policies/gateway_manager.rs`](src/policies/gateway_manager.rs) |
 | AP2 gate | Refusing AP2 while `ap2_experimental` is off | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/ap2/`](src/ap2/) |
 | A2A version and request validation | Resolving `A2A-Version` against the surface's accepted versions, and checking the JSON-RPC envelope and the request shape as the surface's validation level asks; A2A and AP2 only | [`src/a2a/version.rs`](src/a2a/version.rs), [`src/a2a/methods.rs`](src/a2a/methods.rs) |
-| Delegated payment | `agent_pay` settlement through another gateway | [`src/x402/delegate.rs`](src/x402/delegate.rs) |
-| Egress check | Vetting the forward target before anything is charged locally | [`src/egress.rs`](src/egress.rs) |
+| Egress check | Vetting the forward target before the request is charged or forwarded | [`src/egress.rs`](src/egress.rs) |
 | Body-size limit | Refusing a body over `[a2a] max_body_size` with `413`, as it is read and again before forwarding; an MCP Access Point reads up to its `mcp_http.max_request_bytes` | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
-| Local payment | x402 and MPP verification and paywalls | [`src/x402/`](src/x402/), [`src/mpp/`](src/mpp/) |
 | MCP tool policies | Per-tool authorization, configured as `target.mcp_tool_policies` | [`src/policies/opa.rs`](src/policies/opa.rs) |
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
@@ -152,6 +160,7 @@ logic.
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | MCP tool gating | The allow/deny firewall over tool names | [`src/policies/mcp_tool_gating.rs`](src/policies/mcp_tool_gating.rs) |
+| Delegated payment | Deciding whether an `agent_pay` request is chargeable and asking agent-pay to take the payment, last, just before the request is forwarded; receipts, audit, metrics and the payments ledger. Manifest discovery in [`src/gateways/payment_manifest.rs`](src/gateways/payment_manifest.rs) and the held-payment status query in [`src/gateways/payment_case.rs`](src/gateways/payment_case.rs) | [`src/proxy/handler/agent_pay_gate.rs`](src/proxy/handler/agent_pay_gate.rs), [`src/x402/delegate.rs`](src/x402/delegate.rs) |
 | Headers | Trace ID, `did:webvh` identity headers (`x-did-identity`, `x-did-signed-identity`), and caller-info headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`); the caller's own copies of these headers are dropped | [`src/proxy/handler.rs`](src/proxy/handler.rs), [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs) |
 | Transit token | The token a managed agent echoes back on its Transit Point calls. Fabric receive issues one too, for an HTTP(S) Target | [`src/proxy/transit_token.rs`](src/proxy/transit_token.rs) |
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent. A Target bound by external consent is instead sent its grant by binding, in place of the caller's credentials and caller-info headers, only at its endpoint path on the provider's resource through Strict egress, its route chosen before any payment; the Target's refusal of the token gets one refresh and one retry after the response | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs), [`src/proxy/target_grant.rs`](src/proxy/target_grant.rs) |
@@ -211,15 +220,19 @@ token, which refuses rather than passing to policy) → rate limit → body extr
 over `[a2a] max_body_size`, or over `mcp_http.max_request_bytes` on MCP) → MCP
 wire validation and context → agent
 context → appliance-wide gateway policy → gateway OPA → AP2 gate → A2A version negotiation
-and request validation (A2A and AP2) → delegated `agent_pay` payment (a
-`fabric://` Target leaves here: its own paywall, MCP tool policies for MCP, then fabric
-dispatch) → forward-target egress check → body-size re-check (a body the gateway grew, and an
-MCP Access Point's body over `max_body_size`) → local x402/MPP → MCP tool
+and request validation (A2A and AP2) (a `fabric://` Target leaves here: its own policy,
+MCP tool policies and gating for MCP, target authentication and credential delegation, delegated
+payment, then fabric dispatch) →
+forward-target egress check → body-size re-check (a body the gateway grew, and an
+MCP Access Point's body over `max_body_size`) → MCP tool
 policies → extension inspection → caller identity → custom metadata → Trust Check (caller
 leg) → Access Point OPA → appliance-wide surface policy → surface OPA → MCP tool gating
-(`tools/call`) → identity and caller-info headers → transit token generation → MCP custom
-metadata → credential delegation and consent → deferred VP injection → forward → resolve
-protected identity → response processing, including the `tools/list` filter → metrics.
+(`tools/call`) → consent preparation (modern MCP) → identity and caller-info headers → transit
+token generation → MCP custom metadata → target authentication → credential delegation and
+consent → deferred VP injection → Target circuit breaker check → delegated `agent_pay` payment (an
+A2A proxy or MCP proxy Target is charged here too, once the proxy is found and its own checks have
+passed) → mirroring → forward → resolve protected identity → response processing, including the
+`tools/list` filter → metrics.
 
 Outbound:
 
@@ -337,7 +350,7 @@ Breaking one of these is a correctness bug, not a style question.
 | The Target credential is attached only to a request for the Target's origin and under its base path; any other URL is refused with `502` and the credential never follows a redirect ([Target base path](docs/CREDENTIAL_DELEGATION.md#target-base-path), [Target Credential Scope](docs/PROTOCOLS.md#target-credential-scope)). It is withheld under `target_https` and `target_source_auth` `enforce` where the Target is not https or the leg does not check its callers ([Target credential rules on the request path](docs/CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path)). A caller header spelled like a credential header (compared without regard to case or to `_` against `-`) is dropped on every leg ([Credential headers on a Transit Point](docs/CREDENTIAL_DELEGATION.md#credential-headers-on-a-transit-point)). | The operator's credential would reach another host or path, or a caller could supply or replace it. |
 | Every Fabric send sets its own hop count, never a copy a caller, agent or peer sent, and a request past 8 Fabric crossings is refused. | Agents that call each other through their gateways could pass a request back and forth without end. |
 | The Agent Surface is the only routing unit. | Routing behaviour would drift away from what an operator configured. |
-| x402 verification and settlement use the surface's configured payment requirement, or on a fabric facilitator the requirement the requesting peer sends; a credential's `accepted` must name it exactly. | A caller could name its own recipient and amount and still be granted the resource. |
+| A surface charges only through agent-pay. An enabled local x402 or MPP policy fails closed with `503 payment_unavailable` over HTTP and over the fabric, and cannot be saved. | A surface its operator meant to charge would forward requests unpaid. |
 
 ## Module map
 
@@ -399,15 +412,16 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`x402/`](src/x402/) | x402 settlement, facilitator calls, transaction records | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
-| [`mpp/`](src/mpp/) | Machine Payments Protocol | [`PROTOCOLS.md`](docs/PROTOCOLS.md) |
+| [`x402/`](src/x402/) | Mapping agent-pay's answers (`delegate.rs`); the chargeable-request matching (`middleware.rs`) and payment-header parsing the agent-pay gate shares; settlement, startup recovery and the admin API for x402 transactions recorded before local x402 payment was withdrawn. It verifies no payment and is not an x402 facilitator | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#surface-payment-policy) |
+| [`mpp/`](src/mpp/) | The local MPP policy configuration a stored surface still loads, the MPP challenge and credential wire formats the agent-pay gate relays, and the admin API for MPP transactions recorded before local MPP payment was withdrawn. It verifies no payment | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#migrating-older-policies) |
+| [`payments_ledger/`](src/payments_ledger/) | One record per delegated payment call: a bounded in-memory window served at `/api/admin/payments`, and append-only hourly segment files kept 7 days | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#taking-the-payment), [`RBAC.md`](docs/RBAC.md) |
 | [`payment_credentials.rs`](src/payment_credentials.rs) | Dispute-evidence credentials | Source only: [`src/payment_credentials.rs`](src/payment_credentials.rs) |
 
 ### Federation
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`gateways/`](src/gateways/) | Remote gateway records, pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
+| [`gateways/`](src/gateways/) | Remote gateway records (peers and payment gateways, kept apart by `role_scope.rs`; `usage.rs` says what still depends on one), pairing, connection points (`connection_points/first_call_retry.rs` repeats a new one's first mediator call while a mediator the directory lists refuses its DID; other mediators fail at once), issuer attestation, envelope replay | [`FABRIC.md`](docs/FABRIC.md), [`INTEGRATIONS.md`](docs/INTEGRATIONS.md#event-hook) |
 | [`mediators/`](src/mediators/) | DIDComm mediator connections | [`FABRIC.md`](docs/FABRIC.md), [`PER_GATEWAY_MEDIATOR_FEDERATION.md`](docs/PER_GATEWAY_MEDIATOR_FEDERATION.md) |
 
 ### Management plane

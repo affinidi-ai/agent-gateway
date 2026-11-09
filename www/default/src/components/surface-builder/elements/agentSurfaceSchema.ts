@@ -88,8 +88,6 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'target.a2a_proxy_id',
   'target.mcp_identity_config',
   'target.fabric_target_name',
-  'target.mpp_auto_pay',
-  'target.mpp_auto_pay_max_amount',
   'target.fabric_delegated_credentials',
   'target.delegated_credentials_for_fabric_callers',
 
@@ -118,7 +116,6 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'transit.points[*].policy',
   'transit.points[*].response_policy',
   'transit.points[*].mcp_tool_gating',
-  'transit.points[*].payment_policy',
   'transit.points[*].networking',
   'transit.points[*].rate_limit',
   'transit.points[*].per_caller_rate_limit',

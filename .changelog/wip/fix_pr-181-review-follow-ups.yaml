@@ -1,0 +1,43 @@
+branch: fix/pr-181-review-follow-ups
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Read a partner's agent card over Fabric less often
+      description: >-
+        A Transit Point policy with require_agent_context now takes the target's agent card from the
+        card cache the Trust Checks use, instead of reading it on every request. As for Trust
+        Checks, it may see a card up to 60 seconds old, and a card that could not be read is
+        remembered as missing for 10 seconds, for https targets too. A Fabric card read also stops
+        at the first path when the partner gateway refuses the request itself with 404 or 503 (an
+        unknown or inactive surface), instead of asking the legacy path too.
+  fixed:
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Retry a partner's agent card at once after a Fabric connection gap
+      description: >-
+        A Transit Point card read that failed on this gateway's side, because the Fabric connection
+        was not up yet, the mediator refused the message or the reply could not be picked up, is no
+        longer cached as a missing card, nor is a 503 from a briefly unavailable partner. Requests
+        no longer report AGENT_CARD_UNAVAILABLE for 10 seconds after a gateway restart or a partner
+        reconnecting. A partner that answers without a card, or does not answer in time, is still
+        cached for 10 seconds.
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Stop a Fabric Access Point calling itself for its agent card
+      description: >-
+        An Access Point with a fabric:// Target whose surface has a policy gave that policy the
+        agent card by requesting it from its own listener on every request. It now builds the card
+        in process, as the card preview does, so payment gating and rate limits no longer apply to
+        that read and it no longer adds a discovery connection to the metrics. The card is read
+        from the partner over Fabric; a card larger than a2a.max_body_size is now refused, and the
+        read waits a2a.timeout_seconds or the surface's shorter request timeout, like a card read
+        over HTTP. The card an Access Point serves over Fabric is read the same way, rather than
+        with a fixed 30-second wait.
+    - timestamp: '2026-11-05T18:00:00Z'
+      title: Hide the agent card location override on Fabric Transit Points
+      description: >-
+        The Surface Builder no longer offers Override Agent Card Location on a Transit Point whose
+        destination is another gateway, where the gateway reads the card at the partner's discovery
+        paths and never used the override. A stored value is kept and still ignored.
+  removed: []
+  security: []
+  breaking: []

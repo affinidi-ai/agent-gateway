@@ -790,7 +790,7 @@ mod tests {
                 .push(secret_id.to_string());
             if self
                 .lookups_before_missing
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
                 .is_err()
             {
                 return Ok(None);

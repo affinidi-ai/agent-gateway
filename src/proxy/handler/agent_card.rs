@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value as JsonValue;
 use tracing::{debug, error, info, warn};
@@ -18,8 +18,8 @@ use crate::observability::loggable;
 use crate::proxy::backend_identity::ProtectedAgentIdentity;
 use crate::state::ProxyState;
 
-/// Whether the card is served to a caller or built for an operator. A preview
-/// records no gateway fault, no rejected request, no Trust Recorder write and no
+/// Whether the card is served to a caller or built for an operator's preview or
+/// the surface's own policy input. A preview records no gateway fault, no rejected request, no Trust Recorder write and no
 /// connection metric, and always fetches over a client pinned to the vetted
 /// address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,46 +547,28 @@ impl TargetCardFetch<'_> {
         let forwarded_headers = fabric_card_fetch_headers(&state.surface, headers);
         let trace_id = uuid::Uuid::new_v4().to_string();
         let path = super::agent_card_fabric_forward_path(&state.surface);
-        let response = crate::proxy::fabric_forward::forward_via_fabric(
+        let outcome = crate::proxy::fabric_forward::read_fabric_card(
             &state.listener_manager,
-            crate::proxy::fabric_forward::FabricForwardRequest {
+            &crate::proxy::fabric_forward::FabricCardRequest {
                 fabric_target: &state.surface.target.endpoint,
-                method: &Method::GET,
-                path: &path,
+                paths: &[&path],
                 headers: forwarded_headers,
-                body: bytes::Bytes::new(),
-                timeout: std::time::Duration::from_secs(30),
+                timeout: std::time::Duration::from_secs(fabric_card_timeout_secs(state)),
+                max_bytes: state.config.a2a.max_body_size,
                 trace_id: &trace_id,
                 log_label: channel_name,
             },
         )
-        .await
-        .map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to fetch agent card from fabric upstream - bad gateway");
-            self.fail(
-                FetchFault::Unreachable,
-                create_error_response(StatusCode::BAD_GATEWAY, &format!("Failed to fetch from upstream: {}", e)),
-            )
-        })?;
+        .await;
 
-        let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        if !status.is_success() {
-            error!(channel = channel_name, status = %status, "Fabric upstream returned error for agent card - gateway fault");
-            return Err(self.fail(
-                FetchFault::Status {
-                    status: status.as_u16(),
-                    credential_sent: false,
-                },
-                create_error_response(status, &format!("Upstream error: {status}")),
-            ));
-        }
-
-        serde_json::from_slice(&response.body).map_err(|e| {
-            error!(channel = channel_name, error = %e, "Failed to parse fabric agent card JSON");
-            CardFailure::new(
-                FetchFault::InvalidCard,
-                create_error_response(StatusCode::BAD_GATEWAY, "Invalid JSON from upstream"),
-            )
+        fabric_card_result(outcome).map_err(|(fault, status, message)| {
+            error!(channel = channel_name, ?fault, status = %status, "Fabric agent card read failed - gateway fault");
+            let response = create_error_response(status, &message);
+            if fault == FetchFault::InvalidCard {
+                CardFailure::new(fault, response)
+            } else {
+                self.fail(fault, response)
+            }
         })
     }
 
@@ -881,15 +863,59 @@ fn record_agent_card_gateway_fault(
     }
 }
 
+/// The card a Fabric card read found, or the fault, status and message its
+/// failure is answered with.
+fn fabric_card_result(
+    outcome: crate::proxy::fabric_forward::FabricCardOutcome
+) -> Result<JsonValue, (FetchFault, StatusCode, String)> {
+    use crate::proxy::fabric_forward::FabricCardOutcome;
+    match outcome {
+        FabricCardOutcome::Card(card) => Ok(card),
+        FabricCardOutcome::Failed(error) => {
+            Err((FetchFault::Unreachable, StatusCode::BAD_GATEWAY, format!("Failed to fetch from upstream: {error}")))
+        }
+        FabricCardOutcome::Refused { status } => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            Err((
+                FetchFault::Status {
+                    status: status.as_u16(),
+                    credential_sent: false,
+                },
+                status,
+                format!("Upstream error: {status}"),
+            ))
+        }
+        FabricCardOutcome::TooLarge => {
+            Err((FetchFault::TooLarge, StatusCode::BAD_GATEWAY, "Upstream response too large".to_string()))
+        }
+        FabricCardOutcome::NotJson => {
+            Err((FetchFault::InvalidCard, StatusCode::BAD_GATEWAY, "Invalid JSON from upstream".to_string()))
+        }
+    }
+}
+
+/// How long a card read over Fabric waits: the A2A timeout, or the surface's
+/// shorter request timeout, which bound a card read over HTTP alike.
+fn fabric_card_timeout_secs(state: &ProxyState) -> u64 {
+    let a2a = state
+        .config
+        .a2a
+        .timeout_seconds;
+    state
+        .surface
+        .timeout()
+        .map_or(a2a, |timeout| timeout.request_secs.min(a2a))
+}
+
 /// The caller's headers a card fetch over Fabric carries: those the Access Point forwards,
-/// except one named like a Target or delegated credential header, with the first Fabric crossing.
+/// except one named like a Target or delegated credential header.
 fn fabric_card_fetch_headers(
     surface: &crate::config::agent_surface::AgentSurface,
     headers: &HeaderMap,
 ) -> HashMap<String, String> {
     let source_cred_headers = surface.source_credential_headers();
     let credential_headers = super::target_credential_header_names(surface);
-    let mut forwarded_headers = headers
+    headers
         .iter()
         .filter(|(key, _)| {
             super::forwards_ap_caller_header(key.as_str(), &source_cred_headers, None, None, &credential_headers)
@@ -900,13 +926,68 @@ fn fabric_card_fetch_headers(
                 .ok()
                 .map(|value| (key.as_str().to_string(), value.to_string()))
         })
-        .collect::<HashMap<_, _>>();
-    crate::proxy::fabric_hops::set_fabric_hops(&mut forwarded_headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
-    forwarded_headers
+        .collect::<HashMap<_, _>>()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fabric_card_read_failure_is_answered_by_what_went_wrong() {
+        use super::{FetchFault, fabric_card_result};
+        use crate::proxy::fabric_forward::{FabricCardOutcome, FabricForwardError};
+        use axum::http::StatusCode;
+
+        assert_eq!(
+            fabric_card_result(FabricCardOutcome::Card(serde_json::json!({"name": "partner"}))).unwrap(),
+            serde_json::json!({"name": "partner"})
+        );
+        for (case, outcome, fault, status, message) in [
+            (
+                "no answer",
+                FabricCardOutcome::Failed(FabricForwardError::GatewayNotConnected("peer".into())),
+                FetchFault::Unreachable,
+                StatusCode::BAD_GATEWAY,
+                "Failed to fetch from upstream: Remote gateway 'peer' not connected",
+            ),
+            (
+                "refused",
+                FabricCardOutcome::Refused { status: 404 },
+                FetchFault::Status {
+                    status: 404,
+                    credential_sent: false,
+                },
+                StatusCode::NOT_FOUND,
+                "Upstream error: 404 Not Found",
+            ),
+            (
+                "not a status",
+                FabricCardOutcome::Refused { status: 1 },
+                FetchFault::Status {
+                    status: 502,
+                    credential_sent: false,
+                },
+                StatusCode::BAD_GATEWAY,
+                "Upstream error: 502 Bad Gateway",
+            ),
+            (
+                "too large",
+                FabricCardOutcome::TooLarge,
+                FetchFault::TooLarge,
+                StatusCode::BAD_GATEWAY,
+                "Upstream response too large",
+            ),
+            (
+                "not JSON",
+                FabricCardOutcome::NotJson,
+                FetchFault::InvalidCard,
+                StatusCode::BAD_GATEWAY,
+                "Invalid JSON from upstream",
+            ),
+        ] {
+            assert_eq!(fabric_card_result(outcome).unwrap_err(), (fault, status, message.to_string()), "{case}");
+        }
+    }
+
     #[test]
     fn a_card_fetch_over_fabric_drops_a_caller_header_named_like_the_target_credential_header() {
         let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({

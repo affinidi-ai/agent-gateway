@@ -33,6 +33,9 @@ pub(crate) struct FabricForwardResponse {
     /// per-method `WWW-Authenticate`) is not collapsed to a single value.
     pub headers: HashMap<String, Vec<String>>,
     pub body: Vec<u8>,
+    /// The remote gateway refused the request itself, answering with an error
+    /// envelope rather than relaying its surface's answer.
+    pub refused_by_gateway: bool,
 }
 
 /// Typed failures for the fabric forward transport.
@@ -52,6 +55,9 @@ pub(crate) enum FabricForwardError {
     SendFailed(String),
     #[error("No response from remote gateway '{0}' within timeout")]
     NoResponse(String),
+    /// The request was sent, but this gateway's pickup of the reply failed.
+    #[error("No response from remote gateway '{0}': the reply could not be received")]
+    ReplyNotReceived(String),
     #[error("Unexpected message type from remote gateway: {0}")]
     UnexpectedResponse(String),
     #[error("Modern Fabric streaming is unavailable")]
@@ -60,6 +66,168 @@ pub(crate) enum FabricForwardError {
     RemoteLegacyOnly,
     #[error("A Fabric stream cap is full")]
     CapacityReached,
+}
+
+impl FabricForwardError {
+    /// Whether the failure was this gateway's own: it had no Fabric connection
+    /// or route yet, could not hand the request to the mediator, or could not
+    /// pick up the reply. It says nothing about the remote gateway.
+    pub(crate) fn never_reached_the_remote(&self) -> bool {
+        matches!(
+            self,
+            Self::ListenerManagerUnavailable
+                | Self::GatewayNotConnected(_)
+                | Self::GatewayDidNotFound(_)
+                | Self::SendFailed(_)
+                | Self::ReplyNotReceived(_)
+                | Self::CapacityReached
+        )
+    }
+}
+
+/// The paths a remote gateway answers as a public agent card read, in the
+/// order they are asked for.
+pub(crate) const FABRIC_AGENT_CARD_PATHS: [&str; 2] = ["/.well-known/agent-card.json", "/.well-known/agent.json"];
+
+/// A gateway's own read of an agent card from a remote gateway surface.
+pub(crate) struct FabricCardRequest<'a> {
+    /// `fabric://{gateway_id}/{channel_id}` target.
+    pub fabric_target: &'a str,
+    /// The paths asked for, in order.
+    pub paths: &'a [&'a str],
+    /// Headers sent with each read, keys normalized. The read counts as the
+    /// first Fabric crossing whatever they say.
+    pub headers: HashMap<String, String>,
+    pub timeout: Duration,
+    /// The largest card body accepted.
+    pub max_bytes: usize,
+    pub trace_id: &'a str,
+    pub log_label: &'a str,
+}
+
+/// How a Fabric agent card read ended. Only [`Self::Card`] carries a card; the
+/// others describe the last path asked, except that a `503` at an earlier path
+/// stands, so the read is not cached.
+pub(crate) enum FabricCardOutcome {
+    Card(serde_json::Value),
+    /// The remote answered with this non-success status.
+    Refused {
+        status: u16,
+    },
+    /// The remote answered with a card body over the size bound.
+    TooLarge,
+    /// The remote answered with a body that is not JSON.
+    NotJson,
+    /// The read did not get an answer.
+    Failed(FabricForwardError),
+}
+
+impl FabricCardOutcome {
+    pub(crate) fn into_card(self) -> Option<serde_json::Value> {
+        match self {
+            Self::Card(card) => Some(card),
+            _ => None,
+        }
+    }
+
+    /// Whether the outcome describes the remote for longer than this read, so
+    /// that a cache may keep it. A read that failed on this gateway's side, and a
+    /// `503` the remote answers while it is briefly unavailable, do not.
+    pub(crate) fn describes_the_remote(&self) -> bool {
+        match self {
+            Self::Failed(error) => !error.never_reached_the_remote(),
+            Self::Refused { status } => *status != 503,
+            _ => true,
+        }
+    }
+}
+
+/// Read an agent card from a remote gateway surface over Fabric. Each path is
+/// asked in turn with a `GET`. A `404` or `503` the remote gateway answers
+/// itself (an unknown or inactive surface) and a transport failure end the
+/// read, since the next path would fare the same. Any other answer without a
+/// usable card moves on to the next path: the remote reads each path with
+/// different credentials and checks it against its egress policy.
+pub(crate) async fn read_fabric_card(
+    listener_manager: &Arc<RwLock<Option<Arc<ConnectionPointListenerManager>>>>,
+    request: &FabricCardRequest<'_>,
+) -> FabricCardOutcome {
+    let headers = fabric_card_headers(request);
+    read_fabric_card_with(request, |path| {
+        forward_via_fabric(
+            listener_manager,
+            FabricForwardRequest {
+                fabric_target: request.fabric_target,
+                method: &Method::GET,
+                path,
+                headers: headers.clone(),
+                body: Bytes::new(),
+                timeout: request.timeout,
+                trace_id: request.trace_id,
+                log_label: request.log_label,
+                extra_body: None,
+            },
+        )
+    })
+    .await
+}
+
+/// The headers each card read sends: the request's own, counting the read as
+/// the first Fabric crossing.
+fn fabric_card_headers(request: &FabricCardRequest<'_>) -> HashMap<String, String> {
+    let mut headers = request.headers.clone();
+    crate::proxy::fabric_hops::set_fabric_hops(&mut headers, crate::proxy::fabric_hops::FIRST_FABRIC_HOP);
+    headers
+}
+
+async fn read_fabric_card_with<'r, F, Fut>(
+    request: &'r FabricCardRequest<'_>,
+    send: F,
+) -> FabricCardOutcome
+where
+    F: Fn(&'r str) -> Fut,
+    Fut: std::future::Future<Output = Result<FabricForwardResponse, FabricForwardError>>,
+{
+    let mut outcome = FabricCardOutcome::NotJson;
+    for &path in request.paths {
+        let (answer, last) = match send(path).await {
+            Ok(response) if (200..300).contains(&response.status) => {
+                if response.body.len() > request.max_bytes {
+                    (FabricCardOutcome::TooLarge, false)
+                } else {
+                    match serde_json::from_slice(&response.body) {
+                        Ok(card) => return FabricCardOutcome::Card(card),
+                        Err(_) => (FabricCardOutcome::NotJson, false),
+                    }
+                }
+            }
+            Ok(response) => {
+                let by_gateway = response.refused_by_gateway && matches!(response.status, 404 | 503);
+                debug!(
+                    trace_id = request.trace_id,
+                    label = request.log_label,
+                    path,
+                    status = response.status,
+                    by_gateway,
+                    "Fabric agent card read refused"
+                );
+                (FabricCardOutcome::Refused { status: response.status }, by_gateway)
+            }
+            Err(error) => {
+                debug!(trace_id = request.trace_id, label = request.log_label, path, error = %error, "Fabric agent card read failed");
+                (FabricCardOutcome::Failed(error), true)
+            }
+        };
+        // A path the remote could not answer for the moment keeps the read
+        // uncached, whatever a later path says.
+        if !matches!(outcome, FabricCardOutcome::Refused { status: 503 }) {
+            outcome = answer;
+        }
+        if last {
+            break;
+        }
+    }
+    outcome
 }
 
 /// Seconds a caller refused by a full Fabric stream cap is told to wait.
@@ -97,6 +265,9 @@ pub(crate) struct FabricForwardRequest<'a> {
     pub trace_id: &'a str,
     /// Label for logs (e.g. surface name / transit-point alias).
     pub log_label: &'a str,
+    /// Extra top-level `forward-request` fields (e.g. `payment_context`); they
+    /// never replace the fields set here.
+    pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub(crate) struct FabricStreamForwardRequest<'request> {
@@ -591,12 +762,20 @@ pub(crate) async fn forward_via_fabric(
         now.as_secs() + crate::gateways::connection_points::envelope_replay::sent_envelope_lifetime_secs(timeout_secs);
     let deadline_ms = (now.as_millis() as u64).saturating_add(timeout_secs.saturating_mul(1000));
 
+    let mut message_body = forward_request_body(channel_id, &req, body_value, deadline_ms);
+    if let (Some(fields), Some(extra)) = (message_body.as_object_mut(), req.extra_body) {
+        for (name, value) in extra {
+            fields
+                .entry(name)
+                .or_insert(value);
+        }
+    }
     let forward_request_msg = DIDCommMessage::build(
         uuid::Uuid::new_v4().to_string(),
         MessageType::ForwardRequest
             .as_str()
             .to_string(),
-        forward_request_body(channel_id, &req, body_value, deadline_ms),
+        message_body,
     )
     .from(
         gateway_listener
@@ -658,7 +837,8 @@ pub(crate) async fn forward_via_fabric(
 
         let msg = match forward_result {
             Ok(Some((msg, _metadata))) => msg,
-            Ok(None) | Err(_) => return Err(FabricForwardError::NoResponse(gateway_id.to_string())),
+            Ok(None) => return Err(FabricForwardError::NoResponse(gateway_id.to_string())),
+            Err(_) => return Err(FabricForwardError::ReplyNotReceived(gateway_id.to_string())),
         };
 
         if msg.from.as_deref() == Some(remote_gateway_did.as_str()) {
@@ -678,8 +858,11 @@ pub(crate) async fn forward_via_fabric(
         return Err(FabricForwardError::UnexpectedResponse(response_msg.typ.clone()));
     }
 
-    let response_body = response_msg.body;
+    Ok(decode_forward_response(&response_msg.body))
+}
 
+/// A remote gateway's `ForwardResponse` body as HTTP primitives.
+fn decode_forward_response(response_body: &serde_json::Value) -> FabricForwardResponse {
     let status = response_body
         .get("status")
         .and_then(|v| v.as_u64())
@@ -693,23 +876,261 @@ pub(crate) async fn forward_via_fabric(
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
 
-    // Remote gateway error envelopes carry the message in an `error` field
-    // with an empty `body`. Surface it so the caller does not return a blank
-    // error page.
+    // Remote gateway error envelopes carry the message in an `error` field,
+    // a relayed surface answer never does. An envelope with an empty `body`
+    // surfaces it so the caller does not return a blank error page.
+    let error = response_body.get("error");
     if body.is_empty()
-        && let Some(error) = response_body.get("error")
+        && let Some(error) = error
     {
         body = serde_json::json!({ "error": error })
             .to_string()
             .into_bytes();
     }
 
-    Ok(FabricForwardResponse { status, headers, body })
+    FabricForwardResponse {
+        status,
+        headers,
+        body,
+        refused_by_gateway: error.is_some(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote answer to one card path: a status, a body, and whether the
+    /// remote gateway refused the request itself.
+    type CardAnswer = Result<(u16, &'static str, bool), FabricForwardError>;
+
+    /// A case name, the size bound, the remote's answers, the outcome and the
+    /// paths asked for.
+    type CardCase = (&'static str, usize, Vec<CardAnswer>, &'static str, Vec<&'static str>);
+
+    /// What one Fabric card read returns and asks for, given the remote's
+    /// answer at each well-known path in turn.
+    async fn read_card(
+        max_bytes: usize,
+        answers: Vec<CardAnswer>,
+    ) -> (FabricCardOutcome, Vec<String>) {
+        let request = FabricCardRequest {
+            fabric_target: "fabric://partner-gateway/partner-surface",
+            paths: &FABRIC_AGENT_CARD_PATHS,
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(1),
+            max_bytes,
+            trace_id: "trace",
+            log_label: "card-read-test",
+        };
+        let asked = std::sync::Mutex::new(Vec::new());
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        let outcome = read_fabric_card_with(&request, |path| {
+            asked
+                .lock()
+                .unwrap()
+                .push(path.to_string());
+            let answer = answers
+                .lock()
+                .unwrap()
+                .next()
+                .expect("no more answers");
+            async move {
+                answer.map(|(status, body, refused_by_gateway)| FabricForwardResponse {
+                    status,
+                    headers: HashMap::new(),
+                    body: body.as_bytes().to_vec(),
+                    refused_by_gateway,
+                })
+            }
+        })
+        .await;
+        (outcome, asked.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_fabric_card_read_tries_the_next_path_only_when_it_may_answer() {
+        const CARD: &str = r#"{"name":"partner"}"#;
+        let both = FABRIC_AGENT_CARD_PATHS.to_vec();
+        let first = vec![FABRIC_AGENT_CARD_PATHS[0]];
+        let not_connected = || FabricForwardError::GatewayNotConnected("partner-gateway".to_string());
+        let cases: Vec<CardCase> = vec![
+            ("card at the first path", 1024, vec![Ok((200, CARD, false))], "card", first.clone()),
+            (
+                "surface 404, then the card",
+                1024,
+                vec![Ok((404, "{}", false)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "surface 401, then the card",
+                1024,
+                vec![Ok((401, "{}", false)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "target credential refused by the gateway, then the card",
+                1024,
+                vec![Ok((502, r#"{"error":"Target authentication failed"}"#, true)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "oversized, then the card",
+                20,
+                vec![Ok((200, r#"{"name":"far too large a card"}"#, false)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "not JSON, then the card",
+                1024,
+                vec![Ok((200, "<html>", false)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "surface 503, then 404",
+                1024,
+                vec![Ok((503, "{}", false)), Ok((404, "{}", false))],
+                "refused 503",
+                both.clone(),
+            ),
+            (
+                "surface 503, then a transport failure",
+                1024,
+                vec![Ok((503, "{}", false)), Err(not_connected())],
+                "refused 503",
+                both.clone(),
+            ),
+            (
+                "surface 503, then no such surface",
+                1024,
+                vec![Ok((503, "{}", false)), Ok((404, r#"{"error":"Channel x not found"}"#, true))],
+                "refused 503",
+                both.clone(),
+            ),
+            (
+                "surface 404 at both paths",
+                1024,
+                vec![Ok((404, "{}", false)), Ok((404, "{}", false))],
+                "refused 404",
+                both.clone(),
+            ),
+            (
+                "no such surface",
+                1024,
+                vec![Ok((404, r#"{"error":"Channel x not found"}"#, true))],
+                "refused 404",
+                first.clone(),
+            ),
+            (
+                "refused by the gateway's egress policy, then the card",
+                1024,
+                vec![Ok((403, r#"{"error":"Forbidden"}"#, true)), Ok((200, CARD, false))],
+                "card",
+                both.clone(),
+            ),
+            (
+                "inactive surface",
+                1024,
+                vec![Ok((503, r#"{"error":"Channel x is not active"}"#, true))],
+                "refused 503",
+                first.clone(),
+            ),
+            ("transport failure", 1024, vec![Err(not_connected())], "failed", first),
+        ];
+        for (case, max_bytes, answers, expected, expected_asked) in cases {
+            let (outcome, asked) = read_card(max_bytes, answers).await;
+            let described = match &outcome {
+                FabricCardOutcome::Card(card) => {
+                    assert_eq!(card, &serde_json::json!({"name": "partner"}), "{case}");
+                    "card".to_string()
+                }
+                FabricCardOutcome::Refused { status } => format!("refused {status}"),
+                FabricCardOutcome::TooLarge => "too large".to_string(),
+                FabricCardOutcome::NotJson => "not JSON".to_string(),
+                FabricCardOutcome::Failed(_) => "failed".to_string(),
+            };
+            assert_eq!(described, expected, "{case}");
+            assert_eq!(asked, expected_asked, "{case}");
+        }
+    }
+
+    #[test]
+    fn only_an_envelope_with_an_error_is_the_remote_gateways_own_refusal() {
+        let relayed = decode_forward_response(&serde_json::json!({
+            "status": 404, "headers": {"content-type": "application/json"}, "body": "{\"error\":\"no card\"}"
+        }));
+        assert!(!relayed.refused_by_gateway, "a relayed surface answer");
+        assert_eq!(relayed.body, br#"{"error":"no card"}"#.to_vec());
+
+        let unknown_surface =
+            decode_forward_response(&serde_json::json!({"error": "Channel x not found", "status": 404}));
+        assert!(unknown_surface.refused_by_gateway, "an envelope with no body");
+        assert_eq!(unknown_surface.status, 404);
+        assert_eq!(unknown_surface.body, br#"{"error":"Channel x not found"}"#.to_vec());
+
+        let refused_with_body = decode_forward_response(&serde_json::json!({
+            "status": 403, "body": "{\"error\":\"Forbidden\"}", "error": "unknown peer"
+        }));
+        assert!(refused_with_body.refused_by_gateway, "an envelope with a body and an error");
+        assert_eq!(refused_with_body.body, br#"{"error":"Forbidden"}"#.to_vec());
+    }
+
+    #[test]
+    fn a_card_read_counts_as_the_first_fabric_crossing_whatever_its_headers_say() {
+        let mut headers = HashMap::new();
+        headers.insert("accept".to_string(), "application/json".to_string());
+        headers.insert(crate::proxy::fabric_hops::FABRIC_HOPS_HEADER.to_string(), "7".to_string());
+        let request = FabricCardRequest {
+            fabric_target: "fabric://partner-gateway/partner-surface",
+            paths: &FABRIC_AGENT_CARD_PATHS,
+            headers,
+            timeout: Duration::from_secs(1),
+            max_bytes: 1024,
+            trace_id: "trace",
+            log_label: "card-read-test",
+        };
+
+        let sent = fabric_card_headers(&request);
+
+        let hops: Vec<_> = sent
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(crate::proxy::fabric_hops::FABRIC_HOPS_HEADER))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(hops, vec!["1"]);
+        assert_eq!(
+            sent.get("accept")
+                .map(String::as_str),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn only_a_card_read_that_reached_the_remote_gateway_describes_it() {
+        let failed = |error| FabricCardOutcome::Failed(error);
+        for (case, outcome, expected) in [
+            ("card", FabricCardOutcome::Card(serde_json::json!({})), true),
+            ("refused", FabricCardOutcome::Refused { status: 404 }, true),
+            ("briefly unavailable", FabricCardOutcome::Refused { status: 503 }, false),
+            ("too large", FabricCardOutcome::TooLarge, true),
+            ("not JSON", FabricCardOutcome::NotJson, true),
+            ("no answer in time", failed(FabricForwardError::NoResponse("peer".into())), true),
+            ("unexpected answer", failed(FabricForwardError::UnexpectedResponse("x".into())), true),
+            ("not started", failed(FabricForwardError::ListenerManagerUnavailable), false),
+            ("not connected", failed(FabricForwardError::GatewayNotConnected("peer".into())), false),
+            ("peer DID unknown", failed(FabricForwardError::GatewayDidNotFound("peer".into())), false),
+            ("not handed to the mediator", failed(FabricForwardError::SendFailed("peer".into())), false),
+            ("reply not picked up", failed(FabricForwardError::ReplyNotReceived("peer".into())), false),
+            ("stream cap full", failed(FabricForwardError::CapacityReached), false),
+        ] {
+            assert_eq!(outcome.describes_the_remote(), expected, "{case}");
+        }
+    }
 
     #[test]
     fn a_forward_request_names_the_peer_surface_and_only_the_alias_its_target_pins() {
@@ -723,6 +1144,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             trace_id: "trace",
             log_label: "Orders",
+            extra_body: None,
         };
         for (channel, surface, alias) in [("orders", "orders", None), ("orders$v", "orders", Some("v"))] {
             let body = forward_request_body(channel, &request, serde_json::Value::Null, 0);
@@ -1126,6 +1548,7 @@ mod tests {
                 abort_handle: sender_task,
                 metrics: Default::default(),
                 client: sender_client,
+                inbound_acl: crate::mediators::utils::InboundAcl::Open,
             })
             .await;
         let manager = Arc::new(manager);

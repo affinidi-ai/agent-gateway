@@ -68,9 +68,9 @@
       "prefix": "/customer-support"
     },
     {
-      "id": "payments",
-      "name": "payments",
-      "prefix": "/payments"
+      "id": "billing",
+      "name": "billing",
+      "prefix": "/billing"
     },
     {
       "id": "order-status",

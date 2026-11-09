@@ -8,7 +8,7 @@ SHELL := /bin/bash
 # Run `make help` for a list of available commands.
 #
 # Prerequisites:
-# - Rust 1.95.0+ with cargo
+# - Rust 1.99.1+ with cargo
 # - Node.js and npm (for frontend)
 # - Docker (for containerized deployment)
 # - jq (for some storage operations)

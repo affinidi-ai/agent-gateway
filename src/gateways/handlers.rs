@@ -9,14 +9,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::mediators::handlers::mediator_allowed;
 use crate::mediators::utils::fetch_mediator_did_from_url;
-use crate::mediators::utils::{set_acl_to_allow_everything_and_more, set_acl_to_allow_everything_and_more_retrying};
+use crate::mediators::utils::{apply_inbound_acl, set_acl_to_allow_everything_and_more_retrying};
 use crate::messages::MessageType;
 
 use super::GatewayStore;
 use super::connection_points::ConnectionPointStore;
 use super::connection_points::ws_listener::{ConnectionPointListenerManager, ListenerInfo};
+use super::role_scope::{GatewayRoleScope, scoped_role};
 use super::surface_cache::GatewaySurfaceCache;
-use super::types::{ExposureMode, Gateway, GatewayStatus, GatewayType};
+use super::types::{ExposureMode, Gateway, GatewayRole, GatewayStatus, GatewayType};
 use crate::auth::storage::PasskeyStorage;
 use crate::auth::types::UserRole;
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
@@ -119,11 +120,30 @@ fn authorize_gateway_delete(
         return Err((StatusCode::FORBIDDEN, "Cannot delete self gateway".to_string()));
     }
 
-    if !rbac_config.has_permission(caller_role, &Feature::GatewaysDelete) {
+    let feature = match gateway.role {
+        GatewayRole::Peer => Feature::GatewaysDelete,
+        GatewayRole::Payment => Feature::PaymentGatewaysDelete,
+    };
+    if !rbac_config.has_permission(caller_role, &feature) {
         return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
     }
 
     Ok(())
+}
+
+/// `409` while surfaces take payments through `gateway` or it holds unsettled payments, and `503`
+/// for a payment gateway while the payments ledger is not available.
+async fn refuse_removal_in_use(
+    surface_store: Option<&Arc<crate::surfaces::FileSystemAgentSurfaceStore>>,
+    gateway: &Gateway,
+) -> Result<(), (StatusCode, String)> {
+    match super::usage::gateway_usage(surface_store, &gateway.id)
+        .await?
+        .removal_refusal(gateway)
+    {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
 }
 
 /// Derive the effective status of a remote gateway from its connection points'
@@ -191,6 +211,22 @@ fn representative_runtime_status(
     fallback
 }
 
+/// The latest time any of a gateway's connection points heard from the peer,
+/// from the listeners' `peer_last_seen` keyed by connection point id.
+fn latest_peer_seen(
+    connection_points: &[crate::gateways::connection_points::types::GatewayConnectionPoint],
+    peer_last_seen: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    connection_points
+        .iter()
+        .filter_map(|cp| {
+            peer_last_seen
+                .get(&cp.id)
+                .copied()
+        })
+        .max()
+}
+
 /// A gateway plus its derived connection health for the list view.
 ///
 /// `runtime_status` is derived from the gateway's connection points (including
@@ -201,6 +237,10 @@ pub struct GatewayListItem {
     pub gateway: Gateway,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<crate::comm::connection_health::ConnectionRuntimeStatus>,
+    /// When a running listener of this gateway last heard from the peer
+    /// gateway. Not persisted: `None` until it has since this process started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// List all gateways
@@ -208,14 +248,16 @@ pub async fn list_gateways<S: GatewayStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
     Extension(listener_manager): Extension<Option<Arc<crate::gateways::ConnectionPointListenerManager>>>,
     Extension(cp_store): Extension<Option<Arc<crate::gateways::FileSystemConnectionPointStore>>>,
+    role_scope: Option<Extension<GatewayRoleScope>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<Vec<GatewayListItem>>, (StatusCode, String)> {
+    let role = scoped_role(&role_scope);
     let mut gateways = store
         .list_all()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list gateways: {}", e)))?;
-    gateways.retain(|gateway| gateway_allowed(gateway, &context, &scope));
+    gateways.retain(|gateway| gateway.role == role && gateway_allowed(gateway, &context, &scope));
 
     // Group connection points by gateway once (avoids a per-gateway scan).
     let cps_by_gateway: std::collections::HashMap<String, Vec<_>> = match cp_store.as_ref() {
@@ -246,12 +288,20 @@ pub async fn list_gateways<S: GatewayStore>(
         ),
         None => None,
     };
+    let peer_last_seen = match listener_manager.as_ref() {
+        Some(manager) => manager.peer_last_seen().await,
+        None => std::collections::HashMap::new(),
+    };
 
     let items = gateways
         .into_iter()
         .map(|mut gateway| {
             if gateway.gateway_type == GatewayType::SelfGateway {
-                return GatewayListItem { gateway, runtime_status: None };
+                return GatewayListItem {
+                    gateway,
+                    runtime_status: None,
+                    peer_last_seen_at: None,
+                };
             }
 
             let cps = cps_by_gateway
@@ -267,7 +317,11 @@ pub async fn list_gateways<S: GatewayStore>(
                 gateway.status = effective_remote_gateway_status(gateway.status.clone(), has_listener, cps);
             }
 
-            GatewayListItem { gateway, runtime_status }
+            GatewayListItem {
+                gateway,
+                runtime_status,
+                peer_last_seen_at: latest_peer_seen(cps, &peer_last_seen),
+            }
         })
         .collect();
 
@@ -316,7 +370,11 @@ pub async fn get_gateway<S: GatewayStore>(
         }
     }
 
-    Ok(Json(GatewayListItem { gateway, runtime_status }))
+    Ok(Json(GatewayListItem {
+        gateway,
+        runtime_status,
+        peer_last_seen_at: None,
+    }))
 }
 
 /// Create a new gateway
@@ -351,6 +409,7 @@ pub async fn create_gateway<S: GatewayStore>(
 /// Update a gateway
 pub async fn update_gateway<S: GatewayStore>(
     Extension(store): Extension<std::sync::Arc<S>>,
+    Extension(surface_store): Extension<Option<Arc<crate::surfaces::FileSystemAgentSurfaceStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -379,6 +438,9 @@ pub async fn update_gateway<S: GatewayStore>(
     }
     // DID cannot be changed after creation - ignore req.did
     if let Some(status) = req.status {
+        if status == GatewayStatus::Disabled && gateway.status != GatewayStatus::Disabled {
+            refuse_removal_in_use(surface_store.as_ref(), &gateway).await?;
+        }
         gateway.status = status;
     }
 
@@ -651,6 +713,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
     Extension(caller_user_id): Extension<String>,
     Extension(user_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    Extension(surface_store): Extension<Option<Arc<crate::surfaces::FileSystemAgentSurfaceStore>>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -674,6 +737,7 @@ pub async fn delete_gateway<S: GatewayStore, P: ConnectionPointStore>(
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Caller not found".to_string()))?;
 
     authorize_gateway_delete(&caller.role, &gateway, &rbac_config)?;
+    refuse_removal_in_use(surface_store.as_ref(), &gateway).await?;
 
     // Clone gateway for trigger before deletion
     let gateway_for_trigger = gateway.clone();
@@ -739,6 +803,41 @@ mod tests {
     use crate::auth::types::{UserRole, UserStatus};
     use crate::gateways::types::GatewayCreationType;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_gateway_reports_the_latest_peer_contact_of_its_connection_points() {
+        use crate::gateways::connection_points::types::{ConnectionPointType, GatewayConnectionPoint};
+
+        let cp = |id: &str| {
+            let mut c = GatewayConnectionPoint::new(
+                "gw".to_string(),
+                "med".to_string(),
+                format!("did:example:{id}"),
+                id.to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                serde_json::json!({}),
+                None,
+                ConnectionPointType::OobResponder,
+                String::new(),
+            );
+            c.id = id.to_string();
+            c
+        };
+        let earlier = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let later = chrono::Utc::now();
+        let seen = std::collections::HashMap::from([
+            ("cp-a".to_string(), earlier),
+            ("cp-b".to_string(), later),
+            ("cp-other".to_string(), later + chrono::Duration::minutes(1)),
+        ]);
+
+        assert_eq!(latest_peer_seen(&[cp("cp-a"), cp("cp-b"), cp("cp-c")], &seen), Some(later));
+        assert_eq!(latest_peer_seen(&[cp("cp-a")], &seen), Some(earlier));
+        assert_eq!(latest_peer_seen(&[cp("cp-c")], &seen), None);
+        assert_eq!(latest_peer_seen(&[], &seen), None);
+    }
 
     #[test]
     fn effective_remote_gateway_status_derivation() {
@@ -825,6 +924,237 @@ mod tests {
         assert_eq!(info.is_payment_surface, Some(true));
     }
 
+    fn surface_info(value: serde_json::Value) -> SurfaceInfo {
+        let mut base = serde_json::json!({
+            "config_id": "cfg", "name": "S", "description": "", "listen_address": "0.0.0.0:8080", "protocol": "mcp"
+        });
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), value.as_object()) {
+            base.extend(extra.clone());
+        }
+        serde_json::from_value(base).expect("surface info")
+    }
+
+    #[test]
+    fn a_published_manifest_marks_a_payment_target() {
+        let info = surface_info(serde_json::json!({
+            "payment_manifest": {"amount": {"amount": "0.01", "unit": "USDC"}, "payment_points": [{"id": "x402:base"}]}
+        }));
+        assert_eq!(
+            info.payment_manifest
+                .as_ref()
+                .map(|m| m.amount.amount.as_str()),
+            Some("0.01")
+        );
+        assert!(is_payment_target(&info));
+    }
+
+    #[test]
+    fn payment_targets_follow_the_flag_the_manifest_or_the_tag() {
+        assert!(is_payment_target(&surface_info(serde_json::json!({"is_payment_surface": true}))));
+        assert!(is_payment_target(&surface_info(serde_json::json!({"tags": ["payment"]}))));
+        assert!(!is_payment_target(&surface_info(serde_json::json!({}))));
+        assert!(!is_payment_target(&surface_info(
+            serde_json::json!({"is_payment_surface": false, "payment_manifest": null})
+        )));
+    }
+
+    #[tokio::test]
+    async fn payment_providers_are_the_active_payment_gateways_with_a_payment_surface() {
+        fn peer(
+            name: &str,
+            creation_type: GatewayCreationType,
+            status: GatewayStatus,
+        ) -> Gateway {
+            let mut gw = Gateway::new_with_creation_type(
+                name.to_string(),
+                String::new(),
+                format!("did:web:{name}.example"),
+                GatewayType::Remote,
+                creation_type,
+            );
+            gw.status = status;
+            gw.role = GatewayRole::Payment;
+            gw
+        }
+        let user_peer = peer("user-peer", GatewayCreationType::User, GatewayStatus::Active);
+        let accepted_peer = peer("accepted-peer", GatewayCreationType::System, GatewayStatus::Active);
+        let pending_peer = peer("pending-peer", GatewayCreationType::User, GatewayStatus::Pending);
+        let disabled_peer = peer("disabled-peer", GatewayCreationType::User, GatewayStatus::Disabled);
+        let free_peer = peer("free-peer", GatewayCreationType::User, GatewayStatus::Active);
+        let mut routing_peer = peer("routing-peer", GatewayCreationType::User, GatewayStatus::Active);
+        routing_peer.role = GatewayRole::Peer;
+
+        let (store, _dir) = gateway_store_with(&user_peer).await;
+        let cache = Arc::new(GatewaySurfaceCache::new());
+        let paid = surface_info(serde_json::json!({"is_payment_surface": true}));
+        for gw in [&accepted_peer, &pending_peer, &disabled_peer, &free_peer, &routing_peer] {
+            store
+                .create(gw)
+                .await
+                .expect("create gateway");
+        }
+        for gw in [&user_peer, &accepted_peer, &pending_peer, &disabled_peer, &routing_peer] {
+            cache
+                .set(gw.id.clone(), vec![paid.clone()])
+                .await;
+        }
+        cache
+            .set(free_peer.id.clone(), vec![surface_info(serde_json::json!({}))])
+            .await;
+
+        let Json(providers) = list_payment_gateways(
+            Extension(store),
+            Extension(None),
+            Extension(cache),
+            Query(GetGatewaySurfacesQuery { force_refresh: false }),
+            None,
+            None,
+        )
+        .await
+        .expect("payment providers");
+
+        let mut names: Vec<&str> = providers
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["accepted-peer", "user-peer"]);
+        assert!(
+            providers
+                .iter()
+                .all(|p| p.payment_surfaces.len() == 1 && p.payment_surfaces[0].config_id == "cfg")
+        );
+    }
+
+    #[test]
+    fn a_payment_logo_is_served_as_an_inert_image_and_a_missing_one_is_not_found() {
+        let response = payment_logo_response(Some(b"<svg/>".to_vec()));
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers["content-type"], "image/svg+xml");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers["content-security-policy"], "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+
+        assert_eq!(payment_logo_response(None).status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_payment_logo_name_is_not_found() {
+        let response = get_payment_logo(Path("../../etc/passwd".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn manifest_route(
+        store: &Arc<crate::gateways::FileSystemGatewayStore>,
+        gateway_id: &str,
+        surface_id: &str,
+        context: Option<Extension<PatTenantContext>>,
+    ) -> Result<Json<PaymentManifestResponse>, (StatusCode, Json<serde_json::Value>)> {
+        get_payment_manifest(
+            Extension(store.clone()),
+            Extension(None),
+            Path((gateway_id.to_string(), surface_id.to_string())),
+            Query(GetGatewaySurfacesQuery { force_refresh: true }),
+            context,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_refuses_a_malformed_surface_id() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, &gateway.id, "a b", None)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::json!({"error": "invalid_payment_surface_id"}));
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_hides_unknown_and_out_of_scope_gateways() {
+        let mut gateway = remote_gateway();
+        gateway.tenant_id = Some("tenant-a".into());
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, "missing", "pay-1", None)
+            .await
+            .unwrap_err();
+        assert_eq!((status, body), (StatusCode::NOT_FOUND, serde_json::json!({"error": "gateway_not_found"})));
+
+        let other_tenant = Some(Extension(PatTenantContext {
+            token_id: "agat_test".into(),
+            tenant_id: "tenant-b".into(),
+        }));
+        let (status, _) = manifest_route(&store, &gateway.id, "pay-1", other_tenant)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn payable_manifest() -> super::super::payment_manifest::PaymentManifest {
+        serde_json::from_value(serde_json::json!({
+            "amount": {"amount": "0.01", "unit": "USDC"},
+            "payment_points": [{"id": "x402:base", "protocol": "x402"}]
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_forced_refresh_inside_the_interval_serves_the_cached_manifest_and_says_so() {
+        use super::super::payment_manifest::{ManifestFetchError, cache_manifest, install_test_answer};
+
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let manifest = payable_manifest();
+        install_test_answer(&gateway.id, "pay-1", Ok(Some(manifest.clone())));
+        let Json(first) = manifest_route(&store, &gateway.id, "pay-1", None)
+            .await
+            .unwrap();
+        assert!(!first.refresh_throttled, "the first forced refresh asks the payment gateway");
+        assert_eq!(first.manifest, manifest);
+
+        install_test_answer(&gateway.id, "pay-1", Err(ManifestFetchError::Unavailable("down".into())));
+        cache_manifest(&gateway.id, "pay-1", manifest.clone());
+        let Json(second) = manifest_route(&store, &gateway.id, "pay-1", None)
+            .await
+            .unwrap();
+        assert!(second.refresh_throttled, "a second one inside the interval is served from the cache");
+        assert_eq!(second.manifest, manifest);
+        assert_eq!(serde_json::to_value(&second).unwrap()["refresh_throttled"], true);
+        assert!(
+            serde_json::to_value(&first)
+                .unwrap()
+                .get("refresh_throttled")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manifest_requests_past_the_concurrency_cap_are_answered_busy() {
+        let fetches = tokio::sync::Semaphore::new(2);
+        let first = manifest_fetch_permit(&fetches).unwrap();
+        let _second = manifest_fetch_permit(&fetches).unwrap();
+        let (status, Json(body)) = manifest_fetch_permit(&fetches).unwrap_err();
+        assert_eq!(
+            (status, body),
+            (StatusCode::TOO_MANY_REQUESTS, serde_json::json!({"error": "payment_manifest_busy"}))
+        );
+        drop(first);
+        assert!(manifest_fetch_permit(&fetches).is_ok(), "a finished request frees its place");
+    }
+
+    #[tokio::test]
+    async fn the_manifest_route_reports_an_unreachable_payment_gateway() {
+        let gateway = remote_gateway();
+        let (store, _dir) = gateway_store_with(&gateway).await;
+        let (status, Json(body)) = manifest_route(&store, &gateway.id, "pay-1$pro", None)
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, serde_json::json!({"error": "payment_gateway_unavailable"}));
+    }
+
     fn make_user_data(
         user_id: &str,
         role: UserRole,
@@ -907,6 +1237,263 @@ mod tests {
         let err = authorize_gateway_delete(&UserRole::Administrator, &gateway, &rbac_config)
             .expect_err("self gateway must never be deletable");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn a_payment_gateway_is_deleted_under_the_payment_gateway_feature() {
+        let mut payment = remote_gateway();
+        payment.role = GatewayRole::Payment;
+        let mut rbac_config = RbacConfig::default();
+        rbac_config
+            .permissions
+            .insert("payment_gateways.delete".to_string(), "poweruser".to_string());
+
+        assert!(authorize_gateway_delete(&UserRole::PowerUser, &payment, &rbac_config).is_ok());
+        let err = authorize_gateway_delete(&UserRole::PowerUser, &remote_gateway(), &rbac_config)
+            .expect_err("gateways.delete still guards a peer");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let err = authorize_gateway_delete(&UserRole::User, &payment, &rbac_config)
+            .expect_err("a user may not delete a payment gateway");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    async fn surface_store_with(
+        surfaces: &[serde_json::Value]
+    ) -> (Arc<crate::surfaces::FileSystemAgentSurfaceStore>, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().to_path_buf())
+                .await
+                .expect("surface store"),
+        );
+        for surface in surfaces {
+            store
+                .save(&serde_json::from_value(surface.clone()).expect("surface"))
+                .await
+                .expect("save surface");
+        }
+        (store, dir)
+    }
+
+    fn paying_surface(payment_gateway_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "surface_id": "paid",
+            "name": "paid",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/paid", "protocol": "mcp"},
+            "target": {
+                "endpoint": "https://upstream.example/mcp",
+                "payment_policy": {
+                    "type": "agent_pay",
+                    "payment_gateway_id": payment_gateway_id,
+                    "payment_surface_id": "pay-1",
+                },
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_gateway_that_takes_payments_cannot_be_disabled_but_can_be_renamed() {
+        let mut payment = remote_gateway();
+        payment.role = GatewayRole::Payment;
+        let (store, _dir) = gateway_store_with(&payment).await;
+        let (surfaces, _surfaces_dir) = surface_store_with(&[paying_surface(&payment.id)]).await;
+        let call = |json: serde_json::Value| {
+            update_gateway(
+                Extension(store.clone()),
+                Extension(Some(surfaces.clone())),
+                Path(payment.id.clone()),
+                None,
+                None,
+                Json(update_request(json)),
+            )
+        };
+
+        let err = call(serde_json::json!({ "status": "disabled" }))
+            .await
+            .expect_err("in use");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(err.1.contains("1 surface(s)"));
+        assert_eq!(
+            store
+                .get(&payment.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayStatus::Active
+        );
+
+        let Json(renamed) = call(serde_json::json!({ "name": "Payments" }))
+            .await
+            .expect("renaming is not removal");
+        assert_eq!(renamed.name, "Payments");
+    }
+
+    #[tokio::test]
+    async fn an_unused_gateway_can_be_disabled() {
+        let (store, _dir) = gateway_store_with(&remote_gateway()).await;
+        let id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::Remote)
+            .unwrap()
+            .id;
+        let (surfaces, _surfaces_dir) = surface_store_with(&[paying_surface("another-gateway")]).await;
+        let Json(disabled) = update_gateway(
+            Extension(store),
+            Extension(Some(surfaces)),
+            Path(id),
+            None,
+            None,
+            Json(update_request(serde_json::json!({ "status": "disabled" }))),
+        )
+        .await
+        .expect("unused");
+        assert_eq!(disabled.status, GatewayStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn a_route_family_lists_only_gateways_of_its_role() {
+        let mut payment = remote_gateway();
+        payment.role = GatewayRole::Payment;
+        let (store, _dir) = gateway_store_with(&payment).await;
+        let names = |role: Option<GatewayRole>| {
+            let store = store.clone();
+            async move {
+                let Json(items) = list_gateways(
+                    Extension(store),
+                    Extension(None),
+                    Extension(None),
+                    role.map(|role| Extension(GatewayRoleScope(role))),
+                    None,
+                    None,
+                )
+                .await
+                .expect("list");
+                items
+                    .into_iter()
+                    .map(|item| item.gateway.role)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(names(Some(GatewayRole::Payment)).await, vec![GatewayRole::Payment]);
+        let peers = names(None).await;
+        assert!(!peers.is_empty());
+        assert!(
+            peers
+                .iter()
+                .all(|role| *role == GatewayRole::Peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_becomes_a_payment_gateway_that_reaches_no_local_surface() {
+        let mut peer = remote_gateway();
+        peer.exposure_mode = Some(ExposureMode::All);
+        peer.exposed_channels = vec!["s1".to_string()];
+        let (store, _dir) = gateway_store_with(&peer).await;
+        let (surfaces, _surfaces_dir) = surface_store_with(&[paying_surface("elsewhere")]).await;
+
+        let Json(converted) =
+            set_payment_role(Extension(store.clone()), Extension(Some(surfaces)), Path(peer.id.clone()), None, None)
+                .await
+                .expect("converted");
+        assert_eq!(converted.role, GatewayRole::Payment);
+        assert_eq!(converted.exposure_mode, Some(ExposureMode::None));
+        assert!(
+            converted
+                .exposed_channels
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .get(&peer.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            GatewayRole::Payment
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_a_surface_routes_to_stays_a_peer() {
+        let peer = remote_gateway();
+        let (store, _dir) = gateway_store_with(&peer).await;
+        let routed = serde_json::json!({
+            "surface_id": "routed",
+            "name": "routed",
+            "access_point": {"listen_address": "0.0.0.0:8443", "route": "/r", "protocol": "mcp"},
+            "target": {"endpoint": format!("fabric://{}/agent", peer.id)},
+        });
+        let (surfaces, _surfaces_dir) = surface_store_with(&[routed]).await;
+
+        let err =
+            set_payment_role(Extension(store.clone()), Extension(Some(surfaces)), Path(peer.id.clone()), None, None)
+                .await
+                .expect_err("routed to");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            err.1
+                .starts_with("1 surface(s) route to this gateway")
+        );
+        assert_eq!(
+            store
+                .get(&peer.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .role,
+            GatewayRole::Peer
+        );
+    }
+
+    #[tokio::test]
+    async fn the_self_gateway_never_becomes_a_payment_gateway() {
+        let (store, _dir) = gateway_store_with(&remote_gateway()).await;
+        let self_id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::SelfGateway)
+            .unwrap()
+            .id;
+        let (surfaces, _surfaces_dir) = surface_store_with(&[]).await;
+        let err = set_payment_role(Extension(store), Extension(Some(surfaces)), Path(self_id), None, None)
+            .await
+            .expect_err("self");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gateway_info_is_only_asked_of_a_payment_gateway() {
+        let (store, _dir) = gateway_store_with(&remote_gateway()).await;
+        let peer_id = store
+            .list_all()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|g| g.gateway_type == GatewayType::Remote)
+            .unwrap()
+            .id;
+        let err = get_gateway_info(Extension(store), Extension(None), Path(peer_id), None, None)
+            .await
+            .expect_err("peer");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn gateway_info_from_an_unreachable_payment_gateway_is_unavailable() {
+        let mut payment = remote_gateway();
+        payment.role = GatewayRole::Payment;
+        let (store, _dir) = gateway_store_with(&payment).await;
+        let err = get_gateway_info(Extension(store), Extension(None), Path(payment.id.clone()), None, None)
+            .await
+            .expect_err("no listener");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1110,7 +1697,7 @@ mod tests {
         id: &str,
         req: UpdateGatewayRequest,
     ) -> Result<Gateway, (StatusCode, String)> {
-        update_gateway(Extension(Arc::clone(store)), Path(id.to_string()), None, None, Json(req))
+        update_gateway(Extension(Arc::clone(store)), Extension(None), Path(id.to_string()), None, None, Json(req))
             .await
             .map(|Json(gateway)| gateway)
     }
@@ -2109,10 +2696,12 @@ pub async fn connect_via_oob<
         Option<std::sync::Arc<dyn crate::identity::didwebvh::DidWebVhIdentityStore>>,
     >,
     pat: Option<Extension<PatContext>>,
+    role_scope: Option<Extension<GatewayRoleScope>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
     Json(mut req): Json<ConnectViaOOBRequest>,
 ) -> Result<Json<ConnectViaOOBResponse>, (StatusCode, String)> {
+    let role = scoped_role(&role_scope);
     req.tenant_id = tenant_for_create(req.tenant_id.take(), pat.is_some(), tenant_context(&context))
         .map_err(|message| (StatusCode::FORBIDDEN, message.to_string()))?;
     let pending_gateway_id = uuid::Uuid::new_v4().to_string();
@@ -2150,8 +2739,8 @@ pub async fn connect_via_oob<
     info!("  otherwise it falls back to the inviter's mediator (shared mediator mode)");
     info!("");
 
-    // Enforce the appliance gateway limit before starting the OOB handshake.
-    crate::config::enforce_add("connections.gateways")
+    // Enforce the appliance limit of this kind of gateway before starting the OOB handshake.
+    crate::config::enforce_add(role.limit_dimension())
         .await
         .map_err(|e| (StatusCode::FORBIDDEN, e.message()))?;
 
@@ -2203,6 +2792,12 @@ pub async fn connect_via_oob<
     {
         if !gateway_allowed(&existing_gateway, &context, &scope) {
             return Err((StatusCode::NOT_FOUND, "Gateway not found".to_string()));
+        }
+        if existing_gateway.role != role {
+            return Err((
+                StatusCode::CONFLICT,
+                "This connection point is already connected as a gateway of another kind".to_string(),
+            ));
         }
         info!("⚠️  Gateway already exists for DID {}", inviter_temporary_did);
         info!("  Gateway ID: {}", existing_gateway.id);
@@ -2645,6 +3240,7 @@ pub async fn connect_via_oob<
         pending_gateway.id = pending_gateway_id.clone();
         pending_gateway.tenant_id = req.tenant_id;
         pending_gateway.status = GatewayStatus::Pending;
+        pending_gateway.role = role;
 
         store
             .create(&pending_gateway)
@@ -3010,7 +3606,7 @@ async fn recover_ping_after_timeout(
     // after a mediator store flush) so the pong was silently dropped.
     let account_probe = probe_own_account(&gateway_listener.client).await;
 
-    match account_repair(&account_probe) {
+    match account_repair(&account_probe, &gateway_listener.inbound_acl) {
         AccountRepair::Nothing => {
             match &account_probe {
                 Ok(Ok(_)) => {
@@ -3035,14 +3631,15 @@ async fn recover_ping_after_timeout(
         AccountRepair::ReopenReceiveList => {}
     }
 
-    warn!("[{request_id}] Own mediator receive-list is closed; re-opening ACL and retrying ping once.");
-    if let Err(e) = set_acl_to_allow_everything_and_more(
+    warn!("[{request_id}] Own mediator receive-list is not as intended; re-applying the ACL and retrying ping once.");
+    if let Err(e) = apply_inbound_acl(
         gateway_listener.client.atm(),
         Arc::clone(
             gateway_listener
                 .client
                 .profile(),
         ),
+        &gateway_listener.inbound_acl,
     )
     .await
     {
@@ -3270,6 +3867,11 @@ pub async fn ping_gateway<S: GatewayStore>(
             let is_pong = pong.typ == MessageType::GatewayPong.as_str();
 
             if is_pong {
+                gateway_listener
+                    .metrics
+                    .write()
+                    .await
+                    .peer_last_seen = Some(chrono::Utc::now());
                 Ok(Json(GatewayPingResponse {
                     success: true,
                     message: "Gateway ping successful".to_string(),
@@ -3333,6 +3935,10 @@ pub struct SurfaceInfo {
     /// hiding a legacy peer's surfaces behind the payment filter.
     #[serde(default)]
     pub is_payment_surface: Option<bool>,
+    /// The surface's Payment Manifest, when the peer is an agent-pay gateway
+    /// that publishes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_manifest: Option<super::payment_manifest::PaymentManifest>,
 }
 
 /// Outcome of a failed surface discovery. `status` / `message` reproduce the
@@ -3402,93 +4008,21 @@ async fn discover_gateway_surfaces<S: GatewayStore>(
         .map_err(|e| DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {e}")))?
         .ok_or_else(|| DiscoveryFailure::hard(StatusCode::NOT_FOUND, "Gateway not found"))?;
 
-    let listener_mgr = listener_manager
-        .as_ref()
-        .ok_or_else(|| DiscoveryFailure::hard(StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available"))?;
-
-    let gateway_listener = listener_mgr
-        .get_listener(gateway_id)
-        .await
-        .ok_or_else(|| {
-            debug!("[{request_id}] No active listener found for gateway {gateway_id}");
-            DiscoveryFailure::hard(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Gateway not connected - no active WebSocket listener",
-            )
-        })?;
-
-    debug!("[{request_id}] Found active WebSocket listener for gateway");
-
-    // Instant recovery: ensure our mediator connection is live before querying,
-    // so a flushed account is re-registered on the first attempt rather than
-    // timing out with "gateway did not respond".
-    let gateway_listener = ensure_live_listener(listener_mgr, gateway_listener)
-        .await
-        .map_err(|(status, message)| DiscoveryFailure::hard(status, message))?;
-
-    // Build get-channels message
-    use crate::messages::MessageType;
-    use affinidi_messaging_didcomm::Message as DIDCommMessage;
-    use serde_json::json;
-
-    let get_channels_message = DIDCommMessage::build(
-        uuid::Uuid::new_v4().to_string(),
-        MessageType::GetSurfaces
-            .as_str()
-            .to_string(),
-        json!({
+    let response = query_gateway(
+        listener_manager.as_deref(),
+        &gateway,
+        &request_id,
+        MessageType::GetSurfaces,
+        serde_json::json!({
             "request_id": request_id,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }),
+        SURFACES_RESPONSE_TIMEOUT,
     )
-    .from(
-        gateway_listener
-            .gateway_did
-            .clone(),
-    )
-    .to(gateway.did.clone())
-    .thid(uuid::Uuid::new_v4().to_string())
-    .finalize();
-
-    // Pre-resolve and cache the gateway DID (best-effort).
-    let did_cache = listener_mgr.get_did_cache();
-    let tdk_state = gateway_listener
-        .client
-        .atm()
-        .get_tdk();
-    if let Err(e) = did_cache
-        .resolve_and_cache_for_atm(&gateway.did, tdk_state)
-        .await
-    {
-        warn!("[{request_id}] Failed to pre-resolve gateway DID: {e}. Continuing anyway.");
-    }
-
-    gateway_listener
-        .client
-        .pack_and_send_message(&get_channels_message, &gateway.did, &gateway_listener.gateway_did)
-        .await
-        .map_err(|e| {
-            error!(gateway_id = %gateway.id, error = %e, "Failed to send get-channels");
-            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, "Failed to send get-channels".to_string())
-        })?;
-
-    // Wait for get-channels-response via WebSocket (5s timeout).
-    let response = gateway_listener
-        .client
-        .atm()
-        .message_pickup()
-        .live_stream_get(
-            gateway_listener
-                .client
-                .profile(),
-            &get_channels_message.id,
-            SURFACES_RESPONSE_TIMEOUT,
-            true, // auto_delete
-        )
-        .await;
+    .await;
 
     match response {
-        Ok(Some((response_msg, _metadata))) => {
+        Ok(Some(response_msg)) => {
             if response_msg.typ == MessageType::GetSurfacesResponse.as_str() {
                 let channels: Vec<SurfaceInfo> = response_msg
                     .body
@@ -3516,13 +4050,310 @@ async fn discover_gateway_surfaces<S: GatewayStore>(
                 .await;
             Err(DiscoveryFailure::soft(StatusCode::GATEWAY_TIMEOUT, "Request timed out - gateway did not respond"))
         }
-        Err(e) => {
-            cache
-                .set_error(gateway_id.to_string(), format!("Request failed: {e:?}"))
-                .await;
-            Err(DiscoveryFailure::soft(StatusCode::BAD_GATEWAY, format!("Request failed: {e:?}")))
+        Err(failure) => {
+            if failure.soft {
+                cache
+                    .set_error(gateway_id.to_string(), failure.message.clone())
+                    .await;
+            }
+            Err(failure)
         }
     }
+}
+
+/// Send one gateway-query message to a connected Remote gateway and wait up to
+/// `wait` for the reply. `Ok(None)` means the peer did not answer in time; a
+/// failure to receive is a soft failure.
+async fn query_gateway(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    request_id: &str,
+    message_type: MessageType,
+    body: serde_json::Value,
+    wait: std::time::Duration,
+) -> Result<Option<affinidi_messaging_didcomm::Message>, DiscoveryFailure> {
+    use affinidi_messaging_didcomm::Message as DIDCommMessage;
+
+    let listener_mgr = listener_manager
+        .ok_or_else(|| DiscoveryFailure::hard(StatusCode::SERVICE_UNAVAILABLE, "Listener manager not available"))?;
+
+    let gateway_listener = listener_mgr
+        .get_listener(&gateway.id)
+        .await
+        .ok_or_else(|| {
+            debug!("[{request_id}] No active listener found for gateway {}", gateway.id);
+            DiscoveryFailure::hard(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Gateway not connected - no active WebSocket listener",
+            )
+        })?;
+
+    // Instant recovery: ensure our mediator connection is live before querying,
+    // so a flushed account is re-registered on the first attempt rather than
+    // timing out with "gateway did not respond".
+    let gateway_listener = ensure_live_listener(listener_mgr, gateway_listener)
+        .await
+        .map_err(|(status, message)| DiscoveryFailure::hard(status, message))?;
+
+    let message = DIDCommMessage::build(
+        uuid::Uuid::new_v4().to_string(),
+        message_type
+            .as_str()
+            .to_string(),
+        body,
+    )
+    .from(
+        gateway_listener
+            .gateway_did
+            .clone(),
+    )
+    .to(gateway.did.clone())
+    .thid(uuid::Uuid::new_v4().to_string())
+    .finalize();
+
+    // Pre-resolve and cache the gateway DID (best-effort).
+    let did_cache = listener_mgr.get_did_cache();
+    let tdk_state = gateway_listener
+        .client
+        .atm()
+        .get_tdk();
+    if let Err(e) = did_cache
+        .resolve_and_cache_for_atm(&gateway.did, tdk_state)
+        .await
+    {
+        warn!("[{request_id}] Failed to pre-resolve gateway DID: {e}. Continuing anyway.");
+    }
+
+    gateway_listener
+        .client
+        .pack_and_send_message(&message, &gateway.did, &gateway_listener.gateway_did)
+        .await
+        .map_err(|e| {
+            error!(gateway_id = %gateway.id, error = %e, "Failed to send {}", message_type);
+            DiscoveryFailure::hard(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send {}", message_type))
+        })?;
+
+    gateway_listener
+        .client
+        .atm()
+        .message_pickup()
+        .live_stream_get(
+            gateway_listener
+                .client
+                .profile(),
+            &message.id,
+            wait,
+            true, // auto_delete
+        )
+        .await
+        .map(|response| response.map(|(message, _metadata)| message))
+        .map_err(|e| DiscoveryFailure::soft(StatusCode::BAD_GATEWAY, format!("Request failed: {e:?}")))
+}
+
+/// Fetch the Payment Manifest of `surface_id` (optionally `<id>$<alias>`) from
+/// a connected agent-pay gateway over the fabric, reusing a payable manifest
+/// fetched in the last minute unless `force_refresh`. `Ok(None)` means the peer
+/// has no payment surface by that id; that and a manifest with no payment
+/// point are never reused.
+pub async fn fetch_payment_manifest(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    surface_id: &str,
+    force_refresh: bool,
+) -> Result<Option<super::payment_manifest::PaymentManifest>, super::payment_manifest::ManifestFetchError> {
+    use super::payment_manifest::{ManifestFetchError, cache_manifest, cached_manifest, parse_manifest_response};
+
+    #[cfg(test)]
+    if let Some(answer) = super::payment_manifest::test_answer(&gateway.id, surface_id) {
+        return answer;
+    }
+    if !force_refresh && let Some(manifest) = cached_manifest(&gateway.id, surface_id) {
+        return Ok(Some(manifest));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(
+        listener_manager,
+        gateway,
+        &request_id,
+        MessageType::GetManifest,
+        serde_json::json!({ "channel_id": surface_id }),
+        SURFACES_RESPONSE_TIMEOUT,
+    )
+    .await
+    .map_err(|failure| ManifestFetchError::Unavailable(failure.message))?
+    .ok_or_else(|| ManifestFetchError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != MessageType::GetManifestResponse.as_str() {
+        return Err(ManifestFetchError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    let manifest = parse_manifest_response(&response.body)?;
+    if let Some(manifest) = manifest.as_ref() {
+        super::payment_logos::store_manifest_logos(manifest, &response.body).await;
+    }
+    if let Some(payable) = manifest
+        .as_ref()
+        .filter(|manifest| manifest.is_payable())
+    {
+        cache_manifest(&gateway.id, surface_id, payable.clone());
+    }
+    Ok(manifest)
+}
+
+/// Ask a payment gateway for its `gateway-info` summary.
+pub async fn fetch_gateway_info(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+) -> Result<super::gateway_info::GatewayInfo, super::gateway_info::GatewayInfoError> {
+    use super::gateway_info::{GatewayInfoError, parse_gateway_info_response};
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(
+        listener_manager,
+        gateway,
+        &request_id,
+        MessageType::GatewayInfo,
+        serde_json::json!({}),
+        SURFACES_RESPONSE_TIMEOUT,
+    )
+    .await
+    .map_err(|failure| GatewayInfoError::Unavailable(failure.message))?
+    .ok_or_else(|| GatewayInfoError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != MessageType::GatewayInfoResponse.as_str() {
+        return Err(GatewayInfoError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    parse_gateway_info_response(&response.body)
+}
+
+/// What a payment gateway says it offers: `503` when it cannot be reached and
+/// `502` when it answers but is not a payment gateway.
+pub async fn get_gateway_info<S: GatewayStore>(
+    Extension(store): Extension<Arc<S>>,
+    Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
+    Path(id): Path<String>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<super::gateway_info::GatewayInfo>, (StatusCode, String)> {
+    use super::gateway_info::GatewayInfoError;
+
+    let gateway = store
+        .get(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {e}")))?
+        .filter(|gateway| gateway.is_payment_gateway() && gateway_allowed(gateway, &context, &scope))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    fetch_gateway_info(listener_manager.as_deref(), &gateway)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            warn!(gateway_id = %gateway.id, "gateway-info failed: {error}");
+            match error {
+                GatewayInfoError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+                GatewayInfoError::Rejected(_) => (StatusCode::BAD_GATEWAY, error.to_string()),
+            }
+        })
+}
+
+/// Turns a connected peer into a payment gateway: it leaves `/v1/gateways`,
+/// can no longer reach any local surface, and is managed under
+/// `payment_gateways.*`. Refused with `409` while a surface routes to it.
+pub async fn set_payment_role<S: GatewayStore>(
+    Extension(store): Extension<Arc<S>>,
+    Extension(surface_store): Extension<Option<Arc<crate::surfaces::FileSystemAgentSurfaceStore>>>,
+    Path(id): Path<String>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<Gateway>, (StatusCode, String)> {
+    let mut gateway = store
+        .get(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get gateway: {e}")))?
+        .filter(|gateway| gateway_allowed(gateway, &context, &scope))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Gateway not found".to_string()))?;
+    if !gateway_writable(&gateway, &context, &scope) {
+        return Err((StatusCode::FORBIDDEN, "Gateway is outside this token's permitted scope".into()));
+    }
+    if gateway.gateway_type != GatewayType::Remote {
+        return Err((StatusCode::BAD_REQUEST, "Only a remote gateway can be a payment gateway".to_string()));
+    }
+    let routes = super::usage::gateway_usage(surface_store.as_ref(), &gateway.id)
+        .await?
+        .fabric_surfaces;
+    if routes > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("{routes} surface(s) route to this gateway over fabric://; point them elsewhere first"),
+        ));
+    }
+
+    crate::config::enforce_leaf(GatewayRole::Payment.limit_dimension())
+        .await
+        .map_err(|e| (StatusCode::FORBIDDEN, e.message()))?;
+
+    let old_gateway = gateway.clone();
+    gateway.role = GatewayRole::Payment;
+    gateway.exposure_mode = Some(ExposureMode::None);
+    gateway
+        .exposed_channels
+        .clear();
+    gateway.updated_at = chrono::Utc::now();
+    store
+        .update(&gateway)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update gateway: {e}")))?;
+    crate::integrations::trigger_gateway_updated(&old_gateway, &gateway);
+    Ok(Json(gateway))
+}
+
+/// Ask a connected agent-pay gateway for the review state of the held payment
+/// `case_id`, waiting up to `wait`. `Ok(None)` means the peer does not know the
+/// case.
+pub async fn fetch_payment_case_status(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    case_id: &str,
+    wait: std::time::Duration,
+) -> Result<Option<super::payment_case::PaymentCaseState>, super::payment_case::CaseStatusError> {
+    use super::payment_case::{CaseStatusError, parse_case_status_response};
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(
+        listener_manager,
+        gateway,
+        &request_id,
+        MessageType::PaymentCaseStatus,
+        serde_json::json!({ "case_id": case_id }),
+        wait,
+    )
+    .await
+    .map_err(|failure| CaseStatusError::Unavailable(failure.message))?
+    .ok_or_else(|| CaseStatusError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != MessageType::PaymentCaseStatusResponse.as_str() {
+        return Err(CaseStatusError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    parse_case_status_response(&response.body, case_id)
+}
+
+/// Sends a `payment-settle` or `payment-settlement-status` request to a
+/// connected agent-pay gateway and returns the body of its answer, waiting up
+/// to `wait`.
+pub async fn query_payment_settlement(
+    listener_manager: Option<&ConnectionPointListenerManager>,
+    gateway: &Gateway,
+    message_type: MessageType,
+    expected: MessageType,
+    body: serde_json::Value,
+    wait: std::time::Duration,
+) -> Result<serde_json::Value, super::payment_case::CaseStatusError> {
+    use super::payment_case::CaseStatusError;
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = query_gateway(listener_manager, gateway, &request_id, message_type, body, wait)
+        .await
+        .map_err(|failure| CaseStatusError::Unavailable(failure.message))?
+        .ok_or_else(|| CaseStatusError::Unavailable("the payment gateway did not respond".to_string()))?;
+    if response.typ != expected.as_str() {
+        return Err(CaseStatusError::Rejected(format!("unexpected message type {}", response.typ)));
+    }
+    Ok(response.body)
 }
 
 /// Query available channels from a remote gateway.
@@ -3559,6 +4390,131 @@ pub async fn get_gateway_surfaces<S: GatewayStore>(
     }
 }
 
+/// Response of [`get_payment_manifest`].
+#[derive(Debug, Serialize)]
+pub struct PaymentManifestResponse {
+    pub gateway_id: String,
+    pub surface_id: String,
+    pub manifest: super::payment_manifest::PaymentManifest,
+    /// A forced refresh was asked for too soon after the last one, so this is
+    /// the cached manifest.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub refresh_throttled: bool,
+}
+
+/// How many manifest requests may wait on payment gateways at once; a request
+/// past it is answered with `429`, so the route cannot flood the fabric.
+const CONCURRENT_MANIFEST_FETCHES: usize = 4;
+
+static MANIFEST_FETCHES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(CONCURRENT_MANIFEST_FETCHES);
+
+fn manifest_error(
+    status: StatusCode,
+    code: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({ "error": code })))
+}
+
+fn manifest_fetch_permit(
+    fetches: &tokio::sync::Semaphore
+) -> Result<tokio::sync::SemaphorePermit<'_>, (StatusCode, Json<serde_json::Value>)> {
+    fetches
+        .try_acquire()
+        .map_err(|_| manifest_error(StatusCode::TOO_MANY_REQUESTS, "payment_manifest_busy"))
+}
+
+/// `GET /v1/gateways/payment-logos/{sha256}`: a payment point's logo, stored
+/// when its manifest was fetched (see [`super::payment_logos`]). Served as an
+/// image the browser may not sniff, under a CSP that lets it run nothing even
+/// when opened directly. A malformed name and a missing logo are both `404`.
+pub async fn get_payment_logo(Path(sha256): Path<String>) -> axum::response::Response {
+    payment_logo_response(super::payment_logos::read_logo(&sha256).await)
+}
+
+fn payment_logo_response(logo: Option<Vec<u8>>) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    match logo {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, super::payment_logos::LOGO_MEDIA_TYPE),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+                (header::CACHE_CONTROL, "private, max-age=86400, immutable"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /v1/payment-gateways/{id}/surfaces/{surface_id}/payment-manifest`: the Payment
+/// Manifest a connected agent-pay gateway publishes for one of its payment
+/// surfaces. `surface_id` may carry a `$alias`. A payable manifest is reused
+/// for a minute; `?force_refresh=true` skips that cache, but a manifest is
+/// forced at most once every ten seconds: inside that time the cached manifest
+/// is served with `refresh_throttled`. At most four requests wait on payment
+/// gateways at once, and the others are answered with `429
+/// payment_manifest_busy`.
+pub async fn get_payment_manifest<S: GatewayStore>(
+    Extension(store): Extension<Arc<S>>,
+    Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
+    Path((gateway_id, surface_id)): Path<(String, String)>,
+    Query(query): Query<GetGatewaySurfacesQuery>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> Result<Json<PaymentManifestResponse>, (StatusCode, Json<serde_json::Value>)> {
+    use super::payment_manifest::{
+        ManifestFetchError, cached_manifest, forced_refresh_due, is_valid_payment_surface_id,
+    };
+
+    if !is_valid_payment_surface_id(&surface_id) {
+        return Err(manifest_error(StatusCode::BAD_REQUEST, "invalid_payment_surface_id"));
+    }
+    let gateway = store
+        .get(&gateway_id)
+        .await
+        .map_err(|error| {
+            error!(gateway_id = %gateway_id, error = %error, "Failed to load gateway for payment manifest");
+            manifest_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        })?
+        .filter(|gateway| gateway_allowed(gateway, &context, &scope))
+        .ok_or_else(|| manifest_error(StatusCode::NOT_FOUND, "gateway_not_found"))?;
+    if gateway.gateway_type != GatewayType::Remote {
+        return Err(manifest_error(StatusCode::NOT_FOUND, "gateway_not_found"));
+    }
+    let force_refresh = query.force_refresh && forced_refresh_due(&gateway.id, &surface_id, std::time::Instant::now());
+    let refresh_throttled = query.force_refresh && !force_refresh;
+    if refresh_throttled && let Some(manifest) = cached_manifest(&gateway.id, &surface_id) {
+        return Ok(Json(PaymentManifestResponse {
+            gateway_id,
+            surface_id,
+            manifest,
+            refresh_throttled,
+        }));
+    }
+    let _fetching = manifest_fetch_permit(&MANIFEST_FETCHES)?;
+    match fetch_payment_manifest(listener_manager.as_deref(), &gateway, &surface_id, force_refresh).await {
+        Ok(Some(manifest)) => Ok(Json(PaymentManifestResponse {
+            gateway_id,
+            surface_id,
+            manifest,
+            refresh_throttled,
+        })),
+        Ok(None) => Err(manifest_error(StatusCode::NOT_FOUND, "payment_manifest_not_found")),
+        Err(ManifestFetchError::Rejected(reason)) => {
+            warn!(gateway_id = %gateway_id, %reason, "Payment gateway refused the manifest request");
+            Err(manifest_error(StatusCode::BAD_GATEWAY, "payment_manifest_rejected"))
+        }
+        Err(ManifestFetchError::Unavailable(reason)) => {
+            warn!(gateway_id = %gateway_id, %reason, "Payment gateway unavailable for the manifest request");
+            Err(manifest_error(StatusCode::SERVICE_UNAVAILABLE, "payment_gateway_unavailable"))
+        }
+    }
+}
+
 /// A connected remote gateway that exposes at least one payment surface,
 /// together with those surfaces. Returned by [`list_payment_gateways`].
 #[derive(Debug, Serialize)]
@@ -3569,11 +4525,14 @@ pub struct PaymentGatewayInfo {
 }
 
 /// A discovered surface is a payment delegation target when the remote marks it
-/// as a payment surface (`is_payment_surface == true`), or exposes it through a
-/// connection point the operator tagged `payment` (fallback for peers that
-/// predate the authoritative flag).
+/// as a payment surface (`is_payment_surface == true`) or publishes a Payment
+/// Manifest for it, or exposes it through a connection point the operator
+/// tagged `payment` (fallback for peers that predate both signals).
 fn is_payment_target(surface: &SurfaceInfo) -> bool {
     surface.is_payment_surface == Some(true)
+        || surface
+            .payment_manifest
+            .is_some()
         || surface
             .tags
             .iter()
@@ -3585,11 +4544,13 @@ fn is_payment_target(surface: &SurfaceInfo) -> bool {
 /// delegated payment picker's per-gateway discovery fan-out: the gateway does
 /// the (cached, concurrent) discovery and filtering so the client makes a
 /// single request. Unreachable gateways, and gateways exposing no payment
-/// surface, are omitted.
+/// surface, are omitted. `force_refresh` asks every candidate again instead of
+/// reusing its cached surfaces.
 pub async fn list_payment_gateways<S: GatewayStore>(
     Extension(store): Extension<Arc<S>>,
     Extension(listener_manager): Extension<Option<Arc<ConnectionPointListenerManager>>>,
     Extension(cache): Extension<Arc<GatewaySurfaceCache>>,
+    Query(query): Query<GetGatewaySurfacesQuery>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
 ) -> Result<Json<Vec<PaymentGatewayInfo>>, (StatusCode, String)> {
@@ -3598,19 +4559,14 @@ pub async fn list_payment_gateways<S: GatewayStore>(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to list gateways: {e}")))?;
 
-    // Only user-created remote gateways are delegation candidates (mirrors the
-    // client's `gateway_type == 'remote' && creation_type == 'user'` filter).
+    // Only an active payment gateway takes payments, whichever side opened the link.
     let candidates: Vec<Gateway> = gateways
         .into_iter()
-        .filter(|g| {
-            g.gateway_type == GatewayType::Remote
-                && g.creation_type == crate::gateways::types::GatewayCreationType::User
-                && gateway_allowed(g, &context, &scope)
-        })
+        .filter(|g| g.is_active_remote_peer() && g.is_payment_gateway() && gateway_allowed(g, &context, &scope))
         .collect();
 
-    // Discover each candidate concurrently, reusing the 5-minute cache. A
-    // disconnected gateway fails fast (no active listener) and is skipped.
+    // Discover each candidate concurrently, reusing the 5-minute cache unless
+    // forced. A disconnected gateway fails fast (no active listener) and is skipped.
     let discovered = futures::future::join_all(
         candidates
             .into_iter()
@@ -3619,9 +4575,10 @@ pub async fn list_payment_gateways<S: GatewayStore>(
                 let listener_manager = listener_manager.clone();
                 let cache = cache.clone();
                 async move {
-                    let surfaces = discover_gateway_surfaces(&store, &listener_manager, &cache, &gw.id, false)
-                        .await
-                        .unwrap_or_default();
+                    let surfaces =
+                        discover_gateway_surfaces(&store, &listener_manager, &cache, &gw.id, query.force_refresh)
+                            .await
+                            .unwrap_or_default();
                     (gw, surfaces)
                 }
             }),
