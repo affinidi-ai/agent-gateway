@@ -253,7 +253,7 @@ impl AgentSurface {
                              accepts a token its identity provider issued for any other service and the caller that \
                              token names; list the audiences it accepts, or set audience_claim to client_id or azp for \
                              an identity provider that issues no aud. A method without an audience is deprecated and \
-                             will be refused in a future release",
+                             will be refused in the next major release, 2.0.0",
                             config.jwt_verification_strategy_id
                         ))
                     }
@@ -1415,7 +1415,7 @@ mod tests {
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].starts_with("the Access Point's jwt_bearer method (strategy 'idp') names no audience")
-                && warnings[0].contains("deprecated"),
+                && warnings[0].contains("deprecated and will be refused in the next major release, 2.0.0"),
             "{}",
             warnings[0]
         );

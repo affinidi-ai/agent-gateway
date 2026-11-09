@@ -374,7 +374,7 @@ describe('Caller Context editor: audience claim', () => {
 
     expect(firstMethod(latest)).toMatchObject({ jwt_audience_claim: 'client_id' });
     expect(screen.getByTestId('caller-auth-jwt-audience-claim-warning')).toHaveTextContent(
-      'a binding with external consent and delegated credentials for Fabric callers are not released'
+      'these callers get no per-user delegated credentials'
     );
     expect(screen.queryByTestId('caller-auth-audiences-missing-warning')).toBeNull();
   });

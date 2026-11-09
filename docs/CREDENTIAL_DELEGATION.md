@@ -622,15 +622,16 @@ header saying so.
 The switch releases anything only when the receiving surface verifies a per-user credential on
 each Fabric request. Only two kinds of caller authentication can tell a partner's users apart: a
 resource token (`mcp_http.authorization`), and a `jwt_bearer` method that names an audience (its
-own `audiences`, or the resource `protected_resource` binds) through a JWT verification strategy
-that names an issuer. Every other method the Access Point lists must be one of them, or mTLS,
+own `audiences`, or the resource `protected_resource` binds), matched against `aud`, through a JWT
+verification strategy that names an issuer. Every other method the Access Point lists must be one of them, or mTLS,
 which never verifies a request over Fabric and so leaves it with no verified caller. The
 receiving surface normally verifies the credential the peer's `target_auth` presents. With
 `api_key`, the identity hash is the secret's id, so every key in that secret, the partner's and
 those of the surface's direct callers alike, would be one caller with one grant; an
 `api_key_provider` key names the client that holds it; a `did_auth` session names the DID that
-signed in, not the user a partner acts for; and a `jwt_bearer` method with no audience accepts a
-token the identity provider issued for another service. A save of a Transit Point that sets the
+signed in, not the user a partner acts for; and a `jwt_bearer` method with no audience, or one
+whose `audience_claim` is `client_id` or `azp`, accepts a token the identity provider issued for
+another service. A save of a Transit Point that sets the
 switch where the surface's caller authentication, on the surface or in the variant the Transit
 Point belongs to, cannot tell users apart is accepted with a `Warning` header saying so, and the
 Transit Point releases nothing to Fabric callers there. A JWT whose `sub` is the end user, with

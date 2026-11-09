@@ -1540,12 +1540,14 @@ the route or listen address the resource names is refused with `400`, which
 names the setting and asks for a new resource or `null`: dropping the setting
 would leave the JWT Bearer method, whose `audiences` stay empty, checking no
 audience at all. A PUT after which the setting itself no longer fits, one that
-switches the method, sets `forward_header` or `audiences`, or moves the
-protocol off MCP, drops it with a warning in the log instead of being refused
-over a setting the client did not send; the save is then refused with `400`
-unless the edit set `audiences`, since the method must name an audience. `null` removes it, sent with PATCH, or with
-PUT in the same request as the rest of the edit, a route or listen address
-change included. A variant PUT
+switches the method, sets `forward_header`, `audiences` or an `audience_claim`
+other than `aud`, or moves the protocol off MCP, drops it with a warning in the
+log instead of being refused over a setting the client did not send; the save
+is then refused with `400` unless the edit set `audiences`, since the method
+must name an audience. `null` removes it, sent with PATCH, or with PUT in the
+same request as the rest of the edit, a route or listen address change
+included; that request must also list the JWT Bearer method's `audiences`, or
+it is refused for the same reason. A variant PUT
 (`PUT /v1/surfaces/{id}/variants/{variant_id}`) applies the same rules to the
 variant's own setting in the overrides it sends.
 
@@ -1562,8 +1564,10 @@ and stop serving it. Before rolling back to such a release, PATCH
 `{"access_point": {"caller_authentication": {"protected_resource": null}}}`
 onto every surface that sets it, and `{"overrides": {"access_point":
 {"caller_authentication": {"protected_resource": null}}}}` onto every variant
-that sets its own, then protect those Access Points another way: without the
-setting, their JWT Bearer method checks no audience.
+that sets its own. Each request must also send the `caller_authentication`
+methods with the JWT Bearer method's `audiences` listing the resource, since
+this release refuses a method without an audience; the older release then
+checks that audience in place of the setting.
 
 `make mcp-discovery` ([`scripts/mcp-discovery/`](../scripts/mcp-discovery/README.md))
 runs the flow end to end against Ory Hydra with a scripted client and the

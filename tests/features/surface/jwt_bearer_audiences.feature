@@ -52,12 +52,31 @@ Feature: JWT Bearer audiences
     Then the admin API response status is 200
     And the admin API response carries a Warning header containing "names no audience"
 
+  Scenario: A variant saved disabled cannot be enabled with a method that names no audience
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface accepts JWT audience "api://alpha"
+    And the operator has saved the surface with a disabled variant "beta" whose JWT Bearer method names no audience
+    When the operator enables variant "beta"
+    Then the admin API response status is 400
+    And the admin API error response mentions "must name the audiences it accepts"
+
   Scenario: A change to a method stored without audiences is refused unless it names one
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
     When the operator saves the surface reading the caller's JWT Bearer token from header "X-Token"
     Then the admin API response status is 400
     And the admin API error response mentions "must name the audiences it accepts"
+
+  Scenario: A method that checks the client is refused beside a binding that releases callers' own credentials
+    Given the appliance holds the secret "provider-id-secret"
+    And the appliance holds the secret "provider-password-secret"
+    And the operator has created the credential provider "bound" using secrets "provider-id-secret" and "provider-password-secret"
+    And a surface draft for route "/example" whose Access Point checks JWT Bearer tokens issued to client "app-alpha"
+    And the draft injects a delegated credential from credential provider "bound" as header "X-Bound-Token"
+    When the operator creates the surface from the draft
+    Then the admin API response status is 400
+    And the admin API error response mentions "cannot authenticate the callers of a binding that releases their own delegated credentials"
 
   Scenario: A method that checks the client accepts a token issued to a listed client
     Given an A2A surface targeting managed agent "bravo"

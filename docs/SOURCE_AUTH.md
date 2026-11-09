@@ -244,19 +244,30 @@ the surface or in a variant's overrides. For an identity provider whose access t
 the method accepts in `audiences`: the named claim must then be a string that matches one of
 them, and `aud` is not checked. That binds a token to the client it was issued to, not to the
 gateway, so a token a listed client was issued for another service is accepted too. Callers it
-verifies get no grant from a binding with external consent and no delegated credentials for
-Fabric callers; delegated credentials in the `on_demand`, `pre_authorize` and `elicit` consent
-modes are still released per caller, as for a method stored without audiences. `audience_claim` is `aud` by default, must be `aud` beside
-protected resource metadata, and must be `aud` on a Transit Point.
+verifies therefore get no per-user delegated credentials: the admin API refuses, with `400`,
+such a method on a surface or variant with a credential binding, on its Target or a Transit
+Point, whose `consent_mode` is `on_demand`, `pre_authorize` or `elicit`, and a binding with
+external consent or delegated credentials for Fabric callers are withheld from its callers.
+`audience_claim` is `aud` by default, must be `aud` beside protected resource metadata, and must
+be `aud` on a Transit Point.
+
+Neither `client_id` nor `azp` tells an access token from an ID token, and the gateway does not
+check the token type in these modes. Amazon Cognito puts `client_id` only on access tokens, and
+its ID tokens carry `aud` instead, so use `client_id` there. Some providers, such as Keycloak,
+put `azp` on ID tokens as well, so in `azp` mode a listed client's ID token is accepted as an
+access token; where the provider marks the token type, require it in surface policy from
+`input.source_auth.claims`, for example `typ` or `token_use`.
 
 A method stored without `audiences`, from before that rule, keeps loading and skips the audience
 check, so it accepts a token its identity provider issued for any other service. The gateway
 warns about each one at startup and in a `Warning` header on each save of its surface, and a
 save that keeps the stored method unchanged is accepted, so an unrelated edit still saves; a
 save that changes it must name an audience. A variant keeps such a method too when it is added,
-copied, renamed or enabled again, as long as the surface or one of its stored variants has the
-same method. Such methods are deprecated and will be refused in
-a future release: list the audiences the method accepts, or set `audience_claim`.
+copied or renamed, as long as the surface or one of its enabled stored variants has the same
+method. A disabled variant is not validated on save, so a method only a disabled variant has
+never counts: enabling that variant is refused until its method names an audience. Such methods
+are deprecated and will be refused in the next major release, 2.0.0: list the audiences the
+method accepts, or set `audience_claim`.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with

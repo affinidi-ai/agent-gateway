@@ -66,21 +66,41 @@ async fn surface_draft_with_target_auth(
     world.surface_draft = Some(payload);
 }
 
-/// The draft's Access Point checks JWT Bearer tokens without naming an audience, and its Target
-/// takes no credential.
+/// A draft whose Access Point checks callers with one JWT Bearer method, completed by `method`
+/// with the strategy it names, and whose Target takes no credential.
+async fn surface_draft_checking_jwt(
+    world: &mut SurfaceWorld,
+    route: &str,
+    mut method: Value,
+) {
+    let mut payload = build_primary_target_surface_payload(world, route).await;
+    payload["name"] = json!(route.trim_start_matches('/'));
+    payload["status"] = json!("disabled");
+    method["type"] = json!("jwt_bearer");
+    method["jwt_verification_strategy_id"] = create_caller_jwt_strategy(world).await;
+    payload["access_point"]["caller_authentication"] = json!({"methods": [method]});
+    world.surface_draft = Some(payload);
+}
+
 #[given(expr = "a surface draft for route {string} whose Access Point checks JWT Bearer tokens naming no audience")]
 async fn surface_draft_checking_jwt_without_audience(
     world: &mut SurfaceWorld,
     route: String,
 ) {
-    let mut payload = build_primary_target_surface_payload(world, &route).await;
-    payload["name"] = json!(route.trim_start_matches('/'));
-    payload["status"] = json!("disabled");
-    let strategy_id = create_caller_jwt_strategy(world).await;
-    payload["access_point"]["caller_authentication"] = json!({"methods": [{
-        "type": "jwt_bearer", "jwt_verification_strategy_id": strategy_id, "audiences": []
-    }]});
-    world.surface_draft = Some(payload);
+    surface_draft_checking_jwt(world, &route, json!({"audiences": []})).await;
+}
+
+/// The method checks the `client_id` a token was issued to, as for an identity provider whose
+/// tokens carry no audience.
+#[given(
+    expr = "a surface draft for route {string} whose Access Point checks JWT Bearer tokens issued to client {string}"
+)]
+async fn surface_draft_checking_jwt_issued_to_client(
+    world: &mut SurfaceWorld,
+    route: String,
+    client: String,
+) {
+    surface_draft_checking_jwt(world, &route, json!({"audiences": [client], "audience_claim": "client_id"})).await;
 }
 
 #[given("the draft's Target is an https URL")]
@@ -370,6 +390,57 @@ async fn operator_saves_surface_with_new_variant(
     surface["variants"] = json!([{
         "id": format!("variant-{alias}"), "alias": alias, "name": alias, "enabled": true, "overrides": {}
     }]);
+    save_surface(world, &surface).await;
+}
+
+/// A disabled variant is not validated on save, so its own JWT Bearer method without an audience
+/// is stored.
+#[given(
+    expr = "the operator has saved the surface with a disabled variant {string} whose JWT Bearer method names no audience"
+)]
+async fn operator_has_saved_disabled_variant_without_audience(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    let mut surface = stored_surface(world).await;
+    let method = surface["access_point"]["caller_authentication"]["methods"]
+        .as_array()
+        .and_then(|methods| {
+            methods
+                .iter()
+                .find(|method| method["type"] == "jwt_bearer")
+        })
+        .cloned()
+        .expect("the stored surface checks callers with JWT Bearer");
+    let mut own = method;
+    own["audiences"] = json!([]);
+    surface["variants"] = json!([{
+        "id": format!("variant-{alias}"), "alias": alias, "name": alias, "enabled": false,
+        "overrides": {"access_point": {"caller_authentication": {"methods": [own]}}}
+    }]);
+    save_surface(world, &surface).await;
+    let response = world
+        .admin_response
+        .take()
+        .expect("the admin API must answer");
+    assert_eq!(response.status, 200, "saving the disabled variant: {}", response.body);
+}
+
+#[when(expr = "the operator enables variant {string}")]
+async fn operator_enables_variant(
+    world: &mut SurfaceWorld,
+    alias: String,
+) {
+    let mut surface = stored_surface(world).await;
+    let variant = surface["variants"]
+        .as_array_mut()
+        .and_then(|variants| {
+            variants
+                .iter_mut()
+                .find(|variant| variant["alias"] == alias)
+        })
+        .unwrap_or_else(|| panic!("the stored surface has no variant {alias}"));
+    variant["enabled"] = json!(true);
     save_surface(world, &surface).await;
 }
 

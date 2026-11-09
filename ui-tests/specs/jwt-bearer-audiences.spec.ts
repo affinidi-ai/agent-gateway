@@ -3,9 +3,9 @@
  *
  * A JWT Bearer method stored without audiences shows a warning that a new one
  * cannot be saved without one. The Audience Claim select switches the method
- * to the client a token was issued to, with a warning that external-consent
- * bindings and delegated credentials for Fabric callers are withheld, and Save
- * stays blocked until a client is listed.
+ * to the client a token was issued to, with a warning that its callers get no
+ * per-user delegated credentials, and Save stays blocked until a client is
+ * listed.
  */
 
 import type {Page} from '@playwright/test';
@@ -88,7 +88,7 @@ test.describe('Caller Context — JWT Bearer audiences', () => {
         await page.getByTestId('caller-auth-jwt-audience-claim').selectOption('client_id');
 
         await expect(page.getByTestId('caller-auth-jwt-audience-claim-warning')).toContainText(
-            'a binding with external consent and delegated credentials for Fabric callers are not released',
+            'these callers get no per-user delegated credentials',
         );
         await expect(page.getByTestId('caller-auth-audiences-missing-warning')).toHaveCount(0);
         await expect(page.getByTestId('caller-auth-editor-method-0-status')).toHaveAttribute(

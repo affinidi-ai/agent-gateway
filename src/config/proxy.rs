@@ -690,10 +690,11 @@ pub fn validate_source_auth_config(
 /// Access Point publishes a protected resource, whose `resource` is then the
 /// audience, matched against `aud`. A method stored unchanged, such as an
 /// empty list saved before this rule, is kept, so an unrelated edit still
-/// saves; the save warns about it instead. It is kept when `stored`, or any
-/// variant `stored` holds, disabled ones included, has it beside no protected
-/// resource, so a variant added, copied, renamed or enabled again keeps the
-/// method it inherits.
+/// saves; the save warns about it instead. It is kept when `stored`, or an
+/// enabled variant `stored` holds, has it beside no protected resource, so a
+/// variant added, copied or renamed keeps the method it inherits. A disabled
+/// variant is not validated on save, so its method is never a source: one
+/// saved disabled cannot be enabled with a method that never passed the rule.
 fn validate_jwt_bearer_audiences(
     surface: &crate::config::agent_surface::AgentSurface,
     stored: Option<&crate::config::agent_surface::AgentSurface>,
@@ -703,25 +704,7 @@ fn validate_jwt_bearer_audiences(
     let protected_resource = surface
         .protected_resource()
         .is_some();
-    let stored_views: Vec<_> = stored
-        .into_iter()
-        .flat_map(|stored| {
-            std::iter::once(stored.clone()).chain(
-                stored
-                    .variants
-                    .iter()
-                    .map(|variant| {
-                        stored
-                            .serve_selected(Some(variant))
-                            .surface
-                    }),
-            )
-        })
-        .filter(|view| {
-            view.protected_resource()
-                .is_none()
-        })
-        .collect();
+    let mut stored_views: Option<Vec<crate::config::agent_surface::AgentSurface>> = None;
     for method in surface.source_auth_methods() {
         let SourceAuthConfig::JwtBearer(config) = method else {
             continue;
@@ -736,6 +719,17 @@ fn validate_jwt_bearer_audiences(
             }
             continue;
         }
+        if !config.audience_claim.is_aud() && releases_per_caller_credentials(surface) {
+            anyhow::bail!(
+                "Surface '{}': jwt_bearer method (strategy '{}') checks audience_claim {}, so it accepts a token that \
+                 client was issued for another service; it cannot authenticate the callers of a binding that releases \
+                 their own delegated credentials (consent_mode on_demand, pre_authorize or elicit): use audience_claim \
+                 aud",
+                surface.name,
+                config.jwt_verification_strategy_id,
+                config.audience_claim.as_str()
+            );
+        }
         if config
             .audiences
             .iter()
@@ -745,10 +739,14 @@ fn validate_jwt_bearer_audiences(
         }
         let kept = config.audience_claim.is_aud()
             && stored_views
+                .get_or_insert_with(|| stored.map_or_else(Vec::new, enabled_views))
                 .iter()
                 .any(|view| {
-                    view.source_auth_methods()
-                        .contains(method)
+                    view.protected_resource()
+                        .is_none()
+                        && view
+                            .source_auth_methods()
+                            .contains(method)
                 });
         if !kept {
             anyhow::bail!(
@@ -761,6 +759,42 @@ fn validate_jwt_bearer_audiences(
         }
     }
     Ok(())
+}
+
+/// Whether a binding of `surface`, on its Target or a Transit Point, releases
+/// a caller's own delegated credentials: any but `consent_mode = external`.
+fn releases_per_caller_credentials(surface: &crate::config::agent_surface::AgentSurface) -> bool {
+    !surface
+        .target_outbound_credentials()
+        .is_empty()
+        || surface
+            .transit
+            .iter()
+            .flat_map(|transit| transit.points.iter())
+            .any(|point| {
+                !surface
+                    .transit_point_outbound_credentials(point)
+                    .is_empty()
+            })
+}
+
+/// `surface` and each of its enabled variants, as resolved.
+fn enabled_views(
+    surface: &crate::config::agent_surface::AgentSurface
+) -> Vec<crate::config::agent_surface::AgentSurface> {
+    std::iter::once(surface.clone())
+        .chain(
+            surface
+                .variants
+                .iter()
+                .filter(|variant| variant.enabled)
+                .map(|variant| {
+                    surface
+                        .serve_selected(Some(variant))
+                        .surface
+                }),
+        )
+        .collect()
 }
 
 /// Validate one source authentication method being saved, set on the Access
@@ -1197,24 +1231,37 @@ mod tests {
 
     /// A variant with no stored counterpart is checked against the stored
     /// surface, so it keeps a method stored without audiences on the base or
-    /// on any stored variant, disabled ones included, but not a new one.
+    /// on an enabled stored variant, but not one only a disabled variant has:
+    /// a disabled variant is not validated on save, so its method may never
+    /// have passed the rule.
     #[test]
-    fn a_method_stored_without_an_audience_is_kept_from_any_stored_view() {
-        let own_method =
-            serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-2", "audiences": []});
+    fn a_method_stored_without_an_audience_is_kept_from_the_base_or_an_enabled_variant() {
+        let method = |strategy: &str| serde_json::json!({"type": "jwt_bearer", "jwt_verification_strategy_id": strategy, "audiences": []});
+        let variant = |alias: &str, enabled: bool, strategy: &str| {
+            serde_json::json!({
+                "id": format!("v-{alias}"), "name": alias, "alias": alias, "enabled": enabled,
+                "overrides": {"access_point": {"caller_authentication": {"methods": [method(strategy)]}}}
+            })
+        };
         let mut stored = jwt_with(serde_json::json!([]), serde_json::json!({}));
-        stored.variants = serde_json::from_value(serde_json::json!([{
-            "id": "v-old", "name": "Old", "alias": "old", "enabled": false,
-            "overrides": {"access_point": {"caller_authentication": {"methods": [own_method.clone()]}}}
-        }]))
+        stored.variants = serde_json::from_value(serde_json::json!([
+            variant("live", true, "strat-live"),
+            variant("off", false, "strat-off")
+        ]))
         .unwrap();
 
         let inherits_base = jwt_with(serde_json::json!([]), serde_json::json!({}));
         validate_source_auth_config(&inherits_base, Some(&stored)).expect("a new variant keeps the base's method");
 
-        let enabled_again = surface_with_caller_auth(serde_json::json!([own_method]), serde_json::json!({}));
-        validate_source_auth_config(&enabled_again, Some(&stored))
-            .expect("a variant enabled again keeps the method its disabled stored copy has");
+        let copies_enabled = surface_with_caller_auth(serde_json::json!([method("strat-live")]), serde_json::json!({}));
+        validate_source_auth_config(&copies_enabled, Some(&stored))
+            .expect("a copy of an enabled variant keeps the method that variant has");
+
+        let enabled_again = surface_with_caller_auth(serde_json::json!([method("strat-off")]), serde_json::json!({}));
+        assert!(
+            validate_source_auth_config(&enabled_again, Some(&stored)).is_err(),
+            "a variant saved disabled cannot be enabled with a method that never passed the rule"
+        );
 
         let never_stored = surface_with_caller_auth(
             serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-3", "audiences": []}]),
@@ -1224,6 +1271,55 @@ mod tests {
             validate_source_auth_config(&never_stored, Some(&stored)).is_err(),
             "a method no stored view has is new"
         );
+    }
+
+    /// A method that checks only the client a token was issued to accepts a
+    /// token that client was issued for another service, so it cannot sit
+    /// beside a binding that releases a caller's own delegated credentials
+    /// (`on_demand`, `pre_authorize`, `elicit`), on the Target or a Transit
+    /// Point. An `external` binding is gated where it releases its grant.
+    #[test]
+    fn a_client_bound_method_is_refused_beside_a_binding_that_releases_per_caller_credentials() {
+        let client_bound = |extra: serde_json::Value| {
+            surface_with_caller_auth(
+                serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strat-1",
+                    "audiences": ["app-1"], "audience_claim": "client_id"}]),
+                extra,
+            )
+        };
+        let binding = |mode: &str| serde_json::json!({"credential_provider_id": "vendor", "consent_mode": mode});
+        let transit_point = serde_json::json!({"points": [{"alias": "crm", "target_endpoint": "https://crm.example",
+            "require_transit_token": true, "transit_credentials": binding("on_demand")}]});
+
+        for (case, extra) in [
+            ("an on_demand Target binding", serde_json::json!({"outbound_credentials": [binding("on_demand")]})),
+            ("a pre_authorize Target binding", serde_json::json!({"outbound_credentials": [binding("pre_authorize")]})),
+            ("an elicit Target binding", serde_json::json!({"outbound_credentials": [binding("elicit")]})),
+            ("a Transit Point's own binding", serde_json::json!({"transit": transit_point})),
+        ] {
+            let error = validate_source_auth_config(&client_bound(extra), None)
+                .expect_err(case)
+                .to_string();
+            assert!(
+                error.contains("audience_claim client_id")
+                    && error.contains("consent_mode on_demand, pre_authorize or elicit"),
+                "{case}: {error}"
+            );
+        }
+
+        let external = serde_json::json!({"outbound_credentials": [
+            {"credential_provider_id": "vendor", "consent_mode": "external", "subject": "owner"}
+        ]});
+        validate_source_auth_config(&client_bound(external), None)
+            .expect("an external binding is gated where it releases");
+        validate_source_auth_config(&client_bound(serde_json::json!({})), None).expect("no binding releases anything");
+
+        let aud_bound = surface_with_caller_auth(
+            serde_json::json!([jwt_method()]),
+            serde_json::json!({"outbound_credentials": [binding("on_demand")]}),
+        );
+        validate_source_auth_config(&aud_bound, None)
+            .expect("a method that checks aud may release per-caller credentials");
     }
 
     #[test]

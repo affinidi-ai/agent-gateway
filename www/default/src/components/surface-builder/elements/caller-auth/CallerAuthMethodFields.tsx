@@ -254,9 +254,9 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 <i className="fas fa-exclamation-triangle"></i>
                 <span>
                   Only for identity providers whose access tokens carry no <code>aud</code>. A token
-                  a listed client was issued for another service is accepted too, so a binding with
-                  external consent and delegated credentials for Fabric callers are not released to
-                  these callers.
+                  a listed client was issued for another service is accepted too, so these callers
+                  get no per-user delegated credentials: the surface cannot have a credential
+                  binding in on_demand, pre_authorize or elicit mode.
                 </span>
               </div>
             )}

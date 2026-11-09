@@ -132,8 +132,10 @@ pub fn normalize_principal_claim(claim: Option<&str>) -> Result<Option<String>, 
 /// `client_id` bind it only to the client it was issued to, for identity
 /// providers whose access tokens carry no `aud`: a token that client was
 /// issued for another service is accepted too, so callers it verifies get
-/// no grant from a binding with external consent and no delegated
-/// credentials for Fabric callers.
+/// no per-user delegated credentials: a save refuses it beside a binding
+/// whose `consent_mode` is `on_demand`, `pre_authorize` or `elicit`, and a
+/// binding with external consent or delegated credentials for Fabric callers
+/// are withheld.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AudienceClaim {

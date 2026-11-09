@@ -433,8 +433,8 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   a new or changed one with a message the page shows. **Audience Claim**
   (`caller-auth-jwt-audience-claim`) writes `audience_claim` (`aud`, `client_id` or `azp`, saved
   only when not `aud`); a value other than `aud` shows `caller-auth-jwt-audience-claim-warning`
-  (no external-consent binding and no delegated credentials for Fabric callers) and blocks Save
-  until a value is listed. Transit Points have no Audience Claim control: they match `aud`. Loading a surface always replaces `methods`, so a stale
+  (its callers get no per-user delegated credentials; the gateway refuses it beside an
+  `on_demand`, `pre_authorize` or `elicit` binding) and blocks Save until a value is listed. Transit Points have no Audience Claim control: they match `aud`. Loading a surface always replaces `methods`, so a stale
   canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
