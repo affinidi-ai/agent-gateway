@@ -33,4 +33,10 @@ changes:
         in the job summary. The scan only warns until the TRIVY_ENFORCE repository variable is set
         to true, after which it blocks a release image from getting a version tag. The boot probe
         also checks for missing shared libraries.
+    - timestamp: '2026-11-09T00:00:00.000Z'
+      title: Update actix-web and actix-http to clear their security advisories
+      description: >-
+        The OpenAPI-to-MCP proxy's web server crates actix-http and actix-web move to releases
+        that fix request smuggling through malformed chunked trailers and unbounded or oversized
+        request body decompression, which the dependency audit reported. Only Cargo.lock changes.
   breaking: []
