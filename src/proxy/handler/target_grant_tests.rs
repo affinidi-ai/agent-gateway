@@ -211,6 +211,28 @@ impl Fixture {
             .is_some()
     }
 
+    /// The tokens the authorization server has been asked to revoke, once
+    /// `count` of them have arrived. Revocation is spawned and outlives the
+    /// response, so waiting a fixed time for it races a loaded runner.
+    async fn revoked_eventually(
+        &self,
+        count: usize,
+    ) -> Vec<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let revoked = self
+                    .authorization_server
+                    .revoked_tokens();
+                if revoked.len() >= count {
+                    return revoked;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{count} tokens are revoked"))
+    }
+
     async fn send(
         &self,
         request: axum::http::Request<axum::body::Body>,
@@ -774,11 +796,10 @@ async fn a_refused_refresh_after_the_targets_refusal_removes_the_grant() {
             .await,
         "a refused refresh removes the grant"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(
         fixture
-            .authorization_server
-            .revoked_tokens(),
+            .revoked_eventually(2)
+            .await,
         ["first", "first-refresh"]
     );
 }
