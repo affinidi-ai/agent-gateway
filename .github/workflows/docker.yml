@@ -13,7 +13,6 @@ on:
       - scripts/ci/**
       - .github/workflows/docker.yml
   push:
-    branches: [feat/release_hardening]
     tags: ['v*']
   workflow_dispatch:
     inputs:
@@ -178,7 +177,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}},enable=${{ github.ref_type == 'tag' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ github.ref_type == 'tag' }}
-            type=sha,prefix=dryrun-,enable=${{ github.ref_type == 'branch' }}
+            type=sha,prefix=dryrun-,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Create multi-arch manifest
         id: manifest
