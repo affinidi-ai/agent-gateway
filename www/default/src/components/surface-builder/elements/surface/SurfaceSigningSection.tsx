@@ -4,6 +4,7 @@ import FieldHelp from '../../../shared/FieldHelp';
 import { apiClient } from '../../../../api';
 import type { SurfaceSigning } from '../types';
 import type { VtaConnection } from '../../../../pages/VtaConnectionsPage/types';
+import { BOOTSTRAP_CONNECTION_ID } from '../../../../pages/VtaConnectionsPage/vtaConnectionHelpers';
 
 /** Not a connection id, so the select needs a sentinel for "use the default". */
 const INHERIT = '__inherit__';
@@ -60,6 +61,13 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
     connection.pairing.state === 'connected' &&
     Boolean(connection.keys?.active?.key_id);
 
+  // The `[vta]` block's own record, which is the bundled trust agent when there is
+  // one, cannot be named by a surface: it is reached through "Inherit". Offering it
+  // as "not ready" tells the operator it is waiting for setup when it is working.
+  // A surface that already saved it keeps it listed, so its select is not blank.
+  const listed = (connection: VtaConnection) =>
+    connection.id !== BOOTSTRAP_CONNECTION_ID || signing?.connection_id === connection.id;
+
   const choose = (value: string) => {
     if (value === INHERIT) {
       // Undefined, not an empty block: the backend treats "no signing" and
@@ -97,10 +105,14 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
       >
         <option value={INHERIT}>Inherit the appliance default</option>
         <option value={LOCAL}>This gateway&apos;s own key (local)</option>
-        {connections.map(connection => (
+        {connections.filter(listed).map(connection => (
           <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
             {connection.name}
-            {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
+            {connection.id === BOOTSTRAP_CONNECTION_ID
+              ? ' — used through "Inherit the appliance default", not chosen here'
+              : ready(connection)
+                ? ''
+                : ' — not ready: connect it and provision a key first'}
           </option>
         ))}
       </Form.Select>

@@ -132,6 +132,15 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T14:30:00Z'
+      title: Stop listing the bundled trust agent as "not ready" on a surface
+      description: >-
+        The Surface Builder's Signing key list showed the bundled trust agent as
+        "Bootstrap VTA — not ready: connect it and provision a key first", as if
+        it were waiting to be set up, when it is connected and used through
+        "Inherit the appliance default". A surface cannot name it, so it is no
+        longer offered; a surface that already saved it keeps it listed with an
+        explanation.
     - timestamp: '2026-11-09T13:45:00Z'
       title: Say what the appliance signs with in Settings, and why a sidecar failed
       description: >-

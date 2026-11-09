@@ -1164,6 +1164,11 @@ anything itself:
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
   (`canRevoke`) or Verify (`canVerify`), since the server refuses both.
+- The Surface Builder's **Signing key** select (`SurfaceSigningSection`) does not offer the
+  `[vta]` block's own record (`vta-bootstrap`, the bundled trust agent): a surface cannot name
+  it and reaches it through "Inherit the appliance default". It stays listed, with that
+  explanation, only on a surface that already saved it, so the select is never blank. Other
+  connections without an active key stay listed as "not ready".
 - While the gateway signs locally because a bundled trust agent never came up (`enabled` is
   false), the banner still shows the bootstrap line, so the operator is told why.
 - **Settings → Key management** (`KeyManagementSettingsSection`, with `DefaultSigningPicker`)
