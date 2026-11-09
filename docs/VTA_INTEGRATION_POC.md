@@ -330,8 +330,11 @@ Three layers, from the outside in:
 - **Real containers.** `scripts/vta-bundled-compose-e2e.sh` runs the shipped Compose example
   with real images (`GATEWAY_IMAGE=… VTA_IMAGE=… ./scripts/vta-bundled-compose-e2e.sh`; not
   part of CI). It checks first start with no manual grant, the shared loopback and the
-  shared-volume permissions, that nothing else on the network reaches the trust agent, and a
-  restart that keeps the same identity. It found three faults the other layers could not: the
+  shared-volume permissions, that nothing else on the network reaches the trust agent, a
+  restart that keeps the same identity, a revoked gateway that is reported and never
+  re-enrolled, an offline re-grant, and a control-key rotation run in a one-off gateway
+  container beside the sidecar (20 checks). Each check reads only the logs written since its
+  own restart. It found three faults the other layers could not: the
   gateway never received its mandatory backup key or certificates, the shared `/bootstrap`
   volume was unwritable by both users, and a plain `docker compose restart` fails the sidecar.
 - **Real binaries.** `scripts/vta-bundled-e2e.sh` runs the real `vta` and `agent-gateway`
