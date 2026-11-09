@@ -1,0 +1,61 @@
+.changelog/wip/fix_audit-fixes.yaml
+  s_09d9fb08a24a2a::t_05696a34031133 1-20
+.changelog/wip/fix_encrypt-storage-on-new-installs.yaml
+  s_09d9fb08a24a2a::t_5a697e2b23fbc6 1-24
+.changelog/wip/fix_upgrade-rmcp.yaml
+  s_09d9fb08a24a2a::t_11d34fcec85f4c 1-19
+Cargo.lock
+  s_09d9fb08a24a2a::t_2da7868a3a1716 741,880,1555,1566,1655,1675,1696,1714,1765,1777,1790,1803,1828,1840,1852,2658,4342-4351,4394-4406,4440-4450,4501,4597,4611,4625,5224,5264,5328,5330,5551-5560,5987-5988,6990,7016,7036,7038,7044-7045,7049-7050,7054,7060,7065-7090,7888,7911,7932,7934,8047,8515,9693,9765,9767,9772,9794,9796,10056,10058,10061,10068-10069,10077,10090,10092,10097,10099-10101,10107,10113,10115,10117,10121,10126,10128,10131,10136,10207,10300,10367,10388,11253,11264,11347,11505,13682,13684,14089,14491-14500,14515-14526,14706,14725,14998,15000,15006,15946,16610,16778,16780
+Cargo.toml
+  s_09d9fb08a24a2a::t_a056b8d2b485dc 18,123-125,207-213
+Makefile
+  s_09d9fb08a24a2a::t_5602e8b16c0e49 162
+config/examples/config.example.toml
+  s_09d9fb08a24a2a::t_7659106281542f 80-82
+docker-compose.yml
+  s_09d9fb08a24a2a::t_253d17c2f687ee 19-22,65-68
+docs/CAPABILITIES.md
+  s_09d9fb08a24a2a::t_136961f96f732f 522-524
+docs/CONFIGURATION_REFERENCE.md
+  s_09d9fb08a24a2a::t_650e0452e6e328 87
+docs/DEPLOYMENT_REQUIREMENTS.md
+  s_09d9fb08a24a2a::t_031248b981fbc0 209
+docs/development/DEVELOPMENT.md
+  s_09d9fb08a24a2a::t_42f34bac78377b 131-132,136,139-144,386
+docs/development/GETTING_STARTED.md
+  s_09d9fb08a24a2a::t_bed637b19c7387 57-67
+scripts/_certs.sh
+  s_09d9fb08a24a2a::t_26c4d3846f83ad 38-57
+scripts/_encryption_table.sh
+  s_09d9fb08a24a2a::t_49ea8aedbe2915 1-75
+scripts/_prepare.sh
+  s_09d9fb08a24a2a::t_e4c0cbf2acc745 11,42-50,147,165-166,190,197-202,208,217,231-247,270,273,283,400,526
+scripts/checks.sh
+  s_09d9fb08a24a2a::t_5955bb9ed2686e 12-14
+scripts/d-run.sh
+  s_09d9fb08a24a2a::t_8390887ad75abe 41-43,61
+scripts/d-shell.sh
+  s_09d9fb08a24a2a::t_8fc91e7c5d0ce9 19,34
+scripts/test-encryption-setup.sh
+  s_09d9fb08a24a2a::t_920ca50d2018aa 1-226
+src/mcp_proxies/modern_rest.rs
+  s_09d9fb08a24a2a::t_1ea22e36a70bb7 7,766,798,814-816
+ui-tests/README.md
+  s_09d9fb08a24a2a::t_943b9e20fd8afc 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5fcd120d4746ebbc202b59a6af5faed4a31cbad4",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "unknown"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
