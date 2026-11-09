@@ -113,7 +113,8 @@ pub(crate) async fn revoke_api_keys_of_deleted_surfaces(state: &IdentityApiState
 /// Revokes every active API key whose owner is not in `known_owners`, which is read after the
 /// keys so a surface created meanwhile, whose keys can only follow it, is in it. An owner whose
 /// newest key was created within `recent` is left alone, since its surface may exist on another
-/// node and not be visible here yet. Revokes nothing and returns `None` when `mode` is `Standby`,
+/// node and not be visible here yet. Before the first revoke it logs a `WARN` per owner it will
+/// revoke, naming its active key ids. Revokes nothing and returns `None` when `mode` is `Standby`,
 /// or when the keys or the owners cannot all be read; stops at the owner before which `mode` is
 /// no longer `Active`. Returns how many it revoked; a key already revoked is not counted, so a
 /// second run revokes none.
@@ -128,7 +129,7 @@ async fn revoke_api_keys_of_unknown_owners(
         debug!("Not revoking the API keys of deleted surfaces on a Standby node");
         return None;
     }
-    let mut owners: BTreeMap<String, (bool, chrono::DateTime<chrono::Utc>)> = BTreeMap::new();
+    let mut owners: BTreeMap<String, (Vec<String>, chrono::DateTime<chrono::Utc>)> = BTreeMap::new();
     match api_keys
         .list_all_complete()
         .await
@@ -137,8 +138,10 @@ async fn revoke_api_keys_of_unknown_owners(
             for key in keys {
                 let (active, newest) = owners
                     .entry(key.agent_id)
-                    .or_insert((false, key.created_at));
-                *active |= key.status == ApiKeyStatus::Active;
+                    .or_insert((Vec::new(), key.created_at));
+                if key.status == ApiKeyStatus::Active {
+                    active.push(key.key_id);
+                }
                 *newest = (*newest).max(key.created_at);
             }
         }
@@ -147,7 +150,7 @@ async fn revoke_api_keys_of_unknown_owners(
             return None;
         }
     }
-    owners.retain(|_, (active, _)| *active);
+    owners.retain(|_, (active, _)| !active.is_empty());
     let known = if owners.is_empty() {
         HashSet::new()
     } else {
@@ -164,17 +167,28 @@ async fn revoke_api_keys_of_unknown_owners(
     let created_before = chrono::Utc::now()
         .checked_sub_signed(recent)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-    let mut revoked = 0;
     let mut deferred = 0;
-    for (owner, (_, newest)) in owners
+    let mut to_revoke = Vec::new();
+    for (owner, (active, newest)) in owners
         .iter()
         .filter(|(owner, _)| !known.contains(owner.as_str()))
     {
         if *newest > created_before {
             debug!(surface = %owner, "Not revoking the API keys of a surface whose newest key was just created");
             deferred += 1;
-            continue;
+        } else {
+            to_revoke.push((owner, active));
         }
+    }
+    for (owner, active) in &to_revoke {
+        warn!(
+            surface = %owner,
+            key_ids = %active.join(","),
+            "About to revoke the API keys of a surface that no longer exists"
+        );
+    }
+    let mut revoked = 0;
+    for (owner, _) in to_revoke {
         if mode() != Active {
             warn!(revoked, "Stopped revoking the API keys of deleted surfaces: the node is no longer Active");
             return Some(revoked);
@@ -409,11 +423,27 @@ mod tests {
             "an already revoked key is untouched"
         );
         let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        let revocations: Vec<&str> = logged
+        let announcements: Vec<(usize, &str)> = logged
             .lines()
-            .filter(|line| line.contains("Revoked API key"))
+            .enumerate()
+            .filter(|(_, line)| line.contains("About to revoke the API keys of a surface that no longer exists"))
+            .collect();
+        assert_eq!(announcements.len(), 1, "only the first run has keys to revoke: {logged}");
+        let (announced_at, announcement) = announcements[0];
+        assert!(announcement.contains("WARN"), "{logged}");
+        assert!(announcement.contains("surface=gone-surface"), "{logged}");
+        assert!(announcement.contains(&format!("key_ids={orphan}")), "{logged}");
+        let revocations: Vec<(usize, &str)> = logged
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("Revoked API key"))
             .collect();
         assert_eq!(revocations.len(), 1, "{logged}");
+        assert!(announced_at < revocations[0].0, "the owner is named before its keys are revoked: {logged}");
+        let revocations: Vec<&str> = revocations
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect();
         assert!(revocations[0].contains(&format!("key_id={orphan}")), "{logged}");
         assert!(revocations[0].contains("actor=surface-delete"), "{logged}");
         assert!(logged.contains("revoked=1"), "{logged}");
@@ -522,7 +552,7 @@ mod tests {
             revocation
                 .warning()
                 .is_some_and(|warning| warning.contains("could not be read, so none was revoked")),
-            "{revocation:?}"
+            "the warning says no key of the unreadable folder was revoked"
         );
         assert_eq!(status(&store(&directory).await, "locked-surface", &key).await, (ApiKeyStatus::Active, None));
     }

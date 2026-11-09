@@ -156,8 +156,10 @@ changes:
       title: Revoke the API keys of surfaces deleted before the upgrade when going Active
       description: >-
         When the gateway boots Active or a Standby node becomes Active, it revokes every active
-        API key whose owning surface no longer exists, under the actor surface-delete. It logs
-        each revoked key with its key_id and actor=surface-delete, and how many it revoked. The
+        API key whose owning surface no longer exists, under the actor surface-delete. Before
+        it revokes any, it logs a WARN per owner it will revoke, naming the owner and its active
+        key ids. It then logs each revoked key with its key_id and actor=surface-delete, and how
+        many it revoked. The
         revocations are permanent: no API restores a revoked key, and rolling back the gateway
         does not either. Keys of surfaces deleted by an earlier release stayed active, so a
         surface deriving its DID from one kept serving it under warn; it now answers 503 as

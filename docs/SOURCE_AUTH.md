@@ -1366,7 +1366,9 @@ keys is checked again on its next request.
   the id taken.
 - In either mode, when the gateway boots Active or a Standby node becomes Active, it revokes
   the keys of surfaces deleted before deletes revoked them: every active key whose owning
-  surface no longer exists, under the actor `surface-delete`, keeping the keys. It logs one
+  surface no longer exists, under the actor `surface-delete`, keeping the keys. Before it revokes
+  any, it logs one `WARN` line per owner it will revoke, `About to revoke the API keys of a
+  surface that no longer exists` with that `surface` and its active `key_ids`. It then logs one
   `INFO` line per key, `Revoked API key` with its `key_id` and `actor=surface-delete`, and one
   with the count. Its revocations are permanent: no API restores a revoked key, and rolling back
   the gateway does not either. A surface it leaves not ready gets a new DID when it is brought
