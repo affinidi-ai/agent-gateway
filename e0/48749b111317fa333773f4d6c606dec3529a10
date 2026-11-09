@@ -1,0 +1,21 @@
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_1ca5c9c9defc96 159-165,170-196
+  s_09d9fb08a24a2a::t_d9f316e8fe984b 166-169
+  s_09d9fb08a24a2a::t_69fdbf86940821 8-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e048749b111317fa333773f4d6c606dec3529a10",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
