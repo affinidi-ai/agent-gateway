@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# shellcheck disable=SC2154
 # Shared by vta-bundled-compose-e2e.sh and vta-bundled-manual.sh (sourced, not run).
 # Needs `repo` set, and `make config-debug` run once so `envs/local` and
 # `envs/certs` exist.
