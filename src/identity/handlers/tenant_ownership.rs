@@ -492,15 +492,20 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
             if ids.is_empty() {
                 continue;
             }
-            if state.api_key_store.is_none() {
+            let Some(api_keys) = state.api_key_store.as_deref() else {
                 return Err(OwnershipApiError::Refused("API key store is not configured".into()));
-            }
+            };
             if key_owners.is_none() {
                 key_owners = Some(
-                    provider_key_owners(state)
+                    provider_key_owners(api_keys)
                         .await
-                        .map_err(|error| {
-                            OwnershipApiError::Internal(format!("Failed to inspect API key owners: {:?}", error))
+                        .map_err(|error| match error {
+                            super::surfaces::SurfaceApiError::Unavailable(message) => {
+                                OwnershipApiError::Refused(message)
+                            }
+                            error => {
+                                OwnershipApiError::Internal(format!("Failed to inspect API key owners: {:?}", error))
+                            }
                         })?,
                 );
             }
@@ -508,8 +513,7 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
                 .as_ref()
                 .map(|owners| {
                     ids.all()
-                        .filter_map(|key_id| owners.get(key_id))
-                        .flatten()
+                        .flat_map(|key_id| owners.owners_of(key_id))
                         .cloned()
                         .collect::<Vec<_>>()
                 })

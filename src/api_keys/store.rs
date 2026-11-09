@@ -88,6 +88,13 @@ pub trait ApiKeyStore: Send + Sync {
         self.list_all().await
     }
 
+    /// [`Self::list_all`] and the agents whose keys could not be loaded, which it leaves out; an
+    /// error when the agents cannot be listed at all. The default is [`Self::list_all`] with none
+    /// left out.
+    async fn list_all_with_skipped(&self) -> ApiKeyResult<(Vec<ApiKeyMeta>, Vec<String>)> {
+        Ok((self.list_all().await?, Vec::new()))
+    }
+
     /// Get a specific key's full stored record (includes the secret hash, never
     /// the raw secret). Internal use only — backs revoke/rotate/delete.
     async fn get_record(

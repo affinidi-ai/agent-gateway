@@ -211,7 +211,8 @@ pub(crate) fn find_breaches(
 /// The key owners the report judges `surfaces` from: `listed`, the listing the provider key check
 /// of the same boot or reload read, else one listing of `api_keys` when a surface names a key id.
 /// `None` when the store could not be read, logged once, so every surface naming a key id is
-/// reported `store_unavailable`.
+/// reported `store_unavailable`; key folders it could not load are logged by name, and a key id
+/// only they may hold is reported `store_unavailable`.
 pub(crate) async fn report_key_owners(
     listed: Option<KeyOwnersListing>,
     api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>,
@@ -228,6 +229,16 @@ pub(crate) async fn report_key_owners(
         None => return None,
     };
     listing
+        .inspect(|keys| {
+            if !keys.is_complete() {
+                warn!(
+                    rule = PROVIDER_KEY_TENANT_RULE,
+                    reason = API_KEY_STORE_UNAVAILABLE,
+                    skipped = ?keys.skipped(),
+                    "Credential policy report: API key folders could not be loaded, so a surface naming an API key id no loaded folder holds is reported store_unavailable"
+                )
+            }
+        })
         .inspect_err(|cause| {
             warn!(
                 rule = PROVIDER_KEY_TENANT_RULE,
@@ -1118,8 +1129,7 @@ mod tests {
     #[test]
     fn a_surface_naming_a_revoked_provider_key_is_reported_revoked_key_in_both_modes() {
         use crate::config::credential_policy::RuleMode;
-        let mut owners = key_owners();
-        owners.revoked = ["atgk_t1".to_string()].into();
+        let owners = key_owners().with(&["atgk_t1"], &[]);
         for mode in [RuleMode::Warn, RuleMode::Enforce] {
             assert_eq!(
                 provider_key_findings(

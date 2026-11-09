@@ -885,6 +885,15 @@ impl ApiKeyStore for FileSystemApiKeyStore {
         self.list_loaded(true).await
     }
 
+    async fn list_all_with_skipped(&self) -> ApiKeyResult<(Vec<ApiKeyMeta>, Vec<String>)> {
+        let skipped = self.load_new_agents().await?;
+        Ok((
+            self.list_loaded(false)
+                .await?,
+            skipped,
+        ))
+    }
+
     async fn list_all_complete(&self) -> ApiKeyResult<Vec<ApiKeyMeta>> {
         let skipped = self.load_new_agents().await?;
         if !skipped.is_empty() {
@@ -1132,6 +1141,55 @@ mod tests {
             2,
             "the folder is loaded once it can be read"
         );
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_skipped_names_the_agents_whose_keys_cannot_be_loaded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (first, temp_dir) = create_test_store().await;
+        let readable = first
+            .create("agent-readable", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        first
+            .create("agent-locked", "client-1", None, "test-actor")
+            .await
+            .unwrap();
+        let locked = temp_dir
+            .path()
+            .join("agent-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let root_locked = std::fs::read_dir(&locked).is_err();
+        let second = FileSystemApiKeyStore::new(
+            temp_dir
+                .path()
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let partial = second
+            .list_all_with_skipped()
+            .await
+            .map(|(keys, skipped)| (key_ids(keys), skipped));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let recovered = second
+            .list_all_with_skipped()
+            .await
+            .map(|(keys, skipped)| (keys.len(), skipped));
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable_root = second
+            .list_all_with_skipped()
+            .await;
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !root_locked {
+            // Running as root: no read fails.
+            return;
+        }
+
+        assert_eq!(partial.unwrap(), (vec![readable.key_id], vec!["agent-locked".to_string()]));
+        assert_eq!(recovered.unwrap(), (2, Vec::new()), "the folder is loaded once it can be read");
+        assert!(unreadable_root.is_err(), "a root that cannot be read is an error");
     }
 
     fn key_ids(keys: Vec<ApiKeyMeta>) -> Vec<String> {

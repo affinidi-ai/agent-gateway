@@ -2,7 +2,9 @@
 //! derives such a DID with no key lookup, so a stored surface naming a key it may not use is
 //! held back here: under `tenant_credential_isolation: warn` it is only logged, under `enforce`
 //! it is not ready, and while the API key store cannot be read a surface naming a key id that has
-//! not been checked is not ready. A surface naming a revoked key is not ready in every mode.
+//! not been checked is not ready. While only some key folders cannot be loaded, a surface naming
+//! a key id no loaded folder holds is not ready, and one naming key ids found elsewhere is judged
+//! as usual. A surface naming a revoked key is not ready in every mode.
 //! Verdicts are taken when a surface goes live and on the first request that finds none for the
 //! key ids the served surface names, and kept per surface id. Such a judgment lists the whole API
 //! key store and reads from disk the key folders of the surface and of the owners of the keys it
@@ -24,8 +26,8 @@ use tracing::{info, warn};
 
 use crate::config::agent_surface::AgentSurface;
 use crate::identity::handlers::surface_tenancy::{
-    KeyListing, ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, complete_provider_key_listing_in,
-    judge_provider_keys, provider_key_ids, served_provider_key_ids,
+    KeyListing, KeyStatus, ProviderKeyIds, ProviderKeyIssue, ProviderKeyIssueKind, judge_provider_keys,
+    provider_key_ids, provider_key_listing_in, served_provider_key_ids,
 };
 use crate::source_auth::errors::NotReadyReason;
 
@@ -41,14 +43,14 @@ pub const API_KEY_REVOKED: &str = "api_key_revoked";
 /// The reason a surface naming a key id no key has is not ready.
 pub const API_KEY_MISSING: &str = "api_key_missing";
 
-/// The surfaces owning each API key, by key id, and the revoked key ids, from one listing of the
-/// API key store that loaded every key folder, or why the store could not be read.
+/// The surfaces owning each API key, by key id, the revoked key ids and the key folders that
+/// could not be loaded, from one listing of the API key store, or why the store could not be read.
 pub type KeyOwnersListing = Result<KeyListing, &'static str>;
 
-/// Lists the owners and status of every key of `api_keys`; an error when there is no store or
-/// the keys of a key folder could not be loaded.
+/// Lists the owners and status of every key of `api_keys`; an error when there is no store or it
+/// cannot be listed at all.
 pub(crate) async fn list_key_owners(api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>) -> KeyOwnersListing {
-    complete_provider_key_listing_in(api_keys.ok_or("the API key store is not configured")?)
+    provider_key_listing_in(api_keys.ok_or("the API key store is not configured")?)
         .await
         .map_err(|_| "listing API keys failed")
 }
@@ -80,7 +82,7 @@ struct Owners {
     keys: KeyListing,
     api_keys: Arc<dyn crate::api_keys::store::ApiKeyStore>,
     surfaces: Arc<dyn crate::surfaces::AgentSurfaceStore>,
-    complete: bool,
+    whole: bool,
 }
 
 /// The key ids judged for a surface of `tenant_id`, those found in a key folder, those of them it
@@ -254,7 +256,6 @@ struct Verdict {
     issues: Vec<ProviderKeyIssue>,
     found: HashSet<String>,
     owners: HashSet<String>,
-    store_unavailable: bool,
 }
 
 impl Verdict {
@@ -265,7 +266,7 @@ impl Verdict {
                 .any(|issue| kind(issue.kind))
         };
         refusal(
-            self.store_unavailable,
+            any(&|kind| kind == ProviderKeyIssueKind::StoreUnavailable),
             any(&|kind| kind == ProviderKeyIssueKind::RevokedKey),
             any(&|kind| kind == ProviderKeyIssueKind::MissingKey),
             any(&|kind| kind.is_breach()),
@@ -619,7 +620,7 @@ impl ProviderKeyGate {
             keys,
             api_keys,
             surfaces,
-            complete: true,
+            whole: true,
         })
     }
 
@@ -641,13 +642,13 @@ impl ProviderKeyGate {
             keys: KeyListing::default(),
             api_keys,
             surfaces,
-            complete: false,
+            whole: false,
         };
         let named = ids
             .all()
             .map(String::as_str)
             .collect();
-        take_in_from_disk(&mut owners, folders, &named).await?;
+        take_in_from_disk(&mut owners, folders, &named).await;
         Ok(owners)
     }
 
@@ -658,7 +659,7 @@ impl ProviderKeyGate {
         naming: impl IntoIterator<Item = (&'a str, &'a ProviderKeyIds)>,
     ) -> Result<Owners, &'static str> {
         let mut owners = self.list_owners().await?;
-        read_named_keys_from_disk(&mut owners, naming).await?;
+        read_named_keys_from_disk(&mut owners, naming).await;
         Ok(owners)
     }
 
@@ -683,22 +684,14 @@ impl ProviderKeyGate {
         let isolation = crate::config::credential_policy::credential_policy().tenant_credential_isolation;
         let tenant_id = surface.tenant_id.as_deref();
         let Owners {
-            keys: owners,
-            surfaces,
-            complete,
-            ..
+            keys: owners, surfaces, whole, ..
         } = match listing {
             Ok(owners) => owners,
             Err(cause) => return self.store_outage(surface, ids, isolation, cause),
         };
         let mut owner_ids: Vec<String> = Vec::new();
         for id in ids.all() {
-            for owner_id in owners
-                .owners
-                .get(id)
-                .into_iter()
-                .flatten()
-            {
+            for owner_id in owners.owners_of(id) {
                 if !owner_ids.contains(owner_id) {
                     owner_ids.push(owner_id.clone());
                 }
@@ -712,12 +705,8 @@ impl ProviderKeyGate {
                 Err(_) => return self.store_outage(surface, ids, isolation, "reading a key's surface failed"),
             }
         }
-        if *complete
-            && self
-                .store_outage_logged
-                .swap(false, Ordering::Relaxed)
-        {
-            info!("The API key store can be read again: surfaces naming an API key id are judged as they serve");
+        if *whole {
+            self.log_listing(owners);
         }
         let owner_tenants: HashMap<&str, Option<&str>> = owner_tenants
             .iter()
@@ -729,17 +718,38 @@ impl ProviderKeyGate {
             issues,
             found: ids
                 .all()
-                .filter(|id| {
-                    owners
-                        .owners
-                        .contains_key(*id)
-                })
+                .filter(|id| matches!(owners.status_of(id), KeyStatus::Found(_)))
                 .cloned()
                 .collect(),
             owners: owner_ids
                 .into_iter()
                 .collect(),
-            store_unavailable: false,
+        }
+    }
+
+    /// Logs once that a listing of the whole store left key folders out, naming them, and once
+    /// that the store can be read again when a later one leaves none out.
+    fn log_listing(
+        &self,
+        keys: &KeyListing,
+    ) {
+        if keys.is_complete() {
+            if self
+                .store_outage_logged
+                .swap(false, Ordering::Relaxed)
+            {
+                info!("The API key store can be read again: surfaces naming an API key id are judged as they serve");
+            }
+        } else if !self
+            .store_outage_logged
+            .swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                rule = PROVIDER_KEY_TENANT_RULE,
+                reason = API_KEY_STORE_UNAVAILABLE,
+                skipped = ?keys.skipped(),
+                "API key folders could not be loaded: surfaces naming an API key id that no loaded folder holds are not ready until they can"
+            );
         }
     }
 
@@ -774,7 +784,6 @@ impl ProviderKeyGate {
             ),
             found: HashSet::new(),
             owners: HashSet::new(),
-            store_unavailable: true,
         }
     }
 }
@@ -786,7 +795,7 @@ impl ProviderKeyGate {
 async fn read_named_keys_from_disk<'a>(
     owners: &mut Owners,
     naming: impl IntoIterator<Item = (&'a str, &'a ProviderKeyIds)>,
-) -> Result<(), &'static str> {
+) {
     let mut folders: HashSet<String> = HashSet::new();
     let mut named: HashSet<&str> = HashSet::new();
     for (surface_id, ids) in naming {
@@ -796,10 +805,8 @@ async fn read_named_keys_from_disk<'a>(
             folders.extend(
                 owners
                     .keys
-                    .owners
-                    .get(id)
-                    .into_iter()
-                    .flatten()
+                    .owners_of(id)
+                    .iter()
                     .cloned(),
             );
         }
@@ -809,44 +816,31 @@ async fn read_named_keys_from_disk<'a>(
 
 /// Reads each key folder of `folders` from disk and takes the keys of `named` it holds into
 /// `owners`, dropping the folder as an owner of every named key it no longer holds, so a key
-/// another node deleted is not found from this node's cache; an error when a folder cannot be
-/// read.
+/// another node deleted is not found from this node's cache. A folder that cannot be read is
+/// skipped and owns none of them, so a named key no other folder holds is judged store
+/// unavailable.
 async fn take_in_from_disk(
     owners: &mut Owners,
     folders: HashSet<String>,
     named: &HashSet<&str>,
-) -> Result<(), &'static str> {
+) {
     for folder in folders {
-        let keys = owners
+        match owners
             .api_keys
             .list_from_disk(&folder)
             .await
-            .map_err(|_| "reading a key folder from disk failed")?;
-        let held: HashSet<String> = keys
-            .iter()
-            .map(|key| key.key_id.clone())
-            .collect();
-        for id in named {
-            if held.contains(*id) {
-                continue;
-            }
-            let listing = &mut owners.keys;
-            let Some(key_owners) = listing.owners.get_mut(*id) else {
-                continue;
-            };
-            key_owners.retain(|owner| *owner != folder);
-            if key_owners.is_empty() {
-                listing.owners.remove(*id);
-                listing.revoked.remove(*id);
-            }
-        }
-        for key in keys {
-            if named.contains(key.key_id.as_str()) {
-                owners.keys.add(key);
+        {
+            Ok(keys) => owners
+                .keys
+                .take_in_folder(&folder, keys, named),
+            Err(error) => {
+                warn!(folder = %folder, %error, "Could not read an API key folder from disk");
+                owners
+                    .keys
+                    .skip_folder(&folder, named);
             }
         }
     }
-    Ok(())
 }
 
 /// One line per verdict that finds anything: the surface, its tenant, the rule, and each key id
@@ -1862,7 +1856,11 @@ mod tests {
         }
 
         assert_eq!(rechecked, None, "its own folder reads fine");
-        assert_eq!(first, Some(NotReadyReason::ApiKeyStoreUnavailable), "a first judgment still lists the whole store");
+        assert_eq!(
+            first,
+            Some(NotReadyReason::ProviderKeyTenant),
+            "a first judgment judges a key in a readable folder as usual"
+        );
     }
 
     #[tokio::test]
@@ -2003,12 +2001,11 @@ mod tests {
     #[test]
     fn a_revoked_key_is_a_breach_in_both_modes_reported_once_whoever_owns_it() {
         use crate::config::credential_policy::RuleMode;
-        let mut listing: KeyListing = HashMap::from([
+        let listing = KeyListing::from(HashMap::from([
             (KEY_A.to_string(), vec!["owner-a".to_string()]),
             (KEY_B.to_string(), vec!["owner-b".to_string()]),
-        ])
-        .into();
-        listing.revoked = [KEY_A.to_string(), KEY_B.to_string()].into();
+        ]))
+        .with(&[KEY_A, KEY_B], &[]);
         let tenants: HashMap<&str, Option<&str>> =
             [("owner-a", Some("tenant-a")), ("owner-b", Some("tenant-b"))].into();
         let legacy = |id: &str| ProviderKeyIds {
@@ -2047,11 +2044,11 @@ mod tests {
         };
         let mut listing = KeyListing::default();
         listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Active));
-        assert!(listing.revoked.is_empty());
+        assert!(!listing.is_revoked(KEY_A));
         listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Revoked));
         listing.add(meta("owner-a", crate::api_keys::ApiKeyStatus::Active));
-        assert_eq!(listing.revoked, [KEY_A.to_string()].into());
-        assert_eq!(listing.owners[KEY_A], vec!["owner-a".to_string()], "an owner is listed once");
+        assert!(listing.is_revoked(KEY_A));
+        assert_eq!(listing.owners_of(KEY_A), ["owner-a".to_string()], "an owner is listed once");
     }
 
     #[test]
@@ -2243,9 +2240,8 @@ mod tests {
         assert_eq!(
             owners
                 .unwrap()
-                .owners
-                .get(KEY_B),
-            Some(&vec!["owner-b".to_string()])
+                .owners_of(KEY_B),
+            ["owner-b".to_string()]
         );
 
         assert_eq!(report_key_owners(None, Some(flaky.as_ref()), &[plain]).await, None);
@@ -2426,56 +2422,157 @@ mod tests {
         assert_eq!(ProviderKeyIssueKind::OtherSurface { enforced: true }.as_str(), "other_surface");
     }
 
+    fn legacy_secret(key_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "identity_slots": {"inbound": {"type": "from_api_key"}},
+            "access_point": {
+                "listen_address": "https://gateway.example", "route": "/legacy", "protocol": "a2a",
+                "caller_authentication": {"methods": [{
+                    "type": "api_key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": key_id
+                }]}
+            }
+        })
+    }
+
     #[tokio::test]
-    async fn an_unreadable_key_folder_refuses_surfaces_naming_a_key_id_but_not_the_save_listing() {
-        use std::os::unix::fs::PermissionsExt as _;
+    async fn an_unreadable_key_folder_refuses_only_the_surfaces_naming_an_id_no_loaded_folder_holds() {
+        use crate::identity::handlers::credential_policy_report::report_key_owners;
         let enforced = gate().await;
-        let keys_dir = enforced
-            .dir
-            .path()
-            .join("api_keys");
-        let locked = keys_dir.join("owner-b");
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read_dir(&locked).is_ok() {
-            // Running as root: no read fails.
-            return;
-        }
-        let other_node = Arc::new(
-            crate::api_keys::FileSystemApiKeyStore::new(&keys_dir.to_string_lossy())
-                .await
-                .unwrap(),
-        );
+        let locked = lock_folder(&enforced, "owner-b");
+        let fresh = Arc::new(other_node(&enforced).await);
         enforced
             .gate
-            .set_sources(Some(other_node.clone()), Some(enforced.surfaces.clone()));
+            .set_sources(Some(fresh.clone()), Some(enforced.surfaces.clone()));
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let cross = naming("cross", "tenant-a", external(KEY_B));
+        let legacy = naming("legacy", "tenant-a", legacy_secret(KEY_B));
+        let borrower = naming("borrower", "tenant-a", external(KEY_A));
 
-        let refused = enforced
+        let answers = [
+            enforced
+                .gate
+                .refuses(&own)
+                .await,
+            enforced
+                .gate
+                .refuses(&cross)
+                .await,
+            enforced
+                .gate
+                .refuses(&legacy)
+                .await,
+            enforced
+                .gate
+                .refuses(&borrower)
+                .await,
+        ];
+        let cross_found = enforced
             .gate
-            .refuses(&naming("own", "tenant-a", external(KEY_A)))
-            .await;
-        let lenient = crate::identity::handlers::surface_tenancy::provider_key_listing_in(other_node.as_ref()).await;
-        let strict = complete_provider_key_listing_in(other_node.as_ref()).await;
-        let cross = [naming("cross", "tenant-a", external(KEY_B))];
-        let reported = crate::identity::handlers::credential_policy_report::report_key_owners(
-            None,
-            Some(other_node.as_ref()),
-            &cross,
+            .entries
+            .get("cross")
+            .map(|entry| entry.found.clone());
+        let stored = [own.clone(), cross.clone(), legacy.clone()];
+        let reported = report_key_owners(None, Some(fresh.as_ref()), &stored).await;
+        unlock_folder(&enforced, "owner-b");
+        if !locked {
+            return;
+        }
+
+        let unavailable = Some(NotReadyReason::ApiKeyStoreUnavailable);
+        assert_eq!(
+            answers,
+            [None, unavailable, unavailable, Some(NotReadyReason::ProviderKeyTenant)],
+            "a found id is judged as usual; an id only the unreadable folder may hold is refused"
+        );
+        assert_eq!(cross_found, Some(HashSet::new()), "an id no loaded folder holds is not found");
+        assert_eq!(
+            enforced
+                .gate
+                .recorded_refusal(&cross),
+            Some(API_KEY_STORE_UNAVAILABLE),
+            "the kept verdict gives the reason the request was answered with"
+        );
+        assert_eq!(
+            report_rows(&stored, reported.as_ref()),
+            vec![("cross".to_string(), "store_unavailable", true), ("legacy".to_string(), "store_unavailable", true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn admitting_surfaces_while_one_naming_its_own_key_has_an_unreadable_folder_refuses_only_that_one() {
+        let enforced = enforced_gate(
+            &[("owner-a", Some("tenant-a")), ("owner-x", Some("tenant-a"))],
+            &[("owner-a", KEY_A), ("owner-x", "atgk_gate_x")],
         )
         .await;
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let own = naming("owner-a", "tenant-a", external(KEY_A));
+        let locked_own = naming("owner-x", "tenant-a", external("atgk_gate_x"));
+        let locked = lock_folder(&enforced, "owner-x");
 
-        assert_eq!(refused, Some(NotReadyReason::ApiKeyStoreUnavailable));
+        enforced
+            .gate
+            .admit_all([&locked_own, &own])
+            .await;
+        let refusals = [
+            enforced
+                .gate
+                .recorded_refusal(&own),
+            enforced
+                .gate
+                .recorded_refusal(&locked_own),
+        ];
+        unlock_folder(&enforced, "owner-x");
+        if !locked {
+            return;
+        }
+
+        assert_eq!(refusals, [None, Some(API_KEY_STORE_UNAVAILABLE)]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_outage_is_logged_once_naming_its_folders_and_its_end_once_none_is_skipped() {
+        let enforced = gate().await;
+        let locked = lock_folder(&enforced, "owner-b");
+        enforced
+            .gate
+            .set_sources(Some(Arc::new(other_node(&enforced).await)), Some(enforced.surfaces.clone()));
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+
+        for surface in [naming("owner-a", "tenant-a", external(KEY_A)), naming("cross", "tenant-a", external(KEY_B))] {
+            enforced
+                .gate
+                .refuses(&surface)
+                .await;
+        }
+        let during = logs.text();
+        unlock_folder(&enforced, "owner-b");
+        enforced
+            .gate
+            .refuses(&naming("later", "tenant-a", external(KEY_A)))
+            .await;
+        let after = logs.text();
+        if !locked {
+            return;
+        }
+
+        const PARTIAL: &str = "API key folders could not be loaded";
+        const READABLE: &str = "The API key store can be read again";
         assert_eq!(
-            report_rows(&cross, reported.as_ref()),
-            vec![("cross".to_string(), "store_unavailable", true)],
-            "the report does not read a key in the folder as missing"
+            during
+                .matches(PARTIAL)
+                .count(),
+            1,
+            "{during}"
         );
+        assert!(during.contains("owner-b"), "{during}");
+        assert!(!during.contains(READABLE), "{during}");
         assert_eq!(
-            lenient.unwrap().owners,
-            HashMap::from([(KEY_A.to_string(), vec!["owner-a".to_string()])]),
-            "the save rule's listing leaves the folder out"
+            after
+                .matches(READABLE)
+                .count(),
+            1,
+            "{after}"
         );
-        assert!(strict.is_err());
     }
 
     #[tokio::test]

@@ -1311,11 +1311,8 @@ impl ReferenceAuthorizer<'_> {
             if !scope_allows_resource(self.scope, self.context, ResourceKind::ApiKeys, key_id) {
                 return Err(inaccessible("API-key parent Surface"));
             }
-            let Some(surface_ids) = listing.owners.get(key_id) else {
-                if kept {
-                    continue;
-                }
-                return Err(inaccessible("API key"));
+            let Some(surface_ids) = listed_owners(&listing, key_id, kept, false)? else {
+                continue;
             };
             let rule = self.rule_for(ResourceKind::ApiKeys, key_id);
             for surface_id in surface_ids {
@@ -1350,11 +1347,7 @@ impl ReferenceAuthorizer<'_> {
         listing: &KeyListing,
         kept: bool,
     ) -> Result<(), SurfaceApiError> {
-        if kept
-            || !listing
-                .revoked
-                .contains(key_id)
-        {
+        if kept || !listing.is_revoked(key_id) {
             return Ok(());
         }
         if surface_ids
@@ -1376,7 +1369,8 @@ impl ReferenceAuthorizer<'_> {
         listing: &KeyListing,
     ) -> Result<(), SurfaceApiError> {
         let rule = self.rule_for(ResourceKind::ApiKeys, secret_id);
-        let Some(surface_ids) = listing.owners.get(secret_id) else {
+        let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, secret_id);
+        let Some(surface_ids) = listed_owners(listing, secret_id, kept, true)? else {
             return Ok(());
         };
         for surface_id in surface_ids {
@@ -1395,8 +1389,26 @@ impl ReferenceAuthorizer<'_> {
                 return Err(another_surfaces_key(secret_id));
             }
         }
-        let kept = is_grandfathered(&self.grandfathered, ResourceKind::ApiKeys, secret_id);
         self.revoked_key(secret_id, surface_ids, listing, kept)
+    }
+}
+
+/// The surfaces whose key folders hold the key `id` a save names, or `None` when the save leaves
+/// the id alone: one the stored surface already named (`kept`) that no loaded folder holds, or a
+/// `legacy` secret no key has. A new key id no folder holds is refused, as unavailable while a key
+/// folder could not be loaded, since that folder may hold it.
+fn listed_owners<'a>(
+    listing: &'a KeyListing,
+    id: &str,
+    kept: bool,
+    legacy: bool,
+) -> Result<Option<&'a [String]>, SurfaceApiError> {
+    match listing.status_of(id) {
+        KeyStatus::Found(owners) => Ok(Some(owners)),
+        _ if kept => Ok(None),
+        KeyStatus::Unknown => Err(SurfaceApiError::Unavailable("API key store is unavailable".to_string())),
+        KeyStatus::Absent if legacy => Ok(None),
+        KeyStatus::Absent => Err(inaccessible("API key")),
     }
 }
 
@@ -1840,7 +1852,8 @@ pub(crate) enum ProviderKeyIssueKind {
     /// The surface owning the key no longer exists, so its tenant cannot be told; a breach only
     /// when enforced.
     MissingOwner { enforced: bool },
-    /// The API key store is unavailable, so the key's owner cannot be told.
+    /// The API key store is unavailable, or no loaded key folder holds the key while a folder
+    /// that may hold it could not be loaded, so the key's owner cannot be told.
     StoreUnavailable,
     /// The key is revoked, so its DID must not be derived; a breach in every isolation mode.
     RevokedKey,
@@ -1902,7 +1915,8 @@ pub(crate) fn provider_key_verdict(
 /// the surface's own or not, is reported only as revoked. Otherwise a key the surface owns
 /// itself has none, whatever tenant the stores read for it. A key of another tenant is reported
 /// as that, not also as another surface's. A legacy secret is reported only when a key of that
-/// id is revoked or belongs to another surface. `owners` is `None` when the API key store is
+/// id is revoked or belongs to another surface. An id only a key folder that could not be loaded
+/// may hold is reported store unavailable. `owners` is `None` when the API key store is
 /// unavailable; `surface_tenants` maps every stored surface id to its tenant.
 pub(crate) fn judge_provider_keys(
     surface_id: &str,
@@ -1935,16 +1949,20 @@ pub(crate) fn judge_provider_keys(
                 .map(|key_id| (key_id, true)),
         )
     {
-        let Some(owner_ids) = owners.owners.get(key_id) else {
-            if !legacy {
-                issue(key_id, ProviderKeyIssueKind::MissingKey);
+        let owner_ids = match owners.status_of(key_id) {
+            KeyStatus::Found(owner_ids) => owner_ids,
+            KeyStatus::Unknown => {
+                issue(key_id, ProviderKeyIssueKind::StoreUnavailable);
+                continue;
             }
-            continue;
+            KeyStatus::Absent => {
+                if !legacy {
+                    issue(key_id, ProviderKeyIssueKind::MissingKey);
+                }
+                continue;
+            }
         };
-        if owners
-            .revoked
-            .contains(key_id)
-        {
+        if owners.is_revoked(key_id) {
             issue(key_id, ProviderKeyIssueKind::RevokedKey);
             continue;
         }
@@ -1991,12 +2009,16 @@ pub(crate) fn judge_provider_keys(
 }
 
 /// The surfaces owning each API Key Provider key, by key id.
+/// Unavailable while a key folder could not be loaded, as an owner it leaves out may be another
+/// tenant's.
 pub(crate) async fn provider_key_owners(
-    state: &IdentityApiState
-) -> Result<std::collections::HashMap<String, Vec<String>>, SurfaceApiError> {
-    provider_key_listing(state)
-        .await
-        .map(|listing| listing.owners)
+    store: &dyn crate::api_keys::store::ApiKeyStore
+) -> Result<KeyListing, SurfaceApiError> {
+    let listing = provider_key_listing_in(store).await?;
+    if !listing.is_complete() {
+        return Err(SurfaceApiError::Unavailable("API key store is unavailable".to_string()));
+    }
+    Ok(listing)
 }
 
 /// The [`KeyListing`] of the API key store; a key folder that could not be loaded is left out.
@@ -2034,13 +2056,26 @@ pub(crate) async fn refuse_id_owning_api_keys(
     Ok(())
 }
 
-/// The surfaces owning each API Key Provider key, by key id, and the ids of the revoked keys.
+/// The surfaces owning each API Key Provider key, by key id, the ids of the revoked keys, and the
+/// key folders that could not be loaded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KeyListing {
-    pub owners: std::collections::HashMap<String, Vec<String>>,
+    owners: std::collections::HashMap<String, Vec<String>>,
     /// Key ids with a revoked record; a key id held by more than one surface is revoked when any
     /// of its records is.
-    pub revoked: HashSet<String>,
+    revoked: HashSet<String>,
+    skipped: Vec<String>,
+}
+
+/// How a key id stands in a [`KeyListing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyStatus<'a> {
+    /// The key folders of these surfaces hold a key of this id.
+    Found(&'a [String]),
+    /// No key folder holds a key of this id, and every folder was loaded.
+    Absent,
+    /// No loaded key folder holds a key of this id, and a folder that could not be loaded may.
+    Unknown,
 }
 
 impl KeyListing {
@@ -2059,6 +2094,105 @@ impl KeyListing {
             .or_default();
         if !owners.contains(&key.agent_id) {
             owners.push(key.agent_id);
+        }
+    }
+
+    pub(crate) fn status_of(
+        &self,
+        id: &str,
+    ) -> KeyStatus<'_> {
+        match self.owners.get(id) {
+            Some(owners) => KeyStatus::Found(owners),
+            None if self.skipped.is_empty() => KeyStatus::Absent,
+            None => KeyStatus::Unknown,
+        }
+    }
+
+    /// The surfaces whose key folders hold a key of this id; none unless it is found.
+    pub(crate) fn owners_of(
+        &self,
+        id: &str,
+    ) -> &[String] {
+        match self.status_of(id) {
+            KeyStatus::Found(owners) => owners,
+            KeyStatus::Absent | KeyStatus::Unknown => &[],
+        }
+    }
+
+    pub(crate) fn is_revoked(
+        &self,
+        id: &str,
+    ) -> bool {
+        self.revoked.contains(id)
+    }
+
+    /// The key folders that could not be loaded.
+    pub(crate) fn skipped(&self) -> &[String] {
+        &self.skipped
+    }
+
+    /// Whether every key folder was loaded.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.skipped.is_empty()
+    }
+
+    /// Takes in the keys of `named` that `keys`, the key folder `folder` read from disk, holds:
+    /// the folder no longer owns a named key it does not hold, and is no longer skipped.
+    pub(crate) fn take_in_folder(
+        &mut self,
+        folder: &str,
+        keys: Vec<crate::api_keys::ApiKeyMeta>,
+        named: &HashSet<&str>,
+    ) {
+        for id in named {
+            if !keys
+                .iter()
+                .any(|key| key.key_id == *id)
+            {
+                self.drop_owner(id, folder);
+            }
+        }
+        self.skipped
+            .retain(|skipped| skipped != folder);
+        for key in keys {
+            if named.contains(key.key_id.as_str()) {
+                self.add(key);
+            }
+        }
+    }
+
+    /// The key folder `folder` could not be read from disk: it is skipped, and no longer read as
+    /// the owner of a key of `named`.
+    pub(crate) fn skip_folder(
+        &mut self,
+        folder: &str,
+        named: &HashSet<&str>,
+    ) {
+        for id in named {
+            self.drop_owner(id, folder);
+        }
+        if !self
+            .skipped
+            .iter()
+            .any(|skipped| skipped == folder)
+        {
+            self.skipped
+                .push(folder.to_string());
+        }
+    }
+
+    fn drop_owner(
+        &mut self,
+        id: &str,
+        folder: &str,
+    ) {
+        let Some(owners) = self.owners.get_mut(id) else {
+            return;
+        };
+        owners.retain(|owner| owner != folder);
+        if owners.is_empty() {
+            self.owners.remove(id);
+            self.revoked.remove(id);
         }
     }
 }
@@ -2088,7 +2222,7 @@ pub struct ApiKeyReference {
 
 /// The [`ApiKeyReference`]s of the key ids `ids` the surface `surface_id` names, judged as
 /// [`judge_provider_keys`] does: a legacy secret is reported only when a key of that id exists,
-/// and every id is `unknown` when `listing` is `None`. Only a key of this surface reports its
+/// and an id is `unknown` when `listing` is `None` or a key folder it could not load may hold it. Only a key of this surface reports its
 /// status, so nothing of another surface's key is revealed. Sorted by key id.
 pub(crate) fn api_key_references(
     surface_id: &str,
@@ -2107,24 +2241,19 @@ pub(crate) fn api_key_references(
         .filter_map(|(key_id, legacy)| {
             let status = match listing {
                 None => ApiKeyReferenceStatus::Unknown,
-                Some(listing) => match listing.owners.get(key_id) {
-                    None if legacy => return None,
-                    None => ApiKeyReferenceStatus::Missing,
-                    Some(owners)
+                Some(listing) => match listing.status_of(key_id) {
+                    KeyStatus::Unknown => ApiKeyReferenceStatus::Unknown,
+                    KeyStatus::Absent if legacy => return None,
+                    KeyStatus::Absent => ApiKeyReferenceStatus::Missing,
+                    KeyStatus::Found(owners)
                         if !owners
                             .iter()
                             .any(|owner| owner == surface_id) =>
                     {
                         ApiKeyReferenceStatus::Unavailable
                     }
-                    Some(_)
-                        if listing
-                            .revoked
-                            .contains(key_id) =>
-                    {
-                        ApiKeyReferenceStatus::Revoked
-                    }
-                    Some(_) => ApiKeyReferenceStatus::Active,
+                    KeyStatus::Found(_) if listing.is_revoked(key_id) => ApiKeyReferenceStatus::Revoked,
+                    KeyStatus::Found(_) => ApiKeyReferenceStatus::Active,
                 },
             };
             Some(ApiKeyReference { key_id: key_id.clone(), status })
@@ -2134,10 +2263,9 @@ pub(crate) fn api_key_references(
     references
 }
 
-/// The [`ApiKeyReference`]s of `surface` in its base and every variant, read from the complete
-/// key listing the provider key gate reads, so a key in a folder that cannot be loaded is
-/// `unknown`, never `missing`. `None` when the surface names no key id or its variants cannot be
-/// resolved.
+/// The [`ApiKeyReference`]s of `surface` in its base and every variant, read from a listing of
+/// the API key store, so an id that a key folder which cannot be loaded may hold is `unknown`,
+/// never `missing`. `None` when the surface names no key id or its variants cannot be resolved.
 pub(crate) async fn surface_api_key_references(
     state: &IdentityApiState,
     surface: &AgentSurface,
@@ -2147,7 +2275,7 @@ pub(crate) async fn surface_api_key_references(
         return None;
     }
     let listing = match state.api_key_store.as_deref() {
-        Some(store) => complete_provider_key_listing_in(store)
+        Some(store) => provider_key_listing_in(store)
             .await
             .inspect_err(|error| {
                 tracing::warn!(surface = %surface.surface_id, ?error, "Could not list the API keys a surface names");
@@ -2161,36 +2289,47 @@ pub(crate) async fn surface_api_key_references(
 #[cfg(test)]
 impl From<std::collections::HashMap<String, Vec<String>>> for KeyListing {
     fn from(owners: std::collections::HashMap<String, Vec<String>>) -> Self {
-        Self {
-            owners,
-            revoked: HashSet::new(),
-        }
+        Self { owners, ..Self::default() }
     }
 }
 
-/// The [`KeyListing`] of `store`. A key folder that could not be loaded is left out.
+#[cfg(test)]
+impl KeyListing {
+    /// This listing with the key ids of `revoked` revoked and the key folders of `skipped` not
+    /// loaded.
+    pub(crate) fn with(
+        mut self,
+        revoked: &[&str],
+        skipped: &[&str],
+    ) -> Self {
+        self.revoked.extend(
+            revoked
+                .iter()
+                .map(|id| id.to_string()),
+        );
+        self.skipped.extend(
+            skipped
+                .iter()
+                .map(|folder| folder.to_string()),
+        );
+        self
+    }
+}
+
+/// The [`KeyListing`] of `store`: a key folder that could not be loaded is left out and named as
+/// skipped; an error when the store cannot be listed at all.
 pub(crate) async fn provider_key_listing_in(
     store: &dyn crate::api_keys::store::ApiKeyStore
 ) -> Result<KeyListing, SurfaceApiError> {
-    key_listing(store.list_all().await)
-}
-
-/// The [`KeyListing`] of `store`, an error when the keys of an agent could not be loaded.
-pub(crate) async fn complete_provider_key_listing_in(
-    store: &dyn crate::api_keys::store::ApiKeyStore
-) -> Result<KeyListing, SurfaceApiError> {
-    key_listing(
-        store
-            .list_all_complete()
-            .await,
-    )
-}
-
-fn key_listing(
-    keys: crate::api_keys::ApiKeyResult<Vec<crate::api_keys::ApiKeyMeta>>
-) -> Result<KeyListing, SurfaceApiError> {
-    let mut listing = KeyListing::default();
-    for key in keys.map_err(|error| internal("API key", error))? {
+    let (keys, skipped) = store
+        .list_all_with_skipped()
+        .await
+        .map_err(|error| internal("API key", error))?;
+    let mut listing = KeyListing {
+        skipped,
+        ..KeyListing::default()
+    };
+    for key in keys {
         listing.add(key);
     }
     Ok(listing)
@@ -2518,14 +2657,14 @@ mod tests {
             ],
             legacy_secrets: vec!["atgk_legacy_own".into(), "atgk_legacy_plain".into()],
         };
-        let mut listing = KeyListing::from(std::collections::HashMap::from([
+        let listing = KeyListing::from(std::collections::HashMap::from([
             ("atgk_active".to_string(), vec!["own".to_string()]),
             ("atgk_revoked".to_string(), vec!["own".to_string()]),
             ("atgk_foreign".to_string(), vec!["other".to_string()]),
             ("atgk_foreign_revoked".to_string(), vec!["other".to_string()]),
             ("atgk_legacy_own".to_string(), vec!["own".to_string()]),
-        ]));
-        listing.revoked = HashSet::from(["atgk_revoked".to_string(), "atgk_foreign_revoked".to_string()]);
+        ]))
+        .with(&["atgk_revoked", "atgk_foreign_revoked"], &[]);
         let reference = |key_id: &str, status| ApiKeyReference { key_id: key_id.into(), status };
 
         assert_eq!(
@@ -2551,6 +2690,152 @@ mod tests {
             serde_json::to_value(reference("atgk_x", ApiKeyReferenceStatus::Unavailable)).unwrap(),
             serde_json::json!({"key_id": "atgk_x", "status": "unavailable"})
         );
+    }
+
+    fn partial_listing() -> KeyListing {
+        KeyListing::from(std::collections::HashMap::from([
+            ("atgk_own".to_string(), vec!["own".to_string()]),
+            ("atgk_foreign".to_string(), vec!["other".to_string()]),
+        ]))
+        .with(&[], &["locked"])
+    }
+
+    #[test]
+    fn an_id_no_loaded_key_folder_holds_is_unknown_while_a_folder_is_skipped_and_absent_otherwise() {
+        let partial = partial_listing();
+        let complete =
+            KeyListing::from(std::collections::HashMap::from([("atgk_own".to_string(), vec!["own".to_string()])]));
+
+        assert_eq!(partial.status_of("atgk_own"), KeyStatus::Found(&["own".to_string()]));
+        assert_eq!(partial.status_of("atgk_elsewhere"), KeyStatus::Unknown);
+        assert_eq!(complete.status_of("atgk_elsewhere"), KeyStatus::Absent);
+        assert_eq!(partial.owners_of("atgk_elsewhere"), [] as [String; 0]);
+        assert_eq!(partial.skipped(), ["locked".to_string()]);
+        assert!(!partial.is_complete() && complete.is_complete());
+
+        let named = HashSet::from(["atgk_own"]);
+        let mut unreadable = complete.clone();
+        unreadable.skip_folder("own", &named);
+        assert_eq!(
+            unreadable.status_of("atgk_own"),
+            KeyStatus::Unknown,
+            "a folder that cannot be read from disk owns nothing and is skipped"
+        );
+        unreadable.take_in_folder("own", Vec::new(), &named);
+        assert_eq!(unreadable.status_of("atgk_own"), KeyStatus::Absent, "read again, it no longer holds the key");
+    }
+
+    #[test]
+    fn an_id_no_loaded_key_folder_holds_is_judged_store_unavailable_and_a_found_one_as_usual() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_foreign".into(), "atgk_own".into(), "atgk_unknown".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let tenants: std::collections::HashMap<&str, Option<&str>> =
+            [("own", Some("tenant-a")), ("other", Some("tenant-a"))].into();
+
+        let issues: Vec<_> =
+            judge_provider_keys("own", Some("tenant-a"), &ids, Some(&partial_listing()), &tenants, RuleMode::Enforce)
+                .into_iter()
+                .map(|issue| (issue.key_id, issue.kind))
+                .collect();
+
+        assert_eq!(
+            issues,
+            vec![
+                ("atgk_foreign".to_string(), ProviderKeyIssueKind::OtherSurface { enforced: true }),
+                ("atgk_unknown".to_string(), ProviderKeyIssueKind::StoreUnavailable),
+                ("atgk_legacy".to_string(), ProviderKeyIssueKind::StoreUnavailable),
+            ]
+        );
+    }
+
+    #[test]
+    fn api_key_references_report_an_id_no_loaded_key_folder_holds_as_unknown() {
+        let ids = ProviderKeyIds {
+            keys: vec!["atgk_own".into(), "atgk_unknown".into()],
+            legacy_secrets: vec!["atgk_legacy".into()],
+        };
+        let statuses: Vec<_> = api_key_references("own", &ids, Some(&partial_listing()))
+            .into_iter()
+            .map(|reference| (reference.key_id, reference.status))
+            .collect();
+
+        assert_eq!(
+            statuses,
+            vec![
+                ("atgk_legacy".to_string(), ApiKeyReferenceStatus::Unknown),
+                ("atgk_own".to_string(), ApiKeyReferenceStatus::Active),
+                ("atgk_unknown".to_string(), ApiKeyReferenceStatus::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_save_refuses_a_new_id_no_loaded_key_folder_holds_as_unavailable_and_keeps_a_stored_one() {
+        let partial = partial_listing();
+        let complete = KeyListing::default();
+        let outcome =
+            |listing: &KeyListing, id: &str, kept: bool, legacy: bool| match listed_owners(listing, id, kept, legacy) {
+                Ok(owners) => Ok(owners.map(<[String]>::to_vec)),
+                Err(SurfaceApiError::Unavailable(message)) => Err(format!("503 {message}")),
+                Err(SurfaceApiError::BadRequest(message)) => Err(format!("400 {message}")),
+                Err(other) => panic!("{other:?}"),
+            };
+        let unavailable = Err("503 API key store is unavailable".to_string());
+
+        assert_eq!(outcome(&partial, "atgk_own", false, false), Ok(Some(vec!["own".to_string()])));
+        assert_eq!(outcome(&partial, "atgk_unknown", false, false), unavailable);
+        assert_eq!(outcome(&partial, "atgk_unknown", false, true), unavailable, "a new legacy secret too");
+        assert_eq!(outcome(&partial, "atgk_unknown", true, false), Ok(None), "a stored one is kept");
+        assert_eq!(outcome(&partial, "atgk_unknown", true, true), Ok(None));
+        assert_eq!(
+            outcome(&complete, "atgk_unknown", false, false),
+            Err("400 API key reference is not accessible".to_string())
+        );
+        assert_eq!(outcome(&complete, "atgk_unknown", false, true), Ok(None), "a legacy secret no key has");
+    }
+
+    #[tokio::test]
+    async fn the_tenant_ownership_listing_is_unavailable_while_a_key_folder_cannot_be_loaded() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let first = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+        for owner in ["readable", "locked"] {
+            first
+                .create(owner, "client", None, "test")
+                .await
+                .unwrap();
+        }
+        let locked = directory
+            .path()
+            .join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&locked).is_err();
+        let store = crate::api_keys::FileSystemApiKeyStore::new(&path)
+            .await
+            .unwrap();
+
+        let refused = provider_key_owners(&store).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listed = provider_key_owners(&store).await;
+        if !unreadable {
+            return;
+        }
+
+        assert!(
+            matches!(&refused, Err(SurfaceApiError::Unavailable(message)) if message == "API key store is unavailable"),
+            "{refused:?}"
+        );
+        assert!(listed.is_ok_and(|listing| listing.is_complete()));
     }
 
     #[test]

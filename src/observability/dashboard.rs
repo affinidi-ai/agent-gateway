@@ -2161,11 +2161,9 @@ fn mark_revoked_identities(
         identity.revoked = identity.surface_deleted
             || keys.is_some_and(|keys| {
                 api_key_id_of(identity).is_some_and(|key_id| {
-                    keys.revoked.contains(key_id)
+                    keys.is_revoked(key_id)
                         || (key_id.starts_with(crate::api_keys::KEY_ID_PREFIX)
-                            && !keys
-                                .owners
-                                .contains_key(key_id))
+                            && keys.status_of(key_id) == crate::identity::handlers::surface_tenancy::KeyStatus::Absent)
                 })
             });
     }
@@ -2183,8 +2181,12 @@ async fn identity_api_keys(
         return None;
     }
     let store = crate::identity::provider_key_gate::gate().api_key_store()?;
-    match crate::identity::handlers::surface_tenancy::complete_provider_key_listing_in(store.as_ref()).await {
-        Ok(listing) => Some(listing),
+    match crate::identity::handlers::surface_tenancy::provider_key_listing_in(store.as_ref()).await {
+        Ok(listing) if listing.is_complete() => Some(listing),
+        Ok(listing) => {
+            tracing::warn!(skipped = ?listing.skipped(), "Some API key folders could not be loaded for the identity list");
+            None
+        }
         Err(error) => {
             tracing::warn!("Failed to list API keys for the identity list: {error:?}");
             None
@@ -3217,15 +3219,12 @@ mod tests {
                 keyed("did:example:plain", &[]),
                 managed("did:example:surface-gone", "gone"),
             ];
-            let mut listing = crate::identity::handlers::surface_tenancy::KeyListing::default();
-            for key_id in ["atgk_revoked", "atgk_active"] {
-                listing
-                    .owners
-                    .insert(key_id.to_string(), vec!["oxygen".to_string()]);
-            }
-            listing
-                .revoked
-                .insert("atgk_revoked".to_string());
+            let listing =
+                crate::identity::handlers::surface_tenancy::KeyListing::from(std::collections::HashMap::from([
+                    ("atgk_revoked".to_string(), vec!["oxygen".to_string()]),
+                    ("atgk_active".to_string(), vec!["oxygen".to_string()]),
+                ]))
+                .with(&["atgk_revoked"], &[]);
             let mut rows: Vec<_> = list(records, &[surface("oxygen", "OXYGEN")], &names())
                 .await
                 .into_values()
@@ -3277,13 +3276,10 @@ mod tests {
                     .await
                     .into_values()
                     .collect();
-                let mut listing = crate::identity::handlers::surface_tenancy::KeyListing::default();
-                listing
-                    .owners
-                    .insert("atgk_revoked_in_delta".to_string(), vec!["neon".to_string()]);
-                listing
-                    .revoked
-                    .insert("atgk_revoked_in_delta".to_string());
+                let listing = crate::identity::handlers::surface_tenancy::KeyListing::from(
+                    std::collections::HashMap::from([("atgk_revoked_in_delta".to_string(), vec!["neon".to_string()])]),
+                )
+                .with(&["atgk_revoked_in_delta"], &[]);
                 super::super::mark_revoked_identities(&mut rows, Some(&listing));
                 rows
             };

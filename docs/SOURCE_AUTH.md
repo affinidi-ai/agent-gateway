@@ -337,8 +337,8 @@ read-only `api_key_references`: one `{ "key_id", "status" }` per distinct id, so
 with the ids the gate checks (a legacy Caller Context secret only when a key of that id
 exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
 has the id, `unavailable` for a key of any other surface, whose status is never reported,
-and `unknown` for every id when the API key store cannot be read in full, as the gate's
-`store_unavailable`. A same-tenant key of another surface that still serves under `warn` is
+and `unknown`, as the gate's `store_unavailable`, for every id when the API key store cannot be
+read, and for an id no loaded key folder holds while a key folder cannot be loaded. A same-tenant key of another surface that still serves under `warn` is
 `unavailable` too: a surface names only its own keys. The field is absent when the surface
 names no key id, and on the surface list and variant responses. It is read from this node's API
 key cache, so after a key is revoked on another node it can still say `active` until this node's
@@ -1411,15 +1411,18 @@ keys is checked again on its next request.
   kept like a missing key's, so the request after `cache_refresh_interval_secs` (30 seconds when
   it is `0`) checks again and the surface serves once a read succeeds; requests before then are
   refused without reading the store.
-- When a surface goes live, the store counts as unreadable while the keys of any surface's key
-  folder cannot be loaded, for example when the folder cannot be read, so a key in that folder
-  is never mistaken for a missing one. Saves, tenant reassignment and the `GET /v1/api-keys`
-  listing still answer, without that folder's keys: a save naming a key in that folder is
-  refused as `API key reference is not accessible` unless the stored surface already named it.
+- While the keys of a surface's key folder cannot be loaded, for example when the folder cannot
+  be read, a key id that no loaded folder holds is judged `store_unavailable`, never as a missing
+  key, since that folder may hold it: a surface naming it is not ready in either mode, and a key
+  id found in a loaded folder is judged as usual. A save that adds a reference to such an id
+  answers `503` "API key store is unavailable"; one the stored surface already named is kept.
+  Tenant reassignment of a surface naming a key id is refused with the same message until the
+  folder can be loaded. The gateway logs the folders once, by name.
 - Boot and a configuration reload read the API key store once for all the surfaces they bring
   live, and their credential policy report judges from that same listing. While that listing
   fails, the report logs one warning and lists every surface naming a key id as
-  `store_unavailable`, never as `missing_key`.
+  `store_unavailable`, never as `missing_key`; while it leaves key folders out, the report names
+  them and lists a key id no loaded folder holds as `store_unavailable`.
 - If the API key store fails to start, the gateway runs without it until it restarts: every
   surface naming an `atgk_` id stays not ready in either mode. Fix the store and restart.
 

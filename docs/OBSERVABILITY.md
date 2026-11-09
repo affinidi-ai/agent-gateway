@@ -372,9 +372,11 @@ id, with `subject`, `id`, `tenant`, `rule="provider_key_tenant"`, `api_key_id`, 
 refused at runtime (always for `revoked_key` and `missing_key`); see
 [Provider keys when a surface goes live](SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 The report judges from the API key listing the provider key check of the same boot or reload
-read. When that listing fails, including when a key folder cannot be loaded, the report logs one
-`WARN` line with `reason=api_key_store_unavailable` and lists every surface naming a key id as
-`store_unavailable`.
+read. When that listing fails, the report logs one `WARN` line with
+`reason=api_key_store_unavailable` and lists every surface naming a key id as
+`store_unavailable`. When a key folder cannot be loaded, it logs one `WARN` line with
+`reason=api_key_store_unavailable` and the `skipped` folders, and lists as `store_unavailable`
+only the key ids no loaded folder holds.
 
 An OAuth provider breaks `token_endpoint_https` when its token endpoint fails the check its token
 requests are held to: not an `https` URL and not listed in `insecure_token_endpoints`. An `api_key`
