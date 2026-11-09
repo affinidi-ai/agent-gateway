@@ -263,6 +263,58 @@ fn reject_public_predicate_route(surface: &AgentSurface) -> Result<(), SurfaceAp
     Ok(())
 }
 
+/// Refuse an active surface whose route is not a plain path, or that no
+/// surface prefix serves, so callers could not reach it there. A disabled
+/// surface serves no route, and the route an active surface already had is not
+/// checked again, so a surface stored before these checks can still be edited.
+fn refuse_unservable_route(
+    surface: &AgentSurface,
+    existing: Option<&AgentSurface>,
+    network_config: &crate::config::NetworkConfig,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::SurfaceStatus;
+    let route = surface
+        .access_point
+        .route
+        .as_str();
+    let kept_route = existing
+        .is_some_and(|existing| existing.status != SurfaceStatus::Disabled && existing.access_point.route == route);
+    if surface.status == SurfaceStatus::Disabled || kept_route {
+        return Ok(());
+    }
+    crate::config::route_claims::check_surface_route_syntax(route)
+        .and_then(|()| network_config.check_surface_route(route))
+        .map_err(SurfaceApiError::BadRequest)
+}
+
+/// The `gateway.json` on disk, from which the dashboard offers surface
+/// prefixes, so a prefix added and reloaded is accepted without a restart; the
+/// one read at startup when the file cannot be loaded.
+fn current_network_config<'a>(
+    bootstrap: &crate::config::BootstrapConfig,
+    read_at_startup: &'a crate::config::NetworkConfig,
+) -> std::borrow::Cow<'a, crate::config::NetworkConfig> {
+    match bootstrap.load_network_config() {
+        Ok(network_config) => std::borrow::Cow::Owned(network_config),
+        Err(error) => {
+            warn!("Checking the surface route against the gateway.json read at startup: {error}");
+            std::borrow::Cow::Borrowed(read_at_startup)
+        }
+    }
+}
+
+/// Store a new or changed route the way the inbound router matches it, without
+/// a trailing `/`; an unchanged route is kept as stored.
+fn normalize_changed_route(
+    surface: &mut AgentSurface,
+    existing: Option<&AgentSurface>,
+) {
+    let route = &surface.access_point.route;
+    if !route.is_empty() && existing.is_none_or(|existing| existing.access_point.route != *route) {
+        surface.access_point.route = crate::config::route_claims::normalize_route(route);
+    }
+}
+
 fn validate_required_fields(
     surface: &AgentSurface,
     label: &str,
@@ -2128,7 +2180,8 @@ fn check_listen_path_collisions(
 /// by resolved listener port. Mirrors the orchestrator's `channels_by_port`
 /// grouping, which resolves `access_point.listen_address` with the
 /// **unrestricted** `map_url_to_port` — so validation must use the same
-/// resolver to collide exactly where runtime routing would.
+/// resolver to collide exactly where runtime routing would. The route is
+/// normalized the way the inbound handler matches it, so `/a` and `/a/` collide.
 fn access_point_route_claim(
     surface: &AgentSurface,
     resolve_port: &impl Fn(&str) -> Option<u16>,
@@ -2141,13 +2194,7 @@ fn access_point_route_claim(
         Some(port) => ListenerKey::Port(port),
         None => ListenerKey::Unresolved(addr.to_string()),
     };
-    (
-        key,
-        surface
-            .access_point
-            .route
-            .clone(),
-    )
+    (key, crate::config::route_claims::normalize_route(&surface.access_point.route))
 }
 
 /// Reject a surface whose `access_point.route` would shadow an existing
@@ -3081,19 +3128,9 @@ pub async fn create_surface(
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
 
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
+    // Normalize the route BEFORE the shape check so the historical "missing
+    // slash is auto-fixed" behaviour is preserved.
+    normalize_changed_route(&mut surface, None);
 
     // Required-field shape check on the base surface.
     validate_required_fields(&surface, "")?;
@@ -3101,6 +3138,7 @@ pub async fn create_surface(
     validate_api_key_identities(&surface, "")?;
     validate_source_auth(&surface, None)?;
     reject_public_predicate_route(&surface)?;
+    refuse_unservable_route(&surface, None, &current_network_config(&state.bootstrap_config, &state.network_config))?;
     surface.access_point.public = Some(
         surface
             .access_point
@@ -4101,11 +4139,17 @@ async fn validate_and_save_surface(
     {
         surface.access_point.route = format!("/{}", surface.access_point.route);
     }
+    normalize_changed_route(&mut surface, existing);
 
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
+    refuse_unservable_route(
+        &surface,
+        existing,
+        &current_network_config(&state.bootstrap_config, &state.network_config),
+    )?;
     if surface
         .access_point
         .public
@@ -8746,6 +8790,181 @@ mod validation_tests {
         match err {
             SurfaceApiError::BadRequest(msg) => {
                 assert!(msg.contains("/api"), "message should name the route: {msg}");
+                assert!(msg.contains("'beta'"), "message should name the owning surface: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn network_with_agents_prefix() -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "Agents", "prefix": "/agents" }],
+            "routes": { "api": { "type": "identity_api", "prefix": "/api" } },
+        }))
+        .expect("network config fixture")
+    }
+
+    fn route_refusal(
+        surface: &AgentSurface,
+        existing: Option<&AgentSurface>,
+    ) -> String {
+        match refuse_unservable_route(surface, existing, &network_with_agents_prefix()) {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("{}: expected BadRequest, got {other:?}", surface.access_point.route),
+        }
+    }
+
+    fn disabled(mut surface: AgentSurface) -> AgentSurface {
+        surface.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        surface
+    }
+
+    #[test]
+    fn a_surface_route_under_a_surface_prefix_is_accepted() {
+        let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+
+        refuse_unservable_route(&surface, None, &network_with_agents_prefix())
+            .expect("a surface prefix serves the route");
+    }
+
+    #[test]
+    fn a_surface_route_no_surface_prefix_serves_is_refused() {
+        for (route, reason) in
+            [("/foo", "is not served by any surface prefix"), ("/api/foo", "is served by route 'api' (identity_api)")]
+        {
+            let msg = route_refusal(&surface_with_route("s1", "alpha", "0.0.0.0:8443", route), None);
+            assert!(msg.contains(reason), "{route}: {msg}");
+            assert!(msg.contains("under one of: /agents"), "{route}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_surface_route_that_spells_a_variant_url_is_refused() {
+        for route in ["/agents/foo$prod", "/agents/foo%24prod", "/agents//foo"] {
+            let msg = route_refusal(&surface_with_route("s1", "alpha", "0.0.0.0:8443", route), None);
+            assert!(msg.contains("must be a plain path"), "{route}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_surface_may_keep_a_route_no_surface_prefix_serves() {
+        let surface = disabled(surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo"));
+
+        refuse_unservable_route(&surface, None, &network_with_agents_prefix())
+            .expect("a disabled surface serves no route");
+    }
+
+    #[test]
+    fn an_active_surface_keeps_its_stored_route_when_other_settings_change() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+        let mut edited = stored.clone();
+        edited.description = "edited".to_string();
+
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("a route the surface already had is not checked again");
+    }
+
+    #[test]
+    fn a_changed_route_is_checked_again() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+        let moved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        assert!(route_refusal(&moved, Some(&stored)).contains("is not served by any surface prefix"));
+    }
+
+    #[test]
+    fn enabling_a_disabled_surface_checks_its_route() {
+        let stored = disabled(surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo"));
+        let enabled = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        assert!(route_refusal(&enabled, Some(&stored)).contains("is not served by any surface prefix"));
+    }
+
+    fn bootstrap_reading(gateway_json: &std::path::Path) -> crate::config::BootstrapConfig {
+        toml::from_str(&format!(
+            "backup_encryption_key = \"unused\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n\
+             [config_files]\ngateway = {:?}\n",
+            gateway_json
+                .display()
+                .to_string()
+        ))
+        .expect("bootstrap config fixture")
+    }
+
+    #[test]
+    fn a_surface_prefix_added_to_gateway_json_after_startup_serves_a_saved_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let mut on_disk = serde_json::to_value(network_with_agents_prefix()).unwrap();
+        on_disk["channels"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "id": "added", "name": "Added", "prefix": "/added" }));
+        std::fs::write(&gateway_json, on_disk.to_string()).unwrap();
+        let read_at_startup = network_with_agents_prefix();
+        let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/added/foo");
+
+        let current = current_network_config(&bootstrap_reading(&gateway_json), &read_at_startup);
+
+        refuse_unservable_route(&surface, None, &current).expect("the prefix on disk serves the route");
+        assert!(refuse_unservable_route(&surface, None, &read_at_startup).is_err());
+    }
+
+    #[test]
+    fn the_gateway_json_read_at_startup_checks_a_route_when_the_file_cannot_be_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_at_startup = network_with_agents_prefix();
+
+        let current = current_network_config(
+            &bootstrap_reading(
+                &dir.path()
+                    .join("missing.json"),
+            ),
+            &read_at_startup,
+        );
+
+        let served = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+        refuse_unservable_route(&served, None, &current).expect("the startup prefix serves the route");
+        let unserved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/added/foo");
+        assert!(refuse_unservable_route(&unserved, None, &current).is_err());
+    }
+
+    #[test]
+    fn a_new_or_changed_route_is_stored_without_a_trailing_slash() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/old/");
+
+        let mut created = surface_with_route("s1", "alpha", "0.0.0.0:8443", "agents/foo/");
+        normalize_changed_route(&mut created, None);
+        assert_eq!(created.access_point.route, "/agents/foo");
+
+        let mut moved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/new/");
+        normalize_changed_route(&mut moved, Some(&stored));
+        assert_eq!(moved.access_point.route, "/agents/new");
+
+        let mut kept = stored.clone();
+        normalize_changed_route(&mut kept, Some(&stored));
+        assert_eq!(kept.access_point.route, "/agents/old/");
+
+        let mut missing = surface_with_route("s1", "alpha", "0.0.0.0:8443", "");
+        normalize_changed_route(&mut missing, None);
+        assert_eq!(missing.access_point.route, "", "a missing route stays missing for the required-field check");
+    }
+
+    #[test]
+    fn ap_route_collision_rejects_a_route_that_differs_only_by_a_trailing_slash() {
+        let a = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo/");
+        let b = surface_with_route("s2", "beta", "0.0.0.0:8443", "/agents/foo");
+        let err = check_access_point_route_collisions(&a, &[b], no_ports)
+            .expect_err("routes the inbound router matches alike must collide");
+        match err {
+            SurfaceApiError::BadRequest(msg) => {
+                assert!(msg.contains("'/agents/foo'"), "message should name the route: {msg}");
                 assert!(msg.contains("'beta'"), "message should name the owning surface: {msg}");
             }
             other => panic!("expected BadRequest, got {other:?}"),

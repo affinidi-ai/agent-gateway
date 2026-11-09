@@ -1014,12 +1014,7 @@ async fn disable_duplicate_route_surfaces(
             Some(port) => format!("port {}", port),
             None => format!("address '{}'", listen_address),
         };
-        let normalized_route = if route.starts_with('/') {
-            route.to_string()
-        } else {
-            format!("/{}", route)
-        };
-        let combo = format!("{}:{}", listener, normalized_route);
+        let combo = format!("{}:{}", listener, config::route_claims::normalize_route(route));
         if !seen_route_port_combos.insert(combo.clone()) {
             error!(
                 surface = %surface.name,
@@ -1537,6 +1532,20 @@ mod duplicate_route_surface_tests {
             Some(s) => assert_eq!(s.status, SurfaceStatus::Disabled),
             None => panic!("auto-disabled surface 's-b' must be persisted to the store"),
         }
+    }
+
+    #[tokio::test]
+    async fn routes_that_differ_only_by_a_trailing_slash_are_duplicates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let mut channels = vec![surface("s-a", "/agents/a"), surface("s-b", "/agents/a/")];
+
+        disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
+            .await
+            .expect("dedup should succeed");
+
+        assert_eq!(channels[0].status, SurfaceStatus::Active);
+        assert_eq!(channels[1].status, SurfaceStatus::Disabled);
     }
 
     #[tokio::test]

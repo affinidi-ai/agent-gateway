@@ -1661,7 +1661,7 @@ async fn an_a2a_proxy_card_preview_has_the_generated_card_and_no_agent_card() {
         .post(format!("{}/api/v1/surfaces", h.gateway_base))
         .json(&json!({
             "name": "proxy-card-preview", "status": "active",
-            "access_point": {"listen_address": listener, "route": "/proxy-card", "protocol": "a2a"},
+            "access_point": {"listen_address": listener, "route": "/smoke/proxy-card", "protocol": "a2a"},
             "target": {"endpoint": format!("a2a-proxy://{PROXY_ID}"), "a2a_proxy_id": PROXY_ID}
         }))
         .send()

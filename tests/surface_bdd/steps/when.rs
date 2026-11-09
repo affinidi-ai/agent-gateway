@@ -1573,7 +1573,7 @@ async fn operator_creates_a_surface_asking_for_external_consent(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    payload["access_point"]["route"] = serde_json::json!(format!("{route}-external-consent"));
+    payload["access_point"]["route"] = serde_json::json!(format!("{route}/external-consent"));
     for point in payload["transit"]["points"]
         .as_array_mut()
         .into_iter()
@@ -1664,6 +1664,17 @@ async fn valid_surface_create_request_submitted(
     route: String,
 ) {
     create_valid_surface_for_route(world, &route).await;
+}
+
+#[when(expr = "the operator moves the surface to route {string}")]
+async fn surface_moved_to_route(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let mut payload = get_current_admin_surface_body(world, "moving the surface");
+    payload["access_point"]["route"] = serde_json::json!(route);
+
+    update_created_surface(world, payload, "moving the surface").await;
 }
 
 pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {

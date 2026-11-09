@@ -3972,6 +3972,15 @@ pub async fn run_axum_proxy(
                 eprintln!("{}", banner);
             }
 
+            for (surface, reason) in network_config.unreachable_surfaces(&all_surfaces) {
+                warn!(
+                    surface = %loggable::untrusted(&surface.name),
+                    surface_id = %loggable::untrusted(&surface.surface_id),
+                    reason = %loggable::untrusted(&reason),
+                    "Callers cannot reach this surface by its route: move it under a surface prefix or disable it"
+                );
+            }
+
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 

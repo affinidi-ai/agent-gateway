@@ -242,6 +242,20 @@ pub enum RouteType {
     Onboarding,
 }
 
+impl RouteType {
+    /// The name `gateway.json` gives this type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RouteType::Proxy => "proxy",
+            RouteType::IdentityApi => "identity_api",
+            RouteType::Static => "static",
+            RouteType::ConnectionPoint => "connection_point",
+            RouteType::Redirect => "redirect",
+            RouteType::Onboarding => "onboarding",
+        }
+    }
+}
+
 /// A category of routes (e.g., "channels", "agents", "routes")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteCategory {
@@ -296,6 +310,7 @@ impl NetworkConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: NetworkConfig = serde_json::from_str(&contents)?;
         config.validate_listeners()?;
+        config.validate_route_prefixes()?;
         config.validate_terms()?;
         if let Some(profile) = &config.sts.mcp_issuer {
             profile.validate_network(&config)?;
@@ -1069,6 +1084,20 @@ mod url_mapping_tests {
                 300,
                 "{not_whole}"
             );
+        }
+    }
+
+    #[test]
+    fn a_route_type_name_is_the_one_gateway_json_uses() {
+        for route_type in [
+            RouteType::Proxy,
+            RouteType::IdentityApi,
+            RouteType::Static,
+            RouteType::ConnectionPoint,
+            RouteType::Redirect,
+            RouteType::Onboarding,
+        ] {
+            assert_eq!(serde_json::to_value(&route_type).unwrap(), route_type.as_str());
         }
     }
 

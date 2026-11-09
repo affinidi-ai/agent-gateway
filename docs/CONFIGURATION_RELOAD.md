@@ -88,7 +88,8 @@ shared outbound ports:
 2. Clear stale task-monitor entries; rebuilding the routers registers them again.
 3. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 4. Reload network configuration, group active surfaces by listener, and rebuild derived surface
-   state. Each surface's outbound state is updated in place rather than replaced: a surface that
+   state. A `gateway.json` in which two entries use the same prefix fails the reload here,
+   naming each pair, before any router is rebuilt. Each surface's outbound state is updated in place rather than replaced: a surface that
    still has Transit Points on an outbound listener gets its new configuration written into its
    state, and the state of one that no longer has any, because it was deleted, disabled or
    emptied, is retired, so its routes refuse each request with `404`.

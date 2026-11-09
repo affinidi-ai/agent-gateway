@@ -198,13 +198,13 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
     };
     let added = admin
         .post(&surfaces)
-        .json(&surface("/added", protected_resource("/added")))
+        .json(&surface("/smoke/added", protected_resource("/smoke/added")))
         .send()
         .await
         .unwrap();
     assert_eq!(added.status(), 201, "{}", added.text().await.unwrap());
     let published = client
-        .get(metadata_url(&harness, "/added"))
+        .get(metadata_url(&harness, "/smoke/added"))
         .send()
         .await
         .unwrap();
@@ -214,14 +214,14 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .json::<serde_json::Value>()
             .await
             .unwrap()["resource"],
-        "https://gateway.example/added"
+        "https://gateway.example/smoke/added"
     );
 
-    let mut elsewhere = protected_resource("/other");
+    let mut elsewhere = protected_resource("/smoke/other");
     elsewhere["resource"] = json!("https://elsewhere.example/other");
     let refused = admin
         .post(&surfaces)
-        .json(&surface("/other", elsewhere))
+        .json(&surface("/smoke/other", elsewhere))
         .send()
         .await
         .unwrap();
@@ -233,9 +233,9 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             .unwrap()
             .contains("MCP resource 'https://elsewhere.example/other' must be this endpoint's own public URL")
     );
-    let mut audience = surface("/other", protected_resource("/other"));
+    let mut audience = surface("/smoke/other", protected_resource("/smoke/other"));
     audience["access_point"]["caller_authentication"]["methods"][0]["audiences"] =
-        json!(["https://gateway.example/other"]);
+        json!(["https://gateway.example/smoke/other"]);
     let refused = admin
         .post(&surfaces)
         .json(&audience)
@@ -252,7 +252,7 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
     );
     // The strategy the harness surface uses trusts the local fixture issuer, not
     // the advertised server, so every token a client got would be refused.
-    let mut untrusted = surface("/other", protected_resource("/other"));
+    let mut untrusted = surface("/smoke/other", protected_resource("/smoke/other"));
     untrusted["access_point"]["caller_authentication"]["methods"][0]["jwt_verification_strategy_id"] =
         json!("e2e-jwt-strategy");
     let refused = admin
@@ -275,11 +275,11 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
         json!(["https://other-idp.example", AUTHORIZATION_SERVER]),
         json!([AUTHORIZATION_SERVER, "https://other-idp.example"]),
     ] {
-        let mut listed = protected_resource("/other");
+        let mut listed = protected_resource("/smoke/other");
         listed["authorization_servers"] = servers.clone();
         let refused = admin
             .post(&surfaces)
-            .json(&surface("/other", listed))
+            .json(&surface("/smoke/other", listed))
             .send()
             .await
             .unwrap();
@@ -293,11 +293,11 @@ async fn an_mcp_access_point_publishes_the_protected_resource_its_caller_authent
             "{servers}"
         );
     }
-    let mut http_issuer = protected_resource("/other");
+    let mut http_issuer = protected_resource("/smoke/other");
     http_issuer["authorization_servers"] = json!(["http://idp.example"]);
     let refused = admin
         .post(&surfaces)
-        .json(&surface("/other", http_issuer))
+        .json(&surface("/smoke/other", http_issuer))
         .send()
         .await
         .unwrap();
@@ -325,10 +325,10 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
         .json(&json!({
             "name": "edited",
             "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
-                "route": "/edited", "protocol": "mcp",
+                "route": "/smoke/edited", "protocol": "mcp",
                 "caller_authentication": {
                     "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}],
-                    "protected_resource": protected_resource("/edited")
+                    "protected_resource": protected_resource("/smoke/edited")
                 }},
             "target": {"endpoint": harness.mock.url()}
         }))
@@ -358,7 +358,7 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
         .unwrap();
     assert_eq!(kept.status(), 200, "{}", kept.text().await.unwrap());
     let published = client
-        .get(metadata_url(&harness, "/edited"))
+        .get(metadata_url(&harness, "/smoke/edited"))
         .send()
         .await
         .unwrap();
@@ -377,7 +377,7 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
     // A null removes it in the same request as the rest of the edit, a route
     // change the stored setting would no longer fit included.
     surface["description"] = json!("edited without discovery");
-    surface["access_point"]["route"] = json!("/edited-moved");
+    surface["access_point"]["route"] = json!("/smoke/edited-moved");
     surface["access_point"]["caller_authentication"]["protected_resource"] = json!(null);
     let removed = admin
         .put(&url)
@@ -389,7 +389,7 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
     let saved: serde_json::Value = removed.json().await.unwrap();
     assert_eq!(status, 200, "{saved}");
     assert_eq!(saved["description"], "edited without discovery");
-    assert_eq!(saved["access_point"]["route"], "/edited-moved");
+    assert_eq!(saved["access_point"]["route"], "/smoke/edited-moved");
     assert!(
         saved["access_point"]["caller_authentication"]
             .get("protected_resource")
@@ -397,7 +397,7 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
         "{saved}"
     );
     let unpublished = client
-        .get(metadata_url(&harness, "/edited"))
+        .get(metadata_url(&harness, "/smoke/edited"))
         .send()
         .await
         .unwrap();
@@ -413,7 +413,7 @@ async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
         .build()
         .unwrap();
     let methods = json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY, "audiences": []}]);
-    let mut own = protected_resource("/varied");
+    let mut own = protected_resource("/smoke/varied");
     own["scopes"] = json!(["beta"]);
     let surfaces = format!("{}/api/v1/surfaces", harness.gateway_base);
     let created = admin
@@ -421,8 +421,8 @@ async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
         .json(&json!({
             "name": "varied",
             "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
-                "route": "/varied", "protocol": "mcp",
-                "caller_authentication": {"methods": methods, "protected_resource": protected_resource("/varied")}},
+                "route": "/smoke/varied", "protocol": "mcp",
+                "caller_authentication": {"methods": methods, "protected_resource": protected_resource("/smoke/varied")}},
             "target": {"endpoint": harness.mock.url()},
             "variants": [{"id": "beta", "alias": "beta", "name": "Beta", "enabled": true, "overrides": {
                 "access_point": {"caller_authentication": {"methods": methods, "protected_resource": own}}
@@ -441,7 +441,7 @@ async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
     );
     let variant_metadata = || {
         client
-            .get(metadata_url(&harness, "/varied$beta"))
+            .get(metadata_url(&harness, "/smoke/varied$beta"))
             .send()
     };
 
@@ -776,11 +776,11 @@ async fn the_callers_token_never_reaches_the_target() {
         .json(&json!({
             "name": "forwarding",
             "access_point": {"listen_address": harness.gateway_base.replace("127.0.0.1", "localhost"),
-                "route": "/forwarding", "protocol": "mcp",
+                "route": "/smoke/forwarding", "protocol": "mcp",
                 "caller_authentication": {
                     "methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": IDP_STRATEGY,
                         "audiences": [], "forward_header": true}],
-                    "protected_resource": protected_resource("/forwarding")
+                    "protected_resource": protected_resource("/smoke/forwarding")
                 }},
             "target": {"endpoint": harness.mock.url()}
         }))

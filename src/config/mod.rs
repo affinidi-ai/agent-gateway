@@ -15,6 +15,7 @@ pub mod network;
 mod pepper_cache_config;
 mod proxy;
 pub mod rbac_config;
+pub mod route_claims;
 pub mod target_auth_rules;
 pub mod types;
 

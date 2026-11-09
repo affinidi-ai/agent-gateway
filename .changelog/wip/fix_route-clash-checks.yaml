@@ -1,0 +1,34 @@
+branch: fix/route-clash-checks
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T11:58:19Z'
+      title: Refuse a gateway.json in which two entries use the same prefix
+      description: >-
+        Two entries of `channels`, `mcp_proxies` and `routes` on one prefix made the
+        gateway crash while building its router, or let one entry hide the other. The
+        gateway now refuses to start, and a reload refuses the file, naming each pair.
+    - timestamp: '2026-11-09T11:58:19Z'
+      title: Refuse to save a surface on a route callers cannot reach
+      description: >-
+        The admin API saved an active surface whose route no surface prefix served, or
+        on a path another gateway.json entry serves, such as `/api/...` or a `redirect`,
+        and callers never reached it. It now refuses a new or changed route like that
+        with `400`, naming the entry that serves the path or listing the surface
+        prefixes, read from gateway.json as it is on disk. A route an active surface
+        already had is not checked again, so older surfaces can still be edited, and the
+        gateway logs a warning at startup for each one callers cannot reach. A new or
+        changed route is stored without a trailing `/`, and routes that differ only by
+        one count as the same route, when saving and when the gateway starts.
+  removed: []
+  security:
+    - timestamp: '2026-11-09T13:20:00Z'
+      title: Refuse a surface route that could take another surface's traffic
+      description: >-
+        A surface route could contain `$` or `%24` and spell another surface's variant
+        URL, or end in extra slashes and outrank a more specific surface, so requests
+        meant for the other surface reached it. The admin API now refuses a new or
+        changed route that is not a plain path, and the gateway ranks surfaces by their
+        route without trailing slashes.
+  breaking: []

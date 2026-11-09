@@ -9809,20 +9809,6 @@ async fn refused_mcp_request_id(
     .await
 }
 
-fn normalize_route_for_match(route: &str) -> String {
-    let with_leading_slash = if route.starts_with('/') {
-        route.to_string()
-    } else {
-        format!("/{route}")
-    };
-    let trimmed = with_leading_slash.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn route_tail_to_uri_path(tail: &str) -> String {
     if tail.is_empty() {
         "/".to_string()
@@ -9911,19 +9897,21 @@ async fn multi_channel_proxy_handler_in_request_scope(
     // Sort channels by route length (descending) so the most specific route wins.
     let channels = state.channels.read().await;
     let mut sorted_channels: Vec<_> = channels.iter().collect();
-    sorted_channels.sort_by(|a, b| {
-        let a_route = a.surface.route();
-        let b_route = b.surface.route();
-        b_route
-            .len()
-            .cmp(&a_route.len())
+    sorted_channels.sort_by_key(|channel| {
+        std::cmp::Reverse(
+            channel
+                .surface
+                .route()
+                .trim_end_matches('/')
+                .len(),
+        )
     });
 
     let matched_channel = sorted_channels
         .iter()
         .find_map(|ch| {
             let route = ch.surface.route();
-            let normalized_route = normalize_route_for_match(route);
+            let normalized_route = crate::config::route_claims::normalize_route(route);
             // The parser treats "/" specially: a route of "/" matches every path.
             // For prefix matching pass an empty string in that case so any leading
             // `$alias` is honoured at the very start of the path.
@@ -16557,6 +16545,9 @@ mod target_auth_audit_tests;
 pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
+mod route_ranking_tests;
+
+#[cfg(test)]
 mod target_grant_tests;
 
 #[cfg(test)]
@@ -17818,9 +17809,9 @@ mod tests {
         agent_card_fabric_forward_path, agent_card_response, ap2_experimental_enabled_from_flags,
         decode_bearer_jwt_claims, delegates_credentials_over_fabric, evaluate_ap2_inbound_decision,
         fabric_mcp_gate_input, forwards_ap_caller_header, is_forwarded_on_credentialed_card_fetch,
-        modern_fabric_failure_response, normalize_route_for_match, replace_request_header,
-        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping, target_credential_header_names,
+        modern_fabric_failure_response, replace_request_header, resolve_direct_surface_auth_config,
+        resolve_legacy_mcp_session, route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
+        target_credential_header_names,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -22071,13 +22062,6 @@ allow if {
             surface["access_point"]["agent_card_path"] = serde_json::json!(path);
         }
         serde_json::from_value(surface).expect("surface fixture")
-    }
-
-    #[test]
-    fn normalize_route_for_match_trims_trailing_slash() {
-        assert_eq!(normalize_route_for_match("a2a/requester/"), "/a2a/requester");
-        assert_eq!(normalize_route_for_match("/a2a/requester/"), "/a2a/requester");
-        assert_eq!(normalize_route_for_match("/"), "/");
     }
 
     #[test]

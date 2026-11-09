@@ -994,7 +994,7 @@ async fn start_with_stored_shared_key_surface(surface_id: &'static str) -> (Gate
             "name": surface_id,
             "access_point": {
                 "listen_address": gateway["listeners"][0]["external_urls"][0],
-                "route": "/legacy",
+                "route": "/smoke/legacy",
                 "protocol": "a2a",
                 "caller_authentication": { "methods": [{
                     "type": "api_key_provider",
