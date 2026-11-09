@@ -776,7 +776,7 @@ pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoR
     // Exclude VP-audit categories (policy decisions / trust checks) up front so
     // `events`, `total`, and `total_pages` stay consistent — they belong to the
     // VP Audit Log (/v1/audit), not the Credential Delegation Audit Log.
-    match super::audit::read_audit_log(
+    let result = super::audit::read_audit_log(
         page,
         page_size,
         super::audit::AuditLogFilter {
@@ -785,16 +785,59 @@ pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoR
             ..Default::default()
         },
     )
-    .await
-    {
-        Ok(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response(),
+    .await;
+
+    audit_response(result).into_response()
+}
+
+/// Answers with the page, or with `500` when the read failed. An empty page
+/// would assert that this is the whole of the administrator's evidence, and
+/// the io detail stays in the log.
+fn audit_response(result: anyhow::Result<super::audit::AuditLogPage>) -> (StatusCode, Json<serde_json::Value>) {
+    let body = result.and_then(|page| serde_json::to_value(page).map_err(anyhow::Error::from));
+    match body {
+        Ok(body) => (StatusCode::OK, Json(body)),
         Err(e) => {
-            warn!(target: "credential_delegation", error = %e, "Failed to read audit log");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to read audit log: {}", e)})),
-            )
-                .into_response()
+            warn!(target: "credential_delegation", error = %e, "Failed to read the VP Audit Log");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to read the audit log"})))
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_response_tests {
+    use super::*;
+
+    fn page() -> crate::delegation_vault::audit::AuditLogPage {
+        crate::delegation_vault::audit::AuditLogPage {
+            events: Vec::new(),
+            total: 0,
+            page: 1,
+            page_size: 25,
+            total_pages: 1,
+            category_counts: std::collections::BTreeMap::new(),
+            truncated: true,
+            dropped_records: 0,
+            history_bytes: 2048,
+            soft_cap_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn a_read_that_failed_is_answered_with_an_error_not_an_empty_page() {
+        let (status, Json(body)) = audit_response(Err(anyhow::anyhow!("Audit logger not initialized")));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, serde_json::json!({"error": "Failed to read the audit log"}));
+    }
+
+    #[test]
+    fn a_page_is_answered_with_its_counts_and_its_truncated_flag() {
+        let (status, Json(body)) = audit_response(Ok(page()));
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["truncated"], serde_json::json!(true));
+        assert_eq!(body["total"], serde_json::json!(0));
+        assert_eq!(body["total_pages"], serde_json::json!(1));
     }
 }

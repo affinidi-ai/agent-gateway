@@ -1050,6 +1050,49 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
 
+## Audit page: partial reads and log size
+
+An audit read walks the stored history and may not return all of it. The response says so in two
+separate fields: `truncated` (the read stopped before the end — its scan limit, or a rotated file
+missing or unreadable) and `dropped_records` (records in the history it could not read — a line
+too long to assemble, or one an interrupted append left half-written). **Either one makes the
+counts lower bounds**; `useAuditLog` folds them into one `countsAreLowerBounds`, and the UI knows
+only that.
+
+- When the counts are lower bounds every number that came from that walk renders with a trailing
+  `+` and nothing else changes: the record badge (`audit-total-badge`) reads `1243+`, the pager
+  reads `Page 5 of 687+`, and a category count reads `24643+` (`0+` for the zero marker).
+  Otherwise the numbers render exactly as before. No banner, notice, colour or tooltip.
+- The badge shows while `total > 0` **or** the counts are lower bounds, so `0+` is never hidden,
+  and such an empty page reads **"No governance events found in the records searched."**
+  (`audit-empty-truncated`) instead of "No governance events yet" and its advice to enable VP
+  Auditing: the log is not known to be empty, so that advice would be wrong.
+- The flag reaches them through `useAuditLog` (`countsAreLowerBounds`), `AuditList` and
+  `AuditFilters` (the same prop name), and the shared `FilterChipGroup` / `FilterOverflowMenu`.
+  The Category facet renders its counts, so a category with records reads `24643` (or `24643+`
+  when the counts are lower bounds) and one with none keeps the `(0)` / `(0+)` zero marker. The
+  Decision, Flow and Scope facets pass `showBadge={false}`: their chips carry no count, so a
+  badge there would have nothing to show.
+- A **read that failed** is not an empty log. The gateway answers a read it could not make with
+  `500`, so `useAuditLog` keeps the message in `error`, and `AuditList` renders the
+  `alert alert-danger` panel (`audit-error`) with a Retry (`audit-error-retry`) **instead of** the
+  empty state, saying no records could be read and that this is not the log holding none. The
+  toast stays, for the moment the read fails; the panel is what is still there after it fades.
+  Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
+  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
+- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
+  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+- `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
+  bar: neutral under the configured size, amber over it, and over it a line naming the two
+  things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced
+  at `[audit] vp_audit_log_soft_cap_bytes`, no record is deleted and the log keeps growing. With
+  `soft_cap_bytes` of `0` the size shows alone, with no bar, and with no `history_bytes` the
+  line is not shown at all rather than claiming an empty history. The values come from
+  `history_bytes` and `soft_cap_bytes` on the audit response.
+- Sizes in bytes are formatted by `utils/formatBytes.ts` — one implementation for the whole
+  dashboard, in binary units (`312 MiB`, `1.5 GiB`). The Metrics and Tasks pages use it too;
+  do not add a page-local copy.
+
 ## MCP Proxy write warnings
 
 MCP Proxy create and update responses can carry `warnings`, for example when only the
@@ -1527,6 +1570,12 @@ identities: an integration receives every event of its event set, from every res
 - The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says each integration with an
   event set holding audit events receives them independently of the log, at least once, so
   receivers deduplicate on `event_id`.
+- Its **Storage** section explains the size shown above the table: the live log plus every
+  rotated file, rotated at `vp_audit_log_max_bytes`, with every rotated file kept by default
+  so nothing is deleted. It states that `vp_audit_log_soft_cap_bytes` is advisory — passing it
+  deletes nothing and refuses no write — and that bounding the history means setting
+  `vp_audit_log_keep`, which does delete the records that fall out of the window. The panel is
+  where that is explained, because the bar itself carries no copy beyond the two actions.
 
 ## Laptop layouts
 
