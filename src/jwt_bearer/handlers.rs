@@ -51,8 +51,7 @@ async fn check_jwks_source(source: &JwksSource) -> Result<(), axum::response::Re
 }
 
 /// Why a `jwks_uri` is refused on save and by the probe.
-const JWKS_URI_BLOCKED: &str =
-    "jwks_uri rejected: it must be an http(s) URL whose host resolves to neither loopback nor cloud metadata";
+const JWKS_URI_BLOCKED: &str = "jwks_uri rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata";
 
 /// The probe's answer for a `jwks_uri` it could vet but not use.
 const JWKS_URI_UNUSABLE: &str = "jwks_uri could not be fetched or did not return a valid JWKS";

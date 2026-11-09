@@ -103,7 +103,9 @@ fn reference_scan_failed(error: anyhow::Error) -> Response {
 enum ProviderValidationError {
     #[error("token_endpoint must be an https URL")]
     TokenEndpointNotHttps,
-    #[error("token_endpoint must resolve to neither loopback nor cloud metadata")]
+    #[error(
+        "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+    )]
     TokenEndpointBlocked,
     #[error("{0} is required for this provider type")]
     Missing(&'static str),
@@ -2138,7 +2140,8 @@ mod jwt_provider_tests {
         let (status, response) = create(&state, body).await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
         let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &endpoint, None, validate_jwt_bearer("SA_JSON")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_JSON")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["key_material"], "ok");
     }
@@ -2161,7 +2164,7 @@ mod jwt_provider_tests {
                 .contains("key-secret-marker")
         );
         let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, _) = validate(&state, &endpoint, None, validate_jwt_bearer("BAD_JSON")).await;
+        let (status, _) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("BAD_JSON")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -2522,7 +2525,7 @@ mod jwt_provider_tests {
         assert_eq!(response["error"], "token_endpoint must be an https URL");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
             &endpoint,
             None,
@@ -2557,7 +2560,10 @@ mod jwt_provider_tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{token_endpoint}: {response}");
-            assert_eq!(response["error"], "token_endpoint must resolve to neither loopback nor cloud metadata");
+            assert_eq!(
+                response["error"],
+                "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+            );
         }
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -2571,7 +2577,7 @@ mod jwt_provider_tests {
             .local_addr()
             .unwrap();
         let endpoint = format!("http://{closed}/token");
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
             &endpoint,
             None,
@@ -2621,8 +2627,9 @@ mod jwt_provider_tests {
         }
     }
 
-    /// Validates `body` with its `token_endpoint` pointed at the local `endpoint`.
-    async fn validate(
+    /// Validates `body` against the local token endpoint `endpoint`: it rewrites any
+    /// `token_endpoint` the body names to `endpoint`, so the probe reaches the fixture.
+    async fn validate_against_fixture(
         state: &CredentialProviderState,
         endpoint: &str,
         context: Option<Extension<PatTenantContext>>,
@@ -2664,14 +2671,14 @@ mod jwt_provider_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["reachable"], true);
         assert_eq!(response["http_status"], 405);
         assert_eq!(response["token_endpoint"], endpoint);
         assert_eq!(response["key_material"], "ok");
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
             &endpoint,
             None,
@@ -2697,11 +2704,11 @@ mod jwt_provider_tests {
         body.as_object_mut()
             .unwrap()
             .remove("jwt_subject");
-        let (status, response) = validate(&state, &endpoint, None, body).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_subject is required for this provider type");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -2711,7 +2718,8 @@ mod jwt_provider_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &endpoint, None, validate_jwt_bearer("NOT_A_KEY")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("NOT_A_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             response["error"],
@@ -2724,7 +2732,7 @@ mod jwt_provider_tests {
         );
         let mut pss_bearer = validate_jwt_bearer("SA_KEY");
         pss_bearer["jwt_signing_algorithm"] = json!("PS256");
-        let (status, response) = validate(&state, &endpoint, None, pss_bearer).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, pss_bearer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
     }
@@ -2954,11 +2962,12 @@ mod jwt_provider_tests {
         let state = with_key_material(&directory).await;
         add_tenant_a_secret(&state, "TENANT_KEY").await;
         let (endpoint, requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &endpoint, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
         assert_eq!(response["error"], "Secret reference is not accessible");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
     }
 
@@ -2985,7 +2994,8 @@ mod jwt_provider_tests {
             token_id: "token-a".into(),
             tenant_id: "tenant-a".into(),
         }));
-        let (status, response) = validate(&state, &endpoint, tenant_a, validate_jwt_bearer("B_KEY")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a, validate_jwt_bearer("B_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "Secret reference is not accessible");
     }

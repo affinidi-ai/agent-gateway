@@ -177,7 +177,7 @@ file is checked the same way; the key secret may be at most 16 KiB.
 credential provider edit permission, applies the caller's tenant to the secrets it names, and
 answers `"key_material": "ok"` beside the token endpoint's reachability. It reaches the token
 endpoint through the same pinned client as a token request, so a loopback or cloud metadata
-endpoint answers 400 `token_endpoint must resolve to neither loopback nor cloud metadata`
+endpoint answers 400 `token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata`
 without being contacted,
 and an unreachable one answers `"reachable": false` with the fixed error `token_endpoint could
 not be reached`; the detail is only logged. JWK keys are not

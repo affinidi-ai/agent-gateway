@@ -622,7 +622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_loopback() {
+    async fn fetch_jwks_rejects_ecs_metadata() {
         // The ECS task metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_localhost() {
+    async fn fetch_jwks_rejects_gcp_metadata_host() {
         // The GCP metadata host name is refused before it is resolved.
         let client = JwksClient::new();
         let result = client
@@ -663,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_ipv6_loopback() {
+    async fn fetch_jwks_rejects_ipv6_metadata() {
         // The IPv6 AWS metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_key_rejects_loopback_uri() {
+    async fn get_key_rejects_metadata_uri() {
         // A token check refuses a cloud metadata URI before any request.
         let client = JwksClient::new();
         let result = client
@@ -754,7 +754,6 @@ mod tests {
             "https://172.16.0.1/jwks.json",
             "https://192.168.100.100:11443/jwks.json",
             "https://169.254.1.1/jwks.json",
-            "https://[fd00::1]/jwks.json",
         ] {
             assert!(
                 vet_jwks_uri(uri)

@@ -19,11 +19,12 @@ changes:
         answer fixed error messages instead of the upstream error, and log the detail.
   breaking:
     - timestamp: '2026-11-05T15:12:32Z'
-      title: Refuse loopback JWKS URIs and send JWKS and token calls without a proxy
+      title: Refuse JWKS URIs resolving to loopback and send JWKS and token calls direct
       description: >-
-        Creating or updating a JWT verification strategy whose jwks_uri resolves to loopback, an
-        unspecified address or cloud metadata now answers 400, and a stored one fails its JWKS
-        fetches; credential provider token endpoints were already held to that rule. JWKS fetches
+        Saving a JWT verification strategy already refused a jwks_uri naming a loopback address or
+        localhost. Creating or updating one whose host resolves to loopback, an unspecified address
+        or cloud metadata now answers 400 too, and a stored one fails its JWKS fetches; credential
+        provider token endpoints were already held to that rule. JWKS fetches
         and token requests also ignore HTTPS_PROXY, HTTP_PROXY and ALL_PROXY, since a proxy would
         resolve the host again, so a host that reaches the internet only through a proxy must allow
         direct egress to its identity providers; a startup warning names them.

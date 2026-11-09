@@ -304,8 +304,8 @@ pub fn validate_resolved_url(raw: &str) -> Result<Url, String> {
 /// cloud-provider metadata endpoint.
 ///
 /// Like [`validate_resolved_url`] but intentionally allows loopback and
-/// RFC 1918 private ranges. Use this for admin-configured JWKS URIs and other
-/// endpoints where same-machine or same-VPC access is legitimate, but DNS
+/// RFC 1918 private ranges. Use this for endpoints where same-machine or
+/// same-VPC access is legitimate, such as a test allow-list entry, but DNS
 /// rebinding to a cloud metadata endpoint must still be prevented.
 ///
 /// Blocks: cloud metadata IPs/hostnames (static + DNS), embedded credentials,

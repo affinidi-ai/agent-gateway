@@ -533,7 +533,8 @@ The vendor clients of external consent, which carry a client's credentials or a 
 ignore proxy settings (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the system proxy) and always
 connect directly: the fetch of an external consent provider's authorization server metadata,
 the code exchange and refresh, RFC 7009 revocation, and the forward of a request that carries a
-grant by binding. A proxy would resolve the host again and connect to an address nobody vetted,
+grant by binding. The JWKS fetches of JWT verification strategies and the token requests of
+credential providers ignore proxy settings the same way. A proxy would resolve the host again and connect to an address nobody vetted,
 voiding the pin. The gateway warns at startup when a proxy variable is set. Every other pinned client, the authorization
 server discovery of inbound JWT and MCP authorization included, uses a configured proxy as
 before; the proxy then resolves the host itself, so the pin does not hold through it.
