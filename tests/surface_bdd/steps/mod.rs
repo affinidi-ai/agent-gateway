@@ -1,6 +1,7 @@
 pub mod agent_card_preview;
 pub mod credential_references;
 pub mod credential_save;
+pub mod dashboard_routes;
 pub mod given;
 pub mod identities;
 pub mod management_routes;

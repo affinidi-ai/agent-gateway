@@ -3975,18 +3975,11 @@ pub async fn run_axum_proxy(
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 
-        // Fail fast on configuration errors that would shadow dashboard SPA
-        // routes — admin must rename the offending prefix and restart.
-        // Running with these silently would replace dashboard pages with
-        // proxy 404s, which is much worse than refusing to start.
         {
             let collisions =
                 crate::proxy::paths::check_spa_route_collisions(network_config.dashboard_shadowing_prefixes());
             if !collisions.is_empty() {
-                let banner = crate::proxy::paths::spa_collision_banner(&collisions);
-                error!("{}", banner);
-                eprintln!("{}", banner);
-                std::process::exit(2);
+                error!("{}", crate::proxy::paths::spa_collision_warning(&collisions));
             }
         }
 

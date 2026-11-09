@@ -2377,7 +2377,8 @@ fn retry_after_header(retry_after: Option<&str>) -> Vec<(HeaderName, HeaderValue
         .unwrap_or_default()
 }
 
-/// The status a decision that is not `Proceed` is answered with.
+/// The status the caller is answered with for a decision. The gate never
+/// answers `Proceed`, so it maps to 500 only to keep the match total.
 fn answer_status(
     decision: &PaymentDelegationDecision,
     shape: &Shape,

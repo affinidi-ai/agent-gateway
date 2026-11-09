@@ -2,15 +2,28 @@ branch: fix/agent-pay-gate-answers
 changes:
   added: []
   changed: []
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-09T18:00:00Z'
+      title: Start the gateway when a prefix in gateway.json would hide a dashboard page
+      description: >-
+        A gateway whose gateway.json had a channel or proxy route on a dashboard page refused to
+        start, so one bad prefix took down every surface and the dashboard with it, with no way to
+        fix it from the dashboard. It now starts and serves everything else, leaves out each such
+        prefix, and logs an error naming the prefix and the page it would hide. A configuration
+        reload does the same and reports the skipped prefixes in its `warning`, and the dashboard
+        no longer offers a skipped prefix as a Surface Prefix. Rename the prefix, for example to
+        `/svc/<name>`, and reload.
   removed: []
   security: []
   breaking:
     - timestamp: '2026-11-08T12:00:00Z'
-      title: Refuse to start when an MCP proxy or redirect route hides a dashboard page
+      title: Stop serving MCP proxy and redirect prefixes that hide a dashboard page
       description: >-
-        The startup check that stops a channel or proxy route from shadowing a dashboard page now
-        also covers `mcp_proxies` prefixes and `redirect` routes, which are registered ahead of the
-        dashboard in the same way. A configuration with such a prefix used to start with that
-        dashboard page broken; it now stops at startup with an error naming each prefix and the
-        page it hides. Rename the prefix, for example to `/svc/<name>`, and restart.
+        `mcp_proxies` prefixes and `redirect` routes with a target are now left out when they would
+        hide a dashboard page, as channels and proxy routes are, since they are registered ahead of
+        the dashboard in the same way. The dashboard pages that were not reserved before are now:
+        `/access-tokens`, `/api-keys`, `/apikeys`, `/authorities`, `/cli-consent`, `/issuers`,
+        `/jwt-verification-strategies`, `/payment-gateways`, `/policy-definitions` and
+        `/sts-clients`. The whole first segment counts, so a prefix below a page, such as a
+        redirect at `/settings/old`, is left out too. Clients of such a prefix stop reaching it
+        until it is renamed; the gateway logs each one it leaves out.

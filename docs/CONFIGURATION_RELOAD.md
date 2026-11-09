@@ -85,21 +85,25 @@ connection is refused while it runs, on the inbound ports, the management API th
 shared outbound ports:
 
 1. Load the configured source and inject active Agent Surface records.
-2. Clear stale task-monitor entries; rebuilding the routers registers them again.
-3. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
-4. Reload network configuration, group active surfaces by listener, and rebuild derived surface
-   state. Each surface's outbound state is updated in place rather than replaced: a surface that
-   still has Transit Points on an outbound listener gets its new configuration written into its
-   state, and the state of one that no longer has any, because it was deleted, disabled or
+2. Reload network configuration. A channel, MCP proxy, `proxy` route or `redirect` route whose
+   prefix shadows a dashboard page is left out of the rebuilt routers, as at startup (see
+   `channels` in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): the reload logs an
+   error and returns a `warning` naming each prefix and the page it shadows, and serves everything
+   else.
+3. Clear stale task-monitor entries; rebuilding the routers registers them again.
+4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
+5. Group active surfaces by listener and rebuild derived surface state. Each surface's outbound
+   state is updated in place rather than replaced: a surface that still has Transit Points on an
+   outbound listener gets its new configuration written into its state, and the state of one that no longer has any, because it was deleted, disabled or
    emptied, is retired, so its routes refuse each request with `404`.
-5. Build a new router for each configured inbound and outbound port, retaining each inbound
+6. Build a new router for each configured inbound and outbound port, retaining each inbound
    listener's `MultiSurfaceProxyState` for later single-surface updates, and swap it into the
    listener already bound on that port. Only active surfaces' Transit Points are served, so a
    deleted or disabled surface's never are. An outbound port with no active Transit Points
    serves no proxy routes, as at startup, so its liveness route remains available. Each
    outbound router registers its surfaces' outbound state before the reload returns, so a
    surface deleted right after it is retired there too.
-6. Stop the listener of a port no longer configured.
+7. Stop the listener of a port no longer configured.
 
 A listener is bound again only when its port's bind addresses or TLS setting change in
 `gateway.json`, or stopped when its port is removed. Requests using it while it is rebound can
@@ -116,7 +120,7 @@ Each request runs on the router current when it arrives, so a connection kept al
 reload, plain HTTP or TLS, has its next request routed by the new router: a removed Transit Point
 or Access Point route refuses it with `404`, and a changed one is served with its new
 configuration. A request already being handled when the router is swapped completes on the
-router it started on; because that router holds the outbound state updated in step 4, a removed
+router it started on; because that router holds the outbound state updated in step 5, a removed
 Transit Point refuses it with `404`.
 
 If the requested configuration source cannot be loaded,

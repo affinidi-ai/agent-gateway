@@ -86,6 +86,19 @@ pub struct SurfaceConfigBuilder {
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
+    /// `index.html` for every path no other route takes, as a deployed dashboard does.
+    pub serves_dashboard: bool,
+    /// Channel, MCP proxy and redirect prefixes `gateway.json` adds to the surface's.
+    pub gateway_prefixes: Vec<GatewayPrefixFixture>,
+}
+
+/// A prefix the operator adds to `gateway.json`.
+#[derive(Debug, Clone)]
+pub enum GatewayPrefixFixture {
+    Channel(String),
+    McpProxy(String),
+    Redirect { prefix: String, target: String },
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -147,6 +160,8 @@ impl Default for SurfaceConfigBuilder {
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
+            serves_dashboard: false,
+            gateway_prefixes: Vec::new(),
         }
     }
 }

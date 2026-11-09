@@ -267,8 +267,9 @@ pub struct RouteCategory {
 
 impl NetworkConfig {
     /// The route prefixes this configuration registers ahead of the dashboard:
-    /// every channel prefix, every MCP proxy prefix and every route of type
-    /// `proxy` or `redirect`. These are what must not shadow a dashboard page.
+    /// every channel prefix, every MCP proxy prefix, every `proxy` route and
+    /// every `redirect` route that has a target. These are what must not shadow
+    /// a dashboard page.
     pub fn dashboard_shadowing_prefixes(&self) -> Vec<&str> {
         self.channels
             .iter()
@@ -281,7 +282,11 @@ impl NetworkConfig {
             .chain(
                 self.routes
                     .values()
-                    .filter(|route| matches!(route.route_type, RouteType::Proxy | RouteType::Redirect))
+                    .filter(|route| match route.route_type {
+                        RouteType::Proxy => true,
+                        RouteType::Redirect => route.target.is_some(),
+                        _ => false,
+                    })
                     .map(|route| route.prefix.as_str()),
             )
             .collect()
@@ -1098,6 +1103,24 @@ mod url_mapping_tests {
         let mut prefixes = cfg.dashboard_shadowing_prefixes();
         prefixes.sort_unstable();
         assert_eq!(prefixes, vec!["/agents", "/mcp", "/old", "/svc"]);
+    }
+
+    #[test]
+    fn a_redirect_route_without_a_target_shadows_nothing() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [],
+            "routes": {
+                "dead": { "type": "redirect", "prefix": "/settings" },
+                "live": { "type": "redirect", "prefix": "/policies", "target": "/new" }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        assert_eq!(cfg.dashboard_shadowing_prefixes(), vec!["/policies"]);
     }
 
     #[test]

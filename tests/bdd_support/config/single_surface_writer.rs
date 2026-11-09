@@ -11,9 +11,9 @@ use crate::bdd_support::config::config_tree::{
 use crate::bdd_support::config::gateway_bootstrap::GatewayBootstrapSurface;
 use crate::bdd_support::config::mcp_proxy::McpProxyFixture;
 use crate::bdd_support::config::single_surface_fixture::{
-    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, PROTECTED_RESOURCE_PUBLIC_ORIGIN,
-    SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig, SurfaceTransitPointConfig,
-    TargetAuthProviderGrant,
+    CredentialProviderKind, DelegatedCredentialInjection, DidWebVhIdentityFixture, GatewayPrefixFixture,
+    PROTECTED_RESOURCE_PUBLIC_ORIGIN, SurfaceConfigBuilder, SurfaceSourceAuthConfig, SurfaceTargetAuthProviderConfig,
+    SurfaceTransitPointConfig, TargetAuthProviderGrant,
 };
 use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
@@ -590,6 +590,75 @@ fn write_single_surface_config_inner(
     if surface_config.writes_log_directory {
         set_log_directory(base_dir);
     }
+    if surface_config.serves_dashboard {
+        serve_dashboard(base_dir);
+    }
+    add_gateway_prefixes(base_dir, &surface_config.gateway_prefixes);
+}
+
+/// The text of the dashboard build's `index.html`, which every dashboard page serves.
+pub const DASHBOARD_PAGE_MARKER: &str = "<title>BDD dashboard</title>";
+
+/// Writes a dashboard build to `www/` and serves it at `/` as the fallback route,
+/// as a deployed gateway does.
+fn serve_dashboard(base_dir: &Path) {
+    let www = base_dir.join("www");
+    std::fs::create_dir_all(&www).unwrap();
+    std::fs::write(www.join("index.html"), format!("<!doctype html><html><head>{DASHBOARD_PAGE_MARKER}</head></html>"))
+        .unwrap();
+    edit_gateway_json(base_dir, |gateway| {
+        gateway["routes"]["dashboard"] = serde_json::json!({
+            "type": "static", "prefix": "/", "path": www.display().to_string(), "fallback": true
+        });
+    });
+}
+
+/// Adds channel, MCP proxy and redirect prefixes to `gateway.json`.
+pub fn add_gateway_prefixes(
+    base_dir: &Path,
+    prefixes: &[GatewayPrefixFixture],
+) {
+    if prefixes.is_empty() {
+        return;
+    }
+    edit_gateway_json(base_dir, |gateway| {
+        for (index, prefix) in prefixes.iter().enumerate() {
+            let id = format!("bdd-prefix-{index}");
+            match prefix {
+                GatewayPrefixFixture::Channel(path) => push(gateway, "channels", &id, path),
+                GatewayPrefixFixture::McpProxy(path) => push(gateway, "mcp_proxies", &id, path),
+                GatewayPrefixFixture::Redirect { prefix, target } => {
+                    gateway["routes"][id.as_str()] =
+                        serde_json::json!({"type": "redirect", "prefix": prefix, "target": target});
+                }
+            }
+        }
+    });
+
+    fn push(
+        gateway: &mut serde_json::Value,
+        list: &str,
+        id: &str,
+        prefix: &str,
+    ) {
+        if gateway[list].is_null() {
+            gateway[list] = serde_json::json!([]);
+        }
+        gateway[list]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("gateway.json {list} must be a list"))
+            .push(serde_json::json!({"id": id, "name": id, "prefix": prefix}));
+    }
+}
+
+fn edit_gateway_json(
+    base_dir: &Path,
+    edit: impl FnOnce(&mut serde_json::Value),
+) {
+    let path = base_dir.join("gateway.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut gateway);
+    std::fs::write(&path, serde_json::to_string_pretty(&gateway).unwrap()).unwrap();
 }
 
 /// Lowers the gateway's log level from the harness default `error` to `info`.
