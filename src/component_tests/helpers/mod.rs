@@ -1307,10 +1307,10 @@ pub fn build_identity_channel() -> AgentSurface {
 ///
 /// `from_api_key` is credential-derived: the DID comes from a peppered HMAC of
 /// the `api_key_id`, not from the response body, so no JSON schema is needed.
-/// An `atgk_`-prefixed key derives directly without any store lookup, which
-/// makes this the lightest e2e exercise of the credential-derived `Derived`
-/// path through the proxy (the inbound counterpart to the unit tests in
-/// `credential_identity.rs`).
+/// The surface serves only while an active key of that id belongs to it: set
+/// its `surface_id` and store the key in that surface's key folder. This is the
+/// lightest e2e exercise of the credential-derived `Derived` path through the
+/// proxy (the inbound counterpart to the unit tests in `credential_identity.rs`).
 pub fn build_api_key_identity_channel(api_key_id: &str) -> AgentSurface {
     let json = serde_json::json!({
         "name": "smoke-api-key-identity",

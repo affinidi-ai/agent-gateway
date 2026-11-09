@@ -127,7 +127,6 @@ pub fn is_ready_to_serve() -> bool {
     unpack_state(SERVE_STATE.load(Ordering::SeqCst)) == STATE_ACTIVE
 }
 
-#[allow(dead_code)]
 pub fn current_mode() -> ServerMode {
     if is_standby() {
         ServerMode::Standby

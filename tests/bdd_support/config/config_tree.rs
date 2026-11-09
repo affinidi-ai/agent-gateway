@@ -94,6 +94,7 @@ pub struct ApiKeyProviderFixture {
     pub key_id: String,
     pub client_id: String,
     pub secret: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -132,6 +133,7 @@ impl ApiKeyProviderFixture {
             key_id: key_id.into(),
             client_id: client_id.into(),
             secret: secret.into(),
+            created_at: Utc::now(),
         }
     }
 }
@@ -335,6 +337,7 @@ pub fn write_gateway_config_tree(
             &api_key_provider.key_id,
             &api_key_provider.client_id,
             &api_key_provider.secret,
+            api_key_provider.created_at,
         );
     }
 

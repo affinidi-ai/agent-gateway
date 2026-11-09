@@ -384,6 +384,8 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         .expect("Affinidi Terms cache should be written");
     }
 
+    let unreadable_key_folders =
+        config::single_surface_writer::write_unloadable_api_keys(temp_dir.path(), &world.surface_config);
     let config_path = temp_dir
         .path()
         .join("config.toml");
@@ -443,6 +445,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     drop(outbound_port_reservation);
 
     world.infra = Some(ScenarioInfra {
+        _unreadable_key_folders: unreadable_key_folders,
         _temp_dir: TempDirGuard::new(temp_dir, "surface-bdd"),
         gateway,
         mock,

@@ -14,10 +14,11 @@ import { EmptyState } from '../components/shared/EmptyState';
 import { Badge } from '../components/shared/Badge';
 import { DOCS_URL } from '../config/docs';
 import { CopyButton } from '../components/shared/CopyButton';
+import { RevokedIdentityBadge, RevokedIdentityInfo } from '../components/IdentityRevoked';
 import { IdentityNameCell } from './IdentitiesPage/IdentityNameCell';
 import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
-import { IdentitySurfaceCell } from './IdentitiesPage/IdentitySurfaceCell';
+import { IdentitySurfaceCell, SurfaceLinkButton } from './IdentitiesPage/IdentitySurfaceCell';
 import { isSharedManagedDid } from './IdentitiesPage/sharedManagedDid';
 import {
   RECORDER_FILTER_OPTIONS,
@@ -227,6 +228,8 @@ const IdentitiesPage: React.FC = () => {
       };
     });
   };
+
+  const openSurface = (surfaceId: string) => navigate(`/surfaces/${surfaceId}`);
 
   const isSectionExpanded = (did: string, section: string) => {
     return expandedSections[did]?.has(section) || false;
@@ -536,6 +539,9 @@ const IdentitiesPage: React.FC = () => {
                                               : undefined
                                           }
                                         />
+                                        {identity.revoked && (
+                                          <RevokedIdentityBadge className="ms-2" />
+                                        )}
                                       </div>
                                     </td>
                                     <td>
@@ -556,9 +562,7 @@ const IdentitiesPage: React.FC = () => {
                                       <IdentitySurfaceCell
                                         links={surfaceLinksFor(identity)}
                                         principal={identity.credential_principal}
-                                        onOpenSurface={surfaceId =>
-                                          navigate(`/surfaces/${surfaceId}`)
-                                        }
+                                        onOpenSurface={openSurface}
                                       />
                                     </td>
                                     <td>
@@ -754,6 +758,9 @@ const IdentitiesPage: React.FC = () => {
                                     <tr className="expanded-detail-row">
                                       <td colSpan={hasRecorderStatus ? 11 : 10} className="p-0">
                                         <div className="p-3">
+                                          {identity.revoked && (
+                                            <RevokedIdentityInfo className="mb-2" />
+                                          )}
                                           <div
                                             className="accordion"
                                             id={`identityAccordion-${identity.did}`}
@@ -811,18 +818,10 @@ const IdentitiesPage: React.FC = () => {
                                                           </small>
                                                           <div>
                                                             <small>
-                                                              <button
-                                                                type="button"
-                                                                onClick={e => {
-                                                                  e.stopPropagation();
-                                                                  navigate(
-                                                                    `/surfaces/${surfaceLink.id}`
-                                                                  );
-                                                                }}
-                                                                className="btn btn-link p-0 align-baseline text-primary"
-                                                              >
-                                                                {surfaceLink.name}
-                                                              </button>
+                                                              <SurfaceLinkButton
+                                                                surface={surfaceLink}
+                                                                onOpen={openSurface}
+                                                              />
                                                             </small>
                                                           </div>
                                                         </div>

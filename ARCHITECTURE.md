@@ -73,7 +73,9 @@ so a fabric peer can be reachable while the dashboard is still being assembled.
 
 `server_mode` selects `active` or `standby` at startup. Standby drops listeners and
 reports 503 on health. `SIGUSR1` promotes, `SIGUSR2` steps down. See
-[`src/server/mode.rs`](src/server/mode.rs).
+[`src/server/mode.rs`](src/server/mode.rs). A node booting Active, or promoted, revokes the
+API keys of surfaces that no longer exist before its surfaces go live; see
+[`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#provider-keys-when-a-surface-goes-live).
 
 `SIGTERM` or Ctrl-C stops the process: `main.rs` writes the system metrics history to disk,
 shuts down OpenTelemetry, and exits, allowing each step 10 seconds. In-flight requests are not

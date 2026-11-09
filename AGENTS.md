@@ -144,7 +144,19 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
 identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; see _Surface Builder_ in
+Key or API Key Provider; the protected and external Identities' key picker lists only the
+surface's own active keys; see _Surface Builder_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+A protected, external or Transit Point Identity whose API key reference is `blocking`
+(`api_key_references`: a revoked or deleted key, or another surface's key that is revoked or
+under `enforce`) is
+drawn unconfigured, with a red dashed ring and a
+short reason under the node on the canvas and the full warning in its panel, and Save shows that warning as an error until it names an active key. Another surface's key that does
+not block gets only a yellow notice in the panel and saves. The surface page says "This surface
+is refusing requests" while `serving_status` is `not_serving`. The API key detail page says a
+key of a deleted surface is no longer in use. See _Surface Builder_ and
+[_API key delete_](www/default/AGENTS.md#api-key-delete) in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).
@@ -156,6 +168,14 @@ _Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-ed
 
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
+
+Deleting an API key on the Secrets page or the API key page opens a confirmation dialog that
+says surfaces using the key stop working until another key is picked, and deletes only after
+**Delete API key** in that dialog. Revoking one opens the same dialog component worded for
+revoke: surfaces using the key stop serving, the key can't be restored and a new key gives the
+surface a new DID; it revokes only after **Revoke API key**, and a failed revoke shows an error
+toast. See _API key
+delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
@@ -215,6 +235,12 @@ Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Record
 The Identities page shows the name and the DID in separate Name and DID columns, with no Usage
 Count column, and lists a managed agent DID shared by several surfaces once, as "Unnamed Agent"
 with its surface count and every one of its surfaces; see _Identities page_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
+
+The Identities page marks an identity whose API key was revoked or deleted, or whose every
+surface was deleted, with a red "Revoked" badge, shows a deleted surface as plain text with a
+"Deleted" badge and no link, and selecting a revoked identity says it is no longer in use; see
+_Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,

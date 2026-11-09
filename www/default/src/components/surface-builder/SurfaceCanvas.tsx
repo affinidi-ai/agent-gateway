@@ -23,6 +23,12 @@ import {
   policyDefinitionMissing,
   policyDefinitionMissingReason,
 } from './elements/policy/status';
+import {
+  apiKeyReferenceCanvasReason,
+  apiKeyReferenceWarning,
+  type ApiKeyStatuses,
+} from './elements/identity/apiKeyStatus';
+import { useOptionalSurfaceMeta } from './SurfaceMetaContext';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -969,6 +975,11 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
   useEffect(() => {
     surfacePolicyIdsRef.current = surfacePolicyIds;
   }, [surfacePolicyIds]);
+  const apiKeyStatuses = useOptionalSurfaceMeta()?.apiKeyStatuses;
+  const apiKeyStatusesRef = useRef<ApiKeyStatuses | undefined>(undefined);
+  useEffect(() => {
+    apiKeyStatusesRef.current = apiKeyStatuses;
+  }, [apiKeyStatuses]);
   const lastSizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   // Captured on every rebuild so the surfaceSize-prop effect (driven by
   // undo/redo, where the parent reverts state.surfaceSize) can re-apply
@@ -3294,9 +3305,12 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         if (d.type === 'surface') return false;
         if (!d.configured || featureErrorIds.has(d.id)) return true;
         const cn = nodes.find(n => n.id === d.id);
-        return policyDefinitionMissing(
-          { type: d.type, config: cn?.config },
-          surfacePolicyIdsRef.current
+        return (
+          policyDefinitionMissing(
+            { type: d.type, config: cn?.config },
+            surfacePolicyIdsRef.current
+          ) ||
+          (!!cn && apiKeyReferenceWarning(cn, apiKeyStatusesRef.current) !== null)
         );
       })
       .each(function (d) {
@@ -3492,9 +3506,12 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         if (d.type === 'surface') return false;
         if (!d.configured) return true;
         const cn = nodes.find(n => n.id === d.id);
-        return policyDefinitionMissing(
-          { type: d.type, config: cn?.config },
-          surfacePolicyIdsRef.current
+        return (
+          policyDefinitionMissing(
+            { type: d.type, config: cn?.config },
+            surfacePolicyIdsRef.current
+          ) ||
+          (!!cn && apiKeyReferenceWarning(cn, apiKeyStatusesRef.current) !== null)
         );
       })
       .append('text')
@@ -3507,7 +3524,8 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       .text(d => {
         const cn = nodes.find(n => n.id === d.id);
         const reason = cn
-          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn)
+          ? getIncompleteReason(d.type, cn.config, surfacePolicyIdsRef.current, cn) ||
+            apiKeyReferenceCanvasReason(cn, apiKeyStatusesRef.current)
           : null;
         if (!reason) return '';
         return reason.length > 38 ? reason.substring(0, 36) + '…' : reason;
@@ -4509,7 +4527,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       const ring = nodeG.select('.unconfigured-ring');
       const hasFeatureError = updateFeatureErrorIds.has(n.id);
       const policyMissing = policyDefinitionMissing(n, surfacePolicyIds);
-      const wantRing = (!n.configured || hasFeatureError || policyMissing) && n.type !== 'surface';
+      const apiKeyMissing = apiKeyReferenceWarning(n, apiKeyStatuses) !== null;
+      const wantRing =
+        (!n.configured || hasFeatureError || policyMissing || apiKeyMissing) &&
+        n.type !== 'surface';
       const useAnts = hasFeatureError && n.configured && !policyMissing;
       // A policy node with no policy selected or a missing attached policy
       // uses a dotted ring (distinct from the solid incomplete ring and the
@@ -4572,7 +4593,10 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
       // additions/removals shift the reason line correctly.
       const reasonEl = nodeG.select('.node-incomplete-reason');
       const reason =
-        n.type === 'surface' ? null : getIncompleteReason(n.type, n.config, surfacePolicyIds, n);
+        n.type === 'surface'
+          ? null
+          : getIncompleteReason(n.type, n.config, surfacePolicyIds, n) ||
+            apiKeyReferenceCanvasReason(n, apiKeyStatuses);
       if (!reason) {
         if (!reasonEl.empty()) reasonEl.remove();
       } else {
@@ -4592,7 +4616,7 @@ const SurfaceCanvas: React.FC<SurfaceCanvasProps> = ({
         }
       }
     });
-  }, [nodes, surfaceName, protocol, routingReady, surfacePolicyIds]);
+  }, [nodes, surfaceName, protocol, routingReady, surfacePolicyIds, apiKeyStatuses]);
 
   // ─── Single-selection highlight ─────────────────────────────────────
   // Mirror `selectedNodeId` onto a `.node-single-selected` class so the
