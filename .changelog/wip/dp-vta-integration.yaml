@@ -132,6 +132,15 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-09T15:15:00Z'
+      title: Stop the dashboard reloading forever on a session the gateway forgot
+      description: >-
+        A browser holding a session token the gateway no longer knows (after the
+        gateway's storage was wiped or replaced) made the dashboard reload without
+        end. The sign-in page redirected to the dashboard whenever the session
+        check answered 200, though the answer said "authenticated: false", and the
+        app sent the browser straight back. The page now redirects only for a real
+        session, and otherwise forgets the stale token and shows the sign-in form.
     - timestamp: '2026-11-09T14:30:00Z'
       title: Stop listing the bundled trust agent as "not ready" on a surface
       description: >-

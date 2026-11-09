@@ -139,6 +139,11 @@ class SessionManager {
     sessionStorage.removeItem('session_token');
   }
 
+  /** Drop a token the server no longer recognises, without telling the server. */
+  forgetSessionToken(): void {
+    sessionStorage.removeItem('session_token');
+  }
+
   expireSession(): void {
     this.setSessionExpiredError();
     this.logout().finally(() => window.location.reload());
