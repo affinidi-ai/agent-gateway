@@ -1930,7 +1930,32 @@ async fn inbound_from_api_key_derives_did() {
     let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
 
     let h = GatewayHarness::start_with_mock(mock, |_, gw_config, bootstrap| {
-        helpers::seed_api_key(bootstrap, surface_id, api_key_id);
+        let api_keys = std::path::Path::new(
+            &bootstrap
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .unwrap()
+        .join("api_keys");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::api_keys::store::ApiKeyStore as _;
+                crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+                    .await
+                    .unwrap()
+                    .create_with_material(
+                        surface_id,
+                        api_key_id.to_string(),
+                        "atgs_e2e".to_string(),
+                        "client",
+                        None,
+                        "component-test",
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
         let mut surface = helpers::build_api_key_identity_channel(api_key_id);
         surface.surface_id = surface_id.to_string();
         gw_config.surfaces = vec![surface];
@@ -2044,7 +2069,32 @@ async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
     let mut base_dir = std::path::PathBuf::new();
     let h = GatewayHarness::start_with_outbound_mock(mock, |dir, gw_config, bootstrap| {
         base_dir = dir.to_path_buf();
-        helpers::seed_api_key(bootstrap, surface_id, api_key_id);
+        let api_keys = std::path::Path::new(
+            &bootstrap
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .unwrap()
+        .join("api_keys");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::api_keys::store::ApiKeyStore as _;
+                crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+                    .await
+                    .unwrap()
+                    .create_with_material(
+                        surface_id,
+                        api_key_id.to_string(),
+                        "atgs_e2e".to_string(),
+                        "client",
+                        None,
+                        "component-test",
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
         let mut surface = helpers::build_api_key_identity_channel(api_key_id);
         surface.surface_id = surface_id.to_string();
         surface
