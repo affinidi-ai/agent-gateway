@@ -80,7 +80,7 @@ pub async fn verify_id_token(
         return Err(ContinuationError::InvalidState);
     }
     let claims = verifier
-        .validate(token, strategy, &[client_id.to_string()])
+        .validate(token, strategy, &[client_id.to_string()], crate::jwt_bearer::models::AudienceClaim::Aud)
         .await
         .map_err(|_| ContinuationError::InvalidState)?;
     profile

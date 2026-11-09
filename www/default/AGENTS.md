@@ -426,13 +426,21 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   method reads the request body, at most one DID Auth, and, while authorization server discovery
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
-  unconfigured as `Method <n>: <reason>`. Loading a surface always replaces `methods`, so a stale
+  unconfigured as `Method <n>: <reason>`.
+- **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
+  Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
+  blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses
+  a new or changed one with a message the page shows. **Audience Claim**
+  (`caller-auth-jwt-audience-claim`) writes `audience_claim` (`aud`, `client_id` or `azp`, saved
+  only when not `aud`); a value other than `aud` shows `caller-auth-jwt-audience-claim-warning`
+  (its callers get no per-user delegated credentials; the gateway refuses it beside an
+  `on_demand`, `pre_authorize` or `elicit` binding) and blocks Save until a value is listed. Transit Points have no Audience Claim control: they match `aud`. Loading a surface always replaces `methods`, so a stale
   canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   first method is JWT Bearer; additional methods never show it. Turning it on prefills the
   resource with the Access Point's https listener URL plus its route (left empty otherwise),
-  empties Accepted Audiences, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
+  empties Accepted Audiences, sets Audience Claim to `aud`, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
   locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
   scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
   gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
@@ -534,6 +542,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | A row's Make primary and remove     | `<area>-method-<index>-make-primary-button`, `-remove-button` (editor)                  |
 | Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
+| JWT audience claim and its warnings | `caller-auth-jwt-audience-claim`, `-audience-claim-warning`, `caller-auth-audiences-missing-warning` |
 
 ## Trust Check
 

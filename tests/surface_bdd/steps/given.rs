@@ -2333,6 +2333,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
@@ -3596,6 +3597,27 @@ fn surface_accepts_jwt_audience(
     {
         SurfaceSourceAuthConfig::JwtBearer(config) => config.audiences = vec![audience],
         _ => panic!("JWT source authentication must be configured before setting audiences"),
+    }
+}
+
+/// The JWT Bearer method checks the `client_id` a token was issued to, as for
+/// an identity provider whose tokens carry no audience.
+#[given(expr = "the surface accepts JWT Bearer tokens issued to client {string}")]
+fn surface_accepts_jwt_bearer_tokens_issued_to_client(
+    world: &mut SurfaceWorld,
+    client: String,
+) {
+    match world
+        .surface_config
+        .source_auth
+        .as_mut()
+        .expect("JWT source authentication must be configured before naming its clients")
+    {
+        SurfaceSourceAuthConfig::JwtBearer(config) => {
+            config.audiences = vec![client];
+            config.audience_claim = Some("client_id".to_string());
+        }
+        _ => panic!("JWT source authentication must be configured before naming its clients"),
     }
 }
 

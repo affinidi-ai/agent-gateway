@@ -14,12 +14,16 @@ export const PROTOCOLS = {
   didcomm: 'didcomm',
 } as const satisfies Record<ChannelProtocol, ChannelProtocol>;
 
+/** The claim a JWT Bearer method matches its `audiences` against; absent means `aud`. */
+export type JwtAudienceClaim = 'aud' | 'azp' | 'client_id';
+
 // Source Authentication configuration (replaces identity_config auth modes + source_authentication_strategy)
 export type SourceAuthConfig =
   | {
       type: 'jwt_bearer';
       jwt_verification_strategy_id: string;
       audiences: string[];
+      audience_claim?: JwtAudienceClaim;
       token_header: string;
       token_scheme: string;
       forward_header: boolean;
