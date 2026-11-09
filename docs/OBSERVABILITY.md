@@ -1034,7 +1034,8 @@ template sends the default event envelope, whose `data` is the record:
 ```
 
 Kafka producers belong to the endpoint: every integration and test send on one endpoint shares
-it. It is rebuilt when the brokers or SASL settings change and dropped when the endpoint is
+it. It is rebuilt when the brokers, security protocol or SASL settings change and dropped
+when the endpoint is
 changed or deleted; the Kinesis, Pulsar and Redis Streams publishers still open a client per
 record.
 
