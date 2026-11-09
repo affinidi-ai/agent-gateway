@@ -330,6 +330,8 @@ mod tests {
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
             previously_connected,
+            signing_key_id: None,
+            signing_key_public: None,
             owner: "unclaimed",
         }
     }

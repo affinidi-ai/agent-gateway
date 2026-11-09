@@ -156,4 +156,19 @@ describe('DefaultSigningPicker', () => {
       await screen.findByRole('option', { name: /This gateway's own key \(local\)/ })
     ).toBeInTheDocument();
   });
+
+  it('shows the bundled agent as chosen when the stored default names its record', async () => {
+    // Naming the bundled record as the default is the same as handing the choice
+    // back to the configuration, so the select must not go blank.
+    respondWith([connection({ id: 'vta-bootstrap', name: 'Bootstrap VTA' }), connection()], {
+      default_signing: { connection_id: 'vta-bootstrap' },
+    });
+    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="bundled" />);
+
+    await screen.findByRole('option', { name: /Production agent/ });
+    const select = screen.getByRole('combobox') as HTMLSelectElement;
+    await waitFor(() =>
+      expect(select.options[select.selectedIndex].text).toBe('The bundled trust agent (default)')
+    );
+  });
 });

@@ -163,6 +163,12 @@ pub struct BootstrapStatus {
     pub context_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrapped_at: Option<DateTime<Utc>>,
+    /// The signing key the sidecar holds for this gateway, and its public half.
+    /// Public data: the dashboard offers it as the bundled agent's key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_key_public: Option<String>,
     /// A completed bootstrap was recorded before this start. Decides whether a
     /// problem falls back to local signing (never connected) or refuses to sign
     /// (tokens were already issued by the sidecar's key).
@@ -525,6 +531,8 @@ pub async fn run(
         context_id: context_id.clone(),
         bootstrapped_at: None,
         previously_connected: false,
+        signing_key_id: None,
+        signing_key_public: None,
         owner: "unclaimed",
     };
 
@@ -540,6 +548,12 @@ pub async fn run(
         status.vta_did = Some(state.vta_did.clone());
         status.control_did = Some(state.control_did.clone());
         status.bootstrapped_at = Some(state.bootstrapped_at);
+        status.signing_key_id = Some(state.signing_key_id.clone());
+        status.signing_key_public = Some(
+            state
+                .signing_key_public
+                .clone(),
+        );
     }
 
     let result = connect(config, storage, &context_id, state.as_ref(), &mut status).await;
@@ -550,6 +564,16 @@ pub async fn run(
             status.vta_did = Some(connected.vta_did.clone());
             status.control_did = Some(connected.control_did.clone());
             status.bootstrapped_at = Some(connected.bootstrapped_at);
+            status.signing_key_id = Some(
+                connected
+                    .signing_key_id
+                    .clone(),
+            );
+            status.signing_key_public = Some(
+                connected
+                    .signing_key_public
+                    .clone(),
+            );
             Outcome { status, state: Some(connected) }
         }
         Err(failure) => {
@@ -994,6 +1018,8 @@ mod tests {
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
                 previously_connected: true,
+                signing_key_id: None,
+                signing_key_public: None,
                 owner: "unclaimed",
             },
             state: Some(state(VTA)),
@@ -1027,6 +1053,8 @@ mod tests {
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
                 previously_connected: false,
+                signing_key_id: None,
+                signing_key_public: None,
                 owner: "unclaimed",
             },
             state: None,
@@ -1757,6 +1785,8 @@ mod tests {
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
             previously_connected: true,
+            signing_key_id: None,
+            signing_key_public: None,
             owner: "unclaimed",
         };
 

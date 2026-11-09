@@ -61,12 +61,15 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
     connection.pairing.state === 'connected' &&
     Boolean(connection.keys?.active?.key_id);
 
-  // The `[vta]` block's own record, which is the bundled trust agent when there is
-  // one, cannot be named by a surface: it is reached through "Inherit". Offering it
-  // as "not ready" tells the operator it is waiting for setup when it is working.
-  // A surface that already saved it keeps it listed, so its select is not blank.
+  // The `[vta]` block's own record is the bundled trust agent. It is offered once it
+  // is connected, under a name that says what it is. While it is not, offering it
+  // greyed out as "not ready" would suggest there is something to set up, so it is
+  // left out, unless this surface already saved it, so the select is never blank.
+  const bundled = (connection: VtaConnection) => connection.id === BOOTSTRAP_CONNECTION_ID;
   const listed = (connection: VtaConnection) =>
-    connection.id !== BOOTSTRAP_CONNECTION_ID || signing?.connection_id === connection.id;
+    !bundled(connection) || ready(connection) || signing?.connection_id === connection.id;
+  const label = (connection: VtaConnection) =>
+    bundled(connection) ? 'Bundled trust agent' : connection.name;
 
   const choose = (value: string) => {
     if (value === INHERIT) {
@@ -107,11 +110,11 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
         <option value={LOCAL}>This gateway&apos;s own key (local)</option>
         {connections.filter(listed).map(connection => (
           <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
-            {connection.name}
-            {connection.id === BOOTSTRAP_CONNECTION_ID
-              ? ' — used through "Inherit the appliance default", not chosen here'
-              : ready(connection)
-                ? ''
+            {label(connection)}
+            {ready(connection)
+              ? ''
+              : bundled(connection)
+                ? ' — not ready: the bundled trust agent is not connected'
                 : ' — not ready: connect it and provision a key first'}
           </option>
         ))}

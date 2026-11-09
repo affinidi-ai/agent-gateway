@@ -268,7 +268,11 @@ impl VtaConnection {
         // one there is nothing to sign the handshake with, so an enabled
         // connection that lacks the reference is a misconfiguration rather than
         // an anonymous client.
+        // The bundled record is the exception: it authenticates with the key the
+        // bootstrap made, which is never in the secrets store, so it has no
+        // reference to carry.
         if self.enabled
+            && !self.is_bootstrap()
             && self
                 .control_key_ref
                 .as_deref()
@@ -352,6 +356,19 @@ impl VtaConnection {
             | BootstrapState::Misconfigured => PairingState::Degraded,
         };
         let connected = state == PairingState::Connected;
+        if connected && let Some(key_id) = status.signing_key_id.clone() {
+            self.keys.active = Some(SigningKey {
+                key_id,
+                public_key: status
+                    .signing_key_public
+                    .clone(),
+                label: Some("bundled trust agent signing key".to_string()),
+                added_at: status
+                    .bootstrapped_at
+                    .unwrap_or_else(Utc::now),
+                retired_at: None,
+            });
+        }
         self.status = state.into();
         self.pairing = crate::vta::pairing::PairingRecord {
             state,
@@ -565,6 +582,8 @@ mod tests {
             control_did: Some("did:key:z6MkGateway".to_string()),
             context_id: "gateway".to_string(),
             bootstrapped_at: Some(Utc::now()),
+            signing_key_id: Some("gateway-jwt-1".to_string()),
+            signing_key_public: Some("z6MkBundledKey".to_string()),
             previously_connected: true,
             owner: "unclaimed",
         }
@@ -595,6 +614,44 @@ mod tests {
         assert_eq!(shown.pairing.granted_contexts, vec!["gateway".to_string()]);
         assert_eq!(shown.pairing.last_verified_at, status.bootstrapped_at);
         assert_eq!(shown.pairing.last_error, None);
+    }
+
+    #[test]
+    fn a_connected_bundled_agent_shows_the_key_it_signs_with() {
+        use crate::vta::bundled::BootstrapState;
+        let status = bundled_status(BootstrapState::Connected);
+        let shown = connection(BOOTSTRAP_CONNECTION_ID).presented_with_bundled(&status);
+        let active = shown
+            .keys
+            .active
+            .expect("the bundled signing key is shown as active");
+        assert_eq!(active.key_id, "gateway-jwt-1");
+        assert_eq!(active.public_key.as_deref(), Some("z6MkBundledKey"));
+    }
+
+    #[test]
+    fn a_bundled_agent_that_is_not_connected_shows_no_signing_key() {
+        use crate::vta::bundled::BootstrapState;
+        for state in [BootstrapState::WaitingForVta, BootstrapState::Revoked, BootstrapState::VtaLost] {
+            let shown = connection(BOOTSTRAP_CONNECTION_ID).presented_with_bundled(&bundled_status(state));
+            assert!(shown.keys.active.is_none(), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_bundled_record_needs_no_control_key_of_its_own() {
+        // It authenticates with the key the bootstrap made, never one from the
+        // secrets store, so requiring a reference would make it unusable.
+        let mut bundled = connection(BOOTSTRAP_CONNECTION_ID);
+        bundled.control_key_ref = None;
+        assert_eq!(bundled.validate(), Ok(()));
+    }
+
+    #[test]
+    fn any_other_enabled_connection_still_needs_a_control_key() {
+        let mut other = connection("customer-1");
+        other.control_key_ref = None;
+        assert_eq!(other.validate(), Err("control_key_ref is required for an enabled connection".to_string()));
     }
 
     #[test]

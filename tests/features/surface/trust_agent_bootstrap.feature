@@ -29,6 +29,7 @@ Feature: A bundled trust agent connects itself on first start
     When the operator reads the key inventory
     Then the admin API response status is 200
     And the inventory lists the bundled trust agent as paired and usable
+    And the inventory shows the bundled trust agent's signing key
 
   Scenario: Verifying the bundled trust agent's connection is refused, so signing is not interrupted
     Given a bundled trust agent that has enrolled the gateway

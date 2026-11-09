@@ -87,6 +87,25 @@ async fn inventory_lists_bundled_agent_usable(world: &mut SurfaceWorld) {
     assert_eq!(connection["usable"], true, "{connection}");
 }
 
+#[then("the inventory shows the bundled trust agent's signing key")]
+async fn inventory_shows_bundled_key(world: &mut SurfaceWorld) {
+    let body = &world
+        .admin_response
+        .as_ref()
+        .expect("the key inventory was read")
+        .body;
+    let connection = body["connections"]
+        .as_array()
+        .and_then(|connections| {
+            connections
+                .iter()
+                .find(|c| c["connection_id"] == "vta-bootstrap")
+        })
+        .unwrap_or_else(|| panic!("no bootstrap connection in {body}"));
+    assert_eq!(connection["keys"][0]["key_id"], "gateway-jwt-1", "{connection}");
+    assert_eq!(connection["keys"][0]["status"], "active", "{connection}");
+}
+
 fn bootstrap_connection(world: &SurfaceWorld) -> &serde_json::Value {
     let body = &world
         .admin_response

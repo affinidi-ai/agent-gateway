@@ -1,6 +1,16 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-09T16:00:00Z'
+      title: Let a surface sign through the bundled trust agent by name
+      description: >-
+        A surface could not name the bundled trust agent: its record was treated
+        as having no control key, so the surface fell back to local signing, and
+        the Surface Builder greyed it out as "not ready". The record now
+        validates without a secrets-store control key, shows the bundled signing
+        key once connected, and the Signing key list offers "Bundled trust
+        agent". A surface can be pinned to the sidecar while the appliance
+        default is another trust agent.
     - timestamp: '2026-11-08T23:45:00Z'
       title: Show the bundled trust agent's bootstrap state on the Trust Agent page
       description: >-
