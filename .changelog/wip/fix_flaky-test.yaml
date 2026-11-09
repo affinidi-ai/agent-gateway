@@ -1,0 +1,26 @@
+branch: fix/flaky-test
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T14:00:00Z'
+      title: Stop a Target grant test racing the revocations it asserts
+      description: >-
+        A Target that refuses a token and an authorization server that then refuses the refresh
+        end the connection and revoke both tokens, and the revocation is spawned, so it outlives
+        the response the caller gets. The test covering it waited a fixed 300 milliseconds for
+        those two revocations to arrive, which is long enough on a developer machine and not
+        always long enough on an instrumented coverage run, where the suite reported no
+        revocation at all. It now waits for the two to arrive, up to five seconds, and asserts
+        the same thing about them. No behaviour changed.
+    - timestamp: '2026-11-09T14:30:00Z'
+      title: Retry the gateway-to-gateway image pulls when a registry refuses one
+      description: >-
+        The gateway-to-gateway scenarios pull a mediator image and a Valkey image before they
+        run, and both registries throttle anonymous pulls per source address, which hosted CI
+        runners share. One refusal failed the whole job. Each pull is now attempted up to four
+        times, waiting 15, 30 and 60 seconds, and the job fails only if every attempt is
+        refused.
+  removed: []
+  security: []
+  breaking: []
