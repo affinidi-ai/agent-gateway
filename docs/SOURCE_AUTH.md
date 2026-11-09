@@ -230,12 +230,44 @@ the agent returns in its answer and the caller sends back, not from a cookie.
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
-each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
-list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called. A request whose token header
+each with 60 seconds of leeway. `aud` must name one of the method's `audiences`, except on an MCP
+Access Point that publishes protected resource metadata, where `aud` must name the resource of
+the route called. A request whose token header
 carries more than one value in the method's `token_scheme` fails, whatever the values, on an
 Access Point, a Transit Point and over Fabric. A value in another scheme, such as an MPP
 `Payment` credential beside the `Bearer` token, does not count.
+
+An Access Point `jwt_bearer` method must name at least one audience, unless the Access Point
+publishes protected resource metadata; the admin API refuses a save without one with `400`, on
+the surface or in a variant's overrides. For an identity provider whose access tokens carry no
+`aud`, such as Amazon Cognito, set `audience_claim` to `client_id` or `azp` and list the clients
+the method accepts in `audiences`: the named claim must then be a string that matches one of
+them, and `aud` is not checked. That binds a token to the client it was issued to, not to the
+gateway, so a token a listed client was issued for another service is accepted too. Callers it
+verifies therefore get no per-user delegated credentials: the admin API refuses, with `400`,
+such a method on a surface or variant with a credential binding, on its Target or a Transit
+Point, whose `consent_mode` is `on_demand`, `pre_authorize` or `elicit`, and a binding with
+external consent or delegated credentials for Fabric callers are withheld from its callers.
+`audience_claim` is `aud` by default, must be `aud` beside protected resource metadata, and must
+be `aud` on a Transit Point.
+
+Neither `client_id` nor `azp` tells an access token from an ID token, and the gateway does not
+check the token type in these modes. Amazon Cognito puts `client_id` only on access tokens, and
+its ID tokens carry `aud` instead, so use `client_id` there. Some providers, such as Keycloak,
+put `azp` on ID tokens as well, so in `azp` mode a listed client's ID token is accepted as an
+access token; where the provider marks the token type, require it in surface policy from
+`input.source_auth.claims`, for example `typ` or `token_use`.
+
+A method stored without `audiences`, from before that rule, keeps loading and skips the audience
+check, so it accepts a token its identity provider issued for any other service. The gateway
+warns about each one at startup and in a `Warning` header on each save of its surface, and a
+save that keeps the stored method unchanged is accepted, so an unrelated edit still saves; a
+save that changes it must name an audience. A variant keeps such a method too when it is added,
+copied or renamed, as long as the surface or one of its enabled stored variants has the same
+method. A disabled variant is not validated on save, so a method only a disabled variant has
+never counts: enabling that variant is refused until its method names an audience. Such methods
+are deprecated and will be refused in the next major release, 2.0.0: list the audiences the
+method accepts, or set `audience_claim`.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
@@ -566,15 +598,15 @@ that:
 - sets `allow_unauthenticated_callers` but authenticates its callers;
 - sets both `source_auth` and `mcp_http.authorization`;
 - sets a `source_auth` a Transit Point does not support, such as a `jwt_bearer` that names no
-  audience, or one the Access Point's rules refuse, such as mTLS trust that names no
-  certificate;
+  audience or whose `audience_claim` is not `aud`, or one the Access Point's rules refuse, such
+  as mTLS trust that names no certificate;
 - sets `delegated_credentials_for_fabric_callers` but does not require a transit token, the
   only way a Fabric caller reaches it (see [Transit token](#transit-token)).
 
 A Transit Point that sets `delegated_credentials_for_fabric_callers` on a surface, or in a
 variant, whose Access Point caller authentication cannot tell a partner's users apart (anything
-but a resource token, or a `jwt_bearer` method that names an audience through a JWT
-verification strategy that names an issuer) is saved with a `Warning` header saying so, and
+but a resource token, or a `jwt_bearer` method that names an audience, matched against `aud`,
+through a JWT verification strategy that names an issuer) is saved with a `Warning` header saying so, and
 releases nothing to Fabric callers. With `api_key`, for example, every key in the secret, the
 partner's and direct callers' alike, would be one caller with one grant (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
@@ -704,7 +736,7 @@ limit or resolves a credential:
 | Method | On a Transit Point |
 | --- | --- |
 | `api_key`, `api_key_provider` | Read from an HTTP header only |
-| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `jwt_bearer` | `forward_header` must be `false`, `audiences` must name at least one audience, and `audience_claim` must be `aud`. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 

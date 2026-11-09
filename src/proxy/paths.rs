@@ -393,6 +393,9 @@ pub fn is_public_request(
 /// dashboard, since channel routes take precedence over the SPA fallback
 /// `ServeDir`. Keep in sync with the routes declared in
 /// `www/default/src/pages/AuthenticatedApp.tsx`.
+///
+/// `scripts/_prepare.sh` reads these entries out of this file to fail env
+/// preparation before a build, so keep the declaration on one line.
 const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "audit",
     "certificates",

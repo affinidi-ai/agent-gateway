@@ -191,6 +191,17 @@ The Audit Log names the surface variant of each request record and describes `re
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).
 
+An audit response says what a read did not return in two fields: `truncated` (it stopped before
+the end of the history) and `dropped_records` (the history holds records it could not read).
+Either makes the counts lower bounds, so the Audit Log and the Credentials audit tab render every
+number from that read with a trailing `+`, an empty page of such a read says the records searched
+held none rather than that the log is empty, and nothing else changes. A read the gateway could
+not make at all is answered with `500`, and both views show that failure — the Audit Log as an
+error panel with a Retry in place of its empty state, never as an empty log. The Audit Log also shows the size of the history against the advisory
+`[audit] vp_audit_log_soft_cap_bytes`, which enforces nothing, formatted by the one shared
+`utils/formatBytes.ts`; see _Audit page: partial reads and
+log size_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-partial-reads-and-log-size).
+
 The Identities page shows a Trust Recorder status chip and a Recorder filter, and the Trust
 Recorder panel shows a Last outcome row; see _Identities page_ and _Trust Recorder panel_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder-panel).
@@ -207,6 +218,11 @@ and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 The Caller Context element lists its caller authentication methods in order, in the sidebar and
 in the fullscreen editor, each row with a Configure button that opens that method's settings;
 see _Caller Context methods_ in [`www/default/AGENTS.md`](www/default/AGENTS.md).
+
+A JWT Bearer Caller Context method requires Accepted Audiences, keeps one stored without them
+until it is changed, and has an **Audience Claim** select (`aud`, `client_id`, `azp`) for identity
+providers that issue no `aud`; see _Caller Context methods_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md).
 
 The Caller Context editor of an MCP surface whose first method is JWT Bearer edits
 authorization server discovery (`caller_authentication.protected_resource`), and Save removes

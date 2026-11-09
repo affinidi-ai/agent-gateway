@@ -597,7 +597,12 @@ impl McpResourceServerConfig {
         let strategy = crate::sts::handlers::gateway_self_trust_strategy(&profile.issuer, jwks)
             .map_err(|_| ResourceTokenError::Unavailable)?;
         let claims = crate::jwt_bearer::JwtBearerVerifier::new(keys)
-            .validate(token, &strategy, std::slice::from_ref(&self.resource))
+            .validate(
+                token,
+                &strategy,
+                std::slice::from_ref(&self.resource),
+                crate::jwt_bearer::models::AudienceClaim::Aud,
+            )
             .await
             .map_err(|_| ResourceTokenError::Invalid)?;
         let now = std::time::SystemTime::now()

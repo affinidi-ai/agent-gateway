@@ -82,6 +82,8 @@ Use this when the backend is already running and you only need the dashboard dev
 | `make config-debug-dev` | Prepare local debug configuration without a static dashboard build |
 | `make config-release` | Prepare the release environment |
 
+Preparation refuses an environment whose `config/gateway.json` has a channel prefix, or a `proxy` route prefix, whose first path segment is a dashboard page: the gateway exits at startup on those, because it would answer a reload of that page with a proxy `404`. The message names each offending prefix and the page it shadows; rename the prefix (for `/payments`, to something such as `/svc/payments`) and the clients that call it, then rerun. Nothing is rewritten for you. The reserved pages are read from `SPA_RESERVED_TOP_LEVEL` in [`src/proxy/paths.rs`](../../src/proxy/paths.rs), the same list the gateway checks; when that list cannot be read, preparation says so and leaves the check to startup.
+
 ## Named Instances
 
 Run isolated local instances by supplying `x`:

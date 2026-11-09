@@ -8,7 +8,8 @@ for supported configuration fields and operator guidance.
 
 This page describes runtime configuration reload behavior: what a reload re-reads, what it does
 not, and how listener state is swapped. It also documents the `[a2a]` bootstrap table (see
-[A2A settings](#a2a-settings)). For what each configuration file controls and the effect of
+[A2A settings](#a2a-settings)) and the `[audit]` one (see
+[Audit log rotation](#audit-log-rotation)). For what each configuration file controls and the effect of
 its fields, see [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md). The source of truth for
 accepted fields and defaults is the configuration types under [`src/config/`](../src/config/).
 
@@ -291,6 +292,27 @@ its issuer metadata and revocation calls have their own 10 second timeouts, not
 `token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and
 needs a restart, see
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#gatewayjson).
+
+## Audit log rotation
+
+The bootstrap `[audit]` table maps to `AuditConfig` in
+[`src/config/types.rs`](../src/config/types.rs). `AuditConfig::validate` runs at startup, and an
+invalid value fails startup with `Invalid [audit] config: …` naming the field. An absent table or
+field takes the default below. Every field is **read once at startup**, when the VP
+Audit Log is opened, and held for the life of the process: a configuration reload re-reads none of
+them, nothing in the dashboard changes them, and changing one needs a restart. A reload never fails
+on them either, so a `config.toml` edited in place keeps the values the gateway started with until
+it is restarted — an operator who lowers `vp_audit_log_keep` and reloads sees nothing happen.
+
+| Field | Default | Behavior |
+| --- | --- | --- |
+| `vp_audit_log_max_bytes` | `8388608` (8 MiB) | Bytes the live log may reach before it is rotated. `0` switches rotation off; any other value below `65536` fails startup. Read once when the log is opened, so a restart is what changes the size at which the live file is rotated. |
+| `vp_audit_log_keep` | `0` | Rotated files kept beside the live one, oldest deleted first; `0` keeps every one of them. Read once when the log is opened. Lowering it takes a restart, and the records past the new bound are then deleted in the next rotation. |
+| `vp_audit_log_soft_cap_bytes` | `1073741824` (1 GiB) | The advisory size the Audit page shows the history against; `0` shows no mark. Advisory only — it changes no behaviour. Read once at startup and published to the audit API from there, so a changed value reaches the page only after a restart. |
+
+What each value does to the log on disk, and what a read of it returns, is in
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#configtoml) and
+[Governance audit forwarding](OBSERVABILITY.md#governance-audit-forwarding).
 
 ## Fabric envelope lifetime
 

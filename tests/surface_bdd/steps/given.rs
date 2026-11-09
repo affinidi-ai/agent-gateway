@@ -2333,6 +2333,7 @@ fn source_auth_fixture(auth_type: &str) -> SurfaceSourceAuthConfig {
             jwks_url: String::new(),
             issuer: String::new(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         }),
         "API Key" => SurfaceSourceAuthConfig::ApiKey(ApiKeySourceAuthConfig {
@@ -2992,6 +2993,94 @@ async fn vp_audit_log_keeps_every_audit_event(world: &mut SurfaceWorld) {
     }
 }
 
+/// The live VP Audit Log of the running gateway: beside its logs when the
+/// scenario configured a log directory, and under `_storage/audit` otherwise,
+/// which the gateway resolves against the base folder it runs in. The rotated
+/// files sit beside it as `delegation-audit.jsonl.<position>`, counting up
+/// from `.1`.
+fn vp_audit_log_path(world: &SurfaceWorld) -> std::path::PathBuf {
+    let base = world
+        .infra
+        .as_ref()
+        .expect("the gateway must be running before its VP Audit Log is reached")
+        ._temp_dir
+        .path();
+    if world
+        .surface_config
+        .writes_log_directory
+    {
+        base.join("_storage/logs/delegation-audit.jsonl")
+    } else {
+        base.join("_storage/audit/delegation-audit.jsonl")
+    }
+}
+
+fn rotated_vp_audit_log_path(
+    world: &SurfaceWorld,
+    position: usize,
+) -> std::path::PathBuf {
+    let live = vp_audit_log_path(world);
+    live.with_file_name(format!("delegation-audit.jsonl.{position}"))
+}
+
+/// One credential injection as the VP Audit Log stores it: a single JSON line,
+/// closed by its newline.
+fn stored_credential_injection(trace_id: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({
+            "timestamp": "2026-11-07T10:00:00Z",
+            "event": "token_injected",
+            "trace_id": trace_id,
+            "provider_id": "calendar",
+            "provider_name": "Calendar",
+            "via_fabric": false,
+        })
+    )
+}
+
+fn write_rotated_vp_audit_log_file(
+    world: &SurfaceWorld,
+    position: usize,
+    trace_id: &str,
+) {
+    let path = rotated_vp_audit_log_path(world, position);
+    std::fs::write(&path, stored_credential_injection(trace_id))
+        .unwrap_or_else(|error| panic!("rotated VP Audit Log file {} must be written: {error}", path.display()));
+}
+
+#[given(expr = "a rotated VP Audit Log file holds a credential injection with trace {string}")]
+fn rotated_vp_audit_log_file_holds_a_credential_injection(
+    world: &mut SurfaceWorld,
+    trace_id: String,
+) {
+    write_rotated_vp_audit_log_file(world, 1, &trace_id);
+}
+
+/// Positions run consecutively while the history is whole, so leaving `.2` out
+/// is what a crash during a rotation, or a file deleted beside the gateway,
+/// leaves behind: the records it held are in no file a read can reach.
+#[given("a rotated VP Audit Log file is missing from the middle of the history")]
+fn rotated_vp_audit_log_file_is_missing_from_the_middle(world: &mut SurfaceWorld) {
+    write_rotated_vp_audit_log_file(world, 1, "gap-oldest-trace");
+    write_rotated_vp_audit_log_file(world, 3, "gap-newest-trace");
+}
+
+/// The half-written line an append interrupted by a crash or a power loss
+/// leaves at the end of the live log.
+#[given("the VP Audit Log holds a line that is not a record")]
+fn vp_audit_log_holds_a_line_that_is_not_a_record(world: &mut SurfaceWorld) {
+    use std::io::Write;
+
+    let path = vp_audit_log_path(world);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("the VP Audit Log at {} must be open for appending: {error}", path.display()));
+    file.write_all(b"{\"timestamp\":\"2026-11-07T10:00:00Z\",\"ev\n")
+        .unwrap_or_else(|error| panic!("the half-written record must be appended: {error}"));
+}
+
 #[given(
     expr = "the Credential Delegation Audit Log contains a token injection for caller {string} with email {string} and name {string}"
 )]
@@ -3596,6 +3685,27 @@ fn surface_accepts_jwt_audience(
     {
         SurfaceSourceAuthConfig::JwtBearer(config) => config.audiences = vec![audience],
         _ => panic!("JWT source authentication must be configured before setting audiences"),
+    }
+}
+
+/// The JWT Bearer method checks the `client_id` a token was issued to, as for
+/// an identity provider whose tokens carry no audience.
+#[given(expr = "the surface accepts JWT Bearer tokens issued to client {string}")]
+fn surface_accepts_jwt_bearer_tokens_issued_to_client(
+    world: &mut SurfaceWorld,
+    client: String,
+) {
+    match world
+        .surface_config
+        .source_auth
+        .as_mut()
+        .expect("JWT source authentication must be configured before naming its clients")
+    {
+        SurfaceSourceAuthConfig::JwtBearer(config) => {
+            config.audiences = vec![client];
+            config.audience_claim = Some("client_id".to_string());
+        }
+        _ => panic!("JWT source authentication must be configured before naming its clients"),
     }
 }
 
