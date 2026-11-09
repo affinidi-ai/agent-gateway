@@ -549,6 +549,7 @@ mod tests {
             | DelegationAuditAction::TraceTerminated { .. }
             | DelegationAuditAction::PaymentEvent(_)
             | DelegationAuditAction::AuthFailed { .. }
+            | DelegationAuditAction::ConnectorCall { .. }
             | DelegationAuditAction::RateLimited { .. }
             | DelegationAuditAction::RequestRejected { .. }
             | DelegationAuditAction::IdentityBindingFailed { .. }
@@ -618,6 +619,14 @@ mod tests {
                 reason: "expired".to_string(),
                 blocking: true,
                 client_ip: None,
+            },
+            DelegationAuditAction::ConnectorCall {
+                transit_point: "linear".to_string(),
+                subject: Some(crate::config::agent_surface::GrantSubject::Caller),
+                outcome: crate::delegation_vault::audit::ConnectorCallOutcome::Forwarded,
+                status_class: Some("2xx".to_string()),
+                reason: None,
+                cause: None,
             },
             DelegationAuditAction::RateLimited {
                 scope: RateLimitScope::Surface,

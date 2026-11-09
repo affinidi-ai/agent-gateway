@@ -10,15 +10,5 @@ changes:
         also covers `mcp_proxies` prefixes and `redirect` routes, which are registered ahead of the
         dashboard in the same way.
   removed: []
-  security:
-    - timestamp: '2026-11-06T16:30:00Z'
-      title: Update actix-http and actix-web to fix four security advisories
-      description: >-
-        actix-http 3.13.1 and actix-web 4.14.0, which the OpenAPI-to-MCP proxy
-        uses, were affected by RUSTSEC-2026-0446 (request smuggling through
-        malformed chunked trailers), RUSTSEC-2026-0447 (compressed request bodies
-        exhausting memory before extractor limits apply), RUSTSEC-2026-0448
-        (unbounded decompression) and RUSTSEC-2026-0455 (large-window Brotli
-        bodies bypassing decompression limits). They are now actix-http 3.20.3
-        and actix-web 4.18.2, the first patched releases.
+  security: []
   breaking: []
