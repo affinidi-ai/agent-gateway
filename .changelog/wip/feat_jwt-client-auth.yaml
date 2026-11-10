@@ -41,4 +41,10 @@ changes:
         that keeps a plain http token endpoint can no longer have its client secret cleared and
         set again by a later update, which would have made it start sending the secret in clear
         text.
+    - timestamp: '2026-11-10T10:53:43Z'
+      title: Mark the Authorization header of a revocation request as sensitive
+      description: >-
+        A revocation request that authenticates its client by HTTP Basic now marks its
+        Authorization header sensitive, as a token request already does, so no debug output of
+        the request shows the client's credentials.
   breaking: []

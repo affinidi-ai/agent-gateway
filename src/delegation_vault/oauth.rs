@@ -1132,8 +1132,9 @@ pub(crate) enum TokenPostFailure {
 /// `request` with `authorization` as its `Authorization` header, marked sensitive so that no
 /// debug output of the request shows it. `authorization` is a `Basic` credential from
 /// `revocation::basic_authorization`, always printable ASCII, so a value that is not a header
-/// value is a bug and stops here rather than going out unmarked.
-fn with_sensitive_authorization(
+/// value is a bug and stops here rather than going out unmarked. Token requests and revocation
+/// requests both set the header through this function.
+pub(super) fn with_sensitive_authorization(
     request: reqwest::RequestBuilder,
     authorization: &str,
 ) -> reqwest::RequestBuilder {
