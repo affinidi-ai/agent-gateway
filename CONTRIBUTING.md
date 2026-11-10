@@ -63,11 +63,12 @@ For faster inner-loop feedback, use `cargo test --no-run` for a compile check an
 GitHub gives workflows on fork pull requests no repository secrets, so the Rust security scan
 (`rust-scan`) is skipped for them, and a skipped job counts as passing for a required check. A
 fork pull request is scanned after it merges, by the run on `main` and the daily scheduled run.
-Before merging a fork pull request, a maintainer should run the scan on a same-repository copy
-of the branch: push the fork's head to a branch in this repository and open or update a pull
-request from it, or run the `checks` workflow on that branch with `workflow_dispatch`. Never
-switch the workflow to `pull_request_target` to get secrets on forks, since that runs untrusted
-code with them.
+Before merging a fork pull request, a maintainer should review the code first, including any
+change to workflows, build scripts and dependencies, because the scan runs the fork's files
+with the scanner secrets. Only then run the scan on a same-repository copy of the branch: push
+the fork's head to a branch in this repository and open or update a pull request from it, or run
+the `checks` workflow on that branch with `workflow_dispatch`. Never switch the workflow to
+`pull_request_target` to get secrets on forks, since that runs untrusted code with them.
 
 ## Code of Conduct
 
