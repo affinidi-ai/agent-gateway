@@ -160,6 +160,12 @@ check "the rotation reported success" grep -q "^Done" "${work}/rotate.log"
 if ! grep -q "^Done" "${work}/rotate.log"; then echo "--- rotate log (tail)"; strip < "${work}/rotate.log" | tail -15; fi
 second="$(bootstrap_file gateway-enrolment.env | sed -n 's/^GATEWAY_CONTROL_DID=//p')"
 check "the control DID changed" test -n "${second}" -a "${second}" != "${first}"
+printed="$(docker run --rm \
+  -v "${project}_gateway-storage:/app/_storage" -v "${project}_bootstrap:/bootstrap" \
+  -v "${work}/config:/app/config:ro" -v "${work}/certs:/app/certs:ro" \
+  -e TG_ENCRYPTION_KEY -e AG_BACKUP_ENCRYPTION_KEY -e AG_IDENTITY_HASH_PEPPER \
+  "${GATEWAY_IMAGE}" --config /app/config/config.toml --vta-print-control-did 2>/dev/null | strip | tail -n1)"
+check "the printed control DID is the key now in use" test "${printed}" = "${second}"
 docker rm -f "${project}-vta2" "${project}-anchor" >/dev/null 2>&1
 mark
 start_pair
