@@ -336,12 +336,6 @@ impl ConnectionKeyRotator {
             let _ = rotation;
             return Err(StartError::InProgress(Box::new(view_of(&connection))));
         }
-        if !connection.enabled {
-            return Err(StartError::NotUsable("the connection is disabled".to_string()));
-        }
-        if connection.pairing.state != crate::vta::pairing::PairingState::Connected {
-            return Err(StartError::NotUsable("the connection is not paired and connected".to_string()));
-        }
         let Some(did) = connection
             .control_did
             .clone()
@@ -349,6 +343,12 @@ impl ConnectionKeyRotator {
         else {
             return Err(StartError::NotWebvh);
         };
+        if !connection.enabled {
+            return Err(StartError::NotUsable("the connection is disabled".to_string()));
+        }
+        if connection.pairing.state != crate::vta::pairing::PairingState::Connected {
+            return Err(StartError::NotUsable("the connection is not paired and connected".to_string()));
+        }
         let key_ref = connection
             .control_key_ref
             .clone()

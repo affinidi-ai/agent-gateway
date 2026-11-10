@@ -1,6 +1,17 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T15:30:00Z'
+      title: Rotate a connection's control key from the API, with cancel
+      description: >-
+        POST /v1/vta/connections/{id}/control-key/rotate replaces the control key
+        of a connection added by hand, keeping its DID: 200 when it finished, 202
+        while it carries on, 502 when the trust agent refused the new key and the
+        old one was put back. POST .../rotate/cancel stops a rotation that has not
+        switched. The connection list shows when the key was last rotated and a
+        rotation under way, without naming the secrets. Editing a connection no
+        longer resets which of its DID's keys the gateway signs in with, and is
+        refused while a rotation is under way.
     - timestamp: '2026-11-10T15:00:00Z'
       title: ⭐ Rotate a custom trust agent connection's control key, keeping its DID
       description: >-

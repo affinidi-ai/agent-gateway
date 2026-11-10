@@ -424,7 +424,19 @@ pub async fn create_connection(
 
 /// A stored connection as the API shows it: the bootstrap record reports the
 /// bundled sidecar's own state when this gateway runs one.
-fn present(connection: VtaConnection) -> VtaConnection {
+fn present(mut connection: VtaConnection) -> VtaConnection {
+    // A rotation under way names the secrets-store entries of both keys; what
+    // the page needs is the phase and the times.
+    if let Some(rotation) = connection
+        .control_key_state
+        .rotation
+        .as_mut()
+    {
+        rotation.next_key_ref.clear();
+        rotation
+            .previous_key_ref
+            .clear();
+    }
     match crate::vta::bundled::status() {
         Some(status) => connection.presented_with_bundled(&status),
         None => connection,
@@ -574,8 +586,24 @@ pub async fn update_connection(
     {
         return response.into_response();
     }
+    if existing
+        .control_key_state
+        .rotation
+        .is_some()
+    {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json("a control-key rotation is under way on this connection; finish or cancel it first"),
+        )
+            .into_response();
+    }
     let mut updated = to_connection(id.clone(), body, existing.status);
     updated.control_did = kept_control_did(&existing, &updated);
+    // Which key of the DID the gateway signs in with is the gateway's to change,
+    // never the request's.
+    updated.control_key_state = existing
+        .control_key_state
+        .clone();
     if let Err(message) = updated.validate() {
         return (StatusCode::BAD_REQUEST, ErrorBody::json(message)).into_response();
     }
@@ -1253,6 +1281,160 @@ pub async fn rotate_control_key(
     }
 }
 
+/// How long a rotation request waits for the rotation to finish before it
+/// answers `202` and lets it carry on in the background.
+const ROTATION_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn rotation_start_refusal(error: crate::vta::connection_key_rotation::StartError) -> axum::response::Response {
+    use crate::vta::connection_key_rotation::StartError as E;
+    let (status, message) = match error {
+        E::NotFound => return not_found().into_response(),
+        E::Bundled => (
+            StatusCode::CONFLICT,
+            "the bundled trust agent's control key rotates through POST /v1/vta/control-key/rotate".to_string(),
+        ),
+        E::NotUsable(reason) => (StatusCode::CONFLICT, format!("{reason}; connect it before rotating its key")),
+        E::NotWebvh => (
+            StatusCode::CONFLICT,
+            "this connection authenticates as a did:key, whose identifier is its key; rotating it needs a new grant on the trust agent"
+                .to_string(),
+        ),
+        E::InProgress(view) => return (StatusCode::CONFLICT, Json(*view)).into_response(),
+        E::Busy => (StatusCode::CONFLICT, "this connection is being worked on right now".to_string()),
+        E::Failed(e) => {
+            error!(error = %e.log_detail(), "Failed to start a control-key rotation");
+            (StatusCode::INTERNAL_SERVER_ERROR, "the rotation could not be started".to_string())
+        }
+    };
+    (status, ErrorBody::json(message)).into_response()
+}
+
+/// `POST /v1/vta/connections/{id}/control-key/rotate` — replace the key the
+/// gateway signs in to a connection with, keeping the connection's `did:webvh`,
+/// so nothing changes on the trust agent.
+///
+/// Answers `200` with the finished rotation, `202` while it is still under way
+/// (it carries on in the background), and `502` when the trust agent refused
+/// the new key and the old one was put back.
+pub async fn rotate_connection_control_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    if let Err(e) = load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    if crate::server::mode::is_standby() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorBody::json("this gateway is on standby; the active gateway rotates the key"),
+        )
+            .into_response();
+    }
+    let Some(rotator) = state.key_rotator.clone() else {
+        return (
+            StatusCode::CONFLICT,
+            ErrorBody::json(
+                "this gateway has no domain to publish a connection's DID under, so there is no key to rotate",
+            ),
+        )
+            .into_response();
+    };
+    if let Err(e) = rotator
+        .start(&id, Some(&user_id))
+        .await
+    {
+        return rotation_start_refusal(e);
+    }
+    let driver = Arc::clone(&rotator);
+    let driven_id = id.clone();
+    let mut task = tokio::spawn(async move { driver.drive(&driven_id).await });
+    let finished = tokio::time::timeout(ROTATION_WAIT, &mut task).await;
+    let connection = match state.store.get(&id).await {
+        Ok(Some(connection)) => connection,
+        _ => return not_found().into_response(),
+    };
+    let view = crate::vta::connection_key_rotation::view_of(&connection);
+    use crate::vta::connection_key_rotation::Outcome;
+    match finished {
+        Ok(Ok(Ok(Outcome::Finished))) => (StatusCode::OK, Json(view)).into_response(),
+        Ok(Ok(Ok(Outcome::RolledBack))) => (
+            StatusCode::BAD_GATEWAY,
+            ErrorBody::json(
+                "the trust agent did not accept the new key; the rotation was rolled back and the current key still works",
+            ),
+        )
+            .into_response(),
+        _ => (StatusCode::ACCEPTED, Json(view)).into_response(),
+    }
+}
+
+/// `POST /v1/vta/connections/{id}/control-key/rotate/cancel` — stop a rotation
+/// that has not switched yet and put the old key back.
+pub async fn cancel_connection_control_key_rotation(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    State(state): State<VtaConnectionAdminState>,
+    Path(id): Path<String>,
+    pat: Option<Extension<PatContext>>,
+    context: Option<Extension<PatTenantContext>>,
+    scope: Option<Extension<PatResourceScope>>,
+) -> axum::response::Response {
+    if let Err(e) = load_for_pairing(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &state,
+        &id,
+        &Feature::KeyManagementEdit,
+        pat.as_ref(),
+        &context,
+        &scope,
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    let Some(rotator) = state.key_rotator.clone() else {
+        return (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response();
+    };
+    use crate::vta::connection_key_rotation::CancelError;
+    match rotator.cancel(&id).await {
+        Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+        Err(CancelError::NotFound) => not_found().into_response(),
+        Err(CancelError::NothingToCancel) => {
+            (StatusCode::CONFLICT, ErrorBody::json("there is no rotation to cancel")).into_response()
+        }
+        Err(CancelError::TooLate) => (
+            StatusCode::CONFLICT,
+            ErrorBody::json("the gateway already signs in with the new key; the rotation can no longer be cancelled"),
+        )
+            .into_response(),
+        Err(CancelError::Failed(e)) => {
+            error!(error = %e.log_detail(), "Failed to cancel a control-key rotation");
+            (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("the rotation could not be cancelled")).into_response()
+        }
+    }
+}
+
 /// `GET /v1/key-management/inventory` — every key this appliance signs with,
 /// which surface maps to what, and which contexts no surface claims.
 ///
@@ -1591,6 +1773,8 @@ pub fn create_vta_connection_router(
         .route("/v1/vta/connections/{id}/revoke", post(revoke_connection))
         .route("/v1/vta/connections/{id}/status", get(connection_status))
         .route("/v1/vta/connections/{id}/rotate", post(rotate_connection_key))
+        .route("/v1/vta/connections/{id}/control-key/rotate", post(rotate_connection_control_key))
+        .route("/v1/vta/connections/{id}/control-key/rotate/cancel", post(cancel_connection_control_key_rotation))
         .route("/v1/vta/connections/{id}/keys", post(provision_connection_key))
         .route("/v1/vta/status", get(vta_status))
         .route("/v1/vta/control-key/rotate", post(rotate_control_key))
@@ -1660,6 +1844,47 @@ mod tests {
             verified: true,
             origin: None,
         }
+    }
+
+    #[test]
+    fn a_connection_shown_to_a_client_names_no_secret_of_a_rotation_under_way() {
+        use crate::vta::connections::{ControlKeyRotation, RotationPhase};
+        let mut connection = crate::vta::connections::VtaConnection {
+            id: "c".to_string(),
+            tenant_id: None,
+            name: "n".to_string(),
+            description: None,
+            enabled: true,
+            transport: Default::default(),
+            endpoint: "http://x".to_string(),
+            vta_did: "did:webvh:v".to_string(),
+            default_context_id: None,
+            control_key_ref: None,
+            control_did: None,
+            control_key_state: Default::default(),
+            status: Default::default(),
+            keys: Default::default(),
+            pairing: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        connection
+            .control_key_state
+            .rotation = Some(ControlKeyRotation {
+            phase: RotationPhase::Introduced,
+            next_key_ref: "vta-control-key-c-key-2".to_string(),
+            next_verification_method: "#key-2".to_string(),
+            previous_key_ref: "vta-control-key-c".to_string(),
+            previous_verification_method: "#key-1".to_string(),
+            started_at: chrono::Utc::now(),
+            give_up_at: chrono::Utc::now(),
+            attempts: 0,
+        });
+
+        let shown = serde_json::to_string(&present(connection)).unwrap();
+
+        assert!(!shown.contains("vta-control-key"), "{shown}");
+        assert!(shown.contains("#key-2"), "{shown}");
     }
 
     #[test]

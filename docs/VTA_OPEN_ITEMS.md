@@ -52,6 +52,11 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 - **The images need more than 8 GB to build.** `vti-specs-core` and the `agent-gateway` crate
   are killed by the out-of-memory killer in an 8 GB Docker VM; 16 GB builds both.
 
+- **A custom connection's control key can only be rotated by hand, and only as a `did:webvh`.**
+  There is no schedule for it, and a connection that authenticates as a `did:key` cannot be
+  rotated without a new grant. After a rotation the trust agent keeps accepting the old key for
+  its DID cache time (60 seconds by default, 300 at most).
+
 ## Tenancy and publication
 
 - **No per-tenant default.** `KeyDirectory::with_tenant_mapping` exists but nothing calls it, and

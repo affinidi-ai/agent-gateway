@@ -254,6 +254,43 @@ next start bootstraps again under a new key id (`gateway-jwt-2`, …); a retired
 key id is never reused. It is never run automatically: a new trust agent means
 new keys and DIDs.
 
+### Rotating the control key of a connection you added
+
+A connection added from the dashboard authenticates as a `did:webvh` the gateway publishes at
+`/vta-auth/<id>/did.jsonl`. Its control key can be replaced **without a new grant**: the DID, and
+so the access entry on the trust agent, do not change. Use **Rotate control key** on the
+connection's row on the Trust Agent page, or
+`POST /v1/vta/connections/{id}/control-key/rotate` (key management edit rights).
+
+Three steps, each saved on the connection record before the action that follows it, so a
+restart resumes the rotation instead of repeating it:
+
+1. **Introduce**: a log entry, signed by the current key, adds the new key to the DID document
+   beside the old one. A trust agent re-reads a cached document that does not define the key a
+   proof names, so it accepts the new key at once.
+2. **Switch**: the connection's one cached client moves to the new key and signs in with it.
+   (A second client would sign the same DID in again and end the first one's session.) A call
+   that took the old token a moment earlier is retried once.
+3. **Retire**: a log entry, signed by the new key, removes the old key, and the old seed is
+   deleted.
+
+If the trust agent refuses the new key, the gateway retries (10 s, doubling to 60 s) until
+`[vta] connection_key_switch_timeout_secs` (default 330) has passed, then rolls back: the old
+key is the only one published again and the new seed is deleted, so signing never stopped. A
+trust agent that cannot be reached leaves the rotation under way (`202`, with the last error on
+the connection); **Cancel** (`POST …/control-key/rotate/cancel`) puts the old key back until the
+switch has happened. The request answers `200` when the rotation finished within 15 seconds,
+`202` while it carries on, `502` when it was rolled back.
+
+Refused with `409`: the bundled record (it rotates through `POST /v1/vta/control-key/rotate`), a
+connection that authenticates as a `did:key` (its identifier is its key; rotating it needs a new
+grant), one that is disabled or not connected, and one already rotating. Checked against a real
+trust agent: the new key is accepted at once, and the old one stops working after the trust
+agent's DID cache time (its `[did_cache] ttl_secs`, 60 seconds by default, 300 at most), plus up
+to 15 minutes for a session it already opened. Like the bundled rotation this is hygiene, not
+recovery from a leak: whoever holds the current key can rotate the document too, and the
+recovery is to revoke and grant again.
+
 ### Rotating the control key
 
 In plain terms, with the setting and the security measures: [how the control key rotates](vta-auth-key-rotation/how-it-works.md).

@@ -88,6 +88,8 @@ pub struct SurfaceConfigBuilder {
     pub writes_log_directory: bool,
     /// The gateway starts with `[vta] auto_bootstrap` against a mock bundled trust agent.
     pub bundled_trust_agent: Option<BundledTrustAgentSetup>,
+    /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
+    pub connection_key_switch_timeout_secs: Option<u64>,
 }
 
 /// Where a bundled gateway finds its trust agent and the folder they share.
@@ -162,6 +164,7 @@ impl Default for SurfaceConfigBuilder {
             keeps_gateway_log: false,
             writes_log_directory: false,
             bundled_trust_agent: None,
+            connection_key_switch_timeout_secs: None,
         }
     }
 }

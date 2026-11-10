@@ -123,8 +123,31 @@ accepts. To recover **without losing any signing keys**:
 Don't use `--vta-rebootstrap` for this: it creates new signing keys, which changes the
 issuer.
 
+## Connections you add yourself
+
+A connection you add from the dashboard authenticates as a `did:webvh` the Gateway publishes, so
+its key can be replaced **without a new grant**: the ID stays the same and the trust agent's
+access entry is untouched. This is done by hand, from the **Rotate control key** action on the
+connection's row on the Trust Agent page (or `POST /v1/vta/connections/{id}/control-key/rotate`).
+There is no schedule for it.
+
+1. The Gateway adds a new key to the published document, beside the old one.
+2. It signs in to the trust agent with the new key, through the connection it already has.
+3. It removes the old key and deletes its secret.
+
+Normally this takes a few seconds and signing carries on throughout. If the trust agent refuses
+the new key, the Gateway keeps trying for a while (`[vta] connection_key_switch_timeout_secs`,
+330 seconds by default), then goes back to the old key and says so; the old key was never removed
+until the new one had worked. A rotation that a restart interrupted is resumed, and one that has
+not switched yet can be cancelled.
+
+The same limits apply as for the sidecar: after the old key is removed the trust agent may keep
+accepting it for its own DID cache time (60 seconds by default, 300 at most), and a session it
+already opened can last up to 15 minutes. A connection that authenticates as a plain `did:key`
+cannot be rotated this way, because for a `did:key` the ID is the key; it needs a new grant on the
+trust agent.
+
 ## Not covered
 
-Trust agents you connect yourself from the dashboard use a `did:webvh` control ID. Their key
-rotates by updating the published DID document, which is a different mechanism and is not
-part of this.
+Scheduled rotation of a connection you added, and rotation of a `did:key` connection without a
+new grant, are not done.
