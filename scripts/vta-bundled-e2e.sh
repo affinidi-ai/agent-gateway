@@ -66,6 +66,14 @@ for a, b in [("/var/lib/vta/config.toml", v + "/data/config.toml"), ("/var/lib/v
              ("/var/lib/vta/seed.enc", v + "/data/seed.enc"), ("/run/secrets/vta_seed_passphrase", v + "/secrets/pass")]:
     t = t.replace(a, b)
 open(v + "/setup.toml", "w").write(t)
+
+# The local dev gateway.json carries a legacy `/payments` channel, which collides
+# with the dashboard's Payments page. A deployment would not have it.
+import json
+gp = g + "/config/gateway.json"
+gj = json.loads(open(gp).read().replace(repo + "/envs/local", g))
+gj["channels"] = [ch for ch in gj.get("channels", []) if ch.get("prefix") != "/payments"]
+open(gp, "w").write(json.dumps(gj, indent=2))
 PY
 
 export TRUST_GATEWAY_MASTER_KEY
