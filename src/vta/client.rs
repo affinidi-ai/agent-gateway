@@ -338,6 +338,24 @@ impl VtaRestClient {
         type_uri: &str,
         payload: Value,
     ) -> Result<T, VtaError> {
+        let generation = self.current_control().0;
+        match self
+            .dispatch_once(type_uri, payload.clone())
+            .await
+        {
+            Err(e) if e.is_superseded() && self.current_control().0 != generation => {
+                self.dispatch_once(type_uri, payload)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn dispatch_once<T: DeserializeOwned>(
+        &self,
+        type_uri: &str,
+        payload: Value,
+    ) -> Result<T, VtaError> {
         let (token, key) = self.session_token().await?;
         let doc = self.build_doc(key.did(), type_uri, payload);
         // Label metrics by the Trust Task slug (the path segment before the
@@ -365,6 +383,24 @@ impl VtaRestClient {
     /// (`keys/sign-jws`) uses it too — that specification declares its request
     /// proof mandatory, so a bearer-only call is refused `proofRequired`.
     pub async fn dispatch_signed<T: DeserializeOwned>(
+        &self,
+        type_uri: &str,
+        payload: Value,
+    ) -> Result<T, VtaError> {
+        let generation = self.current_control().0;
+        match self
+            .dispatch_signed_once(type_uri, payload.clone())
+            .await
+        {
+            Err(e) if e.is_superseded() && self.current_control().0 != generation => {
+                self.dispatch_signed_once(type_uri, payload)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn dispatch_signed_once<T: DeserializeOwned>(
         &self,
         type_uri: &str,
         payload: Value,
@@ -628,6 +664,138 @@ mod tests {
             .unwrap()
             .expect("a record");
         assert_eq!(saved.control_did, new_did);
+    }
+
+    #[derive(Clone)]
+    struct SupersedeState {
+        calls: Arc<AtomicUsize>,
+        status: u16,
+        body: &'static str,
+        replace_on_first:
+            Arc<std::sync::Mutex<Option<(Arc<tokio::sync::OnceCell<Arc<VtaRestClient>>>, Arc<ControlKey>)>>>,
+    }
+
+    async fn echo(
+        State(state): State<SupersedeState>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let task = body["type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if task.contains("auth/challenge") {
+            return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
+        }
+        if task.contains("auth/authenticate") {
+            return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": "t", "expiresIn": 3600 } }))
+                .into_response();
+        }
+        let n = state
+            .calls
+            .fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            let pending = state
+                .replace_on_first
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((cell, key)) = pending {
+                cell.get()
+                    .unwrap()
+                    .replace_control_key(key)
+                    .await;
+            }
+            return (axum::http::StatusCode::from_u16(state.status).unwrap(), state.body.to_string()).into_response();
+        }
+        Json(json!({ "payload": { "ok": true } })).into_response()
+    }
+
+    const SUPERSEDED: &str = r#"{"error":"unauthorized: token superseded"}"#;
+
+    async fn supersede_client(
+        status: u16,
+        body: &'static str,
+        replace_during_first: bool,
+    ) -> (Arc<VtaRestClient>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        let replacement =
+            replace_during_first.then(|| (Arc::clone(&cell), Arc::new(ControlKey::from_seed([22u8; 32]))));
+        let state = SupersedeState {
+            calls: Arc::clone(&calls),
+            status,
+            body,
+            replace_on_first: Arc::new(std::sync::Mutex::new(replacement)),
+        };
+        let app = Router::new()
+            .route(TRUST_TASKS_PATH, post(echo))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(test_client(&format!("http://{addr}"), Arc::new(ControlKey::from_seed([21u8; 32]))));
+        cell.set(Arc::clone(&client))
+            .ok();
+        (client, calls)
+    }
+
+    #[tokio::test]
+    async fn a_call_superseded_by_the_clients_own_key_change_is_retried_once() {
+        let (client, calls) = supersede_client(401, SUPERSEDED, true).await;
+
+        let reply: Value = client
+            .dispatch("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect("retried");
+
+        assert_eq!(reply["payload"]["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one refused, one retried");
+    }
+
+    #[tokio::test]
+    async fn a_signed_call_superseded_by_the_clients_own_key_change_is_retried_once() {
+        let (client, calls) = supersede_client(401, SUPERSEDED, true).await;
+
+        let reply: Value = client
+            .dispatch_signed("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect("retried");
+
+        assert_eq!(reply["payload"]["ok"], true);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_call_without_a_key_change_is_not_retried() {
+        let (client, calls) = supersede_client(401, SUPERSEDED, false).await;
+
+        let err = client
+            .dispatch::<Value>("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect_err("surfaced");
+
+        assert!(err.is_superseded(), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_is_never_retried_even_after_a_key_change() {
+        let (client, calls) = supersede_client(403, r#"{"error":"forbidden"}"#, true).await;
+
+        let err = client
+            .dispatch::<Value>("https://trusttasks.org/spec/test/echo/0.1", json!({}))
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(err, VtaError::Http { status: 403, .. }), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

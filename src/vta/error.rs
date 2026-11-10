@@ -88,6 +88,22 @@ impl VtaError {
             .map(str::to_owned)
     }
 
+    /// The trust agent ended this session because the same DID signed in again:
+    /// `401` with `{"error":"unauthorized: token superseded"}`.
+    pub fn is_superseded(&self) -> bool {
+        let Self::Http { status: 401, body } = self else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|b| {
+                b.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|e| e == "unauthorized: token superseded")
+            })
+            .unwrap_or(false)
+    }
+
     /// Whether the operation may be safely retried once: a transport-level
     /// failure (connection/timeout), or a `429` in which the agent explicitly
     /// told us to come back.
@@ -128,6 +144,34 @@ impl VtaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_superseded_session_is_recognised_by_its_status_and_message_only() {
+        let body = r#"{"error":"unauthorized: token superseded"}"#.to_string();
+        assert!(
+            VtaError::Http {
+                status: 401,
+                body: body.clone()
+            }
+            .is_superseded()
+        );
+        assert!(!VtaError::Http { status: 403, body }.is_superseded(), "another status is not it");
+        assert!(
+            !VtaError::Http {
+                status: 401,
+                body: r#"{"error":"unauthorized: token expired"}"#.to_string()
+            }
+            .is_superseded()
+        );
+        assert!(
+            !VtaError::Http {
+                status: 401,
+                body: "not json".to_string()
+            }
+            .is_superseded()
+        );
+        assert!(!VtaError::Transport("x".to_string()).is_superseded());
+    }
 
     /// The agent signals back-pressure with a 429 and a wait; ignoring it
     /// fails a caller's signature that a one-second pause would have served.

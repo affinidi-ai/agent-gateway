@@ -179,6 +179,14 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-10T14:00:00Z'
+      title: Retry a trust agent call whose session a key change ended
+      description: >-
+        When the gateway moves to a new control key, the trust agent ends the
+        old session of the same DID, and a call that took the old token a moment
+        earlier came back as "token superseded". The client now retries such a
+        call once with a fresh session, and only when its own key changed in the
+        meantime; any other refusal still fails at once.
     - timestamp: '2026-11-10T09:30:00Z'
       title: Keep signing after the control key was rotated by another process
       description: >-
