@@ -18,6 +18,13 @@ changes:
         with no method, or with another method beside jwt_bearer, can never supply the JWT claims
         the identity reads, so it is refused at save time instead of answering 500 per request.
         Stored surfaces that break the rule still load with a warning.
+    - timestamp: '2026-11-10T10:36:15Z'
+      title: Fix flaky credential provider delete test race condition
+      description: >-
+        The a_provider_delete_dropped_part_way_still_revokes_what_was_deferred test waited only for
+        the first revocation token to arrive, then immediately asserted both tokens were present.
+        In CI with different timing, only the second token arrived before the assertion, causing
+        intermittent failures. Now explicitly waits for both tokens before asserting.
   removed: []
   security:
     - timestamp: '2026-11-09T12:00:00Z'
