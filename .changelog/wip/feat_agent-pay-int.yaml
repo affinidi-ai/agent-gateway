@@ -128,10 +128,10 @@ changes:
         overridden in a user's own settings, and it is turned on at startup when a payment gateway
         already exists and nobody has set it.
     - timestamp: '2026-10-21T00:00:00Z'
-      title: Rewrite the Payments page around the payments ledger at /payments
+      title: Rewrite the Payments page around the payments ledger
       description: >-
-        The Payments page is served at `/payments` (`/x402payments` redirects there) and needs only
-        `payments.view`, whatever `agent_pay_delegation` says. It lists the payments ledger with
+        The Payments page stays at `/x402payments`, leaving `/payments` free for gateway channels,
+        and needs only `payments.view`, whatever `agent_pay_delegation` says. It lists the payments ledger with
         filters and a detail view per payment, and the older x402 and MPP records below it.
     - timestamp: '2026-10-30T00:00:00Z'
       title: Share one gateway picker across Managed Agent, Transit Point and Payment
@@ -324,10 +324,3 @@ changes:
         Payment is now taken after policy, so OPA's `input.payment` is
         `{required, rail?, amount?, currency?}` from the trigger check and the manifest snapshot.
         A Rego rule that reads `input.payment.verified` no longer matches.
-    - timestamp: '2026-10-21T00:00:00Z'
-      title: Reserve /payments for the dashboard and rename the example channel
-      description: >-
-        A channel prefix or proxy route whose first segment is `payments` now stops the gateway at
-        startup, as the other dashboard pages do. The shipped example's `payments` channel is now
-        `billing`; rename a `/payments` prefix in an existing `gateway.json` and in the surfaces
-        that use it.

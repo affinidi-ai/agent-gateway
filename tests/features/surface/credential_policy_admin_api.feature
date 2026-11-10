@@ -51,6 +51,32 @@ Feature: Credential rules when saving through the admin API
     Then the admin API response status is 201
     And the credential provider "tenant-cc" is stored
 
+  Scenario: Two tenants each create an authorization code provider with the same provider id
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    And tenant "tenant-a" holds the secret "alpha-id-secret"
+    And tenant "tenant-a" holds the secret "alpha-password-secret"
+    And tenant "tenant-b" holds the secret "bravo-id-secret"
+    And tenant "tenant-b" holds the secret "bravo-password-secret"
+    And the operator has created the authorization code provider "example" for tenant "tenant-a" using secrets "alpha-id-secret" and "alpha-password-secret"
+    When the operator creates the authorization code provider "example" for tenant "tenant-b" using secrets "bravo-id-secret" and "bravo-password-secret"
+    Then the admin API response status is 201
+    And both credential providers "example" have a callback path ending in the id the gateway gave each
+
+  Scenario: The surface routing settings name the gateway's own base URL for callback URLs
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    When the operator reads the surface routing settings
+    Then the admin API response status is 200
+    And the surface routing settings name the gateway's own https address as its base URL
+
+  Scenario: An authorization code provider cannot be created with a callback URL
+    Given the operator can use the admin API and no surface is configured for route "/example"
+    And the appliance holds the secret "provider-id-secret"
+    And the appliance holds the secret "provider-password-secret"
+    When the operator creates the authorization code provider "example" with callback URL "https://192.0.2.1/v1/identity/oauth/callback/example" using secrets "provider-id-secret" and "provider-password-secret"
+    Then the admin API response status is 400
+    And the admin API error response mentions "callback_url is set by an update after create"
+    And no credential provider "example" is stored
+
   Scenario: A tenant surface cannot newly authenticate its target with an appliance-wide secret
     Given the operator can use the admin API and no surface is configured for route "/example"
     And managed agent "bravo" is available as the surface target

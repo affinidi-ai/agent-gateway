@@ -74,12 +74,12 @@ test('shows Payments on payments.view whether agent-pay is on or off', () => {
       <Sidebar />
     </MemoryRouter>
   );
-  expect(screen.getByTestId('nav-payments')).toHaveAttribute('href', '/payments');
+  expect(screen.getByTestId('nav-payments')).toHaveAttribute('href', '/x402payments');
   unmount();
 
   mockFlags = {};
   renderSidebar();
-  expect(screen.getByTestId('nav-payments')).toHaveAttribute('href', '/payments');
+  expect(screen.getByTestId('nav-payments')).toHaveAttribute('href', '/x402payments');
 });
 
 test('hides Payments from callers without payments.view, even with agent-pay on', () => {

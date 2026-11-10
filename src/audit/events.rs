@@ -156,6 +156,34 @@ pub enum DelegationFailureReason {
     CredentialsUnavailable,
     AnonymousCaller,
     ContinuationError,
+    /// A consent start or callback state that is missing, not sealed by this
+    /// gateway, expired, or of the wrong stage.
+    ConsentStateInvalid,
+    /// A consent start or callback state that was already used on this process.
+    ConsentStateReused,
+    /// The path names another provider than the state, or the state's provider
+    /// is gone, renamed or no longer an authorization code provider without an
+    /// issuer.
+    ConsentProviderMismatch,
+    /// A consent callback without the binding cookie the start POST set.
+    BrowserBindingMismatch,
+    /// A consent callback without `iss` from a provider whose issuer is recorded.
+    IssMissing,
+    /// A consent callback whose `iss` is not the provider's recorded issuer.
+    IssMismatch,
+    /// A consent callback that is malformed or carries no code.
+    ConsentResponseInvalid,
+    /// The vendor answered the consent with an error.
+    ConsentDenied,
+    /// The provider's redirect URI breaks the consent rules or is another
+    /// provider's.
+    RedirectUriInvalid,
+    /// The provider's authorization endpoint or parameters break the consent rules.
+    AuthorizationUrlInvalid,
+    /// A consent start POST that did not come from the gateway's start page.
+    CrossSiteConsentStart,
+    /// The vendor's token endpoint refused or failed the code exchange.
+    TokenExchangeFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

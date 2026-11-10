@@ -484,7 +484,7 @@ async fn a_transit_point_workload_binding_names_each_provider_key() {
         surface
             .identity_slots
             .protected = Some(crate::source_auth::ManagedIdentityConfig::FromApiKey {
-            api_key_id: Some("atgk_e2e0000000000000000000000000078".to_string()),
+            api_key_id: Some(keys[0].key_id.clone()),
         });
         gw_config.surfaces = vec![surface];
     })
@@ -757,6 +757,21 @@ async fn a_managed_agent_fallback_ignores_the_presented_key() {
     let mut identities_dir = String::new();
     let h = GatewayHarness::start(|_, gw_config, bootstrap| {
         keys = create_provider_keys(bootstrap, &["fallback-client"], &[]);
+        block_on(async {
+            crate::api_keys::FileSystemApiKeyStore::new(&api_keys_dir(bootstrap))
+                .await
+                .expect("create API key store")
+                .create_with_material(
+                    "managed-key-fallback",
+                    MANAGED_KEY_ID.to_string(),
+                    "atgs_managed".to_string(),
+                    "managed-client",
+                    None,
+                    "component-test",
+                )
+                .await
+                .expect("create the managed key");
+        });
         identities_dir = bootstrap
             .storage_paths
             .identities

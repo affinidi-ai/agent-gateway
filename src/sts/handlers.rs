@@ -286,7 +286,7 @@ impl JwtBearerSubjectVerifier {
             .map_err(|error| StsError::ServerError(format!("gateway jwks projection failed: {error}")))?;
         let strategy = gateway_self_trust_strategy(issuer, &jwks)?;
         self.verifier
-            .validate(token, &strategy, &[])
+            .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
             .map_err(|error| StsError::InvalidGrant(format!("assertion verification failed: {error}")))
     }
@@ -413,7 +413,7 @@ async fn verify_with_client_strategies(
     }
     for (strategy, principal_claim) in candidates {
         match verifier
-            .validate(token, &strategy, &[])
+            .validate(token, &strategy, &[], crate::jwt_bearer::models::AudienceClaim::Aud)
             .await
         {
             Ok(claims) => return Ok(VerifiedAssertion { claims, principal_claim }),

@@ -138,6 +138,103 @@ show_proxy_info() {
   echo ""
 }
 
+# Reads the reserved dashboard routes from SPA_RESERVED_TOP_LEVEL in
+# src/proxy/paths.rs, one per line. That const is already hand-synced with
+# www/default/src/pages/AuthenticatedApp.tsx; deriving it here keeps this
+# script from becoming a third copy that drifts.
+spa_reserved_routes() {
+  awk '
+    /SPA_RESERVED_TOP_LEVEL: &\[&str\] = &\[/ { inside = 1; next }
+    inside && /^\];/ { exit }
+    inside {
+      while (match($0, /"[^"]+"/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        $0 = substr($0, RSTART + RLENGTH)
+      }
+    }
+  ' "$1"
+}
+
+# Warns when a prefix in <gateway_json> shadows a dashboard page. The gateway
+# starts anyway but does not serve that prefix, and logs it (see
+# spa_collision_warning in src/proxy/paths.rs); warning while the env is
+# prepared says so before the first request goes missing. Nothing is rewritten:
+# the developer renames the prefix.
+#
+# The comparison matches the runtime's: the first path segment of the prefix,
+# lowercased, against the reserved list — so /svc/payments is fine and
+# /Payments/v1 is not. The prefixes are the ones
+# NetworkConfig::dashboard_shadowing_prefixes returns: every channel and MCP
+# proxy prefix, every route of type "proxy", and every route of type "redirect"
+# that has a target.
+#
+# Usage: check_reserved_dashboard_routes <gateway_json>
+check_reserved_dashboard_routes() {
+  local gateway_json="$1"
+  local paths_rs="${current_dir}/src/proxy/paths.rs"
+
+  if [[ ! -f "${gateway_json}" ]]; then
+    echo "⚠️  No gateway.json in this env — skipping the reserved dashboard route check"
+    return 0
+  fi
+
+  if [[ ! -f "${paths_rs}" ]]; then
+    echo "⚠️  src/proxy/paths.rs not found — skipping the reserved dashboard route check"
+    return 0
+  fi
+
+  local reserved=""
+  if ! reserved=$(spa_reserved_routes "${paths_rs}"); then
+    reserved=""
+  fi
+  if [[ -z "${reserved}" ]]; then
+    echo "⚠️  Could not read SPA_RESERVED_TOP_LEVEL from src/proxy/paths.rs — skipping the reserved dashboard route check"
+    return 0
+  fi
+
+  local prefixes
+  if ! prefixes=$(jq -r '
+    [ (.channels // [])[]?         | .prefix? ]
+    + [ (.mcp_proxies // [])[]?    | .prefix? ]
+    + [ (.routes // {}) | to_entries[]?
+        | select(.value.type == "proxy" or (.value.type == "redirect" and .value.target != null))
+        | .value.prefix? ]
+    | .[] | select(type == "string")
+  ' "${gateway_json}"); then
+    echo "⚠️  Could not read the prefixes from gateway.json — skipping the reserved dashboard route check"
+    return 0
+  fi
+
+  local collisions=""
+  local prefix segment
+  while IFS= read -r prefix; do
+    [[ -n "${prefix}" ]] || continue
+    segment="${prefix}"
+    while [[ "${segment}" == /* ]]; do
+      segment="${segment#/}"
+    done
+    segment="${segment%%/*}"
+    [[ -n "${segment}" ]] || continue
+    segment=$(printf '%s' "${segment}" | LC_ALL=C tr 'A-Z' 'a-z')
+    if printf '%s\n' "${reserved}" | grep -Fxq -- "${segment}"; then
+      collisions="${collisions}   - prefix '${prefix}' shadows the dashboard page '/${segment}'"$'\n'
+    fi
+  done <<< "${prefixes}"
+
+  if [[ -n "${collisions}" ]]; then
+    echo "⚠️  Reserved dashboard routes are shadowed by ${gateway_json}:"
+    printf '%s' "${collisions}"
+    echo "   The gateway starts, but does not serve these prefixes, since they would"
+    echo "   answer those dashboard pages instead of the dashboard."
+    echo "   Fix: rename each prefix (of a channel, an MCP proxy, or a proxy or redirect"
+    echo "   route, in that gateway.json) to one that is not a dashboard page,"
+    echo "   e.g. '/svc/<name>'. Clients calling it must use the new prefix."
+    return 0
+  fi
+
+  echo "✅ No prefix in gateway.json shadows a reserved dashboard route"
+}
+
 # Default ports for non-local targets (docker, etc.)
 http_port=${3:-8080}
 https_port=${4:-8443}
@@ -554,5 +651,7 @@ if [[ "${env_kind}" == "local" ]]; then
     [[ -n "${_proxy_url}" ]] && echo "🧪 URL_PROXY → ${_proxy_url}"
   fi
 fi
+
+check_reserved_dashboard_routes "${target_dir}/config/gateway.json"
 
 echo "✅ ${target} env ${target_dir} preparation completed!"

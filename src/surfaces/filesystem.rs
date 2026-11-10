@@ -106,6 +106,15 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
             .await
     }
 
+    async fn get_checked(
+        &self,
+        surface_id: &str,
+    ) -> Result<Option<AgentSurface>> {
+        self.storage
+            .get_checked(surface_id)
+            .await
+    }
+
     async fn list_all(&self) -> Result<Vec<AgentSurface>> {
         self.storage.list_all().await
     }
@@ -121,6 +130,7 @@ impl AgentSurfaceStore for FileSystemAgentSurfaceStore {
         self.storage
             .delete(surface_id)
             .await?;
+        crate::observability::dashboard::record_surface_deleted(surface_id);
         policy_changes::surface_written(before.as_ref(), None).await;
         target_auth_changes::surface_written(before.as_ref(), None);
         drop(write);

@@ -231,6 +231,7 @@ impl ProtectedResourceConfig {
         match config {
             crate::source_auth::SourceAuthConfig::JwtBearer(mut jwt) => {
                 jwt.audiences = vec![self.resource.clone()];
+                jwt.audience_claim = crate::jwt_bearer::models::AudienceClaim::Aud;
                 crate::source_auth::SourceAuthConfig::JwtBearer(jwt)
             }
             other => other,

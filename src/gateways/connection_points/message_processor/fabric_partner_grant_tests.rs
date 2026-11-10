@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::response::IntoResponse;
 use serde_json::{Value, json};
+use tower::ServiceExt;
 
 use super::fabric_transit_tests::{
     CALLER_KEY, JWT_AUDIENCE, PEER_CONNECTION_POINT_DID, PEER_ISSUER_DID, PER_USER_PROVIDER, SURFACE_ID, binding,
@@ -32,7 +32,15 @@ use crate::surfaces::{AgentSurfaceStore, FileSystemAgentSurfaceStore};
 
 const SECOND_PROVIDER: &str = "per-user-second";
 const GATEWAY_BASE_URL: &str = "https://receiver.example";
-const CALLBACK_URL: &str = "https://203.0.113.20/oauth/callback/per-user";
+const CALLBACK_ORIGIN: &str = "https://203.0.113.20";
+const OAUTH_CALLBACK_ROUTE: &str = "/oauth/callback";
+
+/// The `state` query parameter of `url`.
+fn state_of(url: &url::Url) -> String {
+    url.query_pairs()
+        .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+        .unwrap_or_else(|| panic!("no state on {url}"))
+}
 
 /// The rejection records of a refused request: stage, reason and `via_fabric`.
 type Rejections = Vec<(RejectionStage, RejectionReason, bool)>;
@@ -259,7 +267,9 @@ impl Receiver {
                         "authorization_endpoint": "https://provider.example/authorize",
                         "token_endpoint": authorization_server.token_endpoint,
                         "client_id_secret_ref": "client-id", "client_secret_secret_ref": "client-secret",
-                        "callback_url": CALLBACK_URL, "default_scopes": ["read"],
+                        "callback_path": format!("{OAUTH_CALLBACK_ROUTE}/{provider}"),
+                        "callback_url": format!("{CALLBACK_ORIGIN}{OAUTH_CALLBACK_ROUTE}/{provider}"),
+                        "default_scopes": ["read"],
                         "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -472,32 +482,30 @@ impl Receiver {
         }
     }
 
-    /// Completes, as the authorization server's redirect with the code `code`
-    /// would, the consent the authorization URL in a direct call's
-    /// `consent_required` answer starts. Returns the state the URL carried.
+    /// Completes, as a browser confirming the start page and the authorization
+    /// server's redirect with the code `code` would, the consent the
+    /// authorization URL in a direct call's `consent_required` answer starts.
+    /// Returns the state the URL carried.
     async fn complete_consent(
         &self,
         consent: &Value,
         code: &str,
     ) -> crate::delegation_vault::OAuthState {
-        let authorization_url = url::Url::parse(
+        let start_url = url::Url::parse(
             consent["consent_required"][0]["authorization_url"]
                 .as_str()
                 .unwrap_or_else(|| panic!("no authorization URL: {consent}")),
         )
         .unwrap();
-        let state = authorization_url
-            .query_pairs()
-            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
-            .unwrap();
-        let opened = crate::delegation_vault::oauth::decode_oauth_state(&state).unwrap();
+        let start_state = state_of(&start_url);
+        let opened = crate::delegation_vault::oauth::decode_start_state(&start_state).unwrap();
         let callback = crate::delegation_vault::handlers::DelegationVaultState {
             vault_store: self.vault.clone(),
             provider_store: self.providers.clone(),
             secrets_store: self.secrets.clone(),
             gateway_base_url: GATEWAY_BASE_URL.to_string(),
             agent_surface_store: None,
-            oauth_callback_route: "/oauth/callback".to_string(),
+            oauth_callback_route: OAUTH_CALLBACK_ROUTE.to_string(),
             vc_signer: None,
             vc_issuer: None,
             vault_population_notifier: None,
@@ -505,20 +513,55 @@ impl Receiver {
             resource_origins: Arc::new(HashMap::new()),
             issuers: Arc::new(None),
         };
+        let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
+            .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
+
+        let started = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post(start_url.path())
+                    .header("origin", CALLBACK_ORIGIN)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(axum::body::Body::from(
+                        url::form_urlencoded::Serializer::new(String::new())
+                            .append_pair("state", &start_state)
+                            .finish(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.status(), axum::http::StatusCode::FOUND);
+        let header = |name| {
+            started
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_else(|| panic!("no {name} on the start answer"))
+        };
+        let vendor = url::Url::parse(header("location")).unwrap();
+        let cookie = header("set-cookie")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code", code)
+            .append_pair("state", &state_of(&vendor))
+            .finish();
+
         let response = self
             .egress()
-            .scope(crate::delegation_vault::handlers::oauth_callback(
-                axum::extract::State(callback),
-                axum::extract::Path(PER_USER_PROVIDER.to_string()),
-                axum::extract::Query(crate::delegation_vault::handlers::OAuthCallbackQuery {
-                    code: Some(code.to_string()),
-                    state: Some(state),
-                    error: None,
-                    error_description: None,
-                }),
-            ))
+            .scope(
+                app.oneshot(
+                    axum::http::Request::get(format!("{OAUTH_CALLBACK_ROUTE}/{PER_USER_PROVIDER}?{query}"))
+                        .header("cookie", cookie)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                ),
+            )
             .await
-            .into_response();
+            .unwrap();
         let page = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

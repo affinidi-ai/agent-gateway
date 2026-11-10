@@ -883,6 +883,7 @@ mod tests {
             token_header: "X-Auth-Token".to_string(),
             token_scheme: String::new(),
             forward_header: false,
+            ..Default::default()
         });
         let json = serde_json::to_string(&config).unwrap();
         let back: SourceAuthConfig = serde_json::from_str(&json).unwrap();

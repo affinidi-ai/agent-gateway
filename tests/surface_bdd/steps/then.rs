@@ -673,6 +673,45 @@ fn vp_audit_log_includes_policy_decision(world: &mut SurfaceWorld) {
     );
 }
 
+#[then(expr = "the VP Audit Log includes the record with trace {string}")]
+fn vp_audit_log_includes_the_record_with_trace(
+    world: &mut SurfaceWorld,
+    trace_id: String,
+) {
+    let events = audit_response_events(world, "VP Audit Log");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["trace_id"] == serde_json::json!(trace_id)),
+        "expected the VP Audit Log to include the record of trace '{trace_id}', got {events:?}"
+    );
+}
+
+#[then("the audit read response says it did not reach the end of the history")]
+fn audit_read_response_says_it_did_not_reach_the_end_of_the_history(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    assert_eq!(
+        body["truncated"],
+        serde_json::json!(true),
+        "a read that could not reach the end of the history must say so, got {body}"
+    );
+}
+
+#[then("the audit read response says it reached the end of the history")]
+fn audit_read_response_says_it_reached_the_end_of_the_history(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    assert_eq!(body["truncated"], serde_json::json!(false), "the read reached the end of the history, got {body}");
+}
+
+#[then("the audit read response counts a record it could not read")]
+fn audit_read_response_counts_a_record_it_could_not_read(world: &mut SurfaceWorld) {
+    let body = &get_admin_response(world).body;
+    let dropped = body["dropped_records"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the audit read response must count the records it could not read, got {body}"));
+    assert!(dropped >= 1, "expected at least one record counted as unreadable, got {body}");
+}
+
 #[then("the VP Audit Log records that the request policy failed to evaluate")]
 async fn vp_audit_log_records_request_policy_evaluation_failure(world: &mut SurfaceWorld) {
     expect_vp_audit_record(
@@ -1392,19 +1431,50 @@ fn response_body_is_error(
 
 #[then("the OAuth callback response shows an authorization failure page")]
 fn oauth_callback_response_shows_authorization_failure_page(world: &mut SurfaceWorld) {
-    assert_content_type_contains(get_response_headers_value(world), "text/html", "OAuth callback response");
+    assert_authorization_failure_page(world, "OAuth callback response");
+}
+
+#[then(expr = "the consent start response status is {int}")]
+fn consent_start_response_status_is(
+    world: &mut SurfaceWorld,
+    expected: u16,
+) {
+    assert_response_status(Some(get_response_status_value(world)), expected);
+}
+
+#[then("the consent start response shows an authorization failure page")]
+fn consent_start_response_shows_authorization_failure_page(world: &mut SurfaceWorld) {
+    assert_authorization_failure_page(world, "consent start response");
+}
+
+#[then(expr = "the consent start response does not send the browser to OAuth provider {string}")]
+fn consent_start_response_does_not_send_browser_to_provider(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let headers = get_response_headers_value(world);
+    assert_eq!(
+        headers.get("location"),
+        None,
+        "expected the consent start response not to send the browser to OAuth provider '{provider}'"
+    );
+    assert_eq!(headers.get("set-cookie"), None, "expected the consent start response to set no consent binding cookie");
+}
+
+fn assert_authorization_failure_page(
+    world: &SurfaceWorld,
+    what: &str,
+) {
+    assert_content_type_contains(get_response_headers_value(world), "text/html", what);
     let body = get_response_body_value(world)
         .get("text")
         .and_then(|value| value.as_str())
         .unwrap_or_else(|| {
-            panic!(
-                "expected OAuth callback response body to be captured as HTML text, got {}",
-                get_response_body_value(world)
-            )
+            panic!("expected the {what} body to be captured as HTML text, got {}", get_response_body_value(world))
         });
     assert!(
         body.contains("Authorization Failed"),
-        "expected OAuth callback response to show an authorization failure page, got {body}"
+        "expected the {what} to show an authorization failure page, got {body}"
     );
 }
 
@@ -2192,7 +2262,20 @@ fn response_includes_authorization_url(
         .get("authorization_url")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("consent entry for '{provider}' should include authorization_url, got {entry}"));
-    assert!(url.contains("/authorize"), "authorization_url should point at OAuth authorization endpoint, got {url}");
+    let url = url::Url::parse(url).unwrap_or_else(|_| panic!("authorization_url should be a URL, got {url}"));
+    let segment = world
+        .surface_config
+        .provider_record_id(&provider);
+    assert_eq!(
+        url.path(),
+        format!("/v1/identity/oauth/callback/{segment}/start"),
+        "authorization_url should point at the gateway's consent start page, got {url}"
+    );
+    assert!(
+        url.query_pairs()
+            .any(|(name, value)| name == "state" && !value.is_empty()),
+        "the consent start page URL should carry a state, got {url}"
+    );
 }
 
 #[then(expr = "the response includes delegated credential scopes {string}")]
@@ -2920,6 +3003,44 @@ fn mcp_tool_result_matches_rest_api_response(
     assert_mcp_tool_result_carries_rest_api_body(get_response_body_value(world), expected, &actor_name);
 }
 
+#[then(expr = "the MCP tool result is REST API {string}'s file as an embedded {string} resource")]
+fn mcp_tool_result_is_rest_api_file_as_embedded_resource(
+    world: &mut SurfaceWorld,
+    actor_name: String,
+    mime_type: String,
+) {
+    let configured = &get_observed_target_for_actor(world, &actor_name, TargetActorKind::RestApi)
+        .configured_response
+        .body;
+    let expected = configured
+        .as_str()
+        .unwrap_or_else(|| panic!("REST API '{actor_name}' must be configured with a file. Configured: {configured}"));
+    let body = get_response_body_value(world);
+    assert_eq!(
+        body.pointer("/result/isError"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected a successful MCP tool result. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/type")
+            .and_then(|value| value.as_str()),
+        Some("resource"),
+        "expected an embedded resource. Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/resource/mimeType")
+            .and_then(|value| value.as_str()),
+        Some(mime_type.as_str()),
+        "Body: {body}"
+    );
+    assert_eq!(
+        body.pointer("/result/content/0/resource/blob")
+            .and_then(|value| value.as_str()),
+        Some(expected),
+        "the file's bytes must arrive unchanged. Body: {body}"
+    );
+}
+
 #[then(expr = "the MCP tool result without the Target credential matches REST API {string} response")]
 fn mcp_tool_result_without_target_credential_matches_rest_api_response(
     world: &mut SurfaceWorld,
@@ -3361,6 +3482,32 @@ async fn delegation_audit_trail_contains_event(
     })
     .await;
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+}
+
+#[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]
+async fn delegation_audit_trail_records_refused_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    reason: String,
+) {
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events.iter().any(|entry| {
+            let failure = entry.pointer("/event/delegation_failed");
+            failure
+                .and_then(|failure| failure.get("reason"))
+                .and_then(|value| value.as_str())
+                == Some(reason.as_str())
+                && failure
+                    .and_then(|failure| failure.get("provider_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(provider.as_str())
+        })
+    })
+    .await;
+    assert!(
+        found,
+        "expected a refused consent for provider '{provider}' with reason '{reason}' in the delegation audit trail, got {events:?}"
+    );
 }
 
 /// Audit records reach the log shortly after the request that produced them,
@@ -4176,7 +4323,7 @@ async fn target_token_requests(world: &SurfaceWorld) -> Vec<HashMap<String, Stri
 }
 
 /// The gateway's log with terminal colour codes removed.
-fn gateway_log(world: &SurfaceWorld) -> String {
+pub(crate) fn gateway_log(world: &SurfaceWorld) -> String {
     let path = world
         .infra
         .as_ref()
@@ -4206,9 +4353,17 @@ fn warning_lines_containing(
     world: &SurfaceWorld,
     text: &str,
 ) -> Vec<String> {
+    log_lines_containing(world, "WARN", text)
+}
+
+fn log_lines_containing(
+    world: &SurfaceWorld,
+    level: &str,
+    text: &str,
+) -> Vec<String> {
     gateway_log(world)
         .lines()
-        .filter(|line| line.contains("WARN") && line.contains(text))
+        .filter(|line| line.contains(level) && line.contains(text))
         .map(str::to_string)
         .collect()
 }
@@ -4232,6 +4387,27 @@ fn gateway_log_has_no_warning(
 ) {
     let lines = warning_lines_containing(world, &text);
     assert!(lines.is_empty(), "the gateway log has warnings containing {text:?}: {lines:?}");
+}
+
+#[then(expr = "the gateway log has an error containing {string}")]
+fn gateway_log_has_error(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    assert!(
+        !log_lines_containing(world, "ERROR", &text).is_empty(),
+        "the gateway log has no error containing {text:?}:\n{}",
+        gateway_log(world)
+    );
+}
+
+#[then(expr = "the gateway log has no error containing {string}")]
+fn gateway_log_has_no_error(
+    world: &mut SurfaceWorld,
+    text: String,
+) {
+    let lines = log_lines_containing(world, "ERROR", &text);
+    assert!(lines.is_empty(), "the gateway log has errors containing {text:?}: {lines:?}");
 }
 
 #[then(expr = "the startup report names the {word} {string} as breaking the rule {string} in {word} mode")]

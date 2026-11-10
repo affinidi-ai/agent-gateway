@@ -50,6 +50,10 @@ import {
 } from '../components/surface-builder/nodesFromSurface';
 import { findDuplicateListenerRoutes } from '../components/surface-builder/templates/scrubVolatile';
 import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
+import {
+  apiKeyStatusMap,
+  firstUnusableApiKeyIdentity,
+} from '../components/surface-builder/elements/identity/apiKeyStatus';
 import { withoutCanvasLayout } from '../utils/surfaceDirtySignature';
 import './SurfaceBuilder.css';
 
@@ -840,6 +844,11 @@ const SurfaceDetailPage: React.FC = () => {
     scheduleSnap,
   ]);
 
+  const apiKeyStatuses = useMemo(
+    () => apiKeyStatusMap(surface?.api_key_references),
+    [surface?.api_key_references]
+  );
+
   /**
    * Build a single, user-facing reason explaining why the surface cannot
    * be saved right now. Returns `null` when ready to PUT. Surfaces the
@@ -882,6 +891,10 @@ const SurfaceDetailPage: React.FC = () => {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
       };
+    }
+    const unusableKey = firstUnusableApiKeyIdentity(builder.state.nodes, apiKeyStatuses);
+    if (unusableKey) {
+      return { message: `Identity: ${unusableKey.warning}`, nodeId: unusableKey.node.id };
     }
     // Unmet feature dependencies (e.g. credential-delegation without
     // source auth on the surface). Block save so the runtime never
@@ -960,6 +973,14 @@ const SurfaceDetailPage: React.FC = () => {
             return {
               message: `Variant "${label}" — ${def?.label ?? incomplete.type}: ${reason}`,
               nodeId: incomplete.id,
+              variantId: vid,
+            };
+          }
+          const variantUnusableKey = firstUnusableApiKeyIdentity(snapNodes, apiKeyStatuses);
+          if (variantUnusableKey) {
+            return {
+              message: `Variant "${label}" — Identity: ${variantUnusableKey.warning}`,
+              nodeId: variantUnusableKey.node.id,
               variantId: vid,
             };
           }
@@ -1656,6 +1677,7 @@ const SurfaceDetailPage: React.FC = () => {
   // Stored without `public`: Public access shows a legacy state, which the
   // operator can close.
   const legacyAccessPoint = !!surface && typeof surface.access_point?.public !== 'boolean';
+  const refusingRequests = surface?.serving_status === 'not_serving';
 
   const policyDefinitionsSaveBlocker = surfacePolicyBlockingReason(
     builder.state.nodes,
@@ -1680,8 +1702,18 @@ const SurfaceDetailPage: React.FC = () => {
         canEdit={canEdit}
         builder={builder}
         topBanner={
-          error || (saveWarnings && saveWarnings.length > 0) ? (
+          error || refusingRequests || (saveWarnings && saveWarnings.length > 0) ? (
             <>
+              {refusingRequests && (
+                <div
+                  className="alert alert-warning surface-page-alert mb-2"
+                  role="status"
+                  data-testid="surface-refusing-requests"
+                >
+                  <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                  This surface is refusing requests
+                </div>
+              )}
               {error && (
                 <div
                   className="alert alert-danger surface-page-alert mb-2"
@@ -1738,6 +1770,7 @@ const SurfaceDetailPage: React.FC = () => {
         hasVariants={savedHasVariants}
         accessPointNotice={accessPointNotice}
         legacyAccessPoint={legacyAccessPoint}
+        apiKeyStatuses={apiKeyStatuses}
         surfaceId={surface?.surface_id}
         tenantId={surface ? (surface.tenant_id ?? null) : undefined}
         lastActivity={

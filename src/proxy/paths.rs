@@ -389,13 +389,26 @@ pub fn is_public_request(
 }
 
 /// Top-level paths owned by the dashboard SPA (www/default).
-/// A channel prefix that shadows any of these would silently break the
-/// dashboard, since channel routes take precedence over the SPA fallback
-/// `ServeDir`. Keep in sync with the routes declared in
-/// `www/default/src/pages/AuthenticatedApp.tsx`.
+/// A channel, MCP proxy, proxy or redirect prefix under any of these would
+/// break the dashboard, since those routes take precedence over the SPA
+/// fallback `ServeDir`, so the gateway does not serve it. Every top-level route
+/// in `www/default/src/pages/AuthenticatedApp.tsx` and
+/// `www/default/src/routes.ts` must be listed; a test checks.
+///
+/// Adding an entry stops every existing gateway whose configuration uses that
+/// segment from serving that prefix after the upgrade, so it needs a `breaking`
+/// changelog entry.
+///
+/// `scripts/_prepare.sh` reads these entries out of this file to warn during env
+/// preparation, so keep the declaration on one line.
 const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
+    "access-tokens",
+    "api-keys",
+    "apikeys",
     "audit",
+    "authorities",
     "certificates",
+    "cli-consent",
     "connections",
     "connection-points",
     "credential-providers",
@@ -406,24 +419,28 @@ const SPA_RESERVED_TOP_LEVEL: &[&str] = &[
     "gateways",
     "identities",
     "integrations",
+    "issuers",
+    "jwt-verification-strategies",
     "logs",
     "mediators",
     "metrics",
     "notifications",
     "oidc-providers",
     "onboard",
-    "payments",
-    "x402payments",
+    "payment-gateways",
     "policies",
+    "policy-definitions",
     "profile",
     "proxies",
     "secrets",
     "settings",
+    "sts-clients",
     "surfaces",
     "system-metrics",
     "tasks",
     "trust-registries",
     "users",
+    "x402payments",
 ];
 
 /// Returns the first path segment of `prefix`, lowercased, or `None` if the
@@ -438,51 +455,40 @@ fn first_segment(prefix: &str) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
-/// Validate that no channel / proxy / pipe prefix collides with a top-level
-/// SPA route. Channel routes are merged into the same router as the SPA's
-/// fallback `ServeDir`, and explicit channel routes win — a collision
-/// silently breaks the dashboard page with a proxy 404.
-///
-/// Returns the list of conflicting `(prefix, spa_path)` pairs. Empty on success.
+/// The dashboard page `prefix` would hide, or `None` when it hides none. A
+/// channel, MCP proxy, proxy or redirect route registered at `prefix` is merged
+/// into the same router as the SPA's fallback `ServeDir` and wins over it, so it
+/// would answer a reload of that page instead of the dashboard.
+pub fn shadowed_dashboard_page(prefix: &str) -> Option<String> {
+    first_segment(prefix)
+        .filter(|segment| SPA_RESERVED_TOP_LEVEL.contains(&segment.as_str()))
+        .map(|segment| format!("/{segment}"))
+}
+
+/// Every `(prefix, page)` pair where `prefix` would hide a dashboard page.
 pub fn check_spa_route_collisions<'a, I>(prefixes: I) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut collisions = Vec::new();
-    for prefix in prefixes {
-        if let Some(seg) = first_segment(prefix)
-            && SPA_RESERVED_TOP_LEVEL.contains(&seg.as_str())
-        {
-            collisions.push((prefix.to_string(), format!("/{}", seg)));
-        }
-    }
-    collisions
+    prefixes
+        .into_iter()
+        .filter_map(|prefix| shadowed_dashboard_page(prefix).map(|page| (prefix.to_string(), page)))
+        .collect()
 }
 
-/// The fatal startup message for prefixes that shadow dashboard pages: each
-/// offending prefix, the page it shadows, and how to fix it.
-pub fn spa_collision_banner(collisions: &[(String, String)]) -> String {
+/// What the gateway logs, and a reload reports, for prefixes it does not serve
+/// because they would hide dashboard pages: each prefix, the page it hides, and
+/// how to fix it.
+pub fn spa_collision_warning(collisions: &[(String, String)]) -> String {
     let detail = collisions
         .iter()
-        .map(|(prefix, spa)| format!("    - prefix '{prefix}' shadows the dashboard page '{spa}'"))
+        .map(|(prefix, page)| format!("prefix '{prefix}' shadows the dashboard page '{page}'"))
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("; ");
     format!(
-        "\n\
-         ============================================================\n\
-         FATAL: Gateway configuration error\n\
-         ============================================================\n\
-         One or more channel/proxy prefixes collide with reserved\n\
-         dashboard routes. Starting in this state would replace\n\
-         dashboard pages with proxy 404s, so the server is exiting.\n\n\
-         Collisions:\n{detail}\n\n\
-         Fix: rename each offending prefix (a channel's `prefix`, or the\n\
-         `prefix` of a proxy route, in your gateway.json) to one that is\n\
-         not a dashboard page, e.g. '/svc/<name>', and restart. The\n\
-         dashboard's Payments page owns '/payments', so a channel on\n\
-         '/payments' must be renamed; clients that call it must use the\n\
-         new prefix.\n\
-         ============================================================\n"
+        "Not serving gateway.json prefixes that would hide dashboard pages, everything else is served: {detail}. \
+         Rename each prefix (of a channel, an MCP proxy, or a proxy or redirect route) to one that is not a \
+         dashboard page, e.g. '/svc/<name>', and reload; clients that call it must use the new prefix."
     )
 }
 
@@ -747,27 +753,97 @@ mod tests {
     }
 
     #[test]
-    fn collision_detects_the_payments_page_and_its_legacy_redirect() {
-        let hits = check_spa_route_collisions(["/payments", "/payments/v1/report", "/x402payments"]);
-        assert_eq!(
-            hits,
-            vec![
-                ("/payments".to_string(), "/payments".to_string()),
-                ("/payments/v1/report".to_string(), "/payments".to_string()),
-                ("/x402payments".to_string(), "/x402payments".to_string()),
-            ]
-        );
+    fn the_payments_page_is_reserved_at_x402payments_and_payments_stays_free_for_channels() {
+        let hits = check_spa_route_collisions(["/x402payments", "/payments", "/payments/v1/report"]);
+        assert_eq!(hits, vec![("/x402payments".to_string(), "/x402payments".to_string())]);
     }
 
     #[test]
-    fn the_startup_error_names_each_prefix_the_page_it_shadows_and_the_rename() {
-        let banner = spa_collision_banner(&check_spa_route_collisions(["/payments", "/svc/x", "/policies/v1"]));
+    fn channels_shipped_in_existing_configs_never_shadow_a_dashboard_page() {
+        let shipped = [
+            "/payments",
+            "/cats",
+            "/agents",
+            "/routes",
+            "/mcp",
+            "/tools",
+            "/customer-support",
+            "/billing",
+            "/order-status",
+            "/product-catalog",
+            "/helpdesk",
+            "/inventory",
+        ];
+        assert_eq!(check_spa_route_collisions(shipped), Vec::<(String, String)>::new());
+    }
 
-        assert!(banner.contains("prefix '/payments' shadows the dashboard page '/payments'"), "{banner}");
-        assert!(banner.contains("prefix '/policies/v1' shadows the dashboard page '/policies'"), "{banner}");
-        assert!(!banner.contains("'/svc/x'"), "{banner}");
-        assert!(banner.contains("rename each offending prefix"), "{banner}");
-        assert!(banner.contains("'/payments' must be renamed"), "{banner}");
+    #[test]
+    fn the_warning_names_each_skipped_prefix_the_page_it_hides_and_the_rename() {
+        let warning = spa_collision_warning(&check_spa_route_collisions(["/x402payments", "/svc/x", "/policies/v1"]));
+
+        assert!(warning.starts_with("Not serving gateway.json prefixes that would hide dashboard pages"), "{warning}");
+        assert!(
+            warning.contains(
+                "prefix '/x402payments' shadows the dashboard page '/x402payments'; \
+                 prefix '/policies/v1' shadows the dashboard page '/policies'. "
+            ),
+            "{warning}"
+        );
+        assert!(!warning.contains('\n'), "a log line: {warning}");
+        assert!(!warning.contains("'/svc/x'"), "{warning}");
+        assert!(warning.contains("e.g. '/svc/<name>', and reload"), "{warning}");
+        assert!(warning.contains("clients that call it must use the new prefix"), "{warning}");
+    }
+
+    #[test]
+    fn a_prefix_under_a_dashboard_page_names_that_page_and_any_other_prefix_none() {
+        assert_eq!(shadowed_dashboard_page("/Settings/old"), Some("/settings".to_string()));
+        assert_eq!(shadowed_dashboard_page("/cli-consent"), Some("/cli-consent".to_string()));
+        assert_eq!(shadowed_dashboard_page("/payments"), None);
+        assert_eq!(shadowed_dashboard_page("/svc/settings"), None);
+        assert_eq!(shadowed_dashboard_page("/"), None);
+    }
+
+    fn dashboard_top_level_pages() -> std::collections::BTreeSet<String> {
+        let routes = include_str!("../../www/default/src/pages/AuthenticatedApp.tsx")
+            .split("path=\"/")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next());
+        let constants = include_str!("../../www/default/src/routes.ts")
+            .split(": '/")
+            .skip(1)
+            .filter_map(|rest| rest.split(['\'', '?']).next());
+        routes
+            .chain(constants)
+            .filter_map(first_segment)
+            .collect()
+    }
+
+    #[test]
+    fn every_top_level_dashboard_page_is_reserved() {
+        let pages = dashboard_top_level_pages();
+        assert!(
+            ["x402payments", "settings", "cli-consent"]
+                .iter()
+                .all(|page| pages.contains(*page)),
+            "{pages:?}"
+        );
+
+        let unreserved: Vec<_> = pages
+            .iter()
+            .filter(|page| !SPA_RESERVED_TOP_LEVEL.contains(&page.as_str()))
+            .collect();
+        assert_eq!(unreserved, Vec::<&String>::new(), "add these to SPA_RESERVED_TOP_LEVEL");
+    }
+
+    #[test]
+    fn the_configuration_reference_lists_every_reserved_page() {
+        let reference = include_str!("../../docs/CONFIGURATION_REFERENCE.md");
+        let missing: Vec<_> = SPA_RESERVED_TOP_LEVEL
+            .iter()
+            .filter(|page| !reference.contains(&format!("`/{page}`")))
+            .collect();
+        assert_eq!(missing, Vec::<&&str>::new(), "list these in docs/CONFIGURATION_REFERENCE.md");
     }
 
     #[test]
@@ -778,7 +854,36 @@ mod tests {
         ))
         .expect("the shipped example config loads");
         assert!(!config.channels.is_empty(), "the example offers channel prefixes");
-        assert_eq!(check_spa_route_collisions(config.proxy_prefixes()), Vec::<(String, String)>::new());
+        assert_eq!(check_spa_route_collisions(config.dashboard_shadowing_prefixes()), Vec::<(String, String)>::new());
+    }
+
+    #[test]
+    fn an_mcp_proxy_or_redirect_route_on_a_dashboard_page_is_a_collision() {
+        let config: crate::config::NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "mcp_proxies": [
+                { "id": "mcp", "name": "mcp", "prefix": "/mcp" },
+                { "id": "policies", "name": "policies", "prefix": "/policies" }
+            ],
+            "routes": {
+                "legacy": { "type": "redirect", "prefix": "/settings", "target": "/new" }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        let mut hits = check_spa_route_collisions(config.dashboard_shadowing_prefixes());
+        hits.sort_unstable();
+        assert_eq!(
+            hits,
+            vec![
+                ("/policies".to_string(), "/policies".to_string()),
+                ("/settings".to_string(), "/settings".to_string()),
+            ]
+        );
     }
 
     #[test]

@@ -280,17 +280,27 @@ pub struct RouteCategory {
 }
 
 impl NetworkConfig {
-    /// The route prefixes this configuration serves through the proxy: every
-    /// channel prefix and every route of type `proxy`. These are what must not
-    /// shadow a dashboard page.
-    pub fn proxy_prefixes(&self) -> Vec<&str> {
+    /// The route prefixes this configuration registers ahead of the dashboard:
+    /// every channel prefix, every MCP proxy prefix, every `proxy` route and
+    /// every `redirect` route that has a target. These are what must not shadow
+    /// a dashboard page.
+    pub fn dashboard_shadowing_prefixes(&self) -> Vec<&str> {
         self.channels
             .iter()
+            .chain(
+                self.mcp_proxies
+                    .iter()
+                    .flatten(),
+            )
             .map(|channel| channel.prefix.as_str())
             .chain(
                 self.routes
                     .values()
-                    .filter(|route| matches!(route.route_type, RouteType::Proxy))
+                    .filter(|route| match route.route_type {
+                        RouteType::Proxy => true,
+                        RouteType::Redirect => route.target.is_some(),
+                        _ => false,
+                    })
                     .map(|route| route.prefix.as_str()),
             )
             .collect()
@@ -1102,7 +1112,7 @@ mod url_mapping_tests {
     }
 
     #[test]
-    fn proxy_prefixes_are_the_channel_prefixes_and_the_proxy_routes_only() {
+    fn dashboard_shadowing_prefixes_are_the_channels_mcp_proxies_and_proxy_and_redirect_routes() {
         let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
             "did": { "domain": "test.local" },
             "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
@@ -1112,14 +1122,48 @@ mod url_mapping_tests {
             "mcp_proxies": [{ "id": "mcp", "name": "mcp", "prefix": "/mcp" }],
             "routes": {
                 "channels": { "type": "proxy", "prefix": "/svc" },
+                "legacy": { "type": "redirect", "prefix": "/old", "target": "/new" },
                 "api": { "type": "identity_api", "prefix": "/api" },
                 "dashboard": { "type": "static", "prefix": "/", "path": "www", "fallback": true }
             },
         }))
         .expect("network config should deserialize");
 
-        let mut prefixes = cfg.proxy_prefixes();
+        let mut prefixes = cfg.dashboard_shadowing_prefixes();
         prefixes.sort_unstable();
-        assert_eq!(prefixes, vec!["/agents", "/svc"]);
+        assert_eq!(prefixes, vec!["/agents", "/mcp", "/old", "/svc"]);
+    }
+
+    #[test]
+    fn a_redirect_route_without_a_target_shadows_nothing() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [],
+            "routes": {
+                "dead": { "type": "redirect", "prefix": "/settings" },
+                "live": { "type": "redirect", "prefix": "/policies", "target": "/new" }
+            },
+        }))
+        .expect("network config should deserialize");
+
+        assert_eq!(cfg.dashboard_shadowing_prefixes(), vec!["/policies"]);
+    }
+
+    #[test]
+    fn dashboard_shadowing_prefixes_without_mcp_proxies_are_the_channels_and_routes() {
+        let cfg: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "agents", "prefix": "/agents" }],
+            "routes": {},
+        }))
+        .expect("network config should deserialize");
+
+        assert_eq!(cfg.dashboard_shadowing_prefixes(), vec!["/agents"]);
     }
 }

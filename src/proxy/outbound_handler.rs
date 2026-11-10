@@ -5750,26 +5750,7 @@ async fn step_inject_external_grant(
     let injections = crate::proxy::credential_delegation::build_injection_headers(&injection, &grant.access_token);
     ctx.grant_destination = Some(destination);
     apply_grant_injections(ctx, &injections)?;
-    if grant.use_is_due(chrono::Utc::now()) {
-        let vault = Arc::clone(vault);
-        let id = grant.id.clone();
-        let request_id = ctx.request_id.clone();
-        let surface_variant = crate::observability::policy_audit::current_request_variant();
-        tokio::spawn(async move {
-            if let Err(error) = vault
-                .mark_grant_used(&id)
-                .await
-            {
-                debug!(
-                    target: "credential_delegation",
-                    request_id = %request_id,
-                    surface_variant = surface_variant.as_deref(),
-                    error = %error,
-                    "Failed to record a grant's use"
-                );
-            }
-        });
-    }
+    crate::delegation_vault::release::record_use_in_background(vault, &grant, Some(ctx.request_id.clone()));
     audit_grant_injected(ctx, &caller, &provider, &grant, subject);
     ctx.released_grant = Some(Box::new(ReleasedGrant {
         grant,
@@ -6630,11 +6611,12 @@ fn refuse_a_compressed_mcp_answer(
 
 /// [12a] A vendor's refusal of a grant by binding. A `401` whose `Bearer`
 /// challenge rejects the token (`invalid_token`) gets one refresh,
-/// single-flight, and one retry with the new token. A grant that cannot be
-/// refreshed, or a refresh token the authorization server refuses
-/// (`invalid_grant`), removes the grant, revoking it at the vendor, and
-/// answers `connect_required`, but only while the grant still holds the token
-/// refused: a grant refreshed or reconnected meanwhile is kept. A second `401`
+/// single-flight, and one retry with the new token. A refresh token the
+/// authorization server refuses (`invalid_grant`), or a caller's grant that
+/// cannot be refreshed, removes the grant, revoking it at the vendor, but only
+/// while the grant still holds the token refused: a grant refreshed or
+/// reconnected meanwhile is kept. An owner's grant that cannot be refreshed is
+/// kept. Each answers `connect_required`. A second `401`
 /// refuses that request, not the fresh grant, which is kept, and answers
 /// `connector_unavailable`. A `401` without such a challenge, as a front
 /// proxy or a firewall answers, or with one that names no error, and a
@@ -9427,6 +9409,7 @@ mod tests {
                     "id": "provider", "name": "Provider", "provider_id": "provider",
                     "authorization_endpoint": "https://provider.example/authorize",
                     "client_id_secret_ref": "provider-client-id",
+                    "callback_path": "/v1/identity/oauth/callback/provider",
                     "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
                 }))
                 .unwrap(),
@@ -10686,6 +10669,7 @@ mod tests {
             let mut ctx = test_pipeline_context();
             ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
             let mut surface = (*ctx.surface).clone();
+            surface.surface_id = "owner-a".into();
             surface.tenant_id = Some("tenant-a".into());
             let mut point = ctx.virtual_channel.clone();
             point.managed_identity =
@@ -10719,8 +10703,58 @@ mod tests {
             step_provider_key_gate(&mut own)
                 .await
                 .is_ok(),
-            "its own tenant's key is served"
+            "its own key is served"
         );
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_naming_its_surfaces_revoked_api_key_refuses_every_request_in_both_modes() {
+        use crate::api_keys::store::ApiKeyStore as _;
+        use crate::config::credential_policy::RuleMode;
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            let gate = crate::identity::provider_key_gate::test_support::enforced_gate(
+                &[("owner-a", Some("tenant-a"))],
+                &[("owner-a", "atgk_transit_a")],
+            )
+            .await;
+            crate::config::credential_policy::use_thread_credential_policy(
+                crate::config::credential_policy::CredentialPolicyConfig {
+                    tenant_credential_isolation: mode,
+                    ..Default::default()
+                },
+            );
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel.protocol = crate::config::agent_surface::TransitProtocol::Mcp;
+            let mut surface = (*ctx.surface).clone();
+            surface.surface_id = "owner-a".into();
+            surface.tenant_id = Some("tenant-a".into());
+            let mut point = ctx.virtual_channel.clone();
+            point.managed_identity =
+                Some(serde_json::from_value(json!({"type": "from_api_key", "api_key_id": "atgk_transit_a"})).unwrap());
+            surface.transit = Some(crate::config::agent_surface::TransitConfig {
+                points: vec![point],
+                outbound_listen_address: None,
+                shared: Default::default(),
+            });
+            ctx.surface = Arc::new(surface);
+            assert!(
+                step_provider_key_gate(&mut ctx)
+                    .await
+                    .is_ok(),
+                "{mode:?}: an active key is served"
+            );
+
+            gate.api_keys
+                .revoke("owner-a", "atgk_transit_a", "test")
+                .await
+                .unwrap();
+            gate.gate
+                .key_changed("atgk_transit_a");
+            let error = step_provider_key_gate(&mut ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE, "{mode:?}");
+        }
     }
 
     #[tokio::test]
@@ -17990,6 +18024,89 @@ mod tests {
         assert!(vendor.requests().is_empty());
     }
 
+    /// A vendor's `401` to a grant that cannot be refreshed asks for a new
+    /// connect. A caller's grant is removed and revoked. An owner's is kept and
+    /// nothing is revoked: any caller of the binding can send a request the
+    /// vendor refuses, so none ends the owner's grant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vendors_401_to_a_grant_that_cannot_be_refreshed_removes_only_a_callers_grant() {
+        use crate::delegation_vault::grants::GrantKey;
+        use crate::delegation_vault::release::GrantRefusal;
+        use crate::delegation_vault::revocation::tests::{Answer, RecordingServer};
+        let caller = "c".repeat(64);
+        for (subject, key) in [
+            ("owner", GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor")),
+            ("caller", GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap()),
+        ] {
+            let authorization_server = RecordingServer::start_answering(vec![Answer::status(200)]).await;
+            let vendor = RecordingServer::start_answering(vec![
+                Answer::status(401).with_header("WWW-Authenticate", r#"Bearer error="invalid_token""#),
+            ])
+            .await;
+            let directory = tempfile::tempdir().unwrap();
+            let state = fixture_grant_state(directory.path(), &authorization_server, &vendor).await;
+            let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&key, "first");
+            unrefreshable.refresh_token = None;
+            let vault = state
+                .delegation_vault_store
+                .clone()
+                .unwrap();
+            vault
+                .store_grant(unrefreshable)
+                .await
+                .unwrap();
+            let surface = fixture_surface(&vendor, subject, "http");
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+
+            let refused = send_with_grant(&state, &mut ctx)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(grant_refusal(&refused), Some(GrantRefusal::ConnectRequired { .. })),
+                "{subject}: {refused:?}"
+            );
+            let kept = vault
+                .grant(&key)
+                .await
+                .unwrap();
+            if subject == "owner" {
+                assert_eq!(kept.map(|grant| grant.access_token), Some("first".to_string()), "{subject}");
+                assert!(
+                    vault
+                        .deferred_revocations()
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "{subject}: no revocation is kept for it, pending or deferred"
+                );
+                assert!(
+                    authorization_server
+                        .requests()
+                        .is_empty(),
+                    "{subject}: nothing is revoked"
+                );
+            } else {
+                assert!(kept.is_none(), "{subject}");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while authorization_server
+                        .requests()
+                        .is_empty()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    !authorization_server
+                        .requests()
+                        .is_empty(),
+                    "{subject}: revoked at the vendor"
+                );
+            }
+        }
+    }
+
     /// A vendor's `401` gets one refresh and one retry with the new token. A
     /// second `401`, after a refresh the authorization server granted, refuses
     /// this request, not the connection, which any caller of an owner binding
@@ -19326,6 +19443,7 @@ mod tests {
             };
             let caller = "a".repeat(64);
             let key = GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "fixture-vendor");
+            let caller_key = GrantKey::caller(None, "transit-fabric", VENDOR_HOP, "fixture-vendor", &caller).unwrap();
             let revoked_line = "Revoked a delegated grant at its authorization server";
 
             {
@@ -19336,7 +19454,7 @@ mod tests {
                 .await;
                 let directory = tempfile::tempdir().unwrap();
                 let state = fixture_grant_state(directory.path(), &authorization_server, &rejecting).await;
-                let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&key, "first");
+                let mut unrefreshable = crate::delegation_vault::grants::tests::grant(&caller_key, "first");
                 unrefreshable.refresh_token = None;
                 state
                     .delegation_vault_store
@@ -19345,7 +19463,7 @@ mod tests {
                     .store_grant(unrefreshable)
                     .await
                     .unwrap();
-                let surface = fixture_surface(&rejecting, "owner", "http");
+                let surface = fixture_surface(&rejecting, "caller", "http");
                 lines.clear();
                 let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
                 assert!(
@@ -21808,7 +21926,8 @@ mod tests {
             json!({"id": "broken-key", "name": "Broken key", "provider_id": "broken-key",
                 "provider_type": "api_key", "api_key_secret_ref": "missing-secret"}),
             json!({"id": "consent", "name": "Consent", "provider_id": "consent",
-                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id"}),
+                "authorization_endpoint": "https://provider.example/authorize", "client_id_secret_ref": "client-id",
+                "callback_path": "/v1/identity/oauth/callback/consent"}),
         ] {
             let mut provider = provider;
             provider["created_at"] = json!("2026-10-01T00:00:00Z");
@@ -22068,6 +22187,7 @@ mod tests {
                         "id": provider, "name": provider, "provider_id": provider, "tenant_id": tenant,
                         "authorization_endpoint": "https://provider.example/authorize",
                         "client_id_secret_ref": "client-id",
+                        "callback_path": format!("/v1/identity/oauth/callback/{provider}"),
                         "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-01T00:00:00Z"
                     }))
                     .unwrap(),
@@ -22191,13 +22311,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert_eq!(body["type"], "https://affinidi.com/atg/errors/consent-required");
         assert_eq!(body["consent_required"][0]["provider_name"], "Consent");
-        assert!(
+        let start = url::Url::parse(
             body["consent_required"][0]["authorization_url"]
                 .as_str()
-                .unwrap()
-                .starts_with("https://provider.example/authorize?"),
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            start
+                .origin()
+                .ascii_serialization(),
+            "https://gateway.example",
             "{body}"
         );
+        assert_eq!(start.path(), "/v1/identity/oauth/callback/consent/start", "{body}");
+        let state = start
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        let state = crate::delegation_vault::oauth::decode_start_state(&state).expect("a sealed start state");
+        assert_eq!((state.provider_id.as_str(), state.browser_binding), ("consent", None));
         assert_eq!(
             body.as_object()
                 .unwrap()

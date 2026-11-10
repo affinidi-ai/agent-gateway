@@ -45,6 +45,21 @@ const AuditInfoBanner: React.FC<AuditInfoBannerProps> = ({ open, onToggle }) => 
           set, independently of this log and of VP Auditing. Delivery is at least once, so receivers
           deduplicate on <code>event_id</code>.
         </p>
+        <p className="mb-1 fw-semibold">Storage</p>
+        <p className="mb-2">
+          The size shown above the table is the whole history on disk: the live log and every
+          rotated file beside it. The live log is rotated once it reaches{' '}
+          <code>vp_audit_log_max_bytes</code>, and by default every rotated file is kept, so no
+          audit record is deleted and the history grows for as long as the appliance runs.
+        </p>
+        <p className="mb-2">
+          The size it is measured against, <code>vp_audit_log_soft_cap_bytes</code>, is advisory:
+          passing it deletes nothing, refuses no write and stops nothing &mdash; it is there so the
+          growth is visible. To bound the history instead, set <code>vp_audit_log_keep</code> to the
+          number of rotated files to keep; the records that fall out of that window are deleted
+          outright, so forward anything that must outlive them to a Governance Audit integration
+          first. Both settings are read at startup only.
+        </p>
         <p className="mb-1 fw-semibold">Categories</p>
         <ul className="mb-0 ps-3">
           <li>

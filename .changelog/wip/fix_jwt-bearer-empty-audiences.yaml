@@ -1,0 +1,44 @@
+branch: fix/jwt-bearer-empty-audiences
+changes:
+  added:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Let a JWT Bearer method match its audiences against client_id or azp
+      description: >-
+        An Access Point jwt_bearer method takes an audience_claim of aud (the default),
+        client_id or azp, so identity providers whose access tokens carry no aud, such as
+        Amazon Cognito, can still be bound to an allow-list. Such a method binds a token only to
+        the client it was issued to, so its callers get no per-user delegated credentials: a save
+        refuses it beside a credential binding whose consent_mode is on_demand, pre_authorize or
+        elicit, and external-consent and Fabric grants are withheld. The dashboard's Caller
+        Context editor has an Audience Claim select for it.
+  changed:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Deprecate JWT Bearer methods stored without audiences
+      description: >-
+        A JWT Bearer method stored without audiences keeps working and skipping the audience
+        check, but the gateway now warns about it at startup and in a Warning header on each
+        save of its surface. A save that keeps it unchanged is accepted, including one that adds,
+        copies or renames a variant inheriting it from the surface or an enabled variant; one
+        that changes it, or enables a variant that alone has it, must name an audience. Such
+        methods will be refused in the next major release, 2.0.0.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-06T12:00:00Z'
+      title: Refuse new JWT Bearer methods that accept tokens for any audience
+      description: >-
+        An Access Point JWT Bearer method with an empty audiences list skipped the audience
+        check, so a token its identity provider issued for any other service authenticated the
+        caller it named. The admin API now refuses a new or changed method without an audience,
+        on the surface and in variants, unless the Access Point publishes protected resource
+        metadata, which binds the audience.
+  breaking:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Refuse saving a JWT Bearer method that names no audience
+      description: >-
+        A script or client that creates or changes an Access Point jwt_bearer method with an
+        empty audiences list, without protected resource metadata, now gets a 400 from the admin
+        API, and so does a dashboard save of a new JWT Bearer method with no Accepted Audiences.
+        List the audiences the method accepts, or set audience_claim to client_id or azp and list
+        the clients. Saving a client-bound method beside an on_demand, pre_authorize or elicit
+        credential binding is refused too.

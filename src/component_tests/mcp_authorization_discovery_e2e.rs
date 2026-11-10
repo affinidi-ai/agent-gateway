@@ -375,10 +375,12 @@ async fn a_put_removes_discovery_only_where_it_sends_null() {
     assert_eq!(refused.status(), 415);
 
     // A null removes it in the same request as the rest of the edit, a route
-    // change the stored setting would no longer fit included.
+    // change the stored setting would no longer fit included. Without the
+    // resource, the method names its own audience.
     surface["description"] = json!("edited without discovery");
     surface["access_point"]["route"] = json!("/smoke/edited-moved");
     surface["access_point"]["caller_authentication"]["protected_resource"] = json!(null);
+    surface["access_point"]["caller_authentication"]["methods"][0]["audiences"] = json!(["api://edited"]);
     let removed = admin
         .put(&url)
         .json(&surface)
@@ -465,11 +467,14 @@ async fn a_variant_put_keeps_its_discovery_unless_it_sends_null() {
         json!(["beta"])
     );
 
-    // A null removes it.
+    // A null removes it; without the resource, the method names its own
+    // audience.
+    let mut named = methods.clone();
+    named[0]["audiences"] = json!(["api://varied-beta"]);
     let removed = admin
         .put(&url)
         .json(&json!({"overrides": {"access_point": {"caller_authentication": {
-            "methods": methods, "protected_resource": null
+            "methods": named, "protected_resource": null
         }}}}))
         .send()
         .await

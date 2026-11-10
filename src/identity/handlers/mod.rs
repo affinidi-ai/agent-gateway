@@ -2,9 +2,10 @@
 pub mod agents;
 pub mod audit_log;
 pub mod config;
-mod credential_policy_report;
+pub(crate) mod credential_policy_report;
 pub mod credentials;
 pub mod debug_export;
+pub(crate) mod deleted_surface_api_keys;
 pub mod didcomm;
 pub mod health;
 pub mod limits;

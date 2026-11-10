@@ -257,6 +257,13 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl crate::surfaces::AgentSurfaceStore for Surfaces {
+        async fn get_checked(
+            &self,
+            surface_id: &str,
+        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+            self.get(surface_id).await
+        }
+
         async fn save(
             &self,
             _surface: &crate::config::agent_surface::AgentSurface,

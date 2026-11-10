@@ -28,8 +28,8 @@ pub use network::*;
 pub use pepper_cache_config::PepperCacheConfig;
 pub(crate) use proxy::{
     fall_back_to_first_source_auth_method, fall_back_to_first_source_auth_methods_in_memory,
-    log_additional_source_auth_method_notices, log_source_auth_fallbacks, validate_source_auth_config,
-    validate_source_auth_method,
+    log_additional_source_auth_method_notices, log_source_auth_fallbacks, log_unchecked_audience_warnings,
+    validate_source_auth_config, validate_source_auth_method,
 };
 pub use rbac_config::*;
 pub use types::*;

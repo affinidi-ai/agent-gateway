@@ -1907,8 +1907,8 @@ async fn inbound_from_jwt_claim_injects_vp_into_forwarded_request() {
 /// selector built by `compile_identity_engines_from_managed_identity`.
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_from_api_key_derives_did() {
-    // `atgk_`-prefixed key derives directly without any store lookup.
     let api_key_id = "atgk_e2e0000000000000000000000000001";
+    let surface_id = "api-key-identity-surface";
 
     let agent_response = json!({
         "jsonrpc": "2.0",
@@ -1929,8 +1929,36 @@ async fn inbound_from_api_key_derives_did() {
     });
     let mock = MockServer::start_with_response(serde_json::to_string(&agent_response).unwrap()).await;
 
-    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, _| {
-        gw_config.surfaces = vec![helpers::build_api_key_identity_channel(api_key_id)];
+    let h = GatewayHarness::start_with_mock(mock, |_, gw_config, bootstrap| {
+        let api_keys = std::path::Path::new(
+            &bootstrap
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .unwrap()
+        .join("api_keys");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::api_keys::store::ApiKeyStore as _;
+                crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+                    .await
+                    .unwrap()
+                    .create_with_material(
+                        surface_id,
+                        api_key_id.to_string(),
+                        "atgs_e2e".to_string(),
+                        "client",
+                        None,
+                        "component-test",
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
+        let mut surface = helpers::build_api_key_identity_channel(api_key_id);
+        surface.surface_id = surface_id.to_string();
+        gw_config.surfaces = vec![surface];
     })
     .await;
 
@@ -2024,6 +2052,7 @@ fn stored_identity_origin(
 #[tokio::test(flavor = "multi_thread")]
 async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
     let api_key_id = "atgk_e2e0000000000000000000000000003";
+    let surface_id = "managed-api-key-identity-surface";
     let agent_response = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -2038,9 +2067,36 @@ async fn managed_api_key_identity_reached_inbound_first_stays_managed() {
     });
     let mock = MockServer::start_with_response(agent_response.to_string()).await;
     let mut base_dir = std::path::PathBuf::new();
-    let h = GatewayHarness::start_with_outbound_mock(mock, |dir, gw_config, _| {
+    let h = GatewayHarness::start_with_outbound_mock(mock, |dir, gw_config, bootstrap| {
         base_dir = dir.to_path_buf();
+        let api_keys = std::path::Path::new(
+            &bootstrap
+                .storage_paths
+                .secrets,
+        )
+        .parent()
+        .unwrap()
+        .join("api_keys");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                use crate::api_keys::store::ApiKeyStore as _;
+                crate::api_keys::FileSystemApiKeyStore::new(&api_keys.to_string_lossy())
+                    .await
+                    .unwrap()
+                    .create_with_material(
+                        surface_id,
+                        api_key_id.to_string(),
+                        "atgs_e2e".to_string(),
+                        "client",
+                        None,
+                        "component-test",
+                    )
+                    .await
+                    .unwrap();
+            })
+        });
         let mut surface = helpers::build_api_key_identity_channel(api_key_id);
+        surface.surface_id = surface_id.to_string();
         surface
             .transit
             .as_mut()

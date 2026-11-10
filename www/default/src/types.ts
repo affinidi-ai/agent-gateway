@@ -14,12 +14,16 @@ export const PROTOCOLS = {
   didcomm: 'didcomm',
 } as const satisfies Record<ChannelProtocol, ChannelProtocol>;
 
+/** The claim a JWT Bearer method matches its `audiences` against; absent means `aud`. */
+export type JwtAudienceClaim = 'aud' | 'azp' | 'client_id';
+
 // Source Authentication configuration (replaces identity_config auth modes + source_authentication_strategy)
 export type SourceAuthConfig =
   | {
       type: 'jwt_bearer';
       jwt_verification_strategy_id: string;
       audiences: string[];
+      audience_claim?: JwtAudienceClaim;
       token_header: string;
       token_scheme: string;
       forward_header: boolean;
@@ -199,6 +203,10 @@ export interface Identity {
   display_name_pending?: boolean;
   surface_id?: string;
   surface_name?: string;
+  // Every surface this identity is linked to was deleted.
+  surface_deleted?: boolean;
+  // The API key this identity's DID comes from is revoked or deleted.
+  revoked?: boolean;
   credential_principal?: CredentialPrincipal;
   // Every live surface where this DID is the managed agent, sorted by name; omitted when empty.
   managed_surfaces?: ManagedSurfaceRef[];

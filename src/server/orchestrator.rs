@@ -1500,17 +1500,20 @@ pub async fn run_axum_proxy(
                 .clone()
                 .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
         );
+        crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(&identity_state).await;
+        let mut provider_key_listing = None;
         if let Some(ref surface_store) = agent_surface_store {
             match surface_store.list_all().await {
                 Ok(surfaces) => {
-                    for surface in surfaces
-                        .iter()
-                        .filter(|surface| surface.status == crate::config::agent_surface::SurfaceStatus::Active)
-                    {
-                        provider_key_gate
-                            .admit(surface)
-                            .await;
-                    }
+                    provider_key_listing = provider_key_gate
+                        .admit_all(
+                            surfaces
+                                .iter()
+                                .filter(|surface| {
+                                    surface.status == crate::config::agent_surface::SurfaceStatus::Active
+                                }),
+                        )
+                        .await;
                 }
                 Err(e) => warn!("Failed to list surfaces for the provider key check: {}", e),
             }
@@ -2033,6 +2036,7 @@ pub async fn run_axum_proxy(
                 .logging
                 .log_directory
                 .as_deref(),
+            &bootstrap_config.audit,
         )
         .await;
 
@@ -3397,7 +3401,7 @@ pub async fn run_axum_proxy(
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
         identity_state.jwt_verification_strategy_store = Some(source_auth_middleware.provider_store());
-        crate::identity::handlers::report_credential_policy(&identity_state).await;
+        crate::identity::handlers::report_credential_policy(&identity_state, provider_key_listing).await;
 
         // Register with the GW2 message processor (global singleton).
         crate::gateways::connection_points::message_processor::init_mcp_auth_network(Arc::new(network_config.clone()));
@@ -3623,6 +3627,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .oauth_callback_route
                     .clone(),
+                base_url.clone(),
                 vault_rbac_guard.clone(),
                 Some(source_auth_middleware.provider_store()),
                 identity_state
@@ -3984,17 +3989,11 @@ pub async fn run_axum_proxy(
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 
-        // Fail fast on configuration errors that would shadow dashboard SPA
-        // routes — admin must rename the offending prefix and restart.
-        // Running with these silently would replace dashboard pages with
-        // proxy 404s, which is much worse than refusing to start.
         {
-            let collisions = crate::proxy::paths::check_spa_route_collisions(network_config.proxy_prefixes());
+            let collisions =
+                crate::proxy::paths::check_spa_route_collisions(network_config.dashboard_shadowing_prefixes());
             if !collisions.is_empty() {
-                let banner = crate::proxy::paths::spa_collision_banner(&collisions);
-                error!("{}", banner);
-                eprintln!("{}", banner);
-                std::process::exit(2);
+                error!("{}", crate::proxy::paths::spa_collision_warning(&collisions));
             }
         }
 
@@ -4567,6 +4566,7 @@ async fn rederive_planes_on_activation(
         warn!("API key store refresh on activation failed: {e}");
     }
     crate::payments_ledger::reload_global().await;
+    crate::identity::handlers::deleted_surface_api_keys::revoke_api_keys_of_deleted_surfaces(identity_state).await;
 
     // 2. Rebuild channels + surfaces from the refreshed surfaces on disk.
     let reloading = identity_state

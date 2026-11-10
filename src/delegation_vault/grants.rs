@@ -120,6 +120,15 @@ pub fn connect_expiry(id: &str) -> Option<DateTime<Utc>> {
 #[error("Delegated grants are kept only while at-rest encryption is enabled with a key")]
 pub struct EncryptionRequired;
 
+/// A revocation the vault kept cannot be read now, as when at-rest encryption
+/// is off or its record fails to decrypt: whoever needs every kept revocation
+/// of a provider must wait until it can be.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("A kept revocation {revocation_id} cannot be read")]
+pub struct UnreadableKeptRevocation {
+    pub revocation_id: String,
+}
+
 /// The vault refuses to store or release a grant while the identity hash
 /// pepper was generated for this process: a grant's id derives from it, so the
 /// next restart would orphan the grant.
