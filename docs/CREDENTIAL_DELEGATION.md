@@ -145,7 +145,9 @@ Every type except `api_key` sends its client secret, assertion or code to the to
 so the endpoint must be an https URL. An http endpoint meets the rule only when the bootstrap
 `[credential_policy] insecure_token_endpoints` lists it exactly (compared as parsed URLs, so
 another port or path does not match), or, under `AG_TEST_MODE=true`, when
-`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `credential_policy.token_endpoint_https`
+`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `insecure_token_endpoints` relaxes only the
+scheme: an endpoint it names must still resolve to neither loopback nor cloud metadata
+([Service tokens](#service-tokens)). `credential_policy.token_endpoint_https`
 sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
 
 | | `warn` (default) | `enforce` |
@@ -222,7 +224,12 @@ is not PEM, so a wrong format fails the save rather than the first token request
 file is checked the same way; the key secret may be at most 16 KiB.
 `POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
 credential provider edit permission, applies the caller's tenant to the secrets it names, and
-answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
+answers `"key_material": "ok"` beside the token endpoint's reachability. It reaches the token
+endpoint through the same pinned client as a token request, so a loopback or cloud metadata
+endpoint answers 400 `token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata`
+without being contacted,
+and an unreachable one answers `"reachable": false` with the fixed error `token_endpoint could
+not be reached`; the detail is only logged. JWK keys are not
 accepted. The provider API never returns the key or certificate; the list leaves out
 their references too.
 
@@ -244,13 +251,16 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
 - An API key is read from the secrets store on every use and never cached.
 - Every token request (Client Credentials, JWT Bearer, `private_key_jwt` and refresh) is sent
   on a client pinned to the addresses the token endpoint resolved to when it was checked, with
-  redirects off. The pin holds when no HTTP proxy is configured: a client that honours
-  `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` lets the proxy resolve the host
-  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving to loopback, an unspecified address or cloud metadata is
-  refused before any request, reported as `TokenEndpointRefused` ("credential provider token
-  endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
-  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
-  (never cloud metadata).
+  redirects off and any HTTP proxy ignored, since a proxy would resolve the host again; a host
+  that needs `HTTPS_PROXY` to reach the internet must allow direct egress to its token
+  endpoints, and a startup warning says so when a proxy is set
+  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving
+  to loopback, an unspecified address or cloud metadata is refused before any request,
+  reported as `TokenEndpointRefused` ("credential provider token endpoint refused by egress
+  policy"), and creating or updating a provider with such a token endpoint answers 400.
+  Private networks are allowed, so a token endpoint inside the operator's network works. Under `AG_TEST_MODE=true`,
+  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints (never cloud
+  metadata).
 - An issued token is cached in the delegation vault and renewed half its lifetime before its
   `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
   renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the

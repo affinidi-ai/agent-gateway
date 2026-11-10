@@ -1011,8 +1011,10 @@ impl TokenEgress {
         Ok(())
     }
 
-    /// A redirect-off client pinned to the addresses `endpoint` resolved to when it was
-    /// vetted, and the URL to post to. A blocked address is [`TokenEndpointRefused`].
+    /// A redirect-off client that ignores proxies, pinned to the addresses `endpoint`
+    /// resolved to when the Configured policy vetted it (cloud metadata, loopback and
+    /// unspecified addresses refused, private networks allowed), and the URL to post to.
+    /// A refused address is [`TokenEndpointRefused`].
     pub(crate) async fn pinned_client(
         &self,
         endpoint: &str,
@@ -1021,12 +1023,14 @@ impl TokenEgress {
         let timeout = self.timeout;
         let allowlist = self.exact_allowlist.clone();
         let (client, target) = tokio::task::spawn_blocking(move || {
-            crate::egress::pinned_configured_client(&raw, timeout, allowlist.as_deref())
+            crate::egress::pinned_configured_direct_client(&raw, timeout, allowlist.as_deref())
         })
         .await
         .context("Provider token request failed")?
         .map_err(|error| match error {
-            crate::egress::EgressError::Blocked(_) => anyhow::Error::new(TokenEndpointRefused),
+            crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_) => {
+                anyhow::Error::new(TokenEndpointRefused)
+            }
             _ => anyhow!("Provider token request failed"),
         })?;
         Ok((client, target.url))

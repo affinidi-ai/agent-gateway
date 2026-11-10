@@ -14,33 +14,88 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::jwt_bearer::errors::{JwtBearerError, JwtBearerResult};
 
-/// Build a per-fetch pinned, redirect-disabled client for a JWKS URI.
-///
-/// Vets `jwks_uri` with the cloud-metadata-only policy (loopback and RFC 1918
-/// stay allowed for admin/same-VPC IdPs), resolves DNS once, and pins the
-/// connection to that exact address so the host cannot rebind to a cloud
-/// metadata IP between validation and connect (SSRF rebinding TOCTOU). Built
-/// per fetch because JWKS fetches are transient and cached.
-///
-/// Resolves DNS on a blocking pool so the async runtime is not stalled. The
-/// resolved IP stays log-only; the returned error keeps the generic
-/// `jwks_uri blocked` shape.
+/// The largest JWKS response the gateway reads.
+const MAX_JWKS_BYTES: usize = 256 * 1024;
+
+/// The exact URLs a JWKS fetch may reach although the Configured policy refuses them:
+/// the BDD egress allow-list under `AG_TEST_MODE`, plus, in unit tests, the
+/// loopback servers [`super::test_utils::start_jwks_server`] started. `None` in
+/// production.
+fn jwks_egress_allowlist() -> Option<String> {
+    let allowlist = crate::egress::bdd_egress_allowlist();
+    #[cfg(test)]
+    {
+        let fixtures = super::test_utils::jwks_fixture_origins();
+        if !fixtures.is_empty() {
+            return Some(
+                allowlist
+                    .into_iter()
+                    .chain(fixtures)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+    }
+    allowlist
+}
+
+/// Vet `jwks_uri` with the Configured egress policy when a strategy is saved
+/// ([`crate::egress::configured_refuses`]): it must be an http(s) URL resolving
+/// to neither cloud metadata, loopback nor an unspecified address; private
+/// networks are allowed. A refusal is [`JwtBearerError::JwksUriBlocked`]. A host
+/// that does not resolve, or not in time, passes, since every fetch vets it again.
+pub(crate) async fn vet_jwks_uri(jwks_uri: &str) -> JwtBearerResult<()> {
+    if crate::egress::configured_refuses(jwks_uri, jwks_egress_allowlist().as_deref()).await {
+        return Err(JwtBearerError::JwksUriBlocked);
+    }
+    Ok(())
+}
+
+/// Build a per-fetch client for a JWKS URI, vetted with the Configured policy
+/// ([`crate::egress::vet_configured`]), pinned to the addresses the host resolved to so it
+/// cannot rebind between validation and connect, with redirects refused and
+/// proxies ignored, since a proxy would resolve the host again. Built per
+/// fetch because JWKS fetches are transient and cached.
 async fn pinned_jwks_client(jwks_uri: &str) -> JwtBearerResult<reqwest::Client> {
     let raw = jwks_uri.to_string();
+    let allowlist = jwks_egress_allowlist();
     let pinned = tokio::task::spawn_blocking(move || {
-        crate::egress::pinned_forward_client(&raw, Duration::from_secs(crate::http_client::SHORT_TIMEOUT_SECS))
+        crate::egress::pinned_configured_direct_client(
+            &raw,
+            Duration::from_secs(crate::http_client::SHORT_TIMEOUT_SECS),
+            allowlist.as_deref(),
+        )
     })
     .await
     .map_err(|e| JwtBearerError::JwksFetchFailed(format!("jwks_uri resolve task failed: {e}")))?;
+    pinned
+        .map(|(client, _target)| client)
+        .map_err(egress_refusal)
+}
 
-    match pinned {
-        Ok((client, _target)) => Ok(client),
-        Err(e) => Err(JwtBearerError::JwksFetchFailed(format!("jwks_uri blocked: {e}"))),
+fn egress_refusal(error: crate::egress::EgressError) -> JwtBearerError {
+    warn!(error = %error, "JWKS URI refused by egress policy or not resolvable");
+    match error {
+        crate::egress::EgressError::Blocked(_) | crate::egress::EgressError::Parse(_) => JwtBearerError::JwksUriBlocked,
+        other => JwtBearerError::JwksFetchFailed(other.to_string()),
     }
+}
+
+/// Read a JWKS answer of at most [`MAX_JWKS_BYTES`] and parse it.
+async fn read_jwks(response: reqwest::Response) -> JwtBearerResult<JwksResponse> {
+    let limits = crate::proxy::upstream_body::UpstreamBodyLimits::new(
+        MAX_JWKS_BYTES,
+        None,
+        crate::http_client::SHORT_TIMEOUT_SECS,
+    );
+    let body = crate::proxy::upstream_body::read_bounded(response, limits)
+        .await
+        .map_err(|e| JwtBearerError::JwksFetchFailed(e.to_string()))?;
+    serde_json::from_slice(&body).map_err(|e| JwtBearerError::JwksFetchFailed(format!("Failed to parse JWKS: {}", e)))
 }
 
 /// Default JWKS cache TTL when no `Cache-Control: max-age` header is present.
@@ -152,10 +207,7 @@ impl JwksClient {
             return Err(JwtBearerError::JwksFetchFailed(format!("JWKS endpoint returned HTTP {}", response.status())));
         }
 
-        response
-            .json::<JwksResponse>()
-            .await
-            .map_err(|e| JwtBearerError::JwksFetchFailed(format!("Failed to parse JWKS: {}", e)))
+        read_jwks(response).await
     }
 
     /// Evict the cached JWKS for `strategy_id`.
@@ -225,11 +277,7 @@ impl JwksClient {
         &self,
         jwks_uri: &str,
     ) -> JwtBearerResult<CacheEntry> {
-        // Defense-in-depth SSRF guard: the write-path handler also validates,
-        // but strategies could have been stored before this check existed. The
-        // pinned client vets the URI (cloud-metadata-only), resolves DNS once,
-        // and pins the connection so a rebind cannot move it to an internal
-        // address between validation and connect.
+        // Vetted on every fetch: a stored strategy may predate the save check, and DNS answers change.
         let client = pinned_jwks_client(jwks_uri).await?;
 
         let response = client
@@ -246,10 +294,7 @@ impl JwksClient {
             return Err(JwtBearerError::JwksFetchFailed(format!("JWKS endpoint returned HTTP {}", response.status())));
         }
 
-        let jwks: JwksResponse = response
-            .json()
-            .await
-            .map_err(|e| JwtBearerError::JwksFetchFailed(format!("Failed to parse JWKS: {}", e)))?;
+        let jwks = read_jwks(response).await?;
 
         let mut keys: HashMap<String, Jwk> = HashMap::new();
         for key in jwks.keys {
@@ -570,42 +615,35 @@ mod tests {
             .fetch_jwks("http://169.254.169.254/latest/meta-data/jwks.json")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block AWS metadata IP, got: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_loopback() {
-        // Loopback is blocked at the write path (create/update strategy).
-        // The runtime fetcher only blocks cloud metadata — allowing loopback
-        // keeps dev/test scenarios working and is safe because no loopback URI
-        // can be stored in the first place.
-        // This test verifies that a cloud-metadata IP (link-local range) is still blocked.
+    async fn fetch_jwks_rejects_ecs_metadata() {
+        // The ECS task metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://169.254.170.2/v2/credentials/jwks.json")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block cloud metadata IP, got: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_localhost() {
-        // Loopback/localhost is blocked at the write path only.
-        // The runtime fetcher blocks cloud metadata; loopback is allowed so that
-        // stored strategies that pre-date the write-path guard still work in dev.
-        // This test verifies GCP metadata hostname is blocked at fetch time.
+    async fn fetch_jwks_rejects_gcp_metadata_host() {
+        // The GCP metadata host name is refused before it is resolved.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://metadata.google.internal/.well-known/jwks.json")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block GCP metadata hostname, got: {:?}",
             result
         );
@@ -618,22 +656,21 @@ mod tests {
             .fetch_jwks("http://user:pass@public.example.com/jwks.json")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block URLs with embedded credentials, got: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn fetch_jwks_rejects_ipv6_loopback() {
-        // IPv6 loopback is blocked at write-path; the fetcher blocks cloud metadata.
-        // This test verifies the IPv6 AWS metadata endpoint is blocked at fetch time.
+    async fn fetch_jwks_rejects_ipv6_metadata() {
+        // The IPv6 AWS metadata address is refused as cloud metadata.
         let client = JwksClient::new();
         let result = client
             .fetch_jwks("http://[fd00:ec2::254]/jwks.json")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block IPv6 AWS metadata, got: {:?}",
             result
         );
@@ -646,22 +683,21 @@ mod tests {
             .get_key("strat-ssrf", "http://169.254.169.254/jwks.json", "kid-1")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "get_key must block SSRF at the execution sink, got: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn get_key_rejects_loopback_uri() {
-        // Loopback is blocked at write-path; the fetcher only blocks cloud metadata.
-        // This test verifies that a cloud-metadata URI is still rejected at get_key.
+    async fn get_key_rejects_metadata_uri() {
+        // A token check refuses a cloud metadata URI before any request.
         let client = JwksClient::new();
         let result = client
             .get_key("strat-loopback", "http://169.254.169.254/jwks.json", "kid-1")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "get_key must block cloud metadata SSRF, got: {:?}",
             result
         );
@@ -674,9 +710,98 @@ mod tests {
             .fetch_jwks("file:///etc/passwd")
             .await;
         assert!(
-            matches!(result, Err(JwtBearerError::JwksFetchFailed(_))),
+            matches!(result, Err(JwtBearerError::JwksUriBlocked)),
             "should block non-http scheme, got: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn a_loopback_or_metadata_jwks_uri_is_refused_without_a_request() {
+        let client = JwksClient::new();
+        for uri in [
+            "https://127.0.0.1:1/jwks.json",
+            "https://localhost:1/jwks.json",
+            "https://[::1]:1/jwks.json",
+            "https://0.0.0.0/jwks.json",
+            "https://0x7f000001/jwks.json",
+            "https://[::ffff:127.0.0.1]/jwks.json",
+            "https://169.254.169.254/jwks.json",
+            "https://[fd00:ec2::254]/jwks.json",
+            "https://metadata.google.internal/jwks.json",
+        ] {
+            assert!(
+                matches!(client.fetch_jwks(uri).await, Err(JwtBearerError::JwksUriBlocked)),
+                "fetch must refuse {uri}"
+            );
+            assert!(
+                matches!(
+                    client
+                        .get_key("strategy", uri, "kid")
+                        .await,
+                    Err(JwtBearerError::JwksUriBlocked)
+                ),
+                "a token check must refuse {uri}"
+            );
+            assert!(matches!(vet_jwks_uri(uri).await, Err(JwtBearerError::JwksUriBlocked)), "save must refuse {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_network_jwks_uri_passes_the_vetting() {
+        for uri in [
+            "https://10.0.0.1/jwks.json",
+            "https://172.16.0.1/jwks.json",
+            "https://192.168.100.100:11443/jwks.json",
+            "https://169.254.1.1/jwks.json",
+        ] {
+            assert!(
+                vet_jwks_uri(uri)
+                    .await
+                    .is_ok(),
+                "save must accept {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_jwks_fixture_is_no_longer_admitted() {
+        let (base, server) = start_jwks_server(rsa_jwks_body("key-1", DUMMY_N, DUMMY_E), None).await;
+        let uri = format!("{base}/.well-known/jwks.json");
+        assert!(
+            vet_jwks_uri(&uri)
+                .await
+                .is_ok(),
+            "a running fixture is admitted"
+        );
+        drop(server);
+        assert!(
+            matches!(vet_jwks_uri(&uri).await, Err(JwtBearerError::JwksUriBlocked)),
+            "a stopped fixture's loopback origin is refused like any other"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_jwks_uri_passes_the_vetting() {
+        assert!(
+            vet_jwks_uri("https://1.2.3.4/.well-known/jwks.json")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_jwks_answer_over_the_size_cap_is_refused() {
+        let keys = (0..MAX_JWKS_BYTES / 32)
+            .map(|index| format!(r#"{{"kty":"RSA","kid":"key-{index}","n":"{DUMMY_N}","e":"{DUMMY_E}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let body = format!(r#"{{"keys":[{keys}]}}"#);
+        assert!(body.len() > MAX_JWKS_BYTES);
+        let (base, _server) = start_jwks_server(body, None).await;
+        let result = JwksClient::new()
+            .fetch_jwks(&format!("{base}/.well-known/jwks.json"))
+            .await;
+        assert!(matches!(result, Err(JwtBearerError::JwksFetchFailed(_))), "got: {result:?}");
     }
 }

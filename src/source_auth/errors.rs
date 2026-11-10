@@ -57,6 +57,9 @@ impl From<JwtBearerError> for SourceAuthError {
             JwtBearerError::JwksFetchFailed(msg) => SourceAuthError::Internal {
                 reason: format!("JWKS fetch failed: {msg}"),
             },
+            JwtBearerError::JwksUriBlocked => SourceAuthError::Internal {
+                reason: "JWKS fetch failed: jwks_uri refused by egress policy".to_string(),
+            },
             JwtBearerError::Storage(msg) => SourceAuthError::Internal {
                 reason: format!("Storage error: {msg}"),
             },
