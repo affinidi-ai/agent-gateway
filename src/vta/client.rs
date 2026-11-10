@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::control_key::SignerKeyProvider;
+use super::control_key::{ControlKeyReloader, SignerKeyProvider};
 use super::di_proof::{PROOF_PURPOSE_AUTHENTICATION, sign_document};
 use super::error::VtaError;
 use super::onboarding::OnboardingState;
@@ -58,6 +58,8 @@ pub struct VtaRestClient {
     resilience: Resilience,
     /// Customer-sovereign onboarding checks run after the first auth (VTA-05).
     onboarding: Option<OnboardingState>,
+    /// Asked for a newer control key when the trust agent refuses this one.
+    key_reloader: Option<Arc<dyn ControlKeyReloader>>,
     /// Treat the access token as expired this many seconds early, so a call
     /// started just before expiry does not race the VTA's own clock.
     expiry_skew: Duration,
@@ -102,8 +104,19 @@ impl VtaRestClient {
             session: RwLock::new(None),
             resilience: Resilience::new(max_concurrent),
             onboarding,
+            key_reloader: None,
             expiry_skew: Duration::from_secs(30),
         }
+    }
+
+    /// Ask `reloader` for the stored control key when the trust agent refuses
+    /// the one this client holds, and try once more if it is a different one.
+    pub fn with_key_reloader(
+        mut self,
+        reloader: Arc<dyn ControlKeyReloader>,
+    ) -> Self {
+        self.key_reloader = Some(reloader);
+        self
     }
 
     /// The carrier this client is using, for metrics and diagnostics.
@@ -205,7 +218,30 @@ impl VtaRestClient {
 
     /// Open a session with the current control key and return its token with the
     /// key it belongs to.
+    ///
+    /// A refusal (`401`/`403`) with a reloader set asks it for the stored key; if
+    /// that is a different DID the client moves to it and tries once more. Never
+    /// more than once, and never anything but the control key: a trust agent that
+    /// still refuses is reported as it always was.
     async fn establish(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
+        let first = self.establish_once().await;
+        let Err(VtaError::Http { status: 401 | 403, .. }) = &first else {
+            return first;
+        };
+        let Some(reloader) = &self.key_reloader else {
+            return first;
+        };
+        match reloader.reload().await {
+            Some(stored) if stored.did() != self.control_did() => {
+                self.replace_control_key(stored)
+                    .await;
+                self.establish_once().await
+            }
+            _ => first,
+        }
+    }
+
+    async fn establish_once(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
         let (generation, key) = self.current_control();
         // 1. challenge (unsigned): payload = { subject: <control did> }.
         let challenge_doc = self.build_doc(key.did(), TASK_AUTH_CHALLENGE, json!({ "subject": key.did() }));

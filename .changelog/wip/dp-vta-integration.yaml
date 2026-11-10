@@ -150,6 +150,13 @@ changes:
         rather than refused. The gateway will not sign if the agent's own
         context is not the holder the presentation names.
   fixed:
+    - timestamp: '2026-11-10T09:30:00Z'
+      title: Keep signing after the control key was rotated by another process
+      description: >-
+        When the bundled trust agent refuses the gateway's control key, the
+        gateway now looks for the key stored for it, finishing an interrupted
+        rotation first, and signs in once more if that is a different key. It
+        never retries with the same key and never falls back to local signing.
     - timestamp: '2026-11-09T15:15:00Z'
       title: Stop the dashboard reloading forever on a session the gateway forgot
       description: >-

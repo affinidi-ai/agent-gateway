@@ -186,14 +186,27 @@ pub async fn select_signing_backends(
         std::time::Duration::from_secs(ROTATION_MIN_INTERVAL_SECS),
     );
 
-    let client = Arc::new(VtaRestClient::new(
+    let mut client = VtaRestClient::new(
         base_url,
         vta_did,
         control_key,
         Duration::from_millis(config.timeout_ms),
         config.max_concurrent,
         Some(onboarding),
-    )?);
+    )?;
+    if config.auto_bootstrap
+        && let Some(path) = config
+            .auth_key_source
+            .as_deref()
+            .and_then(|source| source.strip_prefix("file://"))
+    {
+        client = client.with_key_reloader(Arc::new(control_rotation::StoredKeyReloader::new(
+            config.clone(),
+            vta_did.to_string(),
+            std::path::PathBuf::from(path),
+        )));
+    }
+    let client = Arc::new(client);
 
     // Optional VTA-08 audit sink: bounded, data-minimized, non-blocking. Off by
     // default; when enabled it logs hashes-only records on the `vta_audit`

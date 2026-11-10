@@ -258,6 +258,43 @@ async fn swap_to_new_key(
     ))
 }
 
+/// Finds the control key stored for the bundled trust agent, finishing a
+/// rotation that a crash interrupted first.
+pub struct StoredKeyReloader {
+    config: VtaConfig,
+    vta_did: String,
+    control_key_path: PathBuf,
+}
+
+impl StoredKeyReloader {
+    pub fn new(
+        config: VtaConfig,
+        vta_did: String,
+        control_key_path: PathBuf,
+    ) -> Self {
+        Self {
+            config,
+            vta_did,
+            control_key_path,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl super::control_key::ControlKeyReloader for StoredKeyReloader {
+    async fn reload(&self) -> Option<Arc<dyn SignerKeyProvider>> {
+        // A rotation running right now settles its own pending key.
+        let _quiet = Rotating::begin(&self.control_key_path)?;
+        if let Err(e) = settle_pending(&self.config, &self.vta_did, &self.control_key_path).await {
+            tracing::warn!(target: "vta_audit", "could not settle a pending control key: {}", e.log_detail());
+        }
+        let seed = read_seed(&self.control_key_path)
+            .await
+            .ok()??;
+        Some(Arc::new(ControlKey::from_seed(seed)))
+    }
+}
+
 /// Rotate the control key at `control_key_path` on the trust agent `vta_did`,
 /// with nothing else running (the offline command).
 pub async fn rotate(
@@ -440,6 +477,7 @@ mod tests {
         refuse_swap: bool,
         swaps: Vec<(String, String)>,
         auths: Vec<String>,
+        challenges: Vec<String>,
         wrong_subject: bool,
     }
 
@@ -506,6 +544,12 @@ mod tests {
         let denied =
             || (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } }))).into_response();
         if task.contains("auth/challenge") {
+            vta.challenges.push(
+                body["payload"]["subject"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
             return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
         }
         if task.contains("auth/authenticate") {
@@ -603,6 +647,7 @@ mod tests {
             refuse_swap: false,
             swaps: Vec::new(),
             auths: Vec::new(),
+            challenges: Vec::new(),
             wrong_subject: false,
         })))
     }
@@ -715,6 +760,127 @@ mod tests {
             .did(),
             rotated.new_did,
             "the new key is the one on disk"
+        );
+    }
+
+    fn reloading_client(
+        url: &str,
+        held: &ControlKey,
+        path: &Path,
+    ) -> VtaRestClient {
+        running_client(url, held).with_key_reloader(Arc::new(StoredKeyReloader::new(
+            config(url),
+            VTA.to_string(),
+            path.to_path_buf(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn a_refused_authentication_reloads_a_rotated_key_and_retries_once() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _enrolled) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let held_by_the_client = ControlKey::generate();
+
+        let client = reloading_client(&url, &held_by_the_client, &path);
+        client
+            .authenticate()
+            .await
+            .expect("the stored key signs in");
+
+        let stored = ControlKey::from_seed(
+            read_seed(&path)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(client.control_did(), stored.did());
+        assert_eq!(auths_as(&mock, stored.did()), 1);
+        assert_eq!(
+            mock.0
+                .lock()
+                .unwrap()
+                .challenges,
+            [
+                held_by_the_client
+                    .did()
+                    .to_string(),
+                stored.did().to_string()
+            ],
+            "one try with the held key, one with the stored one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_authentication_with_the_same_key_on_disk_fails_as_before() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("vta_appliance_control_key");
+        let refused = ControlKey::generate();
+        write_seed(&path, &refused)
+            .await
+            .unwrap();
+        let url = serve(&mock).await;
+        let client = reloading_client(&url, &refused, &path);
+
+        let err = client
+            .authenticate()
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(err, VtaError::Http { status: 403, .. }), "{err:?}");
+        assert_eq!(
+            mock.0
+                .lock()
+                .unwrap()
+                .challenges
+                .len(),
+            1,
+            "no second attempt with the same key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_key_found_on_refusal_is_settled_first() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("vta_appliance_control_key");
+        let old = ControlKey::generate();
+        let pending = ControlKey::generate();
+        write_seed(&path, &old)
+            .await
+            .unwrap();
+        write_seed(&pending_key_path(&path), &pending)
+            .await
+            .unwrap();
+        mock.0.lock().unwrap().allowed = vec![pending.did().to_string()];
+        let url = serve(&mock).await;
+        let client = reloading_client(&url, &old, &path);
+
+        client
+            .authenticate()
+            .await
+            .expect("the pending key was settled and used");
+
+        assert_eq!(client.control_did(), pending.did());
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_none(),
+            "promoted"
+        );
+        assert_eq!(
+            read_seed(&path)
+                .await
+                .unwrap()
+                .unwrap(),
+            pending.seed_bytes()
         );
     }
 

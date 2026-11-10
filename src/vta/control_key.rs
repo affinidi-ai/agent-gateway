@@ -43,6 +43,14 @@ pub trait SignerKeyProvider: Send + Sync {
     ) -> Result<[u8; 64], VtaError>;
 }
 
+/// Where a client looks for a control key it was not told about: the one stored
+/// for it, which a rotation by another process or an interrupted one may have
+/// moved on.
+#[async_trait]
+pub trait ControlKeyReloader: Send + Sync {
+    async fn reload(&self) -> Option<std::sync::Arc<dyn SignerKeyProvider>>;
+}
+
 /// An Ed25519 control key and its `did:key` identity.
 pub struct ControlKey {
     signing: SigningKey,
