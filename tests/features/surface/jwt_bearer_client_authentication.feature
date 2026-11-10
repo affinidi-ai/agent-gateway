@@ -145,6 +145,16 @@ Feature: JWT Bearer client authentication
     And the admin API error response mentions "token_endpoint must be an https URL"
     And the stored credential provider has no client authentication
 
+  Scenario: A provider with a plain http token endpoint is refused a change to a type that sends its client secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a JWT Bearer provider
+    And the credential provider stores a client ID and a client secret but sets no client authentication
+    And the credential provider has a plain http token endpoint
+    When the operator changes the credential provider's type to "oauth2_client_credentials"
+    Then the admin API response status is 400
+    And the admin API error response mentions "token_endpoint must be an https URL"
+    And the stored credential provider is still a JWT Bearer provider
+
   Scenario: A stored provider is refused a public client authentication while it stores a client secret
     Given an A2A surface targeting managed agent "bravo"
     And the gateway authenticates to the managed agent with a JWT Bearer provider

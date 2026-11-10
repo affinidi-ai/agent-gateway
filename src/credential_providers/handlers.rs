@@ -442,9 +442,9 @@ async fn validate_jwt_key_material(
 }
 
 /// A new provider, or one whose token endpoint or type changes, must have a token endpoint
-/// that meets the https rule. A stored provider saved with the same http endpoint keeps it
-/// while `credential_policy.token_endpoint_https` is `warn`, unless the save makes it start
-/// sending a client secret there.
+/// that meets the https rule. A stored provider saved with the same type and the same http
+/// endpoint keeps it while `credential_policy.token_endpoint_https` is `warn`, unless the save
+/// makes it start sending a client secret there.
 fn validate_token_endpoint_scheme(
     egress: &TokenEgress,
     previous: Option<&CredentialProvider>,
@@ -463,7 +463,7 @@ fn validate_token_endpoint_scheme(
         return Ok(());
     }
     let unchanged = previous.is_some_and(|previous| {
-        previous.provider_type != CredentialProviderType::ApiKey
+        previous.provider_type == provider.provider_type
             && previous
                 .token_endpoint
                 .as_deref()
@@ -3470,11 +3470,10 @@ mod jwt_provider_tests {
         assert!(validate_token_endpoint_scheme(&listed, None, &http).is_ok());
     }
 
-    #[test]
-    fn the_save_check_refuses_a_client_secret_newly_sent_to_a_stored_http_endpoint() {
+    fn warn_egress(insecure_token_endpoints: Vec<String>) -> TokenEgress {
         use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 
-        let egress = |insecure_token_endpoints: Vec<String>| TokenEgress {
+        TokenEgress {
             timeout: std::time::Duration::from_secs(5),
             exact_allowlist: None,
             policy: std::borrow::Cow::Owned(CredentialPolicyConfig {
@@ -3482,7 +3481,11 @@ mod jwt_provider_tests {
                 insecure_token_endpoints,
                 ..Default::default()
             }),
-        };
+        }
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_client_secret_newly_sent_to_a_stored_http_endpoint() {
         let provider = |client_authentication: Value| -> CredentialProvider {
             serde_json::from_value(json!({
                 "id": "cp", "name": "Provider", "provider_id": "provider", "provider_type": "oauth2_jwt_bearer",
@@ -3498,7 +3501,7 @@ mod jwt_provider_tests {
         };
         let stored = provider(Value::Null);
 
-        let warn = egress(vec![]);
+        let warn = warn_egress(vec![]);
         assert!(
             validate_token_endpoint_scheme(&warn, Some(&stored), &stored).is_ok(),
             "the stored provider still saves"
@@ -3523,9 +3526,58 @@ mod jwt_provider_tests {
             "clearing the client authentication stops sending the client secret"
         );
 
-        let listed = egress(vec!["http://idp.internal/token".into()]);
+        let listed = warn_egress(vec!["http://idp.internal/token".into()]);
         assert!(
             validate_token_endpoint_scheme(&listed, Some(&stored), &provider(json!("client_secret_basic"))).is_ok(),
+            "an endpoint insecure_token_endpoints lists is allowed on purpose"
+        );
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_retype_of_a_stored_http_provider() {
+        let provider = |provider_type: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": "cp", "name": "Provider", "provider_id": "provider", "provider_type": provider_type,
+                "token_endpoint": "http://idp.internal/token",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let types = [
+            "oauth2_client_credentials",
+            "oauth2_client_credentials_jwt_auth",
+            "oauth2_authorization_code",
+            "oauth2_jwt_bearer",
+        ];
+
+        let warn = warn_egress(vec![]);
+        for stored in types {
+            for requested in types {
+                let result = validate_token_endpoint_scheme(&warn, Some(&provider(stored)), &provider(requested));
+                if stored == requested {
+                    assert!(result.is_ok(), "{stored} saved again keeps its stored http endpoint");
+                } else {
+                    assert!(
+                        matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps)),
+                        "{stored} retyped to {requested} would use its stored http endpoint in a new way"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            validate_token_endpoint_scheme(&warn, Some(&provider("oauth2_jwt_bearer")), &provider("api_key")).is_ok(),
+            "an API key provider sends nothing to a token endpoint"
+        );
+
+        let listed = warn_egress(vec!["http://idp.internal/token".into()]);
+        assert!(
+            validate_token_endpoint_scheme(
+                &listed,
+                Some(&provider("oauth2_jwt_bearer")),
+                &provider("oauth2_client_credentials")
+            )
+            .is_ok(),
             "an endpoint insecure_token_endpoints lists is allowed on purpose"
         );
     }
@@ -3581,6 +3633,44 @@ mod jwt_provider_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "a public client sends no client secret: {response}");
         assert_eq!(response["client_authentication"], "none");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_stored_http_jwt_bearer_provider_to_client_credentials_is_refused_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "stored-http", "name": "Hydra", "provider_id": "stored-http", "provider_type": "oauth2_jwt_bearer",
+            "token_endpoint": "http://192.0.2.1/token", "jwt_issuer": "gateway", "jwt_subject": "admin@example.com",
+            "jwt_signing_key_secret_ref": "SA_KEY", "client_id_secret_ref": "CLIENT_ID",
+            "client_secret_secret_ref": "CLIENT_SECRET",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+
+        let (status, response) =
+            update(&state, "stored-http", json!({"provider_type": "oauth2_client_credentials"})).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a client credentials grant would send the client secret over http: {response}"
+        );
+        assert_eq!(response["error"], "token_endpoint must be an https URL");
+        let kept = state
+            .store
+            .get("stored-http")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.provider_type, CredentialProviderType::OAuth2JwtBearer);
+
+        let (status, response) = update(&state, "stored-http", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "the stored provider still saves as the type it is: {response}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

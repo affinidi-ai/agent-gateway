@@ -332,6 +332,20 @@ async fn operator_changes_provider_client_authentication(
     change_stored_provider(world, json!({ "client_authentication": method }), None).await;
 }
 
+#[when(expr = "the operator changes the credential provider's type to {string}")]
+async fn operator_changes_provider_type(
+    world: &mut SurfaceWorld,
+    provider_type: String,
+) {
+    change_stored_provider(world, json!({ "provider_type": provider_type }), None).await;
+}
+
+#[then("the stored credential provider is still a JWT Bearer provider")]
+async fn stored_provider_is_still_a_jwt_bearer_provider(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["provider_type"], json!("oauth2_jwt_bearer"), "the stored provider: {stored}");
+}
+
 #[then(expr = "the stored credential provider has the client authentication {string}")]
 async fn stored_provider_has_client_authentication(
     world: &mut SurfaceWorld,

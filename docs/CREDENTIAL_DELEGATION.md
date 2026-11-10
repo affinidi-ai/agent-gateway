@@ -152,8 +152,8 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 
 | | `warn` (default) | `enforce` |
 | --- | --- | --- |
-| Create, or an update that sets a new token endpoint or turns an `api_key` provider into an OAuth type | 400 `token_endpoint must be an https URL` | The same |
-| Update that keeps a stored http endpoint | Saved | 400 |
+| Create, or an update that sets a new token endpoint or changes the provider type (an `api_key` provider turning into an OAuth type, or one OAuth type into another) | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint and the provider type | Saved | 400 |
 | Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent no client secret before | 400 `token_endpoint must be an https URL` | The same |
 | `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
 | Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
@@ -167,10 +167,11 @@ already cached, the legacy code exchange and refresh fail with `token_endpoint m
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
 
-In `warn` mode a stored http provider therefore cannot start sending a client secret. Setting
-`client_authentication` to `none`, clearing it, or switching between `client_secret_basic` and
-`client_secret_post` is still saved. Listing the endpoint in `insecure_token_endpoints` allows
-the change on purpose.
+In `warn` mode a stored http provider therefore cannot start sending a client secret by turning on
+a `client_authentication` that sends one, and cannot change its type to an OAuth type: a retype
+must meet the rule like a new provider. Setting `client_authentication` to `none`, clearing it,
+or switching between `client_secret_basic` and `client_secret_post` is still saved. Listing the
+endpoint in `insecure_token_endpoints` allows the change on purpose.
 
 ### Provider secrets belong to the provider's tenant
 

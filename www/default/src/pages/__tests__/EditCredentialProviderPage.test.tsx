@@ -205,6 +205,7 @@ describe('EditCredentialProviderPage tenant-aware secrets and https error', () =
     expect(warning).toHaveTextContent(
       'New or changed http token endpoints are refused unless listed by exact URL'
     );
+    expect(warning).toHaveTextContent('on a provider whose type is unchanged');
     expect(warning).toHaveTextContent('still accepted while token_endpoint_https is warn');
     expect(warning).not.toHaveTextContent('refuses to save any other http endpoint');
     const input = screen.getByDisplayValue('http://idp.internal/token');

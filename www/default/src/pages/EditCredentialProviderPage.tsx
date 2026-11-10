@@ -582,8 +582,8 @@ const EditCredentialProviderPage: React.FC = () => {
                           This token endpoint uses http. New or changed http token endpoints are
                           refused unless listed by exact URL in{' '}
                           <code>credential_policy.insecure_token_endpoints</code> in the gateway
-                          bootstrap config. A stored endpoint that is unchanged is still accepted
-                          while token_endpoint_https is warn.
+                          bootstrap config. A stored endpoint that is unchanged, on a provider whose
+                          type is unchanged, is still accepted while token_endpoint_https is warn.
                         </div>
                       )}
                       <small className="form-text text-muted">

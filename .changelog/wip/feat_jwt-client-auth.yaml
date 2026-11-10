@@ -20,12 +20,14 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-09T17:00:00Z'
-      title: Refuse sending a new client secret to a stored http token endpoint
+      title: Refuse a new client secret or a retype on a stored http token endpoint
       description: >-
         In warn mode a stored credential provider keeps a plain http token endpoint that
         insecure_token_endpoints does not list. An update that sets a JWT Bearer provider's
         client_authentication to client_secret_basic or client_secret_post, when it sent no client
-        secret before, is now refused with "token_endpoint must be an https URL", so the client
-        secret is never sent in clear text. Setting none, clearing the setting, or switching
-        between the two secret methods is still saved, and listing the endpoint allows it.
+        secret before, or that changes the provider's type to an OAuth type, is now refused with
+        "token_endpoint must be an https URL", so neither a new client authentication nor a retype
+        starts sending a client secret in clear text. Setting none, clearing the setting, or
+        switching between the two secret methods is still saved, and listing the endpoint allows
+        it.
   breaking: []
