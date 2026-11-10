@@ -13,6 +13,7 @@ pub mod provider_token;
 pub mod secret_force_delete_audit;
 pub mod sign_in_events;
 pub mod sts;
+pub mod surface_routes;
 pub mod target_auth_audit;
 pub mod target_auth_save;
 pub mod target_credential;

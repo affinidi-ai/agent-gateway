@@ -447,6 +447,12 @@ request received by the destination gateway:
 The sending and receiving gateways enforce their own policies independently. For MCP surfaces, tool
 gating on each side composes: a tool hidden or denied by either surface remains unavailable.
 
+Fabric finds the destination surface by id, never by its Access Point route, but a surface reached
+only over Fabric, or used only for its Transit Points, still needs a route a surface prefix serves:
+the admin API refuses to save a new or changed route that none serves (see `channels` in
+[`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)). Moving the route changes nothing a peer
+calls, but it moves the default paths of the surface's Transit Points, which follow the route.
+
 ### Modern MCP activation
 
 Modern MCP (`2026-07-28`) is active on every MCP surface and crosses Fabric only

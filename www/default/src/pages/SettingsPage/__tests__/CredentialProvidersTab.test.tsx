@@ -67,4 +67,51 @@ describe('CredentialProvidersTab', () => {
     ).toBe('The vault is unavailable (503)');
     expect(providerDeleteError(500, '', '')).toBe('Request failed (500)');
   });
+
+  describe('client authentication badge', () => {
+    const renderList = async (records: Record<string, unknown>[]) => {
+      mockFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve(records) });
+      render(
+        <MemoryRouter>
+          <CredentialProvidersTab />
+        </MemoryRouter>
+      );
+      await screen.findByRole('row', { name: new RegExp(`^${records[0].name}`) });
+    };
+    const jwt = (name: string, extra: Record<string, unknown>) => ({
+      ...item(name, 'https://hydra.example/token', null),
+      provider_type: 'oauth2_jwt_bearer',
+      ...extra,
+    });
+
+    it.each([
+      ['none', 'Client ID only'],
+      ['client_secret_basic', 'HTTP Basic'],
+      ['client_secret_post', 'Form body'],
+    ])('badges a JWT Bearer provider whose client authentication is %s', async (method, label) => {
+      await renderList([jwt('hydra', { client_authentication: method })]);
+      const row = screen.getByRole('row', { name: /^hydra/ });
+      const badge = within(row).getByTestId('credential-provider-client-authentication-badge');
+      expect(badge).toHaveTextContent(label);
+      expect(badge).toHaveClass('text-bg-secondary');
+    });
+
+    it('shows no badge for a client authentication the dashboard does not know', async () => {
+      await renderList([jwt('odd', { client_authentication: 'private_key_jwt' })]);
+      expect(
+        screen.queryByTestId('credential-provider-client-authentication-badge')
+      ).not.toBeInTheDocument();
+    });
+
+    it('shows no badge without a client authentication or on another type', async () => {
+      await renderList([
+        jwt('google', {}),
+        item('cc', 'https://idp.example/token', null),
+        { ...item('cc2', 'https://idp.example/token', null), client_authentication: 'none' },
+      ]);
+      expect(
+        screen.queryByTestId('credential-provider-client-authentication-badge')
+      ).not.toBeInTheDocument();
+    });
+  });
 });

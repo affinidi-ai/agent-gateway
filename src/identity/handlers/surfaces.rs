@@ -264,6 +264,75 @@ fn reject_public_predicate_route(surface: &AgentSurface) -> Result<(), SurfaceAp
     Ok(())
 }
 
+/// Refuse an active surface whose route is not a plain path, or that no
+/// surface prefix serves, so callers could not reach it there. A disabled
+/// surface serves no route, and the route an active surface already had is not
+/// checked again, so a surface stored before these checks can still be edited.
+fn refuse_unservable_route(
+    surface: &AgentSurface,
+    existing: Option<&AgentSurface>,
+    network_config: &crate::config::NetworkConfig,
+) -> Result<(), SurfaceApiError> {
+    use crate::config::agent_surface::SurfaceStatus;
+    let route = surface
+        .access_point
+        .route
+        .as_str();
+    let kept_route =
+        existing.is_some_and(|existing| existing.status != SurfaceStatus::Disabled) && keeps_route(surface, existing);
+    if surface.status == SurfaceStatus::Disabled || kept_route {
+        return Ok(());
+    }
+    crate::config::route_claims::check_surface_route_syntax(route)
+        .and_then(|()| network_config.check_surface_route(route))
+        .map_err(SurfaceApiError::BadRequest)
+}
+
+/// The `gateway.json` on disk, from which the dashboard offers surface
+/// prefixes, so a prefix added and reloaded is accepted without a restart; the
+/// one read at startup when the file cannot be loaded.
+fn current_network_config<'a>(
+    bootstrap: &crate::config::BootstrapConfig,
+    read_at_startup: &'a crate::config::NetworkConfig,
+) -> std::borrow::Cow<'a, crate::config::NetworkConfig> {
+    match bootstrap.load_network_config() {
+        Ok(network_config) => std::borrow::Cow::Owned(network_config),
+        Err(error) => {
+            warn!("Checking the surface route against the gateway.json read at startup: {error}");
+            std::borrow::Cow::Borrowed(read_at_startup)
+        }
+    }
+}
+
+/// Whether `surface` keeps the route `existing` had, as the inbound router
+/// matches it: a missing leading or an added trailing `/` changes nothing.
+fn keeps_route(
+    surface: &AgentSurface,
+    existing: Option<&AgentSurface>,
+) -> bool {
+    use crate::config::route_claims::normalize_route;
+    existing.is_some_and(|existing| {
+        normalize_route(&existing.access_point.route) == normalize_route(&surface.access_point.route)
+    })
+}
+
+/// Store a new or changed route the way the inbound router matches it, without
+/// a trailing `/`. A kept route only gets a missing leading `/`, and keeps a
+/// trailing one, which its Transit Points' default paths follow.
+fn normalize_saved_route(
+    surface: &mut AgentSurface,
+    existing: Option<&AgentSurface>,
+) {
+    let kept = keeps_route(surface, existing);
+    let route = &surface.access_point.route;
+    let saved = match (route.is_empty(), kept, route.starts_with('/')) {
+        (true, _, _) | (false, true, true) => return,
+        (false, true, false) => format!("/{route}"),
+        (false, false, _) => crate::config::route_claims::normalize_route(route),
+    };
+    surface.access_point.route = saved;
+}
+
 fn validate_required_fields(
     surface: &AgentSurface,
     label: &str,
@@ -960,7 +1029,9 @@ fn validate_transit_points(
 
 /// Give each Transit Point of one list, the surface's or a variant's (named by
 /// `place`), an id when it has none, and refuse an alias that is not URL-safe
-/// or that another point of the list has.
+/// or that another point of the list has, and a `proxy://` target whose id no
+/// MCP Proxy can have: a Transit Point is dispatched to the whole id, so a
+/// save checks that same id.
 fn identify_transit_points(
     points: &mut [crate::config::agent_surface::TransitPoint],
     place: &str,
@@ -972,6 +1043,14 @@ fn identify_transit_points(
         }
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
+        }
+        if crate::mcp_proxies::types::endpoint_proxy_id(&tp.target_endpoint).is_some()
+            && crate::mcp_proxies::types::transit_proxy_id(&tp.target_endpoint).is_none()
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{place}transit.points[{idx}]: target_endpoint proxy://<id> needs the id of an MCP Proxy: letters, \
+                 digits, '-' and '_', and nothing after it"
+            )));
         }
         if let Err(msg) = tp.validate_per_caller_rate_limit() {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
@@ -1161,6 +1240,14 @@ async fn save_warnings(
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
+    let stale_pins = super::surface_tenancy::stale_mcp_proxy_pin_warnings(
+        state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
+        surface,
+    )
+    .await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1183,6 +1270,7 @@ async fn save_warnings(
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
         .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
+        .chain(stale_pins)
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
@@ -2141,7 +2229,8 @@ fn check_listen_path_collisions(
 /// by resolved listener port. Mirrors the orchestrator's `channels_by_port`
 /// grouping, which resolves `access_point.listen_address` with the
 /// **unrestricted** `map_url_to_port` — so validation must use the same
-/// resolver to collide exactly where runtime routing would.
+/// resolver to collide exactly where runtime routing would. The route is
+/// normalized the way the inbound handler matches it, so `/a` and `/a/` collide.
 fn access_point_route_claim(
     surface: &AgentSurface,
     resolve_port: &impl Fn(&str) -> Option<u16>,
@@ -2154,13 +2243,7 @@ fn access_point_route_claim(
         Some(port) => ListenerKey::Port(port),
         None => ListenerKey::Unresolved(addr.to_string()),
     };
-    (
-        key,
-        surface
-            .access_point
-            .route
-            .clone(),
-    )
+    (key, crate::config::route_claims::normalize_route(&surface.access_point.route))
 }
 
 /// Reject a surface whose `access_point.route` would shadow an existing
@@ -3094,19 +3177,9 @@ pub async fn create_surface(
         return Err(SurfaceApiError::Forbidden("surface is outside this token's permitted scope".to_string()));
     }
 
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
+    // Normalize the route BEFORE the shape check so the historical "missing
+    // slash is auto-fixed" behaviour is preserved.
+    normalize_saved_route(&mut surface, None);
 
     // Required-field shape check on the base surface.
     validate_required_fields(&surface, "")?;
@@ -3114,6 +3187,7 @@ pub async fn create_surface(
     validate_api_key_identities(&surface, "")?;
     validate_source_auth(&surface, None)?;
     reject_public_predicate_route(&surface)?;
+    refuse_unservable_route(&surface, None, &current_network_config(&state.bootstrap_config, &state.network_config))?;
     surface.access_point.public = Some(
         surface
             .access_point
@@ -3157,7 +3231,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
-    super::surface_tenancy::validate_external_consent_bindings(&state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
     // Reject overlapping outbound listener routes before they can reach
     // the Axum router and panic the gateway on rebuild.
@@ -4110,24 +4184,19 @@ async fn validate_and_save_surface(
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
+    // Normalize the route BEFORE the shape check so the historical "missing
+    // slash is auto-fixed" behaviour is preserved.
+    normalize_saved_route(&mut surface, existing);
 
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
     validate_api_key_identities(&surface, "")?;
     reject_public_predicate_route(&surface)?;
+    refuse_unservable_route(
+        &surface,
+        existing,
+        &current_network_config(&state.bootstrap_config, &state.network_config),
+    )?;
     if surface
         .access_point
         .public
@@ -4159,7 +4228,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
-    super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
@@ -4300,9 +4369,7 @@ pub async fn patch_surface(
     )
     .await?;
 
-    let mut merged = serde_json::to_value(&existing)
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface for merge: {}", e)))?;
-    json_patch::merge(&mut merged, &patch);
+    let mut merged = merged_onto_stored(&existing, &patch)?;
 
     if let Some(obj) = merged.as_object_mut() {
         obj.insert("surface_id".to_string(), serde_json::Value::String(surface_id.clone()));
@@ -4334,6 +4401,23 @@ pub async fn patch_surface(
         save_warnings(&state, &saved).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
+}
+
+/// The merge `PATCH` `patch` applied to the stored surface `existing`, as
+/// JSON. The stored MCP Proxy pins are left out of what it is merged onto, so
+/// the merged surface carries only a pin the patch itself sends, and every
+/// other binding keeps its stored one when it is saved
+/// ([`super::surface_tenancy::pin_mcp_proxy_grants`]).
+fn merged_onto_stored(
+    existing: &AgentSurface,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, SurfaceApiError> {
+    let mut unpinned = existing.clone();
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut unpinned);
+    let mut merged = serde_json::to_value(&unpinned)
+        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface for merge: {}", e)))?;
+    json_patch::merge(&mut merged, patch);
+    Ok(merged)
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -4390,7 +4474,10 @@ pub async fn patch_variant(
         reject_undeclared_trust_check_edit(variant_patch_touches_trust_checks(&patch), &existing)?;
     }
 
-    let mut merged_variant = serde_json::to_value(&existing.variants[variant_index])
+    // The stored pins are kept unless the patch itself sends one.
+    let mut unpinned_variant = existing.variants[variant_index].clone();
+    super::surface_tenancy::forget_variant_mcp_proxy_pins(&mut unpinned_variant);
+    let mut merged_variant = serde_json::to_value(&unpinned_variant)
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise variant for merge: {}", e)))?;
     json_patch::merge(&mut merged_variant, &patch);
 
@@ -4416,6 +4503,7 @@ pub async fn patch_variant(
     }
 
     let mut surface = existing.clone();
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
     surface.variants[variant_index] = new_variant;
 
     let (saved, warnings) = validate_and_save_surface(
@@ -5103,6 +5191,9 @@ pub async fn create_variant(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one, and one
+    // the copy creates is a new binding.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if body.name.trim().is_empty() {
         return Err(SurfaceApiError::BadRequest("variant name is required".to_string()));
@@ -5215,6 +5306,9 @@ pub async fn update_variant(
     )
     .await?;
     let existing = surface.clone();
+    // Only overrides the request sends carry a pin it sent; every other
+    // binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if let Some(ref new_alias) = body.alias {
         SurfaceVariant::validate_alias(new_alias).map_err(SurfaceApiError::BadRequest)?;
@@ -5374,6 +5468,8 @@ pub async fn delete_variant(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if surface
         .default_variant_id
@@ -5447,6 +5543,8 @@ pub async fn promote_variant_to_default(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     let variant = surface
         .variants
@@ -5900,6 +5998,33 @@ mod validation_tests {
         }
         let mut surface = surface_with_transit_points(distinct.clone(), distinct);
         assert!(validate_transit_points(&mut surface, 30, None).is_ok(), "the variant may reuse the surface's ids");
+    }
+
+    /// A Transit Point is dispatched to the MCP Proxy its whole `proxy://` id
+    /// names, so a save refuses an id no MCP Proxy can have, `proxy://a/b`
+    /// among them, rather than check one proxy and dispatch to another.
+    #[test]
+    fn a_transit_point_naming_an_id_no_mcp_proxy_can_have_is_refused() {
+        let point = |endpoint: &str| serde_json::json!({ "id": "drive-id", "alias": "drive", "target_endpoint": endpoint, "protocol": "mcp" });
+        let expected = "target_endpoint proxy://<id> needs the id of an MCP Proxy";
+        for endpoint in ["proxy://a/b", "proxy://drive/", "proxy://drive?x=1", "proxy://../drive", "proxy://"] {
+            for (place, points, variant_points) in [
+                ("", serde_json::json!([point(endpoint)]), serde_json::json!([])),
+                ("variant 'candidate' ", serde_json::json!([]), serde_json::json!([point(endpoint)])),
+            ] {
+                let mut surface = surface_with_transit_points(points, variant_points);
+                match validate_transit_points(&mut surface, 30, None) {
+                    Err(SurfaceApiError::BadRequest(message)) => assert!(
+                        message.starts_with(&format!("{place}transit.points[0]: {expected}")),
+                        "{endpoint}: {message}"
+                    ),
+                    other => panic!("{endpoint}: expected a 400, got {other:?}"),
+                }
+            }
+        }
+        let mut surface =
+            surface_with_transit_points(serde_json::json!([point("proxy://drive_v3-1")]), serde_json::json!([]));
+        assert!(validate_transit_points(&mut surface, 30, None).is_ok());
     }
 
     fn caller_key() -> serde_json::Value {
@@ -7119,6 +7244,100 @@ mod validation_tests {
             serde_json::from_value(sent_points.clone()).unwrap();
         settle_variant_put_points(&mut points, &own, "candidate", Some(&sent_points));
         assert_eq!(points[0].id, "hop-variant", "a variant with its own list keeps its own id");
+    }
+
+    /// A merge `PATCH` starts from the stored surface, so a stored pin it
+    /// carries is not one it sent: a patch for another reason keeps the stored
+    /// pin even after the MCP Proxy changed, and never approves the change. A
+    /// patch that sends the proxy's current pin pins the binding to it, one
+    /// that sends the stored pin back keeps it, and one that sends another is
+    /// refused.
+    #[tokio::test]
+    async fn a_merge_patch_keeps_the_stored_mcp_proxy_pin_unless_it_sends_the_proxys_current_one() {
+        use crate::mcp_proxies::McpProxyStore;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let drive =
+            crate::credential_providers::external::tests::grant_proxy("drive", None, "https://203.0.113.30/drive/v3");
+        proxies
+            .create(&drive)
+            .await
+            .unwrap();
+        let point = |pin: Option<String>| {
+            let mut binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+                "subject": "owner"});
+            if let Some(pin) = pin {
+                binding["mcp_proxy_pin"] = serde_json::json!(pin);
+            }
+            serde_json::json!({ "id": "hop-drive", "alias": "drive", "target_endpoint": "proxy://drive",
+                "protocol": "mcp", "require_transit_token": true, "transit_credentials": binding })
+        };
+        let mut stored = surface_with_transit_points(serde_json::json!([point(None)]), serde_json::json!([]));
+        stored.tenant_id = None;
+        super::super::surface_tenancy::pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let first = drive.grant_pin();
+        let mut edited = drive.clone();
+        edited.base_url = "https://203.0.113.30/drive/v2".into();
+        proxies
+            .update(&edited)
+            .await
+            .unwrap();
+        let patched = |patch: serde_json::Value| {
+            let (stored, proxies) = (stored.clone(), &proxies);
+            async move {
+                let mut surface: AgentSurface =
+                    serde_json::from_value(merged_onto_stored(&stored, &patch).unwrap()).unwrap();
+                super::super::surface_tenancy::pin_mcp_proxy_grants(&mut surface, Some(&stored), Some(proxies))
+                    .await
+                    .map(|()| {
+                        surface
+                            .transit
+                            .unwrap()
+                            .points[0]
+                            .transit_credentials
+                            .clone()
+                            .unwrap()
+                            .mcp_proxy_pin
+                    })
+            }
+        };
+
+        assert_eq!(
+            patched(serde_json::json!({ "name": "renamed" }))
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a patch for another reason keeps the stored pin"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(None)] } }))
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a patch that sends the Transit Point without a pin keeps the stored one"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some(edited.grant_pin()))] } }))
+                .await
+                .unwrap(),
+            Some(edited.grant_pin()),
+            "a patch that sends the proxy's current pin pins the binding to it"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some(first.clone()))] } }))
+                .await
+                .unwrap(),
+            Some(first),
+            "a patch that sends the stored pin back keeps it, approving nothing"
+        );
+        assert!(matches!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some("sha256:another".into()))] } })).await,
+            Err(SurfaceApiError::BadRequestCode(super::super::surface_tenancy::MCP_PROXY_PIN_NOT_CURRENT, _))
+        ));
     }
 
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,
@@ -8862,6 +9081,205 @@ mod validation_tests {
         match err {
             SurfaceApiError::BadRequest(msg) => {
                 assert!(msg.contains("/api"), "message should name the route: {msg}");
+                assert!(msg.contains("'beta'"), "message should name the owning surface: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    fn network_with_agents_prefix() -> crate::config::NetworkConfig {
+        serde_json::from_value(serde_json::json!({
+            "did": { "domain": "test.local" },
+            "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+            "integration": { "types": [], "categories": [] },
+            "listeners": [],
+            "channels": [{ "id": "agents", "name": "Agents", "prefix": "/agents" }],
+            "routes": { "api": { "type": "identity_api", "prefix": "/api" } },
+        }))
+        .expect("network config fixture")
+    }
+
+    fn route_refusal(
+        surface: &AgentSurface,
+        existing: Option<&AgentSurface>,
+    ) -> String {
+        match refuse_unservable_route(surface, existing, &network_with_agents_prefix()) {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("{}: expected BadRequest, got {other:?}", surface.access_point.route),
+        }
+    }
+
+    fn disabled(mut surface: AgentSurface) -> AgentSurface {
+        surface.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        surface
+    }
+
+    #[test]
+    fn a_surface_route_under_a_surface_prefix_is_accepted() {
+        let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+
+        refuse_unservable_route(&surface, None, &network_with_agents_prefix())
+            .expect("a surface prefix serves the route");
+    }
+
+    #[test]
+    fn a_surface_route_no_surface_prefix_serves_is_refused() {
+        for (route, reason) in
+            [("/foo", "is not served by any surface prefix"), ("/api/foo", "is served by route 'api' (identity_api)")]
+        {
+            let msg = route_refusal(&surface_with_route("s1", "alpha", "0.0.0.0:8443", route), None);
+            assert!(msg.contains(reason), "{route}: {msg}");
+            assert!(msg.contains("under one of: /agents"), "{route}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_surface_route_that_spells_a_variant_url_is_refused() {
+        for route in ["/agents/foo$prod", "/agents/foo%24prod", "/agents//foo"] {
+            let msg = route_refusal(&surface_with_route("s1", "alpha", "0.0.0.0:8443", route), None);
+            assert!(msg.contains("must be a plain path"), "{route}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_surface_may_keep_a_route_no_surface_prefix_serves() {
+        let surface = disabled(surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo"));
+
+        refuse_unservable_route(&surface, None, &network_with_agents_prefix())
+            .expect("a disabled surface serves no route");
+    }
+
+    #[test]
+    fn an_active_surface_keeps_its_stored_route_when_other_settings_change() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+        let mut edited = stored.clone();
+        edited.description = "edited".to_string();
+
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("a route the surface already had is not checked again");
+    }
+
+    #[test]
+    fn a_changed_route_is_checked_again() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+        let moved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        assert!(route_refusal(&moved, Some(&stored)).contains("is not served by any surface prefix"));
+    }
+
+    #[test]
+    fn enabling_a_disabled_surface_checks_its_route() {
+        let stored = disabled(surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo"));
+        let enabled = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        assert!(route_refusal(&enabled, Some(&stored)).contains("is not served by any surface prefix"));
+    }
+
+    fn bootstrap_reading(gateway_json: &std::path::Path) -> crate::config::BootstrapConfig {
+        toml::from_str(&format!(
+            "backup_encryption_key = \"unused\"\n[tls]\ncert_path = \"cert.pem\"\nkey_path = \"key.pem\"\n\
+             [config_files]\ngateway = {:?}\n",
+            gateway_json
+                .display()
+                .to_string()
+        ))
+        .expect("bootstrap config fixture")
+    }
+
+    #[test]
+    fn a_surface_prefix_added_to_gateway_json_after_startup_serves_a_saved_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let mut on_disk = serde_json::to_value(network_with_agents_prefix()).unwrap();
+        on_disk["channels"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "id": "added", "name": "Added", "prefix": "/added" }));
+        std::fs::write(&gateway_json, on_disk.to_string()).unwrap();
+        let read_at_startup = network_with_agents_prefix();
+        let surface = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/added/foo");
+
+        let current = current_network_config(&bootstrap_reading(&gateway_json), &read_at_startup);
+
+        refuse_unservable_route(&surface, None, &current).expect("the prefix on disk serves the route");
+        assert!(refuse_unservable_route(&surface, None, &read_at_startup).is_err());
+    }
+
+    #[test]
+    fn the_gateway_json_read_at_startup_checks_a_route_when_the_file_cannot_be_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_at_startup = network_with_agents_prefix();
+
+        let current = current_network_config(
+            &bootstrap_reading(
+                &dir.path()
+                    .join("missing.json"),
+            ),
+            &read_at_startup,
+        );
+
+        let served = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo");
+        refuse_unservable_route(&served, None, &current).expect("the startup prefix serves the route");
+        let unserved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/added/foo");
+        assert!(refuse_unservable_route(&unserved, None, &current).is_err());
+    }
+
+    #[test]
+    fn a_new_or_changed_route_is_stored_without_a_trailing_slash() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/old/");
+
+        let mut created = surface_with_route("s1", "alpha", "0.0.0.0:8443", "agents/foo/");
+        normalize_saved_route(&mut created, None);
+        assert_eq!(created.access_point.route, "/agents/foo");
+
+        let mut moved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/new/");
+        normalize_saved_route(&mut moved, Some(&stored));
+        assert_eq!(moved.access_point.route, "/agents/new");
+
+        let mut kept = stored.clone();
+        normalize_saved_route(&mut kept, Some(&stored));
+        assert_eq!(kept.access_point.route, "/agents/old/");
+
+        let mut missing = surface_with_route("s1", "alpha", "0.0.0.0:8443", "");
+        normalize_saved_route(&mut missing, None);
+        assert_eq!(missing.access_point.route, "", "a missing route stays missing for the required-field check");
+    }
+
+    #[test]
+    fn a_stored_route_without_a_leading_slash_is_kept_and_not_checked_again() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "foo");
+        let mut edited = stored.clone();
+        edited.description = "edited".to_string();
+
+        normalize_saved_route(&mut edited, Some(&stored));
+
+        assert_eq!(edited.access_point.route, "/foo");
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("the route the surface already had is not checked again");
+    }
+
+    #[test]
+    fn a_route_that_differs_from_the_stored_one_only_by_a_trailing_slash_is_kept() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo/");
+        let mut edited = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        normalize_saved_route(&mut edited, Some(&stored));
+
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("the route the surface already had is not checked again");
+    }
+
+    #[test]
+    fn ap_route_collision_rejects_a_route_that_differs_only_by_a_trailing_slash() {
+        let a = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/foo/");
+        let b = surface_with_route("s2", "beta", "0.0.0.0:8443", "/agents/foo");
+        let err = check_access_point_route_collisions(&a, &[b], no_ports)
+            .expect_err("routes the inbound router matches alike must collide");
+        match err {
+            SurfaceApiError::BadRequest(msg) => {
+                assert!(msg.contains("'/agents/foo'"), "message should name the route: {msg}");
                 assert!(msg.contains("'beta'"), "message should name the owning surface: {msg}");
             }
             other => panic!("expected BadRequest, got {other:?}"),

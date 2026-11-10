@@ -2191,6 +2191,16 @@ pub struct TransitCredentials {
     /// Required with `external`, refused with every other mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<GrantSubject>,
+    /// For a `consent_mode = external` binding on a Transit Point whose target
+    /// is `proxy://<id>`: the [`crate::mcp_proxies::types::McpProxy::grant_pin`]
+    /// of that MCP Proxy the binding is pinned to. A write may send the proxy's
+    /// current `grant_pin`, or the pin stored for the binding, which is kept as
+    /// if not sent; any other value is refused. Leaving it out keeps the
+    /// stored pin, and a new binding is pinned to the proxy as it is. Cleared
+    /// on every other binding. The grant goes through the proxy only while the
+    /// proxy's pin is still this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_proxy_pin: Option<String>,
 }
 
 fn default_transit_elicit_timeout_secs() -> u64 {
@@ -3974,9 +3984,16 @@ impl AgentSurface {
 
     /// Whether a caller whose credential is missing or invalid is refused
     /// before policy and the Target: on a closed Access Point, even one
-    /// edited by hand without `on_failure`, or when `on_failure` is `reject`.
+    /// edited by hand without `on_failure`, when `on_failure` is `reject`, or
+    /// when the inbound identity is `from_jwt_claim`, which derives no caller
+    /// identity without a valid JWT.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
         self.access_point.public == Some(false)
+            || self
+                .inbound_identity()
+                .is_some_and(|identity| {
+                    matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
+                })
             || self
                 .access_point
                 .caller_authentication
@@ -4484,6 +4501,20 @@ mod tests {
         ))
         .unwrap();
 
+        assert!(surface.rejects_failed_caller_authentication());
+    }
+
+    #[test]
+    fn an_inbound_from_jwt_claim_surface_rejects_failed_callers_without_a_stored_on_failure() {
+        let mut stored = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+        ]}}));
+        stored["identity_slots"] = serde_json::json!({"inbound": {
+            "type": "from_jwt_claim", "claim": "oid", "namespace_claims": []
+        }});
+        let surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(surface.access_point.public, None);
         assert!(surface.rejects_failed_caller_authentication());
     }
 

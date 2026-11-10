@@ -216,6 +216,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         "An OAuth consent start or callback was refused, with the reason",
         Delegation,
     ),
+    event(
+        "mcp_proxy_pin_changed",
+        "MCP Proxy Pin Changed",
+        "A surface save pinned a Transit Point's grant binding to its MCP Proxy as the proxy is now",
+        Delegation,
+    ),
 ];
 
 /// The event's bit in a selection bitmap: its position in [`AUDIT_EVENTS`].
@@ -316,6 +322,7 @@ mod tests {
             "elicitation_declined",
             "elicitation_cancelled",
             "elicitation_timed_out",
+            "mcp_proxy_pin_changed",
         ] {
             assert_eq!(group_of(delegation), Some(AuditEventGroup::Delegation), "{delegation}");
         }

@@ -141,7 +141,7 @@ logic.
 
 | Stage | Owns | Lives in |
 | --- | --- | --- |
-| Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401` on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
+| Source authentication | Establishing the caller's identity with the one method the request's credential selects. A missing or invalid credential is refused with `401`, the body saying only that the credential is missing or invalid and the reason logged, on a closed Access Point (`access_point.public: false`, set on every surface the admin API creates unless it is public), on one whose `caller_authentication.on_failure` is `reject`, on one whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a valid JWT), and on an MCP Access Point that publishes protected resource metadata (with the discovery challenge for its JWT Bearer method, a plain `401` for any other); otherwise it is passed to policy | [`src/source_auth/`](src/source_auth/), [`src/protocols/protected_resource.rs`](src/protocols/protected_resource.rs) |
 | Resource Server token | Replaces source authentication on an MCP surface that sets `mcp_http.authorization`: a bearer token for this resource and its scopes is required, and a missing, invalid or insufficient one is refused at once with a `WWW-Authenticate` challenge, not passed to policy | [`src/mcp/resource_server.rs`](src/mcp/resource_server.rs) |
 | Rate limiting | Per-surface request limits; a Transit Point's shared and per-caller limits are checked on the outbound path | [`src/policies/rate_limiter.rs`](src/policies/rate_limiter.rs) |
 | Body extraction | Reading the request body once | [`src/proxy/handler.rs`](src/proxy/handler.rs) |
@@ -248,7 +248,8 @@ Transit Point header mapping
 (A2A and AP2) → outbound extension inspection (A2A) → identity resolution → trusted
 identity → custom metadata → trust context → Trust Check (the Transit Point's own list) → gateway OPA →
 surface OPA → Transit Point OPA → MCP tool gating (`tools/call`) → credential injection →
-forward → response and agent-card rewrite → metrics. The stages from trust context to MCP
+forward (a `proxy://` Transit Point is answered by its MCP Proxy, whose backend gets only a
+`consent_mode: external` grant) → response and agent-card rewrite → metrics. The stages from trust context to MCP
 tool gating are skipped for discovery reads.
 
 This page is the authority on pipeline ordering. When it disagrees with a summary
@@ -448,7 +449,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers) | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
+| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers); `route_claims.rs` the prefixes `gateway.json` serves, no two of which may serve the same path, and whether a surface prefix serves a surface route | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
 | [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |

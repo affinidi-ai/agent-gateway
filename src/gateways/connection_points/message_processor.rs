@@ -164,6 +164,13 @@ pub async fn init_mcp_proxy_store(mcp_proxy_store: Arc<crate::mcp_proxies::FileS
     info!("GW2: Global MCP proxy store initialized");
 }
 
+/// The MCP proxy store, once initialized.
+pub fn get_mcp_proxy_store() -> Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>> {
+    GLOBAL_MCP_PROXY_STORE
+        .get()
+        .cloned()
+}
+
 /// Initialize the global A2A proxy store for GW2
 pub async fn init_a2a_proxy_store(a2a_proxy_store: Arc<crate::a2a_proxies::FileSystemA2aProxyStore>) {
     let _ = GLOBAL_A2A_PROXY_STORE.set(a2a_proxy_store);
@@ -4867,7 +4874,8 @@ async fn process_charged_forward_request(
                     return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Invalid)).await;
                 }
             };
-            let identity = match authorization.authenticate(&auth_headers, profile, issuer, middleware.jwks_client()).await {
+            let reach = middleware.token_reach(&surface.name, surface.tenant_id.as_deref());
+            let identity = match authorization.authenticate(&auth_headers, profile, issuer, middleware.jwks_client(), reach).await {
                 Ok(identity) => identity,
                 Err(error) => {
                     token_refused(error);
@@ -4928,6 +4936,9 @@ async fn process_charged_forward_request(
                 let view = crate::didauth::sessions::SessionView {
                     surface_id: &surface.surface_id,
                     variant_id: active_variant_id.as_deref(),
+                    tenant_id: surface
+                        .tenant_id
+                        .as_deref(),
                 };
                 let verified = if selection.ambiguous {
                     Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)

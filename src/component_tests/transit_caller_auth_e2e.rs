@@ -555,7 +555,7 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
         }
         json!({
             "name": "open-transit",
-            "access_point": { "listen_address": h.gateway_base, "route": "/open-transit", "protocol": "a2a" },
+            "access_point": { "listen_address": h.gateway_base, "route": "/smoke/open-transit", "protocol": "a2a" },
             "target": { "endpoint": h.mock.url() },
             "transit": { "outbound_listen_address": PUBLIC_OUTBOUND_URL, "points": [point] }
         })
@@ -609,7 +609,7 @@ async fn a_transit_point_that_authenticates_no_caller_must_be_marked_open_and_an
 
     let before = requests_seen(&h);
     let open_point = format!(
-        "{}/outbound/open-transit/open",
+        "{}/outbound/smoke/open-transit/open",
         h.outbound_url
             .as_ref()
             .unwrap()

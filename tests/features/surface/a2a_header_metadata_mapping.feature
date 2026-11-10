@@ -67,8 +67,8 @@ Feature: Header Metadata Mapping on A2A Access Points
     And managed agent "bravo" did not receive A2A metadata field "session_id"
 
   Scenario Outline: Sensitive headers cannot be mapped into A2A metadata
-    Given the operator can use the admin API and no surface is configured for route "/example-sensitive"
-    When the operator attempts to create an A2A surface for route "/example-sensitive" mapping inbound header <header> to A2A metadata field "blocked"
+    Given the operator can use the admin API and no surface is configured for route "/example/sensitive"
+    When the operator attempts to create an A2A surface for route "/example/sensitive" mapping inbound header <header> to A2A metadata field "blocked"
     Then the admin API response status is 400
     And the admin API error response mentions "sensitive header"
 

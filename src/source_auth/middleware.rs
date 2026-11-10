@@ -121,6 +121,8 @@ pub struct SourceAuthMiddleware {
     cert_store: Option<Arc<dyn CertificateStore>>,
     /// Per-cert cache for mTLS trust material; see [`CachedTrustEntry`].
     trust_cache: Arc<DashMap<String, CachedTrustEntry>>,
+    /// Which managed connection minted a token this gateway's STS issued.
+    sts_token_origins: Option<Arc<dyn crate::sts::token_origin::StsTokenOrigins>>,
 }
 
 /// Return the installed middleware, or an internal (non-caller) error when a
@@ -152,7 +154,18 @@ impl SourceAuthMiddleware {
             didauth_store,
             cert_store,
             trust_cache: Arc::new(DashMap::new()),
+            sts_token_origins: None,
         }
+    }
+
+    /// Refuse a JWT Bearer token this gateway's STS minted for a managed
+    /// connection whose tenant may not reach the surface.
+    pub fn with_sts_token_origins(
+        mut self,
+        origins: Arc<dyn crate::sts::token_origin::StsTokenOrigins>,
+    ) -> Self {
+        self.sts_token_origins = Some(origins);
+        self
     }
 
     /// Return the underlying JWT strategy store (used by the CRUD router).
@@ -191,7 +204,7 @@ impl SourceAuthMiddleware {
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         match config {
             SourceAuthConfig::JwtBearer(jwt_config) => {
-                self.authenticate_jwt_bearer(jwt_config, headers, channel_name)
+                self.authenticate_jwt_bearer(jwt_config, headers, channel_name, view)
                     .await
             }
             SourceAuthConfig::ApiKey(apikey_config) => {
@@ -220,6 +233,7 @@ impl SourceAuthMiddleware {
         config: &JwtBearerAuthConfig,
         headers: &HeaderMap,
         channel_name: &str,
+        view: SessionView<'_>,
     ) -> SourceAuthResult<AuthenticatedIdentity> {
         // 1. Extract bearer token from the configured header / scheme. A value in
         // another scheme, such as an MPP `Payment` credential, is not a token. A
@@ -270,6 +284,8 @@ impl SourceAuthMiddleware {
             .validate(token, &jwt_strategy, &config.audiences, config.audience_claim)
             .await
             .map_err(SourceAuthError::from)?;
+        self.ensure_minting_tenant_may_reach(&claims, channel_name, view)
+            .await?;
         let subject = claims
             .get(principal_claim.as_str())
             .and_then(|v| v.as_str())
@@ -288,6 +304,48 @@ impl SourceAuthMiddleware {
             principal_claim,
             claims,
         })
+    }
+
+    /// Refuse a verified token this gateway's STS minted for a managed
+    /// connection that no longer exists, or whose tenant may not reach the
+    /// surface. The caller is not told which tenant the surface belongs to.
+    async fn ensure_minting_tenant_may_reach(
+        &self,
+        claims: &serde_json::Value,
+        channel_name: &str,
+        view: SessionView<'_>,
+    ) -> SourceAuthResult<()> {
+        let Some(reach) = self.token_reach(channel_name, view.tenant_id) else {
+            return Ok(());
+        };
+        reach
+            .ensure(claims)
+            .await
+            .map_err(|refusal| match refusal {
+                crate::sts::token_origin::ReachRefusal::Unavailable => SourceAuthError::Internal {
+                    reason: "Authentication configuration error".to_string(),
+                },
+                crate::sts::token_origin::ReachRefusal::Refused => SourceAuthError::InvalidCredential {
+                    reason: "Token was not issued for this surface".to_string(),
+                },
+            })
+    }
+
+    /// The STS token origins, when installed.
+    pub fn sts_token_origins(&self) -> Option<Arc<dyn crate::sts::token_origin::StsTokenOrigins>> {
+        self.sts_token_origins.clone()
+    }
+
+    /// The check of which managed connection minted a token presented to
+    /// `surface` of `tenant_id`, when the STS token origins are installed.
+    pub fn token_reach<'a>(
+        &'a self,
+        surface: &'a str,
+        tenant_id: Option<&'a str>,
+    ) -> Option<crate::sts::token_origin::TokenReach<'a>> {
+        self.sts_token_origins
+            .as_deref()
+            .map(|origins| crate::sts::token_origin::TokenReach { origins, surface, tenant_id })
     }
 
     // ── API Key (SecretsStore) ─────────────────────────────────────────────
@@ -708,7 +766,7 @@ fn constant_time_compare(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api_keys::{ApiKeyIssuer, ApiKeyMeta, ApiKeyResult, ApiKeyStatus};
     use crate::didauth::sessions::DidAuthSessionStore;
@@ -756,6 +814,10 @@ mod tests {
             is_local,
             verified: true,
             origin: None,
+            slot: None,
+            credential_updated_at: None,
+            rotations: Vec::new(),
+            rotation_count: 0,
         }
     }
 
@@ -1460,10 +1522,12 @@ mod tests {
         let variant = SessionView {
             surface_id: "surface-a-id",
             variant_id: Some("variant-1"),
+            tenant_id: None,
         };
         let other_variant = SessionView {
             surface_id: "surface-a-id",
             variant_id: Some("variant-2"),
+            tenant_id: None,
         };
         let (on_the_variant, _) = didauth_store
             .create_session("did:example:mallory".into(), "surface-a".into(), variant, 3600)
@@ -1735,6 +1799,220 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
                 );
             }
             other => panic!("expected JwtBearer identity, got: {other:?}"),
+        }
+    }
+
+    /// Tokens of `https://issuer.example.com` are this STS's, minted for the
+    /// connection their `client_id` names: `alpha` of tenant A, `global` of
+    /// no tenant, and any other unknown.
+    struct StubOrigins;
+
+    #[async_trait]
+    impl crate::sts::token_origin::StsTokenOrigins for StubOrigins {
+        async fn origin(
+            &self,
+            claims: &serde_json::Value,
+        ) -> anyhow::Result<crate::sts::token_origin::TokenOrigin> {
+            use crate::sts::token_origin::TokenOrigin;
+            if claims["iss"] != "https://issuer.example.com" {
+                return Ok(TokenOrigin::Elsewhere);
+            }
+            Ok(match claims["client_id"].as_str() {
+                Some("alpha") => TokenOrigin::Connection {
+                    tenant_id: Some("tenant-a".into()),
+                },
+                Some("global") => TokenOrigin::Connection { tenant_id: None },
+                _ => TokenOrigin::UnknownConnection,
+            })
+        }
+    }
+
+    struct UnreadableOrigins;
+
+    #[async_trait]
+    impl crate::sts::token_origin::StsTokenOrigins for UnreadableOrigins {
+        async fn origin(
+            &self,
+            _claims: &serde_json::Value,
+        ) -> anyhow::Result<crate::sts::token_origin::TokenOrigin> {
+            anyhow::bail!("connection store unavailable")
+        }
+    }
+
+    /// A middleware whose STS minted the connection `alpha` of `tenant-a`, a
+    /// JWT Bearer method accepting `audience`, and a token `alpha` was issued
+    /// for it, for tests of the paths that pass the surface tenant.
+    pub(crate) async fn sts_minted_token_fixture(
+        audience: &str
+    ) -> (SourceAuthMiddleware, SourceAuthConfig, String, crate::jwt_bearer::test_utils::TestServer) {
+        let (mw, strategy_id, server) = jwt_test_setup().await;
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com",
+                "sub": "user-1",
+                "aud": audience,
+                "client_id": "alpha",
+                "exp": now_secs() + 3600,
+                "iat": now_secs(),
+            }),
+            "source-auth-test-key",
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec![audience.to_string()],
+            ..Default::default()
+        });
+        (mw.with_sts_token_origins(Arc::new(StubOrigins)), config, token, server)
+    }
+
+    /// Authenticates a token of `issuer` minted for `client_id` with audience
+    /// `audience` at a surface of `tenant_id`.
+    async fn authenticate_minted(
+        origins: Arc<dyn crate::sts::token_origin::StsTokenOrigins>,
+        issuer: &str,
+        client_id: Option<&str>,
+        audience: &str,
+        tenant_id: Option<&str>,
+    ) -> SourceAuthResult<AuthenticatedIdentity> {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let mw = mw.with_sts_token_origins(origins);
+        let mut claims = json!({
+            "iss": issuer,
+            "sub": "user-1",
+            "aud": audience,
+            "exp": now_secs() + 3600,
+            "iat": now_secs(),
+        });
+        if let Some(client_id) = client_id {
+            claims["client_id"] = json!(client_id);
+        }
+        let mut strategy = mw
+            .jwt_strategy_store
+            .get(&strategy_id)
+            .await
+            .unwrap()
+            .unwrap();
+        strategy.expected_issuer = issuer.to_string();
+        mw.jwt_strategy_store
+            .update(strategy)
+            .await
+            .unwrap();
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id,
+            audiences: vec![audience.to_string()],
+            ..Default::default()
+        });
+        let view = SessionView {
+            surface_id: "surface-b-id",
+            variant_id: None,
+            tenant_id,
+        };
+        mw.authenticate(&config, &bearer(&make_token(claims, kid)), "surface-b", view, None)
+            .await
+    }
+
+    const STATIC_AUDIENCE: &str = "https://api.example.com";
+    const AGENT_DID_AUDIENCE: &str = "did:webvh:example.com:surface-b";
+
+    #[tokio::test]
+    async fn another_tenants_connection_token_is_refused_at_a_tenant_surface() {
+        for audience in [STATIC_AUDIENCE, AGENT_DID_AUDIENCE] {
+            let refused = authenticate_minted(
+                Arc::new(StubOrigins),
+                "https://issuer.example.com",
+                Some("alpha"),
+                audience,
+                Some("tenant-b"),
+            )
+            .await;
+            match refused {
+                Err(SourceAuthError::InvalidCredential { reason }) => {
+                    assert_eq!(reason, "Token was not issued for this surface", "{audience}");
+                    assert!(!reason.contains("tenant"), "the refusal must not name tenants: {reason}");
+                }
+                other => panic!("expected an invalid credential for {audience}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_token_is_accepted_at_its_own_tenants_and_global_surfaces() {
+        for audience in [STATIC_AUDIENCE, AGENT_DID_AUDIENCE] {
+            for tenant in [Some("tenant-a"), None] {
+                let identity = authenticate_minted(
+                    Arc::new(StubOrigins),
+                    "https://issuer.example.com",
+                    Some("alpha"),
+                    audience,
+                    tenant,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{audience} at {tenant:?}: {error:?}"));
+                assert!(
+                    matches!(&identity, AuthenticatedIdentity::JwtBearer { subject, .. } if subject == "user-1"),
+                    "{identity:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_global_connection_token_is_accepted_at_a_tenant_surface() {
+        let identity = authenticate_minted(
+            Arc::new(StubOrigins),
+            "https://issuer.example.com",
+            Some("global"),
+            STATIC_AUDIENCE,
+            Some("tenant-b"),
+        )
+        .await
+        .expect("a global connection reaches every surface");
+        assert!(matches!(identity, AuthenticatedIdentity::JwtBearer { .. }), "{identity:?}");
+    }
+
+    #[tokio::test]
+    async fn a_token_of_a_deleted_or_unnamed_connection_is_refused() {
+        for client_id in [Some("deleted"), None] {
+            let refused = authenticate_minted(
+                Arc::new(StubOrigins),
+                "https://issuer.example.com",
+                client_id,
+                STATIC_AUDIENCE,
+                None,
+            )
+            .await;
+            assert!(matches!(refused, Err(SourceAuthError::InvalidCredential { .. })), "{client_id:?}: {refused:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_of_another_issuer_is_not_checked_for_a_connection() {
+        let identity = authenticate_minted(
+            Arc::new(StubOrigins),
+            "https://idp.example.com",
+            Some("alpha"),
+            STATIC_AUDIENCE,
+            Some("tenant-b"),
+        )
+        .await
+        .expect("a third-party token is not this STS's");
+        assert!(matches!(identity, AuthenticatedIdentity::JwtBearer { .. }), "{identity:?}");
+    }
+
+    #[tokio::test]
+    async fn unreadable_connections_fail_closed_as_an_internal_error() {
+        let refused = authenticate_minted(
+            Arc::new(UnreadableOrigins),
+            "https://issuer.example.com",
+            Some("alpha"),
+            STATIC_AUDIENCE,
+            Some("tenant-a"),
+        )
+        .await;
+        match refused {
+            Err(error @ SourceAuthError::Internal { .. }) => assert!(!error.is_caller_attributable()),
+            other => panic!("expected an internal error, got {other:?}"),
         }
     }
 

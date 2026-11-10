@@ -1321,6 +1321,9 @@ pub async fn build_port_router(
                         mcp_router.layer(axum::Extension(crate::mcp::resource_server::ResourceServerAuthContext {
                             issuer: issuer.clone(),
                             keys: Arc::new(crate::jwt_bearer::JwksClient::new()),
+                            sts_token_origins: source_auth_middleware
+                                .as_ref()
+                                .and_then(|middleware| middleware.sts_token_origins()),
                         }));
                 }
                 app = app.merge(mcp_router);
@@ -1797,6 +1800,7 @@ pub async fn build_outbound_port_router(
                 transit_token_issuer: get_transit_token_issuer(),
                 delegation_vault_store: get_delegation_vault_store(),
                 credential_provider_store: get_credential_provider_store(),
+                mcp_proxy_store: crate::gateways::get_mcp_proxy_store(),
                 consent_identity_strategies: source_auth_middleware
                     .as_ref()
                     .map(|middleware| middleware.provider_store()),

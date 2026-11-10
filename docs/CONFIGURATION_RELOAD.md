@@ -90,7 +90,8 @@ shared outbound ports:
    prefix shadows a dashboard page is left out of the rebuilt routers, as at startup (see
    `channels` in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): the reload logs an
    error and returns a `warning` naming each prefix and the page it shadows, and serves everything
-   else.
+   else. A `gateway.json` in which two entries use the same prefix fails
+   the reload here, naming each pair, before anything is replaced.
 3. Clear stale task-monitor entries; rebuilding the routers registers them again.
 4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 5. Group active surfaces by listener and rebuild derived surface state. Each surface's outbound
@@ -279,12 +280,12 @@ needs a restart.
 | `tenant_credential_isolation` | `"warn"` | `"warn"` or `"enforce"`. Whether credential providers may use only secrets of their own tenant, and tenant surfaces (including their custom metadata and the credential providers they bind) and tenant A2A Proxies only their own tenant's secrets and providers; see [Provider secrets belong to the provider's tenant](CREDENTIAL_DELEGATION.md#provider-secrets-belong-to-the-providers-tenant) and [Tenant isolation on a surface's upstream legs](CREDENTIAL_DELEGATION.md#tenant-isolation-on-a-surfaces-upstream-legs). |
 | `target_https` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential (a static secret or a credential provider) may only be sent to an `https` Target or Transit Point endpoint. A `fabric://` or `a2a-proxy://` endpoint is not https; a `proxy://` Target is judged by its MCP proxy's `base_url`. In `enforce` the credential is withheld at request time and `target.auth.fallback` decides the request; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
 | `target_source_auth` | `"warn"` | `"warn"` or `"enforce"`. Whether a Target credential may only be sent from a leg that checks its callers: the Access Point (at least one `caller_authentication` method, or `mcp_http.authorization`) for the Target, the Transit Point itself (a transit token, `source_auth` or `mcp_http.authorization`) for a Transit Point. It also holds the Direct Line credential an A2A proxy sends for an `a2a-proxy://` Target of an A2A or AP2 surface, which `target_https` does not. In `enforce` the credential is withheld at request time, except on the gateway's own agent card fetch; see [Target credential rules on the request path](CREDENTIAL_DELEGATION.md#target-credential-rules-on-the-request-path). |
-| `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately, for example an internal identity provider. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
+| `insecure_token_endpoints` | `[]` | Exact token endpoint URLs that may use http deliberately. It relaxes only the https rule: a token endpoint that resolves to loopback or cloud metadata is refused whatever the list says. Honoured in both modes. An entry that is not a valid URL, is not `http`, or carries a user name or password fails startup, naming the entry. |
 | `token_request_timeout_secs` | `30` | Seconds a credential provider token request may take, from 1 to 120; `0` or a larger value fails startup. Applies to service grants and their refreshes, the legacy delegated refresh, the legacy code exchange and the `2026-07-28` consent exchange. It does not apply to the connect API's grant code exchange and refresh, which keep a fixed 30 seconds. The no-redirect rule is unchanged. |
 
 `"warn"` keeps stored configurations that break a rule working and logs a warning; new or changed
 configurations that break `token_endpoint_https` or `tenant_credential_isolation` are refused on
-save, while ones that break `target_https` or `target_source_auth` are saved with a warning.
+save (for `token_endpoint_https`, this includes an update that changes a kept http provider's type to an OAuth type or makes it start sending a client secret, see [https token endpoints](CREDENTIAL_DELEGATION.md#https-token-endpoints)), while ones that break `target_https` or `target_source_auth` are saved with a warning.
 `"enforce"` refuses all of them on save and also at runtime. For `tenant_credential_isolation`
 that means a tenant surface sending an appliance-wide secret or credential provider; for
 `target_https` and `target_source_auth`, a request whose Target credential breaks the rule goes

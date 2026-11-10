@@ -2,9 +2,9 @@ use cucumber::{given, then, when};
 use serde_json::Value;
 
 use crate::bdd_support::caller::post_json;
-use crate::bdd_support::json_rpc::build_a2a_message_send_body;
+use crate::bdd_support::json_rpc::{attach_agent_identity_payload, build_a2a_message_send_body};
 use crate::steps::given::tracked_surface_id;
-use crate::steps::when::{ensure_admin_session, ensure_gateway_running};
+use crate::steps::when::{ensure_admin_session, ensure_gateway_running, send_a2a_body_through_transit_point};
 use crate::world::SurfaceWorld;
 
 const DASHBOARD_STATS_PATH: &str = "/v1/dashboard/stats";
@@ -128,6 +128,212 @@ async fn surface_takes_managed_identity_from_api_key(
             "api_key_id": api_key_id,
         });
     })
+    .await;
+}
+
+fn surface_under_test_name(world: &SurfaceWorld) -> String {
+    world
+        .surface_config
+        .surface_name
+        .clone()
+        .expect("the surface must have been named before this step")
+}
+
+/// Reads the surface under test, applies `edit` to its Transit Point `alias`, and saves it
+/// through the admin API.
+async fn edit_transit_point(
+    world: &mut SurfaceWorld,
+    alias: &str,
+    action: &str,
+    edit: impl FnOnce(&mut Value),
+) {
+    let surface_name = surface_under_test_name(world);
+    edit_named_surface(world, &surface_name, action, |surface| {
+        let point = surface["transit"]["points"]
+            .as_array_mut()
+            .and_then(|points| {
+                points
+                    .iter_mut()
+                    .find(|point| point["alias"] == alias)
+            })
+            .unwrap_or_else(|| panic!("the surface should have Transit Point {alias:?}"));
+        edit(point);
+    })
+    .await;
+}
+
+#[given(expr = "Transit Point {string} has a managed identity of its own")]
+async fn transit_point_has_own_managed_identity(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    let managed_identity = serde_json::json!({
+        "type": "payload_extraction",
+        "meta_field": "agentIdentity",
+        "fields": ["agentIdentity.softwareInfo.name", "agentIdentity.softwareInfo.version", "agentIdentity.cloudProvider"],
+        "json_schema": crate::bdd_support::config::managed_identity::default_identity_payload_schema(),
+    });
+    edit_transit_point(world, &transit_point, "giving the Transit Point a managed identity of its own", |point| {
+        point["managed_identity"] = managed_identity;
+    })
+    .await;
+}
+
+#[given(expr = "Transit Point {string} presents the managed agent's identity to its destination")]
+async fn transit_point_presents_managed_agent_identity(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    edit_transit_point(world, &transit_point, "turning on VP injection on the Transit Point", |point| {
+        point["identity_injection"]["inject_vp"] = Value::Bool(true);
+    })
+    .await;
+}
+
+#[given(
+    expr = "managed agent {string} has sent a request with the agent-identity extension through Transit Point {string}"
+)]
+async fn managed_agent_has_sent_identity_request_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    let mut body = build_a2a_message_send_body("hello");
+    attach_agent_identity_payload(&mut body);
+    send_a2a_body_through_transit_point(world, &agent_name, &transit_point, Vec::new(), body).await;
+    let response = world
+        .caller_response
+        .as_ref()
+        .expect("the Transit Point response must have been recorded");
+    assert_eq!(
+        response.status, 200,
+        "expected the request through Transit Point {transit_point:?} to succeed, got {}: {}",
+        response.status, response.body
+    );
+}
+
+fn self_signed_client_certificate_pem(common_name: &str) -> String {
+    let key_pair = rcgen::KeyPair::generate().expect("generate a client key pair");
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
+    params
+        .self_signed(&key_pair)
+        .expect("self-sign the client certificate")
+        .pem()
+}
+
+async fn send_admin_request(
+    world: &mut SurfaceWorld,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+    action: &str,
+) -> Value {
+    ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json(method, path, Some(body))
+        .await
+        .unwrap_or_else(|error| panic!("{action} through admin API: {error}"));
+    assert!(
+        (200..300).contains(&response.status),
+        "{action} should succeed, got status {} body {}",
+        response.status,
+        response.body
+    );
+    response.body
+}
+
+#[given(expr = "the surface takes its protected identity from client certificate {string}")]
+async fn surface_takes_protected_identity_from_client_certificate(
+    world: &mut SurfaceWorld,
+    certificate_name: String,
+) {
+    let stored = send_admin_request(
+        world,
+        reqwest::Method::POST,
+        "/api/v1/certificates",
+        &serde_json::json!({
+            "name": certificate_name,
+            "kind": "client_leaf",
+            "certificate_pem": self_signed_client_certificate_pem(&certificate_name),
+            "active": true,
+        }),
+        "storing the client certificate",
+    )
+    .await;
+    let certificate_id = stored["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the stored certificate should have an id, got {stored}"))
+        .to_string();
+    world
+        .client_certificates
+        .insert(certificate_name, certificate_id.clone());
+    let surface_name = surface_under_test_name(world);
+    edit_named_surface(world, &surface_name, "taking the protected identity from a client certificate", |surface| {
+        surface["identity_slots"]["protected"] = serde_json::json!({
+            "type": "from_mtls",
+            "certificate_id": certificate_id,
+        });
+    })
+    .await;
+}
+
+#[given(expr = "client certificate {string} has been renewed")]
+async fn client_certificate_has_been_renewed(
+    world: &mut SurfaceWorld,
+    certificate_name: String,
+) {
+    let certificate_id = world
+        .client_certificates
+        .get(&certificate_name)
+        .cloned()
+        .unwrap_or_else(|| panic!("client certificate {certificate_name:?} must have been stored before this step"));
+    send_admin_request(
+        world,
+        reqwest::Method::PUT,
+        &format!("/api/v1/certificates/{certificate_id}"),
+        &serde_json::json!({ "certificate_pem": self_signed_client_certificate_pem(&certificate_name) }),
+        "renewing the client certificate",
+    )
+    .await;
+}
+
+#[given(expr = "the value of API key {string} has been changed")]
+async fn api_key_value_has_been_changed(
+    world: &mut SurfaceWorld,
+    api_key_id: String,
+) {
+    ensure_admin_session(world).await;
+    let secrets: Value = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_json::<(), _>(reqwest::Method::GET, "/api/v1/secrets", None)
+        .await
+        .unwrap_or_else(|error| panic!("list secrets through admin API: {error}"));
+    let id = secrets
+        .as_array()
+        .and_then(|secrets| {
+            secrets
+                .iter()
+                .find(|secret| secret["secret_id"] == api_key_id.as_str())
+        })
+        .and_then(|secret| secret["id"].as_str())
+        .unwrap_or_else(|| panic!("API key secret {api_key_id:?} must have been stored, secrets: {secrets}"))
+        .to_string();
+    send_admin_request(
+        world,
+        reqwest::Method::PUT,
+        &format!("/api/v1/secrets/{id}"),
+        &serde_json::json!({ "value": format!("{}-changed", api_key_value(&api_key_id)), "update_value": true }),
+        "changing the API key value",
+    )
     .await;
 }
 
@@ -333,6 +539,109 @@ fn managed_identity_belongs_to_surfaces(
     let mut expected = [first.as_str(), second.as_str()];
     expected.sort_unstable();
     assert_eq!(observed, expected, "unexpected managed surfaces, observed: {identity}");
+}
+
+fn assert_managed_identity_slot(
+    world: &SurfaceWorld,
+    expected_slot: &Value,
+) {
+    let identity = single_identity_with_origin(world, "managed");
+    assert_eq!(identity.get("slot"), Some(expected_slot), "unexpected Identity slot, observed: {identity}");
+}
+
+#[then(expr = "the Managed Agent identity is in the slot of Transit Point {string}")]
+fn managed_identity_is_in_transit_point_slot(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    assert_managed_identity_slot(world, &serde_json::json!({ "kind": "transit_point", "alias": transit_point }));
+}
+
+#[then("the Managed Agent identity is in the protected slot")]
+fn managed_identity_is_in_protected_slot(world: &mut SurfaceWorld) {
+    assert_managed_identity_slot(world, &serde_json::json!({ "kind": "protected" }));
+}
+
+/// Each managed DID in the slot is a version, and so is each credential rotation it kept
+/// its DID through, as the Identities page counts them.
+#[then(expr = "the Managed Agent identity has {int} versions in the protected slot")]
+fn managed_identity_has_versions_in_protected_slot(
+    world: &mut SurfaceWorld,
+    expected_versions: usize,
+) {
+    let protected = serde_json::json!({ "kind": "protected" });
+    let in_slot: Vec<&Value> = identities_with_origin(world, "managed")
+        .into_iter()
+        .filter(|identity| identity.get("slot") == Some(&protected))
+        .collect();
+    let versions: usize = in_slot
+        .iter()
+        .map(|identity| {
+            1 + identity
+                .get("rotation_count")
+                .and_then(Value::as_u64)
+                .map_or(0, |count| usize::try_from(count).expect("rotation count fits usize"))
+        })
+        .sum();
+    assert_eq!(
+        versions,
+        expected_versions,
+        "unexpected identity versions in the protected slot, observed identities: {:?}",
+        dashboard_identities(world)
+    );
+}
+
+/// The Managed Agent identity's row, and the rotations its Version History loads.
+async fn managed_identity_version_history(world: &SurfaceWorld) -> (Value, Vec<Value>) {
+    let identity = single_identity_with_origin(world, "managed").clone();
+    let identity_hash = identity["identity_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the Managed Agent identity should carry its hash, observed: {identity}"));
+    let page: Value = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_json::<(), _>(reqwest::Method::GET, &format!("/v1/identities/by-hash/{identity_hash}/rotations"), None)
+        .await
+        .unwrap_or_else(|error| panic!("read the Version History through the admin API: {error}"));
+    let rotations = page["rotations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the Version History should list rotations, got: {page}"))
+        .clone();
+    assert_eq!(page["total"], rotations.len(), "the Version History should fit one page, got: {page}");
+    (identity, rotations)
+}
+
+#[then("the Version History of the Managed Agent identity shows the certificate fingerprint it replaced")]
+async fn version_history_shows_replaced_certificate_fingerprint(world: &mut SurfaceWorld) {
+    let (identity, rotations) = managed_identity_version_history(world).await;
+    let [rotation] = rotations.as_slice() else {
+        panic!("expected one credential rotation, got: {rotations:?}");
+    };
+    let replaced = rotation["previous"]["fingerprint_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rotation should name the fingerprint it replaced, got: {rotation}"));
+    let current = identity["agent_identity"]["fingerprint_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the identity should carry its certificate fingerprint, observed: {identity}"));
+    assert_eq!(replaced.len(), 64, "the replaced fingerprint should be a SHA-256, got: {replaced}");
+    assert_ne!(replaced, current, "the rotation should name the renewed certificate's earlier fingerprint");
+    assert!(rotation["rotated_at"].is_string(), "the rotation should have a time, got: {rotation}");
+}
+
+#[then("the Version History of the Managed Agent identity shows a credential update without field changes")]
+async fn version_history_shows_credential_update(world: &mut SurfaceWorld) {
+    let (_, rotations) = managed_identity_version_history(world).await;
+    let [rotation] = rotations.as_slice() else {
+        panic!("expected one credential update, got: {rotations:?}");
+    };
+    assert!(
+        rotation
+            .get("previous")
+            .is_none(),
+        "an API key update replaces no identity fields, got: {rotation}"
+    );
+    assert!(rotation["rotated_at"].is_string(), "the update should have a time, got: {rotation}");
 }
 
 fn recorder_state_and_reason(status: &Value) -> (Option<&str>, Option<&str>) {

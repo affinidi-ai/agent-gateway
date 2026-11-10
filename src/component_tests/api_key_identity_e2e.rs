@@ -128,7 +128,9 @@ async fn configured_key_identity(key_id: &str) -> (std::collections::HashMap<Str
     .await
     .expect("derive configured key identity")
     .expect("configured key identity");
-    let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } = derived
+    let crate::identity::credential_identity::CredentialIdentity::Derived {
+        identity_fields, identity_hash, ..
+    } = derived
     else {
         panic!("an API key identity is derived");
     };
@@ -1009,7 +1011,7 @@ async fn start_with_stored_shared_key_surface(surface_id: &'static str) -> (Gate
             "name": surface_id,
             "access_point": {
                 "listen_address": gateway["listeners"][0]["external_urls"][0],
-                "route": "/legacy",
+                "route": "/smoke/legacy",
                 "protocol": "a2a",
                 "caller_authentication": { "methods": [{
                     "type": "api_key_provider",

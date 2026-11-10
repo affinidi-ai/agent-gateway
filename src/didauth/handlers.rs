@@ -249,6 +249,7 @@ pub async fn authenticate_handler(
             let view = crate::didauth::sessions::SessionView {
                 surface_id: &state.surface_id,
                 variant_id: state.variant_id.as_deref(),
+                tenant_id: None,
             };
             let (session_id, session) = state
                 .session_store

@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::McpProxyStore;
-use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyWriteResponse, UpdateMcpProxyRequest};
+use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyAnswer, McpProxyWriteResponse, UpdateMcpProxyRequest};
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::mcp::sse_server::SseSessionManager;
 use crate::observability::loggable;
@@ -42,7 +42,7 @@ fn mcp_proxy_allowed(
 /// A caller-chosen proxy id. It names the record's file on disk and is embedded
 /// in `TENANT:{tenant}:mcp-proxies:{id}` scope targets, so path separators, dots
 /// and colons are all excluded.
-fn is_valid_mcp_proxy_id(id: &str) -> bool {
+pub fn is_valid_mcp_proxy_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 128
@@ -526,12 +526,12 @@ impl McpServerManager {
     }
 }
 
-/// List all MCP Proxies
+/// List all MCP Proxies, each with its `grant_pin`.
 pub async fn list_mcp_proxies<S: McpProxyStore>(
     Extension(store): Extension<Arc<S>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
-) -> Result<Json<Vec<McpProxy>>, (StatusCode, String)> {
+) -> Result<Json<Vec<McpProxyAnswer>>, (StatusCode, String)> {
     let mut proxies = store
         .list_all()
         .await
@@ -539,16 +539,21 @@ pub async fn list_mcp_proxies<S: McpProxyStore>(
     let context = tenant_context(&context);
     let scope = resource_scope(&scope);
     proxies.retain(|proxy| mcp_proxy_allowed(proxy, context, scope));
-    Ok(Json(proxies))
+    Ok(Json(
+        proxies
+            .into_iter()
+            .map(McpProxyAnswer::from)
+            .collect(),
+    ))
 }
 
-/// Get a specific MCP Proxy by ID
+/// Get a specific MCP Proxy by ID, with its `grant_pin`.
 pub async fn get_mcp_proxy<S: McpProxyStore>(
     Extension(store): Extension<Arc<S>>,
     Path(id): Path<String>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
-) -> Result<Json<McpProxy>, (StatusCode, String)> {
+) -> Result<Json<McpProxyAnswer>, (StatusCode, String)> {
     let proxy = store
         .get(&id)
         .await
@@ -557,7 +562,7 @@ pub async fn get_mcp_proxy<S: McpProxyStore>(
     if !mcp_proxy_allowed(&proxy, tenant_context(&context), resource_scope(&scope)) {
         return Err((StatusCode::NOT_FOUND, "MCP Proxy not found".to_string()));
     }
-    Ok(Json(proxy))
+    Ok(Json(proxy.into()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1285,7 +1290,7 @@ pub async fn create_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
+    Ok(Json(McpProxyWriteResponse::new(proxy, warnings)))
 }
 
 /// Update an MCP Proxy
@@ -1464,7 +1469,7 @@ pub async fn update_mcp_proxy<S: McpProxyStore>(
         });
     }
 
-    Ok(Json(McpProxyWriteResponse { proxy, warnings }))
+    Ok(Json(McpProxyWriteResponse::new(proxy, warnings)))
 }
 
 /// Delete an MCP Proxy
@@ -2764,6 +2769,102 @@ pub struct PreparedMcpRequest {
     call: McpCall,
 }
 
+impl PreparedMcpRequest {
+    /// Whether the request calls a tool, the only call that reaches the
+    /// proxy's backend.
+    pub fn calls_a_tool(&self) -> bool {
+        matches!(self.call, McpCall::ToolsCall { .. })
+    }
+
+    /// Whether a tool of the proxy has a header, query parameter or declared
+    /// body field that asks its backend to run another HTTP method than its
+    /// operation's ([`sends_a_method_override`]).
+    pub fn sends_a_method_override(&self) -> bool {
+        sends_a_method_override(&self.server)
+    }
+}
+
+/// The MCP server `proxy`'s OpenAPI spec defines, and the proxy's
+/// `base_url`: what every request to the proxy is served with. It holds no
+/// credential: a credentialed tool call is sent by the gateway's own REST
+/// client with its headers.
+fn proxy_server(proxy: &McpProxy) -> Result<(McpServer, Url), McpProxyCallError> {
+    // Parse the OpenAPI spec from YAML to JSON
+    let openapi_json: serde_json::Value =
+        serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
+    let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base_url: {}", e))?;
+    let mut server = McpServer::builder()
+        .openapi_spec(openapi_json)
+        .base_url(base_url.clone())
+        .build();
+    server
+        .load_openapi_spec()
+        .map_err(|e| format!("Failed to load OpenAPI spec: {}", e))?;
+    Ok((server, base_url))
+}
+
+/// Headers that ask a REST API to run another HTTP method than the request's
+/// own, which many honour (Google's APIs among them): a header parameter of
+/// one of these names would let an agent turn an allowed `GET` tool into a
+/// `DELETE` behind the same tool name. Compared without case.
+pub const METHOD_OVERRIDE_HEADERS: [&str; 3] = ["X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"];
+
+/// The parameter that asks a web framework (Rails, Laravel, Express's
+/// method-override) to run another HTTP method, sent in the query or the
+/// body. Compared without case.
+const METHOD_OVERRIDE_PARAMETER: &str = "_method";
+
+/// Whether `name`, a parameter outside the headers, asks for another method:
+/// [`METHOD_OVERRIDE_PARAMETER`] or one of [`METHOD_OVERRIDE_HEADERS`].
+pub(super) fn overrides_the_method(name: &str) -> bool {
+    std::iter::once(METHOD_OVERRIDE_PARAMETER)
+        .chain(METHOD_OVERRIDE_HEADERS)
+        .any(|override_name| override_name.eq_ignore_ascii_case(name))
+}
+
+/// Whether a tool of `server` can send a method override: a header parameter
+/// named one of [`METHOD_OVERRIDE_HEADERS`], or a query parameter or a field
+/// of its request body named as [`overrides_the_method`] reads. The tools'
+/// parameter mappings are what a call's arguments are sent by (unknown
+/// arguments are refused), so they hold every header and query parameter a
+/// tool call can send; the body's fields are those of its `request_body`
+/// schema.
+fn sends_a_method_override(server: &McpServer) -> bool {
+    server
+        .get_tool_names()
+        .iter()
+        .filter_map(|name| server.get_tool_metadata(name))
+        .any(|metadata| {
+            let in_parameters = metadata
+                .parameter_mappings
+                .values()
+                .any(|mapping| match mapping.location.as_str() {
+                    "header" => METHOD_OVERRIDE_HEADERS
+                        .iter()
+                        .any(|header| header.eq_ignore_ascii_case(&mapping.original_name)),
+                    "query" => overrides_the_method(&mapping.original_name),
+                    _ => false,
+                });
+            let in_body = metadata
+                .parameters
+                .pointer("/properties/request_body/properties")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .any(|field| overrides_the_method(field))
+                });
+            in_parameters || in_body
+        })
+}
+
+/// Whether `proxy`'s spec, loaded as a request to the proxy loads it, has a
+/// tool that can send a method override ([`sends_a_method_override`]). A
+/// spec that does not load serves no tool, so it sends none.
+pub fn spec_sends_a_method_override(proxy: &McpProxy) -> bool {
+    proxy_server(proxy).is_ok_and(|(server, _)| sends_a_method_override(&server))
+}
+
 enum McpCall {
     Initialize,
     ToolsList,
@@ -2787,28 +2888,30 @@ pub fn prepare_mcp_request(
 ) -> Result<PreparedMcpRequest, McpProxyCallError> {
     // Check if proxy is active
     if proxy.status != super::types::McpProxyStatus::Active {
-        channel_warn!(config_id, "❌ Proxy '{}' is disabled", proxy.name);
+        // The name is the proxy editor's: logged escaped.
+        channel_warn!(config_id, "❌ Proxy {} is disabled", loggable::untrusted(&proxy.name));
         return Err("MCP proxy is disabled"
             .to_string()
             .into());
     }
 
     // Create MCP server from proxy config
-    channel_info!(config_id, "Creating MCP server for proxy '{}' at {}", proxy.name, loggable::url(&proxy.base_url));
-
-    // Parse the OpenAPI spec from YAML to JSON
-    let openapi_json: serde_json::Value =
-        serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
-
-    let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base_url: {}", e))?;
+    channel_info!(
+        config_id,
+        "Creating MCP server for proxy {} at {}",
+        loggable::untrusted(&proxy.name),
+        loggable::url(&proxy.base_url)
+    );
 
     // Build default headers from target auth if configured
     let default_headers = if let Some((header_name, header_value)) = &target_auth_header {
         let mut headers = reqwest::header::HeaderMap::new();
         let name = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
             .map_err(|e| format!("Invalid target auth header name '{}': {}", header_name, e))?;
-        let value = reqwest::header::HeaderValue::from_str(header_value)
+        let mut value = reqwest::header::HeaderValue::from_str(header_value)
             .map_err(|e| format!("Invalid target auth header value: {}", e))?;
+        // A credential, whatever header it goes in: never indexed by HPACK.
+        value.set_sensitive(true);
         headers.insert(name, value);
         channel_info!(config_id, "Injecting target auth header '{}' into MCP proxy requests", header_name);
         Some(headers)
@@ -2816,29 +2919,16 @@ pub fn prepare_mcp_request(
         None
     };
 
-    let mut server = if let Some(headers) = default_headers.clone() {
-        McpServer::builder()
-            .openapi_spec(openapi_json)
-            .base_url(base_url.clone())
-            .default_headers(headers)
-            .build()
-    } else {
-        McpServer::builder()
-            .openapi_spec(openapi_json)
-            .base_url(base_url.clone())
-            .build()
-    };
-
-    server
-        .load_openapi_spec()
-        .map_err(|e| format!("Failed to load OpenAPI spec: {}", e))?;
+    let (server, base_url) = proxy_server(proxy)?;
 
     let method = request
         .get("method")
         .and_then(|m| m.as_str())
         .unwrap_or("unknown");
 
-    channel_info!(config_id, "🔧 Handling MCP method: {}", method);
+    // The method is the caller's: logged escaped and cut short, so it can
+    // neither forge a log line nor flood the log.
+    channel_info!(config_id, "🔧 Handling MCP method: {}", loggable::untrusted(method));
 
     let call = match method {
         "initialize" => McpCall::Initialize,
@@ -2890,7 +2980,7 @@ pub fn prepare_mcp_request(
             }
         }
         _ => {
-            warn!("❌ Unknown MCP method: {}", method);
+            warn!(method = %loggable::untrusted(method), "❌ Unknown MCP method");
             return Err(format!("Unknown MCP method: {}", method).into());
         }
     };
@@ -2946,46 +3036,14 @@ pub async fn execute_mcp_request(
             Ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": proxy.name.clone(),
-                        "version": "1.0.0"
-                    }
-                }
+                "result": initialize_result(proxy)
             }))
         }
-        McpCall::ToolsList => {
-            let tool_names = server.get_tool_names();
-            info!("✓ Found {} tools for proxy '{}'", tool_names.len(), proxy.name);
-
-            let mut tools = Vec::new();
-            for tool_name in tool_names {
-                if let Some(metadata) = server.get_tool_metadata(&tool_name) {
-                    let input_schema = if proxy.flatten_post_params {
-                        flatten_input_schema(&metadata.parameters)
-                    } else {
-                        metadata.parameters.clone()
-                    };
-                    tools.push(serde_json::json!({
-                        "name": metadata.name,
-                        "description": metadata.description,
-                        "inputSchema": input_schema,
-                    }));
-                }
-            }
-
-            Ok(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "tools": tools
-                }
-            }))
-        }
+        McpCall::ToolsList => Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": tools_list_result(proxy, &server)
+        })),
         McpCall::ToolsCall {
             tool_name,
             arguments,
@@ -2995,7 +3053,8 @@ pub async fn execute_mcp_request(
             let tool = server
                 .get_tool(tool_name)
                 .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
-            channel_info!(config_id, "🔨 Calling tool: {}", tool_name);
+            // A spec operationId, the proxy editor's: logged escaped.
+            channel_info!(config_id, "🔨 Calling tool: {}", loggable::untrusted(tool_name));
 
             let default_limits;
             let limits = match surface.mcp_http.as_ref() {
@@ -3157,13 +3216,210 @@ pub async fn execute_mcp_request(
             Ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {
-                    "content": result.content,
-                    "isError": result.is_error
-                }
+                "result": tool_call_result(result)
             }))
         }
     }
+}
+
+/// The `initialize` result a legacy MCP Proxy answers with.
+fn initialize_result(proxy: &McpProxy) -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": proxy.name.clone(),
+            "version": "1.0.0"
+        }
+    })
+}
+
+/// The `tools/list` result of a legacy MCP Proxy: every tool `server` loaded
+/// from its spec.
+fn tools_list_result(
+    proxy: &McpProxy,
+    server: &McpServer,
+) -> serde_json::Value {
+    let tool_names = server.get_tool_names();
+    info!("✓ Found {} tools for proxy {}", tool_names.len(), loggable::untrusted(&proxy.name));
+    let tools: Vec<serde_json::Value> = tool_names
+        .iter()
+        .filter_map(|tool_name| server.get_tool_metadata(tool_name))
+        .map(|metadata| {
+            let input_schema = if proxy.flatten_post_params {
+                flatten_input_schema(&metadata.parameters)
+            } else {
+                metadata.parameters.clone()
+            };
+            serde_json::json!({
+                "name": metadata.name,
+                "description": metadata.description,
+                "inputSchema": input_schema,
+            })
+        })
+        .collect();
+    serde_json::json!({ "tools": tools })
+}
+
+/// The `tools/call` result of a legacy MCP Proxy.
+fn tool_call_result(result: rmcp::model::CallToolResult) -> serde_json::Value {
+    serde_json::json!({
+        "content": result.content,
+        "isError": result.is_error
+    })
+}
+
+/// The grant by binding a Transit Point sends its MCP Proxy's backend: the
+/// header it goes in, and `destination`, the origin of its provider's
+/// `resource`, the only origin a call carrying it is sent to.
+pub struct ProxyGrant {
+    pub header: (String, String),
+    pub destination: url::Origin,
+}
+
+/// How far a tool call through a Transit Point's MCP Proxy got: whether it
+/// went out to the backend, and the status the backend answered with, kept
+/// even when the gateway then refuses the answer (a redirect, an answer over
+/// the limits, a body that cannot be read, or the call's timeout).
+#[derive(Debug, Default)]
+pub struct TransitCallProgress {
+    sent: std::sync::atomic::AtomicBool,
+    answered: std::sync::atomic::AtomicU16,
+}
+
+impl TransitCallProgress {
+    pub(super) fn mark_sent(&self) {
+        self.sent
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn mark_answered(
+        &self,
+        status: reqwest::StatusCode,
+    ) {
+        self.answered
+            .store(status.as_u16(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the call passed every check and went out to the backend.
+    pub fn sent(&self) -> bool {
+        self.sent
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The status the backend answered with, if it answered.
+    pub fn answered(&self) -> Option<reqwest::StatusCode> {
+        reqwest::StatusCode::from_u16(
+            self.answered
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+        .ok()
+    }
+}
+
+/// What an MCP Proxy behind a Transit Point answered.
+#[derive(Debug)]
+pub enum TransitProxyAnswer {
+    /// The JSON-RPC response.
+    Response(serde_json::Value),
+    /// A tool call that carries a grant would send a body whose top-level key
+    /// asks the backend to run another HTTP method; it was not sent.
+    OverridesTheMethod,
+    /// The backend refused the grant a tool call carried, as
+    /// [`crate::delegation_vault::release::vendor_answer`] reads its answer:
+    /// its status and `WWW-Authenticate` challenges, never its body, so the
+    /// Transit Point refreshes the grant or refuses the call as it does for an
+    /// `https` target.
+    GrantRefused { status: u16, challenges: Vec<axum::http::HeaderValue> },
+}
+
+/// Serve a legacy MCP request for a Transit Point whose target is
+/// `proxy://<id>`, prepared by [`prepare_mcp_request`] with the grant's
+/// header: `initialize` and `tools/list` from the proxy's spec, and a
+/// `tools/call` through its REST backend, never outside the proxy's base
+/// path. Every tool call goes through Strict, `https`-only egress pinned to the
+/// vetted addresses, with redirects refused, as a Transit Point sends a grant
+/// (`exact_allowlist`, the BDD allow-list, alone admits a fixture), never
+/// through the OpenAPI library's client, which follows redirects and vets no
+/// address. With `grant`, a tool call carries the grant's header and goes
+/// only to its `destination`; a backend answer that refuses the grant is
+/// [`TransitProxyAnswer::GrantRefused`], and a body that asks for another
+/// HTTP method is [`TransitProxyAnswer::OverridesTheMethod`], never sent.
+/// Without one, the call carries no credential. `progress` records the call
+/// as sent once it has passed every check, its URL and its egress among them,
+/// so the caller records the grant's use only for a call that reached the
+/// backend, and then the status the backend answered. The surface's own
+/// timeout, retry, circuit breaker and mirroring are its Target's and do not
+/// apply.
+pub async fn serve_through_transit_point(
+    proxy: &McpProxy,
+    prepared: PreparedMcpRequest,
+    grant: Option<ProxyGrant>,
+    limits: &crate::config::McpHttpConfig,
+    exact_allowlist: Option<&str>,
+    config_id: &str,
+    progress: &TransitCallProgress,
+) -> Result<TransitProxyAnswer, McpProxyCallError> {
+    let PreparedMcpRequest { server, request, call } = prepared;
+    let result = match call {
+        McpCall::Initialize => initialize_result(proxy),
+        McpCall::ToolsList => tools_list_result(proxy, &server),
+        McpCall::ToolsCall {
+            tool_name,
+            arguments,
+            credentialed,
+        } => {
+            let tool = server
+                .get_tool(&tool_name)
+                .ok_or_else(|| format!("Tool '{}' not found", tool_name))?;
+            // A spec operationId, the proxy editor's: logged escaped.
+            channel_info!(config_id, "🔨 Calling tool: {}", loggable::untrusted(&tool_name));
+            let (stored, headers) = match (credentialed, grant.as_ref()) {
+                (Some(credentialed), Some(_)) => *credentialed,
+                (None, None) => (
+                    StoredToolCall::prepare(proxy, &server.openapi_spec, tool)
+                        .map_err(|error| format!("Tool execution failed: {error}"))?,
+                    ReqwestHeaderMap::new(),
+                ),
+                _ => {
+                    return Err("Tool execution failed: the grant could not be prepared"
+                        .to_string()
+                        .into());
+                }
+            };
+            match super::modern_rest::call_through_transit_point(
+                stored.directory.as_str(),
+                &stored.metadata,
+                &arguments,
+                &headers,
+                limits,
+                &stored.content_type,
+                grant
+                    .as_ref()
+                    .map(|grant| &grant.destination),
+                exact_allowlist,
+                progress,
+            )
+            .await
+            {
+                Ok(result) => tool_call_result(result),
+                Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
+                    return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
+                }
+                Err(super::modern_rest::RestError::MethodOverride) => {
+                    return Ok(TransitProxyAnswer::OverridesTheMethod);
+                }
+                Err(error) => return Err(format!("Tool execution failed: {error}").into()),
+            }
+        }
+    };
+    Ok(TransitProxyAnswer::Response(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned(),
+        "result": result
+    })))
 }
 
 #[cfg(test)]
@@ -6254,6 +6510,123 @@ mod tests {
         .await
         .expect_err("moved away from its resource");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Every answer that returns an MCP Proxy carries its `grant_pin`, the
+    /// value a surface save sends to pin a grant binding to the proxy as it
+    /// is: create, update, get and list. An update that changes what the pin
+    /// covers, the name among them, answers the new pin.
+    #[tokio::test]
+    async fn every_answer_with_an_mcp_proxy_carries_its_grant_pin() {
+        let store = store_with(vec![]);
+        let manager = Arc::new(super::McpServerManager::new());
+        let Json(created) = super::create_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            None,
+            None,
+            None,
+            Json(serde_json::from_value(create_body(Some("drive"))).unwrap()),
+        )
+        .await
+        .expect("created");
+        let pin = created.proxy.grant_pin();
+        let answered = serde_json::to_value(&created).unwrap();
+        assert_eq!(
+            (answered["id"].clone(), answered["grant_pin"].clone()),
+            (serde_json::json!("drive"), serde_json::json!(pin))
+        );
+
+        let Json(updated) = super::update_mcp_proxy(
+            Extension(store.clone()),
+            Extension(manager.clone()),
+            Extension(None),
+            Extension(no_resource_owners()),
+            Path("drive".to_string()),
+            None,
+            None,
+            Json(serde_json::from_value(serde_json::json!({"name": "Drive, renamed"})).unwrap()),
+        )
+        .await
+        .expect("updated");
+        let renamed = serde_json::to_value(&updated).unwrap()["grant_pin"].clone();
+        assert_ne!(renamed, serde_json::json!(pin), "the name is part of the pin");
+        assert_eq!(renamed, serde_json::json!(updated.proxy.grant_pin()));
+
+        let Json(read) = super::get_mcp_proxy(Extension(store.clone()), Path("drive".to_string()), None, None)
+            .await
+            .expect("read");
+        assert_eq!(serde_json::to_value(&read).unwrap()["grant_pin"], renamed);
+        let Json(listed) = super::list_mcp_proxies(Extension(store.clone()), None, None)
+            .await
+            .expect("listed");
+        let listed = serde_json::to_value(&listed).unwrap();
+        assert_eq!((listed[0]["id"].clone(), listed[0]["grant_pin"].clone()), (serde_json::json!("drive"), renamed));
+    }
+
+    /// A method override is found, in any case, in a spec that loads: a
+    /// header parameter named a method override header, and a query parameter
+    /// or a request body field named `_method` or a method override header.
+    /// Another header, a path parameter of such a name, a header named
+    /// `_method`, and a spec that does not load are not one.
+    #[test]
+    fn a_method_override_is_found_among_a_tools_headers_query_and_body() {
+        let with = |name: &str, location: &str| {
+            let mut proxy = owned("drive", None);
+            proxy.openapi_spec = serde_json::json!({
+                "openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+                "paths": {"/files/{id}": {"get": {"operationId": "search_files",
+                    "parameters": [
+                        {"name": "id", "in": "path", "required": true, "schema": {"type": "string"}},
+                        {"name": name, "in": location, "schema": {"type": "string"}}
+                    ],
+                    "responses": {"200": {"description": "Files"}}}}}
+            })
+            .to_string();
+            proxy
+        };
+        let with_body_field = |name: &str, media_type: &str| {
+            let mut proxy = owned("drive", None);
+            proxy.openapi_spec = serde_json::json!({
+                "openapi": "3.0.0", "info": {"title": "Drive", "version": "1"},
+                "paths": {"/files": {"post": {"operationId": "create_file",
+                    "requestBody": {"content": {media_type: {"schema": {"type": "object",
+                        "properties": {name: {"type": "string"}}}}}},
+                    "responses": {"200": {"description": "File"}}}}}
+            })
+            .to_string();
+            proxy
+        };
+        for (name, location) in [
+            ("X-HTTP-Method-Override", "header"),
+            ("x-http-method", "header"),
+            ("X-METHOD-OVERRIDE", "header"),
+            ("_method", "query"),
+            ("_METHOD", "query"),
+            ("X-HTTP-Method-Override", "query"),
+        ] {
+            assert!(super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
+        }
+        for media_type in ["application/x-www-form-urlencoded", "application/json"] {
+            for name in ["_method", "X-HTTP-Method"] {
+                assert!(
+                    super::spec_sends_a_method_override(&with_body_field(name, media_type)),
+                    "{name} in a {media_type} body"
+                );
+            }
+        }
+        for (name, location) in [("X-Request-Reason", "header"), ("_method", "header"), ("method", "query")] {
+            assert!(!super::spec_sends_a_method_override(&with(name, location)), "{name} in {location}");
+        }
+        assert!(
+            !super::spec_sends_a_method_override(&with_body_field("title", "application/json")),
+            "another body field"
+        );
+        let mut unloadable = owned("drive", None);
+        unloadable.openapi_spec = "X-HTTP-Method-Override: [".into();
+        assert!(!super::spec_sends_a_method_override(&unloadable), "a spec that does not load sends nothing");
     }
 
     fn legacy_incompatible_spec() -> String {

@@ -34,6 +34,7 @@ async fn init_source_auth_middleware(
     api_key_validator: Option<Arc<dyn crate::api_keys::ApiKeyValidator>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     cert_store: Option<Arc<dyn crate::certificates::CertificateStore>>,
+    sts_token_origins: Option<Arc<dyn crate::sts::token_origin::StsTokenOrigins>>,
 ) -> anyhow::Result<Arc<crate::source_auth::SourceAuthMiddleware>> {
     let storage_path = PathBuf::from(secrets_storage_path)
         .parent()
@@ -63,7 +64,7 @@ async fn init_source_auth_middleware(
         });
     }
     let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
-    Ok(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+    let middleware = crate::source_auth::SourceAuthMiddleware::new(
         didauth_session_store,
         store_arc,
         jwks_client,
@@ -71,7 +72,11 @@ async fn init_source_auth_middleware(
         secrets_cache,
         api_key_validator,
         cert_store,
-    )))
+    );
+    Ok(Arc::new(match sts_token_origins {
+        Some(origins) => middleware.with_sts_token_origins(origins),
+        None => middleware,
+    }))
 }
 
 /// Register live entity counters for appliance resource-limit enforcement.
@@ -3397,6 +3402,17 @@ pub async fn run_axum_proxy(
             api_key_validator.clone(),
             didauth_session_store.clone(),
             Some(certificates_store.clone()),
+            Some(Arc::new(crate::sts::token_origin::GatewayStsTokenOrigins::new(
+                vc_issuer_for_api.clone(),
+                network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
+                sts_client_store
+                    .clone()
+                    .map(|clients| clients as Arc<dyn crate::sts::store::StsClientStorage>),
+            )) as Arc<dyn crate::sts::token_origin::StsTokenOrigins>),
         )
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
@@ -3674,6 +3690,9 @@ pub async fn run_axum_proxy(
                         .external_consent_issuers
                         .clone(),
                 ),
+                mcp_proxy_store: identity_state
+                    .mcp_proxy_store
+                    .clone(),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");
@@ -3975,6 +3994,17 @@ pub async fn run_axum_proxy(
                 );
                 error!("{}", banner);
                 eprintln!("{}", banner);
+            }
+
+            for (surface, reason) in network_config.unservable_surfaces(&all_surfaces) {
+                warn!(
+                    surface = %loggable::untrusted(&surface.name),
+                    surface_id = %loggable::untrusted(&surface.surface_id),
+                    reason = %loggable::untrusted(&reason),
+                    "This stored surface's Access Point route breaks the rules a save now checks: move it to a plain \
+                     path under a surface prefix, or disable it. Fabric callers, who find the surface by id, are not \
+                     affected"
+                );
             }
 
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
@@ -4840,6 +4870,7 @@ mod tests {
             std::sync::Arc::new(dashmap::DashMap::new()),
             None,
             std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            None,
             None,
         )
         .await

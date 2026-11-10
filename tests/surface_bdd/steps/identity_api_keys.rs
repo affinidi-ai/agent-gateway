@@ -354,7 +354,7 @@ async fn operator_deletes_surface(world: &mut SurfaceWorld) {
 #[when("the operator creates a surface with the deleted surface's id")]
 async fn operator_creates_surface_with_deleted_id(world: &mut SurfaceWorld) {
     let deleted = surface_id(world);
-    let mut payload = build_primary_target_surface_payload(world, "/reused").await;
+    let mut payload = build_primary_target_surface_payload(world, "/smoke/reused").await;
     payload["surface_id"] = json!(deleted);
     payload["name"] = json!("reused");
     let response = send(world, Method::POST, "/v1/surfaces", Some(&payload)).await;

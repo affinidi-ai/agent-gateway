@@ -207,8 +207,8 @@ mod tests {
         RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails, SecretForceDeleteDetails,
-        TargetAuthChangeDetails, audit_event,
+        McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails,
+        SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -565,7 +565,8 @@ mod tests {
             | DelegationAuditAction::PolicyAttachmentChanged(_)
             | DelegationAuditAction::PolicyChangeRefused(_)
             | DelegationAuditAction::TargetAuthChanged(_)
-            | DelegationAuditAction::SecretForceDeleted(_) => {}
+            | DelegationAuditAction::SecretForceDeleted(_)
+            | DelegationAuditAction::McpProxyPinChanged(_) => {}
         }
     }
 
@@ -695,6 +696,16 @@ mod tests {
                 secret_id: "billing_api_key".to_string(),
                 force: true,
                 referrers: Vec::new(),
+            })),
+            DelegationAuditAction::McpProxyPinChanged(Box::new(McpProxyPinChangeDetails {
+                actor: Actor::user("u-1"),
+                surface_variant: "_base_".to_string(),
+                variant_id: None,
+                transit_point_id: "tp-1".to_string(),
+                transit_point: "drive".to_string(),
+                mcp_proxy_id: "drive".to_string(),
+                previous_pin: None,
+                pin: "sha256:00".to_string(),
             })),
         ]
     }

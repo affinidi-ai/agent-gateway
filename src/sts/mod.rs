@@ -24,5 +24,6 @@ pub mod resource_owners;
 pub mod store;
 pub mod throttle;
 pub mod token_exchange;
+pub mod token_origin;
 pub mod trust_check;
 pub mod types;

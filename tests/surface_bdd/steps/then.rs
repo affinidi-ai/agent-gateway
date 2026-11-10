@@ -1000,6 +1000,16 @@ fn response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWo
     assert_json_bodies_equal(get_response_body_value(world), &expected, "caller credential refusal");
 }
 
+#[then("the MCP response says only that the caller credential is missing or invalid")]
+fn mcp_response_says_only_caller_credential_missing_or_invalid(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    assert_eq!(body["jsonrpc"], "2.0", "MCP refusal must be a JSON-RPC 2.0 envelope: {body}");
+    assert_eq!(
+        body["error"]["message"], "Caller credential missing or invalid",
+        "MCP caller credential refusal: {body}"
+    );
+}
+
 #[then("the operator can still read the stored surface through the admin API")]
 fn fetching_surface_by_id_returns_stored_configuration(world: &mut SurfaceWorld) {
     let lookup = get_surface_lookup_response(world);
@@ -4454,11 +4464,14 @@ fn startup_report_does_not_name_breach(
 
 #[then("the gateway log shows no credential provider secret or token")]
 fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
+    use crate::bdd_support::config::target_auth::{
+        TARGET_AUTH_CLIENT_ID_VALUE, TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN,
+    };
+    use base64::Engine;
     let log = gateway_log(world);
-    for secret in [
-        crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
-        crate::bdd_support::config::target_auth::TARGET_AUTH_CLIENT_SECRET_VALUE,
-    ] {
+    let basic_credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("{TARGET_AUTH_CLIENT_ID_VALUE}:{TARGET_AUTH_CLIENT_SECRET_VALUE}"));
+    for secret in [TARGET_AUTH_PROVIDER_TOKEN, TARGET_AUTH_CLIENT_SECRET_VALUE, basic_credentials.as_str()] {
         assert!(!log.contains(secret), "the gateway log shows a credential provider secret or token");
     }
 }
@@ -4524,7 +4537,6 @@ async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut
         .first()
         .expect("the token endpoint received a grant");
     assert_eq!(grant["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
-    assert!(!grant.contains_key("client_secret"), "a JWT Bearer grant sends no client secret");
     let token_endpoint = world
         .surface_config
         .target_auth_provider

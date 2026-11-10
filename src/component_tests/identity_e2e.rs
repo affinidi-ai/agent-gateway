@@ -2776,7 +2776,7 @@ fn store_inbound_api_key_surface_with_stale_key_ids(
         "name": "stored-inbound-api-key",
         "access_point": {
             "listen_address": gateway["listeners"][0]["external_urls"][0],
-            "route": "/stored",
+            "route": "/smoke/stored",
             "protocol": "a2a",
             "caller_authentication": provider_caller_authentication(STORED_INBOUND_API_KEY_SURFACE)
         },
@@ -2870,7 +2870,7 @@ async fn admin_api_saves_inbound_from_api_key_only_behind_an_api_key_caller() {
     let mut posted = json!({
         "surface_id": posted_id,
         "name": posted_id,
-        "access_point": { "listen_address": h.gateway_base, "route": "/posted", "protocol": "a2a" },
+        "access_point": { "listen_address": h.gateway_base, "route": "/smoke/posted", "protocol": "a2a" },
         "target": { "endpoint": h.mock.url() },
         "identity_slots": { "inbound": { "type": "from_api_key", "api_key_id": "stale-posted-secret" } }
     });

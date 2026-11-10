@@ -28,13 +28,23 @@ has five types, set by `provider_type`.
 | --- | --- | --- |
 | `oauth2_authorization_code` | Three-legged OAuth. The user signs in to the provider and approves the scopes. | Required, per user |
 | `oauth2_client_credentials` | Two-legged, machine to machine. The gateway authenticates as the client with a client secret. | None |
-| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`; no client ID or secret. A Google service account for Vertex AI Agent Engine works this way. | None |
+| `oauth2_jwt_bearer` | JWT Bearer grant (RFC 7523 section 2.1). The gateway signs a JWT with the provider's private key and posts it as the `assertion`. It sends no client identity unless the provider sets a `client_authentication`. A Google service account for Vertex AI Agent Engine works this way; an Ory Hydra client, which Hydra needs identified, sets one. | None |
 | `oauth2_client_credentials_jwt_auth` | Client Credentials grant whose client authenticates with a signed JWT (`private_key_jwt`, RFC 7523 section 2.2) instead of a client secret. An Entra certificate credential (key named by certificate thumbprint) and an Ory `private_key_jwt` client (key named by `kid`) work this way. | None |
 | `api_key` | A static key resolved from the secrets store. No OAuth. | None |
 
 A provider carries its authorization and token endpoints and its default scopes. Its
 client ID, client secret, signing key and certificate are **references** into the secrets
 store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
+
+An `oauth2_authorization_code` or `oauth2_client_credentials` provider without an `issuer`
+needs a `token_endpoint`, a `client_id_secret_ref` and a `client_secret_secret_ref`, and an
+`api_key` provider needs an `api_key_secret_ref`. A create and an update both check the
+provider as it would be stored, and a missing client or API key reference answers 400 with the
+same message in both (for example
+`client_id_secret_ref and client_secret_secret_ref are required for OAuth providers`). An update
+therefore cannot clear one of these references with an empty string, and a retype to one of
+these types must send the references the provider does not store yet. A stored provider that
+already lacks one is refused every update until the update names it.
 
 ### Records that are still in use
 
@@ -145,13 +155,16 @@ Every type except `api_key` sends its client secret, assertion or code to the to
 so the endpoint must be an https URL. An http endpoint meets the rule only when the bootstrap
 `[credential_policy] insecure_token_endpoints` lists it exactly (compared as parsed URLs, so
 another port or path does not match), or, under `AG_TEST_MODE=true`, when
-`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `credential_policy.token_endpoint_https`
+`AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` lists it exactly. `insecure_token_endpoints` relaxes only the
+scheme: an endpoint it names must still resolve to neither loopback nor cloud metadata
+([Service tokens](#service-tokens)). `credential_policy.token_endpoint_https`
 sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#credential-policy)):
 
 | | `warn` (default) | `enforce` |
 | --- | --- | --- |
-| Create, or an update that sets a new token endpoint or turns an `api_key` provider into an OAuth type | 400 `token_endpoint must be an https URL` | The same |
-| Update that keeps a stored http endpoint | Saved | 400 |
+| Create, or an update that sets a new token endpoint or changes the provider type (an `api_key` provider turning into an OAuth type, or one OAuth type into another) | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint and the provider type | Saved | 400 |
+| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent no client secret before | 400 `token_endpoint must be an https URL` | The same |
 | `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
 | Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
 
@@ -163,6 +176,20 @@ http provider logs a warning, and a legacy binding's audit detail gains
 already cached, the legacy code exchange and refresh fail with `token_endpoint must be an https
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
+
+In `warn` mode a stored http provider therefore cannot start sending a client secret by turning on
+a `client_authentication` that sends one, and cannot change its type to an OAuth type: a retype
+must meet the rule like a new provider. Setting `client_authentication` to `none`, clearing it,
+or switching between `client_secret_basic` and `client_secret_post` is still saved. Listing the
+endpoint in `insecure_token_endpoints` allows the change on purpose.
+
+The rule does not compare `client_secret_secret_ref`. A stored http provider may point it at
+another secret of its tenant, which is a rotation and is saved, and a secret's value can already
+change through the secrets API without any check by a provider, so pinning the reference would
+not pin what the endpoint receives. What a stored provider cannot do is lose the reference:
+`oauth2_client_credentials` and `oauth2_authorization_code` providers need it, so an update that
+clears it is refused (see [Credential providers](#credential-providers)), and a provider cannot
+be emptied of its client secret and given one again later on an endpoint that is still http.
 
 ### Provider secrets belong to the provider's tenant
 
@@ -211,8 +238,9 @@ record that misses a required one.
 | `jwt_issuer` | Required: the `iss` claim, a service account's `client_email` | Not used: `iss` and `sub` are the client ID |
 | `jwt_subject` | Required: the `sub` claim, the account the token is issued for (with domain-wide delegation, the user to act as; without it, a Google service account's own `client_email`, the same value as `jwt_issuer`). Create, update and `validate` refuse a blank one with 400 `jwt_subject is required for this provider type`. A provider stored without it still signs its grant without `sub`, but every update of it through the provider update endpoint, a signing key rotation included, must name one | Not used |
 | `jwt_certificate_secret_ref` | Not used | Optional: the PEM certificate, whose SHA-256 thumbprint goes in the `x5t#S256` header. Entra needs it; issuers that find the key by `kid`, such as Ory, do not |
-| `client_id_secret_ref` | Not used | Required, sent as `client_id` |
-| `client_secret_secret_ref` | Not used | Refused, so a misconfiguration cannot fall back to a client secret |
+| `client_authentication` | Optional: how the grant's client identifies itself. `none` is a public client: `client_id` in the form body. `client_secret_basic` is HTTP Basic with the client ID and secret, each form-urlencoded (RFC 6749 section 2.3.1). `client_secret_post` puts `client_id` and `client_secret` in the form body. Unset sends no client identity and leaves the client references unread. An update that omits it keeps the stored value, and an empty string clears it. An update that changes `provider_type` away from `oauth2_jwt_bearer` and omits it drops the stored value | Refused with 400 `client_authentication is only for oauth2_jwt_bearer providers`, as on every type but this one |
+| `client_id_secret_ref` | Required with a `client_authentication` (400 `client_id_secret_ref is required for this client_authentication`), and sent as `client_id` or inside the Basic credentials; not used without one. An empty string clears it, which the dashboard sends while Not sent is chosen, so a cleared provider holds no reference that would block deleting the secret | Required, sent as `client_id` |
+| `client_secret_secret_ref` | Required with `client_secret_basic` and `client_secret_post` (400 `client_secret_secret_ref is required for this client_authentication`), refused with `none` (400 `client_secret_secret_ref is not allowed with client_authentication none`); not used without a `client_authentication`. An update that omits it keeps the stored reference, so an update that switches a stored provider from a secret method to `none` must also send an empty string to clear it, as the dashboard does | Refused, so a misconfiguration cannot fall back to a client secret |
 | `jwt_audience` | Optional `aud`; the token endpoint when unset | The same |
 | `jwt_key_id` | Optional `kid` header. It overrides the `private_key_id` of a JSON key file, which is the default `kid` | Optional `kid` header, such as the `kid` of the key in an Ory client's JWKS. The dashboard warns when neither it nor a certificate is set, since the server may then not find the key |
 
@@ -222,17 +250,66 @@ is not PEM, so a wrong format fails the save rather than the first token request
 file is checked the same way; the key secret may be at most 16 KiB.
 `POST /api/v1/credential-providers/validate` runs the same check before a save: it needs the
 credential provider edit permission, applies the caller's tenant to the secrets it names, and
-answers `"key_material": "ok"` beside the token endpoint's reachability. JWK keys are not
+answers `"key_material": "ok"` beside the token endpoint's reachability. It reaches the token
+endpoint through the same pinned client as a token request, so a loopback or cloud metadata
+endpoint answers 400 `token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata`
+without being contacted,
+and an unreachable one answers `"reachable": false` with the fixed error `token_endpoint could
+not be reached`; the detail is only logged. It takes no client references, so it does not check
+a `client_authentication`; create and update do. JWK keys are not
 accepted. The provider API never returns the key or certificate; the list leaves out
-their references too.
+their references and the client references too, and shows a JWT Bearer provider's
+`client_authentication`.
+
+RFC 7523 makes client authentication optional in a JWT Bearer grant, and servers differ. A Google
+service account needs none. Ory Hydra answers a grant that names no client with 400
+`invalid_request`: set `none` for a public client, and `client_secret_basic` or
+`client_secret_post` to match the `token_endpoint_auth_method` the client is registered with. A
+provider that sets no client authentication keeps sending a client-less grant even when it stores client
+references, such as those left from another type. Create and update refuse a method whose
+references are missing: the client ID for every method, and the client secret for
+`client_secret_basic` and `client_secret_post`. A provider that sets a client authentication
+also names its scopes in the `scope` form field, which servers such as Hydra grant scopes from:
+without it Hydra issues an empty scope, and the gateway refuses a token whose scopes differ
+from those requested. A provider that sets no client authentication sends its scopes only in the assertion's
+`scope` claim, as before.
+
+#### Ory Hydra
+
+Register the OAuth client in Hydra with the JWT bearer grant type
+`urn:ietf:params:oauth:grant-type:jwt-bearer` and a `token_endpoint_auth_method` that matches the
+provider's `client_authentication`:
+
+| `client_authentication` | The gateway sends | Register the client with |
+| --- | --- | --- |
+| unset | No client identity | Not accepted by Hydra: it answers 400 `invalid_request` |
+| `none` | `client_id` in the form body | `token_endpoint_auth_method` `none` |
+| `client_secret_basic` | HTTP Basic with the client ID and secret | `client_secret_basic` |
+| `client_secret_post` | `client_id` and `client_secret` in the form body | `client_secret_post` |
+
+Hydra also needs a trust relationship for the assertion's issuer (the provider's `jwt_issuer`):
+its public key, the subject, and the scopes it may grant. Hydra refuses a grant that names no
+client, so a Hydra provider must set a `client_authentication`.
+
+A 401 `invalid_client` from the token endpoint usually means the provider's
+`client_authentication` does not match how the client is registered, or the client ID or secret
+is wrong. The warning "Provider token request rejected" carries a `client_authentication` field
+(`none`, `client_secret_basic`, `client_secret_post` or `unset`) next to the HTTP status and the
+OAuth error code.
+
+Existing providers are unchanged: their `client_authentication` is unset and they send the same
+grant as before. A gateway without the setting ignores it, and its next save of that provider
+drops it.
 
 Every token request signs a fresh assertion that lives 5 minutes (`iat`, `exp`, a random
 UUID `jti` so the issuer can refuse a replayed assertion, and for a client assertion `nbf`);
-only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, a client assertion in the `scope` form
+only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, and in the `scope` form
+field too when the provider sets a `client_authentication`; a client assertion sends them in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
-`common`. An update that sends a reference or JWT field as an empty string clears it, which
-is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
-reads an empty reference as none.
+`common`. An update that sends a reference or JWT field as an empty string clears it, unless
+the provider's type needs that reference (see above); that is how a client-credentials provider
+switches to `oauth2_client_credentials_jwt_auth`, which needs no client secret reference. A
+create reads an empty reference as none.
 
 ### Service tokens
 
@@ -244,13 +321,16 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
 - An API key is read from the secrets store on every use and never cached.
 - Every token request (Client Credentials, JWT Bearer, `private_key_jwt` and refresh) is sent
   on a client pinned to the addresses the token endpoint resolved to when it was checked, with
-  redirects off. The pin holds when no HTTP proxy is configured: a client that honours
-  `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` lets the proxy resolve the host
-  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving to loopback, an unspecified address or cloud metadata is
-  refused before any request, reported as `TokenEndpointRefused` ("credential provider token
-  endpoint refused by egress policy"); RFC 1918 addresses stay allowed. Under
-  `AG_TEST_MODE=true`, `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints
-  (never cloud metadata).
+  redirects off and any HTTP proxy ignored, since a proxy would resolve the host again; a host
+  that needs `HTTPS_PROXY` to reach the internet must allow direct egress to its token
+  endpoints, and a startup warning says so when a proxy is set
+  ([Other pinned egress sinks](POLICY.md#other-pinned-egress-sinks)). A host resolving
+  to loopback, an unspecified address or cloud metadata is refused before any request,
+  reported as `TokenEndpointRefused` ("credential provider token endpoint refused by egress
+  policy"), and creating or updating a provider with such a token endpoint answers 400.
+  Private networks are allowed, so a token endpoint inside the operator's network works. Under `AG_TEST_MODE=true`,
+  `AG_BDD_OAUTH_ENDPOINT_ALLOWLIST` admits listed loopback test endpoints (never cloud
+  metadata).
 - An issued token is cached in the delegation vault and renewed half its lifetime before its
   `expires_at`, but at most 5 minutes and at least 60 seconds before (a one-hour token is
   renewed 5 minutes early, a 100-second one 60 seconds early). One request renews it while the
@@ -266,7 +346,9 @@ that needs one: legacy and `2026-07-28` delegation bindings, and target authenti
   egress or https rule refuses never serves the stale token. Its key is `<purpose>:<hash>`, where the hash is the hex SHA-256
   of the provider's digest, the sorted, deduplicated scopes, and the id, tenant and `updated_at`
   of each secret the provider's type sends: the client ID and secret of `oauth2_client_credentials`,
-  the signing key and certificate of `oauth2_jwt_bearer`, and the client ID, signing key and
+  the signing key and certificate of `oauth2_jwt_bearer` (after its client ID, and its client
+  secret too for `client_secret_basic` and `client_secret_post`, when it sets a
+  `client_authentication`), and the client ID, signing key and
   certificate of `oauth2_client_credentials_jwt_auth`. Editing the provider, rotating one of
   those secrets or moving one to another tenant therefore requests a new token instead of
   reusing one issued under the old settings. A reference the type does not send, such as an
@@ -1015,12 +1097,13 @@ authorization URL for such a binding.
 | `subject` | Required: `owner` for one grant every caller of the Transit Point uses, or `caller` for one grant per caller, selected by the caller's [identity hash](#the-callers-identity-hash). Refused with every other consent mode |
 | `credential_provider_id` | A provider with an `issuer` and the surface's own tenant, exactly: an untenanted provider for an untenanted surface |
 | `scopes`, `inject_as` | As for any binding |
+| `mcp_proxy_pin` | For a `proxy://` Transit Point only: the `grant_pin` of its MCP Proxy the binding is pinned to ([Through an MCP Proxy](#through-an-mcp-proxy)). A write may send the proxy's current `grant_pin` to pin the binding to the proxy as it is; any other value is refused, and leaving it out keeps the stored pin (a new binding is pinned to the proxy as it is). Cleared on every other binding |
 
 The Transit Point itself must send the grant only where it belongs:
 
 | Field | Rule |
 | --- | --- |
-| `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`. A `fabric://` route is refused: a grant never crosses Fabric |
+| `target_endpoint` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource`, or `proxy://<id>`, an MCP Proxy whose `base_url` has that origin ([Through an MCP Proxy](#through-an-mcp-proxy)). A `fabric://` route is refused: a grant never crosses Fabric |
 | No presentation of the agent | No identity VP (`identity_injection.inject_vp`, or a `managed_identity` of the Transit Point's own) and no enabled `workload_binding`, as on the Access Point Target ([below](#external-consent-on-the-access-point-target)): a presentation of the managed agent would describe the agent to the vendor, which could present it elsewhere. A Transit Point injects no DID of the surface's, so there is no DID mode to refuse. One stored outside the API with a presentation answers `connector_unavailable` and reads no grant |
 | `id` | Names one Transit Point in one place. It appears once, in the surface's points or in one variant's `overrides.transit.points`, and in no other list, whatever the target or binding there. A grant is kept under the Transit Point's id and used under that one Transit Point's settings, so no copy in another variant, with weaker gating or policy, may use it. The exception is a variant that lists no Transit Points of its own: it serves the surface's under the same ids, and so releases the same grants, even when it overrides `transit.shared` (transit policy, rate limit, OPA policy, source auth) or the Access Point. Only a surface editor can set this up, and could weaken the surface itself just as well, so it is allowed: a save answers with a `Warning` header for each Transit Point with `consent_mode: external` that an enabled variant, with transit on, keeps this way. To offer the binding in two variants, give each its own Transit Point id: each then has its own grants. A variant created from another gets new ids for these Transit Points. The id `target` is reserved for the grants of the surface's Access Point Target, which share its key space |
 
@@ -1090,7 +1173,7 @@ the request's id, with the reason in its `data`; on any other (`http`, A2A) it i
 | --- | --- | --- | --- |
 | `connect_required` | `403`, `-32001` | No grant is stored for the binding and principal; it expired and cannot be refreshed; its refresh token was refused (`invalid_grant`, which deletes and revokes it); the authorization server refused its refresh otherwise as often as `external_consent_refresh_refusals` allows since it last succeeded, and the grant cannot be used (it is kept: [Refreshing a grant](#refreshing-a-grant)); a refresh died part way, which may have spent the refresh token; or it was asked for beyond the binding's scopes as saved now (a binding narrowed since: below) | `subject`: `owner` or `caller`. For `caller`, `hint`: 16 bytes, base64url, of the SHA-256 of `agent-gateway-connect-hint\n` and the caller's identity hash, so whoever runs the connect can check that the person who signs in is that caller |
 | `scope_insufficient` | `403`, `-32001` | The vendor answered `403` with a `Bearer` challenge whose `error` is `insufficient_scope` | `scope`, when the challenge names one made of scope names only (letters, digits and `._:/-+=@`, at most 512 characters); a wider scope is never asked for silently |
-| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource`, the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
+| `connector_unavailable` | `503`, `-32603` | Anything a new connect would not fix: the token endpoint cannot be reached, failed or refused the client (`invalid_client`), the client's secret cannot be resolved, the grant is waiting out a refresh failure, the vendor answered `401` without a `Bearer` challenge that rejects the token (`invalid_token`), or again after the grant was refreshed, the grant was refreshed or connected again while the vendor refused an earlier token, the provider is gone, has no issuer, is of another tenant or is [no longer permitted](#permitted-issuers), the Transit Point's target is not a public `https` URL with the origin of the provider's `resource` nor an MCP Proxy that sends there, or that MCP Proxy has changed since its binding was pinned or its spec has a method override header ([Through an MCP Proxy](#through-an-mcp-proxy)), the binding names no subject, the surface also has `outbound_credentials`, its Access Point's callers are not ones a grant may go to ([above](#external-consent-on-a-transit-point)), at-rest encryption is not active, the identity hash pepper is not configured or the grants stored were written under another pepper ([Grants by binding](#grants-by-binding)), or the resource is no longer permitted for its issuer | |
 
 A `caller` binding is refused, `connector_unavailable`, for a caller named by anything but an
 identity hash. A binding that some other path reached with a provider that has an `issuer`, the
@@ -1149,6 +1232,142 @@ addresses, redirects returned rather than followed, and no proxy. It is never fo
 Fabric. A `fabric://` Transit Point withholds delegated credentials unless
 `fabric_delegated_credentials` is set, and with it set the grant is refused, so a grant never
 reaches a stored surface that predates these rules.
+
+#### Through an MCP Proxy
+
+A vendor with a REST API and no MCP server of its own, such as Google Drive, is reached through
+one of the gateway's MCP Proxies: an OpenAPI spec served as MCP tools whose calls go to the
+proxy's `base_url`. A Transit Point whose `target_endpoint` is `proxy://<id>` is answered by
+that MCP Proxy ([`src/proxy/outbound_handler.rs`](../src/proxy/outbound_handler.rs),
+`step_forward_request_mcp_proxy`): `initialize` and `tools/list` come from its spec, a
+notification is accepted (`202`) with nothing sent, a `tools/call` calls the proxy's backend,
+any method but `POST` answers `405`, and a `2026-07-28` request is refused with `-32022` before
+any credential is prepared. The id is everything after `proxy://`, and a surface save refuses
+one an MCP Proxy cannot have (letters, digits, `-` and `_` only, so `proxy://drive/x` is
+refused), so the proxy a save checks is the one a call is sent to. The surface must be able to
+reference the proxy, as it must a `proxy://` Target: one of its own tenant, or an
+appliance-wide one for a tenant's surface. A surface save refuses a Transit Point that names any
+other, and a call to a missing proxy or one the surface may not reference answers `503` (`This
+Transit Point is unavailable`), with the reason in the log. The surface's own timeout, retry,
+circuit breaker and mirroring belong to its Access Point's Target and do not apply: the Transit
+Point's `networking.timeout`, or the surface's timeout when the Transit Point sets none, bounds
+the call, and its `mcp_http` the backend's request and answer.
+
+Every tool call, with a grant or without, goes to the backend through pinned Strict egress, as a
+grant goes to an `https` target: `https` only, internal addresses (loopback, private ranges,
+link-local, cloud metadata) refused after DNS resolution, the connection pinned to the vetted
+addresses, redirects refused (the call answers a tool error), no proxy. The OpenAPI library's
+own client, which follows redirects, is never used for a Transit Point.
+
+A `proxy://` Transit Point speaks MCP and sends its MCP Proxy's backend no credential but the
+grant of a `consent_mode: external` binding: no `target_auth`, no binding of another consent
+mode, and no surface-level `outbound_credentials`, which apply on every Transit Point. One that
+breaks this is refused when the surface is saved (`400`, on the surface and in every variant),
+and one stored outside the API is refused when it is called (`503`), before any credential is
+read. Its `consent_mode: external` binding's grant goes to the backend under the same rules as
+an `https` target's:
+
+| Field | Rule |
+| --- | --- |
+| `protocol` | `mcp` |
+| The MCP Proxy | Of the surface's own tenant, exactly, and served only through surfaces (`direct_access: false`), so its backend is reached with the grant only through the Transit Point that holds it. A proxy anyone can call on its own route is refused |
+| Its `base_url` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource` |
+| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, and no tool with a query parameter or declared request body field named `_method` or one of those three (any case): many REST APIs, Google's among them, run the method such a header names, and web frameworks such as Rails, Laravel and Express's method-override run the one `_method` names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes. A body field the spec does not declare is still sent, so a tool call that carries the grant is also refused when it is sent (`connector_unavailable`) if its body has a top-level key of one of those names |
+| Its pin | The proxy as it was when the binding was pinned: below |
+| `inject_as` | A header: `bearer_header` (the default) or `custom_header`, never `meta`. The grant is the call's only credential |
+| `target_auth` | None |
+
+They are checked when the surface is saved (`400`), when a connect starts (`409`,
+`binding_not_servable`), and on every call: when the grant is released, and again with the proxy
+record the call is sent through (the spec when the call is sent). So a proxy edited afterwards
+to point elsewhere, another `base_url` or `direct_access` turned on, is never sent the grant: the
+call answers `connector_unavailable`. Only a tool call carries the grant, and only to that
+origin, never outside the proxy's base path. A save checks the proxy as it is now even when the
+binding keeps a pin the proxy no longer has (below), so a proxy edited to break one of these
+rules refuses every save of the surface until it is put right.
+
+**The pin.** Whoever may edit an MCP Proxy (`mcp_proxies.edit`, or a token scoped to that one
+proxy) can change which operation a tool name calls, its path, its description and the server
+name the agent is told, on the same origin, without touching the surface. So each `consent_mode:
+external` binding of a `proxy://` Transit Point is pinned to the proxy as a surface save saw it:
+its `mcp_proxy_pin` is the proxy's `grant_pin`, `sha256:` and 64 lowercase hex digits, a SHA-256
+digest of the proxy's `base_url`, its OpenAPI spec as stored, `flatten_post_params` and `name`.
+Every MCP Proxy answer carries `grant_pin`: create, update, `GET` of one and the list. A save
+settles the pin of each such binding, on the surface and in each variant:
+
+| The write sends | The binding's pin |
+| --- | --- |
+| `mcp_proxy_pin` equal to the proxy's current `grant_pin` | That pin: the binding is pinned to the proxy as it is |
+| Any other `mcp_proxy_pin` (stale, or wrong), but the one stored for the binding | The save is refused: `400`, `code` `mcp_proxy_pin_not_current`, naming the Transit Point (`transit.points[0] ('drive')`, or `variant 'beta' transit.points[0] ...`) and the proxy, never its spec |
+| No `mcp_proxy_pin`, or the one stored for the binding sent back, and the binding has one stored | The stored pin, even when the proxy has changed since, so a save made for another reason never approves an edited proxy. The save answers a `Warning` header naming the Transit Point when the kept pin is stale |
+| No `mcp_proxy_pin`, and the binding has none stored (a new binding, a variant copy, or one stored outside the API) | The proxy's current `grant_pin` |
+
+The stored binding is the one of the same Transit Point id that names the same proxy; a Transit
+Point moved to another proxy is a new binding. A merge `PATCH`, a variant create, update, patch,
+delete or promote, and a tenant transfer start from the stored surface, so a pin they carry from
+it is not one they sent: only a pin in the request body itself is compared. A client that `GET`s
+a surface and `PUT`s it back, as the dashboard does, sends the stored pin, which is kept as if
+not sent: the save approves no edit to the proxy, and answers the `Warning` when it is stale.
+A tenant transfer of a surface with such a binding is refused (`409`) until its MCP Proxy is
+transferred first, because the proxy is not of the new tenant; the pin does not cover the tenant,
+so after the proxy's transfer the surface's keeps its pin. A pin is compared only with a proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
+and the save is refused as for any binding to such a proxy, so the answer tells nothing of
+another tenant's proxy. The gateway never stores a pin it did not compute or compare.
+
+While the proxy's `grant_pin` differs from the binding's pin, after any edit to one of the four
+(even whitespace in the spec, so a renamed or added parameter as well), the Transit Point answers nothing through the proxy: the connect
+start answers `409`, and every `POST`, `initialize`, `tools/list` and notifications as well as a
+tool call, answers `connector_unavailable`, so an edited description or server name never
+reaches the agent either. The log names the Transit Point and the proxy
+(`mcp_proxy_changed_since_it_was_pinned`). A binding with no pin, as one stored outside the API,
+is refused the same way until a surface save pins it. A save that sends the proxy's current `grant_pin`
+pins it as it is. Fields outside the pin are shown to the agent by nothing on this path, or are
+checked on their own: `description`, `status` (a disabled proxy only refuses),
+`channel_prefix`, `endpoint_path`, the proxy's own `mcp_http` (the Transit Point's applies), the
+timestamps and `managed_by` are not part of it, and `tenant_id` and `direct_access` are checked
+on every call. A client that writes the proxy and then the surface with the `grant_pin` the
+proxy write answered pins exactly the proxy it wrote, or is refused if the proxy changed in
+between.
+
+Each save that changes a pin, a new binding pinned or a stale pin replaced by the proxy's current
+one, records an `mcp_proxy_pin_changed` event in the VP Audit Log and logs it at info, with the
+surface, the Transit Point's id and alias, the variant, the proxy's id and the previous and new
+pins, never the proxy's spec, `base_url` or name.
+
+**What a request releases.** Only a tool call, a `POST` of one JSON-RPC object with an `id` and
+the method `tools/call`, is released the grant. `initialize`, `tools/list`, notifications, other
+methods, a `GET` and a body that is not one object never carry it, so they neither refresh it nor
+record a use, and they are answered before the person has connected (while the pin holds). The
+`token_injected` audit record and the grant's last use are written only when a tool call that
+carries the grant went out to the backend, after the proxy, the pin, the call's URL and Strict
+egress passed: once for the call, and once more for its retry after a refresh. A call refused
+by any of them records nothing.
+
+**On real vendor traffic.** The rules above fail closed, and some legitimate calls fail with a
+generic tool error:
+
+- A redirect is refused, never followed with the grant. An API that answers a download or an
+  export with a `3xx` to another host (Google may, to `*.googleusercontent.com`) fails.
+- A call stays under the proxy's `base_url` path. With `https://www.googleapis.com/drive/v3`,
+  uploads (`/upload/drive/v3/...`) and `files.download`'s `/download/drive/v3/...` are outside
+  it; a proxy that needs them uses `https://www.googleapis.com/` with a spec that lists only the
+  operations allowed, which the pin then fixes.
+- The answer is capped by the Transit Point's `mcp_http.max_response_bytes`, 1 MiB by default,
+  so larger exports and downloads fail unless it is raised.
+- The call is made directly: `HTTPS_PROXY` and other egress proxy settings are not used, so a
+  deployment that must reach the vendor through an HTTP proxy cannot use this path.
+- `https` only, and no internal address: an MCP Proxy that wraps an internal or private-address
+  REST API works as an Access Point Target, whose Configured egress allows it, but not behind a
+  Transit Point.
+
+The backend's answer to a tool call is the tool's result, a `403` for anything but scope
+included, except an answer that refuses the grant, which is handled as an `https` vendor's
+([above](#external-consent-on-a-transit-point)): a `401` whose `Bearer` challenge rejects the
+token gets one refresh and one retry through the proxy, a second `401`, or one without such a
+challenge, answers `connector_unavailable`, and a `403` whose challenge says
+`insufficient_scope` answers `scope_insufficient`. The backend's body is not passed on in these
+cases. The Access Point's Target is never an MCP Proxy with a grant: a `proxy://` Target's
+binding is refused ([below](#external-consent-on-the-access-point-target)).
 
 ### External consent on the Access Point Target
 
@@ -1335,7 +1554,9 @@ accessible", and refuses it everywhere in `enforce` mode. The startup credential
 names such a surface. A provider holding only its own tenant's secrets attaches freely.
 
 A2A Proxies hold their own secret. An MCP Proxy holds no credential of its own: its upstream
-authentication is the surface's Target authentication, checked above. An A2A Proxy holds its
+authentication is the surface's Target authentication, checked above, or behind a `proxy://`
+Transit Point the grant of its `consent_mode: external` binding ([Through an MCP
+Proxy](#through-an-mcp-proxy)). An A2A Proxy holds its
 Direct Line secret, which must belong to the proxy's own tenant. Saving a tenant proxy that names
 another tenant's or a new appliance-wide secret answers `400` "A2A proxy secret is not
 accessible"; an update that keeps the stored appliance-wide secret and `base_url` is saved with

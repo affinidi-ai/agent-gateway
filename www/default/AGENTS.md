@@ -267,6 +267,12 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   always-visible warning says a paired gateway that sends a person's own token gets that
   person's grant. A variant carries it in `overrides.target`. Test ids:
   `managed-agent-partner-grants-switch` and `managed-agent-partner-grants-warning`.
+- The Agent Identity panel (`identity/IdentityPanel.tsx`) disables **From API Key** on the
+  Managed Agent response identity (`response:identity-protected`), since the key picker lists
+  API keys issued to callers, and none of them identifies the Managed Agent; the inbound and
+  external slots still offer it. A protected
+  identity already set to From API Key keeps showing its key selector. Transit Point
+  identities offer only From Payload.
 - **Entry point URL** is the label for an Access Point's composed URL, with "The URL used to
   access this gateway" behind its `FieldHelp`. It shows at the top of the Access Point panel
   and as a banner along the top of the canvas, both rendered by `RouteListenerBanner`
@@ -996,7 +1002,19 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 (`providerTypeFields`), the first missing required field, and the request fields.
 
 - **JWT Bearer** asks for Token Endpoint, Issuer, Subject, Signing Key, and optionally Key ID and
-  Audience, with no client ID or secret. **Client Credentials JWT** asks for Token Endpoint,
+  Audience, plus a **Client authentication** select
+  (`credential-provider-client-authentication-select`, `ClientAuthenticationSelect.tsx`) that says
+  how the provider's OAuth client identifies itself with the grant: "Not sent (default)" (no client
+  identity, as Google expects), "Client ID only (public client)", "HTTP Basic", or "Form body". Its
+  explanation sits behind its `FieldHelp` (`field-help-client-authentication`), with no permanent
+  text under the select. Any choice but Not sent shows the Client ID Secret picker, and HTTP Basic
+  and Form body also show the Client Secret picker, both required (the messages name the client
+  authentication, not "OAuth providers"); the pickers are the ones Client Credentials uses, under
+  the heading "Client identity (secret references)" (`credential-provider-client-heading`). Save sends
+  `client_authentication` (empty for Not sent), the client ID reference only while its picker
+  shows (empty while it is hidden), and the client secret reference as chosen while its picker
+  shows and empty otherwise.
+  **Client Credentials JWT** asks for Token Endpoint,
   Client ID and Signing Key, and optionally Certificate (Entra) and Key ID, with no client
   secret. Both share the **Signed JWT** section (`JwtAssertionSection.tsx`,
   `credential-provider-jwt-section`): Key ID sits under Certificate, a warning
@@ -1007,8 +1025,11 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   the Secrets page and pastes the PEM, or a whole Google service account JSON key file (16 KiB
   at most), there. Key ID may stay empty for a JSON key, whose `private_key_id` is then sent as
   `kid`; a Key ID overrides it. The gateway checks the key on save.
-- Save sends a field the type does not use as empty, which the gateway reads as cleared, so
-  switching a provider to Client Credentials JWT drops its client secret.
+- Save sends most fields the type does not use as empty, which the gateway reads as cleared, so
+  switching a provider to Client Credentials JWT drops its client secret. The exceptions are the
+  client ID reference, which is omitted for every type but JWT Bearer while its picker is hidden
+  (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
+  secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
   `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
   rejects it (AADSTS901002), the form warns under Token Endpoint
@@ -1023,8 +1044,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 - A Token Endpoint starting with `http://` shows a warning
   (`credential-provider-token-endpoint-https-warning`, warning styling, field not marked invalid)
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
-  `credential_policy.insecure_token_endpoints`, and that an unchanged stored one is still accepted
-  while `token_endpoint_https` is `warn`. It does not block Save; the gateway decides on save.
+  `credential_policy.insecure_token_endpoints`, and that an unchanged stored one, on a provider
+  whose type is unchanged, is still accepted while `token_endpoint_https` is `warn`. It does not
+  block Save; the gateway decides on save.
 - The Callback URL of an authorization code provider is, when editing, the stored `callback_url`
   unchanged (a reverse proxy prefix included) while the chosen listen address is still its origin
   and the stored URL is `https` and its path ends in the stored `callback_path`
@@ -1053,7 +1075,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
   description, default scopes and token refresh (`externalProviderUpdate`).
-- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module. A
+- The Credential Providers tab labels the types from `PROVIDER_TYPE_LABELS` in the same module, and
+  shows a secondary badge after the type of a JWT Bearer provider that has a
+  `client_authentication` (`credential-provider-client-authentication-badge`: Client ID only,
+  HTTP Basic or Form body, from `CLIENT_AUTHENTICATION_LABELS`); no badge without one. A
   refused delete shows the API's reason and, for a `409`, the surface that binds the provider
   (`providerDeleteError`).
 
@@ -1214,17 +1239,45 @@ modern catalog could be registered. Render them with the shared `WriteWarnings` 
 ## Identities page
 
 `pages/IdentitiesPage.tsx` orchestrates. Its page-only parts live in
-`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: search, recorder
-filter, and surface links in the `useIdentityRows` hook, the shared managed DID check in
-`sharedManagedDid.ts`, and the row parts `IdentityNameCell`, `IdentitySurfaceCell`,
-`IdentityOriginBadge`, and `IdentityRecorderChip`.
+`pages/IdentitiesPage/`, with tests in `pages/IdentitiesPage/__tests__/`: grouping, search,
+recorder filter, and surface links in the `useIdentityRows` hook, the grouping and change log
+in `identityVersions.ts`, the shared managed DID check in `sharedManagedDid.ts`, and the row
+parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
+`IdentityRecorderChip`, and `IdentityVersionHistory`.
 
-- Each DID gets its own row, keyed by the DID, with its own actions (Trust Score, Version History, Configure Policy, Copy link).
-  Managed identities that share a surface, such as parallel `from_jwt_claim` DIDs, are
-  separate rows linked to the same surface. `/identities/<did>` expands that exact
-  identity.
-- Expansion state is a `Set` of DIDs. Rows expand and collapse independently, and a deep link
-  adds to the set rather than replacing it.
+- One row per surface Managed Agent: managed rows with the same `surface_id` are versions of
+  one entry (`groupIdentityVersions`), whatever their source
+  (`agent_identity.credential_type`) or `slot`, so the Managed Agent's response and Transit
+  Point DIDs share it. The row shows the most recently used DID, a summed usage count, and the
+  latest last use; its actions (Trust Score, Configure Policy, Copy link) belong to that DID.
+  `from_jwt_claim` DIDs (one per claim value), external callers and identities without a
+  surface keep one row per DID.
+- The expanded row's **Version History** section lists the entry's DIDs and the credential
+  rotations inside them as one timeline, newest first, numbered from the oldest. Each version
+  shows its time ("Time unknown" for a rotation found when tracking began), its DID, a
+  Current badge on the primary DID's latest version, and its field changes against the version
+  before it (a new DID against the previous DID, a rotation against its DID's earlier
+  fields); the first version lists its values. A rotation with field changes (a certificate)
+  is labelled "Credential rotated"; one without (an API key, whose update may only have
+  edited its details) is labelled "Credential updated". A version that introduces a DID other
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). A
+  certificate or API key identity with no versions yet still shows the section, saying none
+  are recorded. Rows carry only `rotation_count`. Opening Version History fetches every page
+  of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,
+  through the `useEntryVersions` hook), showing `identities-version-history-loading` while it
+  loads and `identities-version-history-error` with `identities-version-history-retry-button`
+  when it fails. It refetches only when a member's `rotation_count` changes, and an entry
+  with no rotations builds its DID versions without a request; see
+  `docs/SOURCE_AUTH.md#identity-versions`.
+- `/identities/<did>` expands the entry holding that DID once the dashboard identities have
+  loaded; an earlier DID also opens Version History and marks its versions, including when
+  the entry is already expanded.
+- Expansion state is a `Set` of primary DIDs. Rows expand and collapse independently, and a
+  deep link adds to the set rather than replacing it.
+- Identities page tests prefer the backend-generated rows in `src/__fixtures__/backend/` (a
+  managed row, a managed mTLS row with a rotation, and an external caller row) over
+  hand-written ones. Rust tests fail when the backend no longer sends that shape, and
+  `UPDATE_WEB_FIXTURES=1` regenerates them; do not hand-edit them.
 - The **Name** column (`IdentityNameCell` with `showDid={false}`) shows the display name
   prominently. The header is "Name", not "Agent Name": the column holds display names, and
   _agent name_ is the verified `host/@local` handle only. While a caller name lookup is
@@ -1301,7 +1354,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 
 | Element                        | Test id                                                                  |
 | ------------------------------ | ------------------------------------------------------------------------ |
-| Identity row                   | `identities-row-<did>`                                                   |
+| Identity row (the entry's primary DID) | `identities-row-<did>`                                           |
+| History toggle, version                | `identities-version-history-toggle`, `identities-version-<number>` (with `-changes`), `identities-version-history-empty` |
 | Name, pending, verified        | `identities-name`, `identities-name-pending`, `identities-name-verified` |
 | No name                        | `identities-name-empty`                                                  |
 | Shared managed DID name, count | `identities-unnamed-agent`, `identities-shared-surface-count`            |

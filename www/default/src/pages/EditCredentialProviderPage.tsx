@@ -10,12 +10,14 @@ import { usePageTitle } from '../context/PageTitleContext';
 import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
+import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import {
   CredentialProviderType,
   EMPTY_JWT_FIELDS,
+  clientAuthenticationOf,
   JwtFormFields,
   entraRejectsResource,
   entraResourceMessage,
@@ -68,6 +70,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   client_id_secret_ref: '',
   client_secret_secret_ref: '',
   api_key_secret_ref: '',
+  client_authentication: '',
   default_scopes: '',
   token_refresh_enabled: true,
   additional_params: '',
@@ -176,6 +179,7 @@ const EditCredentialProviderPage: React.FC = () => {
         callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
+        client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
       });
     } catch (e: any) {
@@ -356,7 +360,7 @@ const EditCredentialProviderPage: React.FC = () => {
     return () => document.removeEventListener('keydown', handleKeyboardSave);
   }, [saving, handleSubmit]);
 
-  const typeFields = providerTypeFields(form.provider_type);
+  const typeFields = providerTypeFields(form.provider_type, form.client_authentication);
 
   if (loading) {
     return (
@@ -578,8 +582,8 @@ const EditCredentialProviderPage: React.FC = () => {
                           This token endpoint uses http. New or changed http token endpoints are
                           refused unless listed by exact URL in{' '}
                           <code>credential_policy.insecure_token_endpoints</code> in the gateway
-                          bootstrap config. A stored endpoint that is unchanged is still accepted
-                          while token_endpoint_https is warn.
+                          bootstrap config. A stored endpoint that is unchanged, on a provider whose
+                          type is unchanged, is still accepted while token_endpoint_https is warn.
                         </div>
                       )}
                       <small className="form-text text-muted">
@@ -714,13 +718,25 @@ const EditCredentialProviderPage: React.FC = () => {
                   </div>
                 )}
 
+                {form.provider_type === 'oauth2_jwt_bearer' && (
+                  <ClientAuthenticationSelect
+                    value={form.client_authentication}
+                    onChange={handleChange}
+                  />
+                )}
+
                 {/* OAuth Client Credentials (Secret References) */}
                 {typeFields.clientId && (
                   <>
-                    <hr />
-                    <h6 className="font-weight-bold text-primary mb-3">
-                      <i className="fas fa-key me-2"></i>OAuth Client Credentials (Secret
-                      References)
+                    {form.provider_type !== 'oauth2_jwt_bearer' && <hr />}
+                    <h6
+                      className="font-weight-bold text-primary mb-3"
+                      data-testid="credential-provider-client-heading"
+                    >
+                      <i className="fas fa-key me-2"></i>
+                      {form.provider_type === 'oauth2_jwt_bearer'
+                        ? 'Client identity (secret references)'
+                        : 'OAuth Client Credentials (Secret References)'}
                     </h6>
 
                     {/* Client ID Secret */}

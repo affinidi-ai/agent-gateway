@@ -1,0 +1,100 @@
+branch: feat/grant-on-mcp-proxy-target
+changes:
+  added:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Serve a Transit Point whose target is an MCP Proxy
+      description: >-
+        A Transit Point whose target_endpoint is proxy://<id> was forwarded as if the id were a
+        host name, so every call failed. It is now answered by that MCP Proxy, one the surface
+        may reference: initialize and tools/list from its spec, a notification accepted with
+        nothing sent, and a tools/call through its REST backend, under the Transit Point's own
+        timeout (or the surface's) and mcp_http limits; any method but POST answers 405 and a
+        2026-07-28 request is refused with -32022 before any credential is prepared. Every tool
+        call, with a grant or without, goes through pinned Strict egress: https only, internal
+        addresses refused after DNS resolution, the connection pinned, redirects refused and no
+        HTTP proxy. Such a Transit Point speaks
+        MCP and sends its backend no target_auth and no delegated credential but a
+        consent_mode external grant: a surface save refuses one that breaks this, on the
+        surface and in every variant, and one stored outside the API is refused when called
+        (503), before any credential is read. A surface save now checks that a Transit Point
+        may reference the MCP Proxy it names, using the whole id after proxy:// as a call
+        does, and refuses an id an MCP Proxy cannot have, such as proxy://drive/x.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Send an external consent grant through a Transit Point's MCP Proxy
+      description: >-
+        A Transit Point whose target is proxy://<id> may now carry a consent_mode external
+        binding, so a vendor with a REST API and no MCP server of its own, such as Google Drive,
+        gets a per-person grant the gateway keeps, refreshes and revokes, in place of a fixed
+        token. Only a tool call is released the grant and carries it, in its header, to the
+        proxy's backend; initialize, tools/list and notifications are answered without it, even
+        before the person has connected, and the token_injected audit record and the grant's
+        last use are written only when a tool call that carries it went out to the backend,
+        never for one its URL or Strict egress refused. A backend 401 that rejects the token
+        gets one refresh and one retry through the proxy, and a refused grant answers
+        connect_required, scope_insufficient or connector_unavailable, as on an https target,
+        without the backend's words. A connector_call audit record names the class of the
+        backend's status, not that of the MCP Proxy's answer to the agent, even when the gateway
+        then refuses that answer, and a call no backend answered records none.
+    - timestamp: '2026-11-08T18:00:00Z'
+      title: Answer every MCP Proxy with its grant_pin
+      description: >-
+        Every MCP Proxy API answer that returns a proxy (create, update, a GET of one and the
+        list) now carries grant_pin: sha256: and 64 lowercase hex digits over the proxy's
+        base_url, OpenAPI spec, flatten_post_params and name, the value a surface save sends as
+        a proxy:// Transit Point binding's transit_credentials.mcp_proxy_pin to pin the binding
+        to the proxy as it is. A save that changes a pin records an mcp_proxy_pin_changed audit
+        event, in the VP Audit Log, and an info log line, with the Transit Point, the proxy and
+        both pins.
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Bind a grant through an MCP Proxy only to the provider's resource
+      description: >-
+        A grant goes through a Transit Point's MCP Proxy only while that proxy is of the
+        surface's own tenant, served only through surfaces (direct_access false), and its
+        base_url is a public https URL with the origin of the provider's resource, and only
+        while the Transit Point speaks MCP, sends the grant in a header and has no target_auth.
+        The rules are checked when the surface is saved, when a connect starts (the whole
+        Transit Point rule set), when the grant is released and again with the proxy the call
+        is sent through, so a proxy edited afterwards to point elsewhere is never sent the
+        grant; the tool call itself goes only to that origin, through pinned Strict egress with
+        redirects refused. A grant sent in a custom header is marked sensitive, as an
+        Authorization header is. The Access Point's Target is still never an MCP Proxy with a
+        grant.
+    - timestamp: '2026-11-08T12:00:00Z'
+      title: Pin a grant through an MCP Proxy to the proxy a surface save approved
+      description: >-
+        Whoever may edit an MCP Proxy, but not the surface, could change which operation a tool
+        name calls on the grant's origin, its description or the server name, and so what every
+        person's grant is used for and what the agent reads. Each proxy:// Transit Point's
+        external binding is now pinned to the proxy's grant_pin
+        (transit_credentials.mcp_proxy_pin). A save that sends the proxy's current grant_pin
+        pins the binding to it; one that sends none, or sends the stored pin back as the
+        dashboard does, keeps the stored pin, so a save made for another reason (a PATCH, a
+        variant change, a tenant transfer, a dashboard save) never approves an edited proxy;
+        one that sends any other pin is refused (400, mcp_proxy_pin_not_current, naming the
+        Transit Point); and a new binding is pinned to the proxy as it is. While the proxy
+        differs, or a binding stored outside the API has no pin, the Transit Point answers
+        nothing through it: connect start answers 409, telling the operator to save the surface
+        with the proxy's current grant_pin, and initialize, tools/list and every call
+        connector_unavailable, each refusal with a log line naming the Transit Point and the
+        proxy; the save answers a Warning header. The pin is compared only with a proxy of the
+        surface's own tenant, and a save fails (500) rather than drop a pin when the proxy
+        cannot be read.
+    - timestamp: '2026-11-08T18:00:00Z'
+      title: Refuse a grant through an MCP Proxy whose spec overrides the HTTP method
+      description: >-
+        A header parameter named X-HTTP-Method-Override, X-HTTP-Method or X-Method-Override, or
+        a query parameter or declared request body field named _method or one of those, in any case,
+        lets an agent ask many REST APIs and web frameworks to run another method than the
+        operation's, turning an allowed tool into another behind the same tool name. A
+        proxy:// Transit Point with a grant binding is refused when the surface is saved (400),
+        when a connect starts (409) and when a tool call is sent (connector_unavailable) while
+        its MCP Proxy's spec has a tool with such a parameter. A tool call carrying the grant whose
+        body has a top-level key of one of those names, declared or not, is refused when it is
+        sent and never reaches the backend. An MCP Proxy's name, the tool
+        names it logs and the MCP method a caller sends are now logged escaped, the method cut
+        short.
+  breaking: []

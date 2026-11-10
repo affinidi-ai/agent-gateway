@@ -995,7 +995,10 @@ async fn persist_tenant_id(
                         other => OwnershipApiError::Internal(format!("Surface reference validation failed: {other:?}")),
                     })?;
             }
-            super::surface_tenancy::validate_external_consent_bindings(state, &resource)
+            // A transfer sends no pin: every binding keeps its stored one.
+            let stored = resource.clone();
+            super::surface_tenancy::forget_mcp_proxy_pins(&mut resource);
+            super::surface_tenancy::validate_external_consent_bindings(state, &mut resource, Some(&stored))
                 .await
                 .map_err(|error| match error {
                     super::surfaces::SurfaceApiError::BadRequest(message) => OwnershipApiError::Refused(message),

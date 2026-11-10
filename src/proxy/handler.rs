@@ -2306,7 +2306,19 @@ async fn proxy_charged_request(
                 return Ok(authorization.challenge(error));
             }
             match authorization
-                .authenticate(&headers, profile, issuer, middleware.jwks_client())
+                .authenticate(
+                    &headers,
+                    profile,
+                    issuer,
+                    middleware.jwks_client(),
+                    middleware.token_reach(
+                        &channel_name,
+                        state
+                            .surface
+                            .tenant_id
+                            .as_deref(),
+                    ),
+                )
                 .await
             {
                 Ok(identity) => Some(identity),
@@ -2377,6 +2389,10 @@ async fn proxy_charged_request(
                 variant_id: state
                     .active_variant_id
                     .as_deref(),
+                tenant_id: state
+                    .surface
+                    .tenant_id
+                    .as_deref(),
             };
             let verified = if selection.ambiguous {
                 Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)
@@ -2390,8 +2406,9 @@ async fn proxy_charged_request(
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
                 // it with its challenge, so the caller can fetch a token and
-                // retry, and one whose caller authentication rejects failures
-                // refuses it. Otherwise record the outcome for the policy layer and
+                // retry. An Access Point that rejects failed callers (closed, `on_failure:
+                // reject`, or `from_jwt_claim` inbound identity) refuses it here,
+                // before policy. Otherwise record the outcome for the policy layer and
                 // continue with no asserted caller identity — do not block here.
                 Err(e) if e.is_caller_attributable() => {
                     // On an Access Point that publishes protected resource
@@ -5100,15 +5117,13 @@ async fn proxy_charged_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                ..
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -9807,20 +9822,6 @@ async fn refused_mcp_request_id(
     .await
 }
 
-fn normalize_route_for_match(route: &str) -> String {
-    let with_leading_slash = if route.starts_with('/') {
-        route.to_string()
-    } else {
-        format!("/{route}")
-    };
-    let trimmed = with_leading_slash.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn route_tail_to_uri_path(tail: &str) -> String {
     if tail.is_empty() {
         "/".to_string()
@@ -9909,19 +9910,21 @@ async fn multi_channel_proxy_handler_in_request_scope(
     // Sort channels by route length (descending) so the most specific route wins.
     let channels = state.channels.read().await;
     let mut sorted_channels: Vec<_> = channels.iter().collect();
-    sorted_channels.sort_by(|a, b| {
-        let a_route = a.surface.route();
-        let b_route = b.surface.route();
-        b_route
-            .len()
-            .cmp(&a_route.len())
+    sorted_channels.sort_by_key(|channel| {
+        std::cmp::Reverse(
+            channel
+                .surface
+                .route()
+                .trim_end_matches('/')
+                .len(),
+        )
     });
 
     let matched_channel = sorted_channels
         .iter()
         .find_map(|ch| {
             let route = ch.surface.route();
-            let normalized_route = normalize_route_for_match(route);
+            let normalized_route = crate::config::route_claims::normalize_route(route);
             // The parser treats "/" specially: a route of "/" matches every path.
             // For prefix matching pass an empty string in that case so any leading
             // `$alias` is honoured at the very start of the path.
@@ -10465,7 +10468,11 @@ async fn resolve_configured_caller_identity(
                 issuer_did: None,
             }
         }
-        Ok(Some(CredentialIdentity::Derived { identity_fields, identity_hash })) => {
+        Ok(Some(CredentialIdentity::Derived {
+            identity_fields,
+            identity_hash,
+            credential_updated_at,
+        })) => {
             let Some(issuer) = state
                 .identity_selector
                 .as_ref()
@@ -10493,6 +10500,8 @@ async fn resolve_configured_caller_identity(
                         Some(identity_hash.clone()),
                         surface_id,
                         issuer_id,
+                        crate::identity::filesystem::ManagedIdentitySource::protected()
+                            .with_credential_updated_at(credential_updated_at),
                     )
                     .await
             } else {
@@ -10580,6 +10589,15 @@ fn bind_api_key_caller_did(
     {
         agent.bind_caller_did(extension_identity);
     }
+}
+
+/// Reaching this means the verified credential carries no JWT claims, for
+/// example an API key accepted on a stored surface that also lists `jwt_bearer`.
+fn from_jwt_claim_without_claims() -> Response {
+    create_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "from_jwt_claim requires jwt_bearer source auth on this surface",
+    )
 }
 
 /// The caller identity of an inbound `from_api_key` slot: the DID of the API
@@ -11143,15 +11161,13 @@ async fn handle_fabric_request_inner(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                ..
             }) => {
                 let vc_issuer_opt = state
                     .identity_selector
@@ -16555,6 +16571,9 @@ mod target_auth_audit_tests;
 pub(crate) mod variant_routing_tests;
 
 #[cfg(test)]
+mod route_ranking_tests;
+
+#[cfg(test)]
 mod target_grant_tests;
 
 #[cfg(test)]
@@ -17816,9 +17835,9 @@ mod tests {
         agent_card_fabric_forward_path, agent_card_response, ap2_experimental_enabled_from_flags,
         decode_bearer_jwt_claims, delegates_credentials_over_fabric, evaluate_ap2_inbound_decision,
         fabric_mcp_gate_input, forwards_ap_caller_header, is_forwarded_on_credentialed_card_fetch,
-        modern_fabric_failure_response, normalize_route_for_match, replace_request_header,
-        resolve_direct_surface_auth_config, resolve_legacy_mcp_session, route_tail_to_uri_path,
-        should_forward_ap_request_header_with_mapping, target_credential_header_names,
+        modern_fabric_failure_response, replace_request_header, resolve_direct_surface_auth_config,
+        resolve_legacy_mcp_session, route_tail_to_uri_path, should_forward_ap_request_header_with_mapping,
+        target_credential_header_names,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine;
@@ -22072,13 +22091,6 @@ allow if {
     }
 
     #[test]
-    fn normalize_route_for_match_trims_trailing_slash() {
-        assert_eq!(normalize_route_for_match("a2a/requester/"), "/a2a/requester");
-        assert_eq!(normalize_route_for_match("/a2a/requester/"), "/a2a/requester");
-        assert_eq!(normalize_route_for_match("/"), "/");
-    }
-
-    #[test]
     fn route_tail_to_uri_path_collapses_boundary_slashes() {
         assert_eq!(route_tail_to_uri_path(""), "/");
         assert_eq!(route_tail_to_uri_path("/.well-known/agent-card.json"), "/.well-known/agent-card.json");
@@ -22758,8 +22770,11 @@ allow if {
             .await
             .unwrap()
             .unwrap();
-            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
-                configured
+            let crate::identity::credential_identity::CredentialIdentity::Derived {
+                identity_fields,
+                identity_hash,
+                ..
+            } = configured
             else {
                 panic!("API key identity is derived");
             };
@@ -22941,7 +22956,13 @@ allow if {
                 .await
                 .unwrap();
             let managed = issuer
-                .issue_or_get_managed_credential(fields, Some(hash.clone()), Some("pak-shared".into()), None)
+                .issue_or_get_managed_credential(
+                    fields,
+                    Some(hash.clone()),
+                    Some("pak-shared".into()),
+                    None,
+                    crate::identity::filesystem::ManagedIdentitySource::protected(),
+                )
                 .await
                 .unwrap();
             let state = state_with(inbound_from_api_key("pak-shared"), Some(issuer));
@@ -22973,8 +22994,11 @@ allow if {
             .await
             .unwrap()
             .unwrap();
-            let crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash } =
-                managed
+            let crate::identity::credential_identity::CredentialIdentity::Derived {
+                identity_fields,
+                identity_hash,
+                ..
+            } = managed
             else {
                 panic!("API key identity is derived");
             };
@@ -22984,6 +23008,7 @@ allow if {
                     Some(identity_hash.clone()),
                     Some("pak-plain-shared".into()),
                     None,
+                    crate::identity::filesystem::ManagedIdentitySource::protected(),
                 )
                 .await
                 .unwrap();
@@ -24056,6 +24081,65 @@ mod fabric_send_tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fabric_forward_without_caller_claims_fails_closed_when_bypassing_source_auth() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = sends.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let method = json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let mut surface = (*peer.state.surface).clone();
+        surface.identity_slots.inbound = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: Vec::new(),
+        });
+        surface
+            .access_point
+            .caller_authentication = Some(serde_json::from_value(json!({"methods": [method]})).unwrap());
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        // Calls the forward handler directly, so the receive-side source auth 401 is skipped.
+        let result = super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        )
+        .await;
+
+        let Err(refused) = result else {
+            panic!("a from_jwt_claim surface forwarded a request with no caller claims");
+        };
+        assert_eq!(refused.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0, "the request reached the peer");
     }
 
     #[tokio::test]

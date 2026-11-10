@@ -308,12 +308,23 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     };
     let temp_dir = create_project_temp_dir("surface-bdd-").expect("create surface temp dir");
 
-    let (jwks_server, jwks_files) = if matches!(
-        world
-            .surface_config
-            .source_auth,
-        Some(SurfaceSourceAuthConfig::JwtBearer(_))
-    ) {
+    let transit_point_uses_jwt = world
+        .surface_config
+        .transit_points
+        .iter()
+        .any(|point| {
+            point
+                .source_auth
+                .as_ref()
+                .is_some_and(|source_auth| source_auth["type"] == "jwt_bearer")
+        });
+    let (jwks_server, jwks_files) = if transit_point_uses_jwt
+        || matches!(
+            world
+                .surface_config
+                .source_auth,
+            Some(SurfaceSourceAuthConfig::JwtBearer(_))
+        ) {
         let jwks_server = JwksServer::start().await;
         let issuer = jwks_server.base_url.clone();
 
@@ -405,13 +416,21 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
     // A credentialed MCP proxy tool call vets its REST backend like any stored
-    // backend, which refuses loopback unless the egress allow-list names it.
+    // backend, and the JWKS fetch vets its JWKS URI; both refuse loopback unless
+    // the egress allow-list names the mock.
+    let mut egress_allowlist = Vec::new();
     if world
         .surface_config
         .mcp_proxy_target
         .is_some()
     {
-        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+        egress_allowlist.push(mock.url());
+    }
+    if let Some(files) = &jwks_files {
+        egress_allowlist.push(files.issuer.clone());
+    }
+    if !egress_allowlist.is_empty() {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_allowlist.join(","));
     }
     // The A2A proxy dial refuses loopback targets unless the gateway's
     // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
@@ -1578,7 +1597,7 @@ async fn operator_creates_a_surface_asking_for_external_consent(
         .as_str()
         .unwrap_or_default()
         .to_string();
-    payload["access_point"]["route"] = serde_json::json!(format!("{route}-external-consent"));
+    payload["access_point"]["route"] = serde_json::json!(format!("{route}/external-consent"));
     for point in payload["transit"]["points"]
         .as_array_mut()
         .into_iter()
@@ -1669,6 +1688,17 @@ async fn valid_surface_create_request_submitted(
     route: String,
 ) {
     create_valid_surface_for_route(world, &route).await;
+}
+
+#[when(expr = "the operator moves the surface to route {string}")]
+async fn surface_moved_to_route(
+    world: &mut SurfaceWorld,
+    route: String,
+) {
+    let mut payload = get_current_admin_surface_body(world, "moving the surface");
+    payload["access_point"]["route"] = serde_json::json!(route);
+
+    update_created_surface(world, payload, "moving the surface").await;
 }
 
 pub(crate) async fn mark_surface_public(world: &mut SurfaceWorld) {
@@ -1982,6 +2012,7 @@ fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
 /// The audience a caller's token names: the resource of the surface's route
 /// when it publishes protected resource metadata, so a test token fails only
 /// for the flaw it was made with, and none otherwise.
+/// When neither exists, uses the configured JWT Bearer audiences.
 fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
     match world
         .surface_config
@@ -1992,7 +2023,17 @@ fn caller_token_audience(world: &SurfaceWorld) -> serde_json::Value {
             crate::bdd_support::config::single_surface_fixture::PROTECTED_RESOURCE_PUBLIC_ORIGIN,
             world.surface_config.route
         )),
-        None => serde_json::json!([]),
+        None => {
+            // Check if JWT Bearer configured with audiences
+            if let Some(SurfaceSourceAuthConfig::JwtBearer(JwtSourceAuthConfig { audiences, .. })) = &world
+                .surface_config
+                .source_auth
+                && !audiences.is_empty()
+            {
+                return serde_json::json!(audiences);
+            }
+            serde_json::json!([])
+        }
     }
 }
 
@@ -2120,7 +2161,9 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
-    let token = create_valid_jwt_for_issuer(get_jwt_source_auth_issuer(world));
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
     send_request_with_bearer_token(world, token).await;
 }
 
@@ -2149,6 +2192,19 @@ async fn request_with_token_issued_to_client(
         "test-user",
         serde_json::json!({ "client_id": client }),
     );
+    send_request_with_bearer_token(world, token).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with the token issued to agent {string}")]
+async fn request_with_token_issued_to_agent(
+    world: &mut SurfaceWorld,
+    agent: String,
+) {
+    let token = world
+        .sts_issued_tokens
+        .get(&agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
     send_request_with_bearer_token(world, token).await;
 }
 
@@ -2728,6 +2784,31 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_header(
     .await;
 }
 
+#[when(
+    expr = "managed agent {string} asks for available tools through Transit Point {string} with the token issued to agent {string}"
+)]
+async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    agent: String,
+) {
+    let token = world
+        .sts_issued_tokens
+        .get(&agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("agent '{agent}' must have been issued a token"));
+    let body = build_mcp_list_tools_body_with_id(serde_json::json!("mcp-tools-list-alpha"));
+    send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        vec![("authorization".to_string(), format!("Bearer {token}"))],
+    )
+    .await;
+}
+
 async fn send_mcp_request_through_transit_point_path_with_headers(
     world: &mut SurfaceWorld,
     agent_name: &str,
@@ -2783,6 +2864,23 @@ async fn send_a2a_request_through_transit_point(
     transit_point: &str,
     headers: Vec<(String, String)>,
 ) {
+    send_a2a_body_through_transit_point(
+        world,
+        agent_name,
+        transit_point,
+        headers,
+        build_a2a_message_send_body("hello"),
+    )
+    .await;
+}
+
+pub(crate) async fn send_a2a_body_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -2800,7 +2898,6 @@ async fn send_a2a_request_through_transit_point(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point);
 
-    let body = build_a2a_message_send_body("hello");
     world.sent_body = Some(body.clone());
     let client = reqwest::Client::new();
     let mut request = client

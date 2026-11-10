@@ -29,6 +29,8 @@ pub struct SurfaceConfigBuilder {
     pub managed_identity_strip_raw: bool,
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
+    /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
+    pub jwt_claim_inbound_identity: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -102,6 +104,8 @@ pub struct SurfaceConfigBuilder {
     pub stored_api_keys: Vec<StoredApiKeyFixture>,
     /// Further stored surfaces, disabled, by id.
     pub other_stored_surfaces: Vec<String>,
+    /// Further stored surfaces, each on its own route and with its own status.
+    pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
     /// When the API Key Provider's key was created; when the gateway starts if absent.
@@ -122,6 +126,16 @@ pub enum GatewayPrefixFixture {
     Channel(String),
     McpProxy(String),
     Redirect { prefix: String, target: String },
+}
+
+/// A surface stored before the gateway starts, on a route of its own that
+/// `gateway.json` does not add as a prefix.
+#[derive(Debug, Clone)]
+pub struct StoredSurfaceFixture {
+    pub id: String,
+    pub route: String,
+    /// `active` or `disabled`.
+    pub status: String,
 }
 
 /// An API key record stored before the gateway starts.
@@ -170,6 +184,7 @@ impl Default for SurfaceConfigBuilder {
             managed_identity_strip_raw: false,
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
+            jwt_claim_inbound_identity: false,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,
@@ -219,6 +234,7 @@ impl Default for SurfaceConfigBuilder {
             gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),
             other_stored_surfaces: Vec::new(),
+            stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,
@@ -473,12 +489,51 @@ pub struct SurfaceTargetAuthProviderConfig {
     pub signing_key_is_service_account_file: bool,
     /// The `jwt_subject` a JWT Bearer provider stores; the grant's `sub` claim.
     pub jwt_subject: Option<String>,
+    pub client_authentication: Option<TargetAuthClientAuthentication>,
+    /// A JWT Bearer provider stores a client ID and a client secret although it sets no
+    /// client authentication.
+    pub stores_unused_client_references: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAuthProviderGrant {
     ClientCredentials,
     JwtBearer,
+}
+
+/// How a JWT Bearer provider's client identifies itself with its grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetAuthClientAuthentication {
+    ClientIdOnly,
+    HttpBasic,
+    FormBody,
+}
+
+impl TargetAuthClientAuthentication {
+    /// The choice a scenario names: "the client ID only", "HTTP Basic" or "the form body".
+    pub fn from_wording(wording: &str) -> Self {
+        match wording {
+            "the client ID only" => Self::ClientIdOnly,
+            "HTTP Basic" => Self::HttpBasic,
+            "the form body" => Self::FormBody,
+            other => panic!(
+                "unknown client authentication {other:?}: use \"the client ID only\", \"HTTP Basic\" or \"the form body\""
+            ),
+        }
+    }
+
+    /// The value the admin API takes for `client_authentication`.
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::ClientIdOnly => "none",
+            Self::HttpBasic => "client_secret_basic",
+            Self::FormBody => "client_secret_post",
+        }
+    }
+
+    fn sends_secret(self) -> bool {
+        self != Self::ClientIdOnly
+    }
 }
 
 impl SurfaceTargetAuthProviderConfig {
@@ -493,7 +548,25 @@ impl SurfaceTargetAuthProviderConfig {
             authenticates_surface_target: true,
             signing_key_is_service_account_file: false,
             jwt_subject: Some("bdd-subject@example.com".to_string()),
+            client_authentication: None,
+            stores_unused_client_references: false,
         }
+    }
+
+    pub fn stores_client_id(&self) -> bool {
+        self.grant == TargetAuthProviderGrant::ClientCredentials
+            || self.stores_unused_client_references
+            || self
+                .client_authentication
+                .is_some()
+    }
+
+    pub fn stores_client_secret(&self) -> bool {
+        self.grant == TargetAuthProviderGrant::ClientCredentials
+            || self.stores_unused_client_references
+            || self
+                .client_authentication
+                .is_some_and(TargetAuthClientAuthentication::sends_secret)
     }
 }
 

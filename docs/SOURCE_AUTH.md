@@ -105,6 +105,36 @@ Point, identifies callers by the same claim.
   strategy's claim in the same way. The gateway's own tokens, such as the MCP resource tokens and
   ID-JAGs it issues, name their subject by `sub`.
 
+### Tenant check of STS tokens
+
+A JWT verification strategy can trust the tokens this gateway's [STS](STS.md) issues, under the
+gateway DID or the MCP issuer. Every access token and ID-JAG the STS issues names the managed
+connection it was minted for by its record id in `connection_id`, which never changes, unlike the
+`client_id` an administrator can rename or reuse after a delete. After a token of either issuer
+passes the strategy's signature, issuer, lifetime and audience checks, JWT bearer authentication
+looks that connection up and accepts the token only when:
+
+- the connection has no tenant (appliance-global), or
+- the connection's tenant owns the surface, or the surface is global.
+
+A token minted for a connection of another tenant, or naming a connection that no longer exists
+or no connection at all, is an invalid credential like a token for another audience: on an Access
+Point its `on_failure`, `public` setting and policy decide the answer, and a Transit Point
+refuses it with `401`. That includes a token the STS minted before it named the connection in
+`connection_id`, and any other JWT signed under the gateway DID without one, such as an AP2
+presentation. The caller is not told that another tenant owns the
+surface. The gateway log records the token's `connection_id`, `client_id` and `jti` and the surface's tenant, and
+for a cross-tenant token the connection's tenant too. The check applies on every JWT Bearer
+method of an Access Point or Transit Point, on the surface and its variants, to direct and Fabric
+callers, whatever the method's audiences. While the managed connections cannot be read, including
+when their store failed to open at startup, a token of either issuer fails as an internal error.
+Tokens of any other issuer are not checked.
+
+The MCP Resource Server ([`mcp_http.authorization`](MCP_METADATA.md)) runs the same check on the
+resource tokens it verifies, on a surface's Access Point and Transit Points, over Fabric, and on an
+MCP Proxy against the proxy's tenant. A refused token gets the `invalid_token` challenge, and a token
+whose connections cannot be read the `503` one.
+
 ### Several methods on one Access Point
 
 `methods` is a list, so one surface can accept callers with different credentials, for
@@ -123,8 +153,9 @@ that method:
 3. A request that carries credentials for more than one method fails source authentication
    as the primary method, audited as `ambiguous_credentials`, and neither credential is
    verified, so a caller can't choose the identity the gateway asserts. Like any failed
-   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
-   protected resource metadata, and otherwise passed to policy as
+   credential, it is refused on a closed Access Point, with `on_failure: reject`, on an inbound
+   `from_jwt_claim` identity, or beside protected resource metadata, and otherwise passed to
+   policy as
    `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
    connection that presents a client certificate, on a surface that also accepts mTLS, and an
    MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
@@ -160,8 +191,8 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
-  method is `jwt_bearer`;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless
+  `jwt_bearer` is the only method;
 - an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
@@ -195,7 +226,7 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_jwt_claim` identity without `jwt_bearer` as its only method, or an inbound
 `from_api_key` identity beside a method other than an API key, is logged as a warning at
 startup and refused on the next save.
 
@@ -358,14 +389,35 @@ why, and `not_judged` while it keeps none. It is read only from that kept verdic
 the API key store, so it is per node and eventually consistent, and it is not part of
 `access_point_status`.
 
-On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
+A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
+surface that names an API Key Provider key id, in its base or any variant, also carry a
+read-only `api_key_references`: one `{ "key_id", "status", "blocking" }` per distinct id, sorted by id,
+with the ids the gate checks (a legacy Caller Context secret only when a key of that id
+exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
+has the id, `unavailable` for a key of any other surface, whose status is never reported,
+and `unknown`, as the gate's `store_unavailable`, for every id when the API key store cannot be
+read, and for an id no loaded key folder holds while a key folder cannot be loaded. A
+same-tenant key of another surface that still serves under `warn` is `unavailable` too: a
+surface names only its own keys. The field is absent when the surface names no key id, and on
+the surface list and variant responses. The surface's own key folder is read from disk for it,
+so a key of the surface another node revoked, deleted or created is reported as stored; when
+that folder cannot be read, its keys are `unknown`, as they are while the surfaces owning its
+keys cannot be read. `blocking` is `true` exactly when the provider key gate refuses the surface
+for that id, judged from the same rules: for a `revoked` or `missing` key, and for an
+`unavailable` key when that key is revoked, as the gate refuses a revoked key in both modes, or
+when `tenant_credential_isolation` is `enforce`, except for a legacy Caller Context secret whose
+owning surface no longer exists, which the gate does not refuse. It is `false` for an `active`
+or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
+`serving_status` already shows that it does not serve.
+
+On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
 protects, and repeated wrong credentials aren't throttled by it either. Use high-entropy API keys
 and limit requests per client upstream of the gateway if credential guessing is a concern. MCP callers get a JSON-RPC error carrying the request id; other callers get
-`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only that the credential
-is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
+`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only
+`Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
 Create and update responses are the saved surface plus `access_point_status` and, when it
@@ -413,9 +465,10 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
-A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
-challenge on a direct request), see
+A request to an Access Point whose inbound identity is `from_jwt_claim`, or to an MCP Access Point that
+publishes protected resource metadata, direct or over Fabric, is the exception: a missing or
+invalid credential is refused with a `401` before policy (the discovery challenge on a direct
+MCP request), see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 ### mTLS
@@ -550,9 +603,10 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
-cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
-handed to it; fetch it with `get_bounded` under `Strict`.
+blocks such a name at fetch time. The JWT Bearer JWKS client (`src/jwt_bearer/jwks.rs`)
+always uses a pinned client that refuses only cloud metadata, loopback and unspecified
+addresses, so a `jwks_uri` discovered under `Strict` must not be handed to it; fetch it with
+`get_bounded` under `Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a
@@ -1567,7 +1621,8 @@ decides, as for a failed key.
 ### `from_jwt_claim`
 
 Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived.
+verified before the DID is derived. On a direct or fabric-routed Access Point, a missing or
+invalid bearer token is refused with `401` before the target is called.
 
 | Field | Default | Effect |
 | --- | --- | --- |
@@ -1602,6 +1657,78 @@ the same credential-derived DID for the same agent must share the pepper. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#environment-variables).
 
 Credential-derived modes skip body parsing entirely.
+
+### Identity versions
+
+A managed agent's DID changes when what it is derived from changes: a payload-extraction
+`x-identity` value, the set of `x-identity` fields, or the stored certificate or API key the
+surface points at. The old DID's record stays, and nothing links it to the new one. Rotating
+the value of the same stored certificate or API key keeps the DID.
+
+Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) also stores:
+
+| Field | Holds |
+| --- | --- |
+| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
+| `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
+| `rotation_count` | How many rotations of that credential its rotation history holds. Omitted while there are none. |
+
+Each rotation in the history has `rotated_at` (the credential's new `updated_at`) and
+`previous`, the identity fields the rotation replaced with their earlier values. Every rotation
+is kept, so the fields before the first one are the ones the identity was created with. The
+history is stored apart from the record, one file per identity hash under the identity store's
+`@rotations/` directory, written through the same storage layer (encrypted at rest when storage
+encryption is on). It is written only when a rotation is recorded, so the usage update every
+request makes does not rewrite it. A record written before the history existed keeps its
+rotations inline in `rotations`; the next write of that record moves them to the history.
+
+Identities rows and WebSocket identity updates carry `rotation_count`, not the rotations.
+`GET /api/v1/identities/by-hash/{identity_hash}/rotations` lists them, oldest first, under the
+same session authentication as the other dashboard routes:
+
+| Query | Meaning |
+| --- | --- |
+| `limit` | Rotations per page, 1 to 1000. Default 1000. |
+| `before` | History index the page ends before. Default: the end of the history, so the first page is the newest. |
+
+The answer is `{ "rotations": [...], "total": n, "start": i }`: the history's entries
+`start` to `start + rotations.length - 1` of `total`. Ask again with `before=start` for the
+page before it until `start` is `0`. An unknown identity hash answers `404`.
+
+On each use of a credential-derived managed identity, the gateway compares the credential
+with the record. A certificate counts as rotated when its fingerprint, subject or issuer
+changed; editing only its name or tags does not. A secret-store API key counts as rotated
+whenever its `updated_at` changes, because its value is never stored; its rotations have
+no `previous` fields. The secret store also bumps `updated_at` when only the key's name,
+description, tags, type or tenant change, or when the same value is saved again, so the
+Identities page lists these entries as "Credential updated"
+rather than as a changed value. `atgk_` API keys are never rotated in place: a new key is a new id, so
+it mints a new DID. The record's `identity_fields` then hold the current certificate's
+values.
+
+The identity the gateway presents to Fabric peers follows the same record. After an mTLS
+rotation it keeps its DID but carries the current certificate's fingerprint, subject and
+issuer, matching the certificate its request credentials already use. A peer whose policy
+pins the old fingerprint denies requests from that identity until it updates the policy.
+
+Within one gateway process, usage, origin and rotation updates to one record are serialised
+per identity hash, so concurrent requests don't overwrite each other's writes.
+
+Rotations before this tracking began were not recorded. The first use afterwards stores the
+credential's `updated_at` as a baseline; if a certificate's fields differ from the stored
+ones at that point, that is recorded as one rotation with `rotated_at: null`.
+
+A surface has one Managed Agent, so the Identities page groups every managed DID of a
+surface under one entry, with the most recently used DID as primary: the DIDs from the
+Managed Agent's responses (including its agent card) and from its outbound requests through
+any Transit Point, whatever their source (payload, mTLS, API key or static) and slot. A
+change of the agent's ID is therefore always a new version, whichever side sees it first,
+and managed records without a slot are grouped straight away (records without an origin
+still show one row per DID until their next use). Several DIDs in use at once share one
+entry, whose primary is the one used last. A DID's surface is the one it was last used on.
+External callers, including the external agent on a Transit Point response, keep one row per
+DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at once. Without `AG_IDENTITY_HASH_PEPPER`, every
+restart mints new credential-derived DIDs, which show as versions with no field changes.
 
 ## Trust Recorder
 
