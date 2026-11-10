@@ -25,9 +25,8 @@ Feature: JWT Bearer audiences
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT audience "api://alpha"
-    And the surface has a policy denying callers whose source authentication failed
     When the caller sends a request to the surface with a token for audience "api://other"
-    Then the response status is 403
+    Then the response status is 401
     And managed agent "bravo" was not called
 
   Scenario: A method stored without audiences still accepts a token issued for another service
@@ -91,7 +90,6 @@ Feature: JWT Bearer audiences
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT Bearer tokens issued to client "app-alpha"
-    And the surface has a policy denying callers whose source authentication failed
     When the caller sends a request to the surface with a token issued to client "app-bravo"
-    Then the response status is 403
+    Then the response status is 401
     And managed agent "bravo" was not called

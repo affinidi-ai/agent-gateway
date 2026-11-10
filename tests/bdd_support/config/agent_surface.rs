@@ -32,6 +32,12 @@ pub struct AccessPointFixture {
     pub caller_trust_check_list: Vec<Value>,
     pub trust_recorder_entries: Vec<Value>,
     pub rate_limit: Option<Value>,
+    /// `access_point.public` as stored; `None` derives what the admin API
+    /// writes: closed when the Access Point authenticates callers, public
+    /// otherwise.
+    pub public: Option<bool>,
+    /// Store no `access_point.public`, as a legacy surface does.
+    pub legacy: bool,
 }
 impl Default for AccessPointFixture {
     fn default() -> Self {
@@ -47,6 +53,8 @@ impl Default for AccessPointFixture {
             caller_trust_check_list: Vec::new(),
             trust_recorder_entries: Vec::new(),
             rate_limit: None,
+            public: None,
+            legacy: false,
         }
     }
 }
@@ -136,6 +144,8 @@ impl AgentSurfaceFixture {
                 caller_trust_check_list: Vec::new(),
                 trust_recorder_entries: Vec::new(),
                 rate_limit: None,
+                public: None,
+                legacy: false,
             },
             target: TargetFixture {
                 endpoint: target_endpoint.into(),
@@ -195,6 +205,19 @@ impl AgentSurfaceFixture {
     ) -> Self {
         self.access_point
             .agent_card_path = Some(agent_card_path.into());
+        self
+    }
+
+    pub fn with_public(
+        mut self,
+        public: bool,
+    ) -> Self {
+        self.access_point.public = Some(public);
+        self
+    }
+
+    pub fn with_legacy_access_point(mut self) -> Self {
+        self.access_point.legacy = true;
         self
     }
 
@@ -359,6 +382,21 @@ impl AgentSurfaceFixture {
             "protocol": self.access_point.protocol,
             "publish_to_did_document": false
         });
+        if !self.access_point.legacy {
+            let authenticates = !self
+                .access_point
+                .caller_authentication_methods
+                .is_empty()
+                || self
+                    .mcp_http
+                    .as_ref()
+                    .is_some_and(|mcp_http| !mcp_http["authorization"].is_null());
+            access_point["public"] = json!(
+                self.access_point
+                    .public
+                    .unwrap_or(!authenticates)
+            );
+        }
         if !self
             .access_point
             .caller_authentication_methods
@@ -572,6 +610,8 @@ impl Default for AgentSurfaceFixture {
                 caller_trust_check_list: Vec::new(),
                 trust_recorder_entries: Vec::new(),
                 rate_limit: None,
+                public: None,
+                legacy: false,
             },
             target: TargetFixture {
                 endpoint: "".to_string(),

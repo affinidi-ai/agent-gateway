@@ -4768,9 +4768,10 @@ async fn process_charged_forward_request(
 
     // ── Unified source authentication ──────────────────────────────────────────
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable failures are refused with 401 on an Access Point that
-    // publishes protected resource metadata or rejects failed callers; otherwise
-    // the outcome is handed to the policy layer via `source_auth_context` below.
+    // Caller-attributable failures are refused with 401 on every Access Point
+    // that is not public, and on one that publishes protected resource metadata;
+    // on a public one the outcome is handed to the policy layer via
+    // `source_auth_context` below.
     // Server-side failures (setup/config resolution, internal errors) block with 500.
     // The caller connected to the sending gateway, so its address is not known here.
     let audit_facts = crate::audit::request_events::RequestFacts {
@@ -4951,11 +4952,11 @@ async fn process_charged_forward_request(
                 };
                 match verified {
                     Ok(identity) => Some(identity),
-                    // Caller-attributable failure. An Access Point that
-                    // publishes protected resource metadata, or whose caller
-                    // authentication rejects failures, refuses it; otherwise
-                    // record the outcome for the policy layer and continue with
-                    // no asserted caller identity.
+                    // Caller-attributable failure. An Access Point that is not
+                    // public, or that publishes protected resource metadata,
+                    // refuses it; a public one records the outcome for the
+                    // policy layer and continues with no asserted caller
+                    // identity.
                     Err(e) if e.is_caller_attributable() => {
                         // Beside protected resource metadata every failure is
                         // refused: a failed JWT with the discovery refusal, any

@@ -1,0 +1,34 @@
+branch: fix/enforce-legacy-caller-auth
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-10T13:30:00Z'
+      title: ⭐ Refuse failed callers on legacy Access Points with source authentication
+      description: >-
+        In v1.0.7 and earlier, a legacy surface, one stored without access_point.public (created before v1.0.4,
+        built from DynamoDB, restored from an older backup or edited by hand, and never closed
+        or made public since), handed a caller whose credential was missing or invalid to
+        policy even when it requires caller authentication, so unless a policy denied
+        input.source_auth.method == "failed" the request reached the Target. Such a caller is
+        now refused with 401 before policy and the Target, as on a closed Access Point, on
+        direct inbound, proxy:// MCP Targets, a2a-proxy:// Targets and Fabric receive. Only a
+        public Access Point (access_point.public true) still hands failed callers to policy.
+        Callers with a valid credential, public and closed surfaces, and legacy surfaces
+        without caller authentication are unaffected. Callers that stop working are clients
+        with a revoked, expired or wrong key or token, callers that send no credential,
+        anonymous callers a policy admitted on purpose, and Fabric partners whose sending
+        surface checks the same credential header. Before upgrading, find them as auth_failed
+        audit events with blocking false on surfaces stored without public (select auth_failed
+        under Settings, VP Audit to record them); after upgrading, the gateway logs a warning at
+        start for each legacy surface that now refuses them. To keep admitting failed callers,
+        mark the surface public (the Public access switch, or a public attribute of true on a
+        DynamoDB item). Nothing is written to the stored surface, so a rollback to v1.0.7 or
+        earlier loads it unchanged and reopens it. Like a closed Access Point's, these refusals
+        return before the surface rate limit, so repeated wrong credentials no longer count
+        against it. The dashboard's legacy
+        notice now says failed callers are refused. See "Legacy Access Points after upgrading"
+        in docs/SOURCE_AUTH.md.

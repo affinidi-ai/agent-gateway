@@ -128,11 +128,10 @@ Feature: HTTP MCP surface forwarding
     And MCP server "bravo" received the forwarded MCP request
     And MCP server "bravo" did not receive header "X-API-Key"
 
-  Scenario Outline: An MCP request to a discovery-like path still runs source authentication and policy
+  Scenario Outline: An MCP request to a discovery-like path still runs source authentication
     Given the surface requires "API Key" source authentication
-    And the surface has a policy denying callers whose source authentication failed
     When the caller sends a request to the surface path "<path>"
-    Then the response status is 403
+    Then the response status is 401
     And MCP server "bravo" was not called
 
     Examples:

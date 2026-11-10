@@ -2172,10 +2172,11 @@ async fn proxy_charged_request(
     // Must run before rate limiting so unauthenticated requests are rejected
     // before consuming any rate-limit budget.
     // Public paths (e.g. agent-card) bypass all authentication gates.
-    // Caller-attributable source-auth failures are refused with 401 on an Access
-    // Point that publishes protected resource metadata or rejects failed callers;
-    // otherwise the outcome is handed to the policy layer via `source_auth_context`
-    // below, which decides whether to allow or deny. Server-side failures
+    // Caller-attributable source-auth failures are refused with 401 on every
+    // Access Point that is not public, and on one that publishes protected
+    // resource metadata; on a public one the outcome is handed to the policy
+    // layer via `source_auth_context` below, which decides whether to allow or
+    // deny. Server-side failures
     // (setup/config resolution, internal errors) block with a 500.
     let resource_authorization = state
         .surface
@@ -2407,10 +2408,11 @@ async fn proxy_charged_request(
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
                 // it with its challenge, so the caller can fetch a token and
-                // retry. An Access Point that rejects failed callers (closed, `on_failure:
-                // reject`, or `from_jwt_claim` inbound identity) refuses it here,
-                // before policy. Otherwise record the outcome for the policy layer and
-                // continue with no asserted caller identity — do not block here.
+                // retry. Every other Access Point that is not public refuses it
+                // here, before policy, and so does a public one whose inbound
+                // identity is `from_jwt_claim` or whose `on_failure` is
+                // `reject`. Any other public one records the outcome for the
+                // policy layer and continues with no asserted caller identity.
                 Err(e) if e.is_caller_attributable() => {
                     // On an Access Point that publishes protected resource
                     // metadata a failed JWT gets the discovery challenge, and a

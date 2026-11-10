@@ -63,7 +63,7 @@ export interface SurfaceMetaValue {
   accessPointNotice?: AccessPointNotice | null;
   /**
    * The stored surface has no `access_point.public`: a legacy Access Point,
-   * which hands callers whose credential fails to policy unless it is closed.
+   * which refuses callers whose credential fails, as a closed one does.
    */
   legacyAccessPoint?: boolean;
   /** Status of each API key the stored surface names, by key id; absent while creating. */

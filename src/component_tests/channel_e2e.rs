@@ -233,11 +233,10 @@ async fn inbound_listeners_sharing_a_port_are_each_served_on_their_address() {
     }
 }
 
-/// A channel with `source_auth` (JWT Bearer) no longer blocks requests without a
-/// valid token: a caller-attributable failure is non-blocking, so with no denying
-/// policy both an unauthenticated request and a valid one are forwarded.
+/// A closed Access Point with JWT Bearer source auth refuses a request without
+/// a token with `401` before the target, and forwards one with a valid token.
 #[tokio::test(flavor = "multi_thread")]
-async fn jwt_bearer_auth_forwards_missing_and_valid_without_policy() {
+async fn jwt_bearer_auth_refuses_a_missing_token_and_forwards_a_valid_one() {
     let fixture = JwksFixture::start().await;
 
     let h = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
@@ -249,7 +248,7 @@ async fn jwt_bearer_auth_forwards_missing_and_valid_without_policy() {
     let body = r#"{"jsonrpc":"2.0","method":"test","id":1}"#;
 
     //
-    // 1. Missing token → non-blocking, request is forwarded to the target
+    // 1. Missing token → refused before the target
     //
     let resp = client
         .post(&h.gateway_url)
@@ -259,8 +258,14 @@ async fn jwt_bearer_auth_forwards_missing_and_valid_without_policy() {
         .await
         .expect("request without token failed");
 
-    assert_response(resp).await;
-    assert_forwarded_request(&h.mock, body);
+    assert_eq!(resp.status(), 401);
+    assert_eq!(
+        h.mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the target is never called"
+    );
 
     //
     // 2. Valid token → request forwarded to mock target
@@ -343,8 +348,7 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
 
 /// With `forward_header`, the caller's token reaches the target only when it
 /// verified; an expired token, one from another issuer, or a second token
-/// beside a valid one is still forwarded with no policy denying it, but
-/// without any token.
+/// beside a valid one is refused with `401` before the target.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_header_passes_on_only_a_verified_token() {
     let fixture = JwksFixture::start().await;
@@ -370,12 +374,16 @@ async fn forward_header_passes_on_only_a_verified_token() {
 
     let valid = sign(&fixture.issuer, now_secs() + 300);
     let expired = sign(&fixture.issuer, now_secs() - 3600);
-    for (case, tokens, forwarded) in [
+    for (case, tokens, verified) in [
         ("valid", vec![valid.clone()], true),
         ("expired", vec![expired.clone()], false),
         ("another issuer", vec![sign("https://other-issuer.example", now_secs() + 300)], false),
         ("valid then expired", vec![valid, expired], false),
     ] {
+        let reached = h
+            .mock
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst);
         let resp = tokens
             .iter()
             .fold(client.post(&h.gateway_url), |request, token| {
@@ -387,6 +395,17 @@ async fn forward_header_passes_on_only_a_verified_token() {
             .await
             .expect("request failed");
 
+        if !verified {
+            assert_eq!(resp.status(), 401, "{case}");
+            assert_eq!(
+                h.mock
+                    .request_count
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                reached,
+                "{case}: the target is never called"
+            );
+            continue;
+        }
         assert_response(resp).await;
         assert_forwarded_request(&h.mock, body);
         let received = h
@@ -400,9 +419,7 @@ async fn forward_header_passes_on_only_a_verified_token() {
                 .headers
                 .get("authorization")
                 .map(String::as_str),
-            forwarded
-                .then(|| format!("Bearer {}", tokens[0]))
-                .as_deref(),
+            Some(format!("Bearer {}", tokens[0])).as_deref(),
             "{case}"
         );
     }

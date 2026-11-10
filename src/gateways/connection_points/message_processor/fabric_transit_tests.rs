@@ -287,21 +287,8 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
     )))
     .await;
     assert_eq!(auth_failures(&events), 1, "the surface checks the peer's key");
-    assert_eq!(response["status"], 200, "no policy refuses the unverified request: {response}");
-    let refused = target
-        .received()
-        .pop()
-        .unwrap();
-    let refused_claims = issuer
-        .validate(header_values(&refused, "x-transit-token")[0], 300)
-        .unwrap();
-    assert_eq!(
-        refused_claims
-            .fabric
-            .and_then(|fabric| fabric.principal_hash),
-        None,
-        "a key the surface refused verifies no caller"
-    );
+    assert_eq!(response["status"], 401, "the surface refuses the unverified request: {response}");
+    assert!(target.received().is_empty(), "a refused request never reaches the agent");
     for (case, hops_header, expected_hops) in [("an older peer", None, 1), ("three crossings", Some("3"), 3)] {
         let mut headers = json!({ "content-type": "application/json", "x-api-key": CALLER_KEY,
             "X-Transit-Token": "token-the-peer-sent", "x-transit-token": "another-token-the-peer-sent" });
@@ -987,9 +974,9 @@ async fn a_partner_request_gets_no_per_user_credential_on_fabric_receive() {
 
 /// A service-level binding, such as an API key provider, keys no caller's
 /// grant, so it reaches a partner's request without the opt-in, as long as the
-/// receiving surface verified a caller of the request; without one the request
-/// is refused with `403` before the Target is called, even when the peer names
-/// a caller in the identity extension.
+/// receiving surface verified a caller of the request; without one the closed
+/// Access Point refuses the request with `401` before the Target is called,
+/// even when the peer names a caller in the identity extension.
 #[tokio::test]
 async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in() {
     if ran_in_child("ATG_FABRIC_RECEIVE_SERVICE_CREDENTIAL_CHILD").await {
@@ -1016,11 +1003,42 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
         assert_eq!(header_values(&received[before], "x-service-key"), [SERVICE_KEY], "{case}");
 
         let reached = received.len();
-        let (response, body, rejected) = refused(&send("not-the-key", request)).await;
+        let response = forward_response(&send("not-the-key", request)).await;
+        assert_eq!(response["status"], 401, "{case}: {response}");
+        assert_eq!(target.received().len(), reached, "{case}: the Target is not called");
+    }
+}
+
+/// A public Access Point hands a partner's request whose caller it did not
+/// verify on, but a service-level binding still is not released to it: the
+/// request is refused with `403` before the Target is called, even when the
+/// peer names a caller in the identity extension.
+#[tokio::test]
+async fn a_public_surface_releases_no_service_credential_to_a_partner_whose_caller_it_did_not_verify() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_PUBLIC_SERVICE_CREDENTIAL_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.access_point.public = Some(true);
+    delegating.outbound_credentials = vec![binding(SERVICE_PROVIDER)];
+    let _receiver = receiver(root.path(), &delegating).await;
+    install_delegation_stores(root.path(), &target.url, &[]).await;
+
+    for (case, request) in
+        [("no caller named", a2a_body()), ("peer names a caller", naming(json!({ "agentId": "alice" })))]
+    {
+        let (response, body, rejected) = refused(&forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": "not-the-key" }),
+            request,
+        ))
+        .await;
         assert_eq!(response["status"], 403, "{case}: {response}");
         assert_eq!(body["reason"], "partner_caller_not_verified", "{case}: {body}");
         assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)], "{case}");
-        assert_eq!(target.received().len(), reached, "{case}: the Target is not called");
+        assert!(target.received().is_empty(), "{case}: the Target is not called");
     }
 }
 

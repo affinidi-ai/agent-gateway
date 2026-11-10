@@ -293,9 +293,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   through a load and rebuild unchanged; `withCallerAccessSettled`
   (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
   (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
-  legacy state, "Not enforced (legacy)", under the switch with a **Close Access Point** button
-  (`access-point-close-button`, hidden when read-only) that sets `public: false`. Turning the
-  switch off there clears `public`, so turning it on and off again keeps the stored rules. A
+  legacy state under the switch: the gateway refuses its failed callers, and without a Caller
+  Context it admits every caller. A **Close Access Point** button
+  (`access-point-close-button`, hidden when read-only) sets `public: false`. Turning the
+  switch off there clears `public`, so turning it on and off again keeps the surface legacy. A
   `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
