@@ -737,7 +737,7 @@ mod tests {
 
         assert_eq!(rotated.previous_did, old.did());
         assert_eq!(auths_as(&mock, old.did()), 1, "the old DID signed in once, before the rotation");
-        assert_eq!(mock.0.lock().unwrap().allowed, [rotated.new_did.clone()]);
+        assert_eq!(mock.0.lock().unwrap().allowed, std::slice::from_ref(&rotated.new_did));
     }
 
     #[tokio::test]
