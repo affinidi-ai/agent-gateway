@@ -278,8 +278,8 @@ fn refuse_unservable_route(
         .access_point
         .route
         .as_str();
-    let kept_route = existing
-        .is_some_and(|existing| existing.status != SurfaceStatus::Disabled && existing.access_point.route == route);
+    let kept_route =
+        existing.is_some_and(|existing| existing.status != SurfaceStatus::Disabled) && keeps_route(surface, existing);
     if surface.status == SurfaceStatus::Disabled || kept_route {
         return Ok(());
     }
@@ -304,16 +304,33 @@ fn current_network_config<'a>(
     }
 }
 
+/// Whether `surface` keeps the route `existing` had, as the inbound router
+/// matches it: a missing leading or an added trailing `/` changes nothing.
+fn keeps_route(
+    surface: &AgentSurface,
+    existing: Option<&AgentSurface>,
+) -> bool {
+    use crate::config::route_claims::normalize_route;
+    existing.is_some_and(|existing| {
+        normalize_route(&existing.access_point.route) == normalize_route(&surface.access_point.route)
+    })
+}
+
 /// Store a new or changed route the way the inbound router matches it, without
-/// a trailing `/`; an unchanged route is kept as stored.
-fn normalize_changed_route(
+/// a trailing `/`. A kept route only gets a missing leading `/`, and keeps a
+/// trailing one, which its Transit Points' default paths follow.
+fn normalize_saved_route(
     surface: &mut AgentSurface,
     existing: Option<&AgentSurface>,
 ) {
+    let kept = keeps_route(surface, existing);
     let route = &surface.access_point.route;
-    if !route.is_empty() && existing.is_none_or(|existing| existing.access_point.route != *route) {
-        surface.access_point.route = crate::config::route_claims::normalize_route(route);
-    }
+    let saved = match (route.is_empty(), kept, route.starts_with('/')) {
+        (true, _, _) | (false, true, true) => return,
+        (false, true, false) => format!("/{route}"),
+        (false, false, _) => crate::config::route_claims::normalize_route(route),
+    };
+    surface.access_point.route = saved;
 }
 
 fn validate_required_fields(
@@ -3143,7 +3160,7 @@ pub async fn create_surface(
 
     // Normalize the route BEFORE the shape check so the historical "missing
     // slash is auto-fixed" behaviour is preserved.
-    normalize_changed_route(&mut surface, None);
+    normalize_saved_route(&mut surface, None);
 
     // Required-field shape check on the base surface.
     validate_required_fields(&surface, "")?;
@@ -4148,20 +4165,9 @@ async fn validate_and_save_surface(
     actor: Option<&crate::delegation_vault::audit::AuditCallerContext>,
 ) -> Result<(AgentSurface, Vec<SurfaceWarning>), SurfaceApiError> {
     drop_inbound_api_key_ids(&mut surface);
-    // Ensure route starts with / BEFORE the shape check so the
-    // historical "missing slash is auto-fixed" behaviour is preserved.
-    if !surface
-        .access_point
-        .route
-        .is_empty()
-        && !surface
-            .access_point
-            .route
-            .starts_with('/')
-    {
-        surface.access_point.route = format!("/{}", surface.access_point.route);
-    }
-    normalize_changed_route(&mut surface, existing);
+    // Normalize the route BEFORE the shape check so the historical "missing
+    // slash is auto-fixed" behaviour is preserved.
+    normalize_saved_route(&mut surface, existing);
 
     validate_required_fields(&surface, "")?;
     validate_identity_extraction(&surface, "")?;
@@ -9056,20 +9062,44 @@ mod validation_tests {
         let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/old/");
 
         let mut created = surface_with_route("s1", "alpha", "0.0.0.0:8443", "agents/foo/");
-        normalize_changed_route(&mut created, None);
+        normalize_saved_route(&mut created, None);
         assert_eq!(created.access_point.route, "/agents/foo");
 
         let mut moved = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/agents/new/");
-        normalize_changed_route(&mut moved, Some(&stored));
+        normalize_saved_route(&mut moved, Some(&stored));
         assert_eq!(moved.access_point.route, "/agents/new");
 
         let mut kept = stored.clone();
-        normalize_changed_route(&mut kept, Some(&stored));
+        normalize_saved_route(&mut kept, Some(&stored));
         assert_eq!(kept.access_point.route, "/agents/old/");
 
         let mut missing = surface_with_route("s1", "alpha", "0.0.0.0:8443", "");
-        normalize_changed_route(&mut missing, None);
+        normalize_saved_route(&mut missing, None);
         assert_eq!(missing.access_point.route, "", "a missing route stays missing for the required-field check");
+    }
+
+    #[test]
+    fn a_stored_route_without_a_leading_slash_is_kept_and_not_checked_again() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "foo");
+        let mut edited = stored.clone();
+        edited.description = "edited".to_string();
+
+        normalize_saved_route(&mut edited, Some(&stored));
+
+        assert_eq!(edited.access_point.route, "/foo");
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("the route the surface already had is not checked again");
+    }
+
+    #[test]
+    fn a_route_that_differs_from_the_stored_one_only_by_a_trailing_slash_is_kept() {
+        let stored = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo/");
+        let mut edited = surface_with_route("s1", "alpha", "0.0.0.0:8443", "/foo");
+
+        normalize_saved_route(&mut edited, Some(&stored));
+
+        refuse_unservable_route(&edited, Some(&stored), &network_with_agents_prefix())
+            .expect("the route the surface already had is not checked again");
     }
 
     #[test]
