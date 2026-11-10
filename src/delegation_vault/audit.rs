@@ -1676,10 +1676,11 @@ pub struct AuditLogPage {
     /// did reach the end of the history.
     pub dropped_records: usize,
     /// Bytes the audit history takes on disk: the live log and every rotated
-    /// file beside it.
+    /// file beside it. `0` unless an appliance-wide caller reads the page.
     pub history_bytes: u64,
     /// The size an operator asked to be told about
-    /// (`[audit] vp_audit_log_soft_cap_bytes`), or `0` when none is set.
+    /// (`[audit] vp_audit_log_soft_cap_bytes`), or `0` when none is set or
+    /// the caller is not appliance-wide.
     /// Advisory: nothing happens when the history passes it.
     pub soft_cap_bytes: u64,
 }
@@ -2115,6 +2116,15 @@ fn read_audit_window(
 
     enrich_page_from_signed_vps(path, &mut events, scan_bytes)?;
 
+    // The size of the history describes every tenant's records, so only an
+    // appliance-wide caller is told it, and the cap it is shown against.
+    let told = |bytes: u64| {
+        if *prepared.reader == VaultReadScope::Appliance {
+            bytes
+        } else {
+            0
+        }
+    };
     Ok(AuditLogPage {
         events,
         total,
@@ -2124,8 +2134,8 @@ fn read_audit_window(
         category_counts,
         truncated,
         dropped_records,
-        history_bytes,
-        soft_cap_bytes,
+        history_bytes: told(history_bytes),
+        soft_cap_bytes: told(soft_cap_bytes),
     })
 }
 
@@ -2887,6 +2897,37 @@ mod tests {
             1,
             "an appliance-wide caller is still told its counts are lower bounds"
         );
+    }
+
+    /// The size of the history on disk describes every tenant's records, so
+    /// only an appliance-wide caller is told it, and the cap it is shown
+    /// against.
+    #[test]
+    fn only_an_appliance_wide_caller_is_told_the_size_of_the_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), audit_line("cp-b")));
+        let measured = log_files::history_bytes(&path);
+        let read = |scope: &VaultReadScope| {
+            super::read_audit_window(
+                &path,
+                1,
+                10,
+                &PreparedFilter::new(&OwnedAuditLogFilter::default(), scope),
+                whole_history(),
+                4096,
+                measured,
+            )
+            .unwrap()
+        };
+
+        let tenant = read(&tenant_a());
+        assert_eq!(
+            (tenant.total, tenant.history_bytes, tenant.soft_cap_bytes),
+            (1, 0, 0),
+            "a tenant reads its own record, not the size of every tenant's"
+        );
+        let appliance = read(&VaultReadScope::Appliance);
+        assert_eq!((appliance.total, appliance.history_bytes, appliance.soft_cap_bytes), (2, measured, 4096));
     }
 
     #[test]
