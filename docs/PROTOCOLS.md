@@ -535,18 +535,20 @@ the HTTP+JSON binding it is a problem response. A non-success response that carr
 `result` is forwarded unchanged.
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
 forwarded as received on fabric and outbound paths, except a compressed one, which an outbound
-Transit Point also answers with `502`: forwarded unrewritten, it would point callers past the
-Transit Point.
+Transit Point of any protocol also answers with `502`: forwarded unrewritten, it would point
+callers past the Transit Point.
 
 A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
 forwarded, whatever the surface's A2A validation level, `"off"` included, because a card inside a
 batch response cannot be rewritten. A compressed card cannot be rewritten either, so every card
 fetch, public or extended, on an Access Point or a Transit Point, is forwarded with
 `Accept-Encoding: identity` in place of the caller's value, and a card compressed all the same is
-answered with `502` (`Upstream response is compressed` on an Access Point). Other A2A requests
-keep the caller's `Accept-Encoding` on a direct path, and their compressed answers pass through
-unchanged; over Fabric every buffered request asks for an uncompressed answer (see
-[`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)).
+answered with `502`. An Access Point's direct fetch names the reason (`Upstream response is
+compressed`); over Fabric the caller gets `Upstream error: 502 Bad Gateway`, the receiving
+gateway's status. Other A2A requests keep the caller's `Accept-Encoding` on a direct path, and
+their compressed answers pass through unchanged; over Fabric the sending gateway asks for an
+uncompressed answer on every buffered request and the receiving gateway on every request it
+forwards, framed streams included (see [`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)).
 
 Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
 path. Some requests are not recognised, and are forwarded like any other request with their

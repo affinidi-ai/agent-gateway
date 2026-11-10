@@ -441,11 +441,12 @@ request received by the destination gateway:
    card location, the sending gateway's own card fetch; any other discovery read, the
    `/.well-known/agent.json` fallback included, gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
-   The Target's answer travels back as text, so the request asks for an uncompressed one
-   (`Accept-Encoding: identity`) in place of whatever the sender accepts; a buffered answer
-   compressed all the same is refused with `502` rather than carried corrupted. The sending
-   gateway also sends `Accept-Encoding: identity` on every buffered forward and card read, so a
-   receiving gateway without this check still gets an uncompressed answer.
+   The Target's answer travels back as text, so the request, a framed stream's included, asks
+   for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
+   a buffered answer compressed all the same is refused with `502` rather than carried corrupted.
+   The sending gateway also sends `Accept-Encoding: identity` on every buffered forward and card
+   read, from an Access Point's `fabric://` Target and from a Transit Point alike, so a receiving
+   gateway without this check still gets an uncompressed answer.
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 

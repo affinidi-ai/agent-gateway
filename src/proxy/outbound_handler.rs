@@ -6598,9 +6598,9 @@ fn request_uncompressed_mcp_response(ctx: &mut OutboundPipelineContext) {
 /// An MCP Transit Point's target, and the target of a public agent card read,
 /// are asked for an uncompressed answer ([`request_uncompressed_mcp_response`],
 /// [`request_uncompressed_agent_card`]); one compressed all the same is
-/// refused. Tool gating and the response checks read the body as it is sent,
-/// and a card that cannot be rewritten would point its callers past the
-/// Transit Point.
+/// refused, an agent card only when it would be rewritten. Tool gating and the
+/// response checks read the body as it is sent, and a card that cannot be
+/// rewritten would point its callers past the Transit Point.
 fn refuse_a_compressed_answer(
     ctx: &OutboundPipelineContext,
     upstream: &UpstreamResponse,
@@ -6609,7 +6609,7 @@ fn refuse_a_compressed_answer(
         return Ok(());
     };
     if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp
-        && !is_public_card_request(ctx)
+        && !is_agent_card_response(&ctx.request_path, response.status())
     {
         return Ok(());
     }
@@ -6724,10 +6724,10 @@ async fn step_answer_a_refused_grant(
     Ok(UpstreamResponse::Http(retried))
 }
 
-/// Whether the request reads the public agent card of an A2A/AP2 Transit Point.
+/// Whether the request reads a public agent card, whose answer
+/// [`step_process_response`] rewrites on a Transit Point of any protocol.
 fn is_public_card_request(ctx: &OutboundPipelineContext) -> bool {
-    transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
-        && crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
+    crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
 }
 
 /// A compressed agent card cannot be rewritten, so the Target is asked for an
@@ -17531,18 +17531,21 @@ mod tests {
         }
     }
 
-    /// An A2A Transit Point's public agent card is read uncompressed, whatever
-    /// the agent accepts, so it can be rewritten; one compressed all the same is
-    /// refused rather than passed on pointing past the Transit Point. Its
-    /// messages keep the agent's own encoding.
+    /// A Transit Point's public agent card is read uncompressed, whatever the
+    /// agent accepts and whatever the Transit Point's protocol, so it can be
+    /// rewritten; one compressed all the same is refused rather than passed on
+    /// pointing past the Transit Point. A card the gateway would not rewrite (a
+    /// refusal) passes on, and A2A messages keep the agent's own encoding.
     #[test]
-    fn a_public_agent_card_on_an_a2a_transit_point_is_read_uncompressed() {
-        for (protocol, path, card) in [
-            ("a2a", "/mcp/vendor/.well-known/agent-card.json", true),
-            ("a2a", "/mcp/vendor/.well-known/agent.json", true),
-            ("ap2", "/mcp/vendor/.well-known/agent-card.json", true),
-            ("a2a", "/mcp/vendor", false),
-            ("http", "/mcp/vendor/.well-known/agent-card.json", false),
+    fn a_public_agent_card_on_a_transit_point_is_read_uncompressed() {
+        for (protocol, path, status, card, refused) in [
+            ("a2a", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("a2a", "/mcp/vendor/.well-known/agent.json", 200, true, true),
+            ("ap2", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("http", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("a2a", "/mcp/vendor/.well-known/agent-card.json", 404, true, false),
+            ("a2a", "/mcp/vendor", 200, false, false),
+            ("http", "/mcp/vendor/items", 200, false, false),
         ] {
             let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
             point["protocol"] = json!(protocol);
@@ -17559,9 +17562,14 @@ mod tests {
             } else {
                 "gzip, br"
             };
-            assert_eq!(ctx.original_headers[axum::http::header::ACCEPT_ENCODING], expected, "{protocol} {path}");
+            assert_eq!(
+                ctx.original_headers[axum::http::header::ACCEPT_ENCODING],
+                expected,
+                "{protocol} {path} {status}"
+            );
             let compressed = UpstreamResponse::Http(reqwest::Response::from(
                 axum::http::Response::builder()
+                    .status(status)
                     .header("content-encoding", "gzip")
                     .body(b"\x1f\x8b\x08".to_vec())
                     .unwrap(),
@@ -17571,8 +17579,8 @@ mod tests {
                     refuse_a_compressed_answer(&ctx, &compressed),
                     Err(OutboundPipelineError::UpstreamResponseReadFailed)
                 ),
-                card,
-                "{protocol} {path}"
+                refused,
+                "{protocol} {path} {status}"
             );
         }
     }

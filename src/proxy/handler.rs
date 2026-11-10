@@ -175,6 +175,7 @@ fn access_point_fabric_headers(
         .collect();
     set_fabric_hops(&mut headers_map, FIRST_FABRIC_HOP);
     set_stream_fabric_hops(&mut stream_headers, FIRST_FABRIC_HOP);
+    crate::proxy::fabric_forward::ask_for_an_uncompressed_answer(&mut headers_map);
     (headers_map, stream_headers)
 }
 
@@ -22191,6 +22192,37 @@ allow if {
         for name in ["X_User_Token", "x_user-token"] {
             assert!(!forwards_ap_caller_header(name, &headers, None, Some("X-User-Token"), &[]), "{name}");
             assert!(!should_forward_ap_request_header_with_mapping(name, &headers, None, None), "{name}");
+        }
+    }
+
+    /// A buffered Fabric send asks the remote Target for an uncompressed answer,
+    /// which the remote gateway carries back as text; a framed stream keeps the
+    /// caller's encoding.
+    #[test]
+    fn an_access_point_fabric_send_asks_for_an_uncompressed_answer() {
+        for caller in [None, Some("gzip, br"), Some("identity")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-partner-context", HeaderValue::from_static("kept"));
+            if let Some(value) = caller {
+                headers.insert("accept-encoding", HeaderValue::from_static(value));
+            }
+
+            let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &[]);
+
+            let encodings: Vec<_> = buffered
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(encodings, ["identity"], "{caller:?}");
+            assert_eq!(
+                streamed
+                    .get("accept-encoding")
+                    .and_then(|value| value.to_str().ok()),
+                caller,
+                "{caller:?}"
+            );
+            assert_eq!(buffered["X-PARTNER-CONTEXT"], "kept");
         }
     }
 

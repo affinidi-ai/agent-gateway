@@ -680,6 +680,14 @@ pub(crate) fn with_pinned_alias(
     }
 }
 
+/// Puts `Accept-Encoding: identity` in place of any value the caller sent, in
+/// the headers of a buffered `ForwardRequest`: the remote gateway carries the
+/// Target's answer back as text.
+pub(crate) fn ask_for_an_uncompressed_answer(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("accept-encoding"));
+    headers.insert("ACCEPT-ENCODING".to_string(), "identity".to_string());
+}
+
 /// The body of the `ForwardRequest` sending `req` to `channel`, the part of
 /// the `fabric://` Target after the gateway id, with the alias it pins. The
 /// remote gateway carries the Target's answer back as text, so the Target is
@@ -692,8 +700,7 @@ fn forward_request_body(
 ) -> serde_json::Value {
     let (channel_id, variant_alias) = pinned_alias(channel);
     let mut headers = req.headers.clone();
-    headers.retain(|name, _| !name.eq_ignore_ascii_case("accept-encoding"));
-    headers.insert("accept-encoding".to_string(), "identity".to_string());
+    ask_for_an_uncompressed_answer(&mut headers);
     with_pinned_alias(
         serde_json::json!({
             "channel_id": channel_id,
@@ -1184,7 +1191,7 @@ mod tests {
 
             assert_eq!(
                 body["headers"],
-                serde_json::json!({"accept": "application/json", "accept-encoding": "identity"}),
+                serde_json::json!({"accept": "application/json", "ACCEPT-ENCODING": "identity"}),
                 "{caller:?}"
             );
         }
