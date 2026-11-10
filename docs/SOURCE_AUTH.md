@@ -380,12 +380,6 @@ owning surface no longer exists, which the gate does not refuse. It is `false` f
 or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
 `serving_status` already shows that it does not serve.
 
-Beside `api_key_references`, the same responses carry a read-only `serving_status`: `serving` or
-`not_serving` as the verdict this node keeps on the surface's key ids stands, without saying
-why, and `not_judged` while it keeps none. It is read only from that kept verdict, never from
-the API key store, so it is per node and eventually consistent, and it is not part of
-`access_point_status`.
-
 On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
