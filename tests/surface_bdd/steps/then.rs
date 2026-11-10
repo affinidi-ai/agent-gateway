@@ -3462,12 +3462,17 @@ fn oauth_provider_received_refresh_request(
     );
 }
 
+/// Delegation audit records name a provider by its record id, which is not
+/// its `provider_id` slug when the gateway gave it an id of its own.
 #[then(expr = "the delegation audit trail contains event {string} for OAuth provider {string}")]
 async fn delegation_audit_trail_contains_event(
     world: &mut SurfaceWorld,
     event: String,
     provider: String,
 ) {
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
     let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|entry| {
             entry
@@ -3477,11 +3482,11 @@ async fn delegation_audit_trail_contains_event(
                 && entry
                     .get("provider_id")
                     .and_then(|value| value.as_str())
-                    == Some(provider.as_str())
+                    == Some(record_id.as_str())
         })
     })
     .await;
-    assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+    assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
 }
 
 #[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]
