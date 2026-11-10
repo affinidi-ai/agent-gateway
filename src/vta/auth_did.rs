@@ -274,6 +274,247 @@ fn auth_did_document(
     })
 }
 
+/// A key a published auth DID declares for authentication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredKey {
+    /// The fragment of its verification method id, for example `key-1`.
+    pub fragment: String,
+    pub multibase: String,
+}
+
+fn log_entries(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn fragment_of(id: &str) -> &str {
+    id.rsplit_once('#')
+        .map(|(_, fragment)| fragment)
+        .unwrap_or(id)
+}
+
+/// The keys the newest entry of a log declares for authentication.
+pub fn declared_keys(raw_log: &str) -> Vec<DeclaredKey> {
+    let Some(last) = log_entries(raw_log).pop() else {
+        return Vec::new();
+    };
+    let authenticating: Vec<String> = last["state"]["authentication"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|id| fragment_of(id).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    last["state"]["verificationMethod"]
+        .as_array()
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(|m| {
+                    let fragment = fragment_of(m["id"].as_str()?).to_string();
+                    let multibase = m["publicKeyMultibase"]
+                        .as_str()?
+                        .to_string();
+                    authenticating
+                        .contains(&fragment)
+                        .then_some(DeclaredKey { fragment, multibase })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The fragment for the next key: one past the highest `key-N` any entry of
+/// the log ever declared, so a retired id is never reused.
+pub fn next_key_fragment(raw_log: &str) -> String {
+    let highest = log_entries(raw_log)
+        .iter()
+        .flat_map(|entry| {
+            entry["state"]["verificationMethod"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|m| {
+            fragment_of(m["id"].as_str()?)
+                .strip_prefix("key-")?
+                .parse::<u32>()
+                .ok()
+        })
+        .max()
+        .unwrap_or(0);
+    format!("key-{}", highest + 1)
+}
+
+/// Wait until the clock is in a whole second later than `previous`: a webvh
+/// entry's `versionTime` has whole-second resolution and must strictly increase.
+async fn after_version_time(previous: &Value) {
+    let Some(last) = previous["versionTime"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    else {
+        return;
+    };
+    while chrono::Utc::now().timestamp() <= last.timestamp() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Append an entry that makes the document declare exactly `keys` for
+/// authentication, lets exactly `update_keys` update it next, and is signed by
+/// `signer` (one of the previous entry's update keys). Returns `false`, and
+/// writes nothing, when the log already says that.
+async fn append_key_entry(
+    dir: &Path,
+    did: &str,
+    signer: &ControlKey,
+    keys: &[DeclaredKey],
+    update_keys: &[String],
+) -> Result<bool, VtaError> {
+    let config = |what: &str, e: String| VtaError::Config(format!("[vta] auth DID {what}: {e}"));
+    let raw = crate::storage::did_artifacts::read_did_log_raw(dir)
+        .await
+        .map_err(|e| config("read the log", e.to_string()))?
+        .ok_or_else(|| config("read the log", "there is no log".to_string()))?;
+    let entries = log_entries(&raw);
+    let last = entries
+        .last()
+        .ok_or_else(|| config("read the log", "it has no entries".to_string()))?;
+
+    if declared_keys(&raw) == keys
+        && last["parameters"]["updateKeys"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .as_deref()
+            == Some(
+                update_keys
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+    {
+        return Ok(false);
+    }
+
+    let lines: Vec<String> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let state = crate::identity::didwebvh::handlers::build_webvh_state(did, &lines)
+        .await
+        .map_err(|e| config("load the log", e))?;
+
+    let mut document = last["state"].clone();
+    document["verificationMethod"] = json!(
+        keys.iter()
+            .map(|key| json!({
+                "id": format!("{did}#{}", key.fragment),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": key.multibase,
+            }))
+            .collect::<Vec<_>>()
+    );
+    document["authentication"] = json!(
+        keys.iter()
+            .map(|key| format!("{did}#{}", key.fragment))
+            .collect::<Vec<_>>()
+    );
+
+    let multibase = signer.public_key_multibase();
+    let key_id = format!("did:key:{multibase}#{multibase}");
+    let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, &control_key_jwk(signer))
+        .map_err(|e| config("build the signing key", e.to_string()))?;
+    secret.id = key_id;
+
+    after_version_time(last).await;
+    let updated = didwebvh_rs::prelude::update_did(
+        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+            .state(state)
+            .signing_key(secret)
+            .update_keys(
+                update_keys
+                    .iter()
+                    .cloned()
+                    .map(didwebvh_rs::Multibase::new)
+                    .collect(),
+            )
+            .document(document)
+            .build()
+            .map_err(|e| config("build the update", e.to_string()))?,
+    )
+    .await
+    .map_err(|e| config("update the DID", e.to_string()))?;
+    let entry = serde_json::to_string(updated.log_entry()).map_err(|e| config("encode the entry", e.to_string()))?;
+    crate::storage::did_artifacts::append_did_log_raw(dir, &entry)
+        .await
+        .map_err(|e| config("publish the entry", e.to_string()))?;
+    Ok(true)
+}
+
+/// Add `next_multibase` as `next_fragment` beside the keys already declared,
+/// with an entry signed by `signer` (the current key). Both keys may update the
+/// DID until the overlap ends. `false` when `next_multibase` is already declared.
+pub async fn introduce_key(
+    dir: &Path,
+    did: &str,
+    signer: &ControlKey,
+    next_fragment: &str,
+    next_multibase: &str,
+) -> Result<bool, VtaError> {
+    let raw = crate::storage::did_artifacts::read_did_log_raw(dir)
+        .await
+        .map_err(|e| VtaError::Config(format!("[vta] auth DID read the log: {e}")))?
+        .unwrap_or_default();
+    let mut keys = declared_keys(&raw);
+    if keys
+        .iter()
+        .any(|k| k.multibase == next_multibase)
+    {
+        return Ok(false);
+    }
+    keys.push(DeclaredKey {
+        fragment: next_fragment.to_string(),
+        multibase: next_multibase.to_string(),
+    });
+    let update_keys = vec![signer.public_key_multibase(), next_multibase.to_string()];
+    append_key_entry(dir, did, signer, &keys, &update_keys).await
+}
+
+/// Leave only `keep_fragment` declared, and let only `signer` update the DID
+/// next. Used to retire the old key (signed by the new one) and to roll back
+/// (signed by the old one). `false` when the log already says so.
+pub async fn keep_only_key(
+    dir: &Path,
+    did: &str,
+    signer: &ControlKey,
+    keep_fragment: &str,
+) -> Result<bool, VtaError> {
+    let raw = crate::storage::did_artifacts::read_did_log_raw(dir)
+        .await
+        .map_err(|e| VtaError::Config(format!("[vta] auth DID read the log: {e}")))?
+        .unwrap_or_default();
+    let kept: Vec<DeclaredKey> = declared_keys(&raw)
+        .into_iter()
+        .filter(|k| k.fragment == keep_fragment)
+        .collect();
+    if kept.is_empty() {
+        return Err(VtaError::Config(format!("[vta] auth DID does not declare `{keep_fragment}`")));
+    }
+    let update_keys = vec![signer.public_key_multibase()];
+    append_key_entry(dir, did, signer, &kept, &update_keys).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +694,264 @@ mod tests {
 
     /// An id is a path segment on disk and in the URL, so a traversal attempt
     /// is refused instead of joined.
+
+    async fn born(seed: u8) -> (tempfile::TempDir, std::path::PathBuf, String, ControlKey) {
+        let storage = tempfile::tempdir().expect("tempdir");
+        let key = ControlKey::from_seed([seed; 32]);
+        let did = ensure_connection_auth_did(storage.path(), "example.com", "conn-r", &key)
+            .await
+            .expect("born");
+        let dir = connection_auth_did_dir(storage.path(), "conn-r").expect("dir");
+        (storage, dir, did, key)
+    }
+
+    async fn log_of(dir: &Path) -> String {
+        crate::storage::did_artifacts::read_did_log_raw(dir)
+            .await
+            .expect("read")
+            .expect("log")
+    }
+
+    async fn resolves(
+        dir: &Path,
+        did: &str,
+    ) -> bool {
+        let lines: Vec<String> = log_of(dir)
+            .await
+            .lines()
+            .map(str::to_string)
+            .collect();
+        crate::identity::didwebvh::handlers::build_webvh_state(did, &lines)
+            .await
+            .is_ok()
+    }
+
+    fn last_entry(raw: &str) -> Value {
+        serde_json::from_str(
+            raw.lines()
+                .last()
+                .expect("an entry"),
+        )
+        .expect("json")
+    }
+
+    fn signed_by(entry: &Value) -> String {
+        entry["proof"][0]["verificationMethod"]
+            .as_str()
+            .expect("a proof")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn introducing_a_key_keeps_the_did_and_declares_both_keys_for_authentication() {
+        let (_s, dir, did, old) = born(31).await;
+        let new = ControlKey::from_seed([32u8; 32]);
+
+        let done = introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+
+        assert!(done);
+        let raw = log_of(&dir).await;
+        assert!(resolves(&dir, &did).await, "the log still validates");
+        assert_eq!(did_from_log(&raw).as_deref(), Some(did.as_str()));
+        let state = &last_entry(&raw)["state"];
+        assert_eq!(state["id"], json!(did));
+        assert_eq!(
+            declared_keys(&raw),
+            vec![
+                DeclaredKey {
+                    fragment: "key-1".to_string(),
+                    multibase: old.public_key_multibase()
+                },
+                DeclaredKey {
+                    fragment: "key-2".to_string(),
+                    multibase: new.public_key_multibase()
+                },
+            ]
+        );
+        assert_eq!(state["authentication"], json!([format!("{did}#key-1"), format!("{did}#key-2")]));
+    }
+
+    #[tokio::test]
+    async fn the_introduce_entry_is_signed_by_the_current_key_and_hands_updates_to_both() {
+        let (_s, dir, did, old) = born(33).await;
+        let new = ControlKey::from_seed([34u8; 32]);
+
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+
+        let entry = last_entry(&log_of(&dir).await);
+        let old_mb = old.public_key_multibase();
+        assert_eq!(signed_by(&entry), format!("did:key:{old_mb}#{old_mb}"));
+        assert_eq!(entry["parameters"]["updateKeys"], json!([old_mb, new.public_key_multibase()]));
+    }
+
+    #[tokio::test]
+    async fn retiring_leaves_only_the_new_key_and_is_signed_by_it() {
+        let (_s, dir, did, old) = born(35).await;
+        let new = ControlKey::from_seed([36u8; 32]);
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+
+        let done = keep_only_key(&dir, &did, &new, "key-2")
+            .await
+            .expect("retire");
+
+        assert!(done);
+        let raw = log_of(&dir).await;
+        assert!(resolves(&dir, &did).await);
+        assert_eq!(
+            declared_keys(&raw),
+            vec![DeclaredKey {
+                fragment: "key-2".to_string(),
+                multibase: new.public_key_multibase()
+            }]
+        );
+        let entry = last_entry(&raw);
+        let new_mb = new.public_key_multibase();
+        assert_eq!(signed_by(&entry), format!("did:key:{new_mb}#{new_mb}"));
+        assert_eq!(entry["parameters"]["updateKeys"], json!([new_mb]));
+    }
+
+    #[tokio::test]
+    async fn rolling_back_leaves_only_the_old_key_and_is_signed_by_it() {
+        let (_s, dir, did, old) = born(37).await;
+        let new = ControlKey::from_seed([38u8; 32]);
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+
+        keep_only_key(&dir, &did, &old, "key-1")
+            .await
+            .expect("roll back");
+
+        let raw = log_of(&dir).await;
+        assert!(resolves(&dir, &did).await);
+        assert_eq!(
+            declared_keys(&raw),
+            vec![DeclaredKey {
+                fragment: "key-1".to_string(),
+                multibase: old.public_key_multibase()
+            }]
+        );
+        let old_mb = old.public_key_multibase();
+        assert_eq!(signed_by(&last_entry(&raw)), format!("did:key:{old_mb}#{old_mb}"));
+    }
+
+    #[tokio::test]
+    async fn no_entry_declares_assertion_method() {
+        let (_s, dir, did, old) = born(39).await;
+        let new = ControlKey::from_seed([40u8; 32]);
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+        keep_only_key(&dir, &did, &new, "key-2")
+            .await
+            .expect("retire");
+
+        for line in log_of(&dir).await.lines() {
+            let entry: Value = serde_json::from_str(line).expect("json");
+            assert!(
+                entry["state"]
+                    .get("assertionMethod")
+                    .is_none(),
+                "{entry}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn introducing_twice_is_a_no_op() {
+        let (_s, dir, did, old) = born(41).await;
+        let new = ControlKey::from_seed([42u8; 32]);
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+        let before = log_of(&dir).await;
+
+        let again = introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce again");
+
+        assert!(!again);
+        assert_eq!(log_of(&dir).await, before, "nothing was appended");
+        let retire_again = {
+            keep_only_key(&dir, &did, &new, "key-2")
+                .await
+                .expect("retire");
+            keep_only_key(&dir, &did, &new, "key-2")
+                .await
+                .expect("retire again")
+        };
+        assert!(!retire_again);
+    }
+
+    #[tokio::test]
+    async fn the_next_key_fragment_is_one_past_the_highest_ever_used() {
+        let (_s, dir, did, old) = born(43).await;
+        assert_eq!(next_key_fragment(&log_of(&dir).await), "key-2");
+        let new = ControlKey::from_seed([44u8; 32]);
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce");
+        keep_only_key(&dir, &did, &new, "key-2")
+            .await
+            .expect("retire");
+
+        assert_eq!(
+            next_key_fragment(&log_of(&dir).await),
+            "key-3",
+            "a retired id is never reused, and the highest one counts even once it is the only key"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_is_never_built_in_the_same_second_as_the_previous_one() {
+        let (_s, dir, did, old) = born(45).await;
+        let new = ControlKey::from_seed([46u8; 32]);
+
+        introduce_key(&dir, &did, &old, "key-2", &new.public_key_multibase())
+            .await
+            .expect("introduce right after the birth");
+        keep_only_key(&dir, &did, &new, "key-2")
+            .await
+            .expect("retire right after");
+
+        assert!(resolves(&dir, &did).await, "every entry is later than the one before");
+        let times: Vec<i64> = log_of(&dir)
+            .await
+            .lines()
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                chrono::DateTime::parse_from_rfc3339(
+                    v["versionTime"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap()
+                .timestamp()
+            })
+            .collect();
+        assert!(
+            times
+                .windows(2)
+                .all(|w| w[0] < w[1]),
+            "{times:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keeping_a_key_the_document_does_not_declare_is_refused() {
+        let (_s, dir, did, old) = born(47).await;
+        let err = keep_only_key(&dir, &did, &old, "key-9")
+            .await
+            .expect_err("not declared");
+        assert!(format!("{}", err.log_detail()).contains("key-9"));
+    }
+
     #[tokio::test]
     async fn an_id_that_is_not_a_plain_identifier_cannot_name_a_did() {
         let dir = tempfile::tempdir().expect("tempdir");
