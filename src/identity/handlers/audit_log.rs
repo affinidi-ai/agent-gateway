@@ -229,6 +229,8 @@ mod tests {
                 .category_counts
                 .is_empty()
         );
+        assert!(response.truncated, "nothing was read, so the page does not claim to be the whole history");
+        assert_eq!((response.history_bytes, response.dropped_records), (0, 0), "and it says nothing of the log");
     }
 
     #[test]
