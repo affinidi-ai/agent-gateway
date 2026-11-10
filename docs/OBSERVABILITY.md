@@ -450,10 +450,11 @@ it the disk, because an audit log that fills the disk stops being written — an
 Because nothing is deleted by default, an audit response carries the size of the history on disk
 (`history_bytes`, the live log plus every rotated file) and the advisory
 `[audit] vp_audit_log_soft_cap_bytes` (`soft_cap_bytes`, 1 GiB by default, `0` for none). The
-Audit page shows the one against the other. The soft cap enforces nothing: no record is deleted,
-no write is refused and no rotation happens at it, and the history keeps growing past it. It is
-there so an operator sees the growth and decides what to do — forward to a Governance Audit
-integration, or bound the history below.
+Audit page shows the one against the other. Both describe every tenant's records, so only a session
+or an appliance-wide access token is told them; every other caller reads `0` for both. The soft cap
+enforces nothing: no record is deleted, no write is refused and no rotation happens at it, and the
+history keeps growing past it. It is there so an operator sees the growth and decides what to do —
+forward to a Governance Audit integration, or bound the history below.
 
 The size is measured once, by listing the directory, when the gateway opens the log; from then on
 the writer keeps it as it appends and as retention deletes, so reporting it costs a page load

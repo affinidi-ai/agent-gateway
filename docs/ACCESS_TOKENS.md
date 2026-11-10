@@ -250,10 +250,12 @@ by an earlier release names the provider's `provider_id` slug instead and is sho
 appliance-wide callers, as is the `delegation_failed` of a refused consent, which names the provider
 by its slug. A provider's slug never decides who reads a record, since two tenants can each have a
 provider with the same slug. A line of the log that does not parse as a record names no provider, so
-`dropped_records` counts it only for an appliance-wide caller. A PAT scoped by required headers
-alone, or by a resource pattern without a tenant, reads no record. While the credential providers
-cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and an empty page marked
-`truncated` from `/v1/audit`. A record follows its provider's current tenant, as a vault token does.
+`dropped_records` counts it only for an appliance-wide caller. Only such a caller is told the size of
+the whole history, `history_bytes` and `soft_cap_bytes`; other callers read `0` for both. A PAT
+scoped by required headers alone, or by a resource pattern without a tenant, reads no record. While
+the credential providers cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and
+an empty page marked `truncated` from `/v1/audit`. A record follows its provider's current tenant,
+as a vault token does.
 
 ### Ownership of child records
 
