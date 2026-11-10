@@ -8,7 +8,7 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Once, RwLock};
 
 use chrono::{DateTime, Utc};
 
@@ -27,15 +27,41 @@ pub struct Live {
     storage: PathBuf,
 }
 
-static LIVE: OnceLock<Live> = OnceLock::new();
+static LIVE: RwLock<Option<Arc<Live>>> = RwLock::new(None);
 
-/// Remember the bundled client for later rotations. Does nothing a second time.
+fn live() -> Option<Arc<Live>> {
+    LIVE.read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Remember the bundled client for later rotations, replacing an earlier one
+/// (a process that builds more than one gateway, as the tests do, rotates the
+/// latest).
 pub fn register(
     client: Arc<VtaRestClient>,
     config: VtaConfig,
     storage: PathBuf,
 ) {
-    let _ = LIVE.set(Live { client, config, storage });
+    *LIVE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(Live { client, config, storage }));
+}
+
+/// The shortest time between two rotations asked for by a person.
+pub const MIN_MANUAL_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
+
+/// Seconds left before another rotation may be asked for, if it is too soon.
+pub fn seconds_until_allowed(
+    last_rotated_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<u64> {
+    let allowed_at = last_rotated_at? + MIN_MANUAL_INTERVAL;
+    (now < allowed_at).then(|| {
+        (allowed_at - now)
+            .num_seconds()
+            .max(1) as u64
+    })
 }
 
 /// What started a rotation, for the audit trail.
@@ -65,6 +91,8 @@ pub enum RotateNowError {
     Standby,
     /// Another rotation is running.
     InProgress,
+    /// A rotation was asked for too soon after the last one; the seconds to wait.
+    TooSoon(u64),
     Failed(VtaError),
 }
 
@@ -145,10 +173,14 @@ pub async fn rotate_now(
     user: Option<&str>,
 ) -> Result<Report, RotateNowError> {
     precondition(crate::server::mode::is_standby(), super::bundled::status().map(|s| s.state))?;
-    let live = LIVE
-        .get()
-        .ok_or(RotateNowError::NotBundled)?;
-    let result = perform(live, trigger, user).await;
+    let live = live().ok_or(RotateNowError::NotBundled)?;
+    if trigger == Trigger::Api
+        && let Some(seconds) =
+            seconds_until_allowed(super::bundled::status().and_then(|s| s.control_key_rotated_at), Utc::now())
+    {
+        return Err(RotateNowError::TooSoon(seconds));
+    }
+    let result = perform(&live, trigger, user).await;
     if let Err(e) = &result {
         tracing::warn!(
             target: "vta_audit",
@@ -167,6 +199,7 @@ fn describe(error: &RotateNowError) -> String {
         RotateNowError::NotConnected(state) => format!("the bundled trust agent is {state}"),
         RotateNowError::Standby => "this gateway is on standby".to_string(),
         RotateNowError::InProgress => "another rotation is running".to_string(),
+        RotateNowError::TooSoon(seconds) => format!("the last rotation was too recent; retry in {seconds}s"),
         RotateNowError::Failed(e) => e.to_string(),
     }
 }
@@ -211,37 +244,42 @@ where
 /// Start the background schedule. Rotation runs only on the active gateway and
 /// only while the bundled agent is connected, an hour apart at most.
 pub fn spawn_schedule() {
-    if LIVE.get().is_none() {
+    static STARTED: Once = Once::new();
+    if live().is_none() {
         return;
     }
-    tokio::spawn(async move {
-        let mut schedule = Schedule::default();
-        let mut modes = crate::server::mode::subscribe_mode_changes();
-        let mut wait = std::time::Duration::from_secs(60);
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(wait) => {}
-                _ = modes.recv() => {}
-            }
-            wait = std::time::Duration::from_secs(3600);
-            let status = super::bundled::status();
-            let connected = status
-                .as_ref()
-                .is_some_and(|s| s.state == BootstrapState::Connected);
-            let due = status
-                .as_ref()
-                .and_then(|s| s.control_key_next_rotation_at);
-            let jitter = status
-                .as_ref()
-                .and_then(|s| s.control_did.as_deref())
-                .map(control_key_schedule::jitter)
-                .unwrap_or_default();
-            tick(&mut schedule, Utc::now(), due, jitter, crate::server::mode::is_standby(), connected, || {
-                rotate_now(Trigger::Schedule, None)
-            })
-            .await;
-        }
+    STARTED.call_once(|| {
+        tokio::spawn(schedule_loop());
     });
+}
+
+async fn schedule_loop() {
+    let mut schedule = Schedule::default();
+    let mut modes = crate::server::mode::subscribe_mode_changes();
+    let mut wait = std::time::Duration::from_secs(60);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = modes.recv() => {}
+        }
+        wait = std::time::Duration::from_secs(3600);
+        let status = super::bundled::status();
+        let connected = status
+            .as_ref()
+            .is_some_and(|s| s.state == BootstrapState::Connected);
+        let due = status
+            .as_ref()
+            .and_then(|s| s.control_key_next_rotation_at);
+        let jitter = status
+            .as_ref()
+            .and_then(|s| s.control_did.as_deref())
+            .map(control_key_schedule::jitter)
+            .unwrap_or_default();
+        tick(&mut schedule, Utc::now(), due, jitter, crate::server::mode::is_standby(), connected, || {
+            rotate_now(Trigger::Schedule, None)
+        })
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +298,14 @@ mod tests {
             rotated_at: at(90),
             next_rotation_at: Some(at(180)),
         }
+    }
+
+    #[test]
+    fn a_manual_rotation_is_refused_for_ten_minutes_after_the_last() {
+        let last = Some(at(5));
+        assert_eq!(seconds_until_allowed(last, at(5) + chrono::Duration::minutes(4)), Some(360));
+        assert_eq!(seconds_until_allowed(last, at(5) + chrono::Duration::minutes(10)), None);
+        assert_eq!(seconds_until_allowed(None, at(5)), None, "never rotated is never too soon");
     }
 
     #[test]

@@ -105,6 +105,18 @@ async fn read_seed(path: &Path) -> Result<Option<[u8; 32]>, VtaError> {
     }
 }
 
+/// The DID of the control key stored at `path`, if there is one. Public data:
+/// what an operator re-grants after restoring a backup taken before a rotation.
+pub async fn stored_control_did(path: &Path) -> Result<Option<String>, VtaError> {
+    Ok(read_seed(path)
+        .await?
+        .map(|seed| {
+            ControlKey::from_seed(seed)
+                .did()
+                .to_string()
+        }))
+}
+
 async fn write_seed(
     path: &Path,
     key: &ControlKey,
@@ -881,6 +893,27 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             pending.seed_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_control_did_is_the_one_on_disk_and_only_that() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, key) = enrolled_gateway(&mock, dir.path()).await;
+
+        assert_eq!(
+            stored_control_did(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(key.did())
+        );
+        assert_eq!(
+            stored_control_did(&dir.path().join("absent"))
+                .await
+                .unwrap(),
+            None
         );
     }
 

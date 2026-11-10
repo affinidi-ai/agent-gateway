@@ -255,6 +255,7 @@ What your deployment has to provide, whatever runs it (Compose, a Kubernetes Pod
 | Two secrets | The sidecar's seed passphrase (a mounted file) and the gateway's encryption-at-rest key, which is mandatory on this tier. |
 | Gateway configuration | The `[vta]` block from `config.bundled.toml` added to `config.toml`: `mode = "embedded"` and `auto_bootstrap = true`. |
 | Start order | Restart the gateway first and the sidecar second under Compose. In a Pod either can restart alone. |
+| Backups and rotation | The gateway rotates its control key every 90 days, so a gateway backup older than the last rotation holds a key the sidecar no longer accepts. After a restore, print the key's DID with `agent-gateway --vta-print-control-did` and grant it again on the sidecar; see [Rotating the control key](VTA_INTEGRATION_POC.md#rotating-the-control-key). |
 
 Start from the reference files in [`config/examples/vta-bundled/`](../config/examples/vta-bundled/):
 the Compose example has been run with real containers, and the Kubernetes Pod has only had its

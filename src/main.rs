@@ -137,6 +137,11 @@ struct Args {
     #[arg(long)]
     vta_rotate_control_key: bool,
 
+    /// Print the did:key of the control key stored for the bundled trust agent,
+    /// for granting it again after a backup restore. Prints public data only.
+    #[arg(long)]
+    vta_print_control_did: bool,
+
     /// Confirm --vta-rebootstrap or --vta-rotate-control-key.
     #[arg(long)]
     yes: bool,
@@ -323,6 +328,22 @@ async fn async_main() -> Result<()> {
     // Initialize global encryption config for all storage operations
     storage::filesystem::init_global_encryption(encryption.clone())
         .context("Failed to initialize storage encryption")?;
+
+    if args.vta_print_control_did {
+        let issuer_storage = std::path::PathBuf::from(
+            &bootstrap_config
+                .storage_paths
+                .vc_keys,
+        );
+        match vta::control_rotation::stored_control_did(&vta::appliance_control_key_path(&issuer_storage))
+            .await
+            .map_err(|e| anyhow::anyhow!(e.log_detail().to_string()))?
+        {
+            Some(did) => println!("{did}"),
+            None => anyhow::bail!("no control key is stored for the bundled trust agent"),
+        }
+        return Ok(());
+    }
 
     if args.vta_rotate_control_key {
         let issuer_storage = std::path::PathBuf::from(

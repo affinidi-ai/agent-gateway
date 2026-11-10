@@ -229,3 +229,151 @@ async fn trust_agent_was_asked_to_create_keys(
         .signing_keys_created();
     assert_eq!(created, count);
 }
+
+#[given("a bundled trust agent that refuses to move the gateway's access entry")]
+async fn bundled_trust_agent_that_refuses_the_swap(world: &mut SurfaceWorld) {
+    bundled_trust_agent(world, Behaviour::RefusingSwap, true).await;
+}
+
+#[given(expr = "human user {string} lacks permission to manage keys")]
+async fn human_user_lacks_key_management(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    crate::steps::terms::login(world, &username, "user").await;
+}
+
+#[when("the operator rotates the bundled control key")]
+async fn operator_rotates_the_control_key(world: &mut SurfaceWorld) {
+    let response = send(world, Method::POST, "/v1/vta/control-key/rotate", None).await;
+    world.admin_response = Some(response);
+}
+
+#[given("the operator has rotated the bundled control key")]
+async fn operator_has_rotated_the_control_key(world: &mut SurfaceWorld) {
+    let response = send(world, Method::POST, "/v1/vta/control-key/rotate", None).await;
+    assert_eq!(response.status, 200, "{}", response.body);
+}
+
+#[when(expr = "human user {string} tries to rotate the bundled control key")]
+async fn human_user_tries_to_rotate(
+    world: &mut SurfaceWorld,
+    username: String,
+) {
+    let client = crate::steps::terms::latest_client(world, &username);
+    let response = client
+        .send_recorded_json::<serde_json::Value>(Method::POST, "/v1/vta/control-key/rotate", None)
+        .await
+        .expect("the rotation request completes");
+    world.admin_response = Some(response);
+}
+
+fn rotation(world: &SurfaceWorld) -> &serde_json::Value {
+    &world
+        .admin_response
+        .as_ref()
+        .expect("a rotation was asked for")
+        .body
+}
+
+#[then("the trust agent knows the gateway by the new did:key")]
+async fn trust_agent_knows_the_new_did(world: &mut SurfaceWorld) {
+    let body = rotation(world);
+    let (previous, new) = (
+        body["previous_control_did"]
+            .as_str()
+            .expect("previous DID"),
+        body["control_did"]
+            .as_str()
+            .expect("new DID"),
+    );
+    assert_ne!(previous, new, "{body}");
+    let agent = world
+        .bundled_trust_agent
+        .as_ref()
+        .expect("a bundled trust agent");
+    assert_eq!(
+        agent
+            .gateway_entry()
+            .as_deref(),
+        Some(new)
+    );
+    assert_eq!(agent.swaps(), vec![(previous.to_string(), new.to_string())]);
+}
+
+#[then("the trust agent refused no sign-in from the gateway")]
+async fn trust_agent_refused_no_sign_in(world: &mut SurfaceWorld) {
+    let refused = world
+        .bundled_trust_agent
+        .as_ref()
+        .expect("a bundled trust agent")
+        .refused_sign_ins();
+    assert_eq!(refused, 0, "the gateway signed in as a key that no longer holds the entry");
+}
+
+#[then(expr = "the bootstrap signing key is still {string}")]
+async fn bootstrap_signing_key_is(
+    world: &mut SurfaceWorld,
+    key_id: String,
+) {
+    assert_eq!(status(world)["bootstrap"]["signing_key_id"], key_id, "{}", status(world));
+}
+
+#[then("the status shows the control key was rotated just now")]
+async fn status_shows_rotated_just_now(world: &mut SurfaceWorld) {
+    let rotated = status(world)["bootstrap"]["control_key_rotated_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no rotation time in {}", status(world)));
+    let rotated = chrono::DateTime::parse_from_rfc3339(rotated).expect("an RFC 3339 time");
+    let age = chrono::Utc::now().signed_duration_since(rotated);
+    assert!(age < chrono::Duration::minutes(1) && age > chrono::Duration::minutes(-1), "{age}");
+}
+
+#[then("the next rotation is due in 90 days")]
+async fn next_rotation_is_due_in_ninety_days(world: &mut SurfaceWorld) {
+    let bootstrap = &status(world)["bootstrap"];
+    assert_eq!(bootstrap["control_key_rotation_days"], 90, "{bootstrap}");
+    let next = bootstrap["control_key_next_rotation_at"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no next rotation in {bootstrap}"));
+    let next = chrono::DateTime::parse_from_rfc3339(next).expect("an RFC 3339 time");
+    let wait = next.signed_duration_since(chrono::Utc::now());
+    assert!(wait > chrono::Duration::days(89) && wait < chrono::Duration::days(91), "{wait}");
+}
+
+#[then("the trust agent still knows the gateway by the did:key it enrolled")]
+async fn trust_agent_still_knows_the_first_did(world: &mut SurfaceWorld) {
+    let response = send(world, Method::GET, "/v1/vta/status", None).await;
+    let reported = response.body["bootstrap"]["control_did"]
+        .as_str()
+        .expect("a control DID")
+        .to_string();
+    let agent = world
+        .bundled_trust_agent
+        .as_ref()
+        .expect("a bundled trust agent");
+    assert_eq!(
+        agent
+            .gateway_entry()
+            .as_deref(),
+        Some(reported.as_str())
+    );
+    assert!(agent.swaps().is_empty(), "nothing moved");
+    assert_eq!(response.body["bootstrap"]["state"], "connected", "the gateway is still connected: {}", response.body);
+}
+
+#[then("the rotation is told how long to wait")]
+async fn rotation_is_told_to_wait(world: &mut SurfaceWorld) {
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("a rotation was asked for");
+    assert_eq!(response.status, 429, "{}", response.body);
+    let wait: u64 = response
+        .headers
+        .get("retry-after")
+        .unwrap_or_else(|| panic!("no Retry-After in {:?}", response.headers))
+        .parse()
+        .expect("seconds");
+    assert!((1..=600).contains(&wait), "{wait}");
+}

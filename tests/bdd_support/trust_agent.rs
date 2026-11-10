@@ -31,6 +31,9 @@ pub enum Behaviour {
     Refusing,
     /// Enrolled the gateway as an administrator that may export keys.
     OverPrivileged,
+    /// Enrolled the gateway with exactly the bundled grant, but refuses to move
+    /// its access entry to another key.
+    RefusingSwap,
 }
 
 #[derive(Debug)]
@@ -39,6 +42,11 @@ struct AgentState {
     keys: Vec<Value>,
     creates: usize,
     context_did: Option<String>,
+    /// The one DID the gateway is enrolled as. The first DID to authenticate is
+    /// taken to be the one the sidecar's start-up script enrolled.
+    entry: Option<String>,
+    swaps: Vec<(String, String)>,
+    refused: usize,
 }
 
 #[derive(Debug)]
@@ -72,12 +80,25 @@ async fn trust_tasks(
     let mut agent = state
         .lock()
         .expect("mock trust agent state");
+    let issuer = body["issuer"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     if task.contains("auth/challenge") {
         return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
     }
     if task.contains("auth/authenticate") {
         if agent.behaviour == Behaviour::Refusing {
             return (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } }))).into_response();
+        }
+        match &agent.entry {
+            None => agent.entry = Some(issuer),
+            Some(entry) if *entry != issuer => {
+                agent.refused += 1;
+                return (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } })))
+                    .into_response();
+            }
+            Some(_) => {}
         }
         return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": "t", "expiresIn": 3600 } }))
             .into_response();
@@ -93,6 +114,37 @@ async fn trust_tasks(
             "roles": [role], "scopes": ["ctx:gateway"], "capabilities": capabilities,
         } }))
         .into_response();
+    }
+    if task.contains("acl/swap-key") {
+        let payload = &body["payload"];
+        let current = payload["currentSubject"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let new = payload["newSubject"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let denied = || (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } })));
+        if agent.behaviour == Behaviour::RefusingSwap
+            || agent.entry.as_deref() != Some(current.as_str())
+            || issuer != current
+            || body.get("proof").is_none()
+            || link_proof_is_valid(
+                payload["linkProof"]
+                    .as_str()
+                    .unwrap_or_default(),
+                &new,
+            )
+            .is_err()
+        {
+            return denied().into_response();
+        }
+        agent.entry = Some(new.clone());
+        agent
+            .swaps
+            .push((current.clone(), new.clone()));
+        return Json(json!({ "payload": { "entry": { "subject": new }, "previousSubject": current } })).into_response();
     }
     if task.contains("keys/list") {
         return Json(json!({ "payload": { "keys": agent.keys } })).into_response();
@@ -125,6 +177,56 @@ async fn trust_tasks(
     (StatusCode::BAD_REQUEST, Json(json!({ "error": "unexpected task" }))).into_response()
 }
 
+/// What a real trust agent checks before it lets a key take over an access
+/// entry: the proof is for this trust agent, is current, and is signed by the
+/// new key itself.
+fn link_proof_is_valid(
+    proof: &str,
+    new_subject: &str,
+) -> Result<(), String> {
+    use base64::Engine;
+    use ed25519_dalek::Verifier;
+    let parts: Vec<&str> = proof.split('.').collect();
+    if parts.len() != 3 {
+        return Err("not a compact JWS".to_string());
+    }
+    let decode = |part: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|e| e.to_string())
+    };
+    let payload: Value = serde_json::from_slice(&decode(parts[1])?).map_err(|e| e.to_string())?;
+    if payload["aud"] != TRUST_AGENT_DID {
+        return Err("not for this trust agent".to_string());
+    }
+    let now = chrono::Utc::now().timestamp() as u64;
+    if payload["exp"]
+        .as_u64()
+        .unwrap_or(0)
+        <= now
+    {
+        return Err("expired".to_string());
+    }
+    if payload["iss"] != new_subject || payload["vp"]["holder"] != new_subject {
+        return Err("not by the new subject".to_string());
+    }
+    let (_, key_bytes) = multibase::decode(
+        new_subject
+            .strip_prefix("did:key:")
+            .ok_or("not a did:key")?,
+    )
+    .map_err(|e| e.to_string())?;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(
+        key_bytes[2..]
+            .try_into()
+            .map_err(|_| "key length".to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let signature = ed25519_dalek::Signature::from_slice(&decode(parts[2])?).map_err(|e| e.to_string())?;
+    key.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)
+        .map_err(|e| e.to_string())
+}
+
 impl MockTrustAgent {
     pub async fn start(behaviour: Behaviour) -> Self {
         let state = Arc::new(Mutex::new(AgentState {
@@ -132,6 +234,9 @@ impl MockTrustAgent {
             keys: Vec::new(),
             creates: 0,
             context_did: None,
+            entry: None,
+            swaps: Vec::new(),
+            refused: 0,
         }));
         let app = Router::new()
             .route("/health", get(health))
@@ -187,5 +292,32 @@ impl MockTrustAgent {
             .lock()
             .expect("mock trust agent state")
             .creates
+    }
+
+    /// The DID the trust agent currently knows the gateway by.
+    pub fn gateway_entry(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("mock trust agent state")
+            .entry
+            .clone()
+    }
+
+    /// Every `(from, to)` move of the gateway's access entry.
+    pub fn swaps(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .expect("mock trust agent state")
+            .swaps
+            .clone()
+    }
+
+    /// How many sign-ins were refused because they came from a DID that no
+    /// longer holds the entry.
+    pub fn refused_sign_ins(&self) -> usize {
+        self.state
+            .lock()
+            .expect("mock trust agent state")
+            .refused
     }
 }

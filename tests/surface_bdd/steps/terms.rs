@@ -8,7 +8,7 @@ use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN;
 use crate::steps::when::ensure_gateway_running;
 use crate::world::SurfaceWorld;
 
-async fn login(
+pub(crate) async fn login(
     world: &mut SurfaceWorld,
     username: &str,
     role: &str,
@@ -33,7 +33,7 @@ async fn login(
     client
 }
 
-fn latest_client(
+pub(crate) fn latest_client(
     world: &SurfaceWorld,
     username: &str,
 ) -> AdminApiClient {

@@ -1,6 +1,16 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T10:30:00Z'
+      title: Rotate the bundled trust agent's control key from the API
+      description: >-
+        POST /v1/vta/control-key/rotate moves the gateway's access entry on its
+        bundled trust agent to a new control key now. It needs key management
+        edit rights, is refused with 429 and a Retry-After for ten minutes after
+        the last rotation, with 409 while the agent is not connected, and answers
+        502 when the agent refuses, leaving the current key in use. The new
+        --vta-print-control-did command prints the stored key's DID for granting
+        it again after a backup restore.
     - timestamp: '2026-11-10T10:00:00Z'
       title: ⭐ Rotate the bundled trust agent's control key every 90 days
       description: >-

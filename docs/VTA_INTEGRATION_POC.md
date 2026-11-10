@@ -256,14 +256,38 @@ new keys and DIDs.
 
 ### Rotating the control key
 
-`agent-gateway --vta-rotate-control-key --yes`, **with the gateway stopped**
-(a trust agent supersedes a DID's session when it authenticates again, and the
-running connector holds the old key in memory). It moves the gateway's access
-entry to a new `did:key` with `acl/swap-key`: the new key signs a short proof
-that it agrees to take the entry over, and the agent copies the entry exactly,
-so the grant cannot widen. The new key is stored as pending before the swap is
-sent, so a crash part-way is finished or abandoned at the next start by asking
-the agent which key is live.
+The control key moves while the gateway runs. It rotates **every 90 days by
+default** (`[vta] control_key_rotation_days`, `0` turns it off), on demand from
+the **Rotate control key** button on the Trust Agent page or
+`POST /v1/vta/control-key/rotate` (key management edit rights; refused with
+`429` and a `Retry-After` for ten minutes after the last rotation), and offline
+with `agent-gateway --vta-rotate-control-key --yes` while the gateway is
+stopped. `GET /v1/vta/status` reports `bootstrap.control_key_rotated_at`,
+`control_key_next_rotation_at` and `control_key_rotation_days`.
+
+It moves the gateway's access entry to a new `did:key` with `acl/swap-key`: the
+new key signs a short proof that it agrees to take the entry over, and the
+agent copies the entry exactly, so the grant cannot widen. Only the access entry
+moves; the signing keys, the issuer and the agents' keys are untouched. The
+swap is sent through the connection the gateway already has, so the old DID
+never signs in a second time and nothing in flight is superseded. The new key
+is stored as pending before the swap is sent, so a crash part-way is finished
+or abandoned by asking the agent which key is live, at the next start or on the
+next refused sign-in. A refusal from the agent leaves the current key in use;
+a rotation never makes the gateway sign locally.
+
+The schedule runs on the active gateway only, while the bundled agent is
+connected, with a random delay of up to six hours so gateways installed
+together do not rotate at once. A failure keeps the current key and retries
+after an hour, doubling up to a day, and logs an error after three failures in
+a row. Each rotation logs `vta_control_key_rotated` (old and new DID, what
+triggered it) on the `vta_audit` target.
+
+After restoring a backup taken before the last rotation the stored key is one
+the agent no longer accepts. Print its DID with
+`agent-gateway --vta-print-control-did`, grant it again on the sidecar with the
+same `vta acl create` flags `vta-entrypoint.sh` uses, and start the gateway.
+Do not use `--vta-rebootstrap` for this: it creates new signing keys.
 
 This is hygiene, not recovery from a leak: whoever holds the current key can
 rotate it to one of their own, exactly as with a `did:webvh` control key.

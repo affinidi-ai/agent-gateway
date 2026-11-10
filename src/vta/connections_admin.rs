@@ -1166,6 +1166,89 @@ pub async fn vta_status(
         .into_response()
 }
 
+/// How a refused rotation is answered: the status, the seconds to wait (for a
+/// `429`), and a message that names the next step without naming VTA internals.
+fn rotation_refusal(error: &crate::vta::control_key_live::RotateNowError) -> (StatusCode, Option<u64>, String) {
+    use crate::vta::control_key_live::RotateNowError as E;
+    match error {
+        E::NotBundled => (
+            StatusCode::NOT_FOUND,
+            None,
+            "this gateway runs no bundled trust agent, so there is no key to rotate".to_string(),
+        ),
+        E::NotConnected(state) => (
+            StatusCode::CONFLICT,
+            None,
+            format!("the bundled trust agent is {state}; the control key can be rotated once it is connected"),
+        ),
+        E::InProgress => (StatusCode::CONFLICT, None, "a rotation is already running".to_string()),
+        E::Standby => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            "this gateway is on standby; the active gateway rotates the key".to_string(),
+        ),
+        E::TooSoon(seconds) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(*seconds),
+            format!("the control key was rotated moments ago; try again in {seconds} seconds"),
+        ),
+        E::Failed(_) => (
+            StatusCode::BAD_GATEWAY,
+            None,
+            "the trust agent did not accept the rotation; the current control key still works".to_string(),
+        ),
+    }
+}
+
+/// `POST /v1/vta/control-key/rotate` — move the gateway's access entry on its
+/// bundled trust agent to a new control key, now.
+///
+/// Signing keys and issuer identities are untouched; only the key the gateway
+/// authenticates with changes. Needs key management edit rights.
+pub async fn rotate_control_key(
+    Extension(user_id): Extension<String>,
+    Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
+    Extension(rbac_config): Extension<Arc<RbacConfig>>,
+    pat: Option<Extension<PatContext>>,
+) -> axum::response::Response {
+    if let Err(e) = require_permission(
+        &user_id,
+        &passkey_storage,
+        &rbac_config,
+        &Feature::KeyManagementEdit,
+        pat.as_ref()
+            .map(|Extension(pat)| pat),
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    match crate::vta::control_key_live::rotate_now(crate::vta::control_key_live::Trigger::Api, Some(&user_id)).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "previous_control_did": report.previous_control_did,
+                "control_did": report.control_did,
+                "rotated_at": report.rotated_at,
+                "next_rotation_at": report.next_rotation_at,
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            let (status, retry_after, message) = rotation_refusal(&error);
+            let mut response = (status, ErrorBody::json(message)).into_response();
+            if let Some(seconds) = retry_after
+                && let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string())
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+            response
+        }
+    }
+}
+
 /// `GET /v1/key-management/inventory` — every key this appliance signs with,
 /// which surface maps to what, and which contexts no surface claims.
 ///
@@ -1506,6 +1589,7 @@ pub fn create_vta_connection_router(
         .route("/v1/vta/connections/{id}/rotate", post(rotate_connection_key))
         .route("/v1/vta/connections/{id}/keys", post(provision_connection_key))
         .route("/v1/vta/status", get(vta_status))
+        .route("/v1/vta/control-key/rotate", post(rotate_control_key))
         .route("/v1/key-management/inventory", get(key_inventory))
         .with_state(state);
     if let Some(secrets_store) = secrets_store {
@@ -1571,6 +1655,35 @@ mod tests {
             verified: true,
             origin: None,
         }
+    }
+
+    #[test]
+    fn every_refused_rotation_is_answered_with_its_own_status_and_no_agent_internals() {
+        use crate::vta::bundled::BootstrapState;
+        use crate::vta::control_key_live::RotateNowError as E;
+        let cases = [
+            (E::NotBundled, StatusCode::NOT_FOUND, None),
+            (E::NotConnected(BootstrapState::WaitingForVta.label()), StatusCode::CONFLICT, None),
+            (E::InProgress, StatusCode::CONFLICT, None),
+            (E::Standby, StatusCode::SERVICE_UNAVAILABLE, None),
+            (E::TooSoon(420), StatusCode::TOO_MANY_REQUESTS, Some(420)),
+            (
+                E::Failed(crate::vta::error::VtaError::Http {
+                    status: 403,
+                    body: "secret-internal-detail".to_string(),
+                }),
+                StatusCode::BAD_GATEWAY,
+                None,
+            ),
+        ];
+        for (error, status, retry) in cases {
+            let (got_status, got_retry, message) = rotation_refusal(&error);
+            assert_eq!(got_status, status, "{error:?}");
+            assert_eq!(got_retry, retry, "{error:?}");
+            assert!(!message.contains("secret-internal-detail"), "{message}");
+        }
+        let (_, _, message) = rotation_refusal(&E::NotConnected(BootstrapState::WaitingForVta.label()));
+        assert!(message.contains("waiting for the trust agent"), "{message}");
     }
 
     #[tokio::test]

@@ -39,8 +39,11 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   deployment, which a claim would provide.
 - **A sidecar that starts after the gateway is only picked up at the next start.** There is no
   hot adoption.
-- **Control-key rotation needs the gateway stopped.** The running connector holds the key in
-  memory and the trust agent supersedes a DID's session when it authenticates again.
+- **A rotated control key's old session lives on for up to 15 minutes.** After a swap the
+  trust agent's signing gates fall back to the role in an already-issued access token, so a
+  copy of the old key that holds a token keeps signing until it expires. Rotation protects
+  against old copies of the key (backups, snapshots), not against a session already open.
+  The trust agent ending the old DID's sessions on a swap would close this.
 - **The Kubernetes pod was validated for syntax only.** The Compose example is run with real
   containers by `scripts/vta-bundled-compose-e2e.sh`; no cluster was available for the pod.
 - **Compose restarts must be ordered.** The sidecar joins the gateway's network namespace, so
