@@ -166,6 +166,10 @@ The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ss
 `SCRAM-SHA-256` or `SCRAM-SHA-512`); see
 _Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
 
+The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
+explanation behind `FieldHelp`; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 

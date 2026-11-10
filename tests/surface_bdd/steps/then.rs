@@ -4454,11 +4454,14 @@ fn startup_report_does_not_name_breach(
 
 #[then("the gateway log shows no credential provider secret or token")]
 fn gateway_log_shows_no_provider_secret(world: &mut SurfaceWorld) {
+    use crate::bdd_support::config::target_auth::{
+        TARGET_AUTH_CLIENT_ID_VALUE, TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_PROVIDER_TOKEN,
+    };
+    use base64::Engine;
     let log = gateway_log(world);
-    for secret in [
-        crate::bdd_support::config::target_auth::TARGET_AUTH_PROVIDER_TOKEN,
-        crate::bdd_support::config::target_auth::TARGET_AUTH_CLIENT_SECRET_VALUE,
-    ] {
+    let basic_credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("{TARGET_AUTH_CLIENT_ID_VALUE}:{TARGET_AUTH_CLIENT_SECRET_VALUE}"));
+    for secret in [TARGET_AUTH_PROVIDER_TOKEN, TARGET_AUTH_CLIENT_SECRET_VALUE, basic_credentials.as_str()] {
         assert!(!log.contains(secret), "the gateway log shows a credential provider secret or token");
     }
 }
@@ -4524,7 +4527,6 @@ async fn target_credential_provider_received_signed_jwt_bearer_grant(world: &mut
         .first()
         .expect("the token endpoint received a grant");
     assert_eq!(grant["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
-    assert!(!grant.contains_key("client_secret"), "a JWT Bearer grant sends no client secret");
     let token_endpoint = world
         .surface_config
         .target_auth_provider

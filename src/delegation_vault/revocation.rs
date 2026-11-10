@@ -1203,17 +1203,16 @@ impl<'a> RevocationClient<'a> {
         })
     }
 
-    async fn revoke(
+    /// The request that revokes `token`, or `None` when the client's credential does not fit its
+    /// method. Its `Authorization` header, when the method sends one, is marked sensitive.
+    fn request(
         &self,
         token: &str,
         hint: &str,
-    ) -> RevocationOutcome {
-        let Some(authentication) = self
+    ) -> Option<reqwest::RequestBuilder> {
+        let authentication = self
             .credential
-            .authenticate(self.provider)
-        else {
-            return RevocationOutcome::ClientUnavailable;
-        };
+            .authenticate(self.provider)?;
         let mut form: Vec<(&str, &str)> = vec![("token", token), ("token_type_hint", hint)];
         form.extend(
             authentication
@@ -1221,15 +1220,25 @@ impl<'a> RevocationClient<'a> {
                 .iter()
                 .map(|(name, value)| (*name, value.as_str())),
         );
-        let authorization = authentication.authorization;
-        let mut request = self
+        let request = self
             .http
             .post(self.endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
             .form(&form);
-        if let Some(authorization) = authorization {
-            request = request.header(reqwest::header::AUTHORIZATION, authorization.as_str());
-        }
+        Some(match authentication.authorization {
+            Some(authorization) => super::oauth::with_sensitive_authorization(request, &authorization),
+            None => request,
+        })
+    }
+
+    async fn revoke(
+        &self,
+        token: &str,
+        hint: &str,
+    ) -> RevocationOutcome {
+        let Some(request) = self.request(token, hint) else {
+            return RevocationOutcome::ClientUnavailable;
+        };
         match request.send().await {
             Ok(response) if response.status().is_success() => RevocationOutcome::Revoked,
             Ok(response)
@@ -1800,6 +1809,45 @@ pub(crate) mod tests {
                 .contains("authorization:"),
             "{}",
             requests[1].0
+        );
+    }
+
+    #[test]
+    fn a_revocation_request_marks_a_basic_authorization_header_sensitive() {
+        let basic = provider(Some("http://127.0.0.1/revoke"), "client_secret_basic", Some("client-secret"));
+        let post = provider(Some("http://127.0.0.1/revoke"), "client_secret_post", Some("client-secret"));
+        let request = |provider: &CredentialProvider| {
+            RevocationClient {
+                endpoint: "http://127.0.0.1/revoke",
+                provider,
+                credential: ClientCredential::Secret(zeroize::Zeroizing::new("s3cret:&=".to_string())),
+                http: reqwest::Client::new(),
+            }
+            .request("access-token", "access_token")
+            .expect("the client's credential fits its method")
+            .build()
+            .unwrap()
+        };
+
+        let request_with_basic = request(&basic);
+        let authorization = &request_with_basic.headers()[reqwest::header::AUTHORIZATION];
+        let expected = base64::engine::general_purpose::STANDARD.encode("client+id:s3cret%3A%26%3D");
+        assert_eq!(authorization, format!("Basic {expected}").as_str());
+        assert!(authorization.is_sensitive(), "the Authorization header of a revocation request is not sensitive");
+        assert_eq!(
+            request_with_basic
+                .body()
+                .and_then(reqwest::Body::as_bytes),
+            Some(b"token=access-token&token_type_hint=access_token".as_slice())
+        );
+
+        let request_with_post = request(&post);
+        assert!(
+            request_with_post
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none(),
+            "a form body client sends no Authorization header"
         );
     }
 
