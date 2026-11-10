@@ -2799,6 +2799,68 @@ mod tests {
         assert!(!page.truncated);
     }
 
+    /// A read as the caller `scope` describes, over the whole history.
+    fn scoped_read(
+        path: &Path,
+        filter: &OwnedAuditLogFilter,
+        scope: &VaultReadScope,
+    ) -> AuditLogPage {
+        super::read_audit_window(
+            path,
+            1,
+            10,
+            &PreparedFilter::new(filter, scope),
+            whole_history(),
+            log_files::HISTORY_SOFT_CAP_BYTES,
+            log_files::history_bytes(path),
+        )
+        .unwrap()
+    }
+
+    /// The scope of a token of the tenant that owns the provider `cp-a`.
+    fn tenant_a() -> VaultReadScope {
+        VaultReadScope::Tenant(std::collections::HashSet::from(["cp-a".to_string()]))
+    }
+
+    fn text_filter(text: &str) -> OwnedAuditLogFilter {
+        OwnedAuditLogFilter {
+            text: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A tenant reads its own providers' records from the rotated files as
+    /// from the live log, and neither the counts nor the text filter see any
+    /// other record.
+    #[test]
+    fn a_tenant_reads_only_its_own_records_in_the_live_log_and_the_rotated_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), audit_line("cp-b")));
+        std::fs::write(
+            PathBuf::from(format!("{}.1", path.display())),
+            format!("{}{}", audit_line("cp-b"), audit_line("cp-a")),
+        )
+        .unwrap();
+
+        let page = scoped_read(&path, &OwnedAuditLogFilter::default(), &tenant_a());
+        let providers: Vec<Option<&str>> = page
+            .events
+            .iter()
+            .map(|event| event.provider_id.as_deref())
+            .collect();
+        assert_eq!(providers, [Some("cp-a"), Some("cp-a")], "one from the live log, one from the rotated file");
+        assert_eq!((page.total, page.total_pages), (2, 1));
+        assert_eq!(page.category_counts, std::collections::BTreeMap::from([("token_injected".to_string(), 2)]));
+
+        let probe = scoped_read(&path, &text_filter("cp-b"), &tenant_a());
+        assert_eq!((probe.total, probe.events.len()), (0, 0));
+        assert!(
+            probe
+                .category_counts
+                .is_empty()
+        );
+    }
+
     #[test]
     fn a_page_reports_the_size_of_the_history_against_the_advisory_cap() {
         let dir = tempfile::TempDir::new().unwrap();
