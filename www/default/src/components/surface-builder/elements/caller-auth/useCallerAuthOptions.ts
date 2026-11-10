@@ -30,7 +30,13 @@ export function useJwtStrategies(enabled = true): JwtVerificationStrategyOption[
   return strategies;
 }
 
-/** The secrets that can hold accepted API keys, loaded while `enabled`. */
+const apiKeyTypeFirst = (a: ApiKeySecretOption, b: ApiKeySecretOption): number =>
+  Number(b.secret_type === 'ApiKey') - Number(a.secret_type === 'ApiKey');
+
+/**
+ * The secrets that can hold accepted API keys, loaded while `enabled`. The gateway reads the
+ * secret whatever its type, so every secret is offered, those of type `ApiKey` first.
+ */
 export function useApiKeySecrets(enabled: boolean): {
   secrets: ApiKeySecretOption[];
   loading: boolean;
@@ -44,7 +50,7 @@ export function useApiKeySecrets(enabled: boolean): {
       .get<ApiKeySecretOption[]>('/secrets/')
       .then(res => {
         const list: ApiKeySecretOption[] = Array.isArray(res.data) ? res.data : [];
-        setSecrets(list.filter(secret => !secret.secret_type || secret.secret_type === 'ApiKey'));
+        setSecrets([...list].sort(apiKeyTypeFirst));
       })
       .catch(() => setSecrets([]))
       .finally(() => setLoading(false));
