@@ -1563,8 +1563,10 @@ audit event whose `reason` names the check, but only when the request carried a 
 gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
 only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
 and the event name the provider by its `provider_id` when the path's segment is the sealed
-state's own credential provider id, as it is at a callback path ending in that id, so they match
-`consent_granted`; otherwise they name it by the path's segment:
+state's own credential provider id, as it is at a callback path ending in that id; otherwise they
+name it by the path's segment. The audit routes therefore show a refusal only to appliance-wide
+callers, while `consent_granted`, which names the provider's record id, also reaches the
+provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)):
 
 | `reason` | Refused because |
 | --- | --- |

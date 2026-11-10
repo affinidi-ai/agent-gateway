@@ -408,9 +408,9 @@ not keep, and the reverse. Nothing is selected on a fresh install, and a record 
 is never built. `/v1/audit` shows a tenant's access token only the records of its own tenant's
 credential providers, so no policy decision or other record without a provider; see
 [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records). While the credential provider
-store cannot be read, `/v1/audit` answers a tenant's access token an empty page (`200`) and
-`/api/v1/delegation-audit` answers it `500`; sessions and appliance-wide access tokens never read
-that store and keep reading the whole log.
+store cannot be read, `/v1/audit` answers a tenant's access token an empty page (`200`) marked
+`truncated`, and `/api/v1/delegation-audit` answers it `500`; sessions and appliance-wide access
+tokens never read that store and read the log as usual.
 
 **Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
@@ -579,7 +579,9 @@ than that buffer and the two 64 KiB chunks it is measured across, however it was
 edited, and a rotated name that is not a regular file is passed over rather than opened — only
 the rotated names, the live log's own being the case above. A line
 the walk skipped, and a line that does not parse as a record, are counted in `dropped_records`:
-a page never counts a record it could not read as absent.
+a page never counts a record it could not read as absent. A line that does not parse names no
+credential provider, so only a page an appliance-wide caller reads counts it; a tenant's token is
+not told of it (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)).
 
 A read that fails is answered with `500` by both audit endpoints, with the JSON body
 `{"error": "Failed to read the audit log"}`; what failed stays in the gateway's own log. Neither

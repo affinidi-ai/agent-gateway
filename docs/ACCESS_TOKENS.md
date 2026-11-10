@@ -245,13 +245,15 @@ tenant PAT sees only its own tenant's records. Their `total`, `total_pages` and 
 count only those records, and the `filter` text search looks only among them. A record that names no
 provider, such as a policy decision or a revoke through the management API, and a record of an
 appliance-wide, missing or deleted provider, are shown only to appliance-wide callers. The OAuth
-callback's `consent_granted` names its provider's id, as every other delegation record does, so the
-provider's tenant reads it; one written by an earlier release names the provider's `provider_id`
-slug instead and is shown only to appliance-wide callers. A provider's slug never decides who reads
-a record, since two tenants can each have a provider with the same slug. A PAT scoped by required
-headers alone, or by a resource pattern without a tenant, reads no record. While the credential
-providers cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and an empty page
-from `/v1/audit`. A record follows its provider's current tenant, as a vault token does.
+callback's `consent_granted` names its provider's id, so the provider's tenant reads it; one written
+by an earlier release names the provider's `provider_id` slug instead and is shown only to
+appliance-wide callers, as is the `delegation_failed` of a refused consent, which names the provider
+by its slug. A provider's slug never decides who reads a record, since two tenants can each have a
+provider with the same slug. A line of the log that does not parse as a record names no provider, so
+`dropped_records` counts it only for an appliance-wide caller. A PAT scoped by required headers
+alone, or by a resource pattern without a tenant, reads no record. While the credential providers
+cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and an empty page marked
+`truncated` from `/v1/audit`. A record follows its provider's current tenant, as a vault token does.
 
 ### Ownership of child records
 

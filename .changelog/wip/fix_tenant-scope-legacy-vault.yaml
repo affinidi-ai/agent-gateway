@@ -27,10 +27,11 @@ changes:
       description: >-
         GET /api/v1/delegation-audit and GET /v1/audit returned the whole audit log to a tenant's
         access token. It now gets only records whose credential provider belongs to its tenant,
-        and totals, category counts and the text filter cover only those. Records without a
-        provider, such as policy decisions, and records of an appliance-wide, missing or deleted
-        provider are shown only to appliance-wide callers. Dashboard sessions and appliance-wide
-        access tokens still read the whole log.
+        and totals, category counts, dropped_records and the text filter cover only those; a line
+        that does not parse names no provider and is counted only for appliance-wide callers.
+        Records without a provider, such as policy decisions, and records of an appliance-wide,
+        missing or deleted provider are shown only to appliance-wide callers. Dashboard sessions
+        and appliance-wide access tokens still read the whole log.
     - timestamp: '2026-11-05T15:38:38Z'
       title: Keep store error detail out of delegation vault and audit error answers
       description: >-
