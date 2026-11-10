@@ -41,15 +41,21 @@ Rotation gives the Gateway a new control key and moves its access entry to it:
 - **Automatically, every 90 days** by default. The Gateway checks once an hour whether a
   rotation is due and adds a random delay of up to six hours, so many gateways don't rotate
   at the same moment.
-- **On demand**, from the dashboard: **Trust Agent** page → bundled agent → **Rotate control
-  key**. The same is available as `POST /v1/vta/control-key/rotate`.
+- **On demand**, from the dashboard: **Trust Agent** page → **Bundled trust agent control key**
+  card → **Rotate control key** (it asks you to confirm first). The same is available as
+  `POST /v1/vta/control-key/rotate`.
 - **Offline**, with the Gateway stopped: `agent-gateway --vta-rotate-control-key --yes`.
 
 The Trust Agent page shows the current control ID, when it was last rotated and when the next
-rotation is due.
+rotation is due. `GET /v1/vta/status` reports the same as `control_key_rotated_at`,
+`control_key_next_rotation_at` and `control_key_rotation_days`.
 
 The Gateway keeps running during a rotation. Requests that are in flight finish normally, and
 the next request uses the new key.
+
+If a scheduled rotation fails, the current key keeps working. The Gateway tries again after an
+hour, then after two, four and so on up to a day, and logs an error once three attempts in a row
+have failed.
 
 ## Setup
 
@@ -78,6 +84,9 @@ Nothing has to be done on the trust agent: it already supports moving an access 
 - **Safe if interrupted.** The new key is saved *before* the trust agent is asked. If the
   Gateway stops halfway, the next start asks the trust agent which key is live and finishes
   or cancels the rotation. A rotation can't lock the Gateway out.
+- **Catches up if another process rotated.** If the trust agent refuses the key the Gateway
+  holds, the Gateway looks at the key stored for it, finishing an interrupted rotation first,
+  and tries once more only if that is a different key. It never retries the same key.
 - **Safe if refused.** If the trust agent refuses, the old key keeps working and nothing
   changes. A failed rotation never makes the Gateway sign locally instead.
 - **One at a time.** Only one rotation runs at once, only the Active instance rotates on

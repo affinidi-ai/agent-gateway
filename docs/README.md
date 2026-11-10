@@ -50,6 +50,7 @@ adds procedures for deploying and operating an appliance, operator guides, and F
 | [Management access tokens](ACCESS_TOKENS.md)                          | PAT contract, resource-pattern grammar, delegation, and tenant ownership                                                    |
 | [Security Token Service](STS.md)                                      | RFC 8693 token exchange, ID-JAG issuance/redemption, and issuance gates                                                     |
 | [Trust agent (VTA) signing](VTA_INTEGRATION_POC.md)                   | Delegating key operations to a Verifiable Trust Agent, the bundled sidecar's zero-touch bootstrap, states and recovery, and rotation |
+| [Bundled control key rotation](vta-auth-key-rotation/how-it-works.md)   | How the key the gateway uses with its bundled trust agent rotates by itself every 90 days or on request, what it protects and what it does not |
 | [Trust agent open items](VTA_OPEN_ITEMS.md)                           | What the trust agent integration does not do yet, and the limits to know about                                              |
 | [Onboarding capture](AGENT_ONBOARDING_CAPTURE.md)                     | Capture security boundary, lifetime, and emitted events                                                                     |
 | [Rust design patterns](DESIGN_PATTERNS.md)                            | Internal concurrency, lifecycle, and storage patterns                                                                       |

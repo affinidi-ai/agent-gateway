@@ -256,6 +256,8 @@ new keys and DIDs.
 
 ### Rotating the control key
 
+In plain terms, with the setting and the security measures: [how the control key rotates](vta-auth-key-rotation/how-it-works.md).
+
 The control key moves while the gateway runs. It rotates **every 90 days by
 default** (`[vta] control_key_rotation_days`, `0` turns it off), on demand from
 the **Rotate control key** button on the Trust Agent page or
