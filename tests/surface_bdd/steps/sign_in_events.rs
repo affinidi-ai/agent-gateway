@@ -12,7 +12,7 @@ use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::steps::when::{ensure_admin_session, ensure_gateway_running};
 use crate::world::{StartedSignIn, SurfaceWorld};
 
-/// How long a sign-in event may take to reach the Redis stream.
+/// How long a sign-in event may take to reach the stream.
 const EVENT_WAIT: Duration = Duration::from_secs(15);
 
 /// The user variables of a sign-in event, as its `data` names them.
@@ -64,7 +64,7 @@ async fn console_user_id(
         .to_string()
 }
 
-#[given("an integration streams sign-in events to Redis")]
+#[given("an integration streams sign-in events")]
 async fn integration_streams_sign_in_events(world: &mut SurfaceWorld) {
     let stream = RedisStreamStandIn::start().await;
     world
@@ -240,7 +240,7 @@ async fn receive_sign_in_event(
     let stream = world
         .sign_in_stream
         .as_ref()
-        .expect("the Redis stream");
+        .expect("the stream");
     let event = |entry: &crate::bdd_support::redis_stream::StreamEntry| {
         entry
             .field("data")
@@ -261,12 +261,12 @@ async fn receive_sign_in_event(
         .filter_map(event)
         .collect();
     let found = found.unwrap_or_else(|| {
-        panic!("expected a {event_type} event with {data:?} on the Redis stream; it received {received:?}")
+        panic!("expected a {event_type} event with {data:?} on the stream; it received {received:?}")
     });
     world.sign_in_event = event(&found);
 }
 
-#[then(expr = "the Redis stream receives a {string} event with login method {string}")]
+#[then(expr = "the stream receives a {string} event with login method {string}")]
 async fn stream_receives_sign_in(
     world: &mut SurfaceWorld,
     event_type: String,
@@ -275,7 +275,7 @@ async fn stream_receives_sign_in(
     receive_sign_in_event(world, &event_type, &[("login_method", &method)]).await;
 }
 
-#[then(expr = "the Redis stream receives a {string} event with login method {string} and failure reason {string}")]
+#[then(expr = "the stream receives a {string} event with login method {string} and failure reason {string}")]
 async fn stream_receives_failed_sign_in(
     world: &mut SurfaceWorld,
     event_type: String,
@@ -289,7 +289,7 @@ fn sign_in_event(world: &SurfaceWorld) -> &Value {
     world
         .sign_in_event
         .as_ref()
-        .expect("a sign-in event found on the Redis stream")
+        .expect("a sign-in event found on the stream")
 }
 
 #[then(expr = "that event names the console user {string}")]
