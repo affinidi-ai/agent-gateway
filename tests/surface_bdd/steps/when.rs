@@ -2783,6 +2783,23 @@ async fn send_a2a_request_through_transit_point(
     transit_point: &str,
     headers: Vec<(String, String)>,
 ) {
+    send_a2a_body_through_transit_point(
+        world,
+        agent_name,
+        transit_point,
+        headers,
+        build_a2a_message_send_body("hello"),
+    )
+    .await;
+}
+
+pub(crate) async fn send_a2a_body_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -2800,7 +2817,6 @@ async fn send_a2a_request_through_transit_point(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point);
 
-    let body = build_a2a_message_send_body("hello");
     world.sent_body = Some(body.clone());
     let client = reqwest::Client::new();
     let mut request = client
