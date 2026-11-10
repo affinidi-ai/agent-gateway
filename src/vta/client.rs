@@ -35,6 +35,11 @@ struct Session {
     access_token: Zeroizing<String>,
     /// Monotonic instant after which the access token is treated as expired.
     expires_at: Instant,
+    /// The control key this session was opened with, and which generation of
+    /// the client's key that was: a call signs with the key its token belongs
+    /// to, even if the key is replaced while the call is being built.
+    generation: u64,
+    key: Arc<dyn SignerKeyProvider>,
 }
 
 /// Thin VTA Trust-Task client. One per configured VTA.
@@ -45,7 +50,9 @@ struct Session {
 pub struct VtaRestClient {
     transport: Arc<dyn TrustTaskTransport>,
     vta_did: String,
-    control_key: Arc<dyn SignerKeyProvider>,
+    /// The current control key and its generation. Replaced when the gateway
+    /// rotates its control key; never held across an `.await`.
+    control: std::sync::RwLock<(u64, Arc<dyn SignerKeyProvider>)>,
     session: RwLock<Option<Session>>,
     /// Back-pressure + circuit breaker so a slow/hung VTA fails fast (VTA-04).
     resilience: Resilience,
@@ -91,7 +98,7 @@ impl VtaRestClient {
         Self {
             transport,
             vta_did: vta_did.to_string(),
-            control_key,
+            control: std::sync::RwLock::new((0, control_key)),
             session: RwLock::new(None),
             resilience: Resilience::new(max_concurrent),
             onboarding,
@@ -104,16 +111,56 @@ impl VtaRestClient {
         self.transport.carrier()
     }
 
+    fn current_control(&self) -> (u64, Arc<dyn SignerKeyProvider>) {
+        let guard = self
+            .control
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.0, Arc::clone(&guard.1))
+    }
+
+    /// The DID this client currently authenticates as.
+    pub fn control_did(&self) -> String {
+        self.current_control()
+            .1
+            .did()
+            .to_string()
+    }
+
+    /// Authenticate as `key` from now on.
+    ///
+    /// The cached session is dropped (its token is zeroized), so the next call
+    /// opens a new one as the new DID, and the onboarding check runs again so
+    /// the recorded control DID follows the key.
+    pub async fn replace_control_key(
+        &self,
+        key: Arc<dyn SignerKeyProvider>,
+    ) {
+        {
+            let mut guard = self
+                .control
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.0 += 1;
+            guard.1 = key;
+        }
+        *self.session.write().await = None;
+        if let Some(onboarding) = &self.onboarding {
+            onboarding.reset_verified();
+        }
+    }
+
     /// Build an unsigned Trust Task document (no `proof`).
     fn build_doc(
         &self,
+        issuer: &str,
         type_uri: &str,
         payload: Value,
     ) -> Value {
         json!({
             "id": format!("urn:uuid:{}", Uuid::new_v4()),
             "type": type_uri,
-            "issuer": self.control_key.did(),
+            "issuer": issuer,
             "recipient": self.vta_did,
             "issuedAt": chrono::Utc::now().to_rfc3339(),
             "payload": payload,
@@ -151,8 +198,17 @@ impl VtaRestClient {
 
     /// Run the full DI-signed auth handshake and cache the session tokens.
     pub async fn authenticate(&self) -> Result<(), VtaError> {
+        self.establish()
+            .await
+            .map(|_| ())
+    }
+
+    /// Open a session with the current control key and return its token with the
+    /// key it belongs to.
+    async fn establish(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
+        let (generation, key) = self.current_control();
         // 1. challenge (unsigned): payload = { subject: <control did> }.
-        let challenge_doc = self.build_doc(TASK_AUTH_CHALLENGE, json!({ "subject": self.control_key.did() }));
+        let challenge_doc = self.build_doc(key.did(), TASK_AUTH_CHALLENGE, json!({ "subject": key.did() }));
         let challenge: ChallengeResponse = self
             .post_trust_task("auth", &challenge_doc, None)
             .await?;
@@ -160,6 +216,7 @@ impl VtaRestClient {
         // 2. authenticate (eddsa-jcs-2022 signed): payload = { challenge,
         //    sessionId, scope: [] }.
         let mut auth_doc = self.build_doc(
+            key.did(),
             TASK_AUTH_AUTHENTICATE,
             json!({
                 "challenge": challenge.challenge,
@@ -167,7 +224,7 @@ impl VtaRestClient {
                 "scope": [],
             }),
         );
-        let proof = sign_document(&auth_doc, self.control_key.as_ref(), PROOF_PURPOSE_AUTHENTICATION).await?;
+        let proof = sign_document(&auth_doc, key.as_ref(), PROOF_PURPOSE_AUTHENTICATION).await?;
         auth_doc
             .as_object_mut()
             .expect("auth doc is an object")
@@ -183,42 +240,48 @@ impl VtaRestClient {
         // from the first session token (advisory — never fails the handshake).
         if let Some(onboarding) = &self.onboarding {
             onboarding
-                .on_authenticated(self.control_key.did(), &access_token)
+                .on_authenticated(key.did(), &access_token)
                 .await;
         }
+        let token = access_token.clone();
         *self.session.write().await = Some(Session {
             access_token: Zeroizing::new(access_token),
             expires_at,
+            generation,
+            key: Arc::clone(&key),
         });
-        Ok(())
+        Ok((token, key))
     }
 
-    /// A valid access token, authenticating (or re-authenticating on expiry)
-    /// as needed. Tokens are cloned out of the memory-only cache for the call.
-    pub async fn access_token(&self) -> Result<String, VtaError> {
+    /// A live session's token and the key it was opened with, authenticating
+    /// when there is none, it has expired, or the control key was replaced.
+    async fn session_token(&self) -> Result<(String, Arc<dyn SignerKeyProvider>), VtaError> {
+        let generation = self.current_control().0;
         if let Some(session) = self
             .session
             .read()
             .await
             .as_ref()
+            && session.generation == generation
             && Instant::now() < session.expires_at
         {
-            return Ok(session
-                .access_token
-                .as_str()
-                .to_owned());
-        }
-        self.authenticate().await?;
-        self.session
-            .read()
-            .await
-            .as_ref()
-            .map(|s| {
-                s.access_token
+            return Ok((
+                session
+                    .access_token
                     .as_str()
-                    .to_owned()
-            })
-            .ok_or_else(|| VtaError::Protocol("no session after authenticate".to_string()))
+                    .to_owned(),
+                Arc::clone(&session.key),
+            ));
+        }
+        self.establish().await
+    }
+
+    /// A valid access token, authenticating (or re-authenticating on expiry)
+    /// as needed. Tokens are cloned out of the memory-only cache for the call.
+    pub async fn access_token(&self) -> Result<String, VtaError> {
+        self.session_token()
+            .await
+            .map(|(token, _)| token)
     }
 
     /// What the trust agent says this gateway may do right now
@@ -239,8 +302,8 @@ impl VtaRestClient {
         type_uri: &str,
         payload: Value,
     ) -> Result<T, VtaError> {
-        let token = self.access_token().await?;
-        let doc = self.build_doc(type_uri, payload);
+        let (token, key) = self.session_token().await?;
+        let doc = self.build_doc(key.did(), type_uri, payload);
         // Label metrics by the Trust Task slug (the path segment before the
         // version), e.g. `keys/sign-jws/0.1` → `sign-jws`.
         let operation = type_uri
@@ -270,9 +333,9 @@ impl VtaRestClient {
         type_uri: &str,
         payload: Value,
     ) -> Result<T, VtaError> {
-        let token = self.access_token().await?;
-        let mut doc = self.build_doc(type_uri, payload);
-        let proof = sign_document(&doc, self.control_key.as_ref(), PROOF_PURPOSE_AUTHENTICATION).await?;
+        let (token, key) = self.session_token().await?;
+        let mut doc = self.build_doc(key.did(), type_uri, payload);
+        let proof = sign_document(&doc, key.as_ref(), PROOF_PURPOSE_AUTHENTICATION).await?;
         doc.as_object_mut()
             .expect("doc is an object")
             .insert("proof".to_string(), proof);
@@ -314,6 +377,7 @@ mod tests {
     struct MockState {
         auth_count: Arc<AtomicUsize>,
         token_expires_in: u64,
+        issuers: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     /// Mock `POST /api/trust-tasks`: routes by the Trust Task `type`, asserts the
@@ -343,6 +407,16 @@ mod tests {
                 .auth_count
                 .fetch_add(1, Ordering::SeqCst)
                 + 1;
+            state
+                .issuers
+                .lock()
+                .unwrap()
+                .push(
+                    body["issuer"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
             return Json(json!({
                 "session": { "id": "s", "subject": body["issuer"] },
                 "tokens": {
@@ -368,10 +442,20 @@ mod tests {
     }
 
     async fn spawn_mock_vta(token_expires_in: u64) -> (String, Arc<AtomicUsize>) {
+        let (base, auth_count, _) = spawn_recording_vta(token_expires_in).await;
+        (base, auth_count)
+    }
+
+    /// Also records the DID each authentication was made as.
+    async fn spawn_recording_vta(
+        token_expires_in: u64
+    ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
         let auth_count = Arc::new(AtomicUsize::new(0));
+        let issuers = Arc::new(std::sync::Mutex::new(Vec::new()));
         let state = MockState {
             auth_count: Arc::clone(&auth_count),
             token_expires_in,
+            issuers: Arc::clone(&issuers),
         };
         let app = Router::new()
             .route(TRUST_TASKS_PATH, post(trust_tasks))
@@ -385,7 +469,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        (format!("http://{addr}"), auth_count)
+        (format!("http://{addr}"), auth_count, issuers)
     }
 
     fn test_client(
@@ -408,6 +492,106 @@ mod tests {
             .expect("authenticate");
         assert_eq!(token, "access-token-1");
         assert_eq!(auth_count.load(Ordering::SeqCst), 1, "one auth handshake");
+    }
+
+    #[tokio::test]
+    async fn replacing_the_control_key_authenticates_as_the_new_did_on_the_next_call() {
+        let (base, _, issuers) = spawn_recording_vta(3600).await;
+        let old = Arc::new(ControlKey::from_seed([11u8; 32]));
+        let new = Arc::new(ControlKey::from_seed([12u8; 32]));
+        let (old_did, new_did) = (old.did().to_string(), new.did().to_string());
+        let client = test_client(&base, old);
+        client
+            .access_token()
+            .await
+            .unwrap();
+
+        client
+            .replace_control_key(new)
+            .await;
+        client
+            .access_token()
+            .await
+            .unwrap();
+
+        assert_eq!(*issuers.lock().unwrap(), vec![old_did, new_did.clone()]);
+        assert_eq!(client.control_did(), new_did);
+    }
+
+    #[tokio::test]
+    async fn replacing_the_control_key_drops_the_cached_session() {
+        let (base, auth_count, _) = spawn_recording_vta(3600).await;
+        let client = test_client(&base, Arc::new(ControlKey::from_seed([13u8; 32])));
+        let first = client
+            .access_token()
+            .await
+            .unwrap();
+
+        client
+            .replace_control_key(Arc::new(ControlKey::from_seed([14u8; 32])))
+            .await;
+        let second = client
+            .access_token()
+            .await
+            .unwrap();
+
+        assert_ne!(first, second, "the old token is not reused for the new key");
+        assert_eq!(auth_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_signed_call_after_replacement_is_made_as_the_new_did() {
+        let (base, _, issuers) = spawn_recording_vta(3600).await;
+        let client = test_client(&base, Arc::new(ControlKey::from_seed([15u8; 32])));
+        client.whoami().await.unwrap();
+        let new = Arc::new(ControlKey::from_seed([16u8; 32]));
+        let new_did = new.did().to_string();
+
+        client
+            .replace_control_key(new)
+            .await;
+        client.whoami().await.unwrap();
+
+        assert_eq!(issuers.lock().unwrap().last(), Some(&new_did));
+    }
+
+    #[tokio::test]
+    async fn the_onboarding_check_runs_again_after_a_key_replacement() {
+        let (base, _, _) = spawn_recording_vta(3600).await;
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir
+            .path()
+            .join("vta_onboarding");
+        let onboarding = OnboardingState::new(
+            Some(record.clone()),
+            "gateway".to_string(),
+            "did:webvh:vta.example".to_string(),
+            Duration::from_secs(0),
+        );
+        let old = Arc::new(ControlKey::from_seed([17u8; 32]));
+        let new = Arc::new(ControlKey::from_seed([18u8; 32]));
+        let new_did = new.did().to_string();
+        let client =
+            VtaRestClient::new(&base, "did:webvh:vta.example", old, Duration::from_secs(5), 8, Some(onboarding))
+                .unwrap();
+        client
+            .authenticate()
+            .await
+            .unwrap();
+
+        client
+            .replace_control_key(new)
+            .await;
+        client
+            .authenticate()
+            .await
+            .unwrap();
+
+        let saved = crate::vta::onboarding::OnboardingRecord::load(&record)
+            .await
+            .unwrap()
+            .expect("a record");
+        assert_eq!(saved.control_did, new_did);
     }
 
     #[tokio::test]

@@ -387,6 +387,13 @@ impl OnboardingState {
         }
     }
 
+    /// Run the post-authentication checks again on the next authentication, so
+    /// a replaced control key is checked and recorded like the first one.
+    pub fn reset_verified(&self) {
+        self.verified
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Run once after the first successful authentication: confirm the grant is
     /// least-privilege (warn if broad), then persist/update the onboarding
     /// record. Never fails the request — onboarding signalling is advisory; the
