@@ -153,8 +153,9 @@ that method:
 3. A request that carries credentials for more than one method fails source authentication
    as the primary method, audited as `ambiguous_credentials`, and neither credential is
    verified, so a caller can't choose the identity the gateway asserts. Like any failed
-   credential, it is refused on a closed Access Point, with `on_failure: reject` or beside
-   protected resource metadata, and otherwise passed to policy as
+   credential, it is refused on a closed Access Point, with `on_failure: reject`, on an inbound
+   `from_jwt_claim` identity, or beside protected resource metadata, and otherwise passed to
+   policy as
    `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
    connection that presents a client certificate, on a surface that also accepts mTLS, and an
    MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
@@ -190,8 +191,8 @@ Creating or saving a surface, and each of its enabled variants as resolved, refu
 - a method that reads `mcp_meta` or `a2a_extension` when there is more than one method, since
   it could never be selected;
 - more than one `did_auth` method, because the `/authenticate` endpoints serve one;
-- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless every
-  method is `jwt_bearer`;
+- a `from_jwt_claim` identity, in any identity slot or Transit Point override, unless
+  `jwt_bearer` is the only method;
 - an inbound `from_api_key` identity unless every method is `api_key` or `api_key_provider`;
 - on an Access Point that publishes protected resource metadata, a JWT bearer method other
   than the primary: the discovery audience and challenge belong to the primary method.
@@ -225,7 +226,7 @@ credential location and non-secret references (strategy, secret, provider agent,
 certificates), so it can be rebuilt. An active node's load persists the correction to local
 storage ([`fall_back_to_first_source_auth_methods`](../src/surfaces/store.rs)); a standby
 node, a storage event and a DynamoDB-sourced surface are corrected in memory only. A stored
-`from_jwt_claim` identity beside a method other than `jwt_bearer`, or an inbound
+`from_jwt_claim` identity without `jwt_bearer` as its only method, or an inbound
 `from_api_key` identity beside a method other than an API key, is logged as a warning at
 startup and refused on the next save.
 
@@ -388,14 +389,35 @@ why, and `not_judged` while it keeps none. It is read only from that kept verdic
 the API key store, so it is per node and eventually consistent, and it is not part of
 `access_point_status`.
 
-On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
+A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
+surface that names an API Key Provider key id, in its base or any variant, also carry a
+read-only `api_key_references`: one `{ "key_id", "status", "blocking" }` per distinct id, sorted by id,
+with the ids the gate checks (a legacy Caller Context secret only when a key of that id
+exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
+has the id, `unavailable` for a key of any other surface, whose status is never reported,
+and `unknown`, as the gate's `store_unavailable`, for every id when the API key store cannot be
+read, and for an id no loaded key folder holds while a key folder cannot be loaded. A
+same-tenant key of another surface that still serves under `warn` is `unavailable` too: a
+surface names only its own keys. The field is absent when the surface names no key id, and on
+the surface list and variant responses. The surface's own key folder is read from disk for it,
+so a key of the surface another node revoked, deleted or created is reported as stored; when
+that folder cannot be read, its keys are `unknown`, as they are while the surfaces owning its
+keys cannot be read. `blocking` is `true` exactly when the provider key gate refuses the surface
+for that id, judged from the same rules: for a `revoked` or `missing` key, and for an
+`unavailable` key when that key is revoked, as the gate refuses a revoked key in both modes, or
+when `tenant_credential_isolation` is `enforce`, except for a legacy Caller Context secret whose
+owning surface no longer exists, which the gate does not refuse. It is `false` for an `active`
+or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
+`serving_status` already shows that it does not serve.
+
+On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
 protects, and repeated wrong credentials aren't throttled by it either. Use high-entropy API keys
 and limit requests per client upstream of the gateway if credential guessing is a concern. MCP callers get a JSON-RPC error carrying the request id; other callers get
-`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only that the credential
-is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
+`application/problem+json`. A JWT bearer method adds a `WWW-Authenticate: Bearer` header. The refusal says only
+`Caller credential missing or invalid`; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
 Create and update responses are the saved surface plus `access_point_status` and, when it
@@ -443,9 +465,10 @@ deny if input.source_auth.method == "failed"
 
 See [`POLICY.md`](POLICY.md#failed-caller-authentication).
 
-A request to an MCP Access Point that publishes protected resource metadata, direct or over
-Fabric, is the exception: a missing or invalid JWT is refused with a `401` (the discovery
-challenge on a direct request), see
+A request to an Access Point whose inbound identity is `from_jwt_claim`, or to an MCP Access Point that
+publishes protected resource metadata, direct or over Fabric, is the exception: a missing or
+invalid credential is refused with a `401` before policy (the discovery challenge on a direct
+MCP request), see
 [`MCP_METADATA.md`](MCP_METADATA.md#authorization-server-discovery-for-caller-authentication).
 
 ### mTLS
@@ -1598,7 +1621,8 @@ decides, as for a failed key.
 ### `from_jwt_claim`
 
 Requires `jwt_bearer` source auth on the same surface, so the token is cryptographically
-verified before the DID is derived.
+verified before the DID is derived. On a direct or fabric-routed Access Point, a missing or
+invalid bearer token is refused with `401` before the target is called.
 
 | Field | Default | Effect |
 | --- | --- | --- |

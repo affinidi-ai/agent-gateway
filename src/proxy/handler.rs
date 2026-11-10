@@ -2406,8 +2406,9 @@ async fn proxy_charged_request(
                 // Caller-attributable failure (missing/invalid credential). An
                 // Access Point that publishes protected resource metadata answers
                 // it with its challenge, so the caller can fetch a token and
-                // retry, and one whose caller authentication rejects failures
-                // refuses it. Otherwise record the outcome for the policy layer and
+                // retry. An Access Point that rejects failed callers (closed, `on_failure:
+                // reject`, or `from_jwt_claim` inbound identity) refuses it here,
+                // before policy. Otherwise record the outcome for the policy layer and
                 // continue with no asserted caller identity — do not block here.
                 Err(e) if e.is_caller_attributable() => {
                     // On an Access Point that publishes protected resource
@@ -5116,10 +5117,7 @@ async fn proxy_charged_request(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
@@ -10593,6 +10591,15 @@ fn bind_api_key_caller_did(
     }
 }
 
+/// Reaching this means the verified credential carries no JWT claims, for
+/// example an API key accepted on a stored surface that also lists `jwt_bearer`.
+fn from_jwt_claim_without_claims() -> Response {
+    create_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "from_jwt_claim requires jwt_bearer source auth on this surface",
+    )
+}
+
 /// The caller identity of an inbound `from_api_key` slot: the DID of the API
 /// key source auth verified on this request. An API Key Provider key is
 /// identified by its key id and reports `source_auth`; a plain API Key by its
@@ -11154,10 +11161,7 @@ async fn handle_fabric_request_inner(
             connection_guard
                 .decrement()
                 .await;
-            return Err(create_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "from_jwt_claim requires jwt_bearer source auth on this surface",
-            ));
+            return Err(from_jwt_claim_without_claims());
         };
         match crate::identity::credential_identity::resolve_jwt_claim_identity(claim, namespace_claims, claims) {
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
@@ -24077,6 +24081,65 @@ mod fabric_send_tests {
                 "{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn fabric_forward_without_caller_claims_fails_closed_when_bypassing_source_auth() {
+        let mut peer = fabric_peer_answering(200, json!({"jsonrpc": "2.0", "id": "m-1", "result": {}})).await;
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = sends.clone();
+        crate::comm::didcomm::client::test_send_hook::install(&peer.peer_did, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let method = json!({"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []});
+        let mut surface = (*peer.state.surface).clone();
+        surface.identity_slots.inbound = Some(crate::source_auth::ManagedIdentityConfig::FromJwtClaim {
+            claim: "oid".to_string(),
+            namespace_claims: Vec::new(),
+        });
+        surface
+            .access_point
+            .caller_authentication = Some(serde_json::from_value(json!({"methods": [method]})).unwrap());
+        peer.state.surface = Arc::new(surface);
+        let body = json!({
+            "jsonrpc": "2.0", "id": "m-1", "method": "message/send",
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}], "messageId": "m-1"}}
+        });
+
+        // Calls the forward handler directly, so the receive-side source auth 401 is skipped.
+        let result = super::handle_fabric_request(
+            peer.state.clone(),
+            super::FabricSend {
+                channel_name: "Fabric A2A",
+                method: axum::http::Method::POST,
+                uri: "https://gateway.example/a2a"
+                    .parse()
+                    .unwrap(),
+                headers: axum::http::HeaderMap::new(),
+                source_addr: "127.0.0.1:12345".to_string(),
+                start_time: std::time::Instant::now(),
+                connection_guard: super::ConnectionGuard::new(None, None),
+                body_bytes: axum::body::Bytes::from(body.to_string()),
+                trace_id: "trace-1".to_string(),
+                ucp_operation: None,
+                authenticated_identity: None,
+                source_auth_context: None,
+                payment_context: None,
+                mcp_metadata_context: crate::mcp::meta::McpMetadataContext::default(),
+                mcp_verified_binding: None,
+                mcp_classification: None,
+                subscription_lifetime: None,
+                mcp_continuations: None,
+                payment: None,
+            },
+        )
+        .await;
+
+        let Err(refused) = result else {
+            panic!("a from_jwt_claim surface forwarded a request with no caller claims");
+        };
+        assert_eq!(refused.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0, "the request reached the peer");
     }
 
     #[tokio::test]

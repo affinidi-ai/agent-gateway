@@ -3984,9 +3984,16 @@ impl AgentSurface {
 
     /// Whether a caller whose credential is missing or invalid is refused
     /// before policy and the Target: on a closed Access Point, even one
-    /// edited by hand without `on_failure`, or when `on_failure` is `reject`.
+    /// edited by hand without `on_failure`, when `on_failure` is `reject`, or
+    /// when the inbound identity is `from_jwt_claim`, which derives no caller
+    /// identity without a valid JWT.
     pub fn rejects_failed_caller_authentication(&self) -> bool {
         self.access_point.public == Some(false)
+            || self
+                .inbound_identity()
+                .is_some_and(|identity| {
+                    matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
+                })
             || self
                 .access_point
                 .caller_authentication
@@ -4494,6 +4501,20 @@ mod tests {
         ))
         .unwrap();
 
+        assert!(surface.rejects_failed_caller_authentication());
+    }
+
+    #[test]
+    fn an_inbound_from_jwt_claim_surface_rejects_failed_callers_without_a_stored_on_failure() {
+        let mut stored = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+        ]}}));
+        stored["identity_slots"] = serde_json::json!({"inbound": {
+            "type": "from_jwt_claim", "claim": "oid", "namespace_claims": []
+        }});
+        let surface: super::AgentSurface = serde_json::from_value(stored).unwrap();
+
+        assert_eq!(surface.access_point.public, None);
         assert!(surface.rejects_failed_caller_authentication());
     }
 

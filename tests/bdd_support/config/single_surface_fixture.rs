@@ -29,6 +29,8 @@ pub struct SurfaceConfigBuilder {
     pub managed_identity_strip_raw: bool,
     pub mcp_inbound_identity: bool,
     pub mcp_inbound_identity_strip_raw: bool,
+    /// The inbound identity is the `sub` claim of the caller's JWT (`from_jwt_claim`).
+    pub jwt_claim_inbound_identity: bool,
     pub target_auth: Option<SurfaceTargetAuthConfig>,
     pub target_auth_provider: Option<SurfaceTargetAuthProviderConfig>,
     pub mcp_tool_policy: Option<McpToolPolicyFixture>,
@@ -176,6 +178,7 @@ impl Default for SurfaceConfigBuilder {
             managed_identity_strip_raw: false,
             mcp_inbound_identity: false,
             mcp_inbound_identity_strip_raw: false,
+            jwt_claim_inbound_identity: false,
             target_auth: None,
             target_auth_provider: None,
             mcp_tool_policy: None,

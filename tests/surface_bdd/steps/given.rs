@@ -3008,6 +3008,13 @@ fn surface_has_mcp_inbound_identity_strip_raw(world: &mut SurfaceWorld) {
         .mcp_inbound_identity_strip_raw = true;
 }
 
+#[given("the surface derives the inbound identity from a JWT claim")]
+fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .jwt_claim_inbound_identity = true;
+}
+
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]
 fn surface_injects_custom_metadata(
     world: &mut SurfaceWorld,

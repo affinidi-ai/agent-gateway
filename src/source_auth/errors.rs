@@ -116,6 +116,10 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// (see [`caller_refusal`]), so in practice this builder is reached for
 /// server-side (500) failures.
 ///
+/// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] and a
+/// server-side failure reports [`INTERNAL_ERROR_DETAIL`], so no reason or
+/// internal identifier is sent to the caller. Call sites log the reason.
+///
 /// - **A2A / AP2**: `application/problem+json` with the A2A `proxy-error` type
 ///   URI. JWT Bearer 401s include a `WWW-Authenticate: Bearer` header.
 /// - **MCP**: JWT Bearer 401s return `application/problem+json` *without*
@@ -130,7 +134,11 @@ pub fn deny_response(
     auth_config: &SourceAuthConfig,
     error: &SourceAuthError,
 ) -> Response {
-    let detail = error.to_string();
+    let detail = if error.is_caller_attributable() {
+        CALLER_CREDENTIAL_REFUSED
+    } else {
+        INTERNAL_ERROR_DETAIL
+    };
     let status = error.http_status();
     let title = error.problem_title();
     // Only a genuine 401 warrants a `WWW-Authenticate` challenge; a 500 is a
@@ -138,8 +146,8 @@ pub fn deny_response(
     let challenge = status == StatusCode::UNAUTHORIZED;
 
     match protocol {
-        SurfaceProtocol::Mcp => mcp_deny(auth_config, &detail, status, title, challenge),
-        _ => a2a_deny(auth_config, &detail, status, title, challenge),
+        SurfaceProtocol::Mcp => mcp_deny(auth_config, detail, status, title, challenge),
+        _ => a2a_deny(auth_config, detail, status, title, challenge),
     }
 }
 
@@ -147,14 +155,17 @@ pub fn deny_response(
 /// credential failed is logged, never sent.
 pub const CALLER_CREDENTIAL_REFUSED: &str = "Caller credential missing or invalid";
 
+/// What a caller is told when source authentication fails on the server side.
+pub const INTERNAL_ERROR_DETAIL: &str = "Source authentication could not be completed.";
+
 /// The `WWW-Authenticate` challenge an MCP JWT Bearer refusal carries.
 const MCP_BEARER_CHALLENGE: &str = "Bearer realm=\"agent-gateway\"";
 
 /// The `401` for a caller whose credential is missing or invalid, on an Access
-/// Point whose caller authentication rejects such callers. An MCP caller gets a
-/// JSON-RPC error answering `mcp_request_id`; any other caller gets
-/// `application/problem+json`. A JWT Bearer refusal carries a
-/// `WWW-Authenticate: Bearer` challenge.
+/// Point whose caller authentication rejects such callers, or whose inbound
+/// identity is `from_jwt_claim`. An MCP caller gets a JSON-RPC error answering
+/// `mcp_request_id`; any other caller gets `application/problem+json`. A JWT
+/// Bearer refusal carries a `WWW-Authenticate: Bearer` challenge.
 pub fn caller_refusal(
     protocol: &SurfaceProtocol,
     auth_config: &SourceAuthConfig,
@@ -399,6 +410,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 401);
         assert_eq!(body["title"], "Unauthorized");
+        assert_eq!(body["detail"], CALLER_CREDENTIAL_REFUSED);
+        assert!(
+            !body
+                .to_string()
+                .contains("expired"),
+            "the refusal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
@@ -416,6 +434,13 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("jwks fetch failed"),
+            "the internal reason reached the caller: {body}"
+        );
     }
 
     #[tokio::test]
@@ -523,5 +548,12 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["status"], 500);
         assert_eq!(body["title"], "Internal Server Error");
+        assert_eq!(body["detail"], INTERNAL_ERROR_DETAIL);
+        assert!(
+            !body
+                .to_string()
+                .contains("missing"),
+            "the config id reached the caller: {body}"
+        );
     }
 }

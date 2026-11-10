@@ -5795,10 +5795,11 @@ mod external_provider_tests {
         }
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while server
-                .revoked_tokens()
-                .is_empty()
-            {
+            loop {
+                let tokens = server.revoked_tokens();
+                if tokens.len() == 2 && tokens.contains(&"deferred".to_string()) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
