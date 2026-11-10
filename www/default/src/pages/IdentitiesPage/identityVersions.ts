@@ -1,4 +1,4 @@
-import type { Identity } from '../../types';
+import type { CredentialRotation, Identity } from '../../types';
 
 export interface FieldChange {
   field: string;
@@ -24,11 +24,25 @@ export interface IdentityEntry<T extends Identity> {
   primary: T;
   /** Every DID of the entry, the primary included. */
   dids: string[];
-  /** Newest first; empty for a single DID that was never rotated. */
-  versions: IdentityVersion[];
+  /** Every identity of the entry, from which `entryVersions` builds its versions. */
+  members: T[];
+  /** More than one DID, or a DID with a recorded rotation: Version History has versions. */
+  hasVersions: boolean;
 }
 
+/** Each identity's credential rotations, oldest first, by `identity_hash`. */
+export type RotationsByHash = Record<string, CredentialRotation[]>;
+
 type Fields = Record<string, unknown>;
+
+const NO_ROTATIONS: CredentialRotation[] = [];
+
+/** Rotations recorded for the identity; the backend omits the count when there are none. */
+export const rotationCount = (identity: Identity): number => identity.rotation_count ?? 0;
+
+/** The members whose rotations must be fetched before their versions can be built. */
+export const membersWithRotations = <T extends Identity>(members: T[]): T[] =>
+  members.filter(member => rotationCount(member) > 0);
 
 const time = (value?: string | null): number => {
   const parsed = value ? Date.parse(value) : NaN;
@@ -66,8 +80,7 @@ const groupKey = (identity: Identity): string => {
 };
 
 /** The identity's fields before its rotation at `index`; `rotations.length` gives the current ones. */
-function fieldsBefore(identity: Identity, index: number): Fields {
-  const rotations = identity.rotations ?? [];
+function fieldsBefore(identity: Identity, rotations: CredentialRotation[], index: number): Fields {
   const fields: Fields = { ...(identity.agent_identity ?? {}) };
   for (let i = rotations.length - 1; i >= index; i--) {
     Object.assign(fields, rotations[i].previous ?? {});
@@ -100,14 +113,18 @@ function diff(before: Fields | undefined, after: Fields): FieldChange[] {
  * A new DID is compared with the DID created before it, a rotation with its DID's fields
  * before it. A rotation of unknown time is placed at its DID's creation.
  */
-function timeline<T extends Identity>(members: T[], currentDid: string): IdentityVersion[] {
+function timeline<T extends Identity>(
+  members: T[],
+  currentDid: string,
+  rotationsByHash: RotationsByHash
+): IdentityVersion[] {
   const byCreation = [...members].sort((a, b) => time(a.created_at) - time(b.created_at));
   const events: Array<Omit<IdentityVersion, 'number' | 'current'> & { sortAt: number }> = [];
   let previousDidFields: Fields | undefined;
 
   byCreation.forEach(identity => {
-    const rotations = identity.rotations ?? [];
-    const created = fieldsBefore(identity, 0);
+    const rotations = rotationsByHash[identity.identity_hash] ?? NO_ROTATIONS;
+    const created = fieldsBefore(identity, rotations, 0);
     events.push({
       kind: 'did',
       did: identity.did,
@@ -120,11 +137,14 @@ function timeline<T extends Identity>(members: T[], currentDid: string): Identit
         kind: 'rotation',
         did: identity.did,
         at: rotation.rotated_at,
-        changes: diff(fieldsBefore(identity, index), fieldsBefore(identity, index + 1)),
+        changes: diff(
+          fieldsBefore(identity, rotations, index),
+          fieldsBefore(identity, rotations, index + 1)
+        ),
         sortAt: rotation.rotated_at ? time(rotation.rotated_at) : time(identity.created_at),
       });
     });
-    previousDidFields = fieldsBefore(identity, rotations.length);
+    previousDidFields = fieldsBefore(identity, rotations, rotations.length);
   });
 
   const ordered = events
@@ -148,11 +168,7 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
   );
   const dids = members.map(member => member.did);
   if (members.length === 1) {
-    return {
-      primary: latest,
-      dids,
-      versions: latest.rotations?.length ? timeline(members, latest.did) : [],
-    };
+    return { primary: latest, dids, members, hasVersions: rotationCount(latest) > 0 };
   }
   return {
     primary: {
@@ -161,8 +177,23 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
       last_used_at: lastUse(latest),
     },
     dids,
-    versions: timeline(members, latest.did),
+    members,
+    hasVersions: true,
   };
+}
+
+/**
+ * The entry's versions, newest first, from its members and their fetched rotations (see
+ * `membersWithRotations`). A single DID without rotations has none.
+ */
+export function entryVersions<T extends Identity>(
+  members: T[],
+  currentDid: string,
+  rotationsByHash: RotationsByHash
+): IdentityVersion[] {
+  if (members.length === 0) return [];
+  if (members.length === 1 && !rotationsByHash[members[0].identity_hash]?.length) return [];
+  return timeline(members, currentDid, rotationsByHash);
 }
 
 /**

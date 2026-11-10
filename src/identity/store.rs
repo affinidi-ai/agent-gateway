@@ -89,6 +89,18 @@ pub trait IdentityStore: Send + Sync {
         Ok(())
     }
 
+    /// Every rotation of the identity's credential, oldest first; `None` for an unknown
+    /// identity. Stores without a rotation history keep rotations on the record.
+    async fn rotations(
+        &self,
+        identity_hash: &str,
+    ) -> Result<Option<Vec<filesystem::CredentialRotation>>> {
+        Ok(self
+            .find_by_hash(identity_hash)
+            .await?
+            .map(|record| record.rotations))
+    }
+
     /// Returns the base filesystem storage path, if this is a filesystem-backed store.
     /// Returns `None` for in-memory or mock implementations.
     fn base_path(&self) -> Option<std::path::PathBuf> {

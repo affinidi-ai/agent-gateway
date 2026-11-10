@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from 'react';
 import type { Identity } from '../../types';
-import { groupIdentityVersions, type IdentityVersion } from './identityVersions';
+import { groupIdentityVersions, type IdentityEntry } from './identityVersions';
 import { matchesRecorderFilter, type RecorderFilter } from './recorderFilter';
 import { isSharedManagedDid } from './sharedManagedDid';
 
@@ -13,8 +13,6 @@ type SurfaceRef = Pick<
   | 'channel_config_id'
   | 'origin'
 >;
-
-const NO_VERSIONS: IdentityVersion[] = [];
 
 export interface SurfaceLink {
   id: string;
@@ -39,8 +37,8 @@ export interface IdentityRowsView<T extends Identity> {
   liveSurfaceNames: Map<string, string>;
   surfaceLinkFor: (identity: SurfaceRef) => SurfaceLink | null;
   surfaceLinksFor: (identity: SurfaceRef & Pick<Identity, 'managed_surfaces'>) => SurfaceLink[];
-  /** The versions of the entry whose primary DID is `did`, newest first. */
-  versionsFor: (did: string) => IdentityVersion[];
+  /** The entry whose primary DID is `did`. */
+  entryFor: (did: string) => IdentityEntry<T> | undefined;
   /** The identity whose DID is `did`, for the actions on an earlier version. */
   identityFor: (did: string) => T | undefined;
   /** The primary DID of the entry holding `did`, or `did` itself when no entry holds it. */
@@ -117,20 +115,17 @@ export function useIdentityRows<T extends Identity>({
 
   const entries = useMemo(() => groupIdentityVersions(identities), [identities]);
 
-  const { versionsByPrimary, primaryByDid } = useMemo(() => {
-    const versions = new Map<string, IdentityVersion[]>();
+  const { entriesByPrimary, primaryByDid } = useMemo(() => {
+    const byPrimary = new Map<string, IdentityEntry<T>>();
     const primaries = new Map<string, string>();
     entries.forEach(entry => {
-      versions.set(entry.primary.did, entry.versions);
+      byPrimary.set(entry.primary.did, entry);
       entry.dids.forEach(did => primaries.set(did, entry.primary.did));
     });
-    return { versionsByPrimary: versions, primaryByDid: primaries };
+    return { entriesByPrimary: byPrimary, primaryByDid: primaries };
   }, [entries]);
 
-  const versionsFor = useCallback(
-    (did: string) => versionsByPrimary.get(did) ?? NO_VERSIONS,
-    [versionsByPrimary]
-  );
+  const entryFor = useCallback((did: string) => entriesByPrimary.get(did), [entriesByPrimary]);
 
   const identitiesByDid = useMemo(
     () => new Map(identities.map(identity => [identity.did, identity])),
@@ -169,7 +164,7 @@ export function useIdentityRows<T extends Identity>({
     liveSurfaceNames,
     surfaceLinkFor,
     surfaceLinksFor,
-    versionsFor,
+    entryFor,
     identityFor,
     primaryDidFor,
   };

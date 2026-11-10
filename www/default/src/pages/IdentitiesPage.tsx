@@ -194,7 +194,7 @@ const IdentitiesPage: React.FC = () => {
     liveSurfaceNames,
     surfaceLinkFor,
     surfaceLinksFor,
-    versionsFor,
+    entryFor,
     identityFor,
     primaryDidFor,
   } = useIdentityRows({
@@ -592,7 +592,7 @@ const IdentitiesPage: React.FC = () => {
                               const isExpanded = expandedPrimaryDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
                               const sharedManagedDid = isSharedManagedDid(identity);
-                              const versions = versionsFor(identity.did);
+                              const entry = entryFor(identity.did);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -954,8 +954,7 @@ const IdentitiesPage: React.FC = () => {
                                               )}
                                             </div>
 
-                                            {(versions.length > 0 ||
-                                              recordsRotations(identity)) && (
+                                            {(entry?.hasVersions || recordsRotations(identity)) && (
                                               <div className="card mb-2">
                                                 <div
                                                   className="card-header py-1 bg-light"
@@ -976,7 +975,8 @@ const IdentitiesPage: React.FC = () => {
                                                 {isSectionExpanded(identity.did, 'versions') && (
                                                   <div className="card-body py-2 px-3">
                                                     <IdentityVersionHistory
-                                                      versions={versions}
+                                                      members={entry?.members ?? [identity]}
+                                                      currentDid={identity.did}
                                                       highlightedDid={
                                                         linkedPrimaryDid === identity.did &&
                                                         linkedDid !== identity.did
