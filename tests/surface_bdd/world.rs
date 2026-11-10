@@ -180,6 +180,8 @@ pub struct SurfaceWorld {
     pub started_sign_in: Option<StartedSignIn>,
     /// The event payload a sign-in step last found on the Redis stream.
     pub sign_in_event: Option<serde_json::Value>,
+    /// The payload with Agent Watch's record content a sign-in step last found on the stream.
+    pub sign_in_record: Option<serde_json::Value>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -257,6 +259,7 @@ impl SurfaceWorld {
             passkeys: HashMap::new(),
             started_sign_in: None,
             sign_in_event: None,
+            sign_in_record: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

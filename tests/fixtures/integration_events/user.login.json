@@ -1,0 +1,24 @@
+{
+  "event_type": "user.login",
+  "event_name": "User Login",
+  "timestamp": "<timestamp>",
+  "appliance_id": "<appliance_id>",
+  "summary": "User charlie logged in",
+  "data": {
+    "old_state": null,
+    "new_state": {
+      "user_id": "<user_id>",
+      "role": "user",
+      "status": "approved",
+      "is_primary": false,
+      "created_at": "<timestamp>",
+      "updated_at": "<timestamp>"
+    },
+    "user_id": "<user_id>",
+    "username": "charlie",
+    "user_email": "",
+    "user_role": "user",
+    "user_status": "approved",
+    "login_method": "passkey"
+  }
+}

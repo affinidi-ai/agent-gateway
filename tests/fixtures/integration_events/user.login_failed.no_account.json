@@ -1,0 +1,13 @@
+{
+  "event_type": "user.login_failed",
+  "event_name": "User Login Failed",
+  "timestamp": "<timestamp>",
+  "appliance_id": "<appliance_id>",
+  "summary": "A passkey sign-in failed: unknown_user",
+  "data": {
+    "old_state": null,
+    "new_state": null,
+    "login_method": "passkey",
+    "failure_reason": "unknown_user"
+  }
+}
