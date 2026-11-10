@@ -666,13 +666,14 @@ mod tests {
         assert_eq!(saved.control_did, new_did);
     }
 
+    type Replacement = (Arc<tokio::sync::OnceCell<Arc<VtaRestClient>>>, Arc<ControlKey>);
+
     #[derive(Clone)]
     struct SupersedeState {
         calls: Arc<AtomicUsize>,
         status: u16,
         body: &'static str,
-        replace_on_first:
-            Arc<std::sync::Mutex<Option<(Arc<tokio::sync::OnceCell<Arc<VtaRestClient>>>, Arc<ControlKey>)>>>,
+        replace_on_first: Arc<std::sync::Mutex<Option<Replacement>>>,
     }
 
     async fn echo(

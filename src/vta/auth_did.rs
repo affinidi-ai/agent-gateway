@@ -700,9 +700,6 @@ mod tests {
         );
     }
 
-    /// An id is a path segment on disk and in the URL, so a traversal attempt
-    /// is refused instead of joined.
-
     async fn born(seed: u8) -> (tempfile::TempDir, std::path::PathBuf, String, ControlKey) {
         let storage = tempfile::tempdir().expect("tempdir");
         let key = ControlKey::from_seed([seed; 32]);
@@ -957,9 +954,14 @@ mod tests {
         let err = keep_only_key(&dir, &did, &old, "key-9")
             .await
             .expect_err("not declared");
-        assert!(format!("{}", err.log_detail()).contains("key-9"));
+        assert!(
+            err.log_detail()
+                .contains("key-9")
+        );
     }
 
+    /// An id is a path segment on disk and in the URL, so a traversal attempt
+    /// is refused instead of joined.
     #[tokio::test]
     async fn an_id_that_is_not_a_plain_identifier_cannot_name_a_did() {
         let dir = tempfile::tempdir().expect("tempdir");

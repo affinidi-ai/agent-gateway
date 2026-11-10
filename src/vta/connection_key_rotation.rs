@@ -1032,7 +1032,6 @@ mod tests {
         store: Arc<FakeStore>,
         secrets: Arc<FakeSecrets>,
         clients: Arc<FakeClients>,
-        clock: Arc<FakeClock>,
         rotator: Arc<ConnectionKeyRotator>,
         did: String,
         old: ControlKey,
@@ -1058,8 +1057,10 @@ mod tests {
             .await
             .unwrap();
         let now = Utc::now();
-        let mut pairing = crate::vta::pairing::PairingRecord::default();
-        pairing.state = PairingState::Connected;
+        let pairing = crate::vta::pairing::PairingRecord {
+            state: PairingState::Connected,
+            ..Default::default()
+        };
         let connection = VtaConnection {
             id: ID.to_string(),
             tenant_id: None,
@@ -1099,7 +1100,6 @@ mod tests {
             store,
             secrets,
             clients,
-            clock,
             rotator,
             did,
             old,
