@@ -216,4 +216,64 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
       "Bundled trust agent",
     );
   });
+
+  test("the control key block shows the key and rotates it on request", async ({
+    page,
+  }) => {
+    const oldDid = "did:key:z6MkOldOldOldOldOldOldOldOldOldOldOldOldOld";
+    const newDid = "did:key:z6MkNewNewNewNewNewNewNewNewNewNewNewNewNew";
+    let rotated = false;
+    const bootstrap = () => ({
+      state: "connected",
+      advice: "nothing to do",
+      context_id: "gateway",
+      previously_connected: true,
+      owner: "unclaimed",
+      control_did: rotated ? newDid : oldDid,
+      control_key_rotation_days: 90,
+      control_key_next_rotation_at: "2027-02-08T10:00:00Z",
+      ...(rotated ? { control_key_rotated_at: "2026-11-10T10:00:00Z" } : {}),
+    });
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      route.fulfill({ json: [bootstrapConnection] }),
+    );
+    await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
+      route.fulfill({ json: deployment(bootstrap()) }),
+    );
+    let posts = 0;
+    await page.route(/\/api\/v1\/vta\/control-key\/rotate$/, (route) => {
+      posts += 1;
+      rotated = true;
+      return route.fulfill({
+        json: {
+          previous_control_did: oldDid,
+          control_did: newDid,
+          rotated_at: "2026-11-10T10:00:00Z",
+          next_rotation_at: "2027-02-08T10:00:00Z",
+        },
+      });
+    });
+    await page.goto(`${BASE_URL}/trust-agent`);
+
+    await expect(page.getByTestId("bundled-control-key-did")).toHaveAttribute(
+      "title",
+      oldDid,
+    );
+    await expect(
+      page.getByTestId("bundled-control-key-rotated-at"),
+    ).toHaveText("Never rotated");
+
+    await page.getByTestId("bundled-control-key-rotate").click();
+    expect(posts).toBe(0);
+    await page.getByTestId("bundled-control-key-confirm").click();
+
+    await expect(page.getByTestId("bundled-control-key-did")).toHaveAttribute(
+      "title",
+      newDid,
+    );
+    await expect(
+      page.getByTestId("bundled-control-key-rotated-at"),
+    ).toContainText("Rotated");
+    expect(posts).toBe(1);
+  });
 });

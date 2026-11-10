@@ -9,6 +9,7 @@ import { ConnectVtaWizard } from './ConnectVtaWizard';
 import { NewVtaConnectionForm } from './NewVtaConnectionForm';
 import { VtaConnectionsList } from './VtaConnectionsList';
 import { VtaTierBanner } from './VtaTierBanner';
+import { BundledControlKeyCard } from './BundledControlKeyCard';
 import { StrandedAgentsError, useVtaConnections } from './useVtaConnections';
 import type { NewVtaConnection, VtaConnection } from './types';
 
@@ -134,6 +135,14 @@ const VtaConnectionsPage: React.FC = () => {
       )}
 
       <VtaTierBanner deployment={deployment} />
+
+      {deployment?.bootstrap && (
+        <BundledControlKeyCard
+          bootstrap={deployment.bootstrap}
+          canRotate={hasPermission('key_management.edit')}
+          onRotated={reload}
+        />
+      )}
 
       {pairing && (
         <ConnectVtaWizard

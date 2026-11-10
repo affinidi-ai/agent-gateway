@@ -1,6 +1,14 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T11:00:00Z'
+      title: Show when the bundled control key was rotated, with a Rotate button
+      description: >-
+        The Trust Agent page has a card for the key the gateway authenticates to
+        its bundled trust agent with: the control DID, when it was last rotated,
+        when it is next due, and a Rotate control key button for users who can
+        edit key management. The button asks for confirmation, rotates through
+        the new API, and says how long to wait when a rotation was just done.
     - timestamp: '2026-11-10T10:30:00Z'
       title: Rotate the bundled trust agent's control key from the API
       description: >-

@@ -149,7 +149,9 @@ Key or API Key Provider; see _Surface Builder_ in
 
 The Trust Agent page's tier banner shows the bundled trust agent's bootstrap state and owner when
 the sidecar connects itself, from `GET /v1/vta/status`, and never implies key custody for a
-bundled or local deployment; see _Trust Agent page_ in
+bundled or local deployment. Its Bundled trust agent control key card shows the key the gateway
+authenticates with, when it was last rotated and when it is next due, and a Rotate control key
+button for key management editors; see _Trust Agent page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-agent-page).
 
 The CLI consent page (`/cli-consent`) is shown outside the dashboard shell and reuses the login card styles from `www/default/src/pages/LoginPage.module.css`; see _CLI consent page_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#cli-consent-page).

@@ -10,6 +10,7 @@ const bootstrap = (overrides: Partial<VtaBootstrapStatus> = {}): VtaBootstrapSta
   context_id: 'gateway',
   previously_connected: true,
   owner: 'unclaimed',
+  control_key_rotation_days: 90,
   ...overrides,
 });
 

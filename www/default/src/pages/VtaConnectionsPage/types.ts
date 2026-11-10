@@ -114,6 +114,12 @@ export interface VtaBootstrapStatus {
   control_did?: string;
   context_id: string;
   bootstrapped_at?: string;
+  /** When the control key last moved to a new one; absent until it has. */
+  control_key_rotated_at?: string;
+  /** When it is next due; absent when automatic rotation is off. */
+  control_key_next_rotation_at?: string;
+  /** Days between automatic rotations; 0 is off. */
+  control_key_rotation_days: number;
   /** A completed bootstrap was recorded before this start. */
   previously_connected: boolean;
   /** `unclaimed` until a person claims the trust agent. */

@@ -1160,6 +1160,18 @@ anything itself:
   (`vta-bootstrap-advice`) and `detail` (`vta-bootstrap-detail`) in danger text, and says signing
   is refused when `previously_connected` is true. The advice text is the backend's, so a new
   state needs a label here and advice there.
+- Under the banner, while `bootstrap` is present, the **Bundled trust agent control key** card
+  (`BundledControlKeyCard`, `data-testid="bundled-control-key"`) shows the control DID the gateway
+  authenticates to the sidecar with (shortened, full value in the `title`, with a copy button:
+  `bundled-control-key-did`), when it was last rotated or "Never rotated"
+  (`bundled-control-key-rotated-at`), and when it is next due or "Automatic rotation is off"
+  (`bundled-control-key-next`), from `control_key_rotated_at`, `control_key_next_rotation_at` and
+  `control_key_rotation_days`. **Rotate control key** (`bundled-control-key-rotate`) is shown only
+  with `key_management.edit` and is disabled while the sidecar is not connected. It asks first
+  (an inline confirmation, `bundled-control-key-confirm` / `-cancel`) and then posts to
+  `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N minutes" from `Retry-After`,
+  any other refusal shows the gateway's message, and a success toasts the new DID and reloads the
+  page's status. The card says rotation changes no signing key; keep that true.
 - The connections table below it reads `GET /v1/vta/connections`. The `vta-bootstrap` record is
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
