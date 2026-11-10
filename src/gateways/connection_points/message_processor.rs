@@ -3166,7 +3166,9 @@ async fn read_forward_target_body(
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
 ) -> Result<String, crate::proxy::upstream_body::UpstreamBodyError> {
-    let body_error = if is_sse_response {
+    let body_error = if crate::proxy::upstream_body::is_compressed(response.headers()) {
+        crate::proxy::upstream_body::UpstreamBodyError::Compressed
+    } else if is_sse_response {
         channel_info!(config_id, "GW2: Upstream responded with SSE — consuming stream for final response");
         match crate::mcp::sse_transport::consume_sse_response(response, request, limits).await {
             Ok(json_response) => return Ok(json_response),
@@ -5837,6 +5839,11 @@ async fn process_charged_forward_request(
                 );
                 continue;
             }
+            // The Target's answer is carried back as text, so it is asked for
+            // an uncompressed one below, whatever the sender accepts.
+            if key_lower == "accept-encoding" {
+                continue;
+            }
             // Skip host - reqwest sets :authority from the URL in HTTP/2;
             // forwarding an explicit Host header causes PROTOCOL_ERROR resets
             // from strict HTTP/2 servers (e.g. Google Frontend).
@@ -5874,6 +5881,7 @@ async fn process_charged_forward_request(
     } else {
         channel_info!(config_id, "  ↳ No headers to add");
     }
+    req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
     // Inject target authentication credentials (if configured on the channel)
     let mut target_token = None;
@@ -10804,6 +10812,27 @@ mod tests {
         let (status, body) = forward_error_of(result).await;
         assert_eq!(status, 504);
         assert!(body.contains("Upstream response timed out"), "{body}");
+    }
+
+    /// The Target is asked for an uncompressed answer, which is carried back as
+    /// text; one compressed all the same is refused rather than corrupted.
+    #[tokio::test]
+    async fn a_compressed_forward_target_body_answers_502() {
+        use crate::proxy::upstream_body::tests::{PATIENT, chunk, limits, upstream};
+        use std::time::Duration;
+        for (head, is_sse) in [(JSON_HEAD, false), (SSE_HEAD, true)] {
+            let head = head.replace("\r\n\r\n", "\r\ncontent-encoding: gzip\r\n\r\n");
+            let response =
+                upstream(head, vec![(Duration::ZERO, chunk(b"\x1f\x8b\x08")), (Duration::ZERO, chunk(b""))]).await;
+
+            let result =
+                read_forward_target_body(response, is_sse, b"", limits(1024, Some(PATIENT), PATIENT), "surface-1")
+                    .await;
+
+            let (status, body) = forward_error_of(result).await;
+            assert_eq!(status, 502, "sse: {is_sse}");
+            assert!(body.contains("Upstream response is compressed"), "sse: {is_sse}: {body}");
+        }
     }
 
     #[tokio::test]

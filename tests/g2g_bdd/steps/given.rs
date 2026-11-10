@@ -889,6 +889,19 @@ fn remote_record_id(
         .to_string()
 }
 
+#[given(expr = "managed agent {string} compresses its replies with gzip when asked")]
+pub fn managed_agent_compresses_its_replies_when_asked(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_gzip_when_asked
+        .insert(surface_id);
+}
+
 #[given(expr = "surface {string} serves an agent card naming agent DID {string}")]
 pub fn surface_serves_an_agent_card_naming_agent_did(
     world: &mut G2gWorld,

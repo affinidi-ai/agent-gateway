@@ -103,6 +103,7 @@ impl FetchFault {
             UpstreamBodyError::TooLarge(_) => Self::TooLarge,
             UpstreamBodyError::TimedOut => Self::TimedOut,
             UpstreamBodyError::Read(error) => Self::of_send(error),
+            UpstreamBodyError::Compressed => Self::InvalidCard,
         }
     }
 }
@@ -705,10 +706,15 @@ impl TargetCardFetch<'_> {
                     &credential_headers,
                 ),
             };
-            if forward {
+            if forward
+                && !key
+                    .as_str()
+                    .eq_ignore_ascii_case("accept-encoding")
+            {
                 req = req.header(key.as_str(), value.as_bytes());
             }
         }
+        req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
         if let Some(super::TargetCredential {
             header: (header_name, header_value),
             ..
@@ -772,7 +778,7 @@ impl TargetCardFetch<'_> {
                 .a2a
                 .timeout_seconds,
         );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
+        let body = crate::proxy::upstream_body::read_bounded_uncompressed(response, limits)
             .await
             .map_err(|e| {
                 error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");

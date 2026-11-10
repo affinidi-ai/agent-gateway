@@ -92,6 +92,10 @@ pub enum MockStream {
     /// The configured JSON string, base64-decoded, as the raw body: a file,
     /// not JSON.
     Bytes,
+    /// One JSON body, gzip-compressed when the request accepts gzip.
+    GzipWhenAsked,
+    /// One JSON body, gzip-compressed whatever the request accepts.
+    Gzip,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -456,6 +460,9 @@ async fn handler(
         .as_str()
         .to_string();
     let headers = received_headers(request.headers());
+    let accepts_gzip = headers
+        .get("accept-encoding")
+        .is_some_and(|accepted| accepted.contains("gzip"));
     let content_type = headers
         .get("content-type")
         .cloned();
@@ -524,6 +531,16 @@ async fn handler(
 
     let body = match response.stream {
         MockStream::None => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
+        MockStream::GzipWhenAsked if !accepts_gzip => Body::from(serde_json::to_vec(&response_body_value).unwrap()),
+        MockStream::GzipWhenAsked | MockStream::Gzip => {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder
+                .write_all(&serde_json::to_vec(&response_body_value).unwrap())
+                .unwrap();
+            builder = builder.header("content-encoding", "gzip");
+            Body::from(encoder.finish().unwrap())
+        }
         MockStream::Sse => Body::from(sse_event(&response_body_value)),
         MockStream::Bytes => Body::from(
             base64::Engine::decode(

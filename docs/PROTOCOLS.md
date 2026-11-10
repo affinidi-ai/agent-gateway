@@ -534,12 +534,19 @@ On the JSON-RPC binding the refusal is a JSON-RPC `-32603` error that echoes the
 the HTTP+JSON binding it is a problem response. A non-success response that carries no card
 `result` is forwarded unchanged.
 A public card that cannot be rewritten is answered with `502` on the direct inbound path and
-forwarded as received on fabric and outbound paths.
+forwarded as received on fabric and outbound paths, except a compressed one, which an outbound
+Transit Point also answers with `502`: forwarded unrewritten, it would point callers past the
+Transit Point.
 
 A JSON-RPC batch that contains an extended-card call is rejected with `-32600` before it is
 forwarded, whatever the surface's A2A validation level, `"off"` included, because a card inside a
-batch response cannot be rewritten. A compressed card cannot be rewritten either, so an extended-card fetch is forwarded with
-`Accept-Encoding: identity` in place of the caller's value.
+batch response cannot be rewritten. A compressed card cannot be rewritten either, so every card
+fetch, public or extended, on an Access Point or a Transit Point, is forwarded with
+`Accept-Encoding: identity` in place of the caller's value, and a card compressed all the same is
+answered with `502` (`Upstream response is compressed` on an Access Point). Other A2A requests
+keep the caller's `Accept-Encoding` on a direct path, and their compressed answers pass through
+unchanged; over Fabric every buffered request asks for an uncompressed answer (see
+[`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)).
 
 Extended cards are detected the same way as the public card: from the request's JSON-RPC method or
 path. Some requests are not recognised, and are forwarded like any other request with their

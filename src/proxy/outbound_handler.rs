@@ -1161,7 +1161,7 @@ async fn outbound_proxy_handler_in_request_scope(
     }
     step_inject_credentials(&state, &mut ctx).await?;
 
-    request_uncompressed_extended_agent_card(&mut ctx);
+    request_uncompressed_agent_card(&mut ctx);
     request_uncompressed_mcp_response(&mut ctx);
 
     // [12] Forward Request. A target that cannot be reached, or whose response
@@ -1174,7 +1174,7 @@ async fn outbound_proxy_handler_in_request_scope(
         }
     };
     let upstream_response = step_answer_a_refused_grant(&state, &mut ctx, upstream_response).await?;
-    refuse_a_compressed_mcp_answer(&ctx, &upstream_response)?;
+    refuse_a_compressed_answer(&ctx, &upstream_response)?;
 
     if matches!(
         ctx.mcp_classification
@@ -6595,18 +6595,22 @@ fn request_uncompressed_mcp_response(ctx: &mut OutboundPipelineContext) {
     }
 }
 
-/// An MCP Transit Point's target is asked for an uncompressed answer
-/// ([`request_uncompressed_mcp_response`]); one compressed all the same is
-/// refused, since tool gating and the response checks read the body as it is
-/// sent, and would read none of it.
-fn refuse_a_compressed_mcp_answer(
+/// An MCP Transit Point's target, and the target of a public agent card read,
+/// are asked for an uncompressed answer ([`request_uncompressed_mcp_response`],
+/// [`request_uncompressed_agent_card`]); one compressed all the same is
+/// refused. Tool gating and the response checks read the body as it is sent,
+/// and a card that cannot be rewritten would point its callers past the
+/// Transit Point.
+fn refuse_a_compressed_answer(
     ctx: &OutboundPipelineContext,
     upstream: &UpstreamResponse,
 ) -> Result<(), OutboundPipelineError> {
     let UpstreamResponse::Http(response) = upstream else {
         return Ok(());
     };
-    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp
+        && !is_public_card_request(ctx)
+    {
         return Ok(());
     }
     if crate::proxy::upstream_body::is_compressed(response.headers()) {
@@ -6614,7 +6618,7 @@ fn refuse_a_compressed_mcp_answer(
             request_id = %ctx.request_id,
             alias = %ctx.virtual_channel.alias,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
-            "An MCP Transit Point's target compressed its answer although none was accepted - refusing it, since \
+            "A Transit Point's target compressed its answer although none was accepted - refusing it, since \
              its body could not be checked"
         );
         return Err(OutboundPipelineError::UpstreamResponseReadFailed);
@@ -6720,10 +6724,16 @@ async fn step_answer_a_refused_grant(
     Ok(UpstreamResponse::Http(retried))
 }
 
-/// A compressed extended card cannot be rewritten, so the Target is asked for an
+/// Whether the request reads the public agent card of an A2A/AP2 Transit Point.
+fn is_public_card_request(ctx: &OutboundPipelineContext) -> bool {
+    transit_protocol_family(&ctx.virtual_channel.protocol) == Some("a2a")
+        && crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
+}
+
+/// A compressed agent card cannot be rewritten, so the Target is asked for an
 /// uncompressed one.
-fn request_uncompressed_extended_agent_card(ctx: &mut OutboundPipelineContext) {
-    if is_rest_extended_card_request(ctx) || is_rpc_extended_card_request(ctx) {
+fn request_uncompressed_agent_card(ctx: &mut OutboundPipelineContext) {
+    if is_public_card_request(ctx) || is_rest_extended_card_request(ctx) || is_rpc_extended_card_request(ctx) {
         ctx.original_headers
             .insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
@@ -6909,7 +6919,8 @@ async fn step_process_response(
                 match e {
                     crate::proxy::upstream_body::UpstreamBodyError::TimedOut => OutboundPipelineError::UpstreamTimeout,
                     crate::proxy::upstream_body::UpstreamBodyError::TooLarge(_)
-                    | crate::proxy::upstream_body::UpstreamBodyError::Read(_) => {
+                    | crate::proxy::upstream_body::UpstreamBodyError::Read(_)
+                    | crate::proxy::upstream_body::UpstreamBodyError::Compressed => {
                         OutboundPipelineError::UpstreamResponseReadFailed
                     }
                 }
@@ -17483,7 +17494,7 @@ mod tests {
         request_uncompressed_mcp_response(ctx);
         let upstream = step_forward_request(state, ctx).await?;
         let upstream = step_answer_a_refused_grant(state, ctx, upstream).await?;
-        refuse_a_compressed_mcp_answer(ctx, &upstream)?;
+        refuse_a_compressed_answer(ctx, &upstream)?;
         match upstream {
             UpstreamResponse::Http(response) => Ok(response.status()),
             _ => panic!("an HTTP forward answers over HTTP"),
@@ -17516,6 +17527,52 @@ mod tests {
                 matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)),
                 refused,
                 "{protocol} {encoding}: {sent:?}"
+            );
+        }
+    }
+
+    /// An A2A Transit Point's public agent card is read uncompressed, whatever
+    /// the agent accepts, so it can be rewritten; one compressed all the same is
+    /// refused rather than passed on pointing past the Transit Point. Its
+    /// messages keep the agent's own encoding.
+    #[test]
+    fn a_public_agent_card_on_an_a2a_transit_point_is_read_uncompressed() {
+        for (protocol, path, card) in [
+            ("a2a", "/mcp/vendor/.well-known/agent-card.json", true),
+            ("a2a", "/mcp/vendor/.well-known/agent.json", true),
+            ("ap2", "/mcp/vendor/.well-known/agent-card.json", true),
+            ("a2a", "/mcp/vendor", false),
+            ("http", "/mcp/vendor/.well-known/agent-card.json", false),
+        ] {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["protocol"] = json!(protocol);
+            let surface = transit_surface(json!([point]), json!([]));
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, None);
+            ctx.request_path = path.to_string();
+            ctx.original_headers
+                .insert(axum::http::header::ACCEPT_ENCODING, "gzip, br".parse().unwrap());
+
+            request_uncompressed_agent_card(&mut ctx);
+
+            let expected = if card {
+                "identity"
+            } else {
+                "gzip, br"
+            };
+            assert_eq!(ctx.original_headers[axum::http::header::ACCEPT_ENCODING], expected, "{protocol} {path}");
+            let compressed = UpstreamResponse::Http(reqwest::Response::from(
+                axum::http::Response::builder()
+                    .header("content-encoding", "gzip")
+                    .body(b"\x1f\x8b\x08".to_vec())
+                    .unwrap(),
+            ));
+            assert_eq!(
+                matches!(
+                    refuse_a_compressed_answer(&ctx, &compressed),
+                    Err(OutboundPipelineError::UpstreamResponseReadFailed)
+                ),
+                card,
+                "{protocol} {path}"
             );
         }
     }

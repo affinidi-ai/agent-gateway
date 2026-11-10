@@ -2885,6 +2885,46 @@ async fn managed_agent_sends_a2a_request_through_transit_point_with_header(
     send_a2a_request_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)]).await;
 }
 
+#[when(expr = "managed agent {string} fetches the agent card of Transit Point {string} accepting gzip")]
+async fn managed_agent_fetches_transit_point_card_accepting_gzip(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    ensure_gateway_running(world).await;
+    let infra = world
+        .infra
+        .as_mut()
+        .expect("scenario infra must exist");
+    let outbound_port = infra.outbound_port;
+    infra
+        .gateway
+        .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
+        .await
+        .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
+    let url = format!("http://127.0.0.1:{outbound_port}/transit/{transit_point}/.well-known/agent-card.json");
+
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .expect("fetch agent card through Transit Point");
+
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let body = response
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
+    record_mock_observation(world).await;
+    record_replacement_mock_observation(world).await;
+}
+
 #[when(regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request through Transit Point \"([^\"]+)\"$"#)]
 async fn managed_agent_sends_a2a_request_through_transit_point(
     world: &mut SurfaceWorld,

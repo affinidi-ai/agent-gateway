@@ -310,6 +310,20 @@ fn agent_card_describes_a2a_proxy(
     );
 }
 
+#[then("the agent card points callers at the gateway, not at the agent")]
+fn agent_card_points_callers_at_the_gateway(world: &mut SurfaceWorld) {
+    let response = get_caller_response(world);
+    let url = response
+        .body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("agent card url must be present, got {}", response.body));
+    assert!(
+        url.starts_with("http") && !url.starts_with(crate::steps::given::AGENT_OWN_CARD_URL),
+        "agent card url should point at the gateway, got {url}"
+    );
+}
+
 #[then(expr = "the agent card url points to the surface Access Point")]
 fn agent_card_url_points_to_surface_access_point(world: &mut SurfaceWorld) {
     let response = get_caller_response(world);
@@ -1422,6 +1436,12 @@ fn response_body_is_error(
             "title": "Bad Gateway",
             "status": 502,
             "detail": "Upstream redirected"
+        }),
+        "agent_card_upstream_compressed" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Bad Gateway",
+            "status": 502,
+            "detail": "Upstream response is compressed"
         }),
         other => panic!("unsupported expected response error: {}", other),
     };

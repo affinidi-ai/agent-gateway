@@ -1338,6 +1338,35 @@ fn build_external_agent_card(
     })
 }
 
+pub(crate) const AGENT_OWN_CARD_URL: &str = "http://agent.internal.example/a2a";
+
+#[given(
+    regex = r#"^(?:managed|external) agent \"([^\"]+)\" serves a gzip-compressed agent card (when asked|even when not asked)$"#
+)]
+fn agent_serves_a_gzip_compressed_agent_card(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    when: String,
+) {
+    let mut response = MockResponse::json(serde_json::json!({
+        "protocolVersion": "0.3.0",
+        "name": "gzip-agent",
+        "description": "An agent that compresses its replies",
+        "url": AGENT_OWN_CARD_URL,
+        "version": "1.0.0",
+        "capabilities": {},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": []
+    }));
+    response.stream = if when == "when asked" {
+        MockStream::GzipWhenAsked
+    } else {
+        MockStream::Gzip
+    };
+    set_target_response_for_actor(world, &agent_name, response);
+}
+
 #[given(expr = "external agent {string} publishes an agent card without an agent-identity-credential")]
 fn external_agent_publishes_card_without_identity_credential(
     world: &mut SurfaceWorld,

@@ -1,0 +1,22 @@
+branch: fix/a2a-gzip-target-replies
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-10T11:40:36Z'
+      title: Serve A2A agent cards and Fabric replies from agents that gzip their answers
+      description: >-
+        A caller's Accept-Encoding gzip reached the agent, whose compressed answer the gateway
+        could not read. Access Point card discovery failed with 502 and Fabric carried a corrupted
+        body. Agent card fetches and every Fabric forward now ask the agent for an uncompressed
+        answer, and one compressed all the same is refused with 502 rather than corrupted.
+  removed: []
+  security:
+    - timestamp: '2026-11-10T11:40:36Z'
+      title: Stop a compressed agent card from pointing callers past a Transit Point
+      description: >-
+        A Transit Point returned a gzip-compressed agent card unrewritten, so its URL named the
+        agent itself and callers that followed it skipped the Transit Point's policy,
+        authentication, rate limits and audit. The card is now fetched uncompressed and a card
+        compressed all the same is refused with 502.
+  breaking: []
