@@ -2776,33 +2776,27 @@ impl PreparedMcpRequest {
         matches!(self.call, McpCall::ToolsCall { .. })
     }
 
-    /// Whether a tool of the proxy sends a header that asks its backend to run
-    /// another HTTP method than its operation's ([`sends_a_method_override`]).
+    /// Whether a tool of the proxy has a header, query parameter or declared
+    /// body field that asks its backend to run another HTTP method than its
+    /// operation's ([`sends_a_method_override`]).
     pub fn sends_a_method_override(&self) -> bool {
         sends_a_method_override(&self.server)
     }
 }
 
-/// The MCP server `proxy`'s OpenAPI spec defines, sending `default_headers`
-/// with every tool call, and the proxy's `base_url`: what every request to
-/// the proxy is served with.
-fn proxy_server(
-    proxy: &McpProxy,
-    default_headers: Option<ReqwestHeaderMap>,
-) -> Result<(McpServer, Url), McpProxyCallError> {
+/// The MCP server `proxy`'s OpenAPI spec defines, and the proxy's
+/// `base_url`: what every request to the proxy is served with. It holds no
+/// credential: a credentialed tool call is sent by the gateway's own REST
+/// client with its headers.
+fn proxy_server(proxy: &McpProxy) -> Result<(McpServer, Url), McpProxyCallError> {
     // Parse the OpenAPI spec from YAML to JSON
     let openapi_json: serde_json::Value =
         serde_yaml::from_str(&proxy.openapi_spec).map_err(|e| format!("Failed to parse OpenAPI spec: {}", e))?;
     let base_url = Url::parse(&proxy.base_url).map_err(|e| format!("Invalid base_url: {}", e))?;
-    let builder = McpServer::builder()
+    let mut server = McpServer::builder()
         .openapi_spec(openapi_json)
-        .base_url(base_url.clone());
-    let mut server = match default_headers {
-        Some(headers) => builder
-            .default_headers(headers)
-            .build(),
-        None => builder.build(),
-    };
+        .base_url(base_url.clone())
+        .build();
     server
         .load_openapi_spec()
         .map_err(|e| format!("Failed to load OpenAPI spec: {}", e))?;
@@ -2822,7 +2816,7 @@ const METHOD_OVERRIDE_PARAMETER: &str = "_method";
 
 /// Whether `name`, a parameter outside the headers, asks for another method:
 /// [`METHOD_OVERRIDE_PARAMETER`] or one of [`METHOD_OVERRIDE_HEADERS`].
-fn overrides_the_method(name: &str) -> bool {
+pub(super) fn overrides_the_method(name: &str) -> bool {
     std::iter::once(METHOD_OVERRIDE_PARAMETER)
         .chain(METHOD_OVERRIDE_HEADERS)
         .any(|override_name| override_name.eq_ignore_ascii_case(name))
@@ -2865,10 +2859,10 @@ fn sends_a_method_override(server: &McpServer) -> bool {
 }
 
 /// Whether `proxy`'s spec, loaded as a request to the proxy loads it, has a
-/// tool with a header parameter named one of [`METHOD_OVERRIDE_HEADERS`]. A
+/// tool that can send a method override ([`sends_a_method_override`]). A
 /// spec that does not load serves no tool, so it sends none.
 pub fn spec_sends_a_method_override(proxy: &McpProxy) -> bool {
-    proxy_server(proxy, None).is_ok_and(|(server, _)| sends_a_method_override(&server))
+    proxy_server(proxy).is_ok_and(|(server, _)| sends_a_method_override(&server))
 }
 
 enum McpCall {
@@ -2925,7 +2919,7 @@ pub fn prepare_mcp_request(
         None
     };
 
-    let (server, base_url) = proxy_server(proxy, None)?;
+    let (server, base_url) = proxy_server(proxy)?;
 
     let method = request
         .get("method")
@@ -3285,12 +3279,54 @@ pub struct ProxyGrant {
     pub destination: url::Origin,
 }
 
+/// How far a tool call through a Transit Point's MCP Proxy got: whether it
+/// went out to the backend, and the status the backend answered with, kept
+/// even when the gateway then refuses the answer (a redirect, an answer over
+/// the limits, a body that cannot be read, or the call's timeout).
+#[derive(Debug, Default)]
+pub struct TransitCallProgress {
+    sent: std::sync::atomic::AtomicBool,
+    answered: std::sync::atomic::AtomicU16,
+}
+
+impl TransitCallProgress {
+    pub(super) fn mark_sent(&self) {
+        self.sent
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(super) fn mark_answered(
+        &self,
+        status: reqwest::StatusCode,
+    ) {
+        self.answered
+            .store(status.as_u16(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the call passed every check and went out to the backend.
+    pub fn sent(&self) -> bool {
+        self.sent
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The status the backend answered with, if it answered.
+    pub fn answered(&self) -> Option<reqwest::StatusCode> {
+        reqwest::StatusCode::from_u16(
+            self.answered
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+        .ok()
+    }
+}
+
 /// What an MCP Proxy behind a Transit Point answered.
 #[derive(Debug)]
 pub enum TransitProxyAnswer {
-    /// The JSON-RPC response, and for a tool call, the status its backend
-    /// answered with.
-    Response { response: serde_json::Value, backend_status: Option<reqwest::StatusCode> },
+    /// The JSON-RPC response.
+    Response(serde_json::Value),
+    /// A tool call that carries a grant would send a body whose top-level key
+    /// asks the backend to run another HTTP method; it was not sent.
+    OverridesTheMethod,
     /// The backend refused the grant a tool call carried, as
     /// [`crate::delegation_vault::release::vendor_answer`] reads its answer:
     /// its status and `WWW-Authenticate` challenges, never its body, so the
@@ -3309,10 +3345,12 @@ pub enum TransitProxyAnswer {
 /// through the OpenAPI library's client, which follows redirects and vets no
 /// address. With `grant`, a tool call carries the grant's header and goes
 /// only to its `destination`; a backend answer that refuses the grant is
-/// [`TransitProxyAnswer::GrantRefused`]. Without one, the call carries no
-/// credential. `sent` is set once a tool call has passed every check, its URL
-/// and its egress among them, and is being sent to the backend, so the caller
-/// records the grant's use only for a call that reached it. The surface's own
+/// [`TransitProxyAnswer::GrantRefused`], and a body that asks for another
+/// HTTP method is [`TransitProxyAnswer::OverridesTheMethod`], never sent.
+/// Without one, the call carries no credential. `progress` records the call
+/// as sent once it has passed every check, its URL and its egress among them,
+/// so the caller records the grant's use only for a call that reached the
+/// backend, and then the status the backend answered. The surface's own
 /// timeout, retry, circuit breaker and mirroring are its Target's and do not
 /// apply.
 pub async fn serve_through_transit_point(
@@ -3322,12 +3360,12 @@ pub async fn serve_through_transit_point(
     limits: &crate::config::McpHttpConfig,
     exact_allowlist: Option<&str>,
     config_id: &str,
-    sent: &std::sync::atomic::AtomicBool,
+    progress: &TransitCallProgress,
 ) -> Result<TransitProxyAnswer, McpProxyCallError> {
     let PreparedMcpRequest { server, request, call } = prepared;
-    let (result, backend_status) = match call {
-        McpCall::Initialize => (initialize_result(proxy), None),
-        McpCall::ToolsList => (tools_list_result(proxy, &server), None),
+    let result = match call {
+        McpCall::Initialize => initialize_result(proxy),
+        McpCall::ToolsList => tools_list_result(proxy, &server),
         McpCall::ToolsCall {
             tool_name,
             arguments,
@@ -3362,26 +3400,26 @@ pub async fn serve_through_transit_point(
                     .as_ref()
                     .map(|grant| &grant.destination),
                 exact_allowlist,
-                sent,
+                progress,
             )
             .await
             {
-                Ok((result, status)) => (tool_call_result(result), Some(status)),
+                Ok(result) => tool_call_result(result),
                 Err(super::modern_rest::RestError::GrantRefused { status, challenges }) => {
                     return Ok(TransitProxyAnswer::GrantRefused { status, challenges });
+                }
+                Err(super::modern_rest::RestError::MethodOverride) => {
+                    return Ok(TransitProxyAnswer::OverridesTheMethod);
                 }
                 Err(error) => return Err(format!("Tool execution failed: {error}").into()),
             }
         }
     };
-    Ok(TransitProxyAnswer::Response {
-        response: serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned(),
-            "result": result
-        }),
-        backend_status,
-    })
+    Ok(TransitProxyAnswer::Response(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request.get("id").cloned(),
+        "result": result
+    })))
 }
 
 #[cfg(test)]

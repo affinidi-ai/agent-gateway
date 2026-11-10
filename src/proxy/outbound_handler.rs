@@ -6009,9 +6009,11 @@ fn audit_connector_call(
 /// Audit a call through a connector's Transit Point that the vendor answered
 /// as `connector_call` forwarded, with the class of the vendor's status: the
 /// `response`'s own, or for a `proxy://` Transit Point, that of its MCP
-/// Proxy's backend, which the proxy answers the agent as a tool result. A
-/// call through an MCP Proxy that no backend answered (an unknown tool, a URL
-/// or egress refusal, a failed connection, a redirect) records nothing.
+/// Proxy's backend, which the proxy answers the agent as a tool result, even
+/// when the gateway then refused that answer (a redirect, an answer over the
+/// limits, a body that cannot be read). A call through an MCP Proxy that no
+/// backend answered (an unknown tool, a URL, egress or method override
+/// refusal, a failed connection) records nothing.
 fn audit_connector_call_answered(
     ctx: &OutboundPipelineContext,
     response: &reqwest::Response,
@@ -6321,7 +6323,7 @@ async fn step_forward_request_mcp_proxy(
     let header = grant
         .as_ref()
         .map(|grant| grant.header.clone());
-    let sent = std::sync::atomic::AtomicBool::new(false);
+    let progress = crate::mcp_proxies::handlers::TransitCallProgress::default();
     let answer = match crate::mcp_proxies::handlers::prepare_mcp_request(&proxy, request, header, &config_id) {
         Ok(prepared) => {
             if grant.is_some() && prepared.sends_a_method_override() {
@@ -6339,29 +6341,38 @@ async fn step_forward_request_mcp_proxy(
                         .egress_allowlist
                         .as_deref(),
                     &config_id,
-                    &sent,
+                    &progress,
                 ),
             )
             .await;
             // The grant's use is recorded only for a tool call that passed
             // every check, its URL and egress among them, and went out.
-            if records_the_grant && sent.load(std::sync::atomic::Ordering::Acquire) {
+            if records_the_grant && progress.sent() {
                 record_mcp_proxy_grant_sent(state, ctx);
             }
-            answer.map_err(|_| OutboundPipelineError::UpstreamTimeout)?
+            // The backend's status stands even when the gateway then refuses
+            // its answer, as an `https` vendor's does.
+            ctx.proxy_backend_status = progress.answered();
+            let Ok(answer) = answer else {
+                if records_the_grant && let Some(status) = ctx.proxy_backend_status {
+                    audit_connector_call(ctx, ConnectorCallResult::Forwarded { status });
+                }
+                return Err(OutboundPipelineError::UpstreamTimeout);
+            };
+            answer
         }
         Err(refused) => Err(refused),
     };
     match answer {
-        Ok(TransitProxyAnswer::Response { response, backend_status }) => {
-            ctx.proxy_backend_status = backend_status;
-            Ok(own_answer(
-                StatusCode::OK,
-                json_headers(),
-                response
-                    .to_string()
-                    .into_bytes(),
-            ))
+        Ok(TransitProxyAnswer::Response(response)) => Ok(own_answer(
+            StatusCode::OK,
+            json_headers(),
+            response
+                .to_string()
+                .into_bytes(),
+        )),
+        Ok(TransitProxyAnswer::OverridesTheMethod) => {
+            Err(refuse_external_grant(ctx, "mcp_proxy_call_overrides_the_method"))
         }
         Ok(TransitProxyAnswer::GrantRefused { status, challenges }) => {
             let mut headers = HeaderMap::new();
@@ -6369,7 +6380,6 @@ async fn step_forward_request_mcp_proxy(
                 headers.append(axum::http::header::WWW_AUTHENTICATE, challenge);
             }
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::UNAUTHORIZED);
-            ctx.proxy_backend_status = Some(status);
             Ok(own_answer(status, headers, Vec::new()))
         }
         Err(McpProxyCallError::OutsideTargetBase) => {
@@ -19266,7 +19276,10 @@ mod tests {
     /// build, after the grant was released, records nothing, and no
     /// `connector_call` either, as no backend answered it. A call the backend
     /// answered is recorded as `connector_call` with the class of the
-    /// backend's status, not the `200` the proxy answers the agent with.
+    /// backend's status, not the `200` the proxy answers the agent with, even
+    /// when the gateway refuses that answer, as a redirect. A call whose body
+    /// has an undeclared `_method` key is refused, never sent, and records no
+    /// use.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_proxy_tool_call_refused_before_it_is_sent_records_no_use_of_the_grant() {
         use crate::delegation_vault::audit::{ConnectorCallOutcome, DelegationAuditAction};
@@ -19288,6 +19301,7 @@ mod tests {
         let vendor = RecordingServer::start_answering(vec![
             Answer::json(200, json!({"files": []})),
             Answer::json(404, json!({"error": "no such file"})),
+            Answer::status(302).with_header("Location", "https://elsewhere.example/files"),
         ])
         .await;
         let directory = tempfile::tempdir().unwrap();
@@ -19302,6 +19316,10 @@ mod tests {
             r#""paths": {"#,
             r#""paths": {"/files/{fileId}": {"get": {"operationId": "get_file", "summary": "Get a file",
                 "parameters": [{"name": "fileId", "in": "path", "required": true, "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "A file"}}}},
+            "/files/new": {"post": {"operationId": "create_file", "summary": "Create a file",
+                "requestBody": {"content": {"application/x-www-form-urlencoded": {"schema": {"type": "object",
+                    "properties": {"name": {"type": "string"}}}}}},
                 "responses": {"200": {"description": "A file"}}}},"#,
             1,
         );
@@ -19337,6 +19355,23 @@ mod tests {
             [Some("4xx".to_string())],
             "the backend's 404, not the proxy's 200 to the agent"
         );
+
+        let (answer, events) =
+            crate::audit::producer::capture(answered(&state, &mut drive_call(&surface, search_files(4)))).await;
+        assert!(answer.unwrap().1["error"].is_object(), "the redirect is refused");
+        assert_eq!(grants_injected(&events), 1);
+        assert_eq!(status_classes(&events), [Some("3xx".to_string())], "the backend's answer is still recorded");
+
+        let overriding = json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "create_file",
+            "arguments": {"request_body": {"name": "a", "_method": "DELETE"}}}});
+        let (answer, events) =
+            crate::audit::producer::capture(answered(&state, &mut drive_call(&surface, overriding))).await;
+        assert_eq!(
+            grant_refusal(&answer.expect_err("a body asking for another method")),
+            Some(&crate::delegation_vault::release::GrantRefusal::ConnectorUnavailable)
+        );
+        assert_eq!(grants_injected(&events), 0, "never sent, so no use");
+        assert_eq!(vendor.requests().len(), 3, "the backend is not called");
     }
 
     /// A `proxy://` Transit Point's backend that answers a tool call `403`

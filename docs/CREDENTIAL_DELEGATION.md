@@ -1200,7 +1200,7 @@ an `https` target's:
 | `protocol` | `mcp` |
 | The MCP Proxy | Of the surface's own tenant, exactly, and served only through surfaces (`direct_access: false`), so its backend is reached with the grant only through the Transit Point that holds it. A proxy anyone can call on its own route is refused |
 | Its `base_url` | A public `https` URL with the origin (scheme, host and port) of the provider's `resource` |
-| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, and no tool with a query parameter or request body field named `_method` or one of those three (any case): many REST APIs, Google's among them, run the method such a header names, and web frameworks such as Rails, Laravel and Express's method-override run the one `_method` names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes |
+| Its spec | No tool with a header parameter named `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override`, and no tool with a query parameter or declared request body field named `_method` or one of those three (any case): many REST APIs, Google's among them, run the method such a header names, and web frameworks such as Rails, Laravel and Express's method-override run the one `_method` names, so an agent could turn an allowed `GET` tool into a `DELETE` behind the same tool name, past name-based tool gating. A spec that does not load serves no tool and passes. A body field the spec does not declare is still sent, so a tool call that carries the grant is also refused when it is sent (`connector_unavailable`) if its body has a top-level key of one of those names |
 | Its pin | The proxy as it was when the binding was pinned: below |
 | `inject_as` | A header: `bearer_header` (the default) or `custom_header`, never `meta`. The grant is the call's only credential |
 | `target_auth` | None |
@@ -1236,8 +1236,9 @@ delete or promote, and a tenant transfer start from the stored surface, so a pin
 it is not one they sent: only a pin in the request body itself is compared. A client that `GET`s
 a surface and `PUT`s it back, as the dashboard does, sends the stored pin, which is kept as if
 not sent: the save approves no edit to the proxy, and answers the `Warning` when it is stale.
-A tenant transfer of a surface with such a binding is refused (`409`), because its MCP Proxy is
-not of the new tenant. A pin is compared only with a proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
+A tenant transfer of a surface with such a binding is refused (`409`) until its MCP Proxy is
+transferred first, because the proxy is not of the new tenant; the pin does not cover the tenant,
+so after the proxy's transfer the surface's keeps its pin. A pin is compared only with a proxy of the surface's own tenant: for a missing proxy or another tenant's, it is not compared,
 and the save is refused as for any binding to such a proxy, so the answer tells nothing of
 another tenant's proxy. The gateway never stores a pin it did not compute or compare.
 

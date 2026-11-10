@@ -33,8 +33,8 @@ changes:
         gets one refresh and one retry through the proxy, and a refused grant answers
         connect_required, scope_insufficient or connector_unavailable, as on an https target,
         without the backend's words. A connector_call audit record names the class of the
-        backend's status, not that of the MCP Proxy's answer to the agent, and a call no backend
-        answered records none.
+        backend's status, not that of the MCP Proxy's answer to the agent, even when the gateway
+        then refuses that answer, and a call no backend answered records none.
     - timestamp: '2026-11-08T18:00:00Z'
       title: Answer every MCP Proxy with its grant_pin
       description: >-
@@ -87,12 +87,14 @@ changes:
       title: Refuse a grant through an MCP Proxy whose spec overrides the HTTP method
       description: >-
         A header parameter named X-HTTP-Method-Override, X-HTTP-Method or X-Method-Override, or
-        a query parameter or request body field named _method or one of those, in any case,
+        a query parameter or declared request body field named _method or one of those, in any case,
         lets an agent ask many REST APIs and web frameworks to run another method than the
         operation's, turning an allowed tool into another behind the same tool name. A
         proxy:// Transit Point with a grant binding is refused when the surface is saved (400),
         when a connect starts (409) and when a tool call is sent (connector_unavailable) while
-        its MCP Proxy's spec has a tool with such a parameter. An MCP Proxy's name, the tool
+        its MCP Proxy's spec has a tool with such a parameter. A tool call carrying the grant whose
+        body has a top-level key of one of those names, declared or not, is refused when it is
+        sent and never reaches the backend. An MCP Proxy's name, the tool
         names it logs and the MCP method a caller sends are now logged escaped, the method cut
         short.
   breaking: []

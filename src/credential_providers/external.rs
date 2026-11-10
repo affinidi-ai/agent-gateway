@@ -1079,8 +1079,8 @@ pub async fn check_transit_grant_destination(
 /// method override header parameter ([`check_proxy_grant_spec`]).
 pub const PROXY_OVERRIDES_THE_METHOD: &str = "consent_mode external needs an MCP Proxy whose OpenAPI spec has no \
                                               header parameter named X-HTTP-Method-Override, X-HTTP-Method or \
-                                              X-Method-Override, and no query parameter or request body field \
-                                              named _method or one of those, which would let a tool call run \
+                                              X-Method-Override, and no query parameter or declared request body \
+                                              field named _method or one of those, which would let a tool call run \
                                               another HTTP method than its operation's";
 
 /// Whether the MCP Proxy `proxy` may send a grant with its tool calls as its
