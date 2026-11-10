@@ -1873,9 +1873,14 @@ impl<'a> PreparedFilter<'a> {
         }
         // A line left half-written by a crash is not a record and is not
         // counted as one; the page says so rather than passing silently over
-        // evidence it could not read.
+        // evidence it could not read. It names no provider a tenant's scope
+        // can be checked against, so only an appliance-wide caller is told.
         let Ok(event) = serde_json::from_str::<DelegationAuditEvent>(line) else {
-            return Tallied::Unreadable;
+            return if *self.reader == VaultReadScope::Appliance {
+                Tallied::Unreadable
+            } else {
+                Tallied::Filtered
+            };
         };
         // A record the caller may not read is dropped before anything below
         // counts it, so `total`, `total_pages` and `category_counts` describe
@@ -2858,6 +2863,29 @@ mod tests {
             probe
                 .category_counts
                 .is_empty()
+        );
+    }
+
+    /// A line the read cannot parse names no provider the caller can be
+    /// checked against, so only an appliance-wide caller is told of it; a
+    /// tenant's text filter cannot learn what another tenant's half-written
+    /// record holds.
+    #[test]
+    fn a_half_written_line_is_counted_only_for_an_appliance_wide_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let crashed = audit_line("cp-b");
+        let cut = crashed
+            .find("cp-b")
+            .expect("the record names its provider")
+            + "cp-b\"".len();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), &crashed[..cut]));
+        let probe = text_filter("cp-b");
+
+        assert_eq!(scoped_read(&path, &probe, &tenant_a()).dropped_records, 0, "a tenant's filter learns nothing");
+        assert_eq!(
+            scoped_read(&path, &probe, &VaultReadScope::Appliance).dropped_records,
+            1,
+            "an appliance-wide caller is still told its counts are lower bounds"
         );
     }
 
