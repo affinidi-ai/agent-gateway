@@ -123,7 +123,8 @@ registry.
 - **Pull requests** that touch the `Dockerfile`, the Rust or dashboard sources, `Cargo.toml`,
   `Cargo.lock`, or `scripts/ci/` build the `linux/amd64` image and boot-probe it
   (`scripts/ci/boot-probe.sh` runs the entrypoint with `--help` and requires a clean exit). Nothing
-  is pushed. The boot probe also fails if the binary links a shared library the image lacks, or
+  is pushed, and the job runs with a read-only token: only the tag-triggered build job holds
+  `packages: write`. The boot probe also fails if the binary links a shared library the image lacks, or
   if the `xmlsec1` CLI cannot run.
 - **A `v*` tag**, created by "Publish release", builds `linux/amd64` and `linux/arm64` natively and
   pushes each by digest. Each pushed image is pulled back, boot-probed and scanned, so a blocking

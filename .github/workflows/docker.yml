@@ -28,13 +28,13 @@ env:
   TRIVY_ENFORCE: ${{ vars.TRIVY_ENFORCE }}
 
 jobs:
-  build:
+  verify:
     name: Build ${{ matrix.platform }}
+    if: github.event_name != 'push'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +57,6 @@ jobs:
         run: bash scripts/ci/trivy-scan.sh config
 
       - name: Build image
-        if: github.event_name != 'push'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -68,17 +67,51 @@ jobs:
           provenance: false
 
       - name: Boot-probe image
-        if: github.event_name != 'push'
         env:
           IMAGE: agent-gateway:verify
         run: bash scripts/ci/boot-probe.sh
 
       - name: Scan image
-        if: github.event_name != 'push'
         run: bash scripts/ci/trivy-scan.sh image agent-gateway:verify
 
+
+  build:
+    name: Build and push ${{ matrix.platform }}
+    if: github.event_name == 'push'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            pair: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            pair: arm64
+            build_args: |-
+              CARGO_BUILD_FLAGS=-j2
+              CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Scan Dockerfile
+        if: matrix.pair == 'amd64'
+        run: bash scripts/ci/trivy-scan.sh config
+
       - name: Log in to GHCR
-        if: github.event_name == 'push'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -87,7 +120,6 @@ jobs:
 
       - name: Build and push image by digest
         id: push
-        if: github.event_name == 'push'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -98,7 +130,6 @@ jobs:
           provenance: false
 
       - name: Boot-probe pushed image
-        if: github.event_name == 'push'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -106,13 +137,11 @@ jobs:
           IMAGE="${IMAGE_NAME}@${DIGEST}" bash scripts/ci/boot-probe.sh
 
       - name: Scan pushed image
-        if: github.event_name == 'push'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: bash scripts/ci/trivy-scan.sh image "${IMAGE_NAME}@${DIGEST}"
 
       - name: Record digest
-        if: github.event_name == 'push'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -120,7 +149,6 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        if: github.event_name == 'push'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digests-${{ matrix.pair }}
