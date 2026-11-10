@@ -63,6 +63,25 @@ export function canVerify(connection: VtaConnection): boolean {
   return connection.id !== BOOTSTRAP_CONNECTION_ID;
 }
 
+/**
+ * Whether the control key can be rotated from here: a connection the operator
+ * added whose control identity is a `did:webvh`, which keeps its identifier when
+ * the key changes, and that is connected. The server refuses everything else.
+ */
+export function canRotateControlKey(connection: VtaConnection): boolean {
+  return (
+    connection.id !== BOOTSTRAP_CONNECTION_ID &&
+    connection.enabled &&
+    connection.pairing.state === 'connected' &&
+    (connection.control_did ?? '').startsWith('did:webvh:') &&
+    !connection.control_key_state?.rotation
+  );
+}
+
+export function isRotatingControlKey(connection: VtaConnection): boolean {
+  return Boolean(connection.control_key_state?.rotation);
+}
+
 export function isUsable(connection: VtaConnection): boolean {
   return connection.enabled && connection.pairing.state === 'connected';
 }

@@ -1,6 +1,15 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T16:00:00Z'
+      title: Rotate a custom connection's control key from its row on Trust Agent
+      description: >-
+        A connection added by hand with a did:webvh identity shows which key it
+        signs in with and when it was last rotated, and has a Rotate control key
+        action (for users who can manage keys) that asks first. While a rotation
+        is under way the row says so, shows the last error and offers Cancel
+        rotation, and the page refreshes itself every ten seconds. Connections
+        that authenticate as a did:key show none of this.
     - timestamp: '2026-11-10T15:30:00Z'
       title: Rotate a connection's control key from the API, with cancel
       description: >-

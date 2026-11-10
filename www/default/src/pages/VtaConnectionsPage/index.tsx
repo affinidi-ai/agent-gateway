@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { usePermissions } from '../../context/PermissionsContext';
 import { AppButton } from '../../components/shared/AppButton';
 import { Badge } from '../../components/shared/Badge';
@@ -25,6 +25,9 @@ const VtaConnectionsPage: React.FC = () => {
     loading,
     error,
     reload,
+    refresh,
+    rotateControlKey,
+    cancelControlKeyRotation,
     create,
     pair,
     verify,
@@ -39,6 +42,7 @@ const VtaConnectionsPage: React.FC = () => {
   const [strandedConfirm, setStrandedConfirm] = useState<string | null>(null);
 
   const canEdit = hasPermission('vta_connections.edit');
+  const canRotateKeys = hasPermission('key_management.edit');
   const canDelete = hasPermission('vta_connections.delete');
 
   const filtered = useMemo(() => {
@@ -51,6 +55,51 @@ const VtaConnectionsPage: React.FC = () => {
         c.endpoint.toLowerCase().includes(needle)
     );
   }, [connections, search]);
+
+  const anyRotating = connections.some(c => Boolean(c.control_key_state?.rotation));
+  useEffect(() => {
+    if (!anyRotating) return undefined;
+    const timer = setInterval(() => void refresh(), 10000);
+    return () => clearInterval(timer);
+  }, [anyRotating, refresh]);
+
+  const handleRotateKey = useCallback(
+    async (connection: VtaConnection) => {
+      setBusyId(connection.id);
+      try {
+        const outcome = await rotateControlKey(connection);
+        showToast(
+          'success',
+          outcome === 'finished'
+            ? `${connection.name}: control key rotated. Its DID did not change.`
+            : `${connection.name}: control key rotation is under way.`
+        );
+      } catch (e) {
+        showToast(
+          'error',
+          e instanceof Error ? e.message : 'The control key could not be rotated.'
+        );
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [rotateControlKey]
+  );
+
+  const handleCancelRotation = useCallback(
+    async (connection: VtaConnection) => {
+      setBusyId(connection.id);
+      try {
+        await cancelControlKeyRotation(connection);
+        showToast('success', `${connection.name}: rotation cancelled. The previous key is in use.`);
+      } catch (e) {
+        showToast('error', e instanceof Error ? e.message : 'The rotation could not be cancelled.');
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [cancelControlKeyRotation]
+  );
 
   const handleVerify = useCallback(
     async (connection: VtaConnection) => {
@@ -218,9 +267,12 @@ const VtaConnectionsPage: React.FC = () => {
               busyId={busyId}
               canEdit={canEdit}
               canDelete={canDelete}
+              canRotateKeys={canRotateKeys}
               onOpen={setPairing}
               onVerify={handleVerify}
               onRevoke={handleRevoke}
+              onRotateKey={handleRotateKey}
+              onCancelRotation={handleCancelRotation}
             />
           )}
         </div>

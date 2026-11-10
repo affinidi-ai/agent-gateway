@@ -35,6 +35,26 @@ export interface SigningKeys {
   retiring?: SigningKey[];
 }
 
+export type RotationPhase = 'prepared' | 'introduced' | 'switched';
+
+/** A control-key rotation under way. Holds no secret reference: the API drops them. */
+export interface ControlKeyRotation {
+  phase: RotationPhase;
+  previous_verification_method: string;
+  next_verification_method: string;
+  started_at: string;
+  give_up_at: string;
+  attempts: number;
+}
+
+/** Which key of the connection's `did:webvh` the gateway signs in with, and a rotation under way. */
+export interface ControlKeyState {
+  verification_method?: string;
+  rotated_at?: string;
+  rotation?: ControlKeyRotation;
+  last_error?: string;
+}
+
 export interface VtaConnection {
   id: string;
   tenant_id?: string | null;
@@ -47,6 +67,9 @@ export interface VtaConnection {
   default_context_id?: string | null;
   /** A reference into the secrets store — never key material. */
   control_key_ref?: string | null;
+  /** The `did:webvh` the gateway authenticates as, when it has one. */
+  control_did?: string | null;
+  control_key_state?: ControlKeyState;
   status: VtaConnectionStatus;
   pairing: PairingRecord;
   /** Absent until a key is provisioned on this connection. */

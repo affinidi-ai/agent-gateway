@@ -276,4 +276,96 @@ test.describe("Trust Agent page: bundled bootstrap", () => {
     ).toContainText("Rotated");
     expect(posts).toBe(1);
   });
+
+  test("a connection added by hand rotates its control key, and a stuck rotation can be cancelled", async ({
+    page,
+  }) => {
+    const did = "did:webvh:QmScid:gw.example.com:vta-auth:custom-1";
+    let state: Record<string, unknown> = {};
+    const custom = () => ({
+      ...bootstrapConnection,
+      id: "custom-1",
+      name: "Custom VTA",
+      control_did: did,
+      control_key_state: state,
+    });
+    await page.route(/\/api\/v1\/vta\/connections(\?.*)?$/, (route) =>
+      route.fulfill({ json: [bootstrapConnection, custom()] }),
+    );
+    await page.route(/\/api\/v1\/vta\/status(\?.*)?$/, (route) =>
+      route.fulfill({
+        json: deployment({
+          state: "connected",
+          advice: "nothing to do",
+          context_id: "gateway",
+          previously_connected: true,
+          owner: "unclaimed",
+          control_key_rotation_days: 90,
+        }),
+      }),
+    );
+    const posts: string[] = [];
+    let answer = 200;
+    await page.route(
+      /\/api\/v1\/vta\/connections\/custom-1\/control-key\/rotate(\/cancel)?$/,
+      (route) => {
+        const url = route.request().url();
+        posts.push(url.endsWith("/cancel") ? "cancel" : "rotate");
+        if (url.endsWith("/cancel")) {
+          state = { last_error: "the rotation was cancelled" };
+          return route.fulfill({ json: { connection_id: "custom-1" } });
+        }
+        if (answer === 200) {
+          state = {
+            verification_method: "#key-2",
+            rotated_at: "2026-11-10T10:00:00Z",
+          };
+        } else {
+          state = {
+            last_error: "the trust agent could not be reached",
+            rotation: {
+              phase: "introduced",
+              previous_verification_method: "#key-1",
+              next_verification_method: "#key-2",
+              started_at: "2026-11-10T10:00:00Z",
+              give_up_at: "2026-11-10T10:05:30Z",
+              attempts: 2,
+            },
+          };
+        }
+        return route.fulfill({ status: answer, json: { connection_id: "custom-1" } });
+      },
+    );
+    await page.goto(`${BASE_URL}/trust-agent`);
+
+    const row = page.locator("tr", { hasText: "Custom VTA" });
+    await expect(row.getByTestId("vta-row-control-key-rotated-at")).toHaveText(
+      "Never rotated",
+    );
+    const bundled = page.locator("tr", { hasText: "Bootstrap VTA" });
+    await expect(bundled.getByTestId("vta-row-rotate-control-key")).toHaveCount(0);
+
+    await row.getByTestId("vta-row-rotate-control-key").click();
+    expect(posts).toEqual([]);
+    await page.getByTestId("vta-row-rotate-confirm").click();
+    await expect(row.getByTestId("vta-row-control-key")).toContainText("key-2");
+    await expect(row.getByTestId("vta-row-control-key-rotated-at")).toContainText(
+      "Rotated",
+    );
+    expect(posts).toEqual(["rotate"]);
+
+    answer = 202;
+    await row.getByTestId("vta-row-rotate-control-key").click();
+    await page.getByTestId("vta-row-rotate-confirm").click();
+    await expect(row.getByTestId("vta-row-rotation-status")).toBeVisible();
+    await expect(row.getByTestId("vta-row-rotation-error")).toContainText(
+      "could not be reached",
+    );
+    await expect(row.getByTestId("vta-row-rotate-control-key")).toHaveCount(0);
+
+    await row.getByTestId("vta-row-rotate-cancel").click();
+    await expect(row.getByTestId("vta-row-rotation-status")).toHaveCount(0);
+    await expect(row.getByTestId("vta-row-rotate-control-key")).toBeVisible();
+    expect(posts).toEqual(["rotate", "rotate", "cancel"]);
+  });
 });

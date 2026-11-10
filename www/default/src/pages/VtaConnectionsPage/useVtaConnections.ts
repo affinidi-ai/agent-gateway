@@ -24,11 +24,16 @@ export interface VtaConnectionsState {
   loading: boolean;
   error: string | null;
   reload: () => Promise<void>;
+  /** Read the connections again without the loading state, for polling. */
+  refresh: () => Promise<void>;
   create: (draft: NewVtaConnection) => Promise<VtaConnection>;
   pair: (connection: VtaConnection) => Promise<PairingPayload>;
   verify: (connection: VtaConnection) => Promise<VtaConnection>;
   provisionKey: (connection: VtaConnection) => Promise<VtaConnection>;
   revoke: (connection: VtaConnection, acknowledgeStrandedAgents?: boolean) => Promise<void>;
+  /** Resolves `finished` for a `200` and `under_way` for a `202`; throws with the gateway's message otherwise. */
+  rotateControlKey: (connection: VtaConnection) => Promise<'finished' | 'under_way'>;
+  cancelControlKeyRotation: (connection: VtaConnection) => Promise<void>;
 }
 
 export function useVtaConnections(): VtaConnectionsState {
@@ -54,6 +59,19 @@ export function useVtaConnections(): VtaConnectionsState {
       setError(e instanceof Error ? e.message : 'Failed to load VTA connections.');
     } finally {
       setLoading(false);
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [list, status] = await Promise.all([
+        apiClient.fetch(BASE),
+        apiClient.fetch('/api/v1/vta/status'),
+      ]);
+      if (list.ok) setConnections(await list.json());
+      if (status.ok) setDeployment(await status.json());
+    } catch {
+      // A failed poll leaves what is shown as it was; the next one tries again.
     }
   }, []);
 
@@ -160,12 +178,42 @@ export function useVtaConnections(): VtaConnectionsState {
     [replace]
   );
 
+  const rotateControlKey = useCallback(
+    async (connection: VtaConnection) => {
+      const response = await apiClient.fetch(
+        `${BASE}/${encodeURIComponent(connection.id)}/control-key/rotate`,
+        { method: 'POST' }
+      );
+      if (response.status !== 200 && response.status !== 202) {
+        throw new Error(await readError(response, connection.endpoint));
+      }
+      await refresh();
+      return response.status === 200 ? ('finished' as const) : ('under_way' as const);
+    },
+    [refresh]
+  );
+
+  const cancelControlKeyRotation = useCallback(
+    async (connection: VtaConnection) => {
+      const response = await apiClient.fetch(
+        `${BASE}/${encodeURIComponent(connection.id)}/control-key/rotate/cancel`,
+        { method: 'POST' }
+      );
+      if (!response.ok) throw new Error(await readError(response, connection.endpoint));
+      await refresh();
+    },
+    [refresh]
+  );
+
   return {
     connections,
     deployment,
     loading,
     error,
     reload,
+    refresh,
+    rotateControlKey,
+    cancelControlKeyRotation,
     create,
     pair,
     verify,

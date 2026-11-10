@@ -1172,6 +1172,19 @@ anything itself:
   `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N minutes" from `Retry-After`,
   any other refusal shows the gateway's message, and a success toasts the new DID and reloads the
   page's status. The card says rotation changes no signing key; keep that true.
+- A connection the operator added whose control identity is a `did:webvh` shows, under its
+  agent DID, `Control key key-N · Rotated <date>` or `Never rotated`
+  (`vta-row-control-key`, `vta-row-control-key-rotated-at`) and an action **Rotate control key**
+  (`vta-row-rotate-control-key`, `canRotateControlKey`: not the bundled record, enabled,
+  connected, no rotation under way; only with `key_management.edit`). It asks first, in a row
+  under the connection (`vta-row-rotate-confirm-row`, `-confirm-text`, `-confirm`, `-confirm-cancel`),
+  and posts to `POST /v1/vta/connections/{id}/control-key/rotate`: `200` toasts that the key
+  rotated and the DID did not change, `202` that it is under way, any other status shows the
+  gateway's message. While `control_key_state.rotation` is present the row shows "Rotating control
+  key…" (`vta-row-rotation-status`), the last error (`vta-row-rotation-error`, also shown after
+  a rollback) and **Cancel rotation** (`vta-row-rotate-cancel`, until the phase is `switched`),
+  and the page reads the connections again every 10 seconds. A `did:key` connection shows
+  none of this: its key cannot change without a new grant.
 - The connections table below it reads `GET /v1/vta/connections`. The `vta-bootstrap` record is
   the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
   Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
