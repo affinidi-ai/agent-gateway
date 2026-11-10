@@ -238,8 +238,9 @@ impl NetworkConfig {
         check_route_against(&self.route_claims(), route)
     }
 
-    /// Each active surface callers cannot reach by its route, with the reason.
-    pub fn unreachable_surfaces<'a>(
+    /// Each active surface whose route is not a plain path, once a trailing `/`
+    /// is dropped, or that callers cannot reach by its route, with the reason.
+    pub fn unservable_surfaces<'a>(
         &self,
         surfaces: &'a [AgentSurface],
     ) -> Vec<(&'a AgentSurface, String)> {
@@ -248,7 +249,9 @@ impl NetworkConfig {
             .iter()
             .filter(|surface| surface.status != SurfaceStatus::Disabled)
             .filter_map(|surface| {
-                check_route_against(&claims, &surface.access_point.route)
+                let route = &surface.access_point.route;
+                check_surface_route_syntax(&normalize_route(route))
+                    .and_then(|()| check_route_against(&claims, route))
                     .err()
                     .map(|reason| (surface, reason))
             })
@@ -545,37 +548,35 @@ mod tests {
     }
 
     #[test]
-    fn only_active_surfaces_callers_cannot_reach_are_unreachable() {
+    fn only_active_surfaces_on_routes_callers_cannot_reach_or_that_are_not_plain_paths_are_unservable() {
         let surfaces = [
             stored_surface("served", "/agents/foo", "active"),
+            stored_surface("trailing-slash", "/agents/bar/", "active"),
             stored_surface("outside", "/foo", "active"),
             stored_surface("on-the-api", "/api/foo", "active"),
+            stored_surface("variant-url", "/agents/foo$prod", "active"),
             stored_surface("disabled", "/bar", "disabled"),
         ];
 
-        let unreachable: Vec<(&str, String)> = config(|_| {})
-            .unreachable_surfaces(&surfaces)
+        let unservable: Vec<(&str, String)> = config(|_| {})
+            .unservable_surfaces(&surfaces)
             .into_iter()
             .map(|(surface, reason)| (surface.surface_id.as_str(), reason))
             .collect();
 
-        assert_eq!(unreachable.len(), 2, "{unreachable:?}");
-        assert_eq!(unreachable[0].0, "outside");
-        assert!(
-            unreachable[0]
-                .1
-                .contains("'/foo' is not served by any surface prefix"),
-            "{}",
-            unreachable[0].1
-        );
-        assert_eq!(unreachable[1].0, "on-the-api");
-        assert!(
-            unreachable[1]
-                .1
-                .contains("is served by route 'api' (identity_api)"),
-            "{}",
-            unreachable[1].1
-        );
+        let expected = [
+            ("outside", "'/foo' is not served by any surface prefix"),
+            ("on-the-api", "is served by route 'api' (identity_api)"),
+            ("variant-url", "must be a plain path"),
+        ];
+        assert_eq!(unservable.len(), expected.len(), "{unservable:?}");
+        for ((id, reason), (expected_id, expected_reason)) in unservable
+            .iter()
+            .zip(expected)
+        {
+            assert_eq!(*id, expected_id);
+            assert!(reason.contains(expected_reason), "{id}: {reason}");
+        }
     }
 
     fn load(gateway_json: serde_json::Value) -> anyhow::Result<NetworkConfig> {

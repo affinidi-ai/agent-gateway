@@ -21,13 +21,15 @@ changes:
   removed: []
   security:
     - timestamp: '2026-11-09T13:20:00Z'
-      title: Refuse a surface route that could take another surface's traffic
+      title: Refuse saving a surface route that could take another surface's traffic
       description: >-
         A surface route could contain `$` or `%24` and spell another surface's variant
         URL, or end in extra slashes and outrank a more specific surface, so requests
         meant for the other surface reached it. The admin API now refuses a new or
         changed route that is not a plain path, and the gateway ranks surfaces by their
-        route without trailing slashes.
+        route without trailing slashes. A stored route like that keeps serving as
+        before; the gateway logs a warning for it at startup, so move it or disable the
+        surface.
   breaking:
     - timestamp: '2026-11-10T10:00:00Z'
       title: Refuse a gateway.json in which two entries serve the same path

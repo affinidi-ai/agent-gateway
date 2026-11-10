@@ -3977,12 +3977,14 @@ pub async fn run_axum_proxy(
                 eprintln!("{}", banner);
             }
 
-            for (surface, reason) in network_config.unreachable_surfaces(&all_surfaces) {
+            for (surface, reason) in network_config.unservable_surfaces(&all_surfaces) {
                 warn!(
                     surface = %loggable::untrusted(&surface.name),
                     surface_id = %loggable::untrusted(&surface.surface_id),
                     reason = %loggable::untrusted(&reason),
-                    "Callers cannot reach this surface by its route: move it under a surface prefix or disable it"
+                    "This stored surface's Access Point route breaks the rules a save now checks: move it to a plain \
+                     path under a surface prefix, or disable it. Fabric callers, who find the surface by id, are not \
+                     affected"
                 );
             }
 
