@@ -12,7 +12,7 @@ use crate::auth_manager::middleware::{AuthGuardOk, RbacGuard, caller_allows};
 use crate::auth_manager::pat::PatContext;
 use crate::identity::IdentityStore;
 use crate::identity::display_name::{ManagedDisplayName, managed_surfaces_by_did, resolve_managed_display_name};
-use crate::identity::filesystem::IdentityOrigin;
+use crate::identity::filesystem::{CredentialRotation, IdentityOrigin, ManagedSlot};
 use crate::identity::target_card_names::{CardLocation, TargetCardNameService};
 use crate::integrations::filesystem::NotificationStore;
 use crate::mcp_proxies::filesystem::McpProxyStore;
@@ -387,6 +387,10 @@ pub struct IdentityInfo {
     /// `trust_recorder` shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<ManagedSlot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rotations: Vec<CredentialRotation>,
 }
 
 /// A live surface where a DID is the managed agent.
@@ -2469,6 +2473,8 @@ pub(crate) async fn build_identity_list_with(
                 managed_surfaces,
                 trust_recorder: None,
                 trust_recorder_surface: None,
+                slot: r.slot.clone(),
+                rotations: r.rotations.clone(),
             }
         })
         .collect();
@@ -2997,7 +3003,7 @@ mod tests {
         };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
-        use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin};
+        use crate::identity::filesystem::{AgentIdentityRecord, CredentialRotation, IdentityOrigin, ManagedSlot};
         use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
         use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
         use crate::metrics::MetricsStore;
@@ -3799,6 +3805,70 @@ mod tests {
             ]
             .into();
             assert_eq!(keys, expected);
+        }
+
+        #[tokio::test]
+        async fn test_identity_rows_match_the_dashboard_fixtures() {
+            const MANAGED_DID: &str = "did:webvh:zQmScid:gateway.example.com:surface:alpha";
+            let fixed_time = |mut record: AgentIdentityRecord| {
+                let time = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+                record.created_at = time;
+                record.last_used_at = Some(time);
+                for usage in &mut record.channel_usage {
+                    usage.last_used_at = time;
+                }
+                record
+            };
+            let caller_names = names();
+            caller_names.lookup_or_spawn(CALLER_DID);
+            wait_for_caller_name(&caller_names).await;
+
+            const ROTATED_DID: &str = "did:webvh:zQmCert:gateway.example.com:surface:beta";
+            let mut payload = managed(MANAGED_DID, "alpha");
+            payload.slot = Some(ManagedSlot::Protected);
+            payload
+                .identity_fields
+                .insert("agentIdentity.llmInfo.model".to_string(), json!("gpt-4.1"));
+            let mut rotated = managed(ROTATED_DID, "alpha");
+            rotated.identity_hash = "rotated".to_string();
+            rotated.slot = Some(ManagedSlot::Protected);
+            rotated.identity_fields = HashMap::from([
+                ("credential_type".to_string(), json!("mtls")),
+                ("certificate_id".to_string(), json!("NITROGEN")),
+                ("fingerprint_sha256".to_string(), json!("bb")),
+            ]);
+            rotated
+                .rotations
+                .push(CredentialRotation {
+                    rotated_at: Some(
+                        chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
+                    ),
+                    previous: HashMap::from([("fingerprint_sha256".to_string(), json!("aa"))]),
+                });
+
+            let rows = list(
+                vec![fixed_time(payload), fixed_time(rotated), fixed_time(caller(CALLER_DID))],
+                &[surface("alpha", "ALPHA"), surface("oxygen", "OXYGEN")],
+                &caller_names,
+            )
+            .await;
+
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-managed.json",
+                &serde_json::to_value(&rows[MANAGED_DID]).unwrap(),
+            );
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-managed-rotated.json",
+                &serde_json::to_value(&rows[ROTATED_DID]).unwrap(),
+            );
+            crate::identity::test_helpers::assert_web_fixture(
+                "identity-row-external-caller.json",
+                &serde_json::to_value(&rows[CALLER_DID]).unwrap(),
+            );
         }
 
         #[test]

@@ -405,13 +405,21 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
     // A credentialed MCP proxy tool call vets its REST backend like any stored
-    // backend, which refuses loopback unless the egress allow-list names it.
+    // backend, and the JWKS fetch vets its JWKS URI; both refuse loopback unless
+    // the egress allow-list names the mock.
+    let mut egress_allowlist = Vec::new();
     if world
         .surface_config
         .mcp_proxy_target
         .is_some()
     {
-        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), mock.url());
+        egress_allowlist.push(mock.url());
+    }
+    if let Some(files) = &jwks_files {
+        egress_allowlist.push(files.issuer.clone());
+    }
+    if !egress_allowlist.is_empty() {
+        gateway_env.insert("AG_BDD_EGRESS_ALLOWLIST".to_string(), egress_allowlist.join(","));
     }
     // The A2A proxy dial refuses loopback targets unless the gateway's
     // dev/test hatch is on; the non-A2A managed agent is a loopback mock.
@@ -2783,6 +2791,23 @@ async fn send_a2a_request_through_transit_point(
     transit_point: &str,
     headers: Vec<(String, String)>,
 ) {
+    send_a2a_body_through_transit_point(
+        world,
+        agent_name,
+        transit_point,
+        headers,
+        build_a2a_message_send_body("hello"),
+    )
+    .await;
+}
+
+pub(crate) async fn send_a2a_body_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -2800,7 +2825,6 @@ async fn send_a2a_request_through_transit_point(
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
     let url = format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point);
 
-    let body = build_a2a_message_send_body("hello");
     world.sent_body = Some(body.clone());
     let client = reqwest::Client::new();
     let mut request = client

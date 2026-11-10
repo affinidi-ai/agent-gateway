@@ -550,9 +550,10 @@ applies to the metadata URL at fetch time. It also applies to the discovered
 `localhost` name in a blocked range makes the document invalid. A name that only resolves to
 a private address cannot be known without DNS, so it passes parsing. The caller must therefore
 fetch these URLs with `get_bounded`, or another pinned client, under the same posture, which
-blocks such a name at fetch time. The JWT Bearer `JwksFetcher` always uses the
-cloud-metadata-only pinned client, so a `jwks_uri` discovered under `Strict` must not be
-handed to it; fetch it with `get_bounded` under `Strict`.
+blocks such a name at fetch time. The JWT Bearer JWKS client (`src/jwt_bearer/jwks.rs`)
+always uses a pinned client that refuses only cloud metadata, loopback and unspecified
+addresses, so a `jwks_uri` discovered under `Strict` must not be handed to it; fetch it with
+`get_bounded` under `Strict`.
 
 A failure is a `DiscoveryError`. `failure()` returns the `DiscoveryFailure`, `code()` a
 stable string, `message()` fixed text that is safe in an API response (it never carries a
@@ -1602,6 +1603,56 @@ the same credential-derived DID for the same agent must share the pepper. See
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#environment-variables).
 
 Credential-derived modes skip body parsing entirely.
+
+### Identity versions
+
+A managed agent's DID changes when what it is derived from changes: a payload-extraction
+`x-identity` value, the set of `x-identity` fields, or the stored certificate or API key the
+surface points at. The old DID's record stays, and nothing links it to the new one. Rotating
+the value of the same stored certificate or API key keeps the DID.
+
+Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) also stores:
+
+| Field | Holds |
+| --- | --- |
+| `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
+| `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
+| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Every rotation is kept, so the fields before the first one are the ones the identity was created with. Every Identities row and WebSocket identity update carries the list, so each grows by one entry per rotation. |
+
+On each use of a credential-derived managed identity, the gateway compares the credential
+with the record. A certificate counts as rotated when its fingerprint, subject or issuer
+changed; editing only its name or tags does not. A secret-store API key counts as rotated
+whenever its `updated_at` changes, because its value is never stored; its rotations have
+no `previous` fields. The secret store also bumps `updated_at` when only the key's name,
+description, tags, type or tenant change, or when the same value is saved again, so the
+Identities page lists these entries as "Credential updated"
+rather than as a changed value. `atgk_` API keys are never rotated in place: a new key is a new id, so
+it mints a new DID. The record's `identity_fields` then hold the current certificate's
+values.
+
+The identity the gateway presents to Fabric peers follows the same record. After an mTLS
+rotation it keeps its DID but carries the current certificate's fingerprint, subject and
+issuer, matching the certificate its request credentials already use. A peer whose policy
+pins the old fingerprint denies requests from that identity until it updates the policy.
+
+Within one gateway process, usage, origin and rotation updates to one record are serialised
+per identity hash, so concurrent requests don't overwrite each other's writes.
+
+Rotations before this tracking began were not recorded. The first use afterwards stores the
+credential's `updated_at` as a baseline; if a certificate's fields differ from the stored
+ones at that point, that is recorded as one rotation with `rotated_at: null`.
+
+A surface has one Managed Agent, so the Identities page groups every managed DID of a
+surface under one entry, with the most recently used DID as primary: the DIDs from the
+Managed Agent's responses (including its agent card) and from its outbound requests through
+any Transit Point, whatever their source (payload, mTLS, API key or static) and slot. A
+change of the agent's ID is therefore always a new version, whichever side sees it first,
+and managed records without a slot are grouped straight away (records without an origin
+still show one row per DID until their next use). Several DIDs in use at once share one
+entry, whose primary is the one used last. A DID's surface is the one it was last used on.
+External callers, including the external agent on a Transit Point response, keep one row per
+DID, and so do `from_jwt_claim` DIDs, one per claim value and all current at once. Without `AG_IDENTITY_HASH_PEPPER`, every
+restart mints new credential-derived DIDs, which show as versions with no field changes.
 
 ## Trust Recorder
 

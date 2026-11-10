@@ -188,6 +188,8 @@ node "${HERE}/env.mjs" --dir "${WORK}/env" --binary "${BINARY}" --gateway-port "
     cd "${WORK}/env/config"
     export "$(cat "${WORK}/env/backup-key-var")=$(openssl rand -hex 32)"
     export RUST_LOG="${RUST_LOG:-info}"
+    # The JWKS fetch refuses loopback unless the egress allow-list names Hydra.
+    export AG_TEST_MODE=true AG_BDD_EGRESS_ALLOWLIST="${ISSUER}"
     exec "${BINARY}" --config config.toml
 ) > "${LOGS}/gateway.log" 2>&1 &
 STARTED_PIDS+=("$!")

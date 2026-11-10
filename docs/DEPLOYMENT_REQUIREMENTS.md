@@ -202,7 +202,10 @@ grant by binding to the provider's
 `resource`. A proxy would resolve each vendor's host again and connect to an address the
 gateway never vetted, so the gateway pins these calls to the addresses it checked. On a network
 where egress goes only through a proxy, allow direct egress to those vendors, including each
-provider's token endpoint host, or external consent fails to connect. The gateway logs a
+provider's token endpoint host, or external consent fails to connect. The JWKS fetches of JWT
+verification strategies and the token requests of credential providers ignore the proxy for the
+same reason, so allow direct egress to each strategy's JWKS host and each provider's token
+endpoint host as well, or JWT Bearer callers and service tokens fail. The gateway logs a
 warning at startup when a proxy variable is set. All other outbound calls use a configured
 proxy as before.
 

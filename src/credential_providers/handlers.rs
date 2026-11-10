@@ -106,6 +106,10 @@ fn reference_scan_failed(error: anyhow::Error) -> Response {
 enum ProviderValidationError {
     #[error("token_endpoint must be an https URL")]
     TokenEndpointNotHttps,
+    #[error(
+        "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+    )]
+    TokenEndpointBlocked,
     #[error("{0} is required for this provider type")]
     Missing(&'static str),
     #[error("client_secret_secret_ref is not allowed: this provider authenticates with a signed JWT")]
@@ -134,6 +138,7 @@ impl IntoResponse for ProviderValidationError {
     fn into_response(self) -> Response {
         match self {
             Self::TokenEndpointNotHttps
+            | Self::TokenEndpointBlocked
             | Self::Missing(_)
             | Self::ClientSecretNotAllowed
             | Self::UnsupportedAlgorithm
@@ -1485,7 +1490,7 @@ fn provider_revoker(
 
 /// POST /api/v1/credential-providers/validate
 /// Checks the key material a JWT-signing provider references, with the same tenancy rules
-/// as a save, then that the token endpoint is reachable
+/// as a save, then that the token endpoint passes the Configured egress policy and is reachable
 pub async fn validate_provider(
     State(state): State<CredentialProviderState>,
     pat: Option<Extension<PatContext>>,
@@ -1493,9 +1498,7 @@ pub async fn validate_provider(
     scope: Option<Extension<PatResourceScope>>,
     Json(req): Json<ValidateCredentialProviderRequest>,
 ) -> impl IntoResponse {
-    let client = crate::http_client::with_short_timeout().unwrap_or_else(|_| reqwest::Client::new());
-    validate_provider_with(&state, &client, &TokenEgress::from_environment(), pat.is_some(), &context, &scope, req)
-        .await
+    validate_provider_with(&state, &TokenEgress::from_environment(), pat.is_some(), &context, &scope, req).await
 }
 
 /// The algorithm the requested provider would sign with, once its key material checks
@@ -1547,7 +1550,6 @@ async fn validate_key_material_request(
 
 async fn validate_provider_with(
     state: &CredentialProviderState,
-    client: &reqwest::Client,
     egress: &TokenEgress,
     pat_authenticated: bool,
     context: &Option<Extension<PatTenantContext>>,
@@ -1563,10 +1565,6 @@ async fn validate_provider_with(
             .into_response();
     };
 
-    if let Err(e) = crate::url_validation::validate_oauth_endpoint_url(&token_endpoint) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("token_endpoint: {}", e)})))
-            .into_response();
-    }
     if !egress.permits_token_endpoint(&token_endpoint) {
         return ProviderValidationError::TokenEndpointNotHttps.into_response();
     }
@@ -1577,11 +1575,34 @@ async fn validate_provider_with(
         Err(error) => return error.into_response(),
     };
 
-    match client
-        .get(&token_endpoint)
-        .send()
+    let unreachable = |error: &dyn std::fmt::Display| {
+        warn!(
+            target: "credential_delegation",
+            token_endpoint = %token_endpoint,
+            error = %error,
+            "Token endpoint validation failed"
+        );
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "reachable": false,
+                "error": "token_endpoint could not be reached",
+                "token_endpoint": token_endpoint,
+            })),
+        )
+            .into_response()
+    };
+    let (client, url) = match egress
+        .pinned_client(&token_endpoint)
         .await
     {
+        Ok(pinned) => pinned,
+        Err(error) if error.is::<crate::delegation_vault::oauth::TokenEndpointRefused>() => {
+            return ProviderValidationError::TokenEndpointBlocked.into_response();
+        }
+        Err(error) => return unreachable(&error),
+    };
+    match client.get(url).send().await {
         Ok(resp) => {
             // We just check reachability — OAuth token endpoints typically return 400/405
             // for GET requests, which is fine
@@ -1602,23 +1623,7 @@ async fn validate_provider_with(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Err(e) => {
-            warn!(
-                target: "credential_delegation",
-                token_endpoint = %token_endpoint,
-                error = %e,
-                "Token endpoint validation failed"
-            );
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "reachable": false,
-                    "error": format!("{}", e),
-                    "token_endpoint": token_endpoint,
-                })),
-            )
-                .into_response()
-        }
+        Err(error) => unreachable(&error),
     }
 }
 
@@ -2639,8 +2644,9 @@ mod jwt_provider_tests {
         body["jwt_signing_key_secret_ref"] = json!("SA_JSON");
         let (status, response) = create(&state, body).await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_JSON")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_JSON")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["key_material"], "ok");
     }
@@ -2662,8 +2668,8 @@ mod jwt_provider_tests {
                 .to_string()
                 .contains("key-secret-marker")
         );
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, _) = validate(&state, &http, None, validate_jwt_bearer("BAD_JSON")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, _) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("BAD_JSON")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
@@ -2835,6 +2841,82 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_private_token_endpoint_is_saved_and_a_loopback_or_metadata_one_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for (index, endpoint) in [
+            "https://127.0.0.1/token",
+            "https://[::1]/token",
+            "https://169.254.169.254/token",
+            "https://[fd00:ec2::254]/token",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for body in [client_credentials("oauth2_client_credentials"), jwt_bearer("p")] {
+                let (status, response) =
+                    create(&state, with_token_endpoint(body.clone(), &format!("blocked-{index}"), endpoint)).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {response}");
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("token_endpoint:")),
+                    "{endpoint}: {response}"
+                );
+            }
+        }
+        assert!(
+            state
+                .store
+                .list()
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing is stored"
+        );
+
+        for (index, endpoint) in
+            ["https://10.0.0.1/token", "https://192.168.100.100:11443/token", "https://[fd00::1]/token"]
+                .into_iter()
+                .enumerate()
+        {
+            let (status, response) = create(
+                &state,
+                with_token_endpoint(
+                    client_credentials("oauth2_client_credentials"),
+                    &format!("private-{index}"),
+                    endpoint,
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "a private network endpoint is saved: {endpoint}: {response}");
+        }
+
+        let (status, created) = create(&state, client_credentials("oauth2_client_credentials")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://172.16.0.1/token"})).await;
+        assert_eq!(status, StatusCode::OK, "an update to a private network endpoint is saved: {response}");
+        let (status, response) = update(&state, id, json!({"token_endpoint": "https://127.0.0.1/token"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an update to loopback is refused: {response}");
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .token_endpoint
+                .as_deref(),
+            Some("https://172.16.0.1/token"),
+            "the stored endpoint is kept"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_update_to_an_http_token_endpoint_is_refused_and_a_stored_one_is_kept_in_warn_mode() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
@@ -2932,39 +3014,95 @@ mod jwt_provider_tests {
     async fn validate_refuses_an_http_token_endpoint_without_contacting_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
         let production = TokenEgress {
-            policy: Default::default(),
-            ..listed_http_egress()
+            exact_allowlist: None,
+            ..listed_http_egress(&endpoint)
         };
         let (status, response) = validate_with(
             &state,
-            &http,
             &production,
             None,
-            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "token_endpoint must be an https URL");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
-            &http,
+            &endpoint,
             None,
-            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "an endpoint insecure_token_endpoints lists is checked: {response}");
+        assert_eq!(status, StatusCode::OK, "an endpoint the test allow-list names is checked: {response}");
         assert_eq!(response["reachable"], true);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A client whose every request reaches a local server that answers GET with 405, as a
-    /// token endpoint does, and the number of requests it received.
-    async fn token_endpoint_answering_get()
-    -> (reqwest::Client, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_refuses_a_loopback_or_metadata_token_endpoint_without_contacting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
+        let production = TokenEgress {
+            exact_allowlist: None,
+            ..listed_http_egress(&endpoint)
+        };
+        for token_endpoint in [
+            endpoint.replace("http://", "https://"),
+            "https://[::1]/token".to_string(),
+            "https://169.254.169.254/token".to_string(),
+            "https://[fd00:ec2::254]/token".to_string(),
+        ] {
+            let (status, response) = validate_with(
+                &state,
+                &production,
+                None,
+                json!({"provider_type": "oauth2_client_credentials", "token_endpoint": token_endpoint}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token_endpoint}: {response}");
+            assert_eq!(
+                response["error"],
+                "token_endpoint rejected: it must be an http(s) URL without a user name or password whose host resolves to neither loopback nor cloud metadata"
+            );
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn validate_reports_an_unreachable_token_endpoint_without_its_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let endpoint = format!("http://{closed}/token");
+        let (status, response) = validate_against_fixture(
+            &state,
+            &endpoint,
+            None,
+            json!({"provider_type": "oauth2_client_credentials", "token_endpoint": endpoint}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["reachable"], false);
+        assert_eq!(response["error"], "token_endpoint could not be reached");
+        assert!(
+            response
+                .get("http_status")
+                .is_none(),
+            "{response}"
+        );
+    }
+
+    /// A local token endpoint that answers GET with 405, as a token endpoint does, and counts
+    /// the requests it receives: its URL, the count, and the server.
+    async fn token_endpoint_answering_get() -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinSet<()>) {
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = requests.clone();
         let app = axum::Router::new().fallback(axum::routing::get(move || {
@@ -2974,52 +3112,48 @@ mod jwt_provider_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .proxy(reqwest::Proxy::http(format!("http://{}", listener.local_addr().unwrap())).unwrap())
-            .build()
-            .unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
         let mut server = tokio::task::JoinSet::new();
         server.spawn(async move {
             axum::serve(listener, app)
                 .await
                 .unwrap();
         });
-        (client, requests, server)
+        (endpoint, requests, server)
     }
 
-    /// The egress of an appliance whose credential policy allows the documentation address
-    /// the validate tests use as an http token endpoint.
-    fn listed_http_egress() -> TokenEgress {
+    /// The egress of an appliance whose test allow-list admits the loopback `endpoint`, which
+    /// the Configured policy otherwise refuses, as an http token endpoint.
+    fn listed_http_egress(endpoint: &str) -> TokenEgress {
         TokenEgress {
             timeout: std::time::Duration::from_secs(5),
-            exact_allowlist: None,
-            policy: std::borrow::Cow::Owned(crate::config::credential_policy::CredentialPolicyConfig {
-                insecure_token_endpoints: vec!["http://192.0.2.1/token".into()],
-                ..Default::default()
-            }),
+            exact_allowlist: Some(endpoint.to_string()),
+            policy: Default::default(),
         }
     }
 
-    async fn validate(
+    /// Validates `body` against the local token endpoint `endpoint`: it rewrites any
+    /// `token_endpoint` the body names to `endpoint`, so the probe reaches the fixture.
+    async fn validate_against_fixture(
         state: &CredentialProviderState,
-        http: &reqwest::Client,
+        endpoint: &str,
         context: Option<Extension<PatTenantContext>>,
-        body: Value,
+        mut body: Value,
     ) -> (StatusCode, Value) {
-        validate_with(state, http, &listed_http_egress(), context, body).await
+        if let Some(token_endpoint) = body.get_mut("token_endpoint") {
+            *token_endpoint = json!(endpoint);
+        }
+        validate_with(state, &listed_http_egress(endpoint), context, body).await
     }
 
     async fn validate_with(
         state: &CredentialProviderState,
-        http: &reqwest::Client,
         egress: &TokenEgress,
         context: Option<Extension<PatTenantContext>>,
         body: Value,
     ) -> (StatusCode, Value) {
         let response = validate_provider_with(
             state,
-            http,
             egress,
             context.is_some(),
             &context,
@@ -3041,17 +3175,17 @@ mod jwt_provider_tests {
     async fn validate_checks_reachability_and_the_key_material_of_a_jwt_provider() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["reachable"], true);
         assert_eq!(response["http_status"], 405);
-        assert_eq!(response["token_endpoint"], "http://192.0.2.1/token");
+        assert_eq!(response["token_endpoint"], endpoint);
         assert_eq!(response["key_material"], "ok");
 
-        let (status, response) = validate(
+        let (status, response) = validate_against_fixture(
             &state,
-            &http,
+            &endpoint,
             None,
             json!({"provider_type": "oauth2_client_credentials", "token_endpoint": "http://192.0.2.1/token"}),
         )
@@ -3070,16 +3204,16 @@ mod jwt_provider_tests {
     async fn validate_refuses_a_jwt_bearer_provider_without_a_subject_before_any_request() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
         let mut body = validate_jwt_bearer("SA_KEY");
         body.as_object_mut()
             .unwrap()
             .remove("jwt_subject");
-        let (status, response) = validate(&state, &http, None, body).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_subject is required for this provider type");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -3088,8 +3222,9 @@ mod jwt_provider_tests {
     async fn validate_refuses_key_material_in_the_wrong_format_without_echoing_it() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("NOT_A_KEY")).await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("NOT_A_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(
             response["error"],
@@ -3102,7 +3237,7 @@ mod jwt_provider_tests {
         );
         let mut pss_bearer = validate_jwt_bearer("SA_KEY");
         pss_bearer["jwt_signing_algorithm"] = json!("PS256");
-        let (status, response) = validate(&state, &http, None, pss_bearer).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, pss_bearer).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "jwt_signing_algorithm is not supported for this provider type");
     }
@@ -3331,12 +3466,13 @@ mod jwt_provider_tests {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         add_tenant_a_secret(&state, "TENANT_KEY").await;
-        let (http, requests, _server) = token_endpoint_answering_get().await;
-        let (status, response) = validate(&state, &http, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
+        let (endpoint, requests, _server) = token_endpoint_answering_get().await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a_context(), validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
         assert_eq!(response["error"], "Secret reference is not accessible");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let (status, response) = validate(&state, &http, None, validate_jwt_bearer("SA_KEY")).await;
+        let (status, response) = validate_against_fixture(&state, &endpoint, None, validate_jwt_bearer("SA_KEY")).await;
         assert_eq!(status, StatusCode::OK, "{response}");
     }
 
@@ -3358,12 +3494,13 @@ mod jwt_provider_tests {
             })
             .await
             .unwrap();
-        let (http, _requests, _server) = token_endpoint_answering_get().await;
+        let (endpoint, _requests, _server) = token_endpoint_answering_get().await;
         let tenant_a = Some(Extension(PatTenantContext {
             token_id: "token-a".into(),
             tenant_id: "tenant-a".into(),
         }));
-        let (status, response) = validate(&state, &http, tenant_a, validate_jwt_bearer("B_KEY")).await;
+        let (status, response) =
+            validate_against_fixture(&state, &endpoint, tenant_a, validate_jwt_bearer("B_KEY")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(response["error"], "Secret reference is not accessible");
     }
