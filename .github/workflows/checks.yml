@@ -60,7 +60,8 @@ jobs:
           exit "${audit_status}"
 
   cargo-deny:
-    name: License check
+    # Keeps the `<job id> / <name>` check name the shared workflow reported, which the ruleset requires.
+    name: cargo-deny / License check
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
