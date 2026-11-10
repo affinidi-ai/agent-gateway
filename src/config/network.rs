@@ -318,7 +318,8 @@ impl NetworkConfig {
 
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
-        let config: NetworkConfig = serde_json::from_str(&contents)?;
+        let mut config: NetworkConfig = serde_json::from_str(&contents)?;
+        config.normalize_route_prefixes();
         config.validate_listeners()?;
         config.validate_route_prefixes()?;
         config.validate_terms()?;

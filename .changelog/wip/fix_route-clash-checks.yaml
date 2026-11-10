@@ -4,12 +4,6 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-09T11:58:19Z'
-      title: Refuse a gateway.json in which two entries use the same prefix
-      description: >-
-        Two entries of `channels`, `mcp_proxies` and `routes` on one prefix made the
-        gateway crash while building its router, or let one entry hide the other. The
-        gateway now refuses to start, and a reload refuses the file, naming each pair.
-    - timestamp: '2026-11-09T11:58:19Z'
       title: Refuse to save a surface on a route callers cannot reach
       description: >-
         The admin API saved an active surface whose route no surface prefix served, or
@@ -31,4 +25,17 @@ changes:
         meant for the other surface reached it. The admin API now refuses a new or
         changed route that is not a plain path, and the gateway ranks surfaces by their
         route without trailing slashes.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-10T10:00:00Z'
+      title: Refuse a gateway.json in which two entries serve the same path
+      description: >-
+        Two entries of `channels`, `mcp_proxies` and `routes` on one prefix made the
+        gateway crash while building its router, or let one entry hide the other. The
+        gateway now refuses to start with such a file, and a reload refuses it, naming
+        each pair. A `redirect` beside a `proxy` route or an `mcp_proxies` prefix on the
+        same prefix is still accepted, since one serves only the prefix and the other
+        only the paths below it. Every prefix but a `redirect`'s is now read without a
+        trailing `/`, so a channel at `/agents/` serves `/agents/foo`, and `/agents`
+        beside `/agents/` is a clashing pair. Before upgrading, check `channels`,
+        `mcp_proxies` and `routes` for prefixes that are equal once a trailing `/` is
+        dropped.

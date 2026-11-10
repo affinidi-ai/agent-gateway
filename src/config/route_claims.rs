@@ -16,6 +16,16 @@ enum Reach {
     PrefixAndBelow,
 }
 
+impl Reach {
+    fn includes_prefix(self) -> bool {
+        matches!(self, Reach::Prefix | Reach::PrefixAndBelow)
+    }
+
+    fn includes_below(self) -> bool {
+        matches!(self, Reach::Below | Reach::PrefixAndBelow)
+    }
+}
+
 /// A path prefix one `gateway.json` entry serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteClaim {
@@ -26,6 +36,15 @@ struct RouteClaim {
 }
 
 impl RouteClaim {
+    fn overlaps(
+        &self,
+        other: &RouteClaim,
+    ) -> bool {
+        self.prefix == other.prefix
+            && (self.reach.includes_prefix() && other.reach.includes_prefix()
+                || self.reach.includes_below() && other.reach.includes_below())
+    }
+
     fn serves(
         &self,
         route: &str,
@@ -80,15 +99,52 @@ pub fn check_surface_route_syntax(route: &str) -> Result<(), String> {
     }
 }
 
+fn hides_dashboard_page(prefix: &str) -> bool {
+    crate::proxy::paths::shadowed_dashboard_page(prefix).is_some()
+}
+
 impl NetworkConfig {
-    /// Every path prefix this configuration serves, with its owner. The static
-    /// fallback serves whatever no other entry does, and the identity API,
-    /// onboarding, static and connection point routes at `/` serve only their
-    /// own paths there, so none of them claims a prefix.
+    /// Read every prefix but a `redirect`'s without a trailing `/`, as surface
+    /// routes are matched, so a channel at `/agents/` serves `/agents/foo`. A
+    /// root prefix is kept as written; a `redirect` serves its exact path.
+    pub(super) fn normalize_route_prefixes(&mut self) {
+        fn trim(prefix: &mut String) {
+            let trimmed = prefix.trim_end_matches('/');
+            if !trimmed.is_empty() && trimmed.len() < prefix.len() {
+                *prefix = trimmed.to_string();
+            }
+        }
+        for channel in &mut self.channels {
+            trim(&mut channel.prefix);
+        }
+        for proxy in self
+            .mcp_proxies
+            .iter_mut()
+            .flatten()
+        {
+            trim(&mut proxy.prefix);
+        }
+        for route in self
+            .routes
+            .values_mut()
+            .filter(|route| route.route_type != RouteType::Redirect)
+        {
+            trim(&mut route.prefix);
+        }
+    }
+
+    /// Every path prefix the inbound router mounts for this configuration, with
+    /// its owner. The static fallback serves whatever no other entry does, the
+    /// identity API, onboarding, static and connection point routes at `/` serve
+    /// only their own paths there, and the router mounts no channel, MCP proxy,
+    /// `proxy` or `redirect` prefix that hides a dashboard page, no `redirect`
+    /// without a `target` and no `static` route without a `path`, so none of
+    /// them claims a prefix.
     fn route_claims(&self) -> Vec<RouteClaim> {
         let channels = self
             .channels
             .iter()
+            .filter(|channel| !hides_dashboard_page(&channel.prefix))
             .map(|channel| RouteClaim {
                 prefix: normalize_route(&channel.prefix),
                 owner: format!("channel '{}'", channel.id),
@@ -99,6 +155,7 @@ impl NetworkConfig {
             .mcp_proxies
             .iter()
             .flatten()
+            .filter(|proxy| !hides_dashboard_page(&proxy.prefix))
             .map(|proxy| RouteClaim {
                 prefix: normalize_route(&proxy.prefix),
                 owner: format!("MCP proxy prefix '{}'", proxy.id),
@@ -109,7 +166,12 @@ impl NetworkConfig {
         named_routes.sort_by_key(|(name, _)| name.as_str());
         let routes = named_routes
             .into_iter()
-            .filter(|(_, route)| !(route.route_type == RouteType::Static && route.fallback))
+            .filter(|(_, route)| match route.route_type {
+                RouteType::Proxy => !hides_dashboard_page(&route.prefix),
+                RouteType::Redirect => route.target.is_some() && !hides_dashboard_page(&route.prefix),
+                RouteType::Static => route.path.is_some() && !route.fallback,
+                RouteType::IdentityApi | RouteType::Onboarding | RouteType::ConnectionPoint => true,
+            })
             .map(|(name, route)| {
                 let (serves_surfaces, reach) = match route.route_type {
                     RouteType::Proxy => (true, Reach::Below),
@@ -132,8 +194,10 @@ impl NetworkConfig {
             .collect()
     }
 
-    /// Pairs of entries that claim the same prefix. The inbound router cannot
+    /// Pairs of entries that mount the same path. The inbound router cannot
     /// serve one path twice: it refuses to start, or one entry hides the other.
+    /// A `redirect` serves its prefix only and a `proxy` route or MCP proxy
+    /// prefix only the paths below it, so those two share a prefix safely.
     fn route_prefix_clashes(&self) -> Vec<(RouteClaim, RouteClaim)> {
         let claims = self.route_claims();
         claims
@@ -142,7 +206,7 @@ impl NetworkConfig {
             .flat_map(|(index, first)| {
                 claims[index + 1..]
                     .iter()
-                    .filter(|second| second.prefix == first.prefix)
+                    .filter(|second| first.overlaps(second))
                     .map(|second| (first.clone(), second.clone()))
             })
             .collect()
@@ -542,6 +606,126 @@ mod tests {
 
         assert!(error.contains("'/avatars': channel 'files' and route 'avatars' (static)"), "{error}");
         assert!(error.contains("Give each entry its own prefix"), "{error}");
+    }
+
+    fn gateway_json_with(
+        channels: serde_json::Value,
+        routes: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut value = gateway_json("/files");
+        value["channels"] = channels;
+        value["routes"] = routes;
+        value
+    }
+
+    #[test]
+    fn a_redirect_shares_a_prefix_with_a_proxy_route_or_an_mcp_proxy_prefix() {
+        let loaded = load(gateway_json_with(
+            serde_json::json!([]),
+            serde_json::json!({
+                "docs": { "type": "redirect", "prefix": "/svc", "target": "https://docs.example" },
+                "svc": { "type": "proxy", "prefix": "/svc" }
+            }),
+        ))
+        .expect("a redirect beside a proxy route on one prefix loads");
+        assert!(
+            loaded
+                .routes
+                .contains_key("svc")
+        );
+
+        let clashes = config(|value| {
+            add_route(
+                value,
+                "docs",
+                serde_json::json!({ "type": "redirect", "prefix": "/mcp", "target": "https://x" }),
+            );
+        })
+        .route_prefix_clashes();
+        assert!(clashes.is_empty(), "{clashes:?}");
+    }
+
+    #[test]
+    fn entries_that_both_serve_the_prefix_or_both_serve_below_it_clash() {
+        for (route, owner) in [
+            (
+                serde_json::json!({ "type": "redirect", "prefix": "/agents", "target": "https://x" }),
+                "route 'first' (redirect)",
+            ),
+            (serde_json::json!({ "type": "proxy", "prefix": "/agents/" }), "route 'first' (proxy)"),
+        ] {
+            let clashes = config(|value| add_route(value, "first", route)).route_prefix_clashes();
+            assert_eq!(clashes.len(), 1, "{owner}: {clashes:?}");
+            assert_eq!((clashes[0].0.owner.as_str(), clashes[0].1.owner.as_str()), ("channel 'agents'", owner));
+        }
+
+        let two_proxies = config(|value| {
+            add_route(value, "a", serde_json::json!({ "type": "proxy", "prefix": "/svc" }));
+            add_route(value, "b", serde_json::json!({ "type": "proxy", "prefix": "/svc" }));
+        })
+        .route_prefix_clashes();
+        assert_eq!(two_proxies.len(), 1, "{two_proxies:?}");
+    }
+
+    #[test]
+    fn entries_the_router_does_not_mount_claim_nothing() {
+        let config = config(|value| {
+            add_channel(value, "old-settings", "/settings/old");
+            add_route(value, "no-target", serde_json::json!({ "type": "redirect", "prefix": "/agents/docs" }));
+            add_route(value, "no-path", serde_json::json!({ "type": "static", "prefix": "/agents/files" }));
+            add_route(value, "hidden", serde_json::json!({ "type": "proxy", "prefix": "/policies/svc" }));
+        });
+
+        let owners: Vec<String> = config
+            .route_claims()
+            .into_iter()
+            .map(|claim| claim.owner)
+            .collect();
+        for unmounted in ["channel 'old-settings'", "route 'no-target'", "route 'no-path'", "route 'hidden'"] {
+            assert!(
+                !owners
+                    .iter()
+                    .any(|owner| owner.starts_with(unmounted)),
+                "{unmounted}: {owners:?}"
+            );
+        }
+        assert!(refusal(&config, "/settings/old/x").contains("is not served by any surface prefix"));
+        assert_eq!(config.check_surface_route("/agents/docs"), Ok(()));
+        assert_eq!(config.check_surface_route("/agents/files"), Ok(()));
+    }
+
+    #[test]
+    fn loading_reads_prefixes_without_a_trailing_slash_but_keeps_a_root_and_a_redirect() {
+        let config = load(gateway_json_with(
+            serde_json::json!([{ "id": "agents", "name": "Agents", "prefix": "/agents/" }]),
+            serde_json::json!({
+                "root": { "type": "proxy", "prefix": "" },
+                "docs": { "type": "redirect", "prefix": "/docs/", "target": "https://docs.example" },
+                "files": { "type": "static", "prefix": "/files/", "path": "files" }
+            }),
+        ))
+        .expect("trailing-slash prefixes load");
+
+        assert_eq!(config.channels[0].prefix, "/agents");
+        assert_eq!(config.routes["root"].prefix, "");
+        assert_eq!(config.routes["docs"].prefix, "/docs/");
+        assert_eq!(config.routes["files"].prefix, "/files");
+        assert_eq!(config.check_surface_route("/agents/foo"), Ok(()));
+    }
+
+    #[test]
+    fn loading_two_channels_that_differ_only_by_a_trailing_slash_fails() {
+        let error = load(gateway_json_with(
+            serde_json::json!([
+                { "id": "a", "name": "A", "prefix": "/agents" },
+                { "id": "b", "name": "B", "prefix": "/agents/" }
+            ]),
+            serde_json::json!({}),
+        ))
+        .expect_err("two channels on one prefix must not load")
+        .to_string();
+
+        assert!(error.contains("'/agents': channel 'a' and channel 'b'"), "{error}");
     }
 
     #[test]

@@ -448,7 +448,7 @@ from.
 
 | Module | Owns | Document |
 | --- | --- | --- |
-| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers); `route_claims.rs` the prefixes `gateway.json` serves, which may not repeat, and whether a surface prefix serves a surface route | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
+| [`config/`](src/config/) | Bootstrap parsing, `AgentSurface`, variants, limits, loaders; `target_auth_rules.rs` holds the rules Target authentication must meet (header, value format, https Target, a leg that checks its callers); `route_claims.rs` the prefixes `gateway.json` serves, no two of which may serve the same path, and whether a surface prefix serves a surface route | [`CONFIGURATION_RELOAD.md`](docs/CONFIGURATION_RELOAD.md) |
 | [`storage/`](src/storage/) | Store traits, filesystem JSON, config cache, DID artifacts | [`DESIGN_PATTERNS.md`](docs/DESIGN_PATTERNS.md) |
 | [`encryption/`](src/encryption/) | Encryption at rest and key sources | [`CONFIGURATION_REFERENCE.md`](docs/CONFIGURATION_REFERENCE.md#configtoml) |
 | [`backup_restore/`](src/backup_restore/) | `.agbak` backup and restore | [`DEVELOPMENT.md`](docs/development/DEVELOPMENT.md) |
