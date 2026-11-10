@@ -988,9 +988,10 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
 ///
 /// Duplicates can only reach disk by bypassing the API (hand-edited files,
 /// restores); refusing to boot over them would lock the operator out of the
-/// very UI needed to resolve the conflict. Instead the first copy in
-/// `surface_id` order — the one runtime routing would serve — stays active
-/// deterministically across restarts, later copies are
+/// very UI needed to resolve the conflict. Instead the copy runtime routing
+/// served stays active deterministically across restarts: routes are compared
+/// without a trailing `/`, but were ranked with it, so the copy with the longest
+/// stored route, then the first in `surface_id` order. The other copies are
 /// disabled and show up as such in the UI, and `ProxyConfig::validate`'s
 /// duplicate check (which ignores disabled surfaces) then passes. Re-enabling
 /// a disabled copy goes through full save-time validation, so the conflict
@@ -1006,23 +1007,48 @@ async fn disable_duplicate_route_surfaces(
     channels: &mut [crate::config::agent_surface::AgentSurface],
     network_config: &config::NetworkConfig,
 ) -> Result<()> {
-    let mut seen_route_port_combos = std::collections::HashSet::new();
-    for surface in channels.iter_mut() {
-        if surface.status == crate::config::agent_surface::SurfaceStatus::Disabled {
+    let combos: Vec<Option<String>> = channels
+        .iter()
+        .map(|surface| {
+            (surface.status != crate::config::agent_surface::SurfaceStatus::Disabled).then(|| {
+                let listen_address = surface.listen_address();
+                let listener = match network_config.map_url_to_port(listen_address) {
+                    Some(port) => format!("port {}", port),
+                    None => format!("address '{}'", listen_address),
+                };
+                format!("{}:{}", listener, config::route_claims::normalize_route(surface.route()))
+            })
+        })
+        .collect();
+    let surface_ids: Vec<String> = channels
+        .iter()
+        .map(|surface| surface.surface_id.clone())
+        .collect();
+    let mut served: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, combo) in combos.iter().enumerate() {
+        let Some(combo) = combo else {
             continue;
-        }
-        let listen_address = surface.listen_address();
-        let route = surface.route();
-        let listener = match network_config.map_url_to_port(listen_address) {
-            Some(port) => format!("port {}", port),
-            None => format!("address '{}'", listen_address),
         };
-        let combo = format!("{}:{}", listener, config::route_claims::normalize_route(route));
-        if !seen_route_port_combos.insert(combo.clone()) {
+        let kept = served
+            .entry(combo)
+            .or_insert(index);
+        if channels[index].route().len() > channels[*kept].route().len() {
+            *kept = index;
+        }
+    }
+    for (index, surface) in channels
+        .iter_mut()
+        .enumerate()
+    {
+        let Some(combo) = &combos[index] else {
+            continue;
+        };
+        if served[combo.as_str()] != index {
             error!(
                 surface = %surface.name,
                 surface_id = %surface.surface_id,
                 combo = %combo,
+                kept_surface_id = %surface_ids[served[combo.as_str()]],
                 "Duplicate access-point route+port found in storage — auto-disabling this surface so the gateway can boot; \
                  resolve the conflict and re-enable it via the UI or API"
             );
@@ -1539,17 +1565,27 @@ mod duplicate_route_surface_tests {
     }
 
     #[tokio::test]
-    async fn routes_that_differ_only_by_a_trailing_slash_are_duplicates() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = test_store(dir.path()).await;
-        let mut channels = vec![surface("s-a", "/agents/a"), surface("s-b", "/agents/a/")];
+    async fn of_two_routes_that_differ_only_by_a_trailing_slash_the_served_one_stays_active() {
+        for (first_route, second_route, served) in
+            [("/agents/a", "/agents/a/", "s-b"), ("/agents/a/", "/agents/a", "s-a")]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let store = test_store(dir.path()).await;
+            let mut channels = vec![surface("s-a", first_route), surface("s-b", second_route)];
 
-        disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
-            .await
-            .expect("dedup should succeed");
+            disable_duplicate_route_surfaces(&store, &mut channels, &network_config())
+                .await
+                .expect("dedup should succeed");
 
-        assert_eq!(channels[0].status, SurfaceStatus::Active);
-        assert_eq!(channels[1].status, SurfaceStatus::Disabled);
+            for surface in &channels {
+                let expected = if surface.surface_id == served {
+                    SurfaceStatus::Active
+                } else {
+                    SurfaceStatus::Disabled
+                };
+                assert_eq!(surface.status, expected, "{} on {}", surface.surface_id, surface.route());
+            }
+        }
     }
 
     #[tokio::test]

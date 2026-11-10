@@ -14,7 +14,10 @@ changes:
         already had is not checked again, so older surfaces can still be edited, and the
         gateway logs a warning at startup for each one callers cannot reach. A new or
         changed route is stored without a trailing `/`, and routes that differ only by
-        one count as the same route, when saving and when the gateway starts.
+        one count as the same route, when saving and when the gateway starts. Of two
+        stored active surfaces like that on one listener, startup keeps the one that
+        received the requests, the one whose stored route ends in `/`, and disables the
+        other.
   removed: []
   security:
     - timestamp: '2026-11-09T13:20:00Z'
