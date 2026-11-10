@@ -1198,6 +1198,9 @@ mod tests {
                 is_local: true,
                 verified: true,
                 origin: None,
+                slot: None,
+                credential_updated_at: None,
+                rotations: Vec::new(),
             })
             .await
             .unwrap();
@@ -1267,6 +1270,9 @@ mod tests {
                 is_local: true,
                 verified: true,
                 origin: None,
+                slot: None,
+                credential_updated_at: None,
+                rotations: Vec::new(),
             })
             .await
             .unwrap();
@@ -1311,6 +1317,9 @@ mod tests {
                 is_local: true,
                 verified: true,
                 origin: None,
+                slot: None,
+                credential_updated_at: None,
+                rotations: Vec::new(),
             })
             .await
             .unwrap();

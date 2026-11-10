@@ -255,6 +255,7 @@ async fn issue_for_slot(
     slot: IdentitySlot,
     identity_fields: HashMap<String, JsonValue>,
     identity_hash: String,
+    credential_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     surface: &crate::config::agent_surface::AgentSurface,
 ) -> anyhow::Result<crate::identity::AgentIdentityResponse> {
     let surface_id = Some(surface.surface_id.clone());
@@ -262,7 +263,14 @@ async fn issue_for_slot(
     match slot {
         IdentitySlot::Protected => {
             vc_issuer
-                .issue_or_get_managed_credential(identity_fields, Some(identity_hash), surface_id, issuer_id)
+                .issue_or_get_managed_credential(
+                    identity_fields,
+                    Some(identity_hash),
+                    surface_id,
+                    issuer_id,
+                    crate::identity::filesystem::ManagedIdentitySource::protected()
+                        .with_credential_updated_at(credential_updated_at),
+                )
                 .await
         }
         IdentitySlot::External => {
@@ -376,6 +384,7 @@ pub async fn resolve_agent_identity_for_slot(
             Ok(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                credential_updated_at,
             }) => {
                 let Some(selector) = identity_selector else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -391,8 +400,15 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
-                match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
-                    .await
+                match issue_for_slot(
+                    vc_issuer.as_ref(),
+                    slot,
+                    identity_fields.clone(),
+                    identity_hash.clone(),
+                    credential_updated_at,
+                    surface,
+                )
+                .await
                 {
                     Ok(response) => {
                         let result_label = if response.is_new {
@@ -509,6 +525,7 @@ pub async fn resolve_agent_identity_for_slot(
             Ok(Some(crate::identity::credential_identity::CredentialIdentity::Derived {
                 identity_fields,
                 identity_hash,
+                credential_updated_at,
             })) => {
                 let Some(selector) = identity_selector else {
                     crate::metrics::backends::prometheus::track_managed_identity_resolve(
@@ -524,8 +541,15 @@ pub async fn resolve_agent_identity_for_slot(
                     ));
                 };
                 let vc_issuer = selector.get_vc_issuer();
-                match issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), identity_hash.clone(), surface)
-                    .await
+                match issue_for_slot(
+                    vc_issuer.as_ref(),
+                    slot,
+                    identity_fields.clone(),
+                    identity_hash.clone(),
+                    credential_updated_at,
+                    surface,
+                )
+                .await
                 {
                     Ok(response) => {
                         let result_label = if response.is_new {
@@ -809,7 +833,7 @@ pub async fn resolve_agent_identity_for_slot(
         "[TR-TRACE] backend_identity: calling issue_or_get_credential"
     );
 
-    let response = issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), hash.clone(), surface)
+    let response = issue_for_slot(vc_issuer.as_ref(), slot, identity_fields.clone(), hash.clone(), None, surface)
         .await
         .map_err(|e| IdentityResolutionError::IdentityBackendUnavailable(e.to_string()))?;
 
@@ -1274,10 +1298,13 @@ mod tests {
         let config = crate::source_auth::ManagedIdentityConfig::FromApiKey {
             api_key_id: Some("atgk_bi_origin".to_string()),
         };
-        let Some(crate::identity::credential_identity::CredentialIdentity::Derived { identity_fields, identity_hash }) =
-            crate::identity::credential_identity::derive_credential_identity(&config, None, None)
-                .await
-                .unwrap()
+        let Some(crate::identity::credential_identity::CredentialIdentity::Derived {
+            identity_fields,
+            identity_hash,
+            ..
+        }) = crate::identity::credential_identity::derive_credential_identity(&config, None, None)
+            .await
+            .unwrap()
         else {
             panic!("API key identity is derived");
         };

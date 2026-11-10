@@ -251,7 +251,6 @@ const SIDEBAR_PAGES: LayoutPage[] = [
         actions: [
             ...IDENTITIES,
             `identities-row-${LONG_DID}`,
-            `identities-history-button-${LONG_DID}`,
             `identities-policy-button-${LONG_DID}`,
             `identities-copy-link-button-${LONG_DID}`,
         ],

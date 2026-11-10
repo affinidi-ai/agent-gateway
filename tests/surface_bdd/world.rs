@@ -162,6 +162,9 @@ pub struct SurfaceWorld {
     pub personal_access_token_client: Option<reqwest::Client>,
     /// API keys the scenario created, by scenario name: the owning surface id and the key id.
     pub api_keys: HashMap<String, (String, String)>,
+    /// Client certificates the scenario stored through the admin API, by scenario name: the
+    /// stored certificate id.
+    pub client_certificates: HashMap<String, String>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -235,6 +238,7 @@ impl SurfaceWorld {
             surface_draft: None,
             personal_access_token_client: None,
             api_keys: HashMap::new(),
+            client_certificates: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

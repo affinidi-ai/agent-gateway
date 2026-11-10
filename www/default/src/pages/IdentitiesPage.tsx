@@ -6,7 +6,6 @@ import { usePermissions } from '../context/PermissionsContext';
 import { WS_NONE, WS_DASHBOARD } from '../utils/wsSubscriptions';
 import { formatDateTime, timeAgo } from '../utils/stringUtils';
 import TrustScoreModal from '../components/didwebvh/TrustScoreModal';
-import VersionHistoryModal from '../components/didwebvh/VersionHistoryModal';
 import PolicyConfigModal from '../components/didwebvh/PolicyConfigModal';
 import { apiClient } from '../api';
 import SearchInput from '../components/shared/SearchInput';
@@ -20,6 +19,8 @@ import { IdentityOriginBadge } from './IdentitiesPage/IdentityOriginBadge';
 import { IdentityRecorderChip } from './IdentitiesPage/IdentityRecorderChip';
 import { IdentitySurfaceCell, SurfaceLinkButton } from './IdentitiesPage/IdentitySurfaceCell';
 import { isSharedManagedDid } from './IdentitiesPage/sharedManagedDid';
+import { IdentityVersionHistory } from './IdentitiesPage/IdentityVersionHistory';
+import { recordsRotations } from './IdentitiesPage/identityVersions';
 import {
   RECORDER_FILTER_OPTIONS,
   isRecorderFilter,
@@ -33,6 +34,32 @@ const metadataAgentName = (metadata?: { agent_name?: unknown }): string | undefi
   typeof metadata?.agent_name === 'string' && metadata.agent_name !== ''
     ? metadata.agent_name
     : undefined;
+type SectionsByDid = Record<string, Set<string>>;
+
+/** Open sections keyed by each entry's current primary DID. */
+const remapSections = (
+  sections: SectionsByDid,
+  primaryDidFor: (did: string) => string
+): SectionsByDid => {
+  const byPrimary: SectionsByDid = {};
+  Object.entries(sections).forEach(([did, open]) => {
+    byPrimary[primaryDidFor(did)] = open;
+  });
+  return byPrimary;
+};
+
+/** `sections` without any stored key of the entry whose primary DID is `primaryDid`. */
+const withoutEntry = (
+  sections: SectionsByDid,
+  primaryDid: string,
+  primaryDidFor: (did: string) => string
+): SectionsByDid => {
+  const next: SectionsByDid = {};
+  Object.entries(sections).forEach(([did, open]) => {
+    if (primaryDidFor(did) !== primaryDid) next[did] = open;
+  });
+  return next;
+};
 
 const IdentitiesPage: React.FC = () => {
   const { actions, getCurrentStats } = useApp();
@@ -83,7 +110,6 @@ const IdentitiesPage: React.FC = () => {
 
   // DID:webvh modals
   const [showTrustScoreModal, setShowTrustScoreModal] = useState(false);
-  const [showVersionHistoryModal, setShowVersionHistoryModal] = useState(false);
   const [showPolicyConfigModal, setShowPolicyConfigModal] = useState(false);
   const [selectedIdentity, setSelectedIdentity] = useState<any>(null);
   const canViewIssuers = hasPermission('issuers.view');
@@ -162,11 +188,15 @@ const IdentitiesPage: React.FC = () => {
 
   const {
     filteredIdentities,
+    entryCount,
     hasNamingMetadata,
     hasRecorderStatus,
     liveSurfaceNames,
     surfaceLinkFor,
     surfaceLinksFor,
+    versionsFor,
+    identityFor,
+    primaryDidFor,
   } = useIdentityRows({
     identities,
     channels: stats?.channels,
@@ -174,39 +204,65 @@ const IdentitiesPage: React.FC = () => {
     recorderFilter,
   });
 
-  // Handle deep linking to a specific identity
-  useEffect(() => {
-    if (didParam) {
-      const decodedDid = decodeURIComponent(didParam);
-      setExpandedIdentityDids(prev =>
-        prev.has(decodedDid) ? prev : new Set(prev).add(decodedDid)
-      );
-      setExpandedSections(prev =>
-        prev[decodedDid] ? prev : { ...prev, [decodedDid]: new Set(['summary']) }
-      );
+  const linkedDid = didParam ? decodeURIComponent(didParam) : undefined;
+  const linkedPrimaryDid = linkedDid ? primaryDidFor(linkedDid) : undefined;
+  // Grouping needs the dashboard identities; until they load every DID is its own primary.
+  const identitiesLoaded = stats?.identities !== undefined;
 
-      // Scroll to the identity after a short delay to ensure rendering
-      setTimeout(() => {
-        const element = identityRefs.current[decodedDid];
-        if (element) {
-          element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-      }, 100);
+  // Expansion is stored under the primary DID at the time it was opened. Read it through
+  // `primaryDidFor` so an open entry stays open when another of its DIDs becomes primary.
+  const expandedPrimaryDids = useMemo(
+    () => new Set(Array.from(expandedIdentityDids, primaryDidFor)),
+    [expandedIdentityDids, primaryDidFor]
+  );
+  const sectionsByPrimary = useMemo(
+    () => remapSections(expandedSections, primaryDidFor),
+    [expandedSections, primaryDidFor]
+  );
+
+  // Handle deep linking to a specific identity: an earlier DID opens its surface entry's versions.
+  // Acts once per link, so a later primary change doesn't undo what the user closed.
+  const handledDeepLink = useRef<string>();
+  useEffect(() => {
+    if (!linkedDid) {
+      handledDeepLink.current = undefined;
+      return;
     }
-  }, [didParam]);
+    if (!identitiesLoaded || !linkedPrimaryDid || handledDeepLink.current === linkedDid) return;
+    handledDeepLink.current = linkedDid;
+    const opensVersions = linkedDid !== linkedPrimaryDid;
+    setExpandedIdentityDids(prev =>
+      Array.from(prev).some(did => primaryDidFor(did) === linkedPrimaryDid)
+        ? prev
+        : new Set(prev).add(linkedPrimaryDid)
+    );
+    setExpandedSections(prev => {
+      const current = remapSections(prev, primaryDidFor)[linkedPrimaryDid];
+      if (current && (!opensVersions || current.has('versions'))) return prev;
+      const next = new Set(current ?? ['summary']);
+      if (opensVersions) next.add('versions');
+      return { ...withoutEntry(prev, linkedPrimaryDid, primaryDidFor), [linkedPrimaryDid]: next };
+    });
+
+    // Scroll to the identity after a short delay to ensure rendering
+    setTimeout(() => {
+      const element = identityRefs.current[linkedPrimaryDid];
+      if (element) {
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }, 100);
+  }, [identitiesLoaded, linkedDid, linkedPrimaryDid, primaryDidFor]);
 
   const toggleIdentityDetails = (did: string) => {
-    const isOpen = expandedIdentityDids.has(did);
+    const isOpen = expandedPrimaryDids.has(did);
     setExpandedIdentityDids(prev => {
-      const next = new Set(prev);
-      if (isOpen) next.delete(did);
-      else next.add(did);
+      const next = new Set(Array.from(prev).filter(stored => primaryDidFor(stored) !== did));
+      if (!isOpen) next.add(did);
       return next;
     });
     setExpandedSections(prev => {
-      const next = { ...prev };
-      if (isOpen) delete next[did];
-      else next[did] = new Set(['summary']);
+      const next = withoutEntry(prev, did, primaryDidFor);
+      if (!isOpen) next[did] = new Set(['summary']);
       return next;
     });
     navigate(isOpen ? '/identities' : `/identities/${encodeURIComponent(did)}`);
@@ -215,15 +271,14 @@ const IdentitiesPage: React.FC = () => {
   // Toggle a specific section within an identity
   const toggleSection = (did: string, section: string) => {
     setExpandedSections(prev => {
-      const sections = prev[did] || new Set();
-      const newSections = new Set(sections);
+      const newSections = new Set(remapSections(prev, primaryDidFor)[did]);
       if (newSections.has(section)) {
         newSections.delete(section);
       } else {
         newSections.add(section);
       }
       return {
-        ...prev,
+        ...withoutEntry(prev, did, primaryDidFor),
         [did]: newSections,
       };
     });
@@ -232,7 +287,7 @@ const IdentitiesPage: React.FC = () => {
   const openSurface = (surfaceId: string) => navigate(`/surfaces/${surfaceId}`);
 
   const isSectionExpanded = (did: string, section: string) => {
-    return expandedSections[did]?.has(section) || false;
+    return sectionsByPrimary[did]?.has(section) || false;
   };
 
   /**
@@ -322,17 +377,42 @@ const IdentitiesPage: React.FC = () => {
     setShowTrustScoreModal(true);
   };
 
-  const openVersionHistoryModal = (identity: any, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setSelectedIdentity(identity);
-    setShowVersionHistoryModal(true);
-  };
-
   const openPolicyConfigModal = (identity: any, e: React.MouseEvent) => {
     e.stopPropagation();
     setSelectedIdentity(identity);
     setShowPolicyConfigModal(true);
   };
+
+  const identityActions = (identity: any, testId: (action: string) => string) => (
+    <div className="btn-group btn-group-sm" role="group">
+      {identity.trust_score !== undefined && (
+        <button
+          className="btn btn-outline-primary"
+          data-testid={testId('trust-score')}
+          onClick={e => openTrustScoreModal(identity, e)}
+          title="View Trust Score"
+        >
+          <i className="fas fa-chart-line"></i>
+        </button>
+      )}
+      <button
+        className="btn btn-outline-info"
+        data-testid={testId('policy')}
+        onClick={e => openPolicyConfigModal(identity, e)}
+        title="Configure Policy"
+      >
+        <i className="fas fa-shield-alt"></i>
+      </button>
+      <button
+        className="btn btn-outline-secondary"
+        data-testid={testId('copy-link')}
+        onClick={e => copyDeepLink(identity.did, e)}
+        title="Copy link"
+      >
+        <i className="fas fa-link"></i>
+      </button>
+    </div>
+  );
 
   const handlePolicyConfigSave = async (config: any) => {
     // Use 'id' field from backend API (not 'uuid')
@@ -477,7 +557,7 @@ const IdentitiesPage: React.FC = () => {
                         ariaLabel={`${filteredIdentities.length} agent identities`}
                         suffix={
                           searchTerm || (hasRecorderStatus && recorderFilter !== 'all')
-                            ? ` of ${identities.length}`
+                            ? ` of ${entryCount}`
                             : undefined
                         }
                       />
@@ -509,9 +589,10 @@ const IdentitiesPage: React.FC = () => {
                           </thead>
                           <tbody>
                             {filteredIdentities.map(identity => {
-                              const isExpanded = expandedIdentityDids.has(identity.did);
+                              const isExpanded = expandedPrimaryDids.has(identity.did);
                               const surfaceLink = surfaceLinkFor(identity);
                               const sharedManagedDid = isSharedManagedDid(identity);
+                              const versions = versionsFor(identity.did);
                               return (
                                 <React.Fragment key={identity.did}>
                                   <tr
@@ -714,44 +795,10 @@ const IdentitiesPage: React.FC = () => {
                                       </td>
                                     )}
                                     <td>
-                                      <div className="btn-group btn-group-sm" role="group">
-                                        {identity.trust_score !== undefined && (
-                                          <button
-                                            className="btn btn-outline-primary"
-                                            data-testid={`identities-trust-score-button-${identity.did}`}
-                                            onClick={e => openTrustScoreModal(identity, e)}
-                                            title="View Trust Score"
-                                          >
-                                            <i className="fas fa-chart-line"></i>
-                                          </button>
-                                        )}
-                                        {identity.uuid && (
-                                          <button
-                                            className="btn btn-outline-secondary"
-                                            data-testid={`identities-history-button-${identity.did}`}
-                                            onClick={e => openVersionHistoryModal(identity, e)}
-                                            title="View version history"
-                                          >
-                                            <i className="fas fa-history"></i>
-                                          </button>
-                                        )}
-                                        <button
-                                          className="btn btn-outline-info"
-                                          data-testid={`identities-policy-button-${identity.did}`}
-                                          onClick={e => openPolicyConfigModal(identity, e)}
-                                          title="Configure Policy"
-                                        >
-                                          <i className="fas fa-shield-alt"></i>
-                                        </button>
-                                        <button
-                                          className="btn btn-outline-secondary"
-                                          data-testid={`identities-copy-link-button-${identity.did}`}
-                                          onClick={e => copyDeepLink(identity.did, e)}
-                                          title="Copy link"
-                                        >
-                                          <i className="fas fa-link"></i>
-                                        </button>
-                                      </div>
+                                      {identityActions(
+                                        identity,
+                                        action => `identities-${action}-button-${identity.did}`
+                                      )}
                                     </td>
                                   </tr>
                                   {isExpanded && (
@@ -906,6 +953,53 @@ const IdentitiesPage: React.FC = () => {
                                                 </div>
                                               )}
                                             </div>
+
+                                            {(versions.length > 0 ||
+                                              recordsRotations(identity)) && (
+                                              <div className="card mb-2">
+                                                <div
+                                                  className="card-header py-1 bg-light"
+                                                  style={{ cursor: 'pointer' }}
+                                                  onClick={() =>
+                                                    toggleSection(identity.did, 'versions')
+                                                  }
+                                                  data-testid="identities-version-history-toggle"
+                                                >
+                                                  <small className="mb-0 text-muted">
+                                                    <i
+                                                      className={`fas fa-chevron-${isSectionExpanded(identity.did, 'versions') ? 'down' : 'right'} me-2`}
+                                                    ></i>
+                                                    <i className="fas fa-history"></i> Version
+                                                    History
+                                                  </small>
+                                                </div>
+                                                {isSectionExpanded(identity.did, 'versions') && (
+                                                  <div className="card-body py-2 px-3">
+                                                    <IdentityVersionHistory
+                                                      versions={versions}
+                                                      highlightedDid={
+                                                        linkedPrimaryDid === identity.did &&
+                                                        linkedDid !== identity.did
+                                                          ? linkedDid
+                                                          : undefined
+                                                      }
+                                                      renderActions={version => {
+                                                        const earlier =
+                                                          version.did !== identity.did &&
+                                                          identityFor(version.did);
+                                                        return earlier
+                                                          ? identityActions(
+                                                              earlier,
+                                                              action =>
+                                                                `identities-version-${version.number}-${action}-button`
+                                                            )
+                                                          : null;
+                                                      }}
+                                                    />
+                                                  </div>
+                                                )}
+                                              </div>
+                                            )}
 
                                             {/* Identity Field Values */}
                                             {identity.agent_identity && (
@@ -1452,15 +1546,6 @@ const IdentitiesPage: React.FC = () => {
               setSelectedIdentity(null);
             }}
             agentDna={selectedIdentity?.metadata?.agentDNA}
-          />
-          <VersionHistoryModal
-            identityId={selectedIdentity.uuid || selectedIdentity.did}
-            did={selectedIdentity.did}
-            show={showVersionHistoryModal}
-            onHide={() => {
-              setShowVersionHistoryModal(false);
-              setSelectedIdentity(null);
-            }}
           />
           <PolicyConfigModal
             identity={selectedIdentity}
