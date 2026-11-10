@@ -272,6 +272,7 @@ describe('describeFetchCause', () => {
     ['timeout', 'Check that the agent is running, then Refresh.'],
     ['too_large', 'Shrink the agent card.'],
     ['invalid_card', 'Check the agent card location.'],
+    ['compressed', 'honour Accept-Encoding: identity.'],
     [
       'blocked_by_egress',
       'Check the endpoint host name and DNS from the gateway host, then Refresh.',

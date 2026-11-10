@@ -112,8 +112,9 @@ pub struct GatewayPlan {
     pub surfaces: Vec<SurfaceSpec>,
     pub mock_responses: HashMap<String, serde_json::Value>,
     pub mock_response_delays: HashMap<String, (u64, u64)>,
-    /// Surfaces whose mock gzip-compresses its replies when the request accepts gzip.
-    pub mock_gzip_when_asked: std::collections::HashSet<String>,
+    /// Surfaces whose mock gzip-compresses its replies, always or only when the
+    /// request accepts gzip.
+    pub mock_gzip: HashMap<String, crate::bdd_support::mock_server::MockStream>,
     /// The only MCP revision admitted on Fabric streams it receives, as a
     /// gateway whose surfaces serve just that revision does.
     pub fabric_receive_only: Option<McpVersion>,
@@ -1007,11 +1008,11 @@ async fn spawn_node(
             .get(&surface.surface_id)
         {
             let mut response = crate::bdd_support::mock_server::MockResponse::json(response.clone());
-            if plan
-                .mock_gzip_when_asked
-                .contains(&surface.surface_id)
+            if let Some(stream) = plan
+                .mock_gzip
+                .get(&surface.surface_id)
             {
-                response.stream = crate::bdd_support::mock_server::MockStream::GzipWhenAsked;
+                response.stream = *stream;
             }
             let mock = MockServer::start(response).await;
             if let Some((min_ms, max_ms)) = plan

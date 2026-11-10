@@ -10,6 +10,13 @@ changes:
         could not read. Access Point card discovery failed with 502 and Fabric carried a corrupted
         body. Agent card fetches and every Fabric forward now ask the agent for an uncompressed
         answer, and one compressed all the same is refused with 502 rather than corrupted.
+    - timestamp: '2026-11-10T16:30:00Z'
+      title: Name a compressed agent card as the cause of a failed card fetch
+      description: >-
+        An agent that compresses its card although the gateway asked for none was reported to
+        operators as "Not an agent card" and to Transit Point callers as "Failed to read upstream
+        response". The Agent Cards view now shows "Card compressed" with what to fix, Transit
+        Points answer "Upstream response is compressed", and the refusal counts as a failed call.
   removed: []
   security:
     - timestamp: '2026-11-10T11:40:36Z'

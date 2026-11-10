@@ -889,8 +889,27 @@ fn remote_record_id(
         .to_string()
 }
 
-#[given(expr = "managed agent {string} compresses its replies with gzip when asked")]
-pub fn managed_agent_compresses_its_replies_when_asked(
+#[given(regex = r#"^managed agent "([^"]+)" compresses its replies with gzip (when asked|even when not asked)$"#)]
+pub fn managed_agent_compresses_its_replies(
+    world: &mut G2gWorld,
+    agent_name: String,
+    when: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    let stream = if when == "when asked" {
+        crate::bdd_support::mock_server::MockStream::GzipWhenAsked
+    } else {
+        crate::bdd_support::mock_server::MockStream::Gzip
+    };
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_gzip
+        .insert(surface_id, stream);
+}
+
+#[given(expr = "managed agent {string} serves an agent card")]
+pub fn managed_agent_serves_an_agent_card(
     world: &mut G2gWorld,
     agent_name: String,
 ) {
@@ -898,8 +917,21 @@ pub fn managed_agent_compresses_its_replies_when_asked(
     world
         .topology
         .plan_mut(gw_index)
-        .mock_gzip_when_asked
-        .insert(surface_id);
+        .mock_responses
+        .insert(
+            surface_id,
+            serde_json::json!({
+                "protocolVersion": "0.3.0",
+                "name": "g2g-target-agent",
+                "description": "A managed agent behind a paired gateway",
+                "url": "http://mock.local",
+                "version": "1.0.0",
+                "capabilities": {},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": []
+            }),
+        );
 }
 
 #[given(expr = "surface {string} serves an agent card naming agent DID {string}")]

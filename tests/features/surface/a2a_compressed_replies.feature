@@ -34,5 +34,14 @@ Feature: A2A agents that compress their replies
     And external agent "charlie" serves a gzip-compressed agent card even when not asked
     When managed agent "bravo" fetches the agent card of Transit Point "tr1" with header "accept-encoding" set to "gzip"
     Then the response status is 502
-    And the response body is error "transit_point_upstream_compressed"
+    And the response body is error "agent_card_upstream_compressed"
+    And external agent "charlie" received header "accept-encoding" with value "identity"
+
+  Scenario: An HTTP Transit Point refuses an agent card compressed although none was accepted
+    Given A2A surface "alpha" is defined for route "/example" with managed agent "bravo" as its target
+    And surface "alpha" has HTTP Transit Point "tr1" to external agent "charlie"
+    And external agent "charlie" serves a gzip-compressed agent card even when not asked
+    When managed agent "bravo" fetches the agent card of Transit Point "tr1" with header "accept-encoding" set to "gzip"
+    Then the response status is 502
+    And the response body is error "agent_card_upstream_compressed"
     And external agent "charlie" received header "accept-encoding" with value "identity"

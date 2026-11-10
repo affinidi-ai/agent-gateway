@@ -1470,12 +1470,6 @@ fn response_body_is_error(
             "status": 502,
             "detail": "Upstream redirected"
         }),
-        "transit_point_upstream_compressed" => serde_json::json!({
-            "type": "https://a2a-protocol.org/errors/proxy-error",
-            "title": "Bad Gateway",
-            "status": 502,
-            "detail": "Failed to read upstream response"
-        }),
         "agent_card_upstream_compressed" => serde_json::json!({
             "type": "https://a2a-protocol.org/errors/proxy-error",
             "title": "Bad Gateway",

@@ -116,7 +116,8 @@ Every fetch result is a `200` with these fields, each always present:
 The causes are fixed strings, never upstream text: `needs_token` (401 without a credential),
 `auth_failed` (401 with a credential, a remote gateway's 401 or 403, or a credential the gateway
 could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3xx),
-`upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `blocked_by_egress`,
+`upstream_error`, `unreachable`, `timeout`, `too_large`, `invalid_card`, `compressed` (the agent
+compressed its card although `identity` was asked for), `blocked_by_egress`,
 `proxy_unavailable`, and, with status `not_served` and the agent's card in `before`,
 `identity_failed` and `rewrite_failed`. An `auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
@@ -543,10 +544,11 @@ forwarded, whatever the surface's A2A validation level, `"off"` included, becaus
 batch response cannot be rewritten. A compressed card cannot be rewritten either, so every card
 fetch, public or extended, on an Access Point or a Transit Point, is forwarded with
 `Accept-Encoding: identity` in place of the caller's value, and a card compressed all the same is
-answered with `502`. An Access Point's direct fetch names the reason (`Upstream response is
-compressed`); over Fabric the caller gets `Upstream error: 502 Bad Gateway`, the receiving
-gateway's status. Other A2A requests keep the caller's `Accept-Encoding` on a direct path, and
-their compressed answers pass through unchanged; over Fabric the sending gateway asks for an
+answered with `502`. A direct fetch names the reason (`Upstream response is compressed`); over
+Fabric an Access Point's caller gets `Upstream error: 502 Bad Gateway`, the receiving gateway's
+status. Other A2A requests on a direct path keep the caller's `Accept-Encoding`, and their
+compressed answers pass through unchanged, except streaming methods and requests to a Target that
+binds a grant, which ask for `identity` too; over Fabric the sending gateway asks for an
 uncompressed answer on every buffered request and the receiving gateway on every request it
 forwards, framed streams included (see [`FABRIC.md`](FABRIC.md#fabric-receive-pipeline)).
 

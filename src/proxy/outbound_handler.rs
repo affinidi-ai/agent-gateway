@@ -214,6 +214,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Failed to read upstream response")]
     UpstreamResponseReadFailed,
 
+    #[error("Upstream response is compressed")]
+    UpstreamResponseCompressed,
+
     #[error("Response extension validation failed: {0}")]
     #[allow(dead_code)]
     ResponseValidationFailed(String),
@@ -335,6 +338,7 @@ impl OutboundPipelineError {
             Self::TargetAuthUnavailable { .. }
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
+            | Self::UpstreamResponseCompressed
             | Self::ResponseValidationFailed(_)
             | Self::UnrewritableExtendedAgentCardResponse { .. } => StatusCode::BAD_GATEWAY,
 
@@ -1174,7 +1178,10 @@ async fn outbound_proxy_handler_in_request_scope(
         }
     };
     let upstream_response = step_answer_a_refused_grant(&state, &mut ctx, upstream_response).await?;
-    refuse_a_compressed_answer(&ctx, &upstream_response)?;
+    if let Err(error) = refuse_a_compressed_answer(&ctx, &upstream_response) {
+        step_record_metrics(&state, &ctx, false);
+        return Err(error);
+    }
 
     if matches!(
         ctx.mcp_classification
@@ -6621,7 +6628,7 @@ fn refuse_a_compressed_answer(
             "A Transit Point's target compressed its answer although none was accepted - refusing it, since \
              its body could not be checked"
         );
-        return Err(OutboundPipelineError::UpstreamResponseReadFailed);
+        return Err(OutboundPipelineError::UpstreamResponseCompressed);
     }
     Ok(())
 }
@@ -17522,7 +17529,7 @@ mod tests {
             let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
             let sent = send_with_grant(&state, &mut ctx).await;
             assert_eq!(
-                matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)),
+                matches!(sent, Err(OutboundPipelineError::UpstreamResponseCompressed)),
                 refused,
                 "{protocol} {encoding}: {sent:?}"
             );
@@ -17575,7 +17582,7 @@ mod tests {
             assert_eq!(
                 matches!(
                     refuse_a_compressed_answer(&ctx, &compressed),
-                    Err(OutboundPipelineError::UpstreamResponseReadFailed)
+                    Err(OutboundPipelineError::UpstreamResponseCompressed)
                 ),
                 refused,
                 "{protocol} {path} {status}"

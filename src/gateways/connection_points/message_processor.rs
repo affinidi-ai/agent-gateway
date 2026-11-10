@@ -11464,7 +11464,9 @@ mod tests {
 
     /// The caller-info and DID identity headers and the caller's cookies a peer
     /// gateway sends, in any case, never reach the agent behind the receiving
-    /// surface; the peer's other headers do.
+    /// surface, and the agent is asked for an uncompressed answer whatever the
+    /// peer accepts, as an older sending gateway forwards its caller's value;
+    /// the peer's other headers reach the agent.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11531,6 +11533,7 @@ mod tests {
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
                 "Cookie": "__Host-session_token=peer-dashboard-session",
+                "Accept-Encoding": "gzip, br",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11558,6 +11561,15 @@ mod tests {
             );
         }
         assert_eq!(received[0]["x-peer-context"], "kept");
+        assert_eq!(
+            received[0]
+                .get_all(axum::http::header::ACCEPT_ENCODING)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["identity"],
+            "{:?}",
+            received[0]
+        );
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ pub enum CardFetchCause {
     Timeout,
     TooLarge,
     InvalidCard,
+    Compressed,
     BlockedByEgress,
     ProxyUnavailable,
     IdentityFailed,
@@ -81,6 +82,7 @@ impl CardFetchCause {
             | Self::Timeout
             | Self::TooLarge
             | Self::InvalidCard
+            | Self::Compressed
             | Self::BlockedByEgress
             | Self::ProxyUnavailable => CardFetchStatus::Failed,
         }
@@ -332,6 +334,7 @@ fn classify_fault(
         FetchFault::Status { status, credential_sent } => (classify_status(status, credential_sent), Some(status)),
         FetchFault::TooLarge => (CardFetchCause::TooLarge, None),
         FetchFault::InvalidCard => (CardFetchCause::InvalidCard, None),
+        FetchFault::Compressed => (CardFetchCause::Compressed, None),
         FetchFault::IdentityFailed => (CardFetchCause::IdentityFailed, None),
         FetchFault::RewriteFailed => (CardFetchCause::RewriteFailed, None),
     }
@@ -842,6 +845,7 @@ mod tests {
                     Timeout,
                     TooLarge,
                     InvalidCard,
+                    Compressed,
                     BlockedByEgress,
                     ProxyUnavailable,
                     IdentityFailed,
@@ -862,6 +866,7 @@ mod tests {
                 "timeout",
                 "too_large",
                 "invalid_card",
+                "compressed",
                 "blocked_by_egress",
                 "proxy_unavailable",
                 "identity_failed",
@@ -967,6 +972,8 @@ mod tests {
             classify_fault(FetchFault::CredentialRejected(TargetAuthError::SecretNotFound), false),
             (CardFetchCause::AuthFailed, None)
         );
+        assert_eq!(classify_fault(FetchFault::Compressed, false), (CardFetchCause::Compressed, None));
+        assert_eq!(CardFetchCause::Compressed.status(), CardFetchStatus::Failed);
     }
 
     #[test]

@@ -1275,10 +1275,11 @@ async fn managed_agent_holds_a_transit_token_naming_a_caller(
     ));
 }
 
-#[given(expr = "surface {string} has A2A Transit Point {string} to external agent {string}")]
-fn surface_has_a2a_transit_point_to_external_agent(
+#[given(regex = r#"^surface \"([^\"]+)\" has (A2A|HTTP) Transit Point \"([^\"]+)\" to external agent \"([^\"]+)\"$"#)]
+fn surface_has_transit_point_of_protocol_to_external_agent(
     world: &mut SurfaceWorld,
     surface_name: String,
+    protocol: String,
     transit_point: String,
     external_agent: String,
 ) {
@@ -1292,7 +1293,7 @@ fn surface_has_a2a_transit_point_to_external_agent(
     add_transit_point(
         world,
         &transit_point,
-        "a2a",
+        &protocol.to_ascii_lowercase(),
         &external_agent,
         TargetActorKind::ExternalAgent,
         Some(surface_name),
