@@ -684,6 +684,65 @@ mod tests {
         assert_eq!(ids(appliance_wide), ["appliance", "other", "own"]);
     }
 
+    #[tokio::test]
+    async fn a_consent_confirmation_client_secret_makes_its_provider_a_referrer_of_the_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                directory.path().to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let provider =
+            |id: &str, consent_confirmation: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+                serde_json::from_value(json!({
+                    "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                    "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                    "consent_confirmation": consent_confirmation,
+                    "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                }))
+                .unwrap()
+            };
+        let confirmation = json!({
+            "client_id": "login-client", "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
+            "jwt_verification_strategy_id": "strategy"
+        });
+        for stored in [provider("confirming", confirmation), provider("plain", serde_json::Value::Null)] {
+            store
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let stores = ReferenceStores {
+            credential_providers: Some(store),
+            ..Default::default()
+        };
+        let ids = |referrers: Vec<Referrer>| {
+            sorted(
+                referrers
+                    .into_iter()
+                    .map(|referrer| referrer.id)
+                    .collect(),
+            )
+        };
+        assert_eq!(
+            ids(stores
+                .referrers_of_secret("LOGIN_SECRET")
+                .await
+                .unwrap()),
+            ["confirming"]
+        );
+        assert_eq!(
+            ids(stores
+                .referrers_of_secret("CLIENT_SECRET")
+                .await
+                .unwrap()),
+            ["confirming", "plain"]
+        );
+    }
+
     async fn body(response: Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

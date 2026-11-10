@@ -48,7 +48,7 @@ use crate::authz_metadata::{ClientAuthzMetadata, DiscoveryError, DiscoveryFailur
 use crate::config::network::{IssuerPattern, IssuerTenant, NetworkConfig};
 
 const MAX_URL_CHARS: usize = 2048;
-const MAX_CLIENT_ID_CHARS: usize = 2048;
+pub(super) const MAX_CLIENT_ID_CHARS: usize = 2048;
 
 /// Reads an issuer's authorization server metadata under the client profile.
 pub type IssuerMetadata =
@@ -156,7 +156,7 @@ impl IntoResponse for ExternalProviderError {
     }
 }
 
-fn has_whitespace_or_control(value: &str) -> bool {
+pub(super) fn has_whitespace_or_control(value: &str) -> bool {
     value
         .chars()
         .any(|c| c.is_whitespace() || c.is_control())

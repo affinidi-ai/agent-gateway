@@ -1974,6 +1974,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,

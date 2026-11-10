@@ -139,6 +139,10 @@ enum ProviderValidationError {
     InvalidSigningKey,
     #[error("jwt_certificate_secret_ref must reference a PEM certificate")]
     InvalidCertificate,
+    #[error("{0}")]
+    InvalidConsentConfirmation(String),
+    #[error("Consent confirmation strategy is invalid or not accessible")]
+    InvalidConfirmationStrategy,
 }
 
 impl IntoResponse for ProviderValidationError {
@@ -156,7 +160,9 @@ impl IntoResponse for ProviderValidationError {
             | Self::InvalidConsentStrategy
             | Self::SecretNotAccessible
             | Self::InvalidSigningKey
-            | Self::InvalidCertificate => {
+            | Self::InvalidCertificate
+            | Self::InvalidConsentConfirmation(_)
+            | Self::InvalidConfirmationStrategy => {
                 (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": self.to_string() }))).into_response()
             }
             Self::IdentityConfigurationUnavailable => {
@@ -192,24 +198,159 @@ async fn validate_consent_strategy(
     {
         return Err(ProviderValidationError::InvalidConsentStrategy);
     }
-    let strategy = state
+    let strategy = referenceable_strategy(state, provider, id, context, scope)
+        .await?
+        .ok_or(ProviderValidationError::InvalidConsentStrategy)?;
+    if crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err() {
+        return Err(ProviderValidationError::InvalidConsentStrategy);
+    }
+    Ok(())
+}
+
+/// The JWT verification strategy `id` when it exists, the provider's tenant
+/// can reference it and the caller's scope covers it; `None` otherwise, so a
+/// strategy of another tenant and a missing one are refused alike.
+async fn referenceable_strategy(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    id: &str,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<Option<crate::jwt_bearer::models::JwtVerificationStrategy>, ProviderValidationError> {
+    let Some(strategies) = state
         .identity_strategies
         .as_ref()
-        .ok_or(ProviderValidationError::InvalidConsentStrategy)?
+    else {
+        return Ok(None);
+    };
+    let strategy = strategies
         .get(id)
         .await
-        .map_err(|_| ProviderValidationError::IdentityConfigurationUnavailable)?
-        .ok_or(ProviderValidationError::InvalidConsentStrategy)?;
-    if !can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
-        || !scope_allows_resource(
-            resource_scope(scope),
-            tenant_context(context),
-            ResourceKind::JwtVerificationStrategies,
-            id,
-        )
-        || crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_err()
+        .map_err(|_| ProviderValidationError::IdentityConfigurationUnavailable)?;
+    Ok(strategy.filter(|strategy| {
+        can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
+            && scope_allows_resource(
+                resource_scope(scope),
+                tenant_context(context),
+                ResourceKind::JwtVerificationStrategies,
+                id,
+            )
+    }))
+}
+
+/// Entra issues `sub` per application, so the `sub` of an ID token issued to
+/// the login client never equals the one in a caller's access token. Its
+/// issuers are the global, US government, China and partner cloud login hosts,
+/// `sts.windows.net` for v1 tokens, and the subdomains of `ciamlogin.com` for
+/// External ID tenants.
+fn is_entra_issuer(issuer: &str) -> bool {
+    const HOSTS: [&str; 5] = [
+        "login.microsoftonline.com",
+        "sts.windows.net",
+        "login.microsoftonline.us",
+        "login.chinacloudapi.cn",
+        "login.partner.microsoftonline.cn",
+    ];
+    url::Url::parse(issuer).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| HOSTS.contains(&host) || host.ends_with(".ciamlogin.com"))
+    })
+}
+
+/// The `consent_confirmation` rules, checked when the setting is present: a
+/// legacy consent provider, a configured identity hash pepper, a login client,
+/// an `id_token_principal_claim` that names a caller, endpoints the start POST
+/// and the confirmation exchange accept, and a strategy the provider's tenant
+/// can reference that names no Entra caller by `sub`, neither in the strategy
+/// nor in the ID token. The client secret reference is checked with the
+/// provider's other secret references.
+async fn validate_consent_confirmation(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+    egress: &TokenEgress,
+    context: &Option<Extension<PatTenantContext>>,
+    scope: &Option<Extension<PatResourceScope>>,
+) -> Result<(), ProviderValidationError> {
+    let invalid = |message: &str| Err(ProviderValidationError::InvalidConsentConfirmation(message.to_string()));
+    let Some(confirmation) = provider
+        .consent_confirmation
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    if !provider.uses_legacy_consent() {
+        return invalid("consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer");
+    }
+    if !crate::identity::credential_identity::pepper_is_configured() {
+        return invalid("consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+    }
+    if [&confirmation.client_id, &confirmation.client_secret_secret_ref, &confirmation.jwt_verification_strategy_id]
+        .iter()
+        .any(|value| value.trim().is_empty())
     {
-        return Err(ProviderValidationError::InvalidConsentStrategy);
+        return invalid(
+            "consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id",
+        );
+    }
+    if confirmation
+        .client_id
+        .chars()
+        .count()
+        > super::external::MAX_CLIENT_ID_CHARS
+        || super::external::has_whitespace_or_control(&confirmation.client_id)
+    {
+        return invalid("consent_confirmation.client_id must be at most 2048 characters, without whitespace");
+    }
+    if let Err(error) = crate::jwt_bearer::models::normalize_principal_claim(
+        confirmation
+            .id_token_principal_claim
+            .as_deref(),
+    ) {
+        return invalid(&format!("consent_confirmation.id_token_principal_claim: {error}"));
+    }
+    let authorization_endpoint =
+        crate::url_validation::validate_oauth_endpoint_url(&confirmation.authorization_endpoint).map_err(|error| {
+            ProviderValidationError::InvalidConsentConfirmation(format!(
+                "consent_confirmation.authorization_endpoint: {error}"
+            ))
+        })?;
+    if !crate::url_validation::is_https_or_bdd_allowed(&authorization_endpoint)
+        || authorization_endpoint
+            .host()
+            .is_none()
+        || authorization_endpoint
+            .query()
+            .is_some()
+        || authorization_endpoint
+            .fragment()
+            .is_some()
+    {
+        return invalid(
+            "consent_confirmation.authorization_endpoint must be an https URL with a host and no query or fragment",
+        );
+    }
+    if let Err(error) = crate::url_validation::validate_oauth_endpoint_url(&confirmation.token_endpoint) {
+        return invalid(&format!("consent_confirmation.token_endpoint: {error}"));
+    }
+    if !egress.permits_token_endpoint(&confirmation.token_endpoint) {
+        return invalid("consent_confirmation.token_endpoint must be an https URL");
+    }
+    let strategy = referenceable_strategy(state, provider, &confirmation.jwt_verification_strategy_id, context, scope)
+        .await?
+        .ok_or(ProviderValidationError::InvalidConfirmationStrategy)?;
+    let strategy_claim = strategy
+        .principal_claim_name()
+        .map_err(|_| ProviderValidationError::InvalidConfirmationStrategy)?;
+    let id_token_claim = confirmation
+        .id_token_principal_claim
+        .as_deref()
+        .unwrap_or(strategy_claim);
+    if is_entra_issuer(&strategy.expected_issuer)
+        && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
+    {
+        return invalid(
+            "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid",
+        );
     }
     Ok(())
 }
@@ -517,6 +658,7 @@ async fn validate_provider_settings(
 ) -> Result<(), ProviderValidationError> {
     validate_token_endpoint_scheme(egress, previous, provider)?;
     validate_jwt_provider(provider)?;
+    validate_consent_confirmation(state, provider, egress, context, scope).await?;
     let isolation = egress
         .policy
         .tenant_credential_isolation;
@@ -622,7 +764,9 @@ fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
 /// its redirect URI, is not checked against those rules, so a stored provider
 /// that breaks them can still be edited. Such a provider is created without a
 /// `callback_url`: its `callback_path` ends in its id, so an update sets it,
-/// and no other provider can already hold its redirect URI.
+/// and no other provider can already hold its redirect URI. A provider with
+/// `consent_confirmation` is always checked against the other providers'
+/// redirect URIs, since its confirmation redirect URI may be one of them.
 async fn consent_flow_error(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
@@ -662,13 +806,14 @@ async fn consent_flow_error(
     let keeps_redirect_uri = previous.is_some_and(|previous| {
         previous.redirect_uri(&state.gateway_base_url) == provider.redirect_uri(&state.gateway_base_url)
     });
-    if keeps_redirect_uri {
-        return None;
-    }
-    if let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
+    if !keeps_redirect_uri && let Err(message) = provider.consent_redirect_uri(&state.gateway_base_url) {
         return refused(message);
     }
-    if creating {
+    if (creating || keeps_redirect_uri)
+        && provider
+            .consent_confirmation
+            .is_none()
+    {
         return None;
     }
     match super::redirect_uri_taken_by(state.store.as_ref(), provider, &state.gateway_base_url).await {
@@ -778,6 +923,7 @@ pub async fn create_provider(
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
         send_resource: req.send_resource,
+        consent_confirmation: req.consent_confirmation,
         created_at: now,
         updated_at: now,
     };
@@ -1149,6 +1295,9 @@ pub async fn update_provider(
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
         send_resource: existing.send_resource,
+        consent_confirmation: req
+            .consent_confirmation
+            .unwrap_or(existing.consent_confirmation),
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
@@ -6432,5 +6581,924 @@ mod external_provider_tests {
                 .unwrap()
                 .contains("the provider is kept")
         );
+    }
+}
+
+#[cfg(test)]
+mod consent_confirmation_tests {
+    use super::*;
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+    use serde_json::{Value, json};
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        state: CredentialProviderState,
+        strategies: Arc<FileSystemJwtVerificationStrategyStore>,
+    }
+
+    async fn fixture() -> Fixture {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let strategies = Arc::new(
+            FileSystemJwtVerificationStrategyStore::new(
+                directory
+                    .path()
+                    .join("strategies"),
+            )
+            .await
+            .unwrap(),
+        );
+        let state = CredentialProviderState {
+            store: Arc::new(
+                super::super::storage::FileSystemCredentialProviderStore::new(
+                    directory
+                        .path()
+                        .join("providers"),
+                )
+                .await
+                .unwrap(),
+            ),
+            secrets_store: Arc::new(
+                crate::secrets::FilesystemSecretsStore::new(
+                    directory
+                        .path()
+                        .join("secrets")
+                        .to_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            identity_strategies: Some(strategies.clone()),
+            oauth_callback_route: "/oauth/callback".into(),
+            gateway_base_url: "https://gateway.example".into(),
+            issuer_metadata: super::super::external::strict_issuer_metadata(),
+            surfaces: None,
+            vault: None,
+            egress_allowlist: None,
+            resource_origins: Default::default(),
+            issuers: Default::default(),
+            references: Default::default(),
+            rbac: None,
+        };
+        for (tenant, secret_id) in [
+            (None, "CLIENT_ID"),
+            (None, "CLIENT_SECRET"),
+            (None, "LOGIN_SECRET"),
+            (Some("tenant-a"), "A_CLIENT_ID"),
+            (Some("tenant-a"), "A_CLIENT_SECRET"),
+            (Some("tenant-a"), "A_LOGIN_SECRET"),
+        ] {
+            state
+                .secrets_store
+                .create(crate::secrets::CreateSecretRequest {
+                    tenant_id: tenant.map(Into::into),
+                    name: secret_id.into(),
+                    secret_id: secret_id.into(),
+                    description: None,
+                    value: "value".into(),
+                    secret_type: "general".into(),
+                    tags: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        Fixture {
+            _directory: directory,
+            state,
+            strategies,
+        }
+    }
+
+    impl Fixture {
+        async fn strategy(
+            &self,
+            tenant: Option<&str>,
+            expected_issuer: &str,
+            principal_claim: Option<&str>,
+        ) -> String {
+            let strategy = serde_json::from_value(json!({
+                "id": "", "tenant_id": tenant, "name": "Callers", "expected_issuer": expected_issuer,
+                "jwks_source": {"type": "static", "jwks": []}, "principal_claim": principal_claim,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap();
+            self.strategies
+                .create(strategy)
+                .await
+                .unwrap()
+                .id
+        }
+
+        async fn create(
+            &self,
+            context: Option<Extension<PatTenantContext>>,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            body_of(
+                create_provider(
+                    State(self.state.clone()),
+                    None,
+                    context,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        }
+
+        async fn update(
+            &self,
+            id: &str,
+            body: Value,
+        ) -> (StatusCode, Value) {
+            body_of(
+                update_provider(
+                    State(self.state.clone()),
+                    Path(id.into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response(),
+            )
+            .await
+        }
+
+        async fn stored(
+            &self,
+            id: &str,
+        ) -> CredentialProvider {
+            self.state
+                .store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+    }
+
+    async fn body_of(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    fn tenant_a() -> Option<Extension<PatTenantContext>> {
+        Some(Extension(PatTenantContext {
+            token_id: "token-a".into(),
+            tenant_id: "tenant-a".into(),
+        }))
+    }
+
+    fn confirmation(strategy_id: &str) -> Value {
+        json!({
+            "client_id": "login-client",
+            "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "jwt_verification_strategy_id": strategy_id
+        })
+    }
+
+    fn github(confirmation: Value) -> Value {
+        json!({
+            "name": "GitHub", "provider_id": "github", "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "consent_confirmation": confirmation
+        })
+    }
+
+    fn with(
+        mut body: Value,
+        path: &[&str],
+        value: Value,
+    ) -> Value {
+        let (last, parents) = path.split_last().unwrap();
+        let mut target = &mut body;
+        for parent in parents {
+            target = &mut target[*parent];
+        }
+        target[*last] = value;
+        body
+    }
+
+    const GOOGLE: &str = "https://accounts.google.com";
+    const ENTRA: &str = "https://login.microsoftonline.com/0000-tenant/v2.0";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_consent_provider_stores_its_consent_confirmation() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["consent_confirmation"], confirmation(&strategy));
+        let stored = fixture
+            .stored(body["id"].as_str().unwrap())
+            .await;
+        let stored = stored
+            .consent_confirmation
+            .unwrap();
+        assert_eq!(stored.client_id, "login-client");
+        assert_eq!(stored.jwt_verification_strategy_id, strategy);
+        assert_eq!(stored.id_token_principal_claim, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_confirmation_is_refused_on_any_provider_but_legacy_authorization_code() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let client_credentials = json!({
+            "name": "M2M", "provider_id": "m2m", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "consent_confirmation": confirmation(&strategy)
+        });
+        let (status, body) = fixture
+            .create(None, client_credentials)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+        let mut external = super::super::external::tests::external_provider();
+        external.consent_confirmation = Some(serde_json::from_value(confirmation(&strategy)).unwrap());
+        let refusal =
+            validate_consent_confirmation(&fixture.state, &external, &TokenEgress::from_environment(), &None, &None)
+                .await;
+        assert!(
+            matches!(&refusal, Err(ProviderValidationError::InvalidConsentConfirmation(message)) if message.contains("without issuer")),
+            "{refusal:?}"
+        );
+
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"provider_type": "oauth2_client_credentials"}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a retype keeping the setting is refused: {body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .provider_type,
+            CredentialProviderType::OAuth2AuthorizationCode
+        );
+        let (status, body) = fixture
+            .update(&id, json!({"provider_type": "oauth2_client_credentials", "consent_confirmation": null}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_keeps_the_setting_when_absent_clears_it_on_null_and_checks_a_replacement() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (_, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"name": "GitHub renamed"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["consent_confirmation"], confirmation(&strategy));
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": with(confirmation(&strategy), &["jwt_verification_strategy_id"], json!("gone"))}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .jwt_verification_strategy_id,
+            strategy
+        );
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": null}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.get("consent_confirmation"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_strategy_must_exist_and_be_one_the_providers_tenant_can_reference() {
+        let fixture = fixture().await;
+        let own = fixture
+            .strategy(Some("tenant-a"), GOOGLE, None)
+            .await;
+        let wide = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let other = fixture
+            .strategy(Some("tenant-b"), GOOGLE, None)
+            .await;
+        let tenant_github = |strategy: &str, provider_id: &str| {
+            let mut body = github(with(confirmation(strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")));
+            body["provider_id"] = json!(provider_id);
+            body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+            body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+            body
+        };
+        for (strategy, provider_id) in [(&other, "other"), (&"missing".to_string(), "missing")] {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(strategy, provider_id))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_id}: {body}");
+            assert_eq!(body["error"], "Consent confirmation strategy is invalid or not accessible");
+        }
+        for (strategy, provider_id) in [(&own, "own"), (&wide, "wide")] {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(strategy, provider_id))
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{provider_id}: {body}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_endpoints_must_pass_the_oauth_endpoint_rules() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (field, endpoint) in [
+            ("token_endpoint", "https://127.0.0.1/token"),
+            ("token_endpoint", "https://169.254.169.254/token"),
+            ("token_endpoint", "http://oauth2.googleapis.com/token"),
+            ("authorization_endpoint", "https://127.0.0.1/authorize"),
+            ("authorization_endpoint", "http://accounts.google.com/o/oauth2/v2/auth"),
+            ("authorization_endpoint", "https://accounts.google.com/o/oauth2/v2/auth#fragment"),
+            ("authorization_endpoint", "https://accounts.google.com/o/oauth2/v2/auth?prompt=login"),
+        ] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!(endpoint))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{endpoint}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("consent_confirmation.{field}")),
+                "{endpoint}: {body}"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_login_client_and_strategy_must_be_named() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (field, blank) in
+            [("client_id", " "), ("client_secret_secret_ref", ""), ("jwt_verification_strategy_id", " ")]
+        {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!(blank))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_login_client_id_takes_no_whitespace() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for client_id in [" login-client".to_string(), "login-client\n".into(), "login client".into(), "a".repeat(2049)]
+        {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &["client_id"], json!(client_id))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{client_id:?}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation.client_id must be at most 2048 characters, without whitespace"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(with(confirmation(&strategy), &["client_id"], json!("a".repeat(2048)))))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_token_scope_that_does_not_cover_the_strategy_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(Some("tenant-a"), GOOGLE, None)
+            .await;
+        let provider: CredentialProvider = serde_json::from_value(json!({
+            "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
+            "provider_type": "oauth2_authorization_code",
+            "client_id_secret_ref": "A_CLIENT_ID", "client_secret_secret_ref": "A_CLIENT_SECRET",
+            "consent_confirmation": with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")),
+            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+        }))
+        .unwrap();
+        let scope = |pattern: String| Some(Extension(PatResourceScope(Arc::new(regex::Regex::new(&pattern).unwrap()))));
+        let covering = scope(format!(r"\ATENANT:tenant-a:jwt-verification-strategies:{}\z", regex::escape(&strategy)));
+        let elsewhere = scope(r"\ATENANT:tenant-a:jwt-verification-strategies:other\z".to_string());
+        let check = |scope| {
+            let fixture = &fixture;
+            let provider = &provider;
+            async move {
+                validate_consent_confirmation(
+                    &fixture.state,
+                    provider,
+                    &TokenEgress::from_environment(),
+                    &tenant_a(),
+                    &scope,
+                )
+                .await
+            }
+        };
+        assert!(check(covering).await.is_ok());
+        let refusal = check(elsewhere).await;
+        assert!(matches!(refusal, Err(ProviderValidationError::InvalidConfirmationStrategy)), "{refusal:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_client_secret_must_exist_in_the_providers_own_tenant() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (status, body) = fixture
+            .create(None, github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!("MISSING"))))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "Secret reference is not accessible");
+
+        let tenant_github = |login_secret: &str| {
+            let mut body = github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!(login_secret)));
+            body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+            body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+            body
+        };
+        let (status, body) = fixture
+            .create(tenant_a(), tenant_github("LOGIN_SECRET"))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "an appliance-wide secret for a tenant provider: {body}");
+        assert_eq!(body["error"], "Secret reference is not accessible");
+        let (status, body) = fixture
+            .create(tenant_a(), tenant_github("A_LOGIN_SECRET"))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let stored = fixture
+            .stored(body["id"].as_str().unwrap())
+            .await;
+        assert!(
+            stored
+                .secret_refs()
+                .contains(&"A_LOGIN_SECRET")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entra_issuer_is_refused_when_the_strategy_or_the_id_token_names_callers_by_sub() {
+        let fixture = fixture().await;
+        let mut refused = Vec::new();
+        for issuer in [
+            ENTRA,
+            "https://sts.windows.net/0000-tenant/",
+            "https://login.microsoftonline.us/0000-tenant/v2.0",
+            "https://login.chinacloudapi.cn/0000-tenant/v2.0",
+            "https://login.partner.microsoftonline.cn/0000-tenant/v2.0",
+            "https://contoso.ciamlogin.com/0000-tenant/v2.0",
+        ] {
+            let sub = fixture
+                .strategy(None, issuer, None)
+                .await;
+            let oid = fixture
+                .strategy(None, issuer, Some("oid"))
+                .await;
+            refused.push((issuer, confirmation(&sub)));
+            refused.push((issuer, with(confirmation(&sub), &["id_token_principal_claim"], json!("oid"))));
+            refused.push((issuer, with(confirmation(&oid), &["id_token_principal_claim"], json!("sub"))));
+        }
+        for (index, (issuer, setting)) in refused
+            .into_iter()
+            .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("refused-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer} {index}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid"
+            );
+        }
+        let mut accepted = Vec::new();
+        for issuer in [ENTRA, "https://contoso.ciamlogin.com/0000-tenant/v2.0"] {
+            let oid = fixture
+                .strategy(None, issuer, Some("oid"))
+                .await;
+            accepted.push(confirmation(&oid));
+        }
+        for not_entra in [
+            "https://ciamlogin.com/0000-tenant/v2.0",
+            "https://evilciamlogin.com/0000-tenant/v2.0",
+            "https://login.microsoftonline.com.evil.example/0000-tenant/v2.0",
+        ] {
+            let sub = fixture
+                .strategy(None, not_entra, None)
+                .await;
+            accepted.push(confirmation(&sub));
+        }
+        for (index, setting) in accepted
+            .into_iter()
+            .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("accepted-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{index}: {body}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_id_token_principal_claim_follows_the_strategy_principal_claim_rule() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for claim in ["iss", "aud", "azp", "", "has space"] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &["id_token_principal_claim"], json!(claim))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{claim}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("consent_confirmation.id_token_principal_claim: principal_claim"),
+                "{claim}: {body}"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(with(confirmation(&strategy), &["id_token_principal_claim"], json!("sub"))))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["consent_confirmation"]["id_token_principal_claim"], "sub", "sub is stored, not dropped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consent_confirmation_needs_a_configured_identity_hash_pepper() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+        let (status, body) = fixture
+            .create(None, github(Value::Null))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "a provider without the setting needs no pepper: {body}");
+
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let (status, body) = fixture
+            .create(None, with(github(confirmation(&strategy)), &["provider_id"], json!("github-2")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adding_the_setting_is_refused_while_another_providers_redirect_uri_is_its_confirmation_uri() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let stored = |id: &str, callback_path: &str, callback_url: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "authorization_endpoint": "https://github.com/login/oauth/authorize",
+                "token_endpoint": "https://github.com/login/oauth/access_token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "callback_path": callback_path, "callback_url": callback_url,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        for provider in [
+            stored("cb", "/cb/cb", "https://gateway.example/cb/cb"),
+            stored("confirm", "/cb/confirm", "https://gateway.example/cb/cb/confirm"),
+            stored("free", "/cb/free", "https://gateway.example/cb/free"),
+        ] {
+            fixture
+                .state
+                .store
+                .create(provider)
+                .await
+                .unwrap();
+        }
+        let (status, body) = fixture
+            .update("cb", json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+        assert!(
+            fixture
+                .stored("cb")
+                .await
+                .consent_confirmation
+                .is_none()
+        );
+        let (status, body) = fixture
+            .update("free", json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_provider_without_the_setting_loads_and_saves_unchanged() {
+        let fixture = fixture().await;
+        let stored = json!({
+            "id": "legacy", "name": "GitHub", "provider_id": "github", "provider_type": "oauth2_authorization_code",
+            "authorization_endpoint": "https://github.com/login/oauth/authorize",
+            "token_endpoint": "https://github.com/login/oauth/access_token",
+            "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+            "default_scopes": ["repo"], "callback_path": "/oauth/callback/legacy", "token_refresh_enabled": true,
+            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+        });
+        let provider: CredentialProvider = serde_json::from_value(stored.clone()).unwrap();
+        assert!(
+            provider
+                .consent_confirmation
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&provider).unwrap(), stored);
+        fixture
+            .state
+            .store
+            .create(provider)
+            .await
+            .unwrap();
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .update("legacy", json!({"description": "kept"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let mut saved = serde_json::to_value(fixture.stored("legacy").await).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_at");
+        let mut expected = with(stored, &["description"], json!("kept"));
+        expected
+            .as_object_mut()
+            .unwrap()
+            .remove("updated_at");
+        assert_eq!(saved, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn creating_a_provider_with_an_issuer_and_the_setting_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let mut body = serde_json::to_value(super::super::external::tests::external_provider()).unwrap();
+        for field in ["id", "tenant_id", "created_at", "updated_at"] {
+            body.as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        body["consent_confirmation"] =
+            with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET"));
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_replacing_the_setting_is_checked_against_every_rule() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let entra_sub = fixture
+            .strategy(None, ENTRA, None)
+            .await;
+        let entra_oid = fixture
+            .strategy(None, ENTRA, Some("oid"))
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&strategy)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let original = fixture
+            .stored(&id)
+            .await
+            .consent_confirmation;
+        let refused = [
+            (
+                with(confirmation(&strategy), &["token_endpoint"], json!("https://127.0.0.1/token")),
+                "consent_confirmation.token_endpoint",
+            ),
+            (
+                with(
+                    confirmation(&strategy),
+                    &["authorization_endpoint"],
+                    json!("https://accounts.google.com/auth?x=1"),
+                ),
+                "consent_confirmation.authorization_endpoint",
+            ),
+            (
+                with(confirmation(&strategy), &["client_secret_secret_ref"], json!("MISSING")),
+                "Secret reference is not accessible",
+            ),
+            (confirmation(&entra_sub), "consent_confirmation cannot name an Entra caller by sub"),
+            (
+                with(confirmation(&strategy), &["id_token_principal_claim"], json!("iss")),
+                "consent_confirmation.id_token_principal_claim",
+            ),
+            (with(confirmation(&strategy), &["client_id"], json!("")), "consent_confirmation needs client_id"),
+        ];
+        for (setting, error) in refused {
+            let (status, body) = fixture
+                .update(&id, json!({"consent_confirmation": setting}))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{error}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(error),
+                "{error}: {body}"
+            );
+            assert_eq!(
+                fixture
+                    .stored(&id)
+                    .await
+                    .consent_confirmation,
+                original
+            );
+        }
+
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&entra_oid)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&entra_oid)}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .jwt_verification_strategy_id,
+            entra_oid
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_of_a_tenant_provider_refuses_a_login_secret_outside_its_tenant() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let mut body = github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")));
+        body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+        body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (status, body) = fixture
+            .update(&id, json!({"consent_confirmation": confirmation(&strategy)}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "Secret reference is not accessible");
+        assert_eq!(
+            fixture
+                .stored(&id)
+                .await
+                .consent_confirmation
+                .unwrap()
+                .client_secret_secret_ref,
+            "A_LOGIN_SECRET"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moving_a_redirect_uri_onto_a_confirming_providers_confirmation_uri_is_refused() {
+        let fixture = fixture().await;
+        let strategy = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let stored = |id: &str, callback_path: &str, callback_url: &str| -> CredentialProvider {
+            serde_json::from_value(json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "authorization_endpoint": "https://github.com/login/oauth/authorize",
+                "token_endpoint": "https://github.com/login/oauth/access_token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "callback_path": callback_path, "callback_url": callback_url,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let mut confirming = stored("cb", "/cb/cb", "https://203.0.113.20/cb/cb");
+        confirming.consent_confirmation = Some(serde_json::from_value(confirmation(&strategy)).unwrap());
+        for provider in [confirming, stored("mover", "/cb/confirm", "https://203.0.113.21/cb/confirm")] {
+            fixture
+                .state
+                .store
+                .create(provider)
+                .await
+                .unwrap();
+        }
+        let (status, body) = fixture
+            .update("mover", json!({"callback_url": "https://203.0.113.20/cb/cb/confirm"}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "callback_url is already the redirect URI of another credential provider");
+        assert_eq!(
+            fixture
+                .stored("mover")
+                .await
+                .callback_url
+                .as_deref(),
+            Some("https://203.0.113.21/cb/confirm")
+        );
+        let (status, body) = fixture
+            .update("mover", json!({"callback_url": "https://203.0.113.22/cb/confirm"}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 }

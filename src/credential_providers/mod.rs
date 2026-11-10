@@ -285,6 +285,33 @@ impl TokenEndpointAuthMethod {
     }
 }
 
+/// The gateway's login client at the callers' identity provider, with which a
+/// legacy consent provider confirms the person at the consent start before
+/// sending them to the vendor. The ID token it gets is verified by
+/// `jwt_verification_strategy_id`, and names the caller by
+/// `id_token_principal_claim`, or by that strategy's principal claim when unset.
+///
+/// The caller's vault key hashes a principal value under the strategy's own
+/// principal claim name, and its confirmation is recomputed under that same
+/// name: `id_token_principal_claim` only chooses which ID-token claim supplies
+/// the value, never the name the value is hashed under.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsentConfirmation {
+    /// The login client's id, a plain value: a client id is not a secret.
+    pub client_id: String,
+    /// Secret ID for the login client's secret.
+    pub client_secret_secret_ref: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub jwt_verification_strategy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token_principal_claim: Option<String>,
+}
+
+/// The path the identity provider redirects back to after a consent
+/// confirmation sign-in, appended to the provider's redirect URI.
+pub const CONSENT_CONFIRMATION_PATH: &str = "/confirm";
+
 /// A configured OAuth 2.0 credential provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialProvider {
@@ -434,6 +461,11 @@ pub struct CredentialProvider {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub send_resource: bool,
 
+    /// Confirms the person at their identity provider before the vendor. An
+    /// authorization code provider without an `issuer` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consent_confirmation: Option<ConsentConfirmation>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -453,12 +485,24 @@ impl StorableEntity for CredentialProvider {
 }
 
 impl CredentialProvider {
-    /// The secret ids this provider reads: client, API key, signing key and certificate.
+    /// The secret ids this provider reads: client, API key, signing key, certificate and
+    /// consent confirmation client secret.
     pub fn secret_refs(&self) -> Vec<&str> {
         self.secret_ref_fields()
             .into_iter()
+            .chain([self.consent_confirmation_secret_ref()])
             .flatten()
             .collect()
+    }
+
+    fn consent_confirmation_secret_ref(&self) -> Option<&str> {
+        self.consent_confirmation
+            .as_ref()
+            .map(|confirmation| {
+                confirmation
+                    .client_secret_secret_ref
+                    .as_str()
+            })
     }
 
     /// The secret ids a service token of this provider's type reads: the API key; the client
@@ -510,7 +554,8 @@ impl CredentialProvider {
     /// Each secret reference, paired with whether `previous` held it in the same field while
     /// this provider keeps the type and sends it to the same place: the token and
     /// authorization endpoints, resource, additional parameters, default scopes, JWT issuer,
-    /// subject and audience, and client authentication.
+    /// subject and audience, and client authentication. The consent confirmation client
+    /// secret is never kept.
     fn secret_refs_kept_from(
         &self,
         previous: Option<&Self>,
@@ -539,6 +584,10 @@ impl CredentialProvider {
             .into_iter()
             .zip(stored)
             .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
+            .chain(
+                self.consent_confirmation_secret_ref()
+                    .map(|reference| (reference, false)),
+            )
             .collect()
     }
 
@@ -642,6 +691,45 @@ impl CredentialProvider {
         self.callback_url
             .clone()
             .unwrap_or_else(|| format!("{gateway_base_url}{}", self.callback_path))
+    }
+
+    /// The redirect URI of the consent confirmation sign-in: the redirect URI
+    /// followed by [`CONSENT_CONFIRMATION_PATH`].
+    pub fn consent_confirmation_redirect_uri(
+        &self,
+        gateway_base_url: &str,
+    ) -> String {
+        format!("{}{CONSENT_CONFIRMATION_PATH}", self.redirect_uri(gateway_base_url))
+    }
+
+    /// The redirect URIs this provider's consent flow answers on: its redirect
+    /// URI, and its confirmation redirect URI while it has
+    /// `consent_confirmation`.
+    fn consent_redirect_uris(
+        &self,
+        gateway_base_url: &str,
+    ) -> Vec<url::Url> {
+        let confirmation = self
+            .consent_confirmation
+            .is_some()
+            .then(|| self.consent_confirmation_redirect_uri(gateway_base_url));
+        [Some(self.redirect_uri(gateway_base_url)), confirmation]
+            .into_iter()
+            .flatten()
+            .filter_map(|uri| url::Url::parse(&uri).ok())
+            .collect()
+    }
+
+    /// Whether this provider and `other` answer on a redirect URI in common.
+    fn shares_redirect_uri_with(
+        &self,
+        other: &Self,
+        gateway_base_url: &str,
+    ) -> bool {
+        let others = other.consent_redirect_uris(gateway_base_url);
+        self.consent_redirect_uris(gateway_base_url)
+            .iter()
+            .any(|uri| others.contains(uri))
     }
 
     /// The redirect URI parsed, when it is one the consent flow may use: an
@@ -763,17 +851,15 @@ const RESERVED_AUTHORIZATION_PARAMS: [&str; 7] =
 /// How many parameters the endpoint's query and `additional_params` may hold together.
 const MAX_AUTHORIZATION_PARAMS: usize = 32;
 
-/// Another consent-flow provider, of any tenant, whose redirect URI is
-/// `provider`'s. Each redirect URI names one provider, so the vendor's
-/// redirect identifies it.
+/// Another consent-flow provider, of any tenant, that answers on one of
+/// `provider`'s redirect URIs: its redirect URI, or the confirmation redirect
+/// URI of a provider with `consent_confirmation`. Each redirect URI names one
+/// provider, so the redirect identifies it.
 pub async fn redirect_uri_taken_by(
     store: &dyn storage::CredentialProviderStorage,
     provider: &CredentialProvider,
     gateway_base_url: &str,
 ) -> anyhow::Result<Option<CredentialProvider>> {
-    let Ok(own) = url::Url::parse(&provider.redirect_uri(gateway_base_url)) else {
-        return Ok(None);
-    };
     Ok(store
         .list()
         .await?
@@ -781,7 +867,7 @@ pub async fn redirect_uri_taken_by(
         .find(|other| {
             other.id != provider.id
                 && other.uses_legacy_consent()
-                && url::Url::parse(&other.redirect_uri(gateway_base_url)).is_ok_and(|url| url == own)
+                && provider.shares_redirect_uri_with(other, gateway_base_url)
         }))
 }
 
@@ -792,22 +878,19 @@ pub fn log_redirect_uri_conflicts<'provider>(
     providers: &'provider [CredentialProvider],
     gateway_base_url: &str,
 ) -> Vec<(&'provider str, &'provider str)> {
-    let redirect_uris: Vec<_> = providers
+    let consent_providers: Vec<_> = providers
         .iter()
         .filter(|provider| provider.uses_legacy_consent())
-        .filter_map(|provider| {
-            url::Url::parse(&provider.redirect_uri(gateway_base_url))
-                .ok()
-                .map(|url| (provider.id.as_str(), url))
-        })
         .collect();
     let mut conflicts = Vec::new();
-    for (index, (id, url)) in redirect_uris
+    for (index, &provider) in consent_providers
         .iter()
         .enumerate()
     {
-        for (other_id, other_url) in &redirect_uris[index + 1..] {
-            if url == other_url {
+        let id = provider.id.as_str();
+        for &other in &consent_providers[index + 1..] {
+            let other_id = other.id.as_str();
+            if provider.shares_redirect_uri_with(other, gateway_base_url) {
                 tracing::error!(
                     target: "credential_delegation",
                     provider_id = %id,
@@ -815,7 +898,7 @@ pub fn log_redirect_uri_conflicts<'provider>(
                     "Two credential providers share a redirect URI, so consent for both is refused; give one a \
                      callback_url on a distinct host, or recreate it, which gives it a callback path of its own"
                 );
-                conflicts.push((*id, *other_id));
+                conflicts.push((id, other_id));
             }
         }
     }
@@ -908,6 +991,8 @@ pub struct CreateCredentialProviderRequest {
     pub send_resource: bool,
     #[serde(default)]
     pub authorization_response_issuer: Option<String>,
+    #[serde(default)]
+    pub consent_confirmation: Option<ConsentConfirmation>,
 }
 
 /// Request to update an existing credential provider
@@ -972,6 +1057,18 @@ pub struct UpdateCredentialProviderRequest {
     /// A blank value clears the stored one.
     #[serde(default)]
     pub authorization_response_issuer: Option<String>,
+    /// Absent keeps the stored setting, `null` clears it, and a value replaces it.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    pub consent_confirmation: Option<Option<ConsentConfirmation>>,
+}
+
+/// A field that is present in a request, `null` included.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Request to check a provider before it is saved: the token endpoint's reachability and,
@@ -1107,6 +1204,101 @@ mod tests {
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
         .unwrap()
+    }
+
+    fn confirming(mut provider: CredentialProvider) -> CredentialProvider {
+        provider.consent_confirmation = Some(ConsentConfirmation {
+            client_id: "login-client".into(),
+            client_secret_secret_ref: "LOGIN_SECRET".into(),
+            authorization_endpoint: "https://idp.example/authorize".into(),
+            token_endpoint: "https://idp.example/token".into(),
+            jwt_verification_strategy_id: "strategy".into(),
+            id_token_principal_claim: None,
+        });
+        provider
+    }
+
+    /// A provider with `consent_confirmation` also answers on its redirect URI
+    /// followed by `/confirm`, so another provider whose redirect URI is that
+    /// one shares a redirect URI with it, whichever of the two is checked. A
+    /// provider without the setting reserves no such URI.
+    #[tokio::test]
+    async fn a_confirmation_redirect_uri_is_taken_like_a_redirect_uri() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = storage::FileSystemCredentialProviderStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let confirming_one =
+            confirming(consent_provider("a", "a", Some("https://gw.example/v1/identity/oauth/callback/a")));
+        let at_its_confirmation_uri =
+            consent_provider("b", "confirm", Some("https://gw.example/v1/identity/oauth/callback/a/confirm"));
+        use storage::CredentialProviderStorage as _;
+        store
+            .create(confirming_one.clone())
+            .await
+            .unwrap();
+        store
+            .create(at_its_confirmation_uri.clone())
+            .await
+            .unwrap();
+
+        let taken = |provider: CredentialProvider| {
+            let store = &store;
+            async move {
+                redirect_uri_taken_by(store, &provider, "https://gw.example")
+                    .await
+                    .unwrap()
+                    .map(|other| other.id)
+            }
+        };
+        assert_eq!(
+            taken(confirming_one.clone())
+                .await
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            taken(at_its_confirmation_uri.clone())
+                .await
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            log_redirect_uri_conflicts(
+                &[confirming_one.clone(), at_its_confirmation_uri.clone()],
+                "https://gw.example"
+            ),
+            [("a", "b")]
+        );
+
+        let mut not_confirming = confirming_one;
+        not_confirming.consent_confirmation = None;
+        store
+            .update(not_confirming.clone())
+            .await
+            .unwrap();
+        assert_eq!(taken(not_confirming.clone()).await, None);
+        assert_eq!(taken(at_its_confirmation_uri.clone()).await, None);
+        assert!(
+            log_redirect_uri_conflicts(&[not_confirming, at_its_confirmation_uri], "https://gw.example").is_empty()
+        );
+    }
+
+    #[test]
+    fn an_update_request_tells_an_absent_consent_confirmation_from_null() {
+        let parse = |body: &str| {
+            serde_json::from_str::<UpdateCredentialProviderRequest>(body)
+                .unwrap()
+                .consent_confirmation
+        };
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"consent_confirmation": null}"#), Some(None));
+        let absent: UpdateCredentialProviderRequest = serde_json::from_str("{}").unwrap();
+        let round_trip = serde_json::to_string(&absent).unwrap();
+        assert_eq!(parse(&round_trip), None, "an absent setting stays absent: {round_trip}");
+        let cleared: UpdateCredentialProviderRequest =
+            serde_json::from_str(r#"{"consent_confirmation": null}"#).unwrap();
+        assert_eq!(parse(&serde_json::to_string(&cleared).unwrap()), Some(None));
     }
 
     /// Each pair of consent providers sharing a redirect URI is logged once as
@@ -1457,6 +1649,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: Some("Test provider".to_string()),
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
@@ -1589,6 +1782,7 @@ mod tests {
             api_key_secret_ref: Some("MY_API_KEY".to_string()),
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: now,
             updated_at: now,
             callback_url: None,
