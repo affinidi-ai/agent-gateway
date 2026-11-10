@@ -13,6 +13,7 @@ pub mod audit;
 pub mod connect_api;
 pub mod connects;
 pub mod consent_cookie;
+pub(crate) mod consent_id_token;
 pub mod grants;
 pub mod handlers;
 pub mod jwt_assertion;
