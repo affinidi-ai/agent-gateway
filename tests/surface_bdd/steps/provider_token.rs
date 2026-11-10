@@ -525,8 +525,12 @@ async fn latest_token_request_carries_basic_credentials(
     secret: String,
 ) {
     use base64::Engine;
-    let expected =
-        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}")));
+    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
+    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(&client_id), encode(&secret)))
+    );
     let authorization = latest_token_request_authorization(world).await;
     assert!(
         authorization.as_deref() == Some(expected.as_str()),
