@@ -505,6 +505,23 @@ fn write_single_surface_config_inner(
             .agent_surfaces
             .insert(surface_id.clone(), other);
     }
+    for stored in &surface_config.stored_surfaces_on_routes {
+        let mut surface = AgentSurfaceFixture::new(
+            &stored.id,
+            &stored.id,
+            "A surface stored before the gateway checked routes",
+            format!("http://localhost:{gateway_port}"),
+            stored.route.clone(),
+            surface_config
+                .protocol
+                .clone(),
+            effective_target_url.clone(),
+        );
+        surface.status = stored.status.clone();
+        config_tree
+            .agent_surfaces
+            .insert(stored.id.clone(), surface);
+    }
     for key in surface_config
         .stored_api_keys
         .iter()
