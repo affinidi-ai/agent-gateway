@@ -56,6 +56,47 @@ pub fn spawn_background_task<F>(
     }
 }
 
+/// A part of the background task limit that one kind of task cannot exceed, so a burst of it
+/// leaves the rest of the limit to every other task.
+pub struct TaskShare {
+    name: &'static str,
+    semaphore: Semaphore,
+}
+
+impl TaskShare {
+    pub fn new(
+        name: &'static str,
+        max_tasks: usize,
+    ) -> Self {
+        Self {
+            name,
+            semaphore: Semaphore::new(max_tasks),
+        }
+    }
+}
+
+/// Like [`spawn_background_task`], but the task also needs a permit of `share`: when the share
+/// or the whole limit is full, the task is skipped with a warning.
+pub fn spawn_background_task_in<F>(
+    share: &'static TaskShare,
+    name: &str,
+    future: F,
+) where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Ok(share_permit) = share
+        .semaphore
+        .try_acquire()
+    else {
+        warn!("Background task share '{}' at capacity, skipping task: {}", share.name, name);
+        return;
+    };
+    spawn_background_task(name, async move {
+        let _share_permit = share_permit;
+        future.await;
+    });
+}
+
 /// Execute a critical background task with concurrency control
 ///
 /// Waits for a permit if at capacity (blocking). Use for important tasks
@@ -72,4 +113,58 @@ pub fn spawn_critical_background_task<F>(
         future.await;
         drop(permit);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{Notify, mpsc};
+
+    static SHARE: Lazy<TaskShare> = Lazy::new(|| TaskShare::new("test share", 1));
+
+    #[tokio::test]
+    async fn a_full_share_skips_a_task_until_its_running_task_ends() {
+        let release = Arc::new(Notify::new());
+        let (ran, mut runs) = mpsc::unbounded_channel::<&'static str>();
+        spawn_background_task_in(&SHARE, "first", {
+            let release = release.clone();
+            let ran = ran.clone();
+            async move {
+                release.notified().await;
+                ran.send("first").expect("receiver");
+            }
+        });
+        spawn_background_task_in(&SHARE, "second", {
+            let ran = ran.clone();
+            async move {
+                ran.send("second").expect("receiver");
+            }
+        });
+
+        release.notify_one();
+        let first = tokio::time::timeout(Duration::from_secs(5), runs.recv())
+            .await
+            .expect("a task runs");
+        assert_eq!(first, Some("first"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while SHARE
+                .semaphore
+                .available_permits()
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first task gives its permit back");
+        spawn_background_task_in(&SHARE, "third", async move {
+            ran.send("third").expect("receiver");
+        });
+        let next = tokio::time::timeout(Duration::from_secs(5), runs.recv())
+            .await
+            .expect("a task runs");
+        assert_eq!(next, Some("third"));
+    }
 }
