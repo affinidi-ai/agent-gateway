@@ -43,7 +43,7 @@ export const SurfaceLinkButton: React.FC<SurfaceLinkButtonProps> = ({
         e.stopPropagation();
         onOpen(surface.id);
       }}
-      className="btn btn-link p-0 align-baseline text-primary"
+      className="btn btn-link p-0 align-baseline text-primary text-start"
       style={style}
       data-testid={testId}
     >
