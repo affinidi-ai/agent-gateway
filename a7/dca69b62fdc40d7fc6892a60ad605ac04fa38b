@@ -1,0 +1,21 @@
+.github/workflows/docker.yml
+  s_09d9fb08a24a2a::t_10a6cb3727245b 31,33,77-113
+docs/development/RELEASING.md
+  s_09d9fb08a24a2a::t_6ff5090fe21c62 126-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a7dca69b62fdc40d7fc6892a60ad605ac04fa38b",
+  "prompts": {},
+  "sessions": {
+    "s_09d9fb08a24a2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "466dd48f-7a3f-4943-8fe5-70b23f70855c",
+        "model": "claude-sonnet-5-5"
+      },
+      "human_author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
