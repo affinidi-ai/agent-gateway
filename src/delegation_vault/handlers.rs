@@ -534,7 +534,9 @@ struct StartRefused {
 }
 
 /// Decodes the start state `params` carry and resolves its provider, whose
-/// redirect URI must follow the consent rules and be no other provider's.
+/// redirect URI must follow the consent rules and be no other provider's. A
+/// [`ConsentStage::ConfirmStart`](super::ConsentStage::ConfirmStart) state is
+/// refused: the start page sends only to the vendor.
 async fn resolve_consent_start(
     state: &DelegationVaultState,
     path_segment: &str,
@@ -544,6 +546,7 @@ async fn resolve_consent_start(
         .and_then(|params| {
             oauth::decode_start_state(&params.state)
                 .ok()
+                .filter(|start| start.stage.is_none())
                 .map(|start| (params.state, start))
         })
         .ok_or(StartRefused {

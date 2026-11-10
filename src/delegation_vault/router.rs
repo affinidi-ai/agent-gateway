@@ -729,6 +729,48 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// A start state that confirms the caller at their identity provider never
+    /// goes to the vendor from the start page, and a confirmation state is no
+    /// vendor callback state.
+    #[tokio::test]
+    async fn confirmation_stage_states_never_reach_the_vendor() {
+        use crate::delegation_vault::ConsentStage;
+        use crate::delegation_vault::oauth::{decode_callback_state, decode_start_state, encode_oauth_state};
+        let fixture = consent::Fixture::new().await;
+        let start = decode_start_state(&consent::start_state(&fixture.start_url())).unwrap();
+        let confirm_start = encode_oauth_state(&crate::delegation_vault::OAuthState {
+            stage: Some(ConsentStage::ConfirmStart),
+            ..start
+        })
+        .unwrap();
+        let (callback_state, cookie) = fixture.begin().await;
+        let confirmation = encode_oauth_state(&crate::delegation_vault::OAuthState {
+            stage: Some(ConsentStage::Confirmation),
+            ..decode_callback_state(&callback_state).unwrap()
+        })
+        .unwrap();
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .get(&format!("/v1/identity/oauth/callback/github/start?state={confirm_start}"), &[])
+                    .await,
+                fixture
+                    .start_post(&confirm_start, &[("origin", "https://198.51.100.7")])
+                    .await,
+                fixture
+                    .callback("github", &format!("code=c&state={confirmation}"), Some(&cookie))
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+        }
+        assert!(events.is_empty(), "a state of another stage is not audited: {events:?}");
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// The callback's path must name the state's provider, and the provider the
     /// state names must still have its id and slug and no `issuer`.
     #[tokio::test]

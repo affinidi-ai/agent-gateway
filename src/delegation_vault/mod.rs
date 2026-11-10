@@ -187,6 +187,28 @@ pub struct OAuthState {
     /// start POST. A start state has none; a callback state must have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_binding: Option<String>,
+    /// The consent stage, sealed only on a state that confirms the caller at
+    /// their identity provider. A state without one is a legacy start or
+    /// vendor callback state, told apart by its fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ConsentStage>,
+}
+
+/// The step of a consent flow a sealed [`OAuthState`] is good for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentStage {
+    /// The consent start page and its POST.
+    Start,
+    /// The consent start page and its POST, for a caller confirmed at their
+    /// identity provider before the vendor.
+    #[allow(dead_code)]
+    ConfirmStart,
+    /// The identity provider's redirect back to the gateway.
+    #[allow(dead_code)]
+    Confirmation,
+    /// The vendor's redirect back to the gateway.
+    Vendor,
 }
 
 impl std::fmt::Debug for OAuthState {
@@ -217,6 +239,7 @@ impl std::fmt::Debug for OAuthState {
                     .as_ref()
                     .map(|_| loggable::REDACTED),
             )
+            .field("stage", &self.stage)
             .finish()
     }
 }
@@ -391,6 +414,7 @@ mod tests {
                 code_verifier: Some("pkce-code-verifier".to_string()),
                 scopes: vec!["repo".to_string()],
                 browser_binding: Some("browser-binding-hash".to_string()),
+                stage: None,
             }
         );
         assert!(state.contains(r#"surface_id: "surface-1""#), "{state}");
@@ -498,11 +522,21 @@ mod tests {
             code_verifier: None,
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
         let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("stage"), "a legacy state serializes as before: {json}");
         let deserialized: OAuthState = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.agent_did, "did:web:agent.example.com");
         assert_eq!(deserialized.nonce, "nonce-123");
+        assert_eq!(deserialized.stage, None);
+
+        let staged = serde_json::to_value(OAuthState {
+            stage: Some(ConsentStage::ConfirmStart),
+            ..state
+        })
+        .unwrap();
+        assert_eq!(staged["stage"], "confirm_start");
     }
 
     #[test]
