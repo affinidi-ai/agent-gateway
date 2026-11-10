@@ -16,7 +16,7 @@ use tracing::{error, warn};
 use super::render::render;
 use super::retry::{is_transient_publish_error, retry_delays};
 use super::values::event_values;
-use crate::integrations::background_tasks::spawn_background_task;
+use crate::integrations::background_tasks::{TaskShare, spawn_background_task, spawn_background_task_in};
 use crate::integrations::definitions::endpoint::resolve_secret_references;
 use crate::integrations::definitions::{DefinitionStores, Endpoint, EventSet, Integration, Status, definition_stores};
 use crate::integrations::events::{IntegrationEvent, find_event};
@@ -307,6 +307,37 @@ pub fn dispatch(
     event_id: &str,
     trigger: HashMap<String, String>,
 ) {
+    dispatch_in(None, event_id, trigger);
+}
+
+/// Like [`dispatch`], but the event's background tasks, its routing and each of its deliveries,
+/// hold a permit of `share`, so a burst of the event cannot take the task limit from others.
+pub fn dispatch_within(
+    share: &'static TaskShare,
+    event_id: &str,
+    trigger: HashMap<String, String>,
+) {
+    dispatch_in(Some(share), event_id, trigger);
+}
+
+fn spawn_task<F>(
+    share: Option<&'static TaskShare>,
+    name: &str,
+    task: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match share {
+        Some(share) => spawn_background_task_in(share, name, task),
+        None => spawn_background_task(name, task),
+    }
+}
+
+fn dispatch_in(
+    share: Option<&'static TaskShare>,
+    event_id: &str,
+    trigger: HashMap<String, String>,
+) {
     let Some(event) = dispatched_event(event_id) else {
         warn!(event_id, "Not dispatching an event outside the integration catalog");
         return;
@@ -314,7 +345,7 @@ pub fn dispatch(
     let values = Arc::new(event_values(event, trigger, crate::storage::settings_store::global_appliance_id_override()));
     #[cfg(test)]
     dispatched::record(&event.id, &values);
-    spawn_background_task(event_id, async move {
+    spawn_task(share, event_id, async move {
         let routes = match current_routes().await {
             Ok(routes) => routes,
             Err(error) => {
@@ -322,7 +353,7 @@ pub fn dispatch(
                 return;
             }
         };
-        deliver_each(&event.id, routes.for_event(&event.id), values, |route, values| async move {
+        deliver_each(share, &event.id, routes.for_event(&event.id), values, |route, values| async move {
             deliver(&route, &values).await
         });
     });
@@ -370,6 +401,7 @@ pub mod dispatched {
 /// Delivers each route in a background task of its own, so a slow or failing endpoint never
 /// holds up the other integrations of the event, and the task limit counts deliveries.
 fn deliver_each<D, F>(
+    share: Option<&'static TaskShare>,
     event_id: &str,
     routes: Vec<Route>,
     values: Arc<HashMap<String, String>>,
@@ -382,7 +414,7 @@ fn deliver_each<D, F>(
         let event_id = event_id.to_string();
         let integration_id = route.integration.id.clone();
         let delivery = deliver(route, values.clone());
-        spawn_background_task(&format!("{event_id} to {integration_id}"), async move {
+        spawn_task(share, &format!("{event_id} to {integration_id}"), async move {
             if let Err(error) = delivery.await {
                 error!(
                     event_id = %event_id,
@@ -742,7 +774,7 @@ mod tests {
         let release = Arc::new(tokio::sync::Notify::new());
         let (delivered, mut deliveries) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-        deliver_each("gateway.created", routes, Arc::new(HashMap::new()), {
+        deliver_each(None, "gateway.created", routes, Arc::new(HashMap::new()), {
             let release = release.clone();
             move |route: Route, _values| {
                 let release = release.clone();
@@ -775,6 +807,48 @@ mod tests {
             .await
             .expect("the slow route still completes");
         assert_eq!(second.as_deref(), Some("slow"));
+    }
+
+    #[tokio::test]
+    async fn a_delivery_beyond_the_events_share_is_not_made() {
+        static SHARE: Lazy<TaskShare> = Lazy::new(|| TaskShare::new("one delivery", 1));
+        let endpoint = Endpoint::new("Ops".to_string(), String::new(), EndpointType::Stream, json!({}));
+        let gateways = set(&["gateway.created"]);
+        let routes: Vec<Route> = ["slow", "beyond the share"]
+            .iter()
+            .map(|name| Route {
+                integration: integration_for(name, &endpoint, &gateways),
+                endpoint: endpoint.clone(),
+            })
+            .collect();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (delivered, mut deliveries) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _open = delivered.clone();
+
+        deliver_each(Some(&SHARE), "gateway.created", routes, Arc::new(HashMap::new()), {
+            let release = release.clone();
+            move |route: Route, _values| {
+                let release = release.clone();
+                let delivered = delivered.clone();
+                async move {
+                    if route.integration.name == "slow" {
+                        release.notified().await;
+                    }
+                    delivered
+                        .send(route.integration.name)
+                        .expect("receiver");
+                    Ok(())
+                }
+            }
+        });
+        release.notify_one();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), deliveries.recv())
+            .await
+            .expect("the delivery within the share is made");
+        assert_eq!(first.as_deref(), Some("slow"));
+        let more = tokio::time::timeout(Duration::from_millis(200), deliveries.recv()).await;
+        assert!(more.is_err(), "a delivery beyond the share ran: {more:?}");
     }
 
     #[test]
