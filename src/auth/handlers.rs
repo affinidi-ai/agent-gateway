@@ -740,11 +740,7 @@ mod tests {
         {
             let status = fail_passkey_sign_in(&state, username).await;
 
-            assert_eq!(
-                status,
-                axum::http::StatusCode::UNAUTHORIZED,
-                "passkey sign-in should be unauthorized"
-            );
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "passkey sign-in should be unauthorized");
             let raised = dispatched::values_of("user.login_failed", "USER_ID", user_id);
             assert_eq!(raised.len(), 1, "{raised:?}");
             assert_eq!(raised[0]["FAILURE_REASON"], reason);
