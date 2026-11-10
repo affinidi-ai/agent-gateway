@@ -105,6 +105,36 @@ Point, identifies callers by the same claim.
   strategy's claim in the same way. The gateway's own tokens, such as the MCP resource tokens and
   ID-JAGs it issues, name their subject by `sub`.
 
+### Tenant check of STS tokens
+
+A JWT verification strategy can trust the tokens this gateway's [STS](STS.md) issues, under the
+gateway DID or the MCP issuer. Every access token and ID-JAG the STS issues names the managed
+connection it was minted for by its record id in `connection_id`, which never changes, unlike the
+`client_id` an administrator can rename or reuse after a delete. After a token of either issuer
+passes the strategy's signature, issuer, lifetime and audience checks, JWT bearer authentication
+looks that connection up and accepts the token only when:
+
+- the connection has no tenant (appliance-global), or
+- the connection's tenant owns the surface, or the surface is global.
+
+A token minted for a connection of another tenant, or naming a connection that no longer exists
+or no connection at all, is an invalid credential like a token for another audience: on an Access
+Point its `on_failure`, `public` setting and policy decide the answer, and a Transit Point
+refuses it with `401`. That includes a token the STS minted before it named the connection in
+`connection_id`, and any other JWT signed under the gateway DID without one, such as an AP2
+presentation. The caller is not told that another tenant owns the
+surface. The gateway log records the token's `connection_id`, `client_id` and `jti` and the surface's tenant, and
+for a cross-tenant token the connection's tenant too. The check applies on every JWT Bearer
+method of an Access Point or Transit Point, on the surface and its variants, to direct and Fabric
+callers, whatever the method's audiences. While the managed connections cannot be read, including
+when their store failed to open at startup, a token of either issuer fails as an internal error.
+Tokens of any other issuer are not checked.
+
+The MCP Resource Server ([`mcp_http.authorization`](MCP_METADATA.md)) runs the same check on the
+resource tokens it verifies, on a surface's Access Point and Transit Points, over Fabric, and on an
+MCP Proxy against the proxy's tenant. A refused token gets the `invalid_token` challenge, and a token
+whose connections cannot be read the `503` one.
+
 ### Several methods on one Access Point
 
 `methods` is a list, so one surface can accept callers with different credentials, for
