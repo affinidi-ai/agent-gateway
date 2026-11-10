@@ -494,7 +494,7 @@ pub async fn login_finish(
     .finalize_session(AuthenticatedPrincipal::new(username.clone(), user.user_id.clone()))
     .await?;
 
-    crate::integrations::trigger_user_login(&user);
+    crate::integrations::trigger_user_login(&user, crate::integrations::LoginMethod::Passkey);
     let notif_store_guard = auth_state
         .notification_store
         .read()

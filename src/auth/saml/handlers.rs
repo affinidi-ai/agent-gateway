@@ -337,7 +337,9 @@ pub async fn saml_acs(
         match event {
             SignInEvent::Created(user) => crate::integrations::trigger_user_created(user),
             SignInEvent::Updated { old, new } => crate::integrations::trigger_user_updated(old, new),
-            SignInEvent::Login(user) => crate::integrations::trigger_user_login(user),
+            SignInEvent::Login(user) => {
+                crate::integrations::trigger_user_login(user, crate::integrations::LoginMethod::Saml)
+            }
         }
     }
 
