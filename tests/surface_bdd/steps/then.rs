@@ -323,13 +323,19 @@ fn served_card_url(world: &mut SurfaceWorld) -> String {
 #[then("the agent card points callers at the surface Access Point")]
 fn agent_card_points_callers_at_the_access_point(world: &mut SurfaceWorld) {
     let url = served_card_url(world);
+    let gateway_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .gateway_port;
     let route = world
         .surface_config
         .route
         .trim_end_matches('/');
-    assert!(
-        url.starts_with("http") && url.ends_with(route),
-        "agent card url should be the Access Point at route '{route}', got {url}"
+    assert_eq!(
+        url,
+        format!("http://localhost:{gateway_port}{route}"),
+        "agent card url should be the Access Point at route '{route}'"
     );
 }
 

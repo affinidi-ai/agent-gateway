@@ -6724,16 +6724,14 @@ async fn step_answer_a_refused_grant(
     Ok(UpstreamResponse::Http(retried))
 }
 
-/// Whether the request reads a public agent card, whose answer
-/// [`step_process_response`] rewrites on a Transit Point of any protocol.
-fn is_public_card_request(ctx: &OutboundPipelineContext) -> bool {
-    crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
-}
-
 /// A compressed agent card cannot be rewritten, so the Target is asked for an
-/// uncompressed one.
+/// uncompressed one. [`step_process_response`] rewrites a public card on a
+/// Transit Point of any protocol.
 fn request_uncompressed_agent_card(ctx: &mut OutboundPipelineContext) {
-    if is_public_card_request(ctx) || is_rest_extended_card_request(ctx) || is_rpc_extended_card_request(ctx) {
+    if crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
+        || is_rest_extended_card_request(ctx)
+        || is_rpc_extended_card_request(ctx)
+    {
         ctx.original_headers
             .insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
