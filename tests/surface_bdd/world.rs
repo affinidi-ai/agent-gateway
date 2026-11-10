@@ -12,7 +12,17 @@ use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::passkey::SoftPasskey;
+use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
+
+/// A passkey sign-in the gateway issued a challenge for.
+#[derive(Debug, Clone)]
+pub struct StartedSignIn {
+    pub username: String,
+    pub challenge_id: String,
+    pub request_options: serde_json::Value,
+}
 
 pub use crate::bdd_support::config::single_surface_fixture::{
     ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
@@ -162,6 +172,14 @@ pub struct SurfaceWorld {
     pub personal_access_token_client: Option<reqwest::Client>,
     /// API keys the scenario created, by scenario name: the owning surface id and the key id.
     pub api_keys: HashMap<String, (String, String)>,
+    /// The Redis stream an integration delivers sign-in events to.
+    pub sign_in_stream: Option<RedisStreamStandIn>,
+    /// The passkeys console users registered in the scenario, by username.
+    pub passkeys: HashMap<String, SoftPasskey>,
+    /// The passkey sign-in started last and not yet finished.
+    pub started_sign_in: Option<StartedSignIn>,
+    /// The event payload a sign-in step last found on the Redis stream.
+    pub sign_in_event: Option<serde_json::Value>,
     pub temp_dir: TempDir,
     pub debug: bool,
     pub runtimes: RuntimeRegistry,
@@ -235,6 +253,10 @@ impl SurfaceWorld {
             surface_draft: None,
             personal_access_token_client: None,
             api_keys: HashMap::new(),
+            sign_in_stream: None,
+            passkeys: HashMap::new(),
+            started_sign_in: None,
+            sign_in_event: None,
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
             runtimes: RuntimeRegistry::default(),

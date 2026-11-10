@@ -11,6 +11,7 @@ pub mod names;
 pub mod policy_changes;
 pub mod provider_token;
 pub mod secret_force_delete_audit;
+pub mod sign_in_events;
 pub mod sts;
 pub mod target_auth_audit;
 pub mod target_auth_save;
