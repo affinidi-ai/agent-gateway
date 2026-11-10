@@ -219,9 +219,11 @@ pub(crate) enum UncheckedCallers {
     /// DID Auth without `allowed_dids` accepts any DID that signs its
     /// challenge, so whoever mints one is a caller.
     SelfNamed,
-    /// A JWT bearer method without `audiences`, on an Access Point that
-    /// publishes no protected resource, accepts a token its issuer minted for
-    /// any other service, so whoever holds one is a caller.
+    /// A JWT bearer method without `audiences`, or one that checks only the
+    /// client a token was issued to (`audience_claim` `azp` or `client_id`),
+    /// on an Access Point that publishes no protected resource, accepts a
+    /// token its issuer minted for any other service, so whoever holds one is
+    /// a caller.
     AnyAudience,
     /// The gateway's own resource access tokens (`mcp_http.authorization`)
     /// name a caller by the subject its sign-in stated, under the gateway's
@@ -249,8 +251,9 @@ impl UncheckedCallers {
             }
             Self::AnyAudience => {
                 "consent_mode external needs callers authenticated by something the gateway can check: the Access \
-                 Point's jwt_bearer has no audiences, so it accepts a token its issuer minted for any other service; \
-                 list the audiences it accepts, or publish caller_authentication.protected_resource"
+                 Point's jwt_bearer has no audiences or checks only the client a token was issued to, so it accepts a \
+                 token its issuer minted for any other service; list the aud values it accepts, or publish \
+                 caller_authentication.protected_resource"
             }
             Self::NamedWithoutTheirIssuer => {
                 "consent_mode external with subject caller needs callers named with the issuer that named them: the \
@@ -995,8 +998,9 @@ impl TargetGrantRoute {
     }
 
     /// Record that `grant` is injected into a request released for
-    /// `released`'s caller: mark it used, and audit it under that caller's
-    /// identity hash, whichever subject the binding has.
+    /// `released`'s caller: mark it used, at most once per use interval and
+    /// on its own task, and audit it under that caller's identity hash,
+    /// whichever subject the binding has.
     async fn injected(
         &self,
         surface: &AgentSurface,
@@ -1004,18 +1008,7 @@ impl TargetGrantRoute {
         released: &ReleasedTargetGrant,
         grant: &DelegatedGrant,
     ) {
-        if let Err(error) = release
-            .vault
-            .mark_grant_used(&grant.id)
-            .await
-        {
-            tracing::debug!(
-                target: "credential_delegation",
-                surface_id = %surface.surface_id,
-                error = %error,
-                "Failed to record a grant's use"
-            );
-        }
+        crate::delegation_vault::release::record_use_in_background(release.vault, grant, None);
         self.audit_injected(surface, &released.principal, released.caller.clone(), grant);
     }
 
@@ -1079,8 +1072,9 @@ impl TargetGrantRoute {
     /// challenge rejects the token (`invalid_token`) gets one refresh,
     /// single-flight, and one retry of `retry`, the request as it was sent,
     /// with the new token, a target checking the token before it acts; a grant
-    /// that cannot be refreshed, or whose refresh token is refused, is removed
-    /// and revoked while it still holds the token refused, and answers
+    /// whose refresh token is refused, or a caller's grant that cannot be
+    /// refreshed, is removed and revoked while it still holds the token
+    /// refused, and an owner's that cannot be refreshed is kept; each answers
     /// `connect_required`. A second `401` refuses this request,
     /// `connector_unavailable`, and keeps the fresh grant. A `401` without
     /// such a challenge, a refresh that fails for a reason a new connect would
@@ -1419,6 +1413,16 @@ mod tests {
                     "{subject:?}, {case}"
                 );
             }
+            let client_bound = authenticating(
+                serde_json::json!([{"type": "jwt_bearer", "jwt_verification_strategy_id": "strategy-1",
+                    "audiences": ["app-1"], "audience_claim": "client_id"}]),
+                None,
+            );
+            assert_eq!(
+                unchecked_callers(&client_bound, subject),
+                Some(UncheckedCallers::AnyAudience),
+                "{subject:?}, a client_id-bound method"
+            );
             let bound = authenticating(serde_json::json!([jwt(serde_json::json!(["https://gateway.example"]))]), None);
             assert_eq!(unchecked_callers(&bound, subject), None, "{subject:?}, an audience");
             let published =

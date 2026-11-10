@@ -8,6 +8,8 @@ interface FilterChipGroupProps {
   onSelect: (value: string) => void;
   multiple?: boolean;
   showBadge?: boolean;
+  /** Whether every count in the group is a lower bound, shown with a trailing `+`. */
+  countsAreLowerBounds?: boolean;
 }
 
 /**
@@ -20,6 +22,7 @@ export const FilterChipGroup: React.FC<FilterChipGroupProps> = ({
   onSelect,
   multiple = false,
   showBadge = true,
+  countsAreLowerBounds = false,
 }) => (
   <div
     style={{
@@ -53,6 +56,7 @@ export const FilterChipGroup: React.FC<FilterChipGroupProps> = ({
           onClick={() => onSelect(chip.value)}
           ariaPressed={multiple ? isSelected : undefined}
           showBadge={showBadge}
+          countIsLowerBound={countsAreLowerBounds}
         />
       );
     })}

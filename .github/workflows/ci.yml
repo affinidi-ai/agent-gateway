@@ -342,11 +342,31 @@ jobs:
           shared-key: rust-dev
 
       # Four scenario setups otherwise race to pull these images on a cold
-      # runner, which can exceed the public registry rate limit.
+      # runner, which can exceed the public registry rate limit. Both registries
+      # throttle anonymous pulls per source address in bursts, and hosted
+      # runners share addresses, so a refused pull is retried with a widening
+      # gap instead of failing the job outright.
       - name: Pull BDD images
         run: |
-          docker pull "public.ecr.aws/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
-          docker pull "valkey/valkey:${VALKEY_VERSION}"
+          pull() {
+            local image="$1"
+            local delay=15
+            local attempt
+            for attempt in 1 2 3 4; do
+              if docker pull "$image"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 4 ]; then
+                echo "::error::giving up on $image after $attempt attempts"
+                return 1
+              fi
+              echo "pull of $image failed, retrying in ${delay}s" >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
+          pull "public.ecr.aws/affinidi/messaging-mediator:${MEDIATOR_VERSION}"
+          pull "valkey/valkey:${VALKEY_VERSION}"
 
       # The harness starts a DIDComm mediator per scenario from the public
       # image in scripts/g2g-mediator.sh, which needs no registry credentials.

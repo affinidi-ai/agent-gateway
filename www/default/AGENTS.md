@@ -403,7 +403,58 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the panel shows the one line "Each caller is identified by the API key it presents."
   (`identity-panel-inbound-api-key-note`);
   `buildPayload` never sends an inbound `api_key_id`. The protected and external Identities keep
-  the picker (`identity-panel-api-key-select`) and need a key. An error-level dependency blocks
+  the picker (`identity-panel-api-key-select`) and need a key. The picker lists only the active
+  keys of the surface being edited (`GET /api-keys/{surface_id}`, from `SurfaceMetaContext`), as
+  the gateway refuses another surface's key; a stored id that is not among them stays selected
+  as a disabled option, so it cannot be picked again once changed, labelled by its status
+  (below), or "<id> (not an active key of this surface)" when that status is not `revoked`,
+  `missing` or `unavailable`. **Unconfigured Identity**: the surface read and save
+  responses carry `api_key_references` (`key_id`, `status` and `blocking`), passed to the panels and the
+  canvas as `apiKeyStatuses` in `SurfaceMetaContext` (`elements/identity/apiKeyStatus.ts`). The
+  gateway sets `blocking` on `revoked` and `missing`, and on `unavailable` (another surface's
+  key) when that key is revoked or while `tenant_credential_isolation` is `enforce`, exactly as
+  the gateway refuses the surface; the dashboard follows `blocking`
+  and does not work it out itself. A
+  protected, external or Transit Point From API Key Identity whose current `api_key_id` is
+  `blocking` gets the canvas's red `unconfigured-ring` (red, dashed
+  and animated by the `.surface-builder-canvas .unconfigured-ring` rule, like every other ring)
+  with "API key revoked", "API key deleted" or "API key of another surface" under its label, and
+  the panel shows the full warning in red under the picker (`identity-api-key-revoked-warning`,
+  `role="alert"`) and
+  labels the stored key "<client id> (revoked)" (the revoked key's name from the surface's key
+  list, or its id when that list does not have it), "<id> (deleted)" or "<id> (belongs to
+  another surface)". The
+  warnings are "The API key this Identity uses was revoked. Select an active API key of this
+  surface.", "… was deleted. Select an active API key of this surface." and "The API key this
+  Identity uses belongs to another surface. Select an active API key of this surface." An
+  `unavailable` key that is not `blocking` (`warn`) keeps the "(belongs to another surface)"
+  label and shows the same text in the warning yellow (`text-warning`, `role="status"`,
+  `identity-api-key-other-surface-notice`), with no ring, no canvas reason and no Save block. An
+  `active` or `unknown` status, a key id not in the
+  list, and the inbound Identity show nothing. The lookup is by key id, so variant canvases use
+  the same list, and picking an active key clears the ring before Save. It blocks Save on the
+  surface page, in the base and every variant, with "Identity: " and the full warning
+  (`firstUnusableApiKeyIdentity` in `computeBlockingReason`), and the toast's "Show me" selects
+  the Identity. It is not part of `configured` or `getIncompleteReason`, since the statuses come
+  from the stored surface, not the node. On the create page (`isCreate`, which already has a
+  client-made `surfaceId`) it fetches nothing and shows "A new surface has no API keys yet. Remove
+  this Identity or choose another type, save the surface, add an API key, then come back and
+  select it." (`identity-panel-api-key-unsaved`); the rule is behind
+  `field-help-identity-api-key`. A protected or external From API Key Identity without a key is
+  incomplete and blocks Save with "Select an API key of this surface. A new surface has no API keys
+  yet: remove this Identity or choose another type, save the surface, add an API key, then come
+  back and select it." (`SELECT_OWN_API_KEY`). A template capture or apply
+  (`scrubVolatileTemplateFields`) drops every `api_key_id` of the identity slots, target identity
+  injection, Transit Point `managed_identity` and `identity_injection`, variant overrides and
+  canvas Identity nodes (top-level and in variant overrides), every `atgk_` Caller Context
+  `secret_id` of the base and the variant overrides, and the read-only `access_point_status`,
+  `api_key_references` and `serving_status`, so the new surface's Identity asks for its own key. A
+  surface write never sends `access_point_status`, `api_key_references` or `serving_status`
+  (`toBackendSurface`). **Refusing requests**: while the surface response's `serving_status`
+  (present only beside `api_key_references`) is `not_serving`, the surface page's top banner shows
+  "This surface is refusing requests" (`surface-refusing-requests`, `alert-warning`,
+  `role="status"`); `serving` and `not_judged` show nothing. The gateway gives no reason, so the
+  notice names none. An error-level dependency blocks
   Save unless every Caller Context method is API Key or API Key Provider, with the gateway's
   own message. `incompleteReason(config, node?)` receives the node so a rule can tell the slots
   apart. Rules only the gateway enforces (an MCP `proxy://` target, `mcp_http.authorization`)
@@ -426,13 +477,21 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   method reads the request body, at most one DID Auth, and, while authorization server discovery
   is on, JWT Bearer only as the first method), shown on each row and on the canvas. Removing the
   primary method also turns discovery off, since discovery belongs to it. With several methods an incomplete one marks the element
-  unconfigured as `Method <n>: <reason>`. Loading a surface always replaces `methods`, so a stale
+  unconfigured as `Method <n>: <reason>`.
+- **JWT Bearer audiences**: Accepted Audiences is required; with none listed, discovery off and
+  Audience Claim `aud`, the method shows `caller-auth-audiences-missing-warning`. Save is not
+  blocked for it, since the gateway keeps a method stored without audiences unchanged and refuses
+  a new or changed one with a message the page shows. **Audience Claim**
+  (`caller-auth-jwt-audience-claim`) writes `audience_claim` (`aud`, `client_id` or `azp`, saved
+  only when not `aud`); a value other than `aud` shows `caller-auth-jwt-audience-claim-warning`
+  (its callers get no per-user delegated credentials; the gateway refuses it beside an
+  `on_demand`, `pre_authorize` or `elicit` binding) and blocks Save until a value is listed. Transit Points have no Audience Claim control: they match `aud`. Loading a surface always replaces `methods`, so a stale
   canvas copy never brings back a removed method.
 - **Authorization server discovery** (`caller-auth/CallerAuthDiscoverySection.tsx`) edits
   `caller_authentication.protected_resource` in the Caller Context editor of an MCP surface whose
   first method is JWT Bearer; additional methods never show it. Turning it on prefills the
   resource with the Access Point's https listener URL plus its route (left empty otherwise),
-  empties Accepted Audiences, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
+  empties Accepted Audiences, sets Audience Claim to `aud`, turns token forwarding off and sets the `Authorization` header with the `Bearer` scheme; each of those controls stays
   locked while discovery is on, once it holds that value. Authorization servers (1 to 8) and
   scopes are lists checked as each value is added, and `protectedResource.ts` mirrors the
   gateway's save rules, which block Save. Leaving JWT Bearer drops the setting. A variant shows
@@ -534,6 +593,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | A row's Make primary and remove     | `<area>-method-<index>-make-primary-button`, `-remove-button` (editor)                  |
 | Add method button, menu, menu entry | `<area>-add-method-button`, `<area>-add-method-menu`, `<area>-add-method-<method type>` |
 | Selected method's settings (editor) | `caller-auth-editor-method-settings`                                                    |
+| JWT audience claim and its warnings | `caller-auth-jwt-audience-claim`, `-audience-claim-warning`, `caller-auth-audiences-missing-warning` |
 
 ## Trust Check
 
@@ -656,7 +716,7 @@ fetch never breaks the panel. Test ids: `trust-recorder-last-outcome` with `-sta
 
 ## Payments page
 
-`/payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown on
+`/x402payments` (`pages/PaymentsPage.tsx`, sections in `pages/PaymentsPage/`), shown on
 `payments.view` whether or not `agent_pay_delegation` is on (see _Feature flags_), is one list of payments, with no tabs, chart or audit trail view, and reads the
 append-only ledger from `GET /api/admin/payments` (`surface_id` from the URL query,
 `outcome` from the filter) and shows one row per payment check with an outcome badge; a
@@ -694,7 +754,7 @@ so a 401 expires the session. A
 read-only **Legacy x402/MPP** list appears below the payments only while the old
 x402/MPP endpoints still return rows: one row per transaction (the verification and
 settlement summaries merged, the settlement giving the status) with the x402 amount scaled
-by the token's decimals and shown in dollars. `/x402payments` redirects here and keeps its query string and hash. Test ids:
+by the token's decimals and shown in dollars. `/payments` is left free for gateway channels, which older configs put there. Test ids:
 `page-payments`, `payments-outcome-filter`, `payments-filter-input`, `payments-refresh-button`,
 `payments-row-<id>`, `payments-surface-link-<id>`, `payments-held-case-<id>`,
 `payments-details-button-<id>`, `payments-detail-modal`, `payments-detail-dismiss-button`,
@@ -965,6 +1025,30 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
   `credential_policy.insecure_token_endpoints`, and that an unchanged stored one is still accepted
   while `token_endpoint_https` is `warn`. It does not block Save; the gateway decides on save.
+- The Callback URL of an authorization code provider is, when editing, the stored `callback_url`
+  unchanged (a reverse proxy prefix included) while the chosen listen address is still its origin
+  and the stored URL is `https` and its path ends in the stored `callback_path`
+  (`callbackUrlToSave`). Otherwise it is the chosen listen address followed by the provider's
+  stored `callback_path` (`callbackUrlFor`). The preview, the copy button and Save all use it,
+  because the gateway refuses a `callback_url` whose path does not end in the stored
+  `callback_path`, or that is not `https`. A stored provider with no listen address chosen shows,
+  in the same preview (`credential-provider-callback-url`), the redirect URI it keeps: its stored
+  `callback_url`, or without one `gateway_base_url` from `GET /config/surface-routing` (the base
+  the gateway started with) followed by its `callback_path`; Save then sends no `callback_url`.
+- A new authorization code provider has no Callback URL until it is created: the gateway builds
+  its `callback_path` from the id it generates for the provider (not the Provider ID slug) and
+  refuses a `callback_url` on create. The editor shows a notice in its place
+  (`credential-provider-callback-url-after-create`), which says to register a placeholder redirect
+  URI with an OAuth provider that asks for one before it issues the client ID and secret, and to
+  replace it after create; the editor creates the provider without a `callback_url`. With a
+  listen address chosen, it then saves that address followed by the returned `callback_path` with
+  a PUT. Create refuses an http listen address before sending anything (`isHttpsAddress`), since
+  the gateway refuses an http `callback_url`; the message says to choose an https address or
+  leave the host unselected. After a create the editor opens the created provider, so its
+  Callback URL is in front of the operator. If the PUT fails, an error toast says the provider
+  was created and gives the gateway's reason, and the editor still opens the created provider, so
+  saving again updates it instead of creating it a second time. The Provider ID input has no
+  route prefix, since a new provider's callback path does not contain it.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
@@ -986,6 +1070,38 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 - **Show the value you entered** (`secret-value-reveal-checkbox`) appears only while the
   value field is editable, and reveals only what was typed or generated on this page. The
   value field is `secret-value-input`.
+
+## API key delete
+
+The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
+(**Delete**) share `useApiKeyAction('delete', …)` (`src/components/api-keys/ApiKeyActionDialog.tsx`). The
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
+like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
+a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
+carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
+client id and key id and says, in plain words, that callers using the key will be refused,
+surfaces that use it will stop working until another key is picked, and the delete can't be
+undone. **Delete API key** (`api-key-delete-dialog-confirm`, `btn-danger`) sends the `DELETE`;
+it is enabled on open and disabled, with a spinner, only while the delete runs. **Cancel** and the
+close button delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds
+with the toast "API key deleted", then the tab reloads its keys and the detail page returns to
+`/secrets`. A failed delete shows an error toast that stays until dismissed: "Delete failed:
+<gateway message> (<status>)", and the detail page stays open.
+
+**Revoke** works the same way through `useApiKeyAction('revoke', …)`: the API Keys tab's revoke
+button (`api-keys-revoke-button-<key id>`) and the detail page's **Revoke** send nothing and open
+`api-key-revoke-dialog`, the same dialog component with the title "Revoke API key" and the same
+red warning icon. Its body names the key's client id and key id and says that surfaces using the
+key will stop serving until another key is selected, that a revoked key can't be restored, and
+that selecting a new key gives the surface a new DID. **Revoke API key**
+(`api-key-revoke-dialog-confirm`, `btn-warning`) sends `POST /api-keys/{agent_id}/{key_id}/revoke`;
+**Cancel** and the close button send nothing. A revoke succeeds with the toast "API key revoked",
+then the tab reloads its keys and the detail page reloads the key. A failed revoke shows an error
+toast that stays until dismissed: "Revoke failed: <gateway message>".
+
+When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
+the detail page shows the info alert "This API key is no longer in use because the associated
+surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
 
 ## Policy definition editor
 
@@ -1040,6 +1156,49 @@ word it only through `utils/surfaceVariant.ts`, which the Metrics page uses too.
   only when the caller got a JSON-RPC error; a row shows only when the value is recorded.
 - `requested_variant` is caller-chosen text: render it as React text only.
 - The Metrics page shows the `$alias` badge for a configured alias only, never for `_base_`.
+
+## Audit page: partial reads and log size
+
+An audit read walks the stored history and may not return all of it. The response says so in two
+separate fields: `truncated` (the read stopped before the end — its scan limit, or a rotated file
+missing or unreadable) and `dropped_records` (records in the history it could not read — a line
+too long to assemble, or one an interrupted append left half-written). **Either one makes the
+counts lower bounds**; `useAuditLog` folds them into one `countsAreLowerBounds`, and the UI knows
+only that.
+
+- When the counts are lower bounds every number that came from that walk renders with a trailing
+  `+` and nothing else changes: the record badge (`audit-total-badge`) reads `1243+`, the pager
+  reads `Page 5 of 687+`, and a category count reads `24643+` (`0+` for the zero marker).
+  Otherwise the numbers render exactly as before. No banner, notice, colour or tooltip.
+- The badge shows while `total > 0` **or** the counts are lower bounds, so `0+` is never hidden,
+  and such an empty page reads **"No governance events found in the records searched."**
+  (`audit-empty-truncated`) instead of "No governance events yet" and its advice to enable VP
+  Auditing: the log is not known to be empty, so that advice would be wrong.
+- The flag reaches them through `useAuditLog` (`countsAreLowerBounds`), `AuditList` and
+  `AuditFilters` (the same prop name), and the shared `FilterChipGroup` / `FilterOverflowMenu`.
+  The Category facet renders its counts, so a category with records reads `24643` (or `24643+`
+  when the counts are lower bounds) and one with none keeps the `(0)` / `(0+)` zero marker. The
+  Decision, Flow and Scope facets pass `showBadge={false}`: their chips carry no count, so a
+  badge there would have nothing to show.
+- A **read that failed** is not an empty log. The gateway answers a read it could not make with
+  `500`, so `useAuditLog` keeps the message in `error`, and `AuditList` renders the
+  `alert alert-danger` panel (`audit-error`) with a Retry (`audit-error-retry`) **instead of** the
+  empty state, saying no records could be read and that this is not the log holding none. The
+  toast stays, for the moment the read fails; the panel is what is still there after it fades.
+  Refresh stays enabled while `error` is set, since a failed read leaves `total` at `0` and
+  Refresh is the way back. `CredentialAuditTab` shows the same failure as its own error line.
+- `pages/CredentialsPage/CredentialAuditTab.tsx` reads the same two fields from
+  `/v1/delegation-audit` and appends the same `+` to its badge and its `n–m of t` line.
+- `AuditLogSize.tsx` shows one line above the list, `Audit log: 312 MiB of 1 GiB`, with a thin
+  bar: neutral under the configured size, amber over it, and over it a line naming the two
+  things an operator can do. It is **usage against a mark, never a quota**: nothing is enforced
+  at `[audit] vp_audit_log_soft_cap_bytes`, no record is deleted and the log keeps growing. With
+  `soft_cap_bytes` of `0` the size shows alone, with no bar, and with no `history_bytes` the
+  line is not shown at all rather than claiming an empty history. The values come from
+  `history_bytes` and `soft_cap_bytes` on the audit response.
+- Sizes in bytes are formatted by `utils/formatBytes.ts` — one implementation for the whole
+  dashboard, in binary units (`312 MiB`, `1.5 GiB`). The Metrics and Tasks pages use it too;
+  do not add a page-local copy.
 
 ## MCP Proxy write warnings
 
@@ -1098,6 +1257,20 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
   caller.
 - When the backend sends none of the naming fields, the Name column still shows, with
   `metadata.agent_name` or "Unnamed Agent", and there is no origin badge.
+- A **revoked** identity (`revoked` on the identity: the API key its DID comes from is revoked
+  or deleted, or every surface it is linked to was deleted) gets a "Revoked" badge beside its
+  name cell (`components/IdentityRevoked.tsx`): a plain Bootstrap `badge text-bg-danger`, solid
+  red with white text like the Revoked status on the API key table, not the shared `Badge`.
+  Expanding the row, or opening it in the
+  Dashboard's `IdentityDetailsModal`, shows the `alert-danger` "This identity is no longer in
+  use: its API key was revoked or deleted, or its surface was deleted." The page has no
+  Revoked filter.
+- A surface of an identity marked `surface_deleted` (every surface it is linked to was
+  deleted) is shown by `SurfaceLinkButton` (in `IdentitySurfaceCell.tsx`), in the **Agent
+  Surface** list and the expanded Summary, as muted plain text, the surface name when the
+  identity carries one and otherwise the surface id, with a solid grey "Deleted" badge
+  (`badge text-bg-secondary`, white text), and never links. A live surface keeps its link and
+  shows no badge.
 - **Recorder** status comes from the optional `trust_recorder` field on an identity (types in
   `types.ts`), present only when one of the identity's managed surfaces has a Trust Recorder.
   A shared managed DID carries the worst outcome across those surfaces, ranked Failed >
@@ -1136,6 +1309,8 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 | Origin badge                   | `identities-origin-<origin>`                                             |
 | Surface list, surface link     | `identities-surface-list`, `identities-surface-link`                     |
 | Credential principal           | `identities-credential-principal`                                        |
+| Revoked badge, message         | `identities-revoked-badge`, `identity-revoked-info`                      |
+| Deleted surface, its badge     | `identities-surface-deleted`, `identities-surface-deleted-badge`         |
 | Recorder filter                | `identities-recorder-filter`                                             |
 | Recorder chip                  | `identities-recorder-chip-<state>`                                       |
 | Recorder tooltip               | `identities-recorder-tooltip`                                            |
@@ -1318,7 +1493,7 @@ Settings → **Admin** → **Feature Flags** is a table of the shared `FeatureFl
   one (`templateTakesPayments`); the Payment element's gateway picker shows no Add link
   (`addGatewayLink={null}`). A surface that already has a Payment element keeps it, rendered and
   editable, so opening and saving it never drops its `payment_policy`. The Payments page is not
-  gated: its sidebar entry and `/payments` (and `/x402payments`, which redirects to it) need only
+  gated: its sidebar entry and `/x402payments` need only
   `payments.view`, so the ledger and the legacy x402/MPP list stay readable with the flag off;
   only its empty state changes, naming the flag instead of the Payment element.
   Like `mediator_federation`, it is
@@ -1445,7 +1620,14 @@ identities: an integration receives every event of its event set, from every res
   (`endpoint-type-select`) and fixed after.
 - The fields of each type come from `ENDPOINT_FIELDS` in `endpointFields.ts`, which lists only
   what the gateway's publishers read: email `cc` and `bcc`; Slack `bot_name` and
-  `icon_emoji`, no channel; stream SASL only for Kafka, no AWS keys. Each field is
+  `icon_emoji`, no channel; stream SASL only for Kafka, no AWS keys. Every Kafka endpoint shows
+  **Security protocol** (`plaintext`, `ssl`, `sasl_plaintext` or `sasl_ssl`, default
+  `plaintext`), which replaced the Authentication select; a SASL protocol adds **SASL
+  mechanism** (`PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`, default `PLAIN`), the username and
+  the password. A stored endpoint shows its `security_protocol`; one without it shows what the
+  gateway uses (`sasl_plaintext` for the older `auth_type: sasl` with a username, otherwise
+  `plaintext`, through the field's `legacyValue`), and a save writes `security_protocol` and no
+  `auth_type`, so every configuration the API accepts saves back unchanged. Each field is
   `endpoint-<field>-input`; the others are `endpoint-name-input`, `endpoint-active-switch`,
   `endpoint-save-button` and `endpoint-cancel-button`.
 - **Send test** (`endpoint-test-button`) tests the saved endpoint, so it is disabled while
@@ -1518,6 +1700,12 @@ identities: an integration receives every event of its event set, from every res
 - The **About the Audit Log** panel (`AuditInfoBanner.tsx`) says each integration with an
   event set holding audit events receives them independently of the log, at least once, so
   receivers deduplicate on `event_id`.
+- Its **Storage** section explains the size shown above the table: the live log plus every
+  rotated file, rotated at `vp_audit_log_max_bytes`, with every rotated file kept by default
+  so nothing is deleted. It states that `vp_audit_log_soft_cap_bytes` is advisory — passing it
+  deletes nothing and refuses no write — and that bounding the history means setting
+  `vp_audit_log_keep`, which does delete the records that fall out of the window. The panel is
+  where that is explained, because the bar itself carries no copy beyond the two actions.
 
 ## Laptop layouts
 

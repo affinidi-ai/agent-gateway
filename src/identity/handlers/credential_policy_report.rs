@@ -1,6 +1,7 @@
 //! Startup and reload report of the credential providers and surfaces that break a
-//! `[credential_policy]` rule or a Target authentication header rule. Log lines only: ids,
-//! tenants and rule names, never a secret value.
+//! `[credential_policy]` rule or a Target authentication header rule, and of the consent
+//! providers that share a redirect URI. Log lines only: ids, tenants and rule names, never a
+//! secret value.
 
 use std::collections::HashMap;
 
@@ -8,7 +9,7 @@ use tracing::{info, warn};
 
 use super::surface_target_auth::BrokenTargetRule;
 use super::surface_tenancy::{
-    ProviderKeyIssue, collect_surface_reference_keys, provider_key_owners, provider_key_verdict,
+    KeyListing, ProviderKeyIssue, collect_surface_reference_keys, provider_key_ids, provider_key_verdict,
 };
 use super::surfaces::SurfaceApiError;
 use crate::config::agent_surface::AgentSurface;
@@ -16,7 +17,9 @@ use crate::config::credential_policy::{CredentialPolicyConfig, RuleMode};
 use crate::config::target_auth_rules::{HttpsMcpProxies, TargetCredentialRule};
 use crate::credential_providers::{CredentialProvider, CredentialProviderType};
 use crate::delegation_vault::oauth::TokenEgress;
-use crate::identity::provider_key_gate::PROVIDER_KEY_TENANT_RULE;
+use crate::identity::provider_key_gate::{
+    API_KEY_STORE_UNAVAILABLE, KeyOwnersListing, PROVIDER_KEY_TENANT_RULE, list_key_owners,
+};
 use crate::identity::state::IdentityApiState;
 use crate::surfaces::AgentSurfaceStore;
 use crate::tenancy::ResourceKind;
@@ -89,8 +92,8 @@ pub(crate) struct SkippedSurface {
     pub error: String,
 }
 
-/// An API Key Provider key id a stored surface derives a DID from that it may not use, or whose
-/// key or owning surface is gone.
+/// An API Key Provider key id a stored surface derives a DID from that it may not use, that is
+/// revoked, or whose key or owning surface is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderKeyFinding {
     pub surface_id: String,
@@ -109,7 +112,7 @@ pub(crate) fn find_breaches(
     providers: &[CredentialProvider],
     surfaces: &[AgentSurface],
     secret_tenants: &HashMap<&str, Option<&str>>,
-    key_owners: Option<&HashMap<String, Vec<String>>>,
+    key_owners: Option<&KeyListing>,
     egress: &TokenEgress,
     https_proxies: &HttpsMcpProxies,
 ) -> Findings {
@@ -206,8 +209,55 @@ pub(crate) fn find_breaches(
     findings
 }
 
+/// The key owners the report judges `surfaces` from: `listed`, the listing the provider key check
+/// of the same boot or reload read, else one listing of `api_keys` when a surface names a key id.
+/// `None` when the store could not be read, logged once, so every surface naming a key id is
+/// reported `store_unavailable`; key folders it could not load are logged by name, and a key id
+/// only they may hold is reported `store_unavailable`.
+pub(crate) async fn report_key_owners(
+    listed: Option<KeyOwnersListing>,
+    api_keys: Option<&dyn crate::api_keys::store::ApiKeyStore>,
+    surfaces: &[AgentSurface],
+) -> Option<KeyListing> {
+    let listing = match listed {
+        Some(listing) => listing,
+        None if surfaces
+            .iter()
+            .any(|surface| provider_key_ids(surface).is_ok_and(|ids| !ids.is_empty())) =>
+        {
+            list_key_owners(api_keys).await
+        }
+        None => return None,
+    };
+    listing
+        .inspect(|keys| {
+            if !keys.is_complete() {
+                warn!(
+                    rule = PROVIDER_KEY_TENANT_RULE,
+                    reason = API_KEY_STORE_UNAVAILABLE,
+                    skipped = ?keys.skipped(),
+                    "Credential policy report: API key folders could not be loaded, so a surface naming an API key id no loaded folder holds is reported store_unavailable"
+                )
+            }
+        })
+        .inspect_err(|cause| {
+            warn!(
+                rule = PROVIDER_KEY_TENANT_RULE,
+                reason = API_KEY_STORE_UNAVAILABLE,
+                cause,
+                "Credential policy report: the API key store cannot be read, so every surface naming an API key id is reported store_unavailable"
+            )
+        })
+        .ok()
+}
+
 /// Log one warning per credential provider or surface that breaks a credential policy rule.
-pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
+/// `listed` is the API key listing the provider key check of the same boot or reload read, `None`
+/// when it read none.
+pub(crate) async fn report_credential_policy(
+    state: &IdentityApiState,
+    listed: Option<KeyOwnersListing>,
+) {
     let egress = TokenEgress::from_environment();
     let policy = &egress.policy;
     let providers = match &state.credential_provider_store {
@@ -220,6 +270,15 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         },
         None => return,
     };
+    let gateway_base_url = format!(
+        "https://{}",
+        state
+            .network_config
+            .did
+            .domain
+    );
+    crate::credential_providers::log_redirect_uri_conflicts(&providers, &gateway_base_url);
+    crate::credential_providers::log_consent_rule_breaches(&providers, &gateway_base_url);
     let secrets = match &state.secrets_store {
         Some(store) => match store.list_all().await {
             Ok(secrets) => secrets,
@@ -244,9 +303,7 @@ pub(crate) async fn report_credential_policy(state: &IdentityApiState) {
         .iter()
         .map(|secret| (secret.secret_id.as_str(), secret.tenant_id.as_deref()))
         .collect();
-    let key_owners = provider_key_owners(state)
-        .await
-        .ok();
+    let key_owners = report_key_owners(listed, state.api_key_store.as_deref(), &surfaces).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
 
     log_findings(
@@ -294,7 +351,7 @@ fn log_findings(
             api_key_id = %finding.issue.key_id,
             issue = finding.issue.kind.as_str(),
             not_ready = finding.issue.kind.is_breach(),
-            "Stored surface derives a DID from an API key it may not use, or whose key or surface is gone"
+            "Stored surface derives a DID from an API key it may not use, or that is revoked, or whose key or surface is gone"
         );
     }
     for skipped in &findings.skipped {
@@ -997,7 +1054,7 @@ mod tests {
 
     fn provider_key_findings(
         naming_surfaces: Vec<AgentSurface>,
-        owners: Option<&HashMap<String, Vec<String>>>,
+        owners: Option<&KeyListing>,
         isolation: crate::config::credential_policy::RuleMode,
     ) -> Vec<(String, &'static str, bool)> {
         let mut surfaces = vec![
@@ -1017,7 +1074,7 @@ mod tests {
             .collect()
     }
 
-    fn key_owners() -> HashMap<String, Vec<String>> {
+    fn key_owners() -> KeyListing {
         [
             ("atgk_t1", "owner-t1"),
             ("atgk_t2", "owner-t2"),
@@ -1026,7 +1083,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(key, owner)| (key.to_string(), vec![owner.to_string()]))
-        .collect()
+        .collect::<HashMap<_, _>>()
+        .into()
     }
 
     #[test]
@@ -1035,7 +1093,8 @@ mod tests {
         let owners = key_owners();
         let surfaces = || {
             vec![
-                naming("own", Some("t1"), "atgk_t1"),
+                naming("owner-t1", Some("t1"), "atgk_t1"),
+                naming("same-tenant", Some("t1"), "atgk_t1"),
                 naming("cross", Some("t1"), "atgk_t2"),
                 naming("tenant-key-wide", None, "atgk_t1"),
                 naming("appliance-key", Some("t1"), "atgk_wide"),
@@ -1048,26 +1107,54 @@ mod tests {
         assert_eq!(
             warn,
             vec![
+                ("same-tenant".to_string(), "other_surface", false),
                 ("cross".to_string(), "other_tenant", false),
                 ("tenant-key-wide".to_string(), "other_tenant", false),
                 ("appliance-key".to_string(), "appliance_key", false),
-                ("missing-key".to_string(), "missing_key", false),
+                ("wide-wide".to_string(), "other_surface", false),
+                ("missing-key".to_string(), "missing_key", true),
                 ("missing-owner".to_string(), "missing_owner", false),
             ]
         );
         let enforce = provider_key_findings(surfaces(), Some(&owners), RuleMode::Enforce);
         assert_eq!(
-            enforce[..3],
-            [
+            enforce,
+            vec![
+                ("same-tenant".to_string(), "other_surface", true),
                 ("cross".to_string(), "other_tenant", true),
                 ("tenant-key-wide".to_string(), "other_tenant", true),
                 ("appliance-key".to_string(), "appliance_key", true),
+                ("wide-wide".to_string(), "other_surface", true),
+                ("missing-key".to_string(), "missing_key", true),
+                ("missing-owner".to_string(), "missing_owner", true),
             ]
         );
         assert!(
-            provider_key_findings(vec![naming("own", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
-                .is_empty()
+            provider_key_findings(vec![naming("owner-t1", Some("t1"), "atgk_t1")], Some(&owners), RuleMode::Enforce)
+                .is_empty(),
+            "a surface naming its own key is not reported"
         );
+    }
+
+    #[test]
+    fn a_surface_naming_a_revoked_provider_key_is_reported_revoked_key_in_both_modes() {
+        use crate::config::credential_policy::RuleMode;
+        let owners = key_owners().with(&["atgk_t1"], &[]);
+        for mode in [RuleMode::Warn, RuleMode::Enforce] {
+            assert_eq!(
+                provider_key_findings(
+                    vec![
+                        naming("owner-t1", Some("t1"), "atgk_t1"),
+                        legacy_caller("legacy-own", Some("t1"), "atgk_t1", true),
+                        naming("owner-t2", Some("t2"), "atgk_t2"),
+                    ],
+                    Some(&owners),
+                    mode
+                ),
+                vec![("owner-t1".to_string(), "revoked_key", true), ("legacy-own".to_string(), "revoked_key", true),],
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -1091,7 +1178,7 @@ mod tests {
             provider_key_findings(
                 vec![
                     legacy_caller("legacy-cross", Some("t1"), "atgk_t2", true),
-                    legacy_caller("legacy-own", Some("t1"), "atgk_t1", true),
+                    legacy_caller("legacy-same-tenant", Some("t1"), "atgk_t1", true),
                     legacy_caller("legacy-wide", Some("t1"), "atgk_wide", true),
                     legacy_caller("legacy-unowned", Some("t1"), "atgk_gone", true),
                     legacy_caller("legacy-no-identity", Some("t1"), "atgk_t2", false),
@@ -1101,6 +1188,7 @@ mod tests {
             ),
             vec![
                 ("legacy-cross".to_string(), "other_tenant", true),
+                ("legacy-same-tenant".to_string(), "other_surface", true),
                 ("legacy-wide".to_string(), "appliance_key", true)
             ]
         );

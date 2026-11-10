@@ -13,7 +13,7 @@ use crate::steps::when::{
 };
 use crate::world::{RecordedResponse, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceWorld};
 
-fn before_the_gateway_starts(
+pub(crate) fn before_the_gateway_starts(
     world: &SurfaceWorld,
     what: &str,
 ) {

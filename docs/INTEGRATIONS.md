@@ -269,6 +269,20 @@ delivered again once by its `event_id`, and counts requests by `request_id`.
 All four stream platforms are compiled into the binary; which one is used is a matter of
 configuration.
 
+A Kafka endpoint's connection settings are `brokers`, `security_protocol` (`plaintext`, `ssl`,
+`sasl_plaintext` or `sasl_ssl`) and, for a SASL protocol, `sasl_mechanism` (`PLAIN`,
+`SCRAM-SHA-256` or `SCRAM-SHA-512`), `sasl_username` and `sasl_password`
+([`stream_publishers/kafka.rs`](../src/integrations/stream_publishers/kafka.rs)). Both new
+fields are optional. Without `security_protocol` the older `auth_type` decides: `sasl` with a
+`sasl_username` is `sasl_plaintext`, with `PLAIN` unless `sasl_mechanism` names another, and
+anything else is `plaintext`. A SASL protocol needs a mechanism, a username and a password.
+A save that names an unknown protocol or mechanism, or a SASL protocol without one of the
+three, is refused with `400`, for example "security_protocol must be one of plaintext, ssl,
+sasl_plaintext or sasl_ssl"; an endpoint stored that way fails its deliveries and the startup
+check. `ssl` and `sasl_ssl` verify the brokers' certificates and host names against the gateway
+host's system CA store; there is no setting for a private CA. Amazon MSK with SASL/SCRAM is
+`sasl_ssl` with `SCRAM-SHA-512` on its SASL/SCRAM bootstrap brokers.
+
 A webhook request carries `X-Webhook-Timestamp`, the Unix time in seconds. With a
 `signing_secret` it also carries `X-Webhook-Signature-256`: `sha256=` and the hex
 HMAC-SHA256 of `<timestamp>.<body>` keyed with the secret, so a receiver can check the sender
@@ -615,7 +629,10 @@ sidebar item and the pages need `integrations.view`, the editors and test sends
 
 - **Endpoints** show the fields of their type. Secret fields are never shown once stored: they
   can be kept, replaced or cleared, or point to an appliance-wide secret with
-  `$SECRET:<secret_id>`. A saved endpoint can send a test message.
+  `$SECRET:<secret_id>`. A saved endpoint can send a test message. A Kafka endpoint picks its
+  security protocol, all four of them, and for a SASL protocol its mechanism, username and
+  password. An endpoint stored without `security_protocol` opens with the protocol the gateway
+  uses for it, and saving writes `security_protocol` in place of `auth_type`.
 - **Event sets** pick events from the catalog, grouped by family and audit events by their
   audit group, with search. Audit events are picked and saved like any other.
 - **Integrations** join an endpoint and an event set and hold the template for the endpoint's

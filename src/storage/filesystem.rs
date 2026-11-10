@@ -290,6 +290,18 @@ pub trait StorageBackend<T: StorableEntity>: Send + Sync {
         id: &str,
     ) -> Result<Option<T>>;
 
+    /// Get an entity by ID, as [`Self::get`], except that a record stored on
+    /// disk that could not be read is an error, never `None`. The default is
+    /// [`Self::get`], right for a backend whose `get` already fails on such a
+    /// record (uncached) or that keeps no files (in memory); a backend that
+    /// leaves unreadable records out of a cache overrides it.
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<T>> {
+        self.get(id).await
+    }
+
     /// List all entities
     async fn list_all(&self) -> Result<Vec<T>>;
 
@@ -1921,6 +1933,28 @@ impl<T: StorableEntity> CachedFilesystemStorage<T> {
         Ok(self.cached_entity(id))
     }
 
+    /// The entity `id`, or `None` when no file of it is stored. A file that
+    /// is stored but was left out of the cache, as one that cannot be
+    /// decrypted or parsed, is an error, so a reader that removes what a
+    /// missing record leaves never takes an unreadable one for a deleted one.
+    pub async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<T>> {
+        if let Some(entity) = self.get(id).await? {
+            return Ok(Some(entity));
+        }
+        if crate::storage::validate_storage_id(id).is_err() {
+            return Ok(None);
+        }
+        if tokio::fs::try_exists(get_raw_path(&self.storage_dir, id)).await?
+            || tokio::fs::try_exists(get_encrypted_path(&self.storage_dir, id)).await?
+        {
+            anyhow::bail!("{} {} is stored but could not be read", self.entity_name, loggable_id::<T>(id));
+        }
+        Ok(None)
+    }
+
     /// List all entities
     pub async fn list_all(&self) -> Result<Vec<T>> {
         Ok(self
@@ -2034,6 +2068,12 @@ impl<T: StorableEntity> StorageBackend<T> for CachedFilesystemStorage<T> {
         id: &str,
     ) -> Result<Option<T>> {
         CachedFilesystemStorage::get(self, id).await
+    }
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> Result<Option<T>> {
+        CachedFilesystemStorage::get_checked(self, id).await
     }
     async fn list_all(&self) -> Result<Vec<T>> {
         CachedFilesystemStorage::list_all(self).await
@@ -4960,6 +5000,50 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    /// `get` takes a stored file it could not read for a record that is not
+    /// there; `get_checked` refuses it, and still finds a missing record absent.
+    #[tokio::test]
+    async fn get_checked_refuses_a_stored_record_that_cannot_be_read() {
+        let temp_dir = TempDir::new().unwrap();
+        tokio::fs::write(
+            temp_dir
+                .path()
+                .join("broken.json"),
+            b"not json",
+        )
+        .await
+        .unwrap();
+        let storage = cached_storage::<TestEntity>(temp_dir.path().to_path_buf(), "test_entity")
+            .await
+            .unwrap();
+
+        assert!(
+            storage
+                .get("broken")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage
+                .get_checked("broken")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "test_entity broken is stored but could not be read"
+        );
+        for absent in ["missing", "../broken", ""] {
+            assert!(
+                storage
+                    .get_checked(absent)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{absent:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -48,6 +48,13 @@ pub struct SurfaceConfigBuilder {
     pub credential_delegation: Option<SurfaceCredentialDelegationConfig>,
     pub oauth_provider_base_url: Option<String>,
     pub oauth_callback_base_url: Option<String>,
+    /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
+    pub oauth_authorization_response_issuer: Option<String>,
+    /// OAuth providers the gateway has besides the surface's own, by provider id.
+    pub additional_oauth_providers: Vec<String>,
+    /// The surface's OAuth provider is stored as the admin API now creates one: with a
+    /// record id of its own, which its callback path ends in, instead of its provider id.
+    pub oauth_callback_path_ends_in_record_id: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -86,6 +93,60 @@ pub struct SurfaceConfigBuilder {
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
+    /// The gateway serves a dashboard build from `www/` at `/`, falling back to its
+    /// `index.html` for every path no other route takes, as a deployed dashboard does.
+    pub serves_dashboard: bool,
+    /// Channel, MCP proxy and redirect prefixes `gateway.json` adds to the surface's.
+    pub gateway_prefixes: Vec<GatewayPrefixFixture>,
+    /// API key records stored before the gateway starts.
+    pub stored_api_keys: Vec<StoredApiKeyFixture>,
+    /// Further stored surfaces, disabled, by id.
+    pub other_stored_surfaces: Vec<String>,
+    /// The key id the seeded surface's protected Identity takes its DID from.
+    pub protected_identity_api_key_id: Option<String>,
+    /// When the API Key Provider's key was created; when the gateway starts if absent.
+    pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The gateway starts in Standby mode.
+    pub starts_standby: bool,
+}
+
+/// A prefix the operator adds to `gateway.json`.
+#[derive(Debug, Clone)]
+pub enum GatewayPrefixFixture {
+    Channel(String),
+    McpProxy(String),
+    Redirect { prefix: String, target: String },
+}
+
+/// An API key record stored before the gateway starts.
+#[derive(Debug, Clone)]
+pub struct StoredApiKeyFixture {
+    pub owner: String,
+    pub key_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Whether the gateway can load the owner's key folder.
+    pub loads: bool,
+}
+
+impl SurfaceConfigBuilder {
+    /// The stored id of the credential provider `provider_id`, which is also the last
+    /// segment of its callback path.
+    pub fn provider_record_id(
+        &self,
+        provider_id: &str,
+    ) -> String {
+        let own = self
+            .credential_delegation
+            .as_ref()
+            .filter(|delegation| delegation.provider_id == provider_id);
+        match own {
+            Some(_) if self.oauth_callback_path_ends_in_record_id => format!("0b6e4c2a-{provider_id}-record"),
+            Some(delegation) => delegation
+                .record_id()
+                .to_string(),
+            None => provider_id.to_string(),
+        }
+    }
 }
 
 impl Default for SurfaceConfigBuilder {
@@ -125,6 +186,9 @@ impl Default for SurfaceConfigBuilder {
             credential_delegation: None,
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
+            oauth_authorization_response_issuer: None,
+            additional_oauth_providers: Vec::new(),
+            oauth_callback_path_ends_in_record_id: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
@@ -147,6 +211,13 @@ impl Default for SurfaceConfigBuilder {
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
+            serves_dashboard: false,
+            gateway_prefixes: Vec::new(),
+            stored_api_keys: Vec::new(),
+            other_stored_surfaces: Vec::new(),
+            protected_identity_api_key_id: None,
+            api_key_provider_key_created_at: None,
+            starts_standby: false,
         }
     }
 }
@@ -344,6 +415,9 @@ pub struct JwtSourceAuthConfig {
     pub jwks_url: String,
     pub issuer: String,
     pub audiences: Vec<String>,
+    /// The claim `audiences` is matched against; `None` stores no
+    /// `audience_claim`, which the gateway reads as `aud`.
+    pub audience_claim: Option<String>,
     pub forward_header: bool,
 }
 
@@ -616,6 +690,7 @@ mod tests {
             jwks_url: "https://issuer.example/.well-known/jwks.json".to_string(),
             issuer: "https://issuer.example".to_string(),
             audiences: Vec::new(),
+            audience_claim: None,
             forward_header: false,
         });
         let api_key = super::SurfaceSourceAuthConfig::ApiKey(super::ApiKeySourceAuthConfig {

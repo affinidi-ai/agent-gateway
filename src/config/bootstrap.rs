@@ -323,6 +323,10 @@ impl BootstrapConfig {
             .validate()
             .map_err(|e| anyhow::anyhow!("Invalid [a2a] config: {e}"))?;
 
+        self.audit
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Invalid [audit] config: {e}"))?;
+
         // Install the operator-configured advertised version now that it is known
         // to be supported, so the cards the gateway generates reflect it.
         crate::a2a::version::init_advertised_version(&self.a2a.default_version);

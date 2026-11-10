@@ -230,12 +230,44 @@ the agent returns in its answer and the caller sends back, not from a cookie.
 A JWT bearer token is accepted only when it is signed with an RS256, RS384, RS512, ES256,
 ES384 or EdDSA key from the strategy's key set, its `iss` equals the strategy's expected
 issuer, it has an `exp` that has not passed and, when it has an `nbf`, that time has come,
-each with 60 seconds of leeway. `aud` must name one of the method's `audiences`; an empty
-list skips that check, except on an MCP Access Point that publishes protected resource
-metadata, where `aud` must name the resource of the route called. A request whose token header
+each with 60 seconds of leeway. `aud` must name one of the method's `audiences`, except on an MCP
+Access Point that publishes protected resource metadata, where `aud` must name the resource of
+the route called. A request whose token header
 carries more than one value in the method's `token_scheme` fails, whatever the values, on an
 Access Point, a Transit Point and over Fabric. A value in another scheme, such as an MPP
 `Payment` credential beside the `Bearer` token, does not count.
+
+An Access Point `jwt_bearer` method must name at least one audience, unless the Access Point
+publishes protected resource metadata; the admin API refuses a save without one with `400`, on
+the surface or in a variant's overrides. For an identity provider whose access tokens carry no
+`aud`, such as Amazon Cognito, set `audience_claim` to `client_id` or `azp` and list the clients
+the method accepts in `audiences`: the named claim must then be a string that matches one of
+them, and `aud` is not checked. That binds a token to the client it was issued to, not to the
+gateway, so a token a listed client was issued for another service is accepted too. Callers it
+verifies therefore get no per-user delegated credentials: the admin API refuses, with `400`,
+such a method on a surface or variant with a credential binding, on its Target or a Transit
+Point, whose `consent_mode` is `on_demand`, `pre_authorize` or `elicit`, and a binding with
+external consent or delegated credentials for Fabric callers are withheld from its callers.
+`audience_claim` is `aud` by default, must be `aud` beside protected resource metadata, and must
+be `aud` on a Transit Point.
+
+Neither `client_id` nor `azp` tells an access token from an ID token, and the gateway does not
+check the token type in these modes. Amazon Cognito puts `client_id` only on access tokens, and
+its ID tokens carry `aud` instead, so use `client_id` there. Some providers, such as Keycloak,
+put `azp` on ID tokens as well, so in `azp` mode a listed client's ID token is accepted as an
+access token; where the provider marks the token type, require it in surface policy from
+`input.source_auth.claims`, for example `typ` or `token_use`.
+
+A method stored without `audiences`, from before that rule, keeps loading and skips the audience
+check, so it accepts a token its identity provider issued for any other service. The gateway
+warns about each one at startup and in a `Warning` header on each save of its surface, and a
+save that keeps the stored method unchanged is accepted, so an unrelated edit still saves; a
+save that changes it must name an audience. A variant keeps such a method too when it is added,
+copied or renamed, as long as the surface or one of its enabled stored variants has the same
+method. A disabled variant is not validated on save, so a method only a disabled variant has
+never counts: enabling that variant is refused until its method names an audience. Such methods
+are deprecated and will be refused in the next major release, 2.0.0: list the audiences the
+method accepts, or set `audience_claim`.
 
 An MCP Access Point whose first method is JWT bearer can also publish RFC 9728 protected
 resource metadata naming the authorization server that issues its tokens, with
@@ -295,8 +327,36 @@ Surface responses carry a read-only top-level `access_point_status`, `ready` or
 `not_ready`, for the surface the Access Point URL serves: the default variant when the surface
 has one, otherwise the base. Variant responses carry it for that variant. `ready` does not mean
 the surface serves: a surface refused for its API Key Provider keys stays `ready` and answers
-`503`. Look for `rule="provider_key_tenant"` in the gateway log; see
+`503`. Look for `rule="provider_key_tenant"` in the gateway log, or a `revoked` key in
+`api_key_references` below; see
 [Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live).
+
+A surface read (`GET /v1/surfaces/{id}`) and the create, update and patch responses of a
+surface that names an API Key Provider key id, in its base or any variant, also carry a
+read-only `api_key_references`: one `{ "key_id", "status", "blocking" }` per distinct id, sorted by id,
+with the ids the gate checks (a legacy Caller Context secret only when a key of that id
+exists). `status` is `active` or `revoked` for a key of this surface, `missing` when no key
+has the id, `unavailable` for a key of any other surface, whose status is never reported,
+and `unknown`, as the gate's `store_unavailable`, for every id when the API key store cannot be
+read, and for an id no loaded key folder holds while a key folder cannot be loaded. A
+same-tenant key of another surface that still serves under `warn` is `unavailable` too: a
+surface names only its own keys. The field is absent when the surface names no key id, and on
+the surface list and variant responses. The surface's own key folder is read from disk for it,
+so a key of the surface another node revoked, deleted or created is reported as stored; when
+that folder cannot be read, its keys are `unknown`, as they are while the surfaces owning its
+keys cannot be read. `blocking` is `true` exactly when the provider key gate refuses the surface
+for that id, judged from the same rules: for a `revoked` or `missing` key, and for an
+`unavailable` key when that key is revoked, as the gate refuses a revoked key in both modes, or
+when `tenant_credential_isolation` is `enforce`, except for a legacy Caller Context secret whose
+owning surface no longer exists, which the gate does not refuse. It is `false` for an `active`
+or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
+`serving_status` already shows that it does not serve.
+
+Beside `api_key_references`, the same responses carry a read-only `serving_status`: `serving` or
+`not_serving` as the verdict this node keeps on the surface's key ids stands, without saying
+why, and `not_judged` while it keeps none. It is read only from that kept verdict, never from
+the API key store, so it is per node and eventually consistent, and it is not part of
+`access_point_status`.
 
 On a closed surface, or with `on_failure: reject`, a missing or invalid credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
@@ -308,12 +368,13 @@ and limit requests per client upstream of the gateway if credential guessing is 
 is missing or invalid; the reason is logged. Public discovery reads, the DID Auth ceremony and
 onboarding surfaces are unaffected.
 
-Create and update responses are the saved surface plus `access_point_status`. A save warns
+Create and update responses are the saved surface plus `access_point_status` and, when it
+names a key id, `api_key_references`. A save warns
 in `Warning` headers (code 299), before the Transit Point warnings described below, when the
 Access Point is public, when it or an enabled variant is not ready (a variant's warning is
 prefixed `variant '<alias>': `), and when a legacy surface authenticates no caller and so
 admits every caller. A write request that sends a response back unchanged has its top-level
-`access_point_status` dropped before parsing.
+`access_point_status`, `api_key_references` and `serving_status` dropped before parsing.
 
 A gateway rolled back to a release without these fields cannot load the surfaces that store
 them, which is every surface created after the upgrade; see
@@ -566,15 +627,15 @@ that:
 - sets `allow_unauthenticated_callers` but authenticates its callers;
 - sets both `source_auth` and `mcp_http.authorization`;
 - sets a `source_auth` a Transit Point does not support, such as a `jwt_bearer` that names no
-  audience, or one the Access Point's rules refuse, such as mTLS trust that names no
-  certificate;
+  audience or whose `audience_claim` is not `aud`, or one the Access Point's rules refuse, such
+  as mTLS trust that names no certificate;
 - sets `delegated_credentials_for_fabric_callers` but does not require a transit token, the
   only way a Fabric caller reaches it (see [Transit token](#transit-token)).
 
 A Transit Point that sets `delegated_credentials_for_fabric_callers` on a surface, or in a
 variant, whose Access Point caller authentication cannot tell a partner's users apart (anything
-but a resource token, or a `jwt_bearer` method that names an audience through a JWT
-verification strategy that names an issuer) is saved with a `Warning` header saying so, and
+but a resource token, or a `jwt_bearer` method that names an audience, matched against `aud`,
+through a JWT verification strategy that names an issuer) is saved with a `Warning` header saying so, and
 releases nothing to Fabric callers. With `api_key`, for example, every key in the secret, the
 partner's and direct callers' alike, would be one caller with one grant (see
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-caller-on-a-transit-point)).
@@ -704,7 +765,7 @@ limit or resolves a credential:
 | Method | On a Transit Point |
 | --- | --- |
 | `api_key`, `api_key_provider` | Read from an HTTP header only |
-| `jwt_bearer` | `forward_header` must be `false`, and `audiences` must name at least one audience. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
+| `jwt_bearer` | `forward_header` must be `false`, `audiences` must name at least one audience, and `audience_claim` must be `aud`. Give the Transit Point an audience of its own: with the Access Point's strategy and an audience the Access Point also accepts, on the surface or an enabled variant, a token issued for the Access Point is accepted here too, so any caller of the Access Point can call the Transit Point directly, and a save answers with a `Warning` header saying so. An MCP Access Point that publishes protected resource metadata accepts the resource of each of its routes, so a Transit Point audience that names one of them counts too. Use one JWT verification strategy per issuer on a surface: the identity hash keys a JWT caller by its issuer, subject and principal claim, so a caller verified through another strategy that names the same `expected_issuer` and the same `principal_claim`, on the Access Point or another Transit Point, is the same caller, with the same delegated credentials, and through one that names another claim is another caller. Either way a save answers with a `Warning` header naming both strategies. An audience of `{{ surface.agent_did }}` means the surface's agent DID, as on an Access Point |
 | `mtls` | The certificate from the outbound listener's own TLS handshake (`[tls.client_auth] direct`, on an `https` outbound listener), or from the forwarded-client-cert header of a proxy in `trusted_proxies` |
 | `did_auth` | Not supported: a Transit Point serves no DID Auth challenge |
 
@@ -1133,6 +1194,27 @@ Per-key caller identity therefore needs an API Key Provider.
   with `on_failure: reject`, the request is refused with `401` before policy; otherwise policy
   sees `input.source_auth.method == "failed"` and decides; see
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
+- A key is checked against this node's cached copy of its record; validation reads and writes
+  no key record. A key another node revoked, rotated or deleted stops authenticating here at
+  this node's next cache refresh (`cache_refresh_interval_secs`, see
+  [Configuration reload](CONFIGURATION_RELOAD.md)), or when this node becomes Active. With the
+  default `cache_refresh_interval_secs` of 0 there is no periodic refresh: a key revoked on
+  another node keeps authenticating here until restart or promotion to Active. A record the
+  refresh cannot read is dropped from the cache, and its key resolves no caller identity.
+- A key's last use is kept apart from its record, in `.<key id>.last_used` beside it in the
+  surface's key folder, holding an RFC 3339 time in plain text even with encryption at rest:
+  the time is not secret, and a plain file costs no key service call. A node writes it at most
+  once every 60 seconds per key; a write that fails is logged and the caller is still accepted.
+  A usage write never touches the key record, so it cannot undo a revocation on any node. The
+  API key list and detail show the time in that file, or the record's own `last_used_at` for a
+  key last used before usage files existed. Rotating or deleting a key removes its usage file,
+  and a usage write that finds the key deleted or rotated in this node's cache once written
+  removes it again; a node whose cache has not yet seen a delete or rotation made on another
+  node can leave a usage file behind, which holds only a time and is ignored. A key
+  whose id is not a valid storage id gets no usage file.
+- On one node, revoking, rotating and deleting a key are serialized. A rotation re-reads only
+  that key's record from disk and refuses a key another node revoked before the rotation
+  started.
 - On a direct request, the key's DID replaces any identity the request body asserts, such as
   an identity presentation or a credential extension. [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input)
   describes what that does to `input.agent`. On a `fabric://` target only
@@ -1159,7 +1241,9 @@ An API Key Provider key and a plain API Key secret hash the same fields, `creden
 the key id or `secret_id`. A secret named after a provider key id would get that key's identity
 record and DID, so the `atgk_` prefix is reserved for API key ids: `POST /v1/secrets/new`
 refuses a `secret_id` that starts with it with `400`. An update cannot change a secret's id, and
-a secret stored with such an id before the prefix was reserved keeps loading and serving.
+a secret stored with such an id before the prefix was reserved keeps loading, and serves unless
+a key of that id is revoked (see
+[Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live)).
 
 #### Tenant check of provider keys
 
@@ -1175,6 +1259,11 @@ the base and in every variant:
 A Transit Point's own `identity_injection.api_key_id` is not collected: the request path reads
 only its `inject_vp`.
 
+A surface names only its own keys: the keys of its own surface id
+(`POST /v1/api-keys/{surface_id}`). A new surface owns no keys (see the create rule under
+[Provider keys when a surface goes live](#provider-keys-when-a-surface-goes-live)), so a create
+can name no `atgk_` id; create the surface, add its key, then save the surface naming it.
+
 A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
 
 - another tenant's key, or a tenant's key named by a surface with no tenant: "API-key parent
@@ -1185,71 +1274,222 @@ A save (`POST`, `PUT`, `PATCH`) refuses with `400`:
 - a key id that names no key: "API key reference is not accessible", and a key whose owning
   surface was deleted: "API-key parent Surface reference is not accessible". Either is kept when
   the stored surface already named it, so a GET→PUT of that surface saves;
+- the key of another surface that passes the rules above, of the same tenant or, between
+  surfaces with no tenant, appliance-wide: "API key '<key id>' belongs to another surface; a
+  surface names only its own API keys". A new reference is refused; one the stored surface
+  already named is kept under `warn` and refused under `enforce`. The other tenant cases above
+  answer with their own message, which names no surface;
 - a key id outside a resource-scoped token's pattern (`api-keys:<key id>`), also when the stored
   surface already named it;
 - a new Caller Context API Key `secret_id` that starts with `atgk_`, on a view whose inbound
-  Identity is From API Key, when a key of that id belongs to a surface this one may not
-  reference or to a surface with no tenant. One the stored surface already named is kept under
-  `warn` and refused under `enforce`. An id no key has is a plain secret.
+  Identity is From API Key, when a key of that id belongs to another surface. Such a secret takes
+  that key's DID, so it is held to the same rule as naming the key. One the stored surface
+  already named is kept under `warn` and refused under `enforce`. An id no key has is a plain
+  secret. A key whose owning surface was deleted has no owner to check, but deleting a surface
+  revokes its keys, so the next rule refuses such a new secret;
+- a new reference, in an Identity slot, a Transit Point or such a Caller Context secret, to a
+  revoked key of the surface's own: "API key '<key id>' is revoked; name an active API key of this
+  surface", in either mode. The rules above run first, so a revoked key the surface may not name
+  for another reason answers with that rule's message, and a revoked key whose owning surface was
+  deleted with "API-key parent Surface reference is not accessible"; neither tells the key's
+  status. One the stored surface already named is kept, so a GET→PUT of that surface saves; the
+  surface stays [not ready](#provider-keys-when-a-surface-goes-live) until it names an active key.
+  A save that names a key id the stored surface did not already name reads the surface's own
+  key folder from disk, so a key of this surface another node revoked, deleted or created is
+  judged as stored; when that folder cannot be read, the save answers `503` "API key store is
+  unavailable". A save that only keeps the key ids the stored surface named reads no folder.
 
 Without an API key store, a save naming an `atgk_` id answers `500` "API key store is not
 configured"; a Caller Context API Key `secret_id` that starts with `atgk_` on a view whose
 inbound Identity is From API Key counts. A tenant reassignment is a conflict (`409`), whichever of the two surfaces moves,
 when it would leave a surface naming a key whose owning surface it may not reference, or would
 make a tenant surface name the key of a surface with no tenant. Under `warn`, a tenant surface
-that already names such a key may still move. A reassignment whose surface then fails any
+that already names such a key may still move. A surface that names only its own keys moves with them, so
+its own keys never block its reassignment. A reassignment whose surface then fails any
 reference check is a `409` too, never a `500`. While a surface names an `atgk_` id, such a
 secret included, and no API key store is configured, every reassignment and every ownership
 impact read (`GET /v1/tenant-ownership/{kind}/{id}/impact`) answers `409` "API key store is
 not configured". A key a surface names as such a secret counts as named, so moving its owning
 surface is checked like moving the owner of any named key.
 
+Deleting an API key (`DELETE /v1/api-keys/{agent_id}/{key_id}`), also the cleanup of a key whose
+owning surface is gone, removes its record whether or not a stored surface names it; a key that
+is not there answers `404` "API key not found: <key id>". On this node every surface naming the
+key is checked again on its next request and refused as `missing_key` (`503`) in either mode;
+other nodes see it at their next check (see below). Such a surface's Identity reads as
+Unconfigured until it names another key, which gives the surface a new DID. The dashboard asks the operator to confirm a delete
+first; the API itself takes no confirmation.
+
 #### Provider keys when a surface goes live
 
 A surface goes live without a save at boot, on a configuration reload, when the cache refresh
 scan or another node's write changes it, and on the first request to a version no check has seen.
-Each time, the gateway checks its key ids against their owning surfaces and logs one `WARN` line
-per surface that names a key it may not use, or whose key or owning surface is gone. The line
-names the `surface`, its `tenant`, `rule="provider_key_tenant"`, each key id with its issue
-(`other_tenant`, `appliance_key`, `missing_key` or `missing_owner`) and `not_ready`. It carries
-no secret. When a surface that owns keys changes the same ways, or by a save, or is deleted, every
-surface naming one of its keys is checked again on its next request, so an owner moved to
-another tenant on disk or by another node takes those surfaces out of service under `enforce`.
+Each time, the gateway checks its key ids against their owning surfaces and the keys' status,
+and logs one `WARN` line per surface that names a key it may not use, a revoked key, or a key
+whose key or owning surface is gone. The line names the `surface`, its `tenant`,
+`rule="provider_key_tenant"`, each key id with its issue (`revoked_key`, `other_tenant`,
+`appliance_key`, `other_surface`, `missing_key` or `missing_owner`) and `not_ready`. A revoked
+key is reported as `revoked_key` only, whoever owns it. A key of another tenant is reported as
+`other_tenant` only; `other_surface` is a key of another surface the surface may otherwise
+reference. It carries no secret. When a surface that
+owns keys changes the same ways, or by a save, or is deleted, every surface naming one of its
+keys is checked again on its next request.
 
-- Under `tenant_credential_isolation: warn` the surface keeps serving.
+- In either mode, a surface naming a key id no key has (`missing_key`), such as a deleted key,
+  is not ready: a deleted key's DID must not stay in use. A key the
+  surface's own key folder holds is never mistaken for a missing one, since each check reads that
+  folder from disk. A Caller Context API Key secret with no key of its id stays a plain secret
+  and is not reported.
+- In either mode, a surface naming a revoked key (`revoked_key`), its own or any other, is not
+  ready: its DID is derived from the key id with no key lookup, so a revoked key would otherwise
+  keep it. On the node that revokes the key, through `POST
+  /v1/api-keys/{agent_id}/{key_id}/revoke` or by deleting the key's surface, every surface naming
+  the key is checked again on its next request, so the next request is refused. Every other node
+  reads the key's status from disk when the surface goes live and again on the first request
+  after `cache_refresh_interval_secs` (30 seconds when it is `0`), so a revocation another node
+  wrote is seen within that interval even when `cache_refresh_interval_secs` is `0`. That
+  recheck reads only the key folders of the surface and of the surfaces found owning its keys,
+  not the whole store; one request per surface makes it while requests arriving together wait
+  for its verdict, and requests between rechecks are answered from the kept verdict. Rotating a
+  key keeps it active, so the surface keeps serving; a revoked key cannot be rotated.
+- Otherwise, under `tenant_credential_isolation: warn` the surface keeps serving.
 - Under `enforce`, a surface naming another tenant's key, a tenant's key on a surface with no
-  tenant, or the key of a surface with no tenant is not ready.
-- A key or owning surface that cannot be found is only reported. The key may exist on another
-  node that shares the storage and not be visible here yet, so the request after
+  tenant, the key of a surface with no tenant, the key of any other surface (`other_surface`), or
+  a key whose owning surface cannot be found (`missing_owner`) is not ready. A stored surface
+  naming another surface's key of its own tenant is therefore not ready under `enforce` and
+  serves, logged, under `warn`.
+- In either mode, deleting a surface revokes its API keys (actor `surface-delete`) and keeps
+  them, so a surface naming the key of a deleted surface stops serving. The delete reads the
+  surface's key folder from disk, so keys another node created are revoked too. A folder that
+  cannot be read, or a key that cannot be revoked, is logged as an error naming the surface, and
+  those keys stay active: the delete still answers `200` with `success: true`, and its body carries
+  a `warnings` entry with code `api_keys_left_active` saying none was revoked or naming the keys
+  left active. The next sweep below revokes them. A key record
+  in the folder that names another surface as its owner is not revoked by the delete, and keeps
+  the id taken.
+- In either mode, when the gateway boots Active or a Standby node becomes Active, it revokes
+  the keys of surfaces deleted before deletes revoked them: every active key whose owning
+  surface no longer exists, under the actor `surface-delete`, keeping the keys. Before it revokes
+  any, it logs one `WARN` line per owner it will revoke, `About to revoke the API keys of a
+  surface that no longer exists` with that `surface` and its active `key_ids`. It then logs one
+  `INFO` line per key, `Revoked API key` with its `key_id` and `actor=surface-delete`, and one
+  with the count. Its revocations are permanent: no API restores a revoked key, and rolling back
+  the gateway does not either. A surface it leaves not ready gets a new DID when it is brought
+  back (see below). It never
+  revokes a key whose owner any of these holds: a file in the agent surface folder, by name,
+  whether or not it can be read; the agent surface store, at any status; the static gateway
+  configuration; the DynamoDB configuration source, read again for this; or an API Key
+  Provider `agent_id` any of those surfaces names, in its base, variants or Transit Points; a
+  surface delete revokes the deleted surface's keys even when a provider names its id. It
+  also keeps the keys of an owner whose newest key was created within
+  `cache_refresh_interval_secs` (30 seconds when it is `0`), since its surface may exist on
+  another node sharing the storage and not be visible here yet; those keys wait for the next
+  activation. It revokes nothing, with a `WARN`, when the keys cannot all be read, the agent
+  surface folder cannot be read, the DynamoDB source cannot be read, a surface's variants
+  cannot be resolved, the configuration source is neither `local` nor `dynamodb`, or no
+  surface is found at all (the folder, the store, the static configuration and the DynamoDB
+  source hold none), which the `WARN` reports naming the agent surface folder, as when
+  `storage_paths.agent_surfaces` points at the wrong or an unmounted folder. It reads the keys
+  before the surfaces, so a surface created meanwhile, whose keys can only follow it, is seen.
+  A Standby node revokes nothing, a node that steps down while the sweep runs stops before the
+  next owner, and a configuration reload does not run it. A key a concurrent delete revoked
+  first is left as it is, without an error. A second run revokes nothing more.
+- In either mode, a new surface cannot take an id whose key folder holds any key record,
+  readable or not, such as the kept keys of a deleted surface: the create answers `400` "Surface
+  ID '…' is not available". The create reads only the key folder of that id, from disk; when
+  that folder cannot be read it answers `503` "API key store is unavailable". To free the id
+  of a deleted surface, delete each of its kept keys (`DELETE /v1/api-keys/{surface id}/{key
+  id}`) as a caller that may [clean up orphaned keys](ACCESS_TOKENS.md#orphaned-api-keys); a
+  tenant-, resource- or header-gated PAT cannot. A create with that id then answers `201`, and
+  the new surface derives new DIDs from its own new keys. A record the gateway cannot read is
+  not listed and cannot be deleted through the API, so it keeps the id taken. `POST
+  /v1/surfaces` is the only way to create a surface that checks the id: a surface template is
+  applied in the dashboard and saved through it, and `PUT` and `PATCH` answer `404` for an id
+  with no surface. A surface that reaches the gateway another way is not checked: a file written
+  to the agent surface folder by hand or by a seeding tool, picked up at boot, by a
+  configuration reload, the cache refresh scan or as another node's write; a surface loaded from
+  the DynamoDB configuration source; and a backup restore, which replaces the whole `_storage`
+  directory with the surfaces and key folders of one backup when both folders sit in it, as by
+  default. Such a surface counts as the owner of the keys in its id's key folder. The checks
+  above and below still hold it to the rules for keys of other surfaces, such as
+  `other_surface` and `missing_owner` under `enforce`.
+- A key or owning surface that cannot be found is checked again later. A key that cannot be
+  found (`missing_key`) makes the surface not ready in either mode; an owning surface that cannot
+  be found (`missing_owner`) is only reported under `warn` and makes the surface not ready under
+  `enforce`. The key or its owning surface may exist on another node that shares the storage and
+  not be visible here yet, so the request after
   `cache_refresh_interval_secs` (30 seconds when it is `0`) checks it again; a key that has
   appeared by then is held to the rules above. Until then the verdict is kept, so a surface
-  naming a key that does not exist does not read the API key store on every request. Each read
-  of the API key store picks up the keys of a surface whose first key another node created; a
-  key another node adds for a surface whose keys this node already holds shows up only with
+  naming a key that does not exist does not read the API key store on every request. Each check
+  picks up the keys of a surface whose first key another node created, and reads from disk the
+  key folder of the surface checked and of the surfaces owning the keys it names, so a key
+  another node added to or revoked in those folders is seen. A key another node adds to any
+  other folder whose keys this node already holds shows up only with
   `cache_refresh_interval_secs` greater than `0`, or when this node becomes Active (see
   [Server mode](CONFIGURATION_RELOAD.md#server-mode)).
 - While the API key store cannot be read, a surface naming an `atgk_` id is not ready in either
   mode unless it was checked before the outage and has not gone live again since; a surface that
-  goes live during the outage loses its earlier verdict. The outage is logged once. Each request
-  to an unchecked surface checks again, so it serves once a read succeeds.
+  goes live during the outage loses its earlier verdict. A surface checked before the outage
+  whose keys were all found keeps serving through its rechecks as long as the key folders those
+  rechecks read can be read; when one of them cannot, it is not ready like a surface checked
+  during the outage. A surface naming a key that was missing is checked again against the whole
+  store, so an outage then makes it not ready. The outage is logged once. The outage verdict is
+  kept like a missing key's, so the request after `cache_refresh_interval_secs` (30 seconds when
+  it is `0`) checks again and the surface serves once a read succeeds; requests before then are
+  refused without reading the store.
+- While the keys of a surface's key folder cannot be loaded, for example when the folder cannot
+  be read, a key id that no loaded folder holds is judged `store_unavailable`, never as a missing
+  key, since that folder may hold it: a surface naming it is not ready in either mode, and a key
+  id found in a loaded folder is judged as usual. Surfaces whose key ids are all found keep
+  serving. A single key record that cannot be parsed or decrypted is dropped instead, so its key
+  reads as missing (`api_key_missing`). A save that adds a reference to such an id
+  answers `503` "API key store is unavailable"; one the stored surface already named is kept.
+  While any stored surface names a key id, a tenant reassignment of any resource, and its
+  impact preview, are refused with the same message until the folder can be loaded. The gateway logs the folders once, by name.
+- Boot and a configuration reload read the API key store once for all the surfaces they bring
+  live, and their credential policy report judges from that same listing. While that listing
+  fails, the report logs one warning and lists every surface naming a key id as
+  `store_unavailable`, never as `missing_key`; while it leaves key folders out, the report names
+  them and lists a key id no loaded folder holds as `store_unavailable`.
 - If the API key store fails to start, the gateway runs without it until it restarts: every
   surface naming an `atgk_` id stays not ready in either mode. Fix the store and restart.
 
 The check also covers a Caller Context API Key `secret_id` that starts with `atgk_` on a view
 whose inbound Identity is From API Key: a secret stored before the prefix was reserved. It is
-reported like a key id when a key of that id belongs to a surface the surface may not
-reference, or to a surface with no tenant; otherwise it is a plain secret and is not reported.
+reported like a key id when a key of that id is revoked, or belongs to a surface the surface
+may not reference, or to a surface with no tenant; otherwise it is a plain secret and is not
+reported. A key whose owning surface was deleted is not reported as `missing_owner` for such a
+secret; deleting the surface revokes the key, so it is reported as `revoked_key` and the surface
+is not ready in either mode; only a key the delete could not revoke, because its folder could
+not be read, stays usable as such a secret. Only a secret stored before the
+prefix was reserved can reach this, since new secret ids may not start with `atgk_`.
 
 A not-ready surface refuses every request with `503` before source authentication, policy and
 the target, on direct inbound, Fabric receive and its Transit Points, as a [not ready Access
-Point](#not-ready-access-points) does. The refusal is logged with `reason=provider_key_tenant`,
-or `reason=api_key_store_unavailable` during a store outage, and recorded in the Audit Log as
+Point](#not-ready-access-points) does. The refusal is logged with the reason `api_key_revoked`
+for a revoked key, `api_key_missing` for a key id no key has, `provider_key_tenant` for a key
+the surface may not use, or
+`reason=api_key_store_unavailable` during a store outage, which is named first, and recorded in
+the Audit Log as
 `request_rejected` with the reason `access_point_not_ready` (a Transit Point refusal is logged
 only). The agent card preview of such a surface reports `unsupported_reason: not_running` and
 fetches nothing. The surface response's `access_point_status` stays `ready`, and the Audit Log
 reason is the one a closed surface without source authentication gets, so neither says why. The
 `WARN` line with `rule="provider_key_tenant"` always does; the credential policy report lists the
-surface too, but only at boot and on reload.
+surface too, but only at boot and on reload. Per surface, a `blocking` entry in
+[`api_key_references`](#closed-and-public-access-points) names the key that keeps it from
+serving, `serving_status` is `not_serving` while this node refuses it, and the Surface Builder
+rings the Identity that names a blocking key.
+
+A surface refused during a key folder or store outage serves again once the read succeeds, with
+the same DID. A surface refused for a revoked, missing or other surface's key, or under
+`enforce` for `missing_owner`, serves again once it names an active key of its own: select one
+in place of the refused key, or add a key to the surface and name it. Either
+gives the surface a new DID, since the DID is derived from the key id and every new key gets a
+new id. A revoked key cannot be rotated or restored, and a deleted one cannot come back. A
+recreated surface gets new DIDs too. Update whatever is bound to the old DID, such as Trust
+Registry and Trust Recorder entries, Trust Check lists, policies that match it, and partners
+that allow it.
 
 `from_api_key` on the protected, external and Transit Point slots needs a non-empty
 `api_key_id`; a stored one without it is refused at request time (see the table below). A surface with no inbound identity whose protected slot is `from_api_key`,
@@ -1490,6 +1730,30 @@ is managed elsewhere too. It gets its name back when that surface is deleted or 
 issuing a managed identity. A DID first issued
 to a caller keeps its External Caller origin when the same key later becomes a Managed
 Agent's key, so it is never named; issue that Managed Agent a new key.
+
+#### Revoked identities
+
+The dashboard identity list marks an identity `revoked` when the API key its DID comes from is
+revoked or deleted, or when every surface it is linked to was deleted, whatever its DID comes
+from. Both are computed on every list and never stored.
+
+- The API key is the identity's `api_key_id` credential principal; an identity with a
+  `certificate_id` has none. A key is deleted when its id has the `atgk_` prefix and no key
+  record has it, so a plain secret id never reads as deleted. The keys are read from one
+  complete listing of the API key store; when it is not set or a key folder cannot be read, no
+  identity is marked revoked for its key.
+- An identity is linked to a surface through the surface it was created or last used on and
+  every surface in its usage. It is marked `surface_deleted` when it has at least one such link
+  and none of those surfaces exists; an identity with no surface link never is, and when the
+  surface store cannot be listed none is. When the surface it was created or last used on is
+  deleted but another surface in its usage is live, the list shows the most recently used live
+  surface (ties broken by surface id) as the identity's surface, so a deleted surface is never
+  linked. The identity record keeps no surface name, so the Identities page shows the surface id
+  of a deleted surface as plain text marked Deleted.
+
+The Identities page shows a red Revoked badge on a revoked identity. A dashboard update re-sends
+the identities whose API key this node revoked or deleted, and those whose last surface this
+node deleted; a change made on another node shows on the next full load.
 
 #### Agent Card names
 

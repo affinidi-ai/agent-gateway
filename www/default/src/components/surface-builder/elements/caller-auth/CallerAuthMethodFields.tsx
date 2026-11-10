@@ -4,6 +4,7 @@ import { apiClient } from '../../../../api';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import { deepLinks } from '../../../../utils/deepLinks';
 import type { ConfigPanelProps } from '../types';
+import type { JwtAudienceClaim } from '../../../../types';
 import type { CallerAuthMethodType } from './methodOptions';
 import CallerAuthDiscoverySection from './CallerAuthDiscoverySection';
 import {
@@ -72,6 +73,7 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
   }, [method]);
 
   const audiences: string[] = Array.isArray(config.audiences) ? config.audiences : [];
+  const audienceClaim: JwtAudienceClaim = config.jwt_audience_claim ?? 'aud';
   const hasDiscovery = readProtectedResource(config.protected_resource) !== null;
   const discoveryOn = allowDiscovery && method === 'jwt_bearer' && hasDiscovery;
   const showsDiscovery =
@@ -207,21 +209,57 @@ const CallerAuthMethodFields: React.FC<CallerAuthMethodFieldsProps> = ({
                 tokens whose audience is the resource URL.
               </div>
             ) : (
-              audiences.length === 0 && (
-                <div className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2">
+              audiences.length === 0 &&
+              audienceClaim === 'aud' && (
+                <div
+                  className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2"
+                  data-testid={`${idPrefix}-audiences-missing-warning`}
+                >
                   <i className="fas fa-exclamation-triangle"></i>
                   <span>
-                    No audience configured. <code>aud</code> claim validation will be skipped. It is
-                    strongly recommended to set at least one audience value to prevent tokens issued
-                    for other services from being accepted.
+                    No audience configured. A token the identity provider issued for any other
+                    service is accepted. A new method cannot be saved without one; a method saved
+                    before keeps working until it is changed.
                   </span>
                 </div>
               )
             )}
             <small className="form-text text-muted">
-              Optional. When set, the token's <code>aud</code> claim must match at least one of
-              these values. Press <kbd>Enter</kbd> or <kbd>,</kbd> to add.
+              Required. The token&apos;s <code>{audienceClaim}</code> claim must match at least one
+              of these values. Press <kbd>Enter</kbd> or <kbd>,</kbd> to add.
             </small>
+          </div>
+
+          <div className="mb-3">
+            <label htmlFor={`${idPrefix}-jwt-audience-claim`} className="form-label fw-bold">
+              Audience Claim
+            </label>
+            <select
+              id={`${idPrefix}-jwt-audience-claim`}
+              data-testid={`${idPrefix}-jwt-audience-claim`}
+              className="form-control dropdown-styling"
+              value={audienceClaim}
+              disabled={discoveryOn}
+              onChange={e => updateField('jwt_audience_claim', e.target.value)}
+            >
+              <option value="aud">aud (the service the token was issued for)</option>
+              <option value="client_id">client_id (the client the token was issued to)</option>
+              <option value="azp">azp (the client the token was issued to)</option>
+            </select>
+            {audienceClaim !== 'aud' && (
+              <div
+                className="alert alert-warning py-1 px-2 mt-2 mb-0 small d-flex align-items-center gap-2"
+                data-testid={`${idPrefix}-jwt-audience-claim-warning`}
+              >
+                <i className="fas fa-exclamation-triangle"></i>
+                <span>
+                  Only for identity providers whose access tokens carry no <code>aud</code>. A token
+                  a listed client was issued for another service is accepted too, so these callers
+                  get no per-user delegated credentials: the surface cannot have a credential
+                  binding in on_demand, pre_authorize or elicit mode.
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="row g-3 mb-3">
