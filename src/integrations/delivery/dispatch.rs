@@ -396,6 +396,28 @@ pub mod dispatched {
             .map(|(event_id, _)| event_id.clone())
             .collect()
     }
+
+    /// The values of the dispatched `event_id` events whose `variable` was `value`, in dispatch
+    /// order.
+    pub fn values_of(
+        event_id: &str,
+        variable: &str,
+        value: &str,
+    ) -> Vec<HashMap<String, String>> {
+        EVENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(id, values)| {
+                id == event_id
+                    && values
+                        .get(variable)
+                        .map(String::as_str)
+                        == Some(value)
+            })
+            .map(|(_, values)| values.clone())
+            .collect()
+    }
 }
 
 /// Delivers each route in a background task of its own, so a slow or failing endpoint never

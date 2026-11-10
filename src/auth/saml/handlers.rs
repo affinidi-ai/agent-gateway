@@ -264,6 +264,10 @@ pub async fn saml_acs(
         .validate_response(&form.saml_response)
         .map_err(|e| {
             error!("SAML response validation failed: {}", e);
+            crate::integrations::trigger_user_login_failed(
+                crate::integrations::LoginMethod::Saml,
+                crate::integrations::LoginFailure::SamlRejected,
+            );
             StatusCode::UNAUTHORIZED
         })?;
 
@@ -997,6 +1001,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(acs_return_target(&state.saml_service, Some(&key)), "/");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_saml_response_raises_login_failed_naming_no_user() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let state = saml_state(dir.path()).await;
+        let unsigned = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>mallory@example.test</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#;
+
+        let response = saml_acs(
+            Extension(None),
+            State(state),
+            Form(SamlLoginForm {
+                saml_response: base64::engine::general_purpose::STANDARD.encode(unsigned),
+                relay_state: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response
+                .map(|response| response.status())
+                .unwrap_or_else(|error| error.into_response().status()),
+            StatusCode::UNAUTHORIZED
+        );
+        let raised =
+            crate::integrations::delivery::dispatch::dispatched::values_of("user.login_failed", "FAILURE_REASON", "saml_rejected");
+        assert!(!raised.is_empty());
+        for values in raised {
+            assert_eq!(values["LOGIN_METHOD"], "saml");
+            assert!(!values.contains_key("USER_ID"), "{values:?}");
+            assert!(
+                !values
+                    .values()
+                    .any(|value| value.contains("mallory")),
+                "{values:?}"
+            );
+        }
     }
 
     fn bearer_headers(token: &str) -> axum::http::HeaderMap {

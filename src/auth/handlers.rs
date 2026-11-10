@@ -451,13 +451,14 @@ pub async fn login_finish(
         .clone();
 
     // Verify the credential
-    let _auth_result = auth_state
+    if let Err(e) = auth_state
         .webauthn
         .finish_passkey_authentication(&req.credential, &auth_state_data)
-        .map_err(|e| {
-            error!("Failed to finish passkey authentication: {}", e);
-            StatusCode::UNAUTHORIZED
-        })?;
+    {
+        error!("Failed to finish passkey authentication: {}", e);
+        raise_failed_passkey_sign_in(&auth_state.storage, &username).await;
+        return Err(StatusCode::UNAUTHORIZED.into());
+    }
 
     // Load user to get user_id
     let mut user = auth_state
@@ -470,6 +471,10 @@ pub async fn login_finish(
         })?
         .ok_or_else(|| {
             error!("User not found after authentication");
+            crate::integrations::trigger_user_login_failed(
+                crate::integrations::LoginMethod::Passkey,
+                crate::integrations::LoginFailure::UnknownUser,
+            );
             StatusCode::UNAUTHORIZED
         })?;
 
@@ -520,6 +525,25 @@ pub async fn login_finish(
             consent_required: finalized_session.consent_required,
         }),
     ))
+}
+
+/// Raises `user.login_failed` for a passkey sign-in whose credential did not verify, classified by
+/// the account its challenge named. The event carries that account as stored, never the username
+/// the caller typed, and the caller's answer is the same whichever way it is classified.
+async fn raise_failed_passkey_sign_in(
+    storage: &super::storage::PasskeyStorage,
+    username: &str,
+) {
+    match storage
+        .load_user(username)
+        .await
+    {
+        Ok(account) => crate::integrations::trigger_user_login_failed(
+            crate::integrations::LoginMethod::Passkey,
+            crate::integrations::LoginFailure::of_passkey_account(account.as_ref()),
+        ),
+        Err(e) => error!("Failed to look up the account of a failed passkey sign-in; no event raised: {}", e),
+    }
 }
 
 /// Check authentication status
@@ -590,13 +614,17 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_start, register_start};
+    use super::{
+        LoginFinishRequest, LoginFinishResponse, LoginStartRequest, RegisterStartRequest, login_finish, login_start,
+        register_start,
+    };
     use crate::auth::{
         AuthState,
         storage::UserData,
         types::{UserRole, UserStatus},
     };
-    use axum::{Json, extract::State};
+    use crate::integrations::delivery::dispatch::dispatched;
+    use axum::{Json, extract::State, response::IntoResponse};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
 
@@ -633,12 +661,13 @@ mod tests {
         state: &AuthState,
         username: &str,
         status: UserStatus,
-    ) {
+    ) -> String {
         let now = chrono::Utc::now();
+        let user_id = uuid::Uuid::new_v4().to_string();
         state
             .storage
             .save_user(&UserData {
-                user_id: uuid::Uuid::new_v4().to_string(),
+                user_id: user_id.clone(),
                 username: username.to_string(),
                 passkeys: Vec::new(),
                 role: UserRole::User,
@@ -657,6 +686,84 @@ mod tests {
             })
             .await
             .unwrap();
+        user_id
+    }
+
+    /// A well-formed assertion signed by no passkey the gateway holds.
+    fn unheld_passkey_assertion(challenge_id: String) -> LoginFinishRequest {
+        serde_json::from_value(serde_json::json!({
+            "challenge_id": challenge_id,
+            "credential": {
+                "id": "AAECAwQFBgcICQoLDA0ODw",
+                "rawId": "AAECAwQFBgcICQoLDA0ODw",
+                "type": "public-key",
+                "response": {
+                    "authenticatorData": "AAAA",
+                    "clientDataJSON": "AAAA",
+                    "signature": "AAAA",
+                    "userHandle": null
+                },
+                "extensions": {}
+            }
+        }))
+        .expect("a well-formed assertion")
+    }
+
+    /// Starts a passkey sign-in for `username` and finishes it with a passkey the gateway does
+    /// not hold, returning the status the caller gets.
+    async fn fail_passkey_sign_in(
+        state: &Arc<AuthState>,
+        username: &str,
+    ) -> axum::http::StatusCode {
+        let Json(started) = login_start(State(state.clone()), Json(LoginStartRequest { username: username.to_string() }))
+            .await
+            .unwrap();
+        login_finish(axum::Extension(None), State(state.clone()), Json(unheld_passkey_assertion(started.challenge_id)))
+            .await
+            .map(|response| response.into_response().status())
+            .unwrap_or_else(|error| error.into_response().status())
+    }
+
+    #[tokio::test]
+    async fn a_failed_passkey_sign_in_raises_login_failed_naming_the_stored_account_and_its_reason() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let approved = save_user(&state, "approved-user", UserStatus::Approved).await;
+        let pending = save_user(&state, "pending-user", UserStatus::New).await;
+
+        for (username, user_id, reason) in
+            [("approved-user", &approved, "invalid_credential"), ("pending-user", &pending, "not_approved")]
+        {
+            let status = fail_passkey_sign_in(&state, username).await;
+
+            assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{username}");
+            let raised = dispatched::values_of("user.login_failed", "USER_ID", user_id);
+            assert_eq!(raised.len(), 1, "{username}: {raised:?}");
+            assert_eq!(raised[0]["FAILURE_REASON"], reason);
+            assert_eq!(raised[0]["LOGIN_METHOD"], "passkey");
+            assert_eq!(raised[0]["USERNAME"], username);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_passkey_sign_in_for_an_unknown_account_raises_login_failed_naming_no_user() {
+        let (_temp_dir, state) = test_auth_state().await;
+        let username = format!("unknown-{}", uuid::Uuid::new_v4());
+
+        let status = fail_passkey_sign_in(&state, &username).await;
+
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        let raised = dispatched::values_of("user.login_failed", "FAILURE_REASON", "unknown_user");
+        assert!(!raised.is_empty());
+        for values in raised {
+            assert!(!values.contains_key("USER_ID"), "{values:?}");
+            assert!(!values.contains_key("USERNAME"), "{values:?}");
+            assert!(
+                !values
+                    .values()
+                    .any(|value| value.contains(&username)),
+                "{values:?}"
+            );
+        }
     }
 
     #[tokio::test]
