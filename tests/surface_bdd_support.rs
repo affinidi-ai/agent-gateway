@@ -546,3 +546,69 @@ async fn gateway_process_rejects_invalid_test_login_token() {
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn the_redis_stand_in_records_what_a_redis_client_adds_to_a_stream() {
+    use redis::AsyncCommands;
+    let stand_in = bdd_support::redis_stream::RedisStreamStandIn::start().await;
+    let client = redis::Client::open(stand_in.url()).unwrap();
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+
+    let id: String = connection
+        .xadd("sign-ins", "*", &[("data", r#"{"event_type":"user.login"}"#)])
+        .await
+        .unwrap();
+
+    assert_eq!(id, "1-0");
+    assert_eq!(
+        stand_in.entries(),
+        [bdd_support::redis_stream::StreamEntry {
+            stream: "sign-ins".to_string(),
+            fields: vec![("data".to_string(), r#"{"event_type":"user.login"}"#.to_string())],
+        }]
+    );
+}
+
+fn webauthn_for_localhost() -> webauthn_rs::prelude::Webauthn {
+    webauthn_rs::prelude::WebauthnBuilder::new("localhost", &url::Url::parse("http://localhost:32001").unwrap())
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn a_registered_soft_passkey_signs_in_and_an_unregistered_one_is_refused() {
+    use bdd_support::passkey::SoftPasskey;
+    let webauthn = webauthn_for_localhost();
+    let mut passkey = SoftPasskey::new("localhost", "http://localhost:32001");
+    let (creation, registration) = webauthn
+        .start_passkey_registration(uuid::Uuid::new_v4(), "alpha", "alpha", None)
+        .unwrap();
+    let credential = passkey.register(&serde_json::to_value(&creation).unwrap());
+    let registered = webauthn
+        .finish_passkey_registration(&serde_json::from_value(credential).unwrap(), &registration)
+        .expect("the registration verifies");
+
+    let (request, authentication) = webauthn
+        .start_passkey_authentication(std::slice::from_ref(&registered))
+        .unwrap();
+    let request = serde_json::to_value(&request).unwrap();
+    let signed = webauthn.finish_passkey_authentication(
+        &serde_json::from_value(passkey.sign_in(&request)).unwrap(),
+        &authentication,
+    );
+    let mut unregistered = SoftPasskey::new("localhost", "http://localhost:32001");
+    let (request, authentication) = webauthn
+        .start_passkey_authentication(std::slice::from_ref(&registered))
+        .unwrap();
+    let refused = webauthn.finish_passkey_authentication(
+        &serde_json::from_value(unregistered.sign_in(&serde_json::to_value(&request).unwrap())).unwrap(),
+        &authentication,
+    );
+
+    assert!(signed.is_ok(), "{signed:?}");
+    assert!(refused.is_err());
+}

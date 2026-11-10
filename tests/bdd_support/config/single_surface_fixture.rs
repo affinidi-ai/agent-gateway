@@ -108,6 +108,10 @@ pub struct SurfaceConfigBuilder {
     pub api_key_provider_key_created_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The gateway starts in Standby mode.
     pub starts_standby: bool,
+    /// The Redis URL an integration stored before the gateway starts streams sign-in events to.
+    pub sign_in_event_stream: Option<String>,
+    /// Console users sign in with SAML rather than passkeys.
+    pub signs_in_with_saml: bool,
 }
 
 /// A prefix the operator adds to `gateway.json`.
@@ -216,6 +220,8 @@ impl Default for SurfaceConfigBuilder {
             protected_identity_api_key_id: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,
+            sign_in_event_stream: None,
+            signs_in_with_saml: false,
         }
     }
 }

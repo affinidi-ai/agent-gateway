@@ -608,6 +608,12 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if let Some(redis_url) = &surface_config.sign_in_event_stream {
+        crate::bdd_support::config::sign_in::write_sign_in_event_integration(&base_dir.join("_storage"), redis_url);
+    }
+    if surface_config.signs_in_with_saml {
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+    }
     if surface_config.starts_standby {
         start_standby(base_dir);
     }
