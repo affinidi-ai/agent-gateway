@@ -107,7 +107,7 @@ async fn register_passkey(
         .to_string()
 }
 
-#[given("an integration streams sign-in events")]
+#[given("an integration whose event set holds the sign-in events")]
 async fn integration_streams_sign_in_events(world: &mut SurfaceWorld) {
     let stream = RedisStreamStandIn::start().await;
     world
@@ -116,14 +116,14 @@ async fn integration_streams_sign_in_events(world: &mut SurfaceWorld) {
     world.sign_in_stream = Some(stream);
 }
 
-#[given("console users sign in with SAML")]
+#[given("human users sign in with SAML")]
 fn console_users_sign_in_with_saml(world: &mut SurfaceWorld) {
     world
         .surface_config
         .signs_in_with_saml = true;
 }
 
-#[given(expr = "{string} is an approved console user")]
+#[given(expr = "human user {string} is approved")]
 async fn approved_console_user(
     world: &mut SurfaceWorld,
     username: String,
@@ -135,7 +135,7 @@ async fn approved_console_user(
         .expect("the console user is provisioned");
 }
 
-#[given(expr = "{string} is an approved console user with a passkey")]
+#[given(expr = "human user {string} is approved and has a passkey")]
 async fn approved_console_user_with_passkey(
     world: &mut SurfaceWorld,
     username: String,
@@ -151,7 +151,7 @@ async fn approved_console_user_with_passkey(
     assert!((200..300).contains(&approved.status), "approving {username}: {}", approved.body);
 }
 
-#[given(expr = "{string} has registered a passkey and awaits approval")]
+#[given(expr = "human user {string} has registered a passkey and awaits approval")]
 async fn console_user_awaiting_approval(
     world: &mut SurfaceWorld,
     username: String,
@@ -159,7 +159,7 @@ async fn console_user_awaiting_approval(
     register_passkey(world, username).await;
 }
 
-#[given("another integration streams sign-in events with Agent Watch's record content")]
+#[given("another integration uses Agent Watch's template")]
 fn integration_streams_sign_in_records(world: &mut SurfaceWorld) {
     world
         .surface_config
@@ -186,7 +186,7 @@ async fn start_passkey_sign_in(
     });
 }
 
-#[given(expr = "a passkey sign-in has been started for {string}")]
+#[given(expr = "a passkey sign-in has been started for human user {string}")]
 async fn passkey_sign_in_started(
     world: &mut SurfaceWorld,
     username: String,
@@ -223,7 +223,7 @@ async fn finish_sign_in(
     );
 }
 
-#[when("the sign-in is finished with a passkey the gateway does not hold")]
+#[when("the sign-in is completed with a passkey that is not the user's")]
 async fn finish_with_unheld_passkey(world: &mut SurfaceWorld) {
     let mut passkey = passkey_for(world);
     let credential = passkey.sign_in(
@@ -236,7 +236,7 @@ async fn finish_with_unheld_passkey(world: &mut SurfaceWorld) {
     finish_sign_in(world, credential).await;
 }
 
-#[when("the sign-in is finished with the user's passkey")]
+#[when("the sign-in is completed with the user's passkey")]
 async fn finish_with_users_passkey(world: &mut SurfaceWorld) {
     let started = world
         .started_sign_in
@@ -270,7 +270,7 @@ async fn post_unsigned_saml_response(world: &mut SurfaceWorld) {
     );
 }
 
-#[when("a passkey sign-in is finished with a challenge the gateway did not issue")]
+#[when("a passkey sign-in is completed without a sign-in the gateway started")]
 async fn finish_with_unissued_challenge(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
     let mut passkey = passkey_for(world);
@@ -340,7 +340,7 @@ async fn receive_sign_in_payload(
     .expect("a JSON payload")
 }
 
-#[then(expr = "the stream receives a {string} event with login method {string}")]
+#[then(expr = "the integration receives a {string} event with login method {string}")]
 async fn stream_receives_sign_in(
     world: &mut SurfaceWorld,
     event_type: String,
@@ -350,7 +350,7 @@ async fn stream_receives_sign_in(
         Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &[("login_method", &method)]).await);
 }
 
-#[then(expr = "the stream receives a {string} event with login method {string} and failure reason {string}")]
+#[then(expr = "the integration receives a {string} event with login method {string} and failure reason {string}")]
 async fn stream_receives_failed_sign_in(
     world: &mut SurfaceWorld,
     event_type: String,
@@ -361,7 +361,9 @@ async fn stream_receives_failed_sign_in(
     world.sign_in_event = Some(receive_sign_in_payload(world, EVENT_TOPIC, "data", &event_type, &data).await);
 }
 
-#[then(expr = "the stream receives a {string} record with login method {string} and failure reason {string}")]
+#[then(
+    expr = "that integration receives the {string} event as a record with login method {string} and failure reason {string}"
+)]
 async fn stream_receives_failed_sign_in_record(
     world: &mut SurfaceWorld,
     event_type: String,
@@ -423,17 +425,17 @@ fn assert_exact_fields(
     }
 }
 
-#[then("that event has exactly the fields of a sign-in event naming an account")]
+#[then("that event carries only the fields of a sign-in event for an existing account")]
 fn event_has_the_fields_naming_an_account(world: &mut SurfaceWorld) {
     assert_exact_fields(sign_in_event(world), true);
 }
 
-#[then("that event has exactly the fields of a sign-in event naming no account")]
+#[then("that event carries only the fields of a sign-in event for no account")]
 fn event_has_the_fields_naming_no_account(world: &mut SurfaceWorld) {
     assert_exact_fields(sign_in_event(world), false);
 }
 
-#[then(expr = "that event names the console user {string}")]
+#[then(expr = "that event names human user {string}")]
 async fn event_names_console_user(
     world: &mut SurfaceWorld,
     username: String,
@@ -476,7 +478,7 @@ fn event_names_no_failure_reason(world: &mut SurfaceWorld) {
     );
 }
 
-#[then(expr = "that event matches the golden event {string}")]
+#[then(expr = "that event matches the reference event {string}")]
 fn event_matches_golden(
     world: &mut SurfaceWorld,
     name: String,
@@ -488,7 +490,7 @@ fn event_matches_golden(
     assert_eq!(normalise(event), golden(&name), "the event {event} against {}", golden_path(&name).display());
 }
 
-#[then(expr = "that record matches the golden event {string}")]
+#[then(expr = "that record matches the reference event {string}")]
 fn record_matches_golden(
     world: &mut SurfaceWorld,
     name: String,
@@ -507,14 +509,14 @@ fn record_matches_golden(
     assert_eq!(normalised["record"], golden["data"], "the record of {record} against the data of {name}");
 }
 
-#[then("that event is the only sign-in event the stream receives")]
+#[then("the integration receives no other sign-in event")]
 async fn event_is_the_only_one(world: &mut SurfaceWorld) {
     tokio::time::sleep(EXACTLY_ONCE_WAIT).await;
     let received = payloads(world, EVENT_TOPIC);
     assert_eq!(received.len(), 1, "expected one sign-in event; the stream received {received:?}");
 }
 
-#[then("the stream receives no sign-in event")]
+#[then("the integration receives no sign-in event")]
 async fn stream_receives_no_sign_in_event(world: &mut SurfaceWorld) {
     tokio::time::sleep(NO_EVENT_WAIT).await;
     let received = world
