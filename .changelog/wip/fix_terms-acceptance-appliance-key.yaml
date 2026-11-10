@@ -1,0 +1,17 @@
+branch: fix/terms-acceptance-appliance-key
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-10T15:30:00Z'
+      title: Keep sign-in working after the gateway DID changes and users re-accept Terms
+      description: >-
+        Terms acceptances are tied to the gateway's DID, so after the DID changes users are asked
+        to accept the Terms again. The re-acceptance was treated as a duplicate of the user's
+        earlier one when the Terms store loaded, so the next restart blocked every user with
+        "Access cannot be verified". The duplicate check now tells acceptances under different
+        gateway DIDs apart, as the acceptance lookup already did, and two acceptances by the same
+        user for the same Terms version under the same DID are still refused.
+  removed: []
+  security: []
+  breaking: []
