@@ -108,7 +108,7 @@ async fn load_raw_and_build_state(
 }
 
 /// Build a validated `DIDWebVHState` from already loaded raw log entries.
-async fn build_webvh_state(
+pub(crate) async fn build_webvh_state(
     did: &str,
     raw_entries: &[String],
 ) -> Result<didwebvh_rs::DIDWebVHState, String> {
