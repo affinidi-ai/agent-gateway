@@ -102,6 +102,8 @@ pub struct SurfaceConfigBuilder {
     pub stored_api_keys: Vec<StoredApiKeyFixture>,
     /// Further stored surfaces, disabled, by id.
     pub other_stored_surfaces: Vec<String>,
+    /// Further stored surfaces, each on its own route and with its own status.
+    pub stored_surfaces_on_routes: Vec<StoredSurfaceFixture>,
     /// The key id the seeded surface's protected Identity takes its DID from.
     pub protected_identity_api_key_id: Option<String>,
     /// When the API Key Provider's key was created; when the gateway starts if absent.
@@ -116,6 +118,16 @@ pub enum GatewayPrefixFixture {
     Channel(String),
     McpProxy(String),
     Redirect { prefix: String, target: String },
+}
+
+/// A surface stored before the gateway starts, on a route of its own that
+/// `gateway.json` does not add as a prefix.
+#[derive(Debug, Clone)]
+pub struct StoredSurfaceFixture {
+    pub id: String,
+    pub route: String,
+    /// `active` or `disabled`.
+    pub status: String,
 }
 
 /// An API key record stored before the gateway starts.
@@ -213,6 +225,7 @@ impl Default for SurfaceConfigBuilder {
             gateway_prefixes: Vec::new(),
             stored_api_keys: Vec::new(),
             other_stored_surfaces: Vec::new(),
+            stored_surfaces_on_routes: Vec::new(),
             protected_identity_api_key_id: None,
             api_key_provider_key_created_at: None,
             starts_standby: false,

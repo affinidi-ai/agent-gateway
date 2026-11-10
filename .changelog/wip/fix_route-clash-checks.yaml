@@ -1,0 +1,53 @@
+branch: fix/route-clash-checks
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T11:58:19Z'
+      title: Treat surface routes that differ only by a trailing slash as one route
+      description: >-
+        A new or changed route is stored without a trailing `/`, and routes that differ
+        only by one count as the same route, when saving and when the gateway starts. Of
+        two stored active surfaces like that on one listener, startup keeps the one that
+        received the requests, the one whose stored route ends in `/`, and disables the
+        other.
+  removed: []
+  security:
+    - timestamp: '2026-11-09T13:20:00Z'
+      title: Refuse saving a surface route that could take another surface's traffic
+      description: >-
+        A surface route could contain `$` or `%24` and spell another surface's variant
+        URL, or end in extra slashes and outrank a more specific surface, so requests
+        meant for the other surface reached it. The admin API now refuses a new or
+        changed route that is not a plain path, and the gateway ranks surfaces by their
+        route without trailing slashes. A stored route like that keeps serving as
+        before; the gateway logs a warning for it at startup, so move it or disable the
+        surface.
+  breaking:
+    - timestamp: '2026-11-10T10:00:00Z'
+      title: Refuse a gateway.json in which two entries serve the same path
+      description: >-
+        Two entries of `channels`, `mcp_proxies` and `routes` on one prefix made the
+        gateway crash while building its router, or let one entry hide the other. The
+        gateway now refuses to start with such a file, and a reload refuses it, naming
+        each pair. A `redirect` beside a `proxy` route or an `mcp_proxies` prefix on the
+        same prefix is still accepted, since one serves only the prefix and the other
+        only the paths below it. Every prefix but a `redirect`'s is now read without a
+        trailing `/`, so a channel at `/agents/` serves `/agents/foo`, and `/agents`
+        beside `/agents/` is a clashing pair. Before upgrading, check `channels`,
+        `mcp_proxies` and `routes` for prefixes that are equal once a trailing `/` is
+        dropped.
+    - timestamp: '2026-11-10T10:30:00Z'
+      title: Refuse to save a surface on a route callers cannot reach
+      description: >-
+        The admin API saved an active surface whose route no surface prefix served, or
+        on a path another gateway.json entry serves, such as `/api/...` or a `redirect`,
+        and callers never reached it there. It now refuses a new or changed route like
+        that with `400`, naming the entry that serves the path or listing the surface
+        prefixes, read from gateway.json as it is on disk. This holds for surfaces
+        reached only over Fabric, or used only for their Transit Points, too: API
+        clients that save them on such routes must move them under a surface prefix,
+        which also moves the default paths of their Transit Points. A route an active
+        surface already had is not checked again, so older surfaces can still be
+        edited, and the gateway logs a warning at startup for each one callers cannot
+        reach.

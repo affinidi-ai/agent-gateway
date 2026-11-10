@@ -3977,6 +3977,17 @@ pub async fn run_axum_proxy(
                 eprintln!("{}", banner);
             }
 
+            for (surface, reason) in network_config.unservable_surfaces(&all_surfaces) {
+                warn!(
+                    surface = %loggable::untrusted(&surface.name),
+                    surface_id = %loggable::untrusted(&surface.surface_id),
+                    reason = %loggable::untrusted(&reason),
+                    "This stored surface's Access Point route breaks the rules a save now checks: move it to a plain \
+                     path under a surface prefix, or disable it. Fabric callers, who find the surface by id, are not \
+                     affected"
+                );
+            }
+
             crate::config::group_outbound_vcs_by_port(&all_surfaces, &outbound_ports, map_outbound_address_to_port)
         };
 

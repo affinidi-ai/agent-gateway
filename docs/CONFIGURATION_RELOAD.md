@@ -90,7 +90,8 @@ shared outbound ports:
    prefix shadows a dashboard page is left out of the rebuilt routers, as at startup (see
    `channels` in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md)): the reload logs an
    error and returns a `warning` naming each prefix and the page it shadows, and serves everything
-   else.
+   else. A `gateway.json` in which two entries use the same prefix fails
+   the reload here, naming each pair, before anything is replaced.
 3. Clear stale task-monitor entries; rebuilding the routers registers them again.
 4. Replace the shared `GatewayConfig` and save the successful snapshot to the configuration cache.
 5. Group active surfaces by listener and rebuild derived surface state. Each surface's outbound
