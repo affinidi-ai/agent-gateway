@@ -9551,7 +9551,7 @@ mod tests {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
                 assert_eq!(
                     error,
-                    json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+                    json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "code": "batch_not_supported", "detail": "JSON-RPC batches are not supported"}),
                     "{tool}"
                 );
             }

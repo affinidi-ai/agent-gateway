@@ -3154,7 +3154,7 @@ async fn fabric_tool_call_batch_flow() {
         assert_eq!(response["headers"]["content-type"], "application/problem+json", "{tool}");
         assert_eq!(
             body,
-            json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+            json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "code": "batch_not_supported", "detail": "JSON-RPC batches are not supported"}),
             "{tool}"
         );
         assert_eq!(

@@ -14,7 +14,8 @@ changes:
       title: Drop the A2A error type from the MCP batch refusal
       description: >-
         A JSON-RPC batch sent to an MCP surface still gets a 422 application/problem+json
-        answer, but its type is now about:blank instead of an A2A protocol URL.
+        answer, but its type is now about:blank instead of an A2A protocol URL, and it carries
+        code: batch_not_supported so callers can tell it from other 422 answers.
   removed: []
   security: []
   breaking: []

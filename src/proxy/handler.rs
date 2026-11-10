@@ -10135,20 +10135,13 @@ async fn multi_channel_proxy_handler_in_request_scope(
 // Helper functions
 
 fn no_route_response(path: &str) -> Response {
-    let body = serde_json::json!({
-        "type": "about:blank",
-        "title": "Not Found",
-        "status": 404,
-        "code": "no_route",
-        "detail": format!(
+    crate::protocols::problem_response(
+        StatusCode::NOT_FOUND,
+        "no_route",
+        &format!(
             "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
         ),
-    });
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("content-type", "application/problem+json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
+    )
 }
 
 /// Format an error response body as a human-readable tail for the gateway log

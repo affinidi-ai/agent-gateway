@@ -1408,6 +1408,7 @@ async fn access_point_refuses_tool_call_batches_before_tool_level_controls() {
                 "type": "about:blank",
                 "title": "Unprocessable Entity",
                 "status": 422,
+                "code": "batch_not_supported",
                 "detail": "JSON-RPC batches are not supported"
             }),
             "{tool}"
