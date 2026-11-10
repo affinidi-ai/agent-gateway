@@ -261,6 +261,33 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                     || crate::surfaces::RetiredA2aSwitches::read(&state.bootstrap_config),
                 )
                 .await;
+                if let Some(authorities) = state
+                    .authority_store
+                    .as_deref()
+                {
+                    match crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+                        authorities,
+                        state
+                            .issuer_store
+                            .as_deref()
+                            .map(|store| store as &dyn crate::issuers::IssuerStore),
+                    )
+                    .await
+                    {
+                        Ok(registers) => {
+                            crate::surfaces::record_authority_sources(
+                                agent_surface_store,
+                                &mut channels,
+                                !crate::server::mode::is_standby(),
+                                &registers,
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            warn!(%error, "Failed to read the Authorities; reloaded authority DIDs stay unclassified")
+                        }
+                    }
+                }
                 for surface in channels
                     .iter()
                     .filter(|surface| given.contains(&surface.surface_id))

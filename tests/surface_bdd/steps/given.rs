@@ -591,7 +591,7 @@ async fn surface_has_request_policy_allowing_a2a_metadata_field(
 }
 
 /// Adds a trust registry whose connection fails, so it stays stored but unconnected.
-async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
+pub(crate) async fn create_unconnected_trust_registry(world: &mut SurfaceWorld) -> String {
     crate::steps::when::ensure_admin_session(world).await;
     let registry_name = format!("bdd-unreachable-registry-{}", uuid::Uuid::new_v4());
     let admin_client = world
@@ -710,6 +710,36 @@ fn surface_has_caller_trust_check_with_entity_template(
         .surface_config
         .caller_trust_check_list
         .push(element);
+}
+
+const DELETED_AUTHORITY_DID: &str = "did:web:deleted-authority.example";
+
+#[given("the caller-leg Trust Check takes its authority from an Authority that no longer exists")]
+fn caller_trust_check_uses_deleted_authority(world: &mut SurfaceWorld) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    element["query"]["authority_id"] = serde_json::json!(DELETED_AUTHORITY_DID);
+    element["authority_source"] = serde_json::json!("authority");
+}
+
+#[given(
+    expr = "the Trust Recorder for trust registry {string} takes its authority from an Authority that no longer exists"
+)]
+fn trust_recorder_uses_deleted_authority(
+    world: &mut SurfaceWorld,
+    trust_registry_id: String,
+) {
+    let entry = world
+        .surface_config
+        .trust_recorder_entries
+        .iter_mut()
+        .find(|entry| entry["trust_registry_id"] == trust_registry_id)
+        .unwrap_or_else(|| panic!("the surface has no Trust Recorder for trust registry {trust_registry_id:?}"));
+    entry["authority_did"] = serde_json::json!(DELETED_AUTHORITY_DID);
+    entry["authority_source"] = serde_json::json!("authority");
 }
 
 const RECORDER_AUTHORITY_DID: &str = "did:web:example.com:authority";

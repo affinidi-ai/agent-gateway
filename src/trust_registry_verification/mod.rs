@@ -1,5 +1,6 @@
 //! Trust Registry integration for agent authorization
 
+pub mod authority_source;
 pub mod metadata_gate;
 pub mod predefined_queries;
 pub mod recorder_status;

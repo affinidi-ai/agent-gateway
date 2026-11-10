@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { apiClient } from '../../api';
 import { showToast } from '../../utils/toaster';
 import { getErrorMessage } from '../../utils/apiError';
+import { WarningDialog } from '../shared/WarningDialog';
 
 export type ApiKeyAction = 'delete' | 'revoke';
 
@@ -74,60 +75,41 @@ export const ApiKeyActionDialog: React.FC<ApiKeyActionDialogProps> = ({
   };
 
   return (
-    <>
-      <div
-        className="modal fade show"
-        style={{ display: 'block' }}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={`${testId}-title`}
-        data-testid={testId}
-      >
-        <div className="modal-dialog modal-dialog-centered">
-          <div className="modal-content">
-            <div className="modal-header">
-              <h5 className="modal-title" id={`${testId}-title`}>
-                <i className="fas fa-triangle-exclamation me-2 text-danger" aria-hidden="true" />
-                {copy.title}
-              </h5>
-              <button type="button" className="btn-close" onClick={onCancel} aria-label="Close" />
-            </div>
-            <div className="modal-body">
-              <p>
-                {copy.question} {clientId ? <strong>{clientId}</strong> : null} <code>{keyId}</code>
-                ?
-              </p>
-              <p className="mb-0">{copy.consequence}</p>
-            </div>
-            <div className="modal-footer">
-              <button type="button" className="btn btn-secondary" onClick={onCancel}>
-                Cancel
-              </button>
-              <button
-                type="button"
-                className={`btn ${copy.confirmClass}`}
-                data-testid={`${testId}-confirm`}
-                disabled={running}
-                onClick={confirm}
-              >
-                {running ? (
-                  <span
-                    className="spinner-border spinner-border-sm me-1"
-                    role="status"
-                    aria-hidden="true"
-                  />
-                ) : (
-                  <i className={`fas ${copy.confirmIcon} me-1`} aria-hidden="true" />
-                )}
-                {copy.title}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div className="modal-backdrop fade show" />
-    </>
+    <WarningDialog
+      testId={testId}
+      title={copy.title}
+      onClose={onCancel}
+      footer={
+        <>
+          <button type="button" className="btn btn-secondary" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className={`btn ${copy.confirmClass}`}
+            data-testid={`${testId}-confirm`}
+            disabled={running}
+            onClick={confirm}
+          >
+            {running ? (
+              <span
+                className="spinner-border spinner-border-sm me-1"
+                role="status"
+                aria-hidden="true"
+              />
+            ) : (
+              <i className={`fas ${copy.confirmIcon} me-1`} aria-hidden="true" />
+            )}
+            {copy.title}
+          </button>
+        </>
+      }
+    >
+      <p>
+        {copy.question} {clientId ? <strong>{clientId}</strong> : null} <code>{keyId}</code>?
+      </p>
+      <p className="mb-0">{copy.consequence}</p>
+    </WarningDialog>
   );
 };
 

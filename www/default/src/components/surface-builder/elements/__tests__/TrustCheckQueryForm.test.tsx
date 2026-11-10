@@ -76,7 +76,7 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Acme Inc'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example');
+    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example', 'issuer');
   });
 
   it('renders the verified-issuer default picker on the caller leg even when no Issuers or Authorities are configured (no degenerate locked textbox on the caller leg)', () => {
@@ -186,7 +186,7 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Acme Dept'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example');
+    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example', 'issuer');
   });
 
   it('surfaces a stored legacy template as a locked "from JSON API" option on the target leg', () => {
@@ -283,5 +283,129 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
 
     expect(screen.queryByTestId('trust-check-query-0-name')).toBeNull();
     expect(screen.queryByLabelText(/Name/i)).toBeNull();
+  });
+});
+
+describe('TrustCheckQueryForm — Authority source', () => {
+  const AUTHORITY = { id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' };
+  const ISSUER = { id: 'd-1', name: 'Acme Inc', did: 'did:web:acme.example' };
+  const GONE = 'did:web:deleted-authority.example';
+
+  const storedQuery = (authority_id: string, authority_source?: 'authority' | 'issuer' | 'did') =>
+    ({
+      id: 'q-1',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      ...(authority_source ? { authority_source } : {}),
+      query: { authority_id },
+    }) as TrustCheckQueryConfig;
+
+  it('writes authority_source "authority" when an Authority is picked', () => {
+    const updateAuthorityAt = jest.fn();
+    renderForm(
+      baseProps({
+        isApMa: false,
+        updateAuthorityAt,
+        issuers: [ISSUER] as any,
+        authorities: [AUTHORITY] as any,
+      })
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    fireEvent.click(screen.getByText('Payments Authority'));
+    expect(updateAuthorityAt).toHaveBeenCalledWith(0, AUTHORITY.did, 'authority');
+  });
+
+  it('writes no authority_source when the caller-leg template default is picked', () => {
+    const updateAuthorityAt = jest.fn();
+    renderForm(
+      baseProps({
+        isApMa: true,
+        updateAuthorityAt,
+        authorities: [AUTHORITY] as any,
+        queryConfig: storedQuery(AUTHORITY.did, 'authority'),
+      })
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    fireEvent.click(screen.getByText('Agent identity credential issuer (default)'));
+    expect(updateAuthorityAt).toHaveBeenCalledWith(
+      0,
+      '{{ input.agent.identity_issuer_did }}',
+      undefined
+    );
+  });
+
+  it('shows a deleted Authority as locked and invalid, with the Configuration required warning', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        issuers: [ISSUER] as any,
+        authorities: [AUTHORITY] as any,
+        queryConfig: storedQuery(GONE, 'authority'),
+      })
+    );
+    const toggle = screen.getByTestId('trust-check-query-0-authority');
+    expect(toggle).toHaveTextContent('Deleted Authority');
+    expect(toggle).toHaveClass('is-invalid');
+    const warning = screen.getByTestId('trust-check-query-0-authority-missing');
+    expect(warning).toHaveAttribute('role', 'alert');
+    expect(warning).toHaveTextContent('Configuration required');
+    expect(warning).toHaveTextContent('AUTHORITY_NOT_FOUND');
+    expect(warning).toHaveTextContent(GONE);
+    expect(
+      screen.getByTestId('trust-check-query-0-authority-missing-add-authority-link')
+    ).toHaveAttribute('href', '/authorities/new');
+  });
+
+  it('shows the deleted Authority on a target leg with no register entries left', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        authorities: [],
+        queryConfig: storedQuery(GONE, 'authority'),
+      })
+    );
+    expect(screen.queryByTestId('trust-check-query-0-authority-locked')).toBeNull();
+    expect(screen.getByTestId('trust-check-query-0-authority-missing')).toBeInTheDocument();
+  });
+
+  it('does not warn while the Authorities register has not loaded', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        authorities: [],
+        authoritiesLoaded: false,
+        queryConfig: storedQuery(GONE, 'authority'),
+      })
+    );
+    expect(screen.queryByTestId('trust-check-query-0-authority-missing')).toBeNull();
+  });
+
+  it('does not warn for a DID that is not from the Authorities register', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        issuers: [ISSUER] as any,
+        authorities: [AUTHORITY] as any,
+        queryConfig: storedQuery(GONE, 'did'),
+      })
+    );
+    expect(screen.queryByTestId('trust-check-query-0-authority-missing')).toBeNull();
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveTextContent(
+      'Custom DID (from JSON API)'
+    );
+  });
+
+  it('does not warn while the register still has the Authority', () => {
+    renderForm(
+      baseProps({
+        isApMa: false,
+        authorities: [AUTHORITY] as any,
+        queryConfig: storedQuery(AUTHORITY.did, 'authority'),
+      })
+    );
+    expect(screen.queryByTestId('trust-check-query-0-authority-missing')).toBeNull();
+    expect(screen.getByTestId('trust-check-query-0-authority')).toHaveTextContent(
+      'Payments Authority'
+    );
   });
 });

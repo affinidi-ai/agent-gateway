@@ -68,6 +68,8 @@ export interface SurfaceMetaValue {
   legacyAccessPoint?: boolean;
   /** Status of each API key the stored surface names, by key id; absent while creating. */
   apiKeyStatuses?: ApiKeyStatuses;
+  /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
+  authorityDids?: ReadonlySet<string> | null;
   /** Selects the Access Point and points at the Caller Context element in the palette. */
   onConfigureAuthentication?: () => void;
   setName: (v: string) => void;

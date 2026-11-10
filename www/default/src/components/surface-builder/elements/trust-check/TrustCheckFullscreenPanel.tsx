@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../../../api';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import { getIssuers } from '../../../../utils/issuersCache';
-import type { Authority, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
 import {
   authorityNeedsSelection,
@@ -43,6 +43,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [issuers, setIssuers] = useState<Issuer[]>([]);
   const [authorities, setAuthorities] = useState<Authority[]>([]);
+  const [authoritiesLoaded, setAuthoritiesLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,7 +76,9 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     let alive = true;
     getAuthorities({ refresh: true })
       .then(data => {
-        if (alive) setAuthorities(data);
+        if (!alive) return;
+        setAuthorities(data);
+        setAuthoritiesLoaded(true);
       })
       .catch(() => {});
     return () => {
@@ -113,8 +116,19 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     );
   };
 
-  const updateAuthorityAt = (idx: number, value: string) => {
-    updateQuerySubField(idx, 'authority_id', value);
+  const updateAuthorityAt = (idx: number, value: string, source?: AuthoritySource) => {
+    setDraft(prev =>
+      prev.map((q, i) => {
+        if (i !== idx) return q;
+        const { authority_source: _previous, ...rest } = q;
+        void _previous;
+        return {
+          ...rest,
+          ...(source ? { authority_source: source } : {}),
+          query: { ...(q.query || {}), authority_id: value },
+        };
+      })
+    );
   };
 
   const updateEntityAt = (idx: number, value: string) => {
@@ -225,6 +239,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             registries={registries}
             issuers={issuers}
             authorities={authorities}
+            authoritiesLoaded={authoritiesLoaded}
             loadError={loadError}
             updateQueryAt={updateQueryAt}
             updateQuerySubField={updateQuerySubField}

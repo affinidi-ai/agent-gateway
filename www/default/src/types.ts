@@ -238,6 +238,7 @@ export type TrustRecorderReason =
   | 'registry_not_found'
   | 'registry_not_connected'
   | 'no_surface_issuer'
+  | 'authority_not_found'
   | 'no_response'
   | 'rejected'
   | 'error';
@@ -960,6 +961,12 @@ export interface Issuer {
 // `Issuer` directly. Prefer removing this alias in a follow-up release once
 // no dashboard code depends on it.
 export type Department = Issuer;
+
+/**
+ * Where the literal DID of a Trust Check's or Trust Recorder entry's trust anchor came from:
+ * the Authorities register, the Issuers register, or neither. Absent for a template value.
+ */
+export type AuthoritySource = 'authority' | 'issuer';
 
 // Authorities — local record book of external trust-anchor DIDs.
 // Mirrors `AuthorityResponse` from `src/authorities/types.rs`.

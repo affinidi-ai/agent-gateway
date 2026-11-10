@@ -207,6 +207,7 @@ async fn header_metadata_mapping_is_available_to_trust_check_templates() {
         surface.access_point.trust_check_list = vec![crate::trust_registry_verification::trust_check_element::TrustCheckElement {
             id: "caller-template".to_string(),
             trust_registry_id: "tr-unreachable".to_string(),
+            authority_source: None,
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:example:authority".to_string(),

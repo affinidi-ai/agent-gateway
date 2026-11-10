@@ -3225,6 +3225,7 @@ mod tests {
         crate::trust_registry_verification::TrustCheckElement {
             id: "e1".to_string(),
             trust_registry_id: "reg".to_string(),
+            authority_source: None,
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams::default(),
             timeout_secs: None,

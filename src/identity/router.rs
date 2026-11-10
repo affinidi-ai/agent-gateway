@@ -1808,6 +1808,17 @@ pub fn create_identity_api_router(
 
     // Create authority routes if store is provided
     let authority_router = if let Some(store) = authority_store {
+        let authority_references = crate::credential_providers::references::ReferenceStores {
+            surfaces: state
+                .agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+            sts_clients: sts_client_store.clone(),
+            ..Default::default()
+        };
+        let authority_rbac = passkey_storage_for_manager
+            .as_ref()
+            .map(|storage| crate::auth_manager::middleware::RbacGuard::new(storage.clone(), rbac_config.clone()));
         Router::new()
             .route(
                 "/v1/authorities",
@@ -1850,6 +1861,8 @@ pub fn create_identity_api_router(
             )
             .layer(Extension(store))
             .layer(Extension(issuer_tr_listener_manager))
+            .layer(Extension(authority_references))
+            .layer(Extension(authority_rbac))
     } else {
         Router::new()
     };

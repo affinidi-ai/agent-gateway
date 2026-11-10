@@ -1,5 +1,5 @@
-//! What still uses a credential provider or a secret, so deleting it, or retyping a provider,
-//! can be refused while something would break.
+//! What still uses a credential provider, a secret or an Authority, so deleting it, or
+//! retyping a provider, can be refused while something would break.
 
 use std::sync::Arc;
 
@@ -16,6 +16,9 @@ use crate::config::TargetAuthMethod;
 use crate::config::agent_surface::AgentSurface;
 use crate::rbac::{Feature, RbacConfig};
 use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+use crate::trust_registry_verification::authority_source::{
+    AuthorityReference, AuthorityUse, surface_references, trust_check_references,
+};
 
 use super::storage::CredentialProviderStorage;
 
@@ -29,13 +32,16 @@ pub struct ReferenceStores {
     pub sts_clients: Option<Arc<dyn crate::sts::store::StsClientStorage>>,
 }
 
-/// A record that names the credential provider or secret being changed.
+/// A record that names the credential provider, secret or Authority being changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Referrer {
     pub kind: ResourceKind,
     pub id: String,
     pub name: String,
     pub tenant_id: Option<String>,
+    /// The record's Trust Checks and Trust Recorder entries that use the Authority being
+    /// deleted; empty for any other resource.
+    pub uses: Vec<AuthorityUse>,
 }
 
 /// The kinds of referrer whose view permission the caller holds. A referrer of any other kind
@@ -114,12 +120,23 @@ impl Referrer {
             && scope_allows_resource(scope, context, self.kind, &self.id)
     }
 
+    fn sts_client(client: &crate::sts::store::StsClient) -> Self {
+        Self {
+            kind: ResourceKind::StsClients,
+            id: client.id.clone(),
+            name: client.name.clone(),
+            tenant_id: client.tenant_id.clone(),
+            uses: Vec::new(),
+        }
+    }
+
     fn surface(surface: &AgentSurface) -> Self {
         Self {
             kind: ResourceKind::Surfaces,
             id: surface.surface_id.clone(),
             name: surface.name.clone(),
             tenant_id: surface.tenant_id.clone(),
+            uses: Vec::new(),
         }
     }
 }
@@ -166,6 +183,7 @@ impl ReferenceStores {
                         id: provider.id,
                         name: provider.name,
                         tenant_id: provider.tenant_id,
+                        uses: Vec::new(),
                     }),
             );
         }
@@ -185,6 +203,7 @@ impl ReferenceStores {
                         id: proxy.id,
                         name: proxy.name,
                         tenant_id: proxy.tenant_id,
+                        uses: Vec::new(),
                     }),
             );
         }
@@ -200,13 +219,40 @@ impl ReferenceStores {
                             .as_deref()
                             == Some(secret_id)
                     })
-                    .map(|client| Referrer {
-                        kind: ResourceKind::StsClients,
-                        id: client.id,
-                        name: client.name,
-                        tenant_id: client.tenant_id,
-                    }),
+                    .map(|client| Referrer::sts_client(&client)),
             );
+        }
+        Ok(referrers)
+    }
+
+    /// The surfaces and STS clients whose Trust Checks or Trust Recorder entries name the
+    /// Authority whose DID is `did`, each with the elements that name it.
+    pub async fn referrers_of_authority(
+        &self,
+        did: &str,
+    ) -> anyhow::Result<Vec<Referrer>> {
+        let mut referrers = Vec::new();
+        if let Some(store) = &self.surfaces {
+            for surface in store.list_all().await? {
+                let uses = uses_of_authority(surface_references(&surface), did);
+                if !uses.is_empty() {
+                    referrers.push(Referrer {
+                        uses,
+                        ..Referrer::surface(&surface)
+                    });
+                }
+            }
+        }
+        if let Some(store) = &self.sts_clients {
+            for client in store.list().await? {
+                let uses = uses_of_authority(trust_check_references(&client.trust_check_list), did);
+                if !uses.is_empty() {
+                    referrers.push(Referrer {
+                        uses,
+                        ..Referrer::sts_client(&client)
+                    });
+                }
+            }
         }
         Ok(referrers)
     }
@@ -226,6 +272,17 @@ impl ReferenceStores {
             .map(Referrer::surface)
             .collect())
     }
+}
+
+fn uses_of_authority(
+    references: Vec<AuthorityReference>,
+    did: &str,
+) -> Vec<AuthorityUse> {
+    references
+        .into_iter()
+        .filter(|reference| reference.did == did)
+        .map(|reference| reference.used_by)
+        .collect()
 }
 
 /// The ids of `kind` the surface references. A surface whose variants cannot be resolved
@@ -290,6 +347,27 @@ fn string_values(surface: &AgentSurface) -> Vec<String> {
     found
 }
 
+#[derive(serde::Serialize)]
+struct ReferenceView<'a> {
+    kind: &'static str,
+    id: &'a str,
+    name: &'a str,
+    #[serde(skip_serializing_if = "<[AuthorityUse]>::is_empty")]
+    uses: &'a [AuthorityUse],
+}
+
+/// Whether the caller may view every one of `referrers`.
+pub fn all_visible(
+    referrers: &[Referrer],
+    viewable: &ViewableKinds,
+    context: Option<&PatTenantContext>,
+    scope: Option<&PatResourceScope>,
+) -> bool {
+    referrers
+        .iter()
+        .all(|referrer| referrer.visible_to(viewable, context, scope))
+}
+
 /// The 409 answer for a change refused while `referrers` use the resource: the referrers the
 /// caller may view (a kind in `viewable`, its tenant's or appliance-wide, within its resource
 /// pattern), and a count of the rest.
@@ -303,9 +381,14 @@ pub fn conflict_response(
     let (visible, hidden): (Vec<&Referrer>, Vec<&Referrer>) = referrers
         .iter()
         .partition(|referrer| referrer.visible_to(viewable, context, scope));
-    let references: Vec<serde_json::Value> = visible
+    let references: Vec<ReferenceView<'_>> = visible
         .iter()
-        .map(|referrer| serde_json::json!({ "kind": referrer.kind_label(), "id": referrer.id, "name": referrer.name }))
+        .map(|referrer| ReferenceView {
+            kind: referrer.kind_label(),
+            id: &referrer.id,
+            name: &referrer.name,
+            uses: &referrer.uses,
+        })
         .collect();
     (
         StatusCode::CONFLICT,
@@ -436,6 +519,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_authority_is_used_by_the_surfaces_and_sts_clients_whose_checks_name_it() {
+        use crate::sts::store::StsClientStorage;
+        use crate::surfaces::AgentSurfaceStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().join("surfaces"))
+                .await
+                .unwrap(),
+        );
+        let sts_clients = Arc::new(
+            crate::sts::store::FileSystemStsClientStore::new(dir.path().join("sts"))
+                .await
+                .unwrap(),
+        );
+        let check = |id: &str, did: &str| {
+            json!({
+                "id": id, "trust_registry_id": "tr-1", "query_type": "recognition", "authority_source": "authority",
+                "query": {"authority_id": did, "entity_id": "{{ input.agent.did }}"}
+            })
+        };
+        let surface = |id: &str, did: &str| -> AgentSurface {
+            serde_json::from_value(json!({
+                "surface_id": id, "name": format!("{id} name"),
+                "access_point": {
+                    "listen_address": "0.0.0.0:8443", "route": format!("/{id}"), "protocol": "a2a",
+                    "trust_check_list": [check(&format!("{id}-check"), did)],
+                    "trust_recorder": {"entries": [{
+                        "trust_registry_id": "tr-rec", "issuer_did": "did:web:issuer", "authority_did": did
+                    }]}
+                },
+                "target": {"endpoint": "https://api.example.com"}
+            }))
+            .unwrap()
+        };
+        surfaces
+            .save(&surface("orders", "did:web:acme"))
+            .await
+            .unwrap();
+        surfaces
+            .save(&surface("billing", "did:web:other"))
+            .await
+            .unwrap();
+        let client: crate::sts::store::StsClient = serde_json::from_value(json!({
+            "id": "client-1", "client_id": "cli", "name": "CLI",
+            "trust_check_list": [check("sts-check", "did:web:acme")],
+            "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now()
+        }))
+        .unwrap();
+        sts_clients
+            .create(client)
+            .await
+            .unwrap();
+        let stores = ReferenceStores {
+            surfaces: Some(surfaces),
+            sts_clients: Some(sts_clients),
+            ..Default::default()
+        };
+
+        let mut referrers = stores
+            .referrers_of_authority("did:web:acme")
+            .await
+            .unwrap();
+        referrers.sort_by(|a, b| a.id.cmp(&b.id));
+        assert!(
+            stores
+                .referrers_of_authority("did:web:unused")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let all = ViewableKinds::for_role(&RbacConfig::default(), &UserRole::Administrator, None);
+        let refusal = body(conflict_response("in use", &referrers, &all, None, None)).await;
+        assert_eq!(
+            refusal["references"],
+            json!([
+                {"kind": "sts_client", "id": "client-1", "name": "CLI", "uses": [
+                    {"element": "trust_check", "id": "sts-check"}
+                ]},
+                {"kind": "surface", "id": "orders", "name": "orders name", "uses": [
+                    {"element": "trust_check", "id": "orders-check", "placement": "access_point"},
+                    {"element": "trust_recorder", "trust_registry_id": "tr-rec"}
+                ]}
+            ])
+        );
+        let surfaces_only = ViewableKinds(vec![ResourceKind::Surfaces]);
+        let partial = body(conflict_response("in use", &referrers, &surfaces_only, None, None)).await;
+        assert_eq!(partial["references"][0]["id"], "orders");
+        assert_eq!(partial["hidden_references"], 1, "the STS client is counted, not named or described");
+    }
+
     async fn body(response: Response) -> serde_json::Value {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -451,6 +627,7 @@ mod tests {
             id: id.into(),
             name: format!("{id} name"),
             tenant_id: tenant_id.map(str::to_string),
+            uses: Vec::new(),
         };
         let referrers = [
             referrer(ResourceKind::Surfaces, "own-surface", Some("tenant-a")),
@@ -547,6 +724,7 @@ mod tests {
             id: "orders".into(),
             name: "Orders".into(),
             tenant_id: None,
+            uses: Vec::new(),
         }];
         let providers_only = ViewableKinds(vec![ResourceKind::CredentialProviders]);
         let hidden = body(conflict_response("in use", &referrers, &providers_only, None, None)).await;

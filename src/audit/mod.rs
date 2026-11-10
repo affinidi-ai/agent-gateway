@@ -9,6 +9,7 @@
 //! behind one line at a time, so a reader never holds a file of it in memory.
 
 pub mod audit_log_sink;
+pub mod authority_force_deletes;
 pub mod catalog;
 pub mod context;
 pub mod cursors;

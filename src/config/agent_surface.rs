@@ -7408,6 +7408,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: "tr-1".to_string(),
+            authority_source: None,
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
@@ -7610,6 +7611,7 @@ mod tests {
             trust_registry_id: "tr-1".to_string(),
             issuer_did: "did:example:issuer".to_string(),
             authority_did: "did:example:authority".to_string(),
+            authority_source: None,
             include_owned_agent: false,
             custom_resources: Vec::new(),
         };

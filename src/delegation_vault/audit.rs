@@ -528,12 +528,25 @@ pub struct SecretForceDeleteDetails {
     pub secret_id: String,
     pub force: bool,
     #[serde(default)]
-    pub referrers: Vec<SecretReferrerDetails>,
+    pub referrers: Vec<ReferrerDetails>,
 }
 
-/// A record that used a secret when it was force-deleted.
+/// An Authority deleted with `force=true` through the management API. Names the Authority by
+/// its id and DID and each record whose Trust Checks or Trust Recorder entries still used it
+/// by kind and id; never a record's name.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct AuthorityForceDeleteDetails {
+    pub actor: Actor,
+    pub authority_id: String,
+    pub did: String,
+    pub force: bool,
+    #[serde(default)]
+    pub referrers: Vec<ReferrerDetails>,
+}
+
+/// A record that used a secret or an Authority when it was force-deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-pub struct SecretReferrerDetails {
+pub struct ReferrerDetails {
     pub kind: String,
     pub id: String,
 }
@@ -769,6 +782,8 @@ pub enum DelegationAuditAction {
     TargetAuthChanged(Box<TargetAuthChangeDetails>),
     /// A secret was deleted with `force=true`, with or without records still using it.
     SecretForceDeleted(Box<SecretForceDeleteDetails>),
+    /// An Authority was deleted with `force=true`, with or without records still using it.
+    AuthorityForceDeleted(Box<AuthorityForceDeleteDetails>),
     /// A save changed the pin of a `proxy://` Transit Point's external consent binding.
     McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
 }
@@ -826,6 +841,7 @@ impl DelegationAuditAction {
                 | Self::PolicyChangeRefused(_)
                 | Self::TargetAuthChanged(_)
                 | Self::SecretForceDeleted(_)
+                | Self::AuthorityForceDeleted(_)
                 | Self::McpProxyPinChanged(_)
         )
     }
@@ -1709,6 +1725,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
         DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
         DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
+        DelegationAuditAction::AuthorityForceDeleted(_) => "authority_force_deleted",
         DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
     }
 }

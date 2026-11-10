@@ -1,10 +1,11 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
-import type { Authority, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
 import { topAndTail } from '../../../../utils/stringUtils';
 import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import FormSelect, { type FormSelectOption } from '../../../shared/FormSelect';
+import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import {
   AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
   INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
@@ -74,6 +75,11 @@ const TARGET_ENTITY_SUBJECT_ORDER: readonly NamedSubject[] = ['agent-did'];
 const GRP_ISSUERS = '__grp_issuers__';
 const GRP_AUTHORITIES = '__grp_authorities__';
 
+const CALLER_TEMPLATES: ReadonlySet<string> = new Set([
+  AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
+  INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
+]);
+
 // Sentinel value for the inline "Custom (from JSON API)" `<option>` that
 // surfaces a stored value that isn't one of the four named subjects.
 // Picking it is a no-op (the option preserves the current stored value);
@@ -87,10 +93,16 @@ interface TrustCheckQueryFormProps {
   registries: TrustRegistry[];
   issuers: Issuer[];
   authorities: Authority[];
+  /**
+   * True once the Authorities register has loaded, so an Authority it no longer has can be
+   * reported as deleted. Never set while it loads or after it failed to load.
+   */
+  authoritiesLoaded?: boolean;
   loadError: string | null;
   updateQueryAt: (index: number, patch: Partial<TrustCheckQueryConfig>) => void;
   updateQuerySubField: (index: number, field: string, value: string) => void;
-  updateAuthorityAt: (index: number, value: string) => void;
+  /** `source` is where a literal DID was picked from; absent for a template, which removes it. */
+  updateAuthorityAt: (index: number, value: string, source?: AuthoritySource) => void;
   updateEntityAt: (index: number, value: string) => void;
   handleQueryTypeChangeAt: (index: number, next: TrustCheckRecordType) => void;
   /**
@@ -109,6 +121,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   registries,
   issuers,
   authorities,
+  authoritiesLoaded = true,
   loadError,
   updateQueryAt,
   updateQuerySubField,
@@ -182,10 +195,12 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
             testid={tid('authority')}
             isApMa={isApMa}
             storedValue={authorityValue}
+            storedSource={queryConfig.authority_source}
             issuers={issuers}
             authorities={authorities}
+            authoritiesLoaded={authoritiesLoaded}
             invalid={saveAttempted && authorityNeedsSelection(authorityValue, isApMa)}
-            onChange={did => updateAuthorityAt(index, did)}
+            onChange={(did, source) => updateAuthorityAt(index, did, source)}
           />
         </div>
 
@@ -366,10 +381,12 @@ interface IssuerAuthorityPickerProps {
   testid: string;
   isApMa: boolean;
   storedValue: string;
+  storedSource?: AuthoritySource;
   issuers: Issuer[];
   authorities: Authority[];
+  authoritiesLoaded: boolean;
   invalid?: boolean;
-  onChange: (did: string) => void;
+  onChange: (did: string, source?: AuthoritySource) => void;
 }
 
 /**
@@ -396,13 +413,21 @@ interface IssuerAuthorityPickerProps {
  * so the operator sees the stored value and can replace it. When neither
  * register has entries and nothing custom is stored, a locked read-only
  * textbox prompts the operator to configure a Department or Authority.
+ *
+ * Picking an Issuer writes `authority_source: 'issuer'`, an Authority
+ * `'authority'`, and a caller-leg template removes it. A stored DID picked
+ * from the Authorities register that the loaded register no longer has
+ * shows as a locked "Deleted Authority" option, marked invalid, with the
+ * Configuration required warning under the picker.
  */
 const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   testid,
   isApMa,
   storedValue,
+  storedSource,
   issuers,
   authorities,
+  authoritiesLoaded,
   invalid = false,
   onChange,
 }) => {
@@ -426,13 +451,26 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
       trimmed === INPUT_GATEWAY_SOURCE_ID_TEMPLATE);
   const effectiveValue =
     isApMa && trimmed === '' ? AGENT_IDENTITY_ISSUER_DID_TEMPLATE : storedValue;
-  const selection = classifyTargetAuthoritySelection(storedValue, issuers, authorityList);
+  const selection = classifyTargetAuthoritySelection(
+    storedValue,
+    issuers,
+    authorities,
+    storedSource,
+    authoritiesLoaded
+  );
+  const missingAuthority = selection.kind === 'missing-authority' ? selection.did : null;
   const hasCustom =
     !isVerifiedIssuerDefault &&
     !isKnownCallerTemplate &&
     (selection.kind === 'legacy-template' || selection.kind === 'custom-did');
 
-  if (!isApMa && issuers.length === 0 && authorityList.length === 0 && !hasCustom) {
+  if (
+    !isApMa &&
+    issuers.length === 0 &&
+    authorityList.length === 0 &&
+    !hasCustom &&
+    !missingAuthority
+  ) {
     return (
       <>
         <Form.Control
@@ -507,6 +545,15 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
       });
     }
   }
+  if (missingAuthority && !options.some(o => o.value === missingAuthority)) {
+    options.push({
+      value: missingAuthority,
+      label: 'Deleted Authority',
+      description: topAndTail(missingAuthority, 16, 12),
+      disabled: true,
+      indent: showGroupHeaders,
+    });
+  }
   if (hasCustom) {
     options.push({
       value: storedValue,
@@ -523,7 +570,8 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
 
   const handleChange = (next: string) => {
     if (next === GRP_ISSUERS || next === GRP_AUTHORITIES) return;
-    onChange(next);
+    if (CALLER_TEMPLATES.has(next)) onChange(next);
+    else onChange(next, issuerDids.has(next) ? 'issuer' : 'authority');
   };
 
   return (
@@ -532,14 +580,21 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
         value={effectiveValue}
         options={options}
         onChange={handleChange}
-        isInvalid={invalid}
+        isInvalid={invalid || !!missingAuthority}
         placeholder="Select an Issuer or Authority…"
         testid={testid}
       />
+      {missingAuthority && (
+        <MissingAuthorityWarning
+          testid={`${testid}-missing`}
+          element="trust-check"
+          missing={[{ index: 0, did: missingAuthority }]}
+        />
+      )}
       <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '11px' }}>
         {isApMa
           ? 'Pick the trust anchor the caller is checked against. The default resolves to the cryptographically-verified issuer of the caller’s agent identity credential; pick an Issuer or Authority to pin an explicit DID instead.'
-          : 'Pick the trust anchor the target is checked against. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card.'}
+          : 'Pick the trust anchor the target is checked against. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. If you pick an Authority and it is deleted later, the check fails until you pick another.'}
       </Form.Text>
     </>
   );

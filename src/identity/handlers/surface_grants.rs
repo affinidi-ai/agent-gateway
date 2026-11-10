@@ -627,6 +627,47 @@ async fn refuse_gone_secrets(
     Ok(())
 }
 
+/// Refuse `after` when it links a Trust Check or Trust Recorder entry to an Authority that no
+/// longer exists, one `current` does not link already: its links were checked before the
+/// write took the provider lock, which an Authority delete holds exclusively, so an Authority
+/// deleted in between is caught here.
+async fn refuse_gone_authorities(
+    current: Option<&AgentSurface>,
+    after: &AgentSurface,
+) -> Result<(), SurfaceApiError> {
+    use crate::trust_registry_verification::authority_source::{
+        AuthoritySource, MissingAuthorities, surface_references,
+    };
+
+    let Some(store) = crate::gateways::connection_points::get_authority_store() else {
+        return Ok(());
+    };
+    let kept: std::collections::HashSet<String> = current
+        .map(surface_references)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|reference| reference.source == Some(AuthoritySource::Authority))
+        .map(|reference| reference.did)
+        .collect();
+    let references = surface_references(after);
+    let missing = MissingAuthorities::find(
+        references
+            .iter()
+            .filter(|reference| !kept.contains(&reference.did))
+            .map(|reference| (reference.did.as_str(), reference.source)),
+        Some(store.as_ref()),
+    )
+    .await;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(SurfaceApiError::BadRequest(
+        "An Authority this surface's Trust Checks or Trust Recorder entries use was deleted while it was being \
+         saved. Pick another Authority and save again"
+            .to_string(),
+    ))
+}
+
 /// One async mutex per surface id, held only while some task holds or awaits
 /// it.
 static SURFACE_LOCKS: LazyLock<std::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
@@ -700,6 +741,7 @@ where
     if let Some(after) = after {
         refuse_gone_providers(removal, current.as_ref(), after).await?;
         refuse_gone_secrets(removal, current.as_ref(), after).await?;
+        refuse_gone_authorities(current.as_ref(), after).await?;
     }
     let (saved, outcome) = tokio::sync::oneshot::channel();
     let outcome = crate::delegation_vault::revocation::ChangeOutcome {

@@ -274,6 +274,7 @@ mod tests {
         TrustCheckElement {
             id: "e".to_string(),
             trust_registry_id: "tr".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:literal:authority".to_string(),

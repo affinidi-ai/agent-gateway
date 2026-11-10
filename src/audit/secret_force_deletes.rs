@@ -4,7 +4,7 @@
 use crate::audit::context::current_actor;
 use crate::credential_providers::references::Referrer;
 use crate::delegation_vault::audit::{
-    DelegationAuditAction, SecretForceDeleteDetails, SecretReferrerDetails, action_category, audit_event, emit,
+    DelegationAuditAction, ReferrerDetails, SecretForceDeleteDetails, action_category, audit_event, emit,
 };
 
 /// Records that the secret `secret_id` was force-deleted while `referrers` still used it,
@@ -16,21 +16,26 @@ pub fn secret_force_deleted(
     let Some(actor) = current_actor() else {
         return;
     };
-    let mut referrers: Vec<SecretReferrerDetails> = referrers
+    let action = DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
+        actor,
+        secret_id: secret_id.to_string(),
+        force: true,
+        referrers: referrer_details(referrers),
+    }));
+    emit(action_category(&action), move || audit_event(action, None, None, None, None));
+}
+
+/// `referrers` by kind and id, in that order, never by name.
+pub(super) fn referrer_details(referrers: &[Referrer]) -> Vec<ReferrerDetails> {
+    let mut details: Vec<ReferrerDetails> = referrers
         .iter()
-        .map(|referrer| SecretReferrerDetails {
+        .map(|referrer| ReferrerDetails {
             kind: referrer
                 .kind_label()
                 .to_string(),
             id: referrer.id.clone(),
         })
         .collect();
-    referrers.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
-    let action = DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
-        actor,
-        secret_id: secret_id.to_string(),
-        force: true,
-        referrers,
-    }));
-    emit(action_category(&action), move || audit_event(action, None, None, None, None));
+    details.sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+    details
 }

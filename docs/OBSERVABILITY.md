@@ -804,6 +804,15 @@ for which writes.
   names the management caller as on policy change events. The record carries no secret value and
   no record name, and sets no `surface_id`.
 
+**Authority force-delete events.** Raised by `DELETE /authorities/{id}?force=true` (group
+Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
+
+- `authority_force_deleted`: an Authority was deleted with force, with or without Trust Checks
+  or Trust Recorder entries still using it. `authority_id` and `did` name the Authority, `force`
+  is `true`, and `referrers` lists each record that used it as `{kind, id}` (`surface` or
+  `sts_client`). `actor` names the management caller as on policy change events. The record
+  carries no record name and sets no `surface_id`.
+
 **MCP Proxy pin change events.** Raised by management API writes to a surface (group
 Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)
 for when a save changes a pin.

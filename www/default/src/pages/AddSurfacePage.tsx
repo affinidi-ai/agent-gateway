@@ -45,6 +45,8 @@ import {
 } from '../components/surface-builder/templates/templateSort';
 import { showToast } from '../utils/toaster';
 import { saveWarningMessages } from '../components/surface-builder/elements/payment/saveWarnings';
+import { firstMissingAuthorityNode } from '../components/surface-builder/elements/missingAuthority';
+import { useAuthorityDids } from '../components/surface-builder/hooks/useAuthorityDids';
 import './SurfaceBuilder.css';
 
 const WELCOME_DISMISSED_KEY = 'surface-builder-welcome-dismissed';
@@ -134,6 +136,7 @@ const AddSurfacePage: React.FC = () => {
   const surfacePolicyLoadState = useSurfacePolicyDefinitions();
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
+  const authorityDids = useAuthorityDids();
 
   const [activeTab, setActiveTab] = useState<SurfaceFormView>('surface');
 
@@ -406,6 +409,14 @@ const AddSurfacePage: React.FC = () => {
       return {
         message: `${def?.label ?? firstIncomplete.type}: ${reason}`,
         nodeId: firstIncomplete.id,
+      };
+    }
+    const missingAuthority = firstMissingAuthorityNode(builder.state.nodes, authorityDids);
+    if (missingAuthority) {
+      const def = registry.get(missingAuthority.node.type);
+      return {
+        message: `${def?.label ?? missingAuthority.node.type}: ${missingAuthority.warning}`,
+        nodeId: missingAuthority.node.id,
       };
     }
     // Unmet feature dependencies (e.g. credential-delegation without
@@ -865,6 +876,7 @@ const AddSurfacePage: React.FC = () => {
         hasAttemptedSave={hasAttemptedSave}
         saveError={error}
         accessPointNotice={accessPointNotice}
+        authorityDids={authorityDids}
         manageActions={
           <div className="d-flex gap-2">
             <button
