@@ -36,6 +36,16 @@ A provider carries its authorization and token endpoints and its default scopes.
 client ID, client secret, signing key and certificate are **references** into the secrets
 store, such as `GOOGLE_CLIENT_SECRET`, and are never stored in the provider record itself.
 
+An `oauth2_authorization_code` or `oauth2_client_credentials` provider without an `issuer`
+needs a `token_endpoint`, a `client_id_secret_ref` and a `client_secret_secret_ref`, and an
+`api_key` provider needs an `api_key_secret_ref`. A create and an update both check the
+provider as it would be stored, and a missing client or API key reference answers 400 with the
+same message in both (for example
+`client_id_secret_ref and client_secret_secret_ref are required for OAuth providers`). An update
+therefore cannot clear one of these references with an empty string, and a retype to one of
+these types must send the references the provider does not store yet. A stored provider that
+already lacks one is refused every update until the update names it.
+
 ### Records that are still in use
 
 A credential provider or secret is not deleted while another record uses it, so a surface does
@@ -173,6 +183,14 @@ must meet the rule like a new provider. Setting `client_authentication` to `none
 or switching between `client_secret_basic` and `client_secret_post` is still saved. Listing the
 endpoint in `insecure_token_endpoints` allows the change on purpose.
 
+The rule does not compare `client_secret_secret_ref`. A stored http provider may point it at
+another secret of its tenant, which is a rotation and is saved, and a secret's value can already
+change through the secrets API without any check by a provider, so pinning the reference would
+not pin what the endpoint receives. What a stored provider cannot do is lose the reference:
+`oauth2_client_credentials` and `oauth2_authorization_code` providers need it, so an update that
+clears it is refused (see [Credential providers](#credential-providers)), and a provider cannot
+be emptied of its client secret and given one again later on an endpoint that is still http.
+
 ### Provider secrets belong to the provider's tenant
 
 Every secret a provider references (client ID, client secret, API key, signing key,
@@ -288,9 +306,10 @@ UUID `jti` so the issuer can refuse a replayed assertion, and for a client asser
 only the issued access token is cached. A JWT Bearer grant sends the scopes in the `scope` claim, and in the `scope` form
 field too when the provider sets a `client_authentication`; a client assertion sends them in the `scope` form
 field (Entra: `<audience>/.default`). Entra needs the tenant-specific v2.0 token endpoint, not
-`common`. An update that sends a reference or JWT field as an empty string clears it, which
-is how a client-credentials provider switches to `oauth2_client_credentials_jwt_auth`; a create
-reads an empty reference as none.
+`common`. An update that sends a reference or JWT field as an empty string clears it, unless
+the provider's type needs that reference (see above); that is how a client-credentials provider
+switches to `oauth2_client_credentials_jwt_auth`, which needs no client secret reference. A
+create reads an empty reference as none.
 
 ### Service tokens
 

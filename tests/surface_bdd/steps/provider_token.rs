@@ -298,6 +298,11 @@ async fn operator_clears_provider_subject(world: &mut SurfaceWorld) {
     change_stored_provider(world, json!({ "jwt_subject": "" }), None).await;
 }
 
+#[when("the operator clears the credential provider's client secret")]
+async fn operator_clears_provider_client_secret(world: &mut SurfaceWorld) {
+    change_stored_provider(world, json!({ "client_secret_secret_ref": "" }), None).await;
+}
+
 #[given("the operator has cleared the credential provider's client authentication")]
 async fn operator_has_cleared_provider_client_authentication(world: &mut SurfaceWorld) {
     change_stored_provider(world, json!({ "client_authentication": "" }), None).await;
@@ -365,6 +370,15 @@ async fn stored_provider_has_no_client_authentication(world: &mut SurfaceWorld) 
             .is_none(),
         "the stored provider: {stored}"
     );
+}
+
+#[then(expr = "the stored credential provider still has the client secret {string}")]
+async fn stored_provider_still_has_client_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["client_secret_secret_ref"], json!(secret_id), "the stored provider: {stored}");
 }
 
 /// The Target's credential provider as the admin API returns it.

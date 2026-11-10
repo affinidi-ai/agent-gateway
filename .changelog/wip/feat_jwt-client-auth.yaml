@@ -30,4 +30,15 @@ changes:
         starts sending a client secret in clear text. Setting none, clearing the setting, or
         switching between the two secret methods is still saved, and listing the endpoint allows
         it.
+    - timestamp: '2026-11-10T10:53:43Z'
+      title: Refuse an update that clears a credential provider's client references
+      description: >-
+        An update to an oauth2_client_credentials or oauth2_authorization_code provider must now
+        leave it with its token endpoint, client ID reference and client secret reference, as a
+        create does, and an update to an api_key provider with its API key reference. An update
+        that sends an empty client reference, or retypes a provider to one of these types without
+        the references it needs, is refused with the same 400 message as a create. A provider
+        that keeps a plain http token endpoint can no longer have its client secret cleared and
+        set again by a later update, which would have made it start sending the secret in clear
+        text.
   breaking: []

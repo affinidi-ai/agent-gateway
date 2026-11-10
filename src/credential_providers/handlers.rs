@@ -602,6 +602,16 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
     }
 }
 
+/// The `400` answer for a provider that lacks what its type needs, if it does. A provider with
+/// an issuer takes its client from the issuer, so it needs none of it.
+fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
+    if provider.is_external_consent() {
+        return None;
+    }
+    legacy_type_error(provider)
+        .map(|message| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response())
+}
+
 /// The consent-flow rules a provider passes before it is stored: an
 /// `authorization_response_issuer` only where allowed, and for an authorization
 /// code provider without an `issuer`, an authorization endpoint, when it has
@@ -773,10 +783,8 @@ pub async fn create_provider(
     if let Err(error) = super::external::validate(&provider) {
         return error.into_response();
     }
-    if !provider.is_external_consent()
-        && let Some(message) = legacy_type_error(&provider)
-    {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response();
+    if let Some(response) = missing_type_fields(&provider) {
+        return response;
     }
 
     if let Some(resource) = &provider.resource
@@ -1148,6 +1156,10 @@ pub async fn update_provider(
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
+
+    if let Some(response) = missing_type_fields(&updated) {
+        return response;
+    }
 
     let retypes_to_need_consent = previous
         .provider_type
@@ -3016,7 +3028,7 @@ mod jwt_provider_tests {
             .to_string();
         let (status, response) = update(&state, &id, json!({"client_id_secret_ref": ""})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        assert_eq!(response["error"], "Secret reference is not accessible");
+        assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED);
         let stored = state
             .store
             .get(&id)
@@ -3029,6 +3041,176 @@ mod jwt_provider_tests {
                 .as_deref(),
             Some("CLIENT_ID")
         );
+    }
+
+    const OAUTH_CLIENT_REFERENCES_REQUIRED: &str =
+        "client_id_secret_ref and client_secret_secret_ref are required for OAuth providers";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_cannot_leave_an_oauth_provider_without_its_client_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let (status, created) = create(
+                &state,
+                with_token_endpoint(client_credentials(provider_type), provider_type, "https://192.0.2.1/token"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{provider_type}: {created}");
+            let id = created["id"]
+                .as_str()
+                .unwrap();
+
+            for cleared in [
+                json!({"client_secret_secret_ref": ""}),
+                json!({"client_secret_secret_ref": "   "}),
+                json!({"client_id_secret_ref": ""}),
+                json!({"client_id_secret_ref": "   "}),
+                json!({"client_id_secret_ref": "", "client_secret_secret_ref": ""}),
+            ] {
+                let (status, response) = update(&state, id, cleared.clone()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_type} {cleared}: {response}");
+                assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED, "{provider_type} {cleared}");
+            }
+            let stored = state
+                .store
+                .get(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored
+                    .client_id_secret_ref
+                    .as_deref(),
+                Some("CLIENT_ID"),
+                "{provider_type}"
+            );
+            assert_eq!(
+                stored
+                    .client_secret_secret_ref
+                    .as_deref(),
+                Some("CLIENT_SECRET"),
+                "{provider_type}"
+            );
+
+            let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type}: {response}");
+            assert_eq!(response["client_id_secret_ref"], "CLIENT_ID", "{provider_type}");
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+            let (status, response) = update(&state, id, json!({"client_secret_secret_ref": "NOT_A_KEY"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type} may name another secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "NOT_A_KEY", "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retyping_a_provider_needs_the_references_the_new_type_requires() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(&state, jwt_bearer("bearer")).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+
+        for (retype, error) in [
+            (json!({"provider_type": "oauth2_client_credentials"}), OAUTH_CLIENT_REFERENCES_REQUIRED),
+            (json!({"provider_type": "oauth2_authorization_code"}), OAUTH_CLIENT_REFERENCES_REQUIRED),
+            (
+                json!({"provider_type": "oauth2_client_credentials", "client_id_secret_ref": "CLIENT_ID"}),
+                OAUTH_CLIENT_REFERENCES_REQUIRED,
+            ),
+            (json!({"provider_type": "api_key"}), "api_key_secret_ref is required for ApiKey providers"),
+        ] {
+            let (status, response) = update(&state, id, retype.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{retype}: {response}");
+            assert_eq!(response["error"], error, "{retype}");
+        }
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.provider_type, CredentialProviderType::OAuth2JwtBearer);
+
+        let (status, response) = update(
+            &state,
+            id,
+            json!({"provider_type": "oauth2_client_credentials",
+                   "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["provider_type"], "oauth2_client_credentials");
+        let (status, response) =
+            update(&state, id, json!({"provider_type": "api_key", "api_key_secret_ref": "CLIENT_SECRET"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["api_key_secret_ref"], "CLIENT_SECRET");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_update_cannot_clear_the_api_key_reference_of_an_api_key_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, created) = create(
+            &state,
+            json!({"name": "Key", "provider_id": "key", "provider_type": "api_key", "api_key_secret_ref": "CLIENT_SECRET"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"]
+            .as_str()
+            .unwrap();
+
+        for cleared in [json!({"api_key_secret_ref": ""}), json!({"api_key_secret_ref": "   "})] {
+            let (status, response) = update(&state, id, cleared.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{cleared}: {response}");
+            assert_eq!(response["error"], "api_key_secret_ref is required for ApiKey providers", "{cleared}");
+        }
+        let stored = state
+            .store
+            .get(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .api_key_secret_ref
+                .as_deref(),
+            Some("CLIENT_SECRET")
+        );
+
+        let (status, response) = update(&state, id, json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["api_key_secret_ref"], "CLIENT_SECRET");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_provider_that_lacks_a_required_reference_is_refused_every_update_until_it_names_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let stored: CredentialProvider = serde_json::from_value(json!({
+            "id": "legacy", "name": "Legacy", "provider_id": "legacy", "provider_type": "oauth2_client_credentials",
+            "token_endpoint": "https://192.0.2.1/token", "client_id_secret_ref": "CLIENT_ID",
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap();
+        state
+            .store
+            .create(stored)
+            .await
+            .unwrap();
+
+        let (status, response) = update(&state, "legacy", json!({"name": "Renamed"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED);
+
+        let (status, response) =
+            update(&state, "legacy", json!({"name": "Renamed", "client_secret_secret_ref": "CLIENT_SECRET"})).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["name"], "Renamed");
+        assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3671,6 +3853,48 @@ mod jwt_provider_tests {
 
         let (status, response) = update(&state, "stored-http", json!({"name": "Renamed"})).await;
         assert_eq!(status, StatusCode::OK, "the stored provider still saves as the type it is: {response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_http_provider_keeps_a_client_secret_it_may_replace_but_not_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let stored: CredentialProvider = serde_json::from_value(json!({
+                "id": provider_type, "name": "Hydra", "provider_id": provider_type, "provider_type": provider_type,
+                "token_endpoint": "http://192.0.2.1/token",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap();
+            state
+                .store
+                .create(stored)
+                .await
+                .unwrap();
+
+            let (status, response) = update(&state, provider_type, json!({"client_secret_secret_ref": ""})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{provider_type}: {response}");
+            assert_eq!(response["error"], OAUTH_CLIENT_REFERENCES_REQUIRED, "{provider_type}");
+            let kept = state
+                .store
+                .get(provider_type)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                kept.client_secret_secret_ref
+                    .as_deref(),
+                Some("CLIENT_SECRET"),
+                "{provider_type}"
+            );
+
+            let (status, response) =
+                update(&state, provider_type, json!({"client_secret_secret_ref": "NOT_A_KEY"})).await;
+            assert_eq!(status, StatusCode::OK, "{provider_type} rotates its client secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "NOT_A_KEY", "{provider_type}");
+            assert_eq!(response["token_endpoint"], "http://192.0.2.1/token", "{provider_type}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4501,8 +4725,22 @@ mod consent_strategy_tests {
             references: Default::default(),
             rbac: None,
         };
+        state
+            .secrets_store
+            .create(crate::secrets::CreateSecretRequest {
+                tenant_id: tenant_id.map(str::to_string),
+                name: "Provider key".into(),
+                secret_id: "provider-key".into(),
+                description: None,
+                value: "value".into(),
+                secret_type: "general".into(),
+                tags: vec![],
+            })
+            .await
+            .unwrap();
         let provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Operator provider", "provider_id": "provider", "tenant_id": tenant_id,
+            "provider_type": "api_key", "api_key_secret_ref": "provider-key",
             "callback_path": "/oauth/callback/provider",
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
