@@ -572,6 +572,46 @@ async fn the_redis_stand_in_records_what_a_redis_client_adds_to_a_stream() {
     );
 }
 
+#[test]
+fn normalising_an_event_replaces_only_the_values_that_differ_between_runs() {
+    use bdd_support::sign_in_events::normalise;
+    let state = serde_json::json!({
+        "user_id": "u-7", "role": "user", "status": "approved", "is_primary": false,
+        "created_at": "2026-11-10T12:00:00Z", "updated_at": "2026-11-10T12:00:01Z"
+    });
+    let data = serde_json::json!({
+        "user_id": "u-7", "username": "alpha", "new_state": state, "old_state": null, "login_method": "passkey"
+    });
+    let envelope = serde_json::json!({
+        "event_type": "user.login", "timestamp": "2026-11-10T12:00:02Z", "appliance_id": "aw-1", "data": data
+    });
+    let record = serde_json::json!({
+        "event_type": "user.login", "timestamp": "2026-11-10T12:00:02Z", "appliance_id": "aw-1", "record": data
+    });
+    let normalised_data = serde_json::json!({
+        "user_id": "<user_id>", "username": "alpha", "old_state": null, "login_method": "passkey",
+        "new_state": {
+            "user_id": "<user_id>", "role": "user", "status": "approved", "is_primary": false,
+            "created_at": "<timestamp>", "updated_at": "<timestamp>"
+        }
+    });
+
+    assert_eq!(
+        normalise(&envelope),
+        serde_json::json!({
+            "event_type": "user.login", "timestamp": "<timestamp>", "appliance_id": "<appliance_id>",
+            "data": normalised_data
+        })
+    );
+    assert_eq!(normalise(&record)["record"], normalised_data);
+    let no_account =
+        serde_json::json!({"timestamp": "t", "data": {"new_state": null, "failure_reason": "unknown_user"}});
+    assert_eq!(
+        normalise(&no_account)["data"],
+        serde_json::json!({"new_state": null, "failure_reason": "unknown_user"})
+    );
+}
+
 fn webauthn_for_localhost() -> webauthn_rs::prelude::Webauthn {
     webauthn_rs::prelude::WebauthnBuilder::new("localhost", &url::Url::parse("http://localhost:32001").unwrap())
         .unwrap()

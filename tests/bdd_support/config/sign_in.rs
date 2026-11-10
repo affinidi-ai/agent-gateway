@@ -3,29 +3,22 @@ use std::path::Path;
 use chrono::Utc;
 use serde_json::json;
 
+use crate::bdd_support::sign_in_events::{APPLIANCE_ID, EVENT_TOPIC, RECORD_TEMPLATE, RECORD_TOPIC};
+
 /// The events the stored sign-in integration receives.
 pub const SIGN_IN_EVENTS: [&str; 2] = ["user.login", "user.login_failed"];
 
-/// Stores an active Redis stream endpoint, an event set of [`SIGN_IN_EVENTS`] and an integration
-/// joining them with an empty template, so each event is streamed as the default envelope.
+/// Stores an event set of [`SIGN_IN_EVENTS`] and an integration that streams them to
+/// [`EVENT_TOPIC`] at `redis_url` with an empty template, so each event is the default envelope;
+/// with `records`, a second one streams them to [`RECORD_TOPIC`] with Agent Watch's
+/// [`RECORD_TEMPLATE`]. Sets [`APPLIANCE_ID`] in the stored settings, so envelopes carry it.
 pub fn write_sign_in_event_integration(
     storage_dir: &Path,
     redis_url: &str,
+    records: bool,
 ) {
     let now = Utc::now().to_rfc3339();
     let integrations = storage_dir.join("integrations");
-    write(
-        &integrations.join("endpoints/bdd-sign-in-stream.json"),
-        json!({
-            "id": "bdd-sign-in-stream",
-            "name": "Sign-in stream",
-            "type": "stream",
-            "configuration": {"platform": "redis", "topic": "sign-ins", "redis_url": redis_url},
-            "status": "active",
-            "created_at": now,
-            "updated_at": now,
-        }),
-    );
     write(
         &integrations.join("event_sets/bdd-sign-in-events.json"),
         json!({
@@ -36,19 +29,50 @@ pub fn write_sign_in_event_integration(
             "updated_at": now,
         }),
     );
-    write(
-        &integrations.join("integrations/bdd-sign-in-integration.json"),
-        json!({
-            "id": "bdd-sign-in-integration",
-            "name": "Sign-ins to Redis",
-            "endpoint_id": "bdd-sign-in-stream",
-            "event_set_id": "bdd-sign-in-events",
-            "content": {},
-            "status": "active",
-            "created_at": now,
-            "updated_at": now,
-        }),
-    );
+    let mut streams = vec![("bdd-sign-in", EVENT_TOPIC, json!({}))];
+    if records {
+        let template: serde_json::Value = serde_json::from_str(RECORD_TEMPLATE).expect("the record template is JSON");
+        streams.push(("bdd-sign-in-record", RECORD_TOPIC, template));
+    }
+    for (id, topic, content) in streams {
+        write(
+            &integrations.join(format!("endpoints/{id}-stream.json")),
+            json!({
+                "id": format!("{id}-stream"),
+                "name": topic,
+                "type": "stream",
+                "configuration": {"platform": "redis", "topic": topic, "redis_url": redis_url},
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+            }),
+        );
+        write(
+            &integrations.join(format!("integrations/{id}-integration.json")),
+            json!({
+                "id": format!("{id}-integration"),
+                "name": topic,
+                "endpoint_id": format!("{id}-stream"),
+                "event_set_id": "bdd-sign-in-events",
+                "content": content,
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+            }),
+        );
+    }
+    set_appliance_id(storage_dir);
+}
+
+/// Adds [`APPLIANCE_ID`] to the settings the gateway starts with, keeping any others.
+fn set_appliance_id(storage_dir: &Path) {
+    let path = storage_dir.join("settings/settings.json");
+    let mut settings = std::fs::read_to_string(&path)
+        .ok()
+        .map(|text| serde_json::from_str::<serde_json::Value>(&text).expect("the stored settings are JSON"))
+        .unwrap_or_else(|| json!({}));
+    settings["appliance_id"] = json!(APPLIANCE_ID);
+    write(&path, settings);
 }
 
 /// Switches the gateway written under `base_dir` to SAML sign-in, trusting an identity provider

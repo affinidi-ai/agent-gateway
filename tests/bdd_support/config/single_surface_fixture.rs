@@ -110,6 +110,8 @@ pub struct SurfaceConfigBuilder {
     pub starts_standby: bool,
     /// The Redis URL an integration stored before the gateway starts streams sign-in events to.
     pub sign_in_event_stream: Option<String>,
+    /// A second integration streams sign-in events with Agent Watch's record template.
+    pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
 }
@@ -221,6 +223,7 @@ impl Default for SurfaceConfigBuilder {
             api_key_provider_key_created_at: None,
             starts_standby: false,
             sign_in_event_stream: None,
+            streams_sign_in_records: false,
             signs_in_with_saml: false,
         }
     }
