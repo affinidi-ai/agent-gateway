@@ -1617,7 +1617,29 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 | --- | --- |
 | `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
-| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Every rotation is kept, so the fields before the first one are the ones the identity was created with. Every Identities row and WebSocket identity update carries the list, so each grows by one entry per rotation. |
+| `rotation_count` | How many rotations of that credential its rotation history holds. Omitted while there are none. |
+
+Each rotation in the history has `rotated_at` (the credential's new `updated_at`) and
+`previous`, the identity fields the rotation replaced with their earlier values. Every rotation
+is kept, so the fields before the first one are the ones the identity was created with. The
+history is stored apart from the record, one file per identity hash under the identity store's
+`@rotations/` directory, written through the same storage layer (encrypted at rest when storage
+encryption is on). It is written only when a rotation is recorded, so the usage update every
+request makes does not rewrite it. A record written before the history existed keeps its
+rotations inline in `rotations`; the next write of that record moves them to the history.
+
+Identities rows and WebSocket identity updates carry `rotation_count`, not the rotations.
+`GET /api/v1/identities/by-hash/{identity_hash}/rotations` lists them, oldest first, under the
+same session authentication as the other dashboard routes:
+
+| Query | Meaning |
+| --- | --- |
+| `limit` | Rotations per page, 1 to 1000. Default 1000. |
+| `before` | History index the page ends before. Default: the end of the history, so the first page is the newest. |
+
+The answer is `{ "rotations": [...], "total": n, "start": i }`: the history's entries
+`start` to `start + rotations.length - 1` of `total`. Ask again with `before=start` for the
+page before it until `start` is `0`. An unknown identity hash answers `404`.
 
 On each use of a credential-derived managed identity, the gateway compares the credential
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer

@@ -38,12 +38,5 @@
   "slot": {
     "kind": "protected"
   },
-  "rotations": [
-    {
-      "rotated_at": "2026-01-02T00:00:00Z",
-      "previous": {
-        "fingerprint_sha256": "aa"
-      }
-    }
-  ]
+  "rotation_count": 1
 }

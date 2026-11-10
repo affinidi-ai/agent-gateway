@@ -1243,7 +1243,12 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   edited its details) is labelled "Credential updated". A version that introduces a DID other
   than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). A
   certificate or API key identity with no versions yet still shows the section, saying none
-  are recorded. The rows' `rotations` (every rotation) come from the backend; see
+  are recorded. Rows carry only `rotation_count`. Opening Version History fetches every page
+  of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,
+  through the `useEntryVersions` hook), showing `identities-version-history-loading` while it
+  loads and `identities-version-history-error` with `identities-version-history-retry-button`
+  when it fails. It refetches only when a member's `rotation_count` changes, and an entry
+  with no rotations builds its DID versions without a request; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when

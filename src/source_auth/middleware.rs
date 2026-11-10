@@ -759,6 +759,7 @@ mod tests {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
+            rotation_count: 0,
         }
     }
 

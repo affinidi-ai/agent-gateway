@@ -1,13 +1,22 @@
 import React from 'react';
+import type { Identity } from '../../types';
 import { formatDateTime } from '../../utils/stringUtils';
 import type { FieldChange, IdentityVersion } from './identityVersions';
+import { useEntryVersions } from './useEntryVersions';
 
-interface IdentityVersionHistoryProps {
+interface VersionListProps {
   versions: IdentityVersion[];
   /** DID whose versions are marked, for a deep link to an earlier DID. */
   highlightedDid?: string;
   /** Actions of the DID a version introduces; return `null` to show none. */
   renderActions?: (version: IdentityVersion) => React.ReactNode;
+}
+
+interface IdentityVersionHistoryProps extends Omit<VersionListProps, 'versions'> {
+  /** Every identity of the entry; rotations are fetched for those that have any. */
+  members: Identity[];
+  /** The entry's primary DID, whose latest version is the current one. */
+  currentDid: string;
 }
 
 const formatValue = (value: unknown): string =>
@@ -48,12 +57,8 @@ const emptyChangesText = (version: IdentityVersion): string =>
 const rotationLabel = (version: IdentityVersion): string =>
   version.changes.length > 0 ? 'Credential rotated' : 'Credential updated';
 
-export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
-  versions,
-  highlightedDid,
-  renderActions,
-}) => (
-  <div data-testid="identities-version-history">
+const VersionList: React.FC<VersionListProps> = ({ versions, highlightedDid, renderActions }) => (
+  <>
     {versions.length === 0 && (
       <p className="small text-muted mb-2" data-testid="identities-version-history-empty">
         No earlier DIDs or credential rotations recorded.
@@ -106,7 +111,48 @@ export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
         );
       })}
     </ol>
-  </div>
+  </>
 );
+
+/** The entry's versions, loaded when shown: mount it only while Version History is open. */
+export const IdentityVersionHistory: React.FC<IdentityVersionHistoryProps> = ({
+  members,
+  currentDid,
+  ...listProps
+}) => {
+  const state = useEntryVersions(members, currentDid);
+  return (
+    <div data-testid="identities-version-history" aria-busy={state.status === 'loading'}>
+      {state.status === 'loading' && (
+        <p
+          className="small text-muted mb-2"
+          role="status"
+          data-testid="identities-version-history-loading"
+        >
+          <span className="spinner-border spinner-border-sm me-2" aria-hidden="true" />
+          Loading version history…
+        </p>
+      )}
+      {state.status === 'error' && (
+        <div
+          className="alert alert-danger small py-2 mb-2 d-flex flex-wrap align-items-center gap-2"
+          role="alert"
+          data-testid="identities-version-history-error"
+        >
+          <span className="text-break">Could not load version history: {state.message}</span>
+          <button
+            type="button"
+            className="btn btn-outline-danger btn-sm ms-auto"
+            onClick={state.retry}
+            data-testid="identities-version-history-retry-button"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {state.status === 'ready' && <VersionList versions={state.versions} {...listProps} />}
+    </div>
+  );
+};
 
 export default IdentityVersionHistory;

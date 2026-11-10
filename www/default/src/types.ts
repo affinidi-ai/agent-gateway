@@ -213,7 +213,8 @@ export interface Identity {
   trust_recorder?: TrustRecorderStatus;
   trust_recorder_surface?: ManagedSurfaceRef;
   slot?: ManagedSlot;
-  rotations?: CredentialRotation[];
+  /** Credential rotations recorded for this identity; omitted when there are none. */
+  rotation_count?: number;
 }
 
 export interface ManagedSurfaceRef {

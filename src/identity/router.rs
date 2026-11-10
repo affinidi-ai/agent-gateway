@@ -189,7 +189,8 @@ pub fn create_identity_api_router(
             get(crate::observability::get_ucp_operation_stats),
         )
         .route("/v1/dashboard/metrics/hierarchical", get(crate::observability::get_hierarchical_metrics))
-        .route("/v1/dashboard/system-metrics", get(crate::observability::get_system_metrics));
+        .route("/v1/dashboard/system-metrics", get(crate::observability::get_system_metrics))
+        .route("/v1/identities/by-hash/{identity_hash}/rotations", get(crate::observability::get_identity_rotations));
 
     // Add WebSocket routes conditionally based on auth requirement
     info!(
