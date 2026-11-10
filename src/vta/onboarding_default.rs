@@ -330,6 +330,8 @@ mod tests {
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
             control_key_rotated_at: None,
+            control_key_next_rotation_at: None,
+            control_key_rotation_days: 0,
             previously_connected,
             signing_key_id: None,
             signing_key_public: None,

@@ -2429,6 +2429,22 @@ pub async fn create_identity_api_router(
     let di_vc_issuer = key_directory.di_vc_issuer();
     let agent_provisioner = key_directory.agent_provisioner();
     let vta_client_for_holder = key_directory.client();
+    if let Some(client) = &vta_client_for_holder
+        && sts_vta_config.auto_bootstrap
+        && crate::vta::bundled::status().is_some()
+        && let Some(key_path) = sts_vta_config
+            .auth_key_source
+            .as_deref()
+            .and_then(|source| source.strip_prefix("file://"))
+        && let Some(storage) = std::path::Path::new(key_path).parent()
+    {
+        crate::vta::control_key_live::register(
+            std::sync::Arc::clone(client),
+            sts_vta_config.clone(),
+            storage.to_path_buf(),
+        );
+        crate::vta::control_key_live::spawn_schedule();
+    }
 
     let appliance_key = key_directory
         .resolve_and_provision(crate::config::vta::KeyPurpose::Jwt, &crate::vta::key_directory::KeyScope::default())

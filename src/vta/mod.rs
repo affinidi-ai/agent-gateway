@@ -33,6 +33,8 @@ pub mod context_creator;
 pub mod context_identity;
 pub mod context_signer;
 pub mod control_key;
+pub mod control_key_live;
+pub mod control_key_schedule;
 pub mod control_rotation;
 pub mod di_proof;
 pub mod error;

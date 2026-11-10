@@ -112,6 +112,13 @@ fn default_bootstrap_wait_secs() -> u64 {
     90
 }
 
+fn default_control_key_rotation_days() -> u32 {
+    90
+}
+
+/// The longest interval between automatic control-key rotations: ten years.
+pub const MAX_CONTROL_KEY_ROTATION_DAYS: u32 = 3650;
+
 /// The context a bundled gateway is enrolled in. Fixed by the sidecar's
 /// entrypoint, so the gateway never chooses it.
 pub const BUNDLED_CONTEXT_ID: &str = "gateway";
@@ -328,6 +335,12 @@ pub struct VtaConfig {
     #[serde(default = "default_bootstrap_wait_secs")]
     pub bootstrap_wait_secs: u64,
 
+    /// Days between automatic rotations of the control key the gateway
+    /// authenticates to its bundled trust agent with. `0` turns automatic
+    /// rotation off. Only the bundled tier rotates; read at startup.
+    #[serde(default = "default_control_key_rotation_days")]
+    pub control_key_rotation_days: u32,
+
     /// Which DID the gateway authenticates to the trust agent as. Absent means
     /// "decide from the deployment": see
     /// [`effective_control_did_method`](Self::effective_control_did_method).
@@ -428,6 +441,7 @@ impl Default for VtaConfig {
             auto_bootstrap: false,
             bootstrap_dir: default_bootstrap_dir(),
             bootstrap_wait_secs: default_bootstrap_wait_secs(),
+            control_key_rotation_days: default_control_key_rotation_days(),
             control_did_method: None,
             publish_auth_did: None,
             auth_verification_method: None,
@@ -606,6 +620,11 @@ impl VtaConfig {
         if self.bootstrap_wait_secs == 0 {
             return Err("[vta] bootstrap_wait_secs must be greater than zero".to_string());
         }
+        if self.control_key_rotation_days > MAX_CONTROL_KEY_ROTATION_DAYS {
+            return Err(format!(
+                "[vta] control_key_rotation_days must be at most {MAX_CONTROL_KEY_ROTATION_DAYS} (0 turns rotation off)"
+            ));
+        }
         Ok(())
     }
 
@@ -769,6 +788,33 @@ mod tests {
             .expect("the bootstrap supplies vta_did, context and key");
         assert_eq!(cfg.bootstrap_dir, "/bootstrap");
         assert_eq!(cfg.bootstrap_wait_secs, 90);
+    }
+
+    #[test]
+    fn rotation_days_default_to_ninety() {
+        let cfg: VtaConfig = toml::from_str("enabled = false").expect("parse");
+        assert_eq!(cfg.control_key_rotation_days, 90);
+        assert_eq!(VtaConfig::default().control_key_rotation_days, 90);
+    }
+
+    #[test]
+    fn rotation_days_above_ten_years_are_refused_and_zero_is_allowed() {
+        let block = |days: u32| -> VtaConfig {
+            toml::from_str(&format!(
+                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\ncontrol_key_rotation_days = {days}"
+            ))
+            .expect("parse")
+        };
+        block(0)
+            .validate()
+            .expect("zero turns rotation off");
+        block(3650)
+            .validate()
+            .expect("ten years is the limit");
+        let err = block(3651)
+            .validate()
+            .expect_err("too long");
+        assert!(err.contains("control_key_rotation_days"), "{err}");
     }
 
     #[test]

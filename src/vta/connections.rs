@@ -583,6 +583,8 @@ mod tests {
             context_id: "gateway".to_string(),
             bootstrapped_at: Some(Utc::now()),
             control_key_rotated_at: None,
+            control_key_next_rotation_at: None,
+            control_key_rotation_days: 0,
             signing_key_id: Some("gateway-jwt-1".to_string()),
             signing_key_public: Some("z6MkBundledKey".to_string()),
             previously_connected: true,

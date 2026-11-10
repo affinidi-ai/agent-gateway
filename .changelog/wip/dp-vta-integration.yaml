@@ -1,6 +1,17 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T10:00:00Z'
+      title: ⭐ Rotate the bundled trust agent's control key every 90 days
+      description: >-
+        The gateway now rotates the control key it authenticates to its bundled
+        trust agent with every 90 days by default, while it runs. The active
+        gateway does it, only while the agent is connected, with a random delay
+        of up to six hours; a failure keeps the current key, retries with a
+        growing wait and logs an error after three in a row. Set
+        `[vta] control_key_rotation_days` to change the interval, or 0 to turn it
+        off. The status API reports the days, when the key last rotated and when
+        it is next due.
     - timestamp: '2026-11-10T09:00:00Z'
       title: Rotate the bundled trust agent's control key without a restart
       description: >-

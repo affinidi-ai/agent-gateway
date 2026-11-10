@@ -169,6 +169,12 @@ pub struct BootstrapStatus {
     /// When the control key last moved to a new one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub control_key_rotated_at: Option<DateTime<Utc>>,
+    /// When the control key is next due for rotation. Absent when automatic
+    /// rotation is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_key_next_rotation_at: Option<DateTime<Utc>>,
+    /// Days between automatic rotations; `0` is off.
+    pub control_key_rotation_days: u32,
     /// The signing key the sidecar holds for this gateway, and its public half.
     /// Public data: the dashboard offers it as the bundled agent's key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -537,6 +543,8 @@ pub async fn run(
         context_id: context_id.clone(),
         bootstrapped_at: None,
         control_key_rotated_at: None,
+        control_key_next_rotation_at: None,
+        control_key_rotation_days: 0,
         previously_connected: false,
         signing_key_id: None,
         signing_key_public: None,
@@ -854,6 +862,8 @@ pub async fn record_rotation(
     {
         status.control_did = Some(rotated.new_did.clone());
         status.control_key_rotated_at = Some(now);
+        status.control_key_next_rotation_at =
+            super::control_key_schedule::next_due(Some(now), state.bootstrapped_at, status.control_key_rotation_days);
     }
     Ok(state)
 }
@@ -912,7 +922,15 @@ pub async fn bootstrap(
     }
     let outcome = run(config, storage).await;
     apply(config, &outcome);
-    let status = outcome.status;
+    let mut status = outcome.status;
+    status.control_key_rotation_days = config.control_key_rotation_days;
+    if let Some(state) = &outcome.state {
+        status.control_key_next_rotation_at = super::control_key_schedule::next_due(
+            state.control_key_rotated_at,
+            state.bootstrapped_at,
+            config.control_key_rotation_days,
+        );
+    }
     match status.state {
         BootstrapState::Connected => {
             tracing::info!(
@@ -1196,6 +1214,8 @@ mod tests {
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
                 control_key_rotated_at: None,
+                control_key_next_rotation_at: None,
+                control_key_rotation_days: 0,
                 previously_connected: true,
                 signing_key_id: None,
                 signing_key_public: None,
@@ -1232,6 +1252,8 @@ mod tests {
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
                 control_key_rotated_at: None,
+                control_key_next_rotation_at: None,
+                control_key_rotation_days: 0,
                 previously_connected: false,
                 signing_key_id: None,
                 signing_key_public: None,
@@ -1971,6 +1993,8 @@ mod tests {
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
             control_key_rotated_at: None,
+            control_key_next_rotation_at: None,
+            control_key_rotation_days: 0,
             previously_connected: true,
             signing_key_id: None,
             signing_key_public: None,
