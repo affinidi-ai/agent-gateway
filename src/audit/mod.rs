@@ -17,6 +17,7 @@ pub mod events;
 pub mod integration_sink;
 pub mod journal;
 pub mod log_files;
+pub mod mcp_proxy_pin_changes;
 pub mod pipeline;
 pub mod policy_changes;
 pub mod policy_refusals;

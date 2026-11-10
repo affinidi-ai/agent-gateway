@@ -3674,6 +3674,9 @@ pub async fn run_axum_proxy(
                         .external_consent_issuers
                         .clone(),
                 ),
+                mcp_proxy_store: identity_state
+                    .mcp_proxy_store
+                    .clone(),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");

@@ -512,6 +512,7 @@ impl Receiver {
             egress_allowlist: None,
             resource_origins: Arc::new(HashMap::new()),
             issuers: Arc::new(None),
+            mcp_proxy_store: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));

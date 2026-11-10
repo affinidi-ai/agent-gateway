@@ -164,6 +164,13 @@ pub async fn init_mcp_proxy_store(mcp_proxy_store: Arc<crate::mcp_proxies::FileS
     info!("GW2: Global MCP proxy store initialized");
 }
 
+/// The MCP proxy store, once initialized.
+pub fn get_mcp_proxy_store() -> Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>> {
+    GLOBAL_MCP_PROXY_STORE
+        .get()
+        .cloned()
+}
+
 /// Initialize the global A2A proxy store for GW2
 pub async fn init_a2a_proxy_store(a2a_proxy_store: Arc<crate::a2a_proxies::FileSystemA2aProxyStore>) {
     let _ = GLOBAL_A2A_PROXY_STORE.set(a2a_proxy_store);

@@ -1029,7 +1029,9 @@ fn validate_transit_points(
 
 /// Give each Transit Point of one list, the surface's or a variant's (named by
 /// `place`), an id when it has none, and refuse an alias that is not URL-safe
-/// or that another point of the list has.
+/// or that another point of the list has, and a `proxy://` target whose id no
+/// MCP Proxy can have: a Transit Point is dispatched to the whole id, so a
+/// save checks that same id.
 fn identify_transit_points(
     points: &mut [crate::config::agent_surface::TransitPoint],
     place: &str,
@@ -1041,6 +1043,14 @@ fn identify_transit_points(
         }
         if let Err(msg) = crate::config::agent_surface::TransitPoint::validate_alias(&tp.alias) {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
+        }
+        if crate::mcp_proxies::types::endpoint_proxy_id(&tp.target_endpoint).is_some()
+            && crate::mcp_proxies::types::transit_proxy_id(&tp.target_endpoint).is_none()
+        {
+            return Err(SurfaceApiError::BadRequest(format!(
+                "{place}transit.points[{idx}]: target_endpoint proxy://<id> needs the id of an MCP Proxy: letters, \
+                 digits, '-' and '_', and nothing after it"
+            )));
         }
         if let Err(msg) = tp.validate_per_caller_rate_limit() {
             return Err(SurfaceApiError::BadRequest(format!("{place}transit.points[{idx}]: {msg}")));
@@ -1230,6 +1240,14 @@ async fn save_warnings(
 ) -> axum::http::HeaderMap {
     let issuers = jwt_strategy_issuers(state, surface).await;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
+    let stale_pins = super::surface_tenancy::stale_mcp_proxy_pin_warnings(
+        state
+            .mcp_proxy_store
+            .as_deref()
+            .map(|store| store as &dyn crate::mcp_proxies::McpProxyStore),
+        surface,
+    )
+    .await;
     let mut headers = axum::http::HeaderMap::new();
     for warning in surface
         .access_point_warnings()
@@ -1252,6 +1270,7 @@ async fn save_warnings(
         .chain(inherited_target_binding_warnings(surface))
         .chain(unbound_vendor_view_warnings(surface))
         .chain(super::surface_target_auth::target_rule_warnings(surface, &https_proxies))
+        .chain(stale_pins)
     {
         if let Some(value) = warning_header(&warning) {
             headers.append(axum::http::header::WARNING, value);
@@ -3212,7 +3231,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
-    super::surface_tenancy::validate_external_consent_bindings(&state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
     // Reject overlapping outbound listener routes before they can reach
     // the Axum router and panic the gateway on rebuild.
@@ -4209,7 +4228,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
-    super::surface_tenancy::validate_external_consent_bindings(state, &surface).await?;
+    super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
     let warnings = validate_surface_payment_policies(state.gateway_store.as_ref(), &mut surface, existing).await?;
@@ -4350,9 +4369,7 @@ pub async fn patch_surface(
     )
     .await?;
 
-    let mut merged = serde_json::to_value(&existing)
-        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface for merge: {}", e)))?;
-    json_patch::merge(&mut merged, &patch);
+    let mut merged = merged_onto_stored(&existing, &patch)?;
 
     if let Some(obj) = merged.as_object_mut() {
         obj.insert("surface_id".to_string(), serde_json::Value::String(surface_id.clone()));
@@ -4384,6 +4401,23 @@ pub async fn patch_surface(
         save_warnings(&state, &saved).await,
         SurfaceSaveResponse::new(SurfaceResponse::with_api_key_references(&state, saved).await, warnings),
     ))
+}
+
+/// The merge `PATCH` `patch` applied to the stored surface `existing`, as
+/// JSON. The stored MCP Proxy pins are left out of what it is merged onto, so
+/// the merged surface carries only a pin the patch itself sends, and every
+/// other binding keeps its stored one when it is saved
+/// ([`super::surface_tenancy::pin_mcp_proxy_grants`]).
+fn merged_onto_stored(
+    existing: &AgentSurface,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, SurfaceApiError> {
+    let mut unpinned = existing.clone();
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut unpinned);
+    let mut merged = serde_json::to_value(&unpinned)
+        .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise surface for merge: {}", e)))?;
+    json_patch::merge(&mut merged, patch);
+    Ok(merged)
 }
 
 /// `PATCH /v1/surfaces/{id}/variants/{variant_id}`
@@ -4440,7 +4474,10 @@ pub async fn patch_variant(
         reject_undeclared_trust_check_edit(variant_patch_touches_trust_checks(&patch), &existing)?;
     }
 
-    let mut merged_variant = serde_json::to_value(&existing.variants[variant_index])
+    // The stored pins are kept unless the patch itself sends one.
+    let mut unpinned_variant = existing.variants[variant_index].clone();
+    super::surface_tenancy::forget_variant_mcp_proxy_pins(&mut unpinned_variant);
+    let mut merged_variant = serde_json::to_value(&unpinned_variant)
         .map_err(|e| SurfaceApiError::InternalError(format!("Failed to serialise variant for merge: {}", e)))?;
     json_patch::merge(&mut merged_variant, &patch);
 
@@ -4466,6 +4503,7 @@ pub async fn patch_variant(
     }
 
     let mut surface = existing.clone();
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
     surface.variants[variant_index] = new_variant;
 
     let (saved, warnings) = validate_and_save_surface(
@@ -5153,6 +5191,9 @@ pub async fn create_variant(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one, and one
+    // the copy creates is a new binding.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if body.name.trim().is_empty() {
         return Err(SurfaceApiError::BadRequest("variant name is required".to_string()));
@@ -5265,6 +5306,9 @@ pub async fn update_variant(
     )
     .await?;
     let existing = surface.clone();
+    // Only overrides the request sends carry a pin it sent; every other
+    // binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if let Some(ref new_alias) = body.alias {
         SurfaceVariant::validate_alias(new_alias).map_err(SurfaceApiError::BadRequest)?;
@@ -5424,6 +5468,8 @@ pub async fn delete_variant(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     if surface
         .default_variant_id
@@ -5497,6 +5543,8 @@ pub async fn promote_variant_to_default(
     )
     .await?;
     let existing = surface.clone();
+    // The request sends no pin: every binding keeps its stored one.
+    super::surface_tenancy::forget_mcp_proxy_pins(&mut surface);
 
     let variant = surface
         .variants
@@ -5950,6 +5998,33 @@ mod validation_tests {
         }
         let mut surface = surface_with_transit_points(distinct.clone(), distinct);
         assert!(validate_transit_points(&mut surface, 30, None).is_ok(), "the variant may reuse the surface's ids");
+    }
+
+    /// A Transit Point is dispatched to the MCP Proxy its whole `proxy://` id
+    /// names, so a save refuses an id no MCP Proxy can have, `proxy://a/b`
+    /// among them, rather than check one proxy and dispatch to another.
+    #[test]
+    fn a_transit_point_naming_an_id_no_mcp_proxy_can_have_is_refused() {
+        let point = |endpoint: &str| serde_json::json!({ "id": "drive-id", "alias": "drive", "target_endpoint": endpoint, "protocol": "mcp" });
+        let expected = "target_endpoint proxy://<id> needs the id of an MCP Proxy";
+        for endpoint in ["proxy://a/b", "proxy://drive/", "proxy://drive?x=1", "proxy://../drive", "proxy://"] {
+            for (place, points, variant_points) in [
+                ("", serde_json::json!([point(endpoint)]), serde_json::json!([])),
+                ("variant 'candidate' ", serde_json::json!([]), serde_json::json!([point(endpoint)])),
+            ] {
+                let mut surface = surface_with_transit_points(points, variant_points);
+                match validate_transit_points(&mut surface, 30, None) {
+                    Err(SurfaceApiError::BadRequest(message)) => assert!(
+                        message.starts_with(&format!("{place}transit.points[0]: {expected}")),
+                        "{endpoint}: {message}"
+                    ),
+                    other => panic!("{endpoint}: expected a 400, got {other:?}"),
+                }
+            }
+        }
+        let mut surface =
+            surface_with_transit_points(serde_json::json!([point("proxy://drive_v3-1")]), serde_json::json!([]));
+        assert!(validate_transit_points(&mut surface, 30, None).is_ok());
     }
 
     fn caller_key() -> serde_json::Value {
@@ -7169,6 +7244,100 @@ mod validation_tests {
             serde_json::from_value(sent_points.clone()).unwrap();
         settle_variant_put_points(&mut points, &own, "candidate", Some(&sent_points));
         assert_eq!(points[0].id, "hop-variant", "a variant with its own list keeps its own id");
+    }
+
+    /// A merge `PATCH` starts from the stored surface, so a stored pin it
+    /// carries is not one it sent: a patch for another reason keeps the stored
+    /// pin even after the MCP Proxy changed, and never approves the change. A
+    /// patch that sends the proxy's current pin pins the binding to it, one
+    /// that sends the stored pin back keeps it, and one that sends another is
+    /// refused.
+    #[tokio::test]
+    async fn a_merge_patch_keeps_the_stored_mcp_proxy_pin_unless_it_sends_the_proxys_current_one() {
+        use crate::mcp_proxies::McpProxyStore;
+        let directory = tempfile::tempdir().unwrap();
+        let proxies = crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+            .await
+            .unwrap();
+        let drive =
+            crate::credential_providers::external::tests::grant_proxy("drive", None, "https://203.0.113.30/drive/v3");
+        proxies
+            .create(&drive)
+            .await
+            .unwrap();
+        let point = |pin: Option<String>| {
+            let mut binding = serde_json::json!({"credential_provider_id": "vendor", "consent_mode": "external",
+                "subject": "owner"});
+            if let Some(pin) = pin {
+                binding["mcp_proxy_pin"] = serde_json::json!(pin);
+            }
+            serde_json::json!({ "id": "hop-drive", "alias": "drive", "target_endpoint": "proxy://drive",
+                "protocol": "mcp", "require_transit_token": true, "transit_credentials": binding })
+        };
+        let mut stored = surface_with_transit_points(serde_json::json!([point(None)]), serde_json::json!([]));
+        stored.tenant_id = None;
+        super::super::surface_tenancy::pin_mcp_proxy_grants(&mut stored, None, Some(&proxies))
+            .await
+            .unwrap();
+        let first = drive.grant_pin();
+        let mut edited = drive.clone();
+        edited.base_url = "https://203.0.113.30/drive/v2".into();
+        proxies
+            .update(&edited)
+            .await
+            .unwrap();
+        let patched = |patch: serde_json::Value| {
+            let (stored, proxies) = (stored.clone(), &proxies);
+            async move {
+                let mut surface: AgentSurface =
+                    serde_json::from_value(merged_onto_stored(&stored, &patch).unwrap()).unwrap();
+                super::super::surface_tenancy::pin_mcp_proxy_grants(&mut surface, Some(&stored), Some(proxies))
+                    .await
+                    .map(|()| {
+                        surface
+                            .transit
+                            .unwrap()
+                            .points[0]
+                            .transit_credentials
+                            .clone()
+                            .unwrap()
+                            .mcp_proxy_pin
+                    })
+            }
+        };
+
+        assert_eq!(
+            patched(serde_json::json!({ "name": "renamed" }))
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a patch for another reason keeps the stored pin"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(None)] } }))
+                .await
+                .unwrap(),
+            Some(first.clone()),
+            "a patch that sends the Transit Point without a pin keeps the stored one"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some(edited.grant_pin()))] } }))
+                .await
+                .unwrap(),
+            Some(edited.grant_pin()),
+            "a patch that sends the proxy's current pin pins the binding to it"
+        );
+        assert_eq!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some(first.clone()))] } }))
+                .await
+                .unwrap(),
+            Some(first),
+            "a patch that sends the stored pin back keeps it, approving nothing"
+        );
+        assert!(matches!(
+            patched(serde_json::json!({ "transit": { "points": [point(Some("sha256:another".into()))] } })).await,
+            Err(SurfaceApiError::BadRequestCode(super::super::surface_tenancy::MCP_PROXY_PIN_NOT_CURRENT, _))
+        ));
     }
 
     /// The Surface Builder does not show `delegated_credentials_for_fabric_callers`,

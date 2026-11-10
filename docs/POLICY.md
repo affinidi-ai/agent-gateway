@@ -504,8 +504,9 @@ and forwards through a per-request `reqwest::Client` **pinned** to that exact
 resolved address via `resolve_to_addrs` (TLS SNI preserved) with **redirects
 disabled** — so a host cannot rebind to an internal/metadata IP between vetting
 and connect, and an upstream 3xx is returned to the caller rather than followed.
-A2A-proxy and legacy MCP `proxy://` targets are **not** DNS-resolved/pinned here
-(vetted at dial time / MCP-proxy create time). A modern (`2026-07-28`) owned MCP
+A2A-proxy and legacy MCP `proxy://` Access Point Targets are **not** DNS-resolved/pinned here
+(vetted at dial time / MCP-proxy create time); a `proxy://` Transit Point's tool calls are (see
+_Other pinned egress sinks_). A modern (`2026-07-28`) owned MCP
 Proxy `tools/call`, and a legacy one that carries the Target credential, dials its
 REST backend through a pinned, redirect-free client too, under the stricter
 save-time policy (see _Other pinned egress sinks_). A
@@ -581,6 +582,12 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   `AG_TEST_MODE=true`, `AG_BDD_EGRESS_ALLOWLIST` can admit an exact loopback
   fixture (never cloud metadata); the MCP conformance runner uses this for its
   REST fixture.
+- `egress::pinned_vendor_client` (the Strict policy, `https` only) pins every
+  **`tools/call` of a `proxy://` Transit Point** to its MCP Proxy's REST
+  backend, with a grant or without: internal addresses refused after DNS
+  resolution, the connection pinned, redirects refused, and no HTTP proxy.
+  `rmcp-openapi`'s client is never used on this path. See
+  [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy).
 - `egress::pinned_configured_direct_client` (Configured policy — blocks cloud
   metadata, loopback and unspecified addresses, and their IPv4-mapped forms;
   allows private networks, so an identity provider inside the operator's

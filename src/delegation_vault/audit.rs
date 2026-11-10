@@ -497,6 +497,28 @@ pub struct TargetAuthChangeDetails {
     pub changed: Vec<TargetAuthField>,
 }
 
+/// A management save that changed the pin of a `proxy://` Transit Point's `consent_mode:
+/// external` binding: the MCP Proxy state its grant may go through and its tools be shown in
+/// ([`crate::mcp_proxies::types::McpProxy::grant_pin`]). A new binding is pinned (no
+/// `previous_pin`), or a save sent the proxy's current pin in place of another. Names the
+/// Transit Point, the variant and the proxy by id and alias, and the pins; never the proxy's
+/// spec, `base_url` or name.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct McpProxyPinChangeDetails {
+    pub actor: Actor,
+    /// The variant's alias, or `_base_` for the surface's own Transit Points.
+    pub surface_variant: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    pub transit_point_id: String,
+    /// The Transit Point's alias.
+    pub transit_point: String,
+    pub mcp_proxy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_pin: Option<String>,
+    pub pin: String,
+}
+
 /// A secret deleted with `force=true` through the management API. Names the secret by its id
 /// and each record that still used it by kind and id; never the secret's value or a record's
 /// name.
@@ -747,6 +769,8 @@ pub enum DelegationAuditAction {
     TargetAuthChanged(Box<TargetAuthChangeDetails>),
     /// A secret was deleted with `force=true`, with or without records still using it.
     SecretForceDeleted(Box<SecretForceDeleteDetails>),
+    /// A save changed the pin of a `proxy://` Transit Point's external consent binding.
+    McpProxyPinChanged(Box<McpProxyPinChangeDetails>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +826,7 @@ impl DelegationAuditAction {
                 | Self::PolicyChangeRefused(_)
                 | Self::TargetAuthChanged(_)
                 | Self::SecretForceDeleted(_)
+                | Self::McpProxyPinChanged(_)
         )
     }
 }
@@ -1684,6 +1709,7 @@ pub fn action_category(action: &DelegationAuditAction) -> &'static str {
         DelegationAuditAction::PolicyChangeRefused(_) => "policy_change_refused",
         DelegationAuditAction::TargetAuthChanged(_) => "target_auth_changed",
         DelegationAuditAction::SecretForceDeleted(_) => "secret_force_deleted",
+        DelegationAuditAction::McpProxyPinChanged(_) => "mcp_proxy_pin_changed",
     }
 }
 
