@@ -1,0 +1,14 @@
+.github/workflows/docker.yml
+  h_218db94655109c 16,176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cc1008039dbaf4d037c0f9def65c371af7ac90d3",
+  "prompts": {},
+  "humans": {
+    "h_218db94655109c": {
+      "author": "raghavendrra.m <raghavendrra.m@affinidi.com>"
+    }
+  }
+}
