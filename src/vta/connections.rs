@@ -582,6 +582,7 @@ mod tests {
             control_did: Some("did:key:z6MkGateway".to_string()),
             context_id: "gateway".to_string(),
             bootstrapped_at: Some(Utc::now()),
+            control_key_rotated_at: None,
             signing_key_id: Some("gateway-jwt-1".to_string()),
             signing_key_public: Some("z6MkBundledKey".to_string()),
             previously_connected: true,

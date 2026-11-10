@@ -149,19 +149,59 @@ async fn promote(
     Ok(())
 }
 
-/// Rotate the control key at `control_key_path` on the trust agent `vta_did`.
-pub async fn rotate(
+/// Why a live rotation did not happen.
+#[derive(Debug)]
+pub enum RotateLiveError {
+    /// Another rotation is already running in this process.
+    InProgress,
+    Failed(VtaError),
+}
+
+impl From<VtaError> for RotateLiveError {
+    fn from(e: VtaError) -> Self {
+        Self::Failed(e)
+    }
+}
+
+static ROTATING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+
+fn rotating() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    ROTATING.get_or_init(Default::default)
+}
+
+/// Marks the control key at a path as being rotated, until dropped.
+struct Rotating(PathBuf);
+
+impl Rotating {
+    fn begin(path: &Path) -> Option<Self> {
+        let mut running = rotating()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        running
+            .insert(path.to_path_buf())
+            .then(|| Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for Rotating {
+    fn drop(&mut self) {
+        rotating()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Move the access entry that `client` authenticates as to a new key, through
+/// `client` itself. The old DID is never authenticated a second time, which
+/// would supersede the session the caller is using.
+async fn swap_to_new_key(
+    client: &VtaRestClient,
     config: &VtaConfig,
     vta_did: &str,
     control_key_path: &Path,
-) -> Result<Rotated, VtaError> {
-    let current_seed = read_seed(control_key_path)
-        .await?
-        .ok_or_else(|| VtaError::Config("there is no control key to rotate".to_string()))?;
-    let current = ControlKey::from_seed(current_seed);
-    let previous_did = current.did().to_string();
-    let client = client_for(config, vta_did, ControlKey::from_seed(current_seed))?;
-
+    previous_did: &str,
+) -> Result<(Rotated, ControlKey), VtaError> {
     let new_key = ControlKey::generate();
     let new_did = new_key.did().to_string();
     // Before the swap, never after: a crash in between must lose nothing.
@@ -209,7 +249,72 @@ pub async fn rotate(
         .authenticate()
         .await?;
     promote(control_key_path, &new_key).await?;
-    Ok(Rotated { previous_did, new_did })
+    Ok((
+        Rotated {
+            previous_did: previous_did.to_string(),
+            new_did,
+        },
+        new_key,
+    ))
+}
+
+/// Rotate the control key at `control_key_path` on the trust agent `vta_did`,
+/// with nothing else running (the offline command).
+pub async fn rotate(
+    config: &VtaConfig,
+    vta_did: &str,
+    control_key_path: &Path,
+) -> Result<Rotated, VtaError> {
+    let current_seed = read_seed(control_key_path)
+        .await?
+        .ok_or_else(|| VtaError::Config("there is no control key to rotate".to_string()))?;
+    let current = ControlKey::from_seed(current_seed);
+    let previous_did = current.did().to_string();
+    let client = client_for(config, vta_did, current)?;
+    swap_to_new_key(&client, config, vta_did, control_key_path, &previous_did)
+        .await
+        .map(|(rotated, _)| rotated)
+}
+
+/// Rotate the control key while the gateway runs, through its shared `client`,
+/// which authenticates as the new DID from then on.
+///
+/// A pending key left by an interrupted rotation is settled first rather than
+/// overwritten: if its swap happened it is the only key the trust agent
+/// accepts. Only one rotation runs at a time.
+pub async fn rotate_live(
+    client: &VtaRestClient,
+    config: &VtaConfig,
+    vta_did: &str,
+    control_key_path: &Path,
+) -> Result<Rotated, RotateLiveError> {
+    let _running = Rotating::begin(control_key_path).ok_or(RotateLiveError::InProgress)?;
+
+    if let Some(settled) = settle_pending(config, vta_did, control_key_path).await? {
+        let seed = read_seed(control_key_path)
+            .await?
+            .ok_or_else(|| VtaError::Config("the settled control key is missing".to_string()))?;
+        client
+            .replace_control_key(Arc::new(ControlKey::from_seed(seed)))
+            .await;
+        return Ok(settled);
+    }
+
+    let seed = read_seed(control_key_path)
+        .await?
+        .ok_or_else(|| VtaError::Config("there is no control key to rotate".to_string()))?;
+    let on_disk = ControlKey::from_seed(seed);
+    if on_disk.did() != client.control_did() {
+        client
+            .replace_control_key(Arc::new(on_disk))
+            .await;
+    }
+    let previous_did = client.control_did();
+    let (rotated, new_key) = swap_to_new_key(client, config, vta_did, control_key_path, &previous_did).await?;
+    client
+        .replace_control_key(Arc::new(new_key))
+        .await;
+    Ok(rotated)
 }
 
 /// Finish, or abandon, a rotation that a crash interrupted.
@@ -334,6 +439,8 @@ mod tests {
         allowed: Vec<String>,
         refuse_swap: bool,
         swaps: Vec<(String, String)>,
+        auths: Vec<String>,
+        wrong_subject: bool,
     }
 
     /// The new subject's public key, read out of its did:key as the trust agent
@@ -405,6 +512,7 @@ mod tests {
             if !vta.allowed.contains(&issuer) {
                 return denied();
             }
+            vta.auths.push(issuer.clone());
             return Json(json!({ "session": { "id": "s" }, "tokens": { "accessToken": "t", "expiresIn": 3600 } }))
                 .into_response();
         }
@@ -438,7 +546,12 @@ mod tests {
             vta.allowed.push(new.clone());
             vta.swaps
                 .push((current.clone(), new.clone()));
-            return Json(json!({ "payload": { "entry": { "subject": new }, "previousSubject": current } }))
+            let reported = if vta.wrong_subject {
+                current.clone()
+            } else {
+                new
+            };
+            return Json(json!({ "payload": { "entry": { "subject": reported }, "previousSubject": current } }))
                 .into_response();
         }
         (StatusCode::BAD_REQUEST, Json(json!({ "error": "unexpected task" }))).into_response()
@@ -489,6 +602,8 @@ mod tests {
             allowed: Vec::new(),
             refuse_swap: false,
             swaps: Vec::new(),
+            auths: Vec::new(),
+            wrong_subject: false,
         })))
     }
 
@@ -524,6 +639,218 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "nothing is left pending"
+        );
+    }
+
+    fn running_client(
+        url: &str,
+        key: &ControlKey,
+    ) -> VtaRestClient {
+        client_for(&config(url), VTA, ControlKey::from_seed(key.seed_bytes())).expect("client")
+    }
+
+    fn auths_as(
+        mock: &Mock,
+        did: &str,
+    ) -> usize {
+        mock.0
+            .lock()
+            .unwrap()
+            .auths
+            .iter()
+            .filter(|d| d.as_str() == did)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_live_rotation_moves_the_entry_without_authenticating_the_old_did_again() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let client = running_client(&url, &old);
+        client
+            .authenticate()
+            .await
+            .unwrap();
+
+        let rotated = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect("rotate");
+
+        assert_eq!(rotated.previous_did, old.did());
+        assert_eq!(auths_as(&mock, old.did()), 1, "the old DID signed in once, before the rotation");
+        assert_eq!(mock.0.lock().unwrap().allowed, [rotated.new_did.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_live_rotation_switches_the_running_client_to_the_new_did() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let client = running_client(&url, &old);
+        client
+            .authenticate()
+            .await
+            .unwrap();
+
+        let rotated = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect("rotate");
+
+        assert_eq!(client.control_did(), rotated.new_did);
+        client
+            .access_token()
+            .await
+            .expect("the client signs in as the new DID");
+        assert_eq!(auths_as(&mock, &rotated.new_did), 2, "the proof of life, then the running client");
+        assert_eq!(
+            ControlKey::from_seed(
+                read_seed(&path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .did(),
+            rotated.new_did,
+            "the new key is the one on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_live_swap_keeps_the_old_key_and_removes_the_pending_one() {
+        let mock = new_mock();
+        mock.0
+            .lock()
+            .unwrap()
+            .refuse_swap = true;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let client = running_client(&url, &old);
+
+        let err = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect_err("refused");
+
+        assert!(matches!(err, RotateLiveError::Failed(VtaError::Http { status: 403, .. })), "{err:?}");
+        assert_eq!(client.control_did(), old.did());
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(mock.0.lock().unwrap().allowed, [old.did().to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_live_swap_keeps_the_pending_key_for_the_next_start() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let client = running_client("http://127.0.0.1:1", &old);
+
+        let err = rotate_live(&client, &config("http://127.0.0.1:1"), VTA, &path)
+            .await
+            .expect_err("unreachable");
+
+        assert!(matches!(err, RotateLiveError::Failed(VtaError::Transport(_))), "{err:?}");
+        assert_eq!(client.control_did(), old.did());
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_pending_key_is_settled_not_overwritten() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let pending = ControlKey::generate();
+        {
+            let mut vta = mock.0.lock().unwrap();
+            vta.allowed = vec![pending.did().to_string()];
+        }
+        write_seed(&pending_key_path(&path), &pending)
+            .await
+            .unwrap();
+        let client = running_client(&url, &old);
+
+        let rotated = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect("settled");
+
+        assert_eq!(rotated.new_did, pending.did());
+        assert_eq!(client.control_did(), pending.did());
+        assert!(
+            mock.0
+                .lock()
+                .unwrap()
+                .swaps
+                .is_empty(),
+            "no second swap was sent"
+        );
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn two_rotations_at_once_are_refused() {
+        let mock = new_mock();
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let client = running_client(&url, &old);
+        let _running = Rotating::begin(&path).expect("first");
+
+        let err = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect_err("busy");
+
+        assert!(matches!(err, RotateLiveError::InProgress), "{err:?}");
+        assert!(
+            mock.0
+                .lock()
+                .unwrap()
+                .swaps
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_must_name_the_new_did() {
+        let mock = new_mock();
+        mock.0
+            .lock()
+            .unwrap()
+            .wrong_subject = true;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, old) = enrolled_gateway(&mock, dir.path()).await;
+        let url = serve(&mock).await;
+        let client = running_client(&url, &old);
+
+        let err = rotate_live(&client, &config(&url), VTA, &path)
+            .await
+            .expect_err("wrong subject");
+
+        assert!(matches!(err, RotateLiveError::Failed(VtaError::Protocol(_))), "{err:?}");
+        assert_eq!(client.control_did(), old.did(), "the running client did not move");
+        assert!(
+            read_seed(&pending_key_path(&path))
+                .await
+                .unwrap()
+                .is_some(),
+            "left for the next start to settle"
         );
     }
 

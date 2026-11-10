@@ -289,7 +289,7 @@ fn onboarding_record_path(config: &VtaConfig) -> Option<std::path::PathBuf> {
     let key_path = source.strip_prefix("file://")?;
     std::path::Path::new(key_path)
         .parent()
-        .map(|dir| dir.join("vta_onboarding"))
+        .map(|dir| dir.join(onboarding::ONBOARDING_RECORD_FILE))
 }
 
 /// Source the gateway's Ed25519 control key behind the [`SignerKeyProvider`]

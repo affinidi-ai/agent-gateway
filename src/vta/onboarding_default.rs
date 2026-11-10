@@ -329,6 +329,7 @@ mod tests {
             control_did: None,
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
+            control_key_rotated_at: None,
             previously_connected,
             signing_key_id: None,
             signing_key_public: None,

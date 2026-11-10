@@ -232,6 +232,9 @@ impl GrantScope {
     }
 }
 
+/// The onboarding record's file, beside the control key.
+pub const ONBOARDING_RECORD_FILE: &str = "vta_onboarding";
+
 /// Persisted onboarding state. Written **encrypted at rest** via the shared
 /// secret-file helper (whole-file `.enc` when encryption is active).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

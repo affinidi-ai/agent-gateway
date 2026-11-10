@@ -1,6 +1,14 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T09:00:00Z'
+      title: Rotate the bundled trust agent's control key without a restart
+      description: >-
+        The gateway's control key for its bundled trust agent can now be moved to
+        a new key while the gateway runs, through the connection it already has,
+        so requests in flight keep working. The rotation is recorded in the
+        bundled state with its time, and the signing keys and issuer do not
+        change. Until now the rotation needed the gateway stopped.
     - timestamp: '2026-11-09T16:00:00Z'
       title: Let a surface sign through the bundled trust agent by name
       description: >-

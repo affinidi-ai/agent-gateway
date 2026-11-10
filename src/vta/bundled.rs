@@ -124,6 +124,9 @@ pub struct BundledState {
     #[serde(default)]
     pub retired_keys: Vec<RetiredKey>,
     pub bootstrapped_at: DateTime<Utc>,
+    /// When the control key last moved to a new one. `None` until it has.
+    #[serde(default)]
+    pub control_key_rotated_at: Option<DateTime<Utc>>,
 }
 
 /// A signing key an earlier bootstrap made, no longer signing.
@@ -163,6 +166,9 @@ pub struct BootstrapStatus {
     pub context_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrapped_at: Option<DateTime<Utc>>,
+    /// When the control key last moved to a new one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_key_rotated_at: Option<DateTime<Utc>>,
     /// The signing key the sidecar holds for this gateway, and its public half.
     /// Public data: the dashboard offers it as the bundled agent's key.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,6 +536,7 @@ pub async fn run(
         control_did: None,
         context_id: context_id.clone(),
         bootstrapped_at: None,
+        control_key_rotated_at: None,
         previously_connected: false,
         signing_key_id: None,
         signing_key_public: None,
@@ -706,6 +713,7 @@ async fn connect(
         }
         let mut updated = state.clone();
         updated.control_did = control_did;
+        updated.control_key_rotated_at = Some(Utc::now());
         save_state(storage, &updated)
             .await
             .map_err(misconfigured)?;
@@ -721,6 +729,7 @@ async fn connect(
         signing_key_public,
         retired_keys: retired,
         bootstrapped_at: Utc::now(),
+        control_key_rotated_at: None,
     };
     save_state(storage, &fresh)
         .await
@@ -803,11 +812,50 @@ pub async fn rotate_control_key(
         .map_err(|e| {
             format!("the rotation failed: {e}. Nothing is lost: if the swap did happen, the next start finishes it.")
         })?;
-    let mut updated = state;
-    updated.control_did = rotated.new_did.clone();
-    save_state(storage, &updated).await?;
-    write_enrolment(Path::new(&config.bootstrap_dir), &rotated.new_did).await?;
+    record_rotation(storage, Path::new(&config.bootstrap_dir), &rotated, Utc::now()).await?;
     Ok(format!("{plan}\nDone. The control key is now `{}`. Start the gateway again.", rotated.new_did))
+}
+
+/// Record a finished control-key rotation: the state, the enrolment note a
+/// future sidecar start reads, the onboarding record and the live status.
+///
+/// Only the gateway's access entry moved; the signing key, the issuer and
+/// everything else the state holds are carried over untouched.
+pub async fn record_rotation(
+    storage: &Path,
+    bootstrap_dir: &Path,
+    rotated: &super::control_rotation::Rotated,
+    now: DateTime<Utc>,
+) -> Result<BundledState, String> {
+    let mut state = load_state(storage)
+        .await?
+        .ok_or("nothing to record: no bundled bootstrap is recorded on this gateway")?;
+    state.control_did = rotated.new_did.clone();
+    state.control_key_rotated_at = Some(now);
+    save_state(storage, &state).await?;
+    write_enrolment(bootstrap_dir, &rotated.new_did).await?;
+
+    // Written before the client signs in as the new DID, so the onboarding check
+    // finds the record already current instead of flagging an off-schedule change.
+    let record_path = storage.join(super::onboarding::ONBOARDING_RECORD_FILE);
+    if let Ok(Some(mut record)) = super::onboarding::OnboardingRecord::load(&record_path).await {
+        record.control_did = rotated.new_did.clone();
+        record.granted_at = now;
+        if let Err(e) = record
+            .save(&record_path)
+            .await
+        {
+            tracing::warn!(target: "vta_audit", "could not update the onboarding record: {}", e.log_detail());
+        }
+    }
+
+    if let Ok(mut slot) = slot().write()
+        && let Some(status) = slot.as_mut()
+    {
+        status.control_did = Some(rotated.new_did.clone());
+        status.control_key_rotated_at = Some(now);
+    }
+    Ok(state)
 }
 
 /// Fold a bootstrap result into the `[vta]` block the rest of startup reads.
@@ -906,7 +954,137 @@ mod tests {
             signing_key_public: "z6MkKey".to_string(),
             retired_keys: Vec::new(),
             bootstrapped_at: Utc::now(),
+            control_key_rotated_at: None,
         }
+    }
+
+    fn rotated(
+        previous: &str,
+        new: &str,
+    ) -> super::super::control_rotation::Rotated {
+        super::super::control_rotation::Rotated {
+            previous_did: previous.to_string(),
+            new_did: new.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_records_the_new_control_did_and_when() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let first = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+        let now = Utc::now();
+
+        let state = record_rotation(
+            fixture.storage.path(),
+            fixture.boot.path(),
+            &rotated(&first.control_did, "did:key:z6MkNew"),
+            now,
+        )
+        .await
+        .expect("record");
+
+        assert_eq!(state.control_did, "did:key:z6MkNew");
+        assert_eq!(state.control_key_rotated_at, Some(now));
+        let stored = load_state(fixture.storage.path())
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(stored, state);
+        let note = std::fs::read_to_string(
+            fixture
+                .boot
+                .path()
+                .join(ENROLMENT_FILE),
+        )
+        .unwrap();
+        assert_eq!(note, enrolment_contents("did:key:z6MkNew"), "a future re-enrolment names the new key");
+    }
+
+    #[tokio::test]
+    async fn a_rotation_leaves_the_signing_key_and_issuer_alone() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let before = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+
+        let after = record_rotation(
+            fixture.storage.path(),
+            fixture.boot.path(),
+            &rotated(&before.control_did, "did:key:z6MkNew"),
+            Utc::now(),
+        )
+        .await
+        .expect("record");
+
+        assert_eq!(after.signing_key_id, before.signing_key_id);
+        assert_eq!(after.signing_key_public, before.signing_key_public);
+        assert_eq!(after.retired_keys, before.retired_keys);
+        assert_eq!(after.vta_did, before.vta_did);
+        assert_eq!(after.context_id, before.context_id);
+        assert_eq!(after.bootstrapped_at, before.bootstrapped_at);
+    }
+
+    #[tokio::test]
+    async fn a_rotation_updates_the_onboarding_record_so_the_next_sign_in_is_not_off_schedule() {
+        let mock = Mock::new();
+        let fixture = Fixture::new(&serve(&mock).await);
+        fixture.publish_identity(VTA);
+        let first = fixture
+            .run()
+            .await
+            .state
+            .expect("first");
+        let path = fixture
+            .storage
+            .path()
+            .join(super::super::onboarding::ONBOARDING_RECORD_FILE);
+        super::super::onboarding::OnboardingRecord {
+            control_did: first.control_did.clone(),
+            context_id: "gateway".to_string(),
+            issuer_did: VTA.to_string(),
+            granted_at: Utc::now() - chrono::Duration::days(30),
+        }
+        .save(&path)
+        .await
+        .unwrap();
+
+        record_rotation(
+            fixture.storage.path(),
+            fixture.boot.path(),
+            &rotated(&first.control_did, "did:key:z6MkNew"),
+            Utc::now(),
+        )
+        .await
+        .expect("record");
+
+        let record = super::super::onboarding::OnboardingRecord::load(&path)
+            .await
+            .unwrap()
+            .expect("record");
+        assert_eq!(record.control_did, "did:key:z6MkNew");
+    }
+
+    #[test]
+    fn an_older_state_file_without_a_rotation_time_still_loads() {
+        let mut value = serde_json::to_value(state(VTA)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("control_key_rotated_at");
+
+        let loaded: BundledState = serde_json::from_value(value).expect("loads");
+
+        assert_eq!(loaded.control_key_rotated_at, None);
     }
 
     #[test]
@@ -1017,6 +1195,7 @@ mod tests {
                 control_did: None,
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
+                control_key_rotated_at: None,
                 previously_connected: true,
                 signing_key_id: None,
                 signing_key_public: None,
@@ -1052,6 +1231,7 @@ mod tests {
                 control_did: None,
                 context_id: "gateway".to_string(),
                 bootstrapped_at: None,
+                control_key_rotated_at: None,
                 previously_connected: false,
                 signing_key_id: None,
                 signing_key_public: None,
@@ -1720,6 +1900,12 @@ mod tests {
         let state = outcome.state.expect("state");
         assert_eq!(state.control_did, new_key.did(), "the record follows the key that is now current");
         assert_ne!(state.control_did, first.control_did);
+        assert!(
+            state
+                .control_key_rotated_at
+                .is_some(),
+            "the finished rotation is dated"
+        );
         assert_eq!(mock.creates(), 1, "no second signing key");
         let note = std::fs::read_to_string(
             fixture
@@ -1784,6 +1970,7 @@ mod tests {
             control_did: Some("did:key:z6MkGw".to_string()),
             context_id: "gateway".to_string(),
             bootstrapped_at: None,
+            control_key_rotated_at: None,
             previously_connected: true,
             signing_key_id: None,
             signing_key_public: None,
