@@ -4496,6 +4496,7 @@ mod live_connection_tests {
                 default_context_id: Some(context.clone()),
                 control_key_ref: Some(CONTROL_SECRET_ID.to_string()),
                 control_did: None,
+                control_key_state: Default::default(),
                 status: VtaConnectionStatus::Connected,
                 keys: SigningKeys {
                     active: Some(SigningKey {
@@ -4683,6 +4684,7 @@ mod surface_injection_tests {
                 default_context_id: Some("ctx-a".to_string()),
                 control_key_ref: Some("ctl".to_string()),
                 control_did: None,
+                control_key_state: Default::default(),
                 status: crate::vta::connections::VtaConnectionStatus::Connected,
                 keys: Default::default(),
                 pairing: crate::vta::pairing::PairingRecord {

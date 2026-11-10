@@ -51,6 +51,9 @@ pub struct VtaConnectionAdminState {
     /// Publishes a new connection's `did:webvh`. `None` when the gateway has no
     /// domain to publish under, so connections authenticate as their `did:key`.
     pub auth_did_publisher: Option<Arc<crate::vta::auth_did::ConnectionDidPublisher>>,
+    /// Rotates the control key of a connection the operator added. Absent when
+    /// the gateway has no domain to publish a connection's DID under.
+    pub key_rotator: Option<Arc<crate::vta::connection_key_rotation::ConnectionKeyRotator>>,
 }
 
 /// Query for the actions that stop a connection signing.
@@ -294,6 +297,7 @@ fn to_connection(
         default_context_id: body.default_context_id,
         control_key_ref: body.control_key_ref,
         control_did: None,
+        control_key_state: Default::default(),
         status,
         keys: Default::default(),
         pairing: Default::default(),
@@ -1630,6 +1634,7 @@ mod tests {
             default_resolution: Arc::new(crate::vta::onboarding_default::resolve(&VtaConfig::default())),
             identity_store,
             auth_did_publisher: None,
+            key_rotator: None,
         };
         (state, dir)
     }

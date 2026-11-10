@@ -1,6 +1,17 @@
 branch: dp-vta-integration
 changes:
   added:
+    - timestamp: '2026-11-10T15:00:00Z'
+      title: ⭐ Rotate a custom trust agent connection's control key, keeping its DID
+      description: >-
+        The gateway can now replace the control key of a connection you added
+        yourself without a new grant on the trust agent: the connection's
+        did:webvh stays the same, the new key joins its published document beside
+        the old one, the gateway signs in with it, and the old key is removed. A
+        new key the trust agent refuses is retried and then rolled back, leaving
+        the old key in use, and a rotation a restart interrupted is resumed. A new
+        setting, `[vta] connection_key_switch_timeout_secs`, sets how long it
+        retries.
     - timestamp: '2026-11-10T11:00:00Z'
       title: Show when the bundled control key was rotated, with a Rotate button
       description: >-

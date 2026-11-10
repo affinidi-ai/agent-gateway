@@ -116,6 +116,10 @@ fn default_control_key_rotation_days() -> u32 {
     90
 }
 
+fn default_connection_key_switch_timeout_secs() -> u64 {
+    330
+}
+
 /// The longest interval between automatic control-key rotations: ten years.
 pub const MAX_CONTROL_KEY_ROTATION_DAYS: u32 = 3650;
 
@@ -341,6 +345,13 @@ pub struct VtaConfig {
     #[serde(default = "default_control_key_rotation_days")]
     pub control_key_rotation_days: u32,
 
+    /// How long, in seconds, the gateway keeps trying a new control key on a
+    /// connection you added before it rolls the rotation back. A trust agent
+    /// resolving the gateway's DID itself accepts the new key at once; one
+    /// behind a remote resolver can lag by its cache time (300 seconds at most).
+    #[serde(default = "default_connection_key_switch_timeout_secs")]
+    pub connection_key_switch_timeout_secs: u64,
+
     /// Which DID the gateway authenticates to the trust agent as. Absent means
     /// "decide from the deployment": see
     /// [`effective_control_did_method`](Self::effective_control_did_method).
@@ -442,6 +453,7 @@ impl Default for VtaConfig {
             bootstrap_dir: default_bootstrap_dir(),
             bootstrap_wait_secs: default_bootstrap_wait_secs(),
             control_key_rotation_days: default_control_key_rotation_days(),
+            connection_key_switch_timeout_secs: default_connection_key_switch_timeout_secs(),
             control_did_method: None,
             publish_auth_did: None,
             auth_verification_method: None,
@@ -620,6 +632,9 @@ impl VtaConfig {
         if self.bootstrap_wait_secs == 0 {
             return Err("[vta] bootstrap_wait_secs must be greater than zero".to_string());
         }
+        if !(10..=3600).contains(&self.connection_key_switch_timeout_secs) {
+            return Err("[vta] connection_key_switch_timeout_secs must be between 10 and 3600".to_string());
+        }
         if self.control_key_rotation_days > MAX_CONTROL_KEY_ROTATION_DAYS {
             return Err(format!(
                 "[vta] control_key_rotation_days must be at most {MAX_CONTROL_KEY_ROTATION_DAYS} (0 turns rotation off)"
@@ -795,6 +810,34 @@ mod tests {
         let cfg: VtaConfig = toml::from_str("enabled = false").expect("parse");
         assert_eq!(cfg.control_key_rotation_days, 90);
         assert_eq!(VtaConfig::default().control_key_rotation_days, 90);
+    }
+
+    #[test]
+    fn the_connection_key_switch_timeout_defaults_to_the_longest_cache_and_is_bounded() {
+        assert_eq!(VtaConfig::default().connection_key_switch_timeout_secs, 330);
+        let block = |secs: u64| -> VtaConfig {
+            toml::from_str(&format!(
+                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\nconnection_key_switch_timeout_secs = {secs}"
+            ))
+            .expect("parse")
+        };
+        block(10)
+            .validate()
+            .expect("the shortest");
+        block(3600)
+            .validate()
+            .expect("the longest");
+        assert!(
+            block(9)
+                .validate()
+                .expect_err("too short")
+                .contains("connection_key_switch_timeout_secs")
+        );
+        assert!(
+            block(3601)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

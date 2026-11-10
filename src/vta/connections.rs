@@ -111,6 +111,9 @@ pub struct VtaConnection {
     /// grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_did: Option<String>,
+    /// Which key of that DID the gateway signs in with, and a rotation under way.
+    #[serde(default, skip_serializing_if = "ControlKeyState::is_default")]
+    pub control_key_state: ControlKeyState,
     #[serde(default)]
     pub status: VtaConnectionStatus,
 
@@ -131,6 +134,60 @@ pub struct VtaConnection {
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Where a connection's control key stands: which verification method of its
+/// `did:webvh` the gateway signs in with, when the key last changed, and a
+/// rotation under way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlKeyState {
+    /// The verification method the control key is declared as. Absent means
+    /// `#key-1`, the one a connection is born with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<ControlKeyRotation>,
+    /// Why the last rotation was rolled back or gave up. Operator-facing and
+    /// redacted: never VTA internals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl ControlKeyState {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// How far a control-key rotation has got. Each phase is saved before the side
+/// effect that follows it, so a crash is resumed from the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationPhase {
+    /// The new key is stored; nothing is published yet.
+    Prepared,
+    /// The new key is in the published DID document beside the old one.
+    Introduced,
+    /// The gateway signs in with the new key; the old one is still published.
+    Switched,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlKeyRotation {
+    pub phase: RotationPhase,
+    /// Secrets-store id of the new key's seed. Never returned by the API.
+    pub next_key_ref: String,
+    pub next_verification_method: String,
+    /// Secrets-store id of the key being replaced. Never returned by the API.
+    pub previous_key_ref: String,
+    pub previous_verification_method: String,
+    pub started_at: DateTime<Utc>,
+    /// After this the gateway stops retrying a refused new key and rolls back.
+    pub give_up_at: DateTime<Utc>,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 /// A key this connection publishes.
@@ -316,6 +373,7 @@ impl VtaConnection {
             // this connection keeps using the bootstrap key.
             control_key_ref: None,
             control_did: None,
+            control_key_state: Default::default(),
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),
@@ -565,6 +623,7 @@ mod tests {
             default_context_id: Some("ctx".to_string()),
             control_key_ref: Some("secret-control-key".to_string()),
             control_did: None,
+            control_key_state: Default::default(),
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),

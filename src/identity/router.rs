@@ -2556,6 +2556,24 @@ pub async fn create_identity_api_router(
         (vta_connection_store.clone(), passkey_storage_for_manager.as_ref(), session_manager_for_manager.as_ref())
     {
         info!("VTA connection management routes registered");
+        let auth_did_publisher = connection_did_publisher(&sts_vc_issuer).await;
+        let key_rotator = match (&auth_did_publisher, &vta_connection_registry, &sts_secrets_store) {
+            (Some(publisher), Some(registry), Some(secrets)) => {
+                let rotator = std::sync::Arc::new(crate::vta::connection_key_rotation::ConnectionKeyRotator::new(
+                    store.clone(),
+                    std::sync::Arc::clone(secrets),
+                    (**publisher).clone(),
+                    registry.clone() as std::sync::Arc<dyn crate::vta::registry::ConnectionClients>,
+                    std::sync::Arc::new(crate::vta::connection_key_rotation::SystemClock),
+                    std::time::Duration::from_secs(sts_vta_config.connection_key_switch_timeout_secs),
+                ));
+                if !crate::server::mode::is_standby() {
+                    rotator.resume_all().await;
+                }
+                Some(rotator)
+            }
+            _ => None,
+        };
         let router = crate::vta::connections_admin::create_vta_connection_router(
             crate::vta::connections_admin::VtaConnectionAdminState {
                 store,
@@ -2564,7 +2582,8 @@ pub async fn create_identity_api_router(
                 provisioner: Some(std::sync::Arc::clone(&context_provisioner)),
                 default_resolution: std::sync::Arc::clone(&default_resolution),
                 identity_store: Some(sts_vc_issuer.get_identity_store()),
-                auth_did_publisher: connection_did_publisher(&sts_vc_issuer).await,
+                auth_did_publisher,
+                key_rotator,
             },
             sts_secrets_store.clone(),
         )

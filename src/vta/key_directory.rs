@@ -1503,6 +1503,7 @@ mod tests {
                 default_context_id: Some("ctx".to_string()),
                 control_key_ref: Some(format!("secret-{id}")),
                 control_did: None,
+                control_key_state: Default::default(),
                 status: VtaConnectionStatus::Connected,
                 keys: Default::default(),
                 // Paired, so the registry gets past the pairing gate and this

@@ -146,6 +146,14 @@ impl ConnectionDidPublisher {
         Self { issuer_storage, domain }
     }
 
+    /// Where `connection_id`'s log is kept.
+    pub fn dir(
+        &self,
+        connection_id: &str,
+    ) -> Result<PathBuf, VtaError> {
+        connection_auth_did_dir(&self.issuer_storage, connection_id)
+    }
+
     /// Create (or adopt) `connection_id`'s `did:webvh`, declaring `key`.
     pub async fn publish(
         &self,
@@ -1332,6 +1340,7 @@ mod live_tests {
             default_context_id: Some(parent.clone()),
             control_key_ref: Some("conn-seed".to_string()),
             control_did: Some(did.clone()),
+            control_key_state: Default::default(),
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),

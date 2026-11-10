@@ -4322,6 +4322,7 @@ mod tests {
             default_context_id: None,
             control_key_ref: None,
             control_did: None,
+            control_key_state: Default::default(),
             status: crate::vta::connections::VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),

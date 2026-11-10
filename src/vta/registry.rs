@@ -441,9 +441,48 @@ impl VtaConnectionRegistry {
             .control_did
             .as_deref()
         {
-            Some(did) => Ok(Arc::new(key.with_stable_did(did.to_string(), None)?)),
+            Some(did) => Ok(Arc::new(
+                key.with_stable_did(
+                    did.to_string(),
+                    connection
+                        .control_key_state
+                        .verification_method
+                        .clone(),
+                )?,
+            )),
             None => Ok(Arc::new(key)),
         }
+    }
+}
+
+/// What a control-key rotation needs from the connections' clients: to move
+/// the one cached client of a connection to another key and sign in with it.
+#[async_trait::async_trait]
+pub trait ConnectionClients: Send + Sync {
+    /// Make `key` the control key of `connection_id`'s cached client and
+    /// authenticate with it, through that same client: a second client would
+    /// sign the same DID in again and end the first one's session.
+    async fn switch_key(
+        &self,
+        connection_id: &str,
+        key: Arc<dyn SignerKeyProvider>,
+    ) -> Result<(), VtaError>;
+}
+
+#[async_trait::async_trait]
+impl ConnectionClients for VtaConnectionRegistry {
+    async fn switch_key(
+        &self,
+        connection_id: &str,
+        key: Arc<dyn SignerKeyProvider>,
+    ) -> Result<(), VtaError> {
+        let client = self
+            .client(connection_id)
+            .await?;
+        client
+            .replace_control_key(key)
+            .await;
+        client.authenticate().await
     }
 }
 
@@ -639,6 +678,7 @@ mod tests {
             default_context_id: Some("ctx".to_string()),
             control_key_ref: Some(format!("secret-{id}")),
             control_did: None,
+            control_key_state: Default::default(),
             status: VtaConnectionStatus::Connected,
             keys: Default::default(),
             pairing: Default::default(),

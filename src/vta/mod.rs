@@ -27,6 +27,7 @@ pub mod auth_did;
 pub mod authority;
 pub mod bundled;
 pub mod client;
+pub mod connection_key_rotation;
 pub mod connections;
 pub mod connections_admin;
 pub mod context_creator;

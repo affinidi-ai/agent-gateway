@@ -384,6 +384,7 @@ mod tests {
             default_context_id: context.map(str::to_string),
             control_key_ref: Some("secret-control-key".to_string()),
             control_did: None,
+            control_key_state: Default::default(),
             status: VtaConnectionStatus::Unpaired,
             keys: Default::default(),
             pairing: Default::default(),
