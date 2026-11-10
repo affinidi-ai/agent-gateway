@@ -23,6 +23,12 @@
   "display_name_source": "surface_name",
   "surface_id": "alpha",
   "surface_name": "ALPHA",
+  "managed_surfaces": [
+    {
+      "surface_id": "alpha",
+      "surface_name": "ALPHA"
+    }
+  ],
   "slot": {
     "kind": "protected"
   }

@@ -3,9 +3,9 @@
   "created_at": "2026-01-01T00:00:00+00:00",
   "identity_hash": "rotated",
   "agent_identity": {
-    "fingerprint_sha256": "bb",
     "credential_type": "mtls",
-    "certificate_id": "NITROGEN"
+    "certificate_id": "NITROGEN",
+    "fingerprint_sha256": "bb"
   },
   "usage_count": 1,
   "last_used_at": "2026-01-01T00:00:00+00:00",
@@ -29,6 +29,12 @@
     "kind": "certificate",
     "id": "NITROGEN"
   },
+  "managed_surfaces": [
+    {
+      "surface_id": "alpha",
+      "surface_name": "ALPHA"
+    }
+  ],
   "slot": {
     "kind": "protected"
   },
