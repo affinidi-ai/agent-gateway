@@ -69,6 +69,12 @@ const VARIABLES: &[VariableSpec] = &[
     var("USER_EMAIL", "User Email", "Email of the user, when known"),
     var("USER_ROLE", "User Role", "Role of the user"),
     var("USER_STATUS", "User Status", "Status of the user"),
+    var("LOGIN_METHOD", "Login Method", "How the user signed in, or tried to: passkey or saml"),
+    var(
+        "FAILURE_REASON",
+        "Failure Reason",
+        "Why the sign-in failed: invalid_credential, not_approved, unknown_user or saml_rejected",
+    ),
     var("CP_ID", "Connection Point ID", "ID of the connection point"),
     var("CP_NAME", "Connection Point Name", "Name of the connection point"),
     var("CP_DESCRIPTION", "Connection Point Description", "Description of the connection point"),
@@ -359,7 +365,14 @@ const EVENTS: &[EventSpec] = &[
     spec(USER, "user.approved", "User Approved", "An administrator approved a pending user", &[USER_VARIABLES]),
     spec(USER, "user.updated", "User Updated", "A user's role, status or profile was changed", &[USER_VARIABLES]),
     spec(USER, "user.deleted", "User Deleted", "A user was deleted", &[USER_VARIABLES]),
-    spec(USER, "user.login", "User Login", "A user logged in", &[USER_VARIABLES]),
+    spec(USER, "user.login", "User Login", "A user logged in", &[USER_VARIABLES, &["LOGIN_METHOD"]]),
+    spec(
+        USER,
+        "user.login_failed",
+        "User Login Failed",
+        "A sign-in reached credential verification and failed, or a SAML response was rejected",
+        &[USER_VARIABLES, &["LOGIN_METHOD", "FAILURE_REASON"]],
+    ),
     spec(USER, "user.accessed", "User Profile Accessed", "A user's profile was viewed", &[USER_VARIABLES]),
     spec(
         CONNECTION_POINT,
@@ -585,6 +598,7 @@ mod tests {
             "user.updated",
             "user.deleted",
             "user.login",
+            "user.login_failed",
             "user.accessed",
             "connection_point.created",
             "connection_point.updated",
@@ -700,6 +714,28 @@ mod tests {
                 .variables
                 .contains(&"GATEWAY_OLD_STATUS")
         );
+    }
+
+    #[test]
+    fn sign_in_events_offer_the_user_and_their_method_and_a_failure_its_reason() {
+        let failed = find_event("user.login_failed").expect("user.login_failed");
+        assert_eq!(failed.name, "User Login Failed");
+        assert_eq!((failed.family, failed.family_label), ("user", "User"));
+        let login = find_event("user.login").expect("user.login");
+        let user_variables = ["OLD_STATE", "NEW_STATE", "USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"];
+        for name in user_variables
+            .iter()
+            .chain(&["LOGIN_METHOD"])
+        {
+            assert!(failed.variables.contains(name), "user.login_failed lacks {name}");
+            assert!(login.variables.contains(name), "user.login lacks {name}");
+        }
+        assert!(failed.variables.contains(&"FAILURE_REASON"));
+        assert!(!login.variables.contains(&"FAILURE_REASON"));
+        for id in ["user.created", "user.approved", "user.updated", "user.deleted", "user.accessed"] {
+            let event = find_event(id).unwrap_or_else(|| panic!("{id}"));
+            assert!(!event.variables.contains(&"LOGIN_METHOD"), "{id} offers LOGIN_METHOD");
+        }
     }
 
     #[test]
