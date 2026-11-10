@@ -131,7 +131,7 @@ impl TermsStorage {
                 if !acceptance_ids.insert(record.id.clone()) {
                     bail!("duplicate Terms acceptance id");
                 }
-                let key = (record.user_id, record.document_id, record.version_id);
+                let key = (record.user_id, record.appliance_id, record.document_id, record.version_id);
                 if !acceptance_keys.insert(key) {
                     bail!("duplicate Terms acceptance record");
                 }
