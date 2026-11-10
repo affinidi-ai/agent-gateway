@@ -137,20 +137,19 @@ Every run scans the `Dockerfile` for misconfigurations and the built image for v
 embedded secrets with a pinned Trivy container (`scripts/ci/trivy-scan.sh`). The image is passed to
 the scanner as a tarball, so no Docker socket or registry credential reaches it. HIGH and CRITICAL
 findings, ignoring vulnerabilities that have no fix yet, are listed in the run's job summary and
-raised as warnings. They block the run only when the repository variable `TRIVY_ENFORCE` is set to
-`true`, so the rollout can start warn-only and be switched to blocking after a grace period. A
-fixable finding in the base image clears by rebuilding, because the runtime stage runs
-`apt-get upgrade`. The image runs as the non-root `lowPrivUser`.
+block the run, so a release image with a fixable finding never gets a version tag. Setting the
+repository variable `TRIVY_ENFORCE` to `false` turns them into warnings, for example while a
+finding in a pinned base image waits for a fix. A fixable finding in the base image clears by
+rebuilding, because the runtime stage runs `apt-get upgrade`. The image runs as the non-root `lowPrivUser`.
 
 The runtime image is built from a digest-pinned `debian:bookworm-slim` and carries only the shared
 libraries the binary links, `xmlsec1`, and the bootstrap CLIs, with no compilers, `-dev` packages
 or `git`. Dependabot proposes updates to the pinned base image.
 
 A manual run of the workflow (**Run workflow** on the Actions tab) builds both architectures and
-boot-probes them without pushing anything. Setting `push_test_image` also runs the publish path
-(push by digest, pull-back probe, manifest merge, attestation) but tags the manifest only
-`dryrun-<short sha>`, never a version tag or `latest`; delete that tag from the package afterwards.
-GitHub offers a manual run only for a workflow file that exists on the default branch.
+boot-probes and scans them without pushing anything. Only a `v*` tag pushes an image, and only the
+release app can create one. GitHub offers a manual run only for a workflow file that exists on the
+default branch.
 
 The build uses no layer cache, so each run compiles from scratch. The first publish creates the
 package; set its visibility to public in the organization's package settings if GitHub does not
@@ -162,12 +161,12 @@ twice as long as amd64 (about 40 minutes against about 24); amd64 is unchanged.
 
 ### Testing the publish path before a release
 
-A version tag can only be created by the release app, so a branch cannot publish one. To exercise
-the whole publish path from a branch, use the manual run with `push_test_image` once the workflow
-is on the default branch. Before that, temporarily list the branch under `on.push.branches` and
-change the `type=sha,prefix=dryrun-` tag rule to `enable=${{ github.ref_type == 'branch' }}`, then
-revert both changes afterwards. Either way the manifest is tagged only `dryrun-<short sha>`. Remove the tag and the untagged digests it leaves behind from
-the package when the testing is done.
+A version tag can only be created by the release app, so a branch cannot publish one and no manual
+run pushes an image. To exercise the whole publish path from a branch, temporarily list the branch
+under `on.push.branches` in `docker.yml` and add a tag rule such as
+`type=sha,prefix=dryrun-,enable=${{ github.ref_type == 'branch' }}` to the `Derive tags` step, so the
+manifest is tagged only `dryrun-<short sha>`. Make the `publish` job's condition match, revert both
+changes afterwards, and remove the tag and the untagged digests it leaves behind from the package.
 
 ### Trying an image locally
 

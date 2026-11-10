@@ -30,7 +30,7 @@ changes:
       description: >-
         Every container build now scans the Dockerfile for misconfigurations and the built image
         for fixable high and critical vulnerabilities and embedded secrets, and lists the findings
-        in the job summary. The scan only warns until the TRIVY_ENFORCE repository variable is set
-        to true, after which it blocks a release image from getting a version tag. The boot probe
-        also checks for missing shared libraries.
+        in the job summary. A finding blocks the run, so a release image with a fixable finding never
+        gets a version tag, unless the TRIVY_ENFORCE repository variable is set to false. The boot
+        probe also checks for missing shared libraries.
   breaking: []

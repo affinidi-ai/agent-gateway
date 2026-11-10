@@ -5,9 +5,8 @@
 # never exposed to the scanner.
 #
 # Findings are HIGH and CRITICAL only; vulnerabilities with no available fix are
-# ignored. They are listed in the job summary and as warnings. The script exits
-# non-zero on findings only when TRIVY_ENFORCE=true, so a rollout can start in
-# warn-only mode and be switched to blocking later.
+# ignored. They are listed in the job summary. The script exits non-zero on
+# findings unless TRIVY_ENFORCE=false, which downgrades them to warnings.
 #
 # Usage:
 #   trivy-scan.sh config              scan ./Dockerfile
@@ -50,11 +49,11 @@ report_and_gate() {
   local report="$1" title="$2" count
   count="$(summarize "${report}" "${title}" | tail -n 1)"
   if [[ "${count}" -gt 0 ]]; then
-    if [[ "${TRIVY_ENFORCE:-false}" == "true" ]]; then
+    if [[ "${TRIVY_ENFORCE:-true}" != "false" ]]; then
       echo "::error title=${title}::${count} HIGH or CRITICAL finding(s); see the job summary."
       exit 1
     fi
-    echo "::warning title=${title}::${count} HIGH or CRITICAL finding(s); see the job summary. Not blocking while TRIVY_ENFORCE is not true."
+    echo "::warning title=${title}::${count} HIGH or CRITICAL finding(s); see the job summary. Not blocking because TRIVY_ENFORCE is false."
   fi
 }
 
