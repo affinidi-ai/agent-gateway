@@ -1130,18 +1130,17 @@ pub(crate) enum TokenPostFailure {
 }
 
 /// `request` with `authorization` as its `Authorization` header, marked sensitive so that no
-/// debug output of the request shows it.
+/// debug output of the request shows it. `authorization` is a `Basic` credential from
+/// `revocation::basic_authorization`, always printable ASCII, so a value that is not a header
+/// value is a bug and stops here rather than going out unmarked.
 fn with_sensitive_authorization(
     request: reqwest::RequestBuilder,
     authorization: &str,
 ) -> reqwest::RequestBuilder {
-    match reqwest::header::HeaderValue::from_str(authorization) {
-        Ok(mut value) => {
-            value.set_sensitive(true);
-            request.header(reqwest::header::AUTHORIZATION, value)
-        }
-        Err(_) => request.header(reqwest::header::AUTHORIZATION, authorization),
-    }
+    let mut value =
+        reqwest::header::HeaderValue::from_str(authorization).expect("an Authorization value is printable ASCII");
+    value.set_sensitive(true);
+    request.header(reqwest::header::AUTHORIZATION, value)
 }
 
 /// POST `params` to the token endpoint `endpoint` through `client`, asking for
@@ -2436,6 +2435,33 @@ mod tests {
             let value = &request.headers()[reqwest::header::AUTHORIZATION];
             assert_eq!(value, "Basic abc");
             assert!(value.is_sensitive(), "the Authorization header is not marked sensitive");
+        }
+
+        #[test]
+        #[should_panic(expected = "printable ASCII")]
+        fn an_authorization_value_that_is_not_a_header_value_fails_instead_of_going_unmarked() {
+            let _ = with_sensitive_authorization(reqwest::Client::new().post("http://127.0.0.1/token"), "Basic a\nb");
+        }
+
+        #[test]
+        fn a_basic_credential_is_a_header_value_whatever_the_client_id_and_secret_hold() {
+            let long_id = "x".repeat(4096);
+            let long_secret = "é".repeat(4096);
+            let cases = [
+                ("", ""),
+                ("client id", "p@ss:w+rd/%"),
+                ("line\nbreak", "tab\tand\r\nreturn"),
+                ("nul\0byte", "\u{7f}del"),
+                ("ünïcödé", "日本語🔑"),
+                (long_id.as_str(), long_secret.as_str()),
+            ];
+            for (index, (client_id, secret)) in cases.into_iter().enumerate() {
+                let authorization = crate::delegation_vault::revocation::basic_authorization(client_id, secret);
+                assert!(
+                    reqwest::header::HeaderValue::from_str(&authorization).is_ok(),
+                    "the Basic credential of case {index} is not a header value"
+                );
+            }
         }
 
         fn bearer_with_client_references(client_authentication: Option<&str>) -> Value {
