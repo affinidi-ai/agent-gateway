@@ -746,7 +746,7 @@ mod tests {
                 "passkey sign-in should be unauthorized"
             );
             let raised = dispatched::values_of("user.login_failed", "USER_ID", user_id);
-            assert_eq!(raised.len(), 1, "{username}: {raised:?}");
+            assert_eq!(raised.len(), 1, "{raised:?}");
             assert_eq!(raised[0]["FAILURE_REASON"], reason);
             assert_eq!(raised[0]["LOGIN_METHOD"], "passkey");
             assert_eq!(raised[0]["USERNAME"], username);
