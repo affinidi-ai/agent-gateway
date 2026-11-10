@@ -596,10 +596,8 @@ fn a_registered_soft_passkey_signs_in_and_an_unregistered_one_is_refused() {
         .start_passkey_authentication(std::slice::from_ref(&registered))
         .unwrap();
     let request = serde_json::to_value(&request).unwrap();
-    let signed = webauthn.finish_passkey_authentication(
-        &serde_json::from_value(passkey.sign_in(&request)).unwrap(),
-        &authentication,
-    );
+    let signed = webauthn
+        .finish_passkey_authentication(&serde_json::from_value(passkey.sign_in(&request)).unwrap(), &authentication);
     let mut unregistered = SoftPasskey::new("localhost", "http://localhost:32001");
     let (request, authentication) = webauthn
         .start_passkey_authentication(std::slice::from_ref(&registered))

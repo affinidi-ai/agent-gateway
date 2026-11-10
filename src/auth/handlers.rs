@@ -715,12 +715,17 @@ mod tests {
         state: &Arc<AuthState>,
         username: &str,
     ) -> axum::http::StatusCode {
-        let Json(started) = login_start(State(state.clone()), Json(LoginStartRequest { username: username.to_string() }))
-            .await
-            .unwrap();
+        let Json(started) =
+            login_start(State(state.clone()), Json(LoginStartRequest { username: username.to_string() }))
+                .await
+                .unwrap();
         login_finish(axum::Extension(None), State(state.clone()), Json(unheld_passkey_assertion(started.challenge_id)))
             .await
-            .map(|response| response.into_response().status())
+            .map(|response| {
+                response
+                    .into_response()
+                    .status()
+            })
             .unwrap_or_else(|error| error.into_response().status())
     }
 

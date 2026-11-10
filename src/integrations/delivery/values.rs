@@ -258,7 +258,12 @@ mod tests {
     fn a_failed_sign_in_for_an_unknown_account_names_its_method_and_reason_and_no_user() {
         let values = event_values(
             event("user.login_failed"),
-            trigger(&[("LOGIN_METHOD", "passkey"), ("FAILURE_REASON", "unknown_user"), ("OLD_STATE", ""), ("NEW_STATE", "")]),
+            trigger(&[
+                ("LOGIN_METHOD", "passkey"),
+                ("FAILURE_REASON", "unknown_user"),
+                ("OLD_STATE", ""),
+                ("NEW_STATE", ""),
+            ]),
             None,
         );
 

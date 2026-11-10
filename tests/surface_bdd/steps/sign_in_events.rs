@@ -123,7 +123,9 @@ async fn approved_console_user_with_passkey(
         .await
         .expect("approve the console user");
     assert!((200..300).contains(&approved.status), "approving {username}: {}", approved.body);
-    world.passkeys.insert(username, passkey);
+    world
+        .passkeys
+        .insert(username, passkey);
 }
 
 async fn start_passkey_sign_in(
@@ -214,10 +216,8 @@ async fn finish_with_users_passkey(world: &mut SurfaceWorld) {
 async fn post_unsigned_saml_response(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
     let unsigned = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><saml:Assertion><saml:Subject><saml:NameID>member@example.test</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>"#;
-    let body = format!(
-        "SAMLResponse={}",
-        urlencoding::encode(&base64::engine::general_purpose::STANDARD.encode(unsigned))
-    );
+    let body =
+        format!("SAMLResponse={}", urlencoding::encode(&base64::engine::general_purpose::STANDARD.encode(unsigned)));
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/api/saml/acs", gateway_port(world)))
         .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")

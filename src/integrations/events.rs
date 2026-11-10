@@ -722,19 +722,38 @@ mod tests {
         assert_eq!(failed.name, "User Login Failed");
         assert_eq!((failed.family, failed.family_label), ("user", "User"));
         let login = find_event("user.login").expect("user.login");
-        let user_variables = ["OLD_STATE", "NEW_STATE", "USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"];
+        let user_variables =
+            ["OLD_STATE", "NEW_STATE", "USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"];
         for name in user_variables
             .iter()
             .chain(&["LOGIN_METHOD"])
         {
-            assert!(failed.variables.contains(name), "user.login_failed lacks {name}");
+            assert!(
+                failed
+                    .variables
+                    .contains(name),
+                "user.login_failed lacks {name}"
+            );
             assert!(login.variables.contains(name), "user.login lacks {name}");
         }
-        assert!(failed.variables.contains(&"FAILURE_REASON"));
-        assert!(!login.variables.contains(&"FAILURE_REASON"));
+        assert!(
+            failed
+                .variables
+                .contains(&"FAILURE_REASON")
+        );
+        assert!(
+            !login
+                .variables
+                .contains(&"FAILURE_REASON")
+        );
         for id in ["user.created", "user.approved", "user.updated", "user.deleted", "user.accessed"] {
             let event = find_event(id).unwrap_or_else(|| panic!("{id}"));
-            assert!(!event.variables.contains(&"LOGIN_METHOD"), "{id} offers LOGIN_METHOD");
+            assert!(
+                !event
+                    .variables
+                    .contains(&"LOGIN_METHOD"),
+                "{id} offers LOGIN_METHOD"
+            );
         }
     }
 

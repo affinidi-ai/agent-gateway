@@ -1026,8 +1026,11 @@ mod tests {
                 .unwrap_or_else(|error| error.into_response().status()),
             StatusCode::UNAUTHORIZED
         );
-        let raised =
-            crate::integrations::delivery::dispatch::dispatched::values_of("user.login_failed", "FAILURE_REASON", "saml_rejected");
+        let raised = crate::integrations::delivery::dispatch::dispatched::values_of(
+            "user.login_failed",
+            "FAILURE_REASON",
+            "saml_rejected",
+        );
         assert!(!raised.is_empty());
         for values in raised {
             assert_eq!(values["LOGIN_METHOD"], "saml");

@@ -84,10 +84,7 @@ pub fn spawn_background_task_in<F>(
 ) where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let Ok(share_permit) = share
-        .semaphore
-        .try_acquire()
-    else {
+    let Ok(share_permit) = share.semaphore.try_acquire() else {
         warn!("Background task share '{}' at capacity, skipping task: {}", share.name, name);
         return;
     };
@@ -133,13 +130,15 @@ mod tests {
             let ran = ran.clone();
             async move {
                 release.notified().await;
-                ran.send("first").expect("receiver");
+                ran.send("first")
+                    .expect("receiver");
             }
         });
         spawn_background_task_in(&SHARE, "second", {
             let ran = ran.clone();
             async move {
-                ran.send("second").expect("receiver");
+                ran.send("second")
+                    .expect("receiver");
             }
         });
 
@@ -160,7 +159,8 @@ mod tests {
         .await
         .expect("the first task gives its permit back");
         spawn_background_task_in(&SHARE, "third", async move {
-            ran.send("third").expect("receiver");
+            ran.send("third")
+                .expect("receiver");
         });
         let next = tokio::time::timeout(Duration::from_secs(5), runs.recv())
             .await

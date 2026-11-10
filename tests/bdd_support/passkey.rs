@@ -158,9 +158,19 @@ impl SoftPasskey {
         cbor_head(&mut key, 1, 0);
         cbor_head(&mut key, 0, 1);
         cbor_head(&mut key, 1, 1);
-        cbor_bytes(&mut key, point.x().expect("an uncompressed point"));
+        cbor_bytes(
+            &mut key,
+            point
+                .x()
+                .expect("an uncompressed point"),
+        );
         cbor_head(&mut key, 1, 2);
-        cbor_bytes(&mut key, point.y().expect("an uncompressed point"));
+        cbor_bytes(
+            &mut key,
+            point
+                .y()
+                .expect("an uncompressed point"),
+        );
         key
     }
 }
