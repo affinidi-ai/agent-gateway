@@ -123,6 +123,13 @@ impl CredentialProviderStorage for InMemoryProviders {
             .cloned())
     }
 
+    async fn get_checked(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<CredentialProvider>> {
+        self.get(id).await
+    }
+
     async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
         Ok(self.providers()?.to_vec())
     }

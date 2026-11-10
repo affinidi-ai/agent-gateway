@@ -1483,7 +1483,10 @@ mod tests {
                 crate::surfaces::AgentSurfaceStore::save(surfaces.as_ref(), &surface)
                     .await
                     .unwrap();
-                let vault = Arc::new(InMemoryVault { tokens: Mutex::new(Vec::new()) });
+                let vault = Arc::new(InMemoryVault {
+                    tokens: Mutex::new(Vec::new()),
+                    unreadable: false,
+                });
                 let mut fixture = Self {
                     providers,
                     vault: vault.clone(),
@@ -2399,7 +2402,7 @@ mod tests {
         let (status, body) = without_an_audit_log(response_of(app, "GET", "/api/v1/delegation-audit")).await;
         assert_eq!(
             (status, body.as_str()),
-            (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to read audit log"}"#)
+            (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to read the audit log"}"#)
         );
     }
 }
