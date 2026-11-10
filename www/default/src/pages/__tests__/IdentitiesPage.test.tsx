@@ -879,26 +879,6 @@ describe('IdentitiesPage', () => {
       expect(screen.getAllByTestId(/^identities-row-/)).toHaveLength(2);
     });
 
-    it('notes earlier rotations only when the backend dropped some', async () => {
-      renderWithStats([{ ...managedRotatedFixture, rotations_dropped: true }]);
-
-      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
-      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
-
-      expect(screen.getByTestId('identities-version-history-dropped')).toHaveTextContent(
-        'Earlier rotations not shown.'
-      );
-    });
-
-    it('does not note earlier rotations when none were dropped', async () => {
-      renderWithStats([managedRotatedFixture]);
-
-      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
-      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
-
-      expect(screen.queryByTestId('identities-version-history-dropped')).not.toBeInTheDocument();
-    });
-
     it('opens the surface entry and marks the version for a deep link to an earlier DID', async () => {
       renderWithStats([gpt4o, gpt41], [], `/identities/${encodeURIComponent(gpt4o.did)}`);
 

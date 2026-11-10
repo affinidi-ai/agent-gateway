@@ -195,7 +195,6 @@ const IdentitiesPage: React.FC = () => {
     surfaceLinkFor,
     surfaceLinksFor,
     versionsFor,
-    rotationsDroppedFor,
     identityFor,
     primaryDidFor,
   } = useIdentityRows({
@@ -984,9 +983,6 @@ const IdentitiesPage: React.FC = () => {
                                                           ? linkedDid
                                                           : undefined
                                                       }
-                                                      rotationsDropped={rotationsDroppedFor(
-                                                        identity.did
-                                                      )}
                                                       renderActions={version => {
                                                         const earlier =
                                                           version.did !== identity.did &&

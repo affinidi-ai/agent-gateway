@@ -85,7 +85,6 @@ pub fn test_surface_identity_record(
         slot: None,
         credential_updated_at: None,
         rotations: Vec::new(),
-        rotations_dropped: false,
     }
 }
 
@@ -217,7 +216,6 @@ impl IdentityStore for MockIdentityStore {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
-            rotations_dropped: false,
         };
 
         let mut records = self.records.write().await;

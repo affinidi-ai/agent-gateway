@@ -1616,8 +1616,7 @@ Each managed identity record ([`filesystem.rs`](../src/identity/filesystem.rs)) 
 | --- | --- |
 | `slot` | The slot whose setting created it: `{"kind": "protected"}` (the protected slot, the surface `managed_identity`, an A2A proxy target, or a Transit Point that inherits the surface setting), or `{"kind": "transit_point", "alias": …}` for a Transit Point's own `managed_identity`. Set on creation, and on the first use of a record written before slot tracking. |
 | `credential_updated_at` | The `updated_at` of the stored certificate or secret the identity was last derived from. |
-| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Only the latest 20 are kept (`MAX_ROTATIONS`), since every Identities row and WebSocket identity update carries the list. When older ones are dropped, the oldest kept rotation's `previous` takes their earliest values, so the fields before it are still the ones the identity was created with. |
-| `rotations_dropped` | `true` once older rotations have been dropped; omitted otherwise. The Identities page then notes "Earlier rotations not shown". |
+| `rotations` | The rotations of that credential, oldest first: `rotated_at` (the credential's new `updated_at`) and `previous`, the identity fields the rotation replaced with their earlier values. Every rotation is kept, so the fields before the first one are the ones the identity was created with. Every Identities row and WebSocket identity update carries the list, so each grows by one entry per rotation. |
 
 On each use of a credential-derived managed identity, the gateway compares the credential
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer

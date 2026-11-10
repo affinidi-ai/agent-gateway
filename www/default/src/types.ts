@@ -214,8 +214,6 @@ export interface Identity {
   trust_recorder_surface?: ManagedSurfaceRef;
   slot?: ManagedSlot;
   rotations?: CredentialRotation[];
-  /** Whether older rotations were dropped; the oldest kept one carries their earliest values. */
-  rotations_dropped?: boolean;
 }
 
 export interface ManagedSurfaceRef {

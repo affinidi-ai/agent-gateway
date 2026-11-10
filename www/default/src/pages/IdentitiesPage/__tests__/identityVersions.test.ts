@@ -127,15 +127,6 @@ describe('groupIdentityVersions', () => {
     expect(entries.map(entry => entry.dids)).toEqual([['did:legacy', managed.did, 'did:tp']]);
   });
 
-  it('flags an entry when one of its DIDs had older rotations dropped', () => {
-    const dropped = version(rotated, 'did:mtls', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', {
-      rotations_dropped: true,
-    });
-
-    expect(groupIdentityVersions([managed, dropped])[0].rotationsDropped).toBe(true);
-    expect(groupIdentityVersions([managed])[0].rotationsDropped).toBe(false);
-  });
-
   it('lists a rotation inside its DID with the fields it changed', () => {
     const [entry] = groupIdentityVersions([rotated]);
 

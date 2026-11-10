@@ -249,8 +249,8 @@ and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as
-versions in the expanded row, each earlier DID with its own actions, from the `rotations` and
-`rotations_dropped` the backend sends on each identity; see _Identities page_ in
+versions in the expanded row, each earlier DID with its own actions, from the `rotations` the
+backend sends on each identity; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
 

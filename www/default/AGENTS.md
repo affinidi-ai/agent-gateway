@@ -1241,11 +1241,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   fields); the first version lists its values. A rotation with field changes (a certificate)
   is labelled "Credential rotated"; one without (an API key, whose update may only have
   edited its details) is labelled "Credential updated". A version that introduces a DID other
-  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). When
-  the backend dropped older rotations (`rotations_dropped`), the list ends with "Earlier
-  rotations not shown." (`identities-version-history-dropped`). A certificate or API key
-  identity with no versions yet still shows the section, saying none are recorded. The rows'
-  `rotations` (the latest 20) come from the backend; see
+  than the row's offers that DID's actions (`identities-version-<n>-<action>-button`). A
+  certificate or API key identity with no versions yet still shows the section, saying none
+  are recorded. The rows' `rotations` (every rotation) come from the backend; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when

@@ -391,8 +391,6 @@ pub struct IdentityInfo {
     pub slot: Option<ManagedSlot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotations: Vec<CredentialRotation>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub rotations_dropped: bool,
 }
 
 /// A live surface where a DID is the managed agent.
@@ -2477,7 +2475,6 @@ pub(crate) async fn build_identity_list_with(
                 trust_recorder_surface: None,
                 slot: r.slot.clone(),
                 rotations: r.rotations.clone(),
-                rotations_dropped: r.rotations_dropped,
             }
         })
         .collect();

@@ -197,7 +197,6 @@ fn managed_record(
         slot: None,
         credential_updated_at: None,
         rotations: Vec::new(),
-        rotations_dropped: false,
     }
 }
 

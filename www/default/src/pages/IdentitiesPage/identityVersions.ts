@@ -26,8 +26,6 @@ export interface IdentityEntry<T extends Identity> {
   dids: string[];
   /** Newest first; empty for a single DID that was never rotated. */
   versions: IdentityVersion[];
-  /** Whether a DID of the entry had older rotations dropped by the backend. */
-  rotationsDropped: boolean;
 }
 
 type Fields = Record<string, unknown>;
@@ -149,13 +147,11 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
     time(lastUse(member)) > time(lastUse(best)) ? member : best
   );
   const dids = members.map(member => member.did);
-  const rotationsDropped = members.some(member => member.rotations_dropped === true);
   if (members.length === 1) {
     return {
       primary: latest,
       dids,
       versions: latest.rotations?.length ? timeline(members, latest.did) : [],
-      rotationsDropped,
     };
   }
   return {
@@ -166,7 +162,6 @@ function entryOf<T extends Identity>(members: T[]): IdentityEntry<T> {
     },
     dids,
     versions: timeline(members, latest.did),
-    rotationsDropped,
   };
 }
 

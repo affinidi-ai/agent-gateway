@@ -95,10 +95,6 @@ pub enum ManagedSlot {
     TransitPoint { alias: String },
 }
 
-/// Rotations kept per record; older ones are dropped, since every identity row and
-/// WebSocket update carries the list.
-pub const MAX_ROTATIONS: usize = 20;
-
 /// A change of the stored credential behind a credential-derived identity that kept its DID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CredentialRotation {
@@ -202,14 +198,9 @@ pub struct AgentIdentityRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 
-    /// Rotations of that credential, oldest first; at most [`MAX_ROTATIONS`]. When older
-    /// ones are dropped, the oldest kept rotation's `previous` takes their earliest values
+    /// Every rotation of that credential, oldest first
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rotations: Vec<CredentialRotation>,
-
-    /// Whether older rotations were dropped to keep [`MAX_ROTATIONS`]
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub rotations_dropped: bool,
 }
 
 fn default_is_local() -> bool {
@@ -265,8 +256,7 @@ impl AgentIdentityRecord {
     /// baseline. After that, an mTLS certificate rotates when its identity fields change, and
     /// any other credential, whose fields don't describe its value, whenever its `updated_at`
     /// changes. A field change seen when the baseline is stored is a rotation of unknown time.
-    /// Only the latest [`MAX_ROTATIONS`] rotations are kept; the oldest kept one takes the
-    /// earliest values of the dropped ones, so the fields before it stay the creation fields.
+    /// Every rotation is kept.
     pub fn apply_managed_source(
         &mut self,
         source: &ManagedIdentitySource,
@@ -302,28 +292,6 @@ impl AgentIdentityRecord {
                         .map(|_| updated_at),
                     previous,
                 });
-            let excess = self
-                .rotations
-                .len()
-                .saturating_sub(MAX_ROTATIONS);
-            if excess > 0 {
-                let mut earliest = std::collections::HashMap::new();
-                for dropped in self.rotations.drain(..excess) {
-                    for (key, value) in dropped.previous {
-                        earliest
-                            .entry(key)
-                            .or_insert(value);
-                    }
-                }
-                let oldest_kept = &mut self.rotations[0].previous;
-                for (key, value) in oldest_kept.drain() {
-                    earliest
-                        .entry(key)
-                        .or_insert(value);
-                }
-                *oldest_kept = earliest;
-                self.rotations_dropped = true;
-            }
         }
         self.identity_fields = identity_fields.clone();
         self.credential_updated_at = Some(updated_at);
@@ -648,7 +616,6 @@ impl IdentityStore for FilesystemIdentityStore {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
-            rotations_dropped: false,
         };
 
         self.save_record(record, true)
@@ -750,7 +717,6 @@ mod tests {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
-            rotations_dropped: false,
         }
     }
 
@@ -795,7 +761,6 @@ mod tests {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
-            rotations_dropped: false,
         };
 
         store
@@ -881,7 +846,6 @@ mod tests {
             slot: None,
             credential_updated_at: None,
             rotations: Vec::new(),
-            rotations_dropped: false,
         }
     }
 
@@ -1396,56 +1360,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_managed_source_keeps_only_the_latest_rotations() {
-        let mut record = credential_record(api_key_fields(), Some(at(0)));
-        let updates = i64::try_from(MAX_ROTATIONS).unwrap() + 5;
-
-        for updated_at in 1..=updates {
-            record.apply_managed_source(&observed(updated_at), &api_key_fields());
-        }
-
-        assert_eq!(record.rotations.len(), MAX_ROTATIONS);
-        assert_eq!(record.rotations[0].rotated_at, Some(at(6)));
-        assert_eq!(record.rotations[MAX_ROTATIONS - 1].rotated_at, Some(at(updates)));
-        assert!(record.rotations_dropped);
-    }
-
-    #[test]
-    fn apply_managed_source_keeps_the_creation_fields_when_rotations_are_dropped() {
+    fn apply_managed_source_keeps_every_rotation() {
         let mut record = credential_record(mtls_fields("f0"), Some(at(0)));
-        let updates = i64::try_from(MAX_ROTATIONS).unwrap() + 3;
+        let updates = 25;
 
         for updated_at in 1..=updates {
             record.apply_managed_source(&observed(updated_at), &mtls_fields(&format!("f{updated_at}")));
         }
 
-        assert!(record.rotations_dropped);
-        assert_eq!(record.rotations.len(), MAX_ROTATIONS);
+        assert_eq!(record.rotations.len(), usize::try_from(updates).unwrap());
+        assert_eq!(record.rotations[0].rotated_at, Some(at(1)));
         assert_eq!(
             record.rotations[0]
                 .previous
                 .get("fingerprint_sha256"),
             Some(&serde_json::json!("f0")),
-            "the oldest kept rotation replaced the creation fingerprint"
+            "the first rotation replaced the creation fingerprint"
         );
-        assert_eq!(
-            record.rotations[1]
-                .previous
-                .get("fingerprint_sha256"),
-            Some(&serde_json::json!(format!("f{}", updates - i64::try_from(MAX_ROTATIONS).unwrap() + 1)))
-        );
-    }
-
-    #[test]
-    fn apply_managed_source_does_not_flag_dropped_rotations_within_the_limit() {
-        let mut record = credential_record(api_key_fields(), Some(at(0)));
-
-        for updated_at in 1..=i64::try_from(MAX_ROTATIONS).unwrap() {
-            record.apply_managed_source(&observed(updated_at), &api_key_fields());
-        }
-
-        assert_eq!(record.rotations.len(), MAX_ROTATIONS);
-        assert!(!record.rotations_dropped);
+        assert_eq!(record.rotations[24].rotated_at, Some(at(updates)));
     }
 
     #[test]
