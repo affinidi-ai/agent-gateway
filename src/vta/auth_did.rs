@@ -742,7 +742,10 @@ mod live_tests {
     /// Serve connection logs at the path the real gateway route serves them
     /// on (`/vta-auth/{connection_id}/did.jsonl`), reading them from where the
     /// publisher wrote them.
-    async fn serve_connection_dids(storage: PathBuf) -> std::net::SocketAddr {
+    async fn serve_connection_dids(
+        storage: PathBuf,
+        port: u16,
+    ) -> std::net::SocketAddr {
         use axum::Router;
         use axum::extract::Path as UrlPath;
         use axum::routing::get;
@@ -761,7 +764,7 @@ mod live_tests {
                 }
             }),
         );
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", CONN_PORT))
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("bind the connection DID server; is the port already in use?");
         let addr = listener
@@ -814,7 +817,7 @@ mod live_tests {
             did,
             "a restart must not change the identity the grant names"
         );
-        let addr = serve_connection_dids(storage.clone()).await;
+        let addr = serve_connection_dids(storage.clone(), CONN_PORT).await;
         eprintln!("LIVE_CONN_DID_URL=http://{addr}/vta-auth/{CONN_ID}/did.jsonl");
 
         let now = chrono::Utc::now();
@@ -874,5 +877,234 @@ mod live_tests {
             outcome.scope
         );
         eprintln!("LIVE_CONN_OK did={did} scope={:?}", outcome.scope);
+    }
+
+    const ROTATE_STORAGE: &str = "/tmp/tg-vta-rotate-e2e";
+    const ROTATE_PORT: u16 = 4569;
+    const ROTATE_CONN: &str = "live-rotate-webvh";
+
+    /// Append a log entry to the connection's `did.jsonl` that declares `keys`
+    /// for authentication, hands updates to `update_keys`, and is signed by
+    /// `signer`, the way a rotation would.
+    async fn append_rotation_entry(
+        dir: &Path,
+        did: &str,
+        signer: &ControlKey,
+        keys: &[(&str, &ControlKey)],
+        update_keys: &[&ControlKey],
+    ) {
+        // A webvh entry's versionTime (whole seconds) must be later than the last one's.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let path = dir.join("did.jsonl");
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .expect("log");
+        let lines: Vec<&str> = raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let mut state = didwebvh_rs::DIDWebVHState::default();
+        state
+            .resolve_log(did, &lines.join("\n"), None)
+            .await
+            .expect("the current log resolves");
+        let last: Value = serde_json::from_str(
+            lines
+                .last()
+                .expect("an entry"),
+        )
+        .expect("json");
+        let mut doc = last["state"].clone();
+        doc["verificationMethod"] = json!(
+            keys.iter()
+                .map(|(id, key)| json!({
+                    "id": format!("{did}#{id}"),
+                    "type": "Multikey",
+                    "controller": did,
+                    "publicKeyMultibase": key.public_key_multibase(),
+                }))
+                .collect::<Vec<_>>()
+        );
+        doc["authentication"] = json!(
+            keys.iter()
+                .map(|(id, _)| format!("{did}#{id}"))
+                .collect::<Vec<_>>()
+        );
+        let mb = signer.public_key_multibase();
+        let key_id = format!("did:key:{mb}#{mb}");
+        let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, &control_key_jwk(signer)).expect("secret");
+        secret.id = key_id;
+        let result = didwebvh_rs::prelude::update_did(
+            didwebvh_rs::prelude::UpdateDIDConfig::builder()
+                .state(state)
+                .signing_key(secret)
+                .update_keys(
+                    update_keys
+                        .iter()
+                        .map(|k| didwebvh_rs::Multibase::new(k.public_key_multibase()))
+                        .collect(),
+                )
+                .document(doc)
+                .build()
+                .expect("update config"),
+        )
+        .await
+        .expect("update the DID");
+        let entry = serde_json::to_string(result.log_entry()).expect("entry json");
+        let updated = format!("{}\n{}\n", lines.join("\n"), entry);
+        let mut check = didwebvh_rs::DIDWebVHState::default();
+        check
+            .resolve_log(did, updated.trim_end(), None)
+            .await
+            .expect("the new log still resolves locally");
+        tokio::fs::write(&path, updated)
+            .await
+            .expect("write");
+    }
+
+    fn client_for(
+        url: &str,
+        vta_did: &str,
+        key: &ControlKey,
+        did: &str,
+        vm: &str,
+    ) -> VtaRestClient {
+        let key = ControlKey::from_seed(key.seed_bytes())
+            .with_stable_did(did.to_string(), Some(vm.to_string()))
+            .expect("stable did");
+        VtaRestClient::new(url, vta_did, Arc::new(key), Duration::from_secs(15), 4, None).expect("client")
+    }
+
+    /// Loop until `f` returns the wanted outcome or the time runs out; prints
+    /// what happened on the way and returns how long it took.
+    async fn until(
+        what: &str,
+        want_ok: bool,
+        limit: Duration,
+        f: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), VtaError>> + Send>>,
+    ) -> Option<Duration> {
+        let start = std::time::Instant::now();
+        let mut last = String::new();
+        while start.elapsed() < limit {
+            let r = f().await;
+            let now = match &r {
+                Ok(()) => "ok".to_string(),
+                Err(VtaError::Http { status, body }) => format!(
+                    "HTTP {status} {}",
+                    body.chars()
+                        .take(220)
+                        .collect::<String>()
+                ),
+                Err(e) => format!("{e:?}"),
+            };
+            if now != last {
+                eprintln!("  [{:>5.1}s] {what}: {now}", start.elapsed().as_secs_f32());
+                last = now;
+            }
+            let refused = matches!(&r, Err(VtaError::Http { status: 401 | 403 | 422, .. }));
+            if (want_ok && r.is_ok()) || (!want_ok && refused) {
+                return Some(start.elapsed());
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        None
+    }
+
+    /// What a key rotation inside a connection's `did:webvh` needs from a real
+    /// trust agent: a second key in the document authenticates, a superseded
+    /// session says so, and a removed key stops authenticating.
+    ///
+    /// `LIVE_ROTATE_PHASE=publish` publishes a fresh DID and prints its grant
+    /// command; grant it on the VTA, then run with `LIVE_ROTATE_PHASE=run`.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service and a grant of the published DID"]
+    async fn live_a_connection_did_rotates_its_key_on_a_real_trust_agent() {
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID");
+        let phase = std::env::var("LIVE_ROTATE_PHASE").unwrap_or_else(|_| "run".to_string());
+        let storage = PathBuf::from(ROTATE_STORAGE);
+        let old = ControlKey::from_seed([91u8; 32]);
+        let new = ControlKey::from_seed([92u8; 32]);
+        let publisher = ConnectionDidPublisher::new(storage.clone(), format!("localhost:{ROTATE_PORT}"));
+        if phase == "publish" {
+            let _ = tokio::fs::remove_dir_all(&storage).await;
+            tokio::fs::create_dir_all(&storage)
+                .await
+                .expect("storage");
+            let did = publisher
+                .publish(ROTATE_CONN, &old)
+                .await
+                .expect("publish");
+            println!("LIVE_ROTATE_DID={did}");
+            return;
+        }
+        let did = publisher
+            .publish(ROTATE_CONN, &old)
+            .await
+            .expect("adopt");
+        let dir = connection_auth_did_dir(&storage, ROTATE_CONN).expect("dir");
+        serve_connection_dids(storage.clone(), ROTATE_PORT).await;
+        let limit = Duration::from_secs(420);
+        eprintln!("DID {did}");
+
+        eprintln!("1. the old key, #key-1, signs in");
+        let a = client_for(&url, &vta_did, &old, &did, "#key-1");
+        a.authenticate()
+            .await
+            .expect("the published key authenticates");
+
+        eprintln!("2. publish an entry declaring #key-1 and #key-2, updates by both, signed by the old key");
+        append_rotation_entry(&dir, &did, &old, &[("key-1", &old), ("key-2", &new)], &[&old, &new]).await;
+        let introduced = std::time::Instant::now();
+
+        eprintln!("3. the new key, #key-2, signs in (the VTA may still have the old document cached)");
+        let took = until("new key #key-2", true, limit, || {
+            let c = client_for(&url, &vta_did, &new, &did, "#key-2");
+            Box::pin(async move { c.authenticate().await })
+        })
+        .await;
+        eprintln!("   => the new key was accepted after {took:?}");
+        assert!(took.is_some(), "a second key in the document never authenticated");
+
+        eprintln!("4. the old key still signs in while both are declared");
+        let a2 = client_for(&url, &vta_did, &old, &did, "#key-1");
+        a2.authenticate()
+            .await
+            .expect("the old key still authenticates during the overlap");
+
+        eprintln!("5. a session of the same DID is superseded by a new sign-in");
+        let b = client_for(&url, &vta_did, &new, &did, "#key-2");
+        b.authenticate()
+            .await
+            .expect("new key");
+        match a2.whoami().await {
+            Ok(_) => eprintln!("   => NOT superseded: the old session still answers whoami"),
+            Err(e) => eprintln!(
+                "   => superseded: {e} code={:?} body={}",
+                e.trust_task_code(),
+                e.log_detail()
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ),
+        }
+        b.whoami()
+            .await
+            .expect("the newest session answers");
+
+        eprintln!("6. retire #key-1: only #key-2, updates by the new key, signed by the new key");
+        append_rotation_entry(&dir, &did, &new, &[("key-2", &new)], &[&new]).await;
+        let gone = until("old key #key-1 after retire", false, limit, || {
+            let c = client_for(&url, &vta_did, &old, &did, "#key-1");
+            Box::pin(async move { c.authenticate().await })
+        })
+        .await;
+        eprintln!("   => the old key was refused after {gone:?} (from the introduce: {:?})", introduced.elapsed());
+        assert!(gone.is_some(), "the removed key kept authenticating");
+        client_for(&url, &vta_did, &new, &did, "#key-2")
+            .authenticate()
+            .await
+            .expect("the new key still authenticates after the retire");
+        eprintln!("LIVE_ROTATE_OK");
     }
 }
