@@ -149,7 +149,11 @@ account exists, from the account as stored. For `unknown_user` and `saml_rejecte
 a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
 caller typed nor anything in a rejected SAML response leaves the appliance. With the default
 `webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing
-account, `user_id` and the other user fields. The caller's answer to a failed sign-in does not
+account, `user_id` and the other user fields. Each shape, `user.login` and `user.login_failed`
+with and without an account, is kept as a reference payload in the default envelope, with run-
+specific values as placeholders, under
+[`tests/fixtures/integration_events/`](../tests/fixtures/integration_events/); the behaviour
+tests compare an event of each shape with it. The caller's answer to a failed sign-in does not
 depend on the event: it is the same `401` whether the account exists or not.
 
 Anyone can fail a sign-in, so the background tasks of `user.login_failed`, routing it and each of
