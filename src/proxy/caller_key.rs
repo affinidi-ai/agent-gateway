@@ -265,6 +265,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             claims,
             verification,
+            strategy_id: None,
         }
     }
 

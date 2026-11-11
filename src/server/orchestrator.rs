@@ -3697,6 +3697,11 @@ pub async fn run_axum_proxy(
                     .clone(),
                 crate::credential_providers::external::PermittedIssuers::of(&network_config),
                 reference_stores.clone(),
+                network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
             );
 
             let dv_state = crate::delegation_vault::handlers::DelegationVaultState {

@@ -776,15 +776,20 @@ mod tests {
         use crate::delegation_vault::ConsentStage;
         use crate::delegation_vault::oauth::{decode_callback_state, decode_start_state, encode_oauth_state};
         let fixture = consent::Fixture::new().await;
+        let confirm_binding = crate::delegation_vault::ConsentConfirmBinding {
+            strategy_id: "strategy-1".to_string(),
+            strategy_digest: "ab".repeat(32),
+            tenant_id: None,
+        };
         let start = decode_start_state(&consent::start_state(&fixture.start_url())).unwrap();
         let confirm_start = encode_oauth_state(&crate::delegation_vault::OAuthState {
-            stage: Some(ConsentStage::ConfirmStart),
+            stage: Some(ConsentStage::ConfirmStart(confirm_binding.clone())),
             ..start
         })
         .unwrap();
         let (callback_state, cookie) = fixture.begin().await;
         let confirmation = encode_oauth_state(&crate::delegation_vault::OAuthState {
-            stage: Some(ConsentStage::Confirmation),
+            stage: Some(ConsentStage::Confirmation(confirm_binding)),
             ..decode_callback_state(&callback_state).unwrap()
         })
         .unwrap();
@@ -904,6 +909,7 @@ mod tests {
             "surface",
             &["repo".to_string()],
             "https://198.51.100.7",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1259,6 +1265,7 @@ mod tests {
             "surface",
             &[],
             "https://198.51.100.7",
+            None,
         )
         .unwrap();
         let started = fixture
@@ -1623,6 +1630,7 @@ mod tests {
                     "surface",
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
+                    None,
                 )
                 .unwrap()
             }

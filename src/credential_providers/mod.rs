@@ -308,6 +308,66 @@ pub struct ConsentConfirmation {
     pub id_token_principal_claim: Option<String>,
 }
 
+impl ConsentConfirmation {
+    /// Whether confirming through a strategy that expects `expected_issuer` and
+    /// names callers by `strategy_claim` would name an Entra caller by `sub`,
+    /// in the strategy or in the ID token. Entra issues `sub` per application,
+    /// so the `sub` of an ID token issued to the login client never equals the
+    /// one in a caller's access token.
+    pub fn names_entra_caller_by_sub(
+        &self,
+        expected_issuer: &str,
+        strategy_claim: &str,
+    ) -> bool {
+        let id_token_claim = self
+            .id_token_principal_claim
+            .as_deref()
+            .unwrap_or(strategy_claim);
+        is_entra_issuer(expected_issuer)
+            && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
+    }
+}
+
+/// Whether `expected_issuer` names `gateway_issuer`, this gateway's own STS
+/// MCP issuer, compared as URLs and without a trailing `/`.
+pub fn is_gateway_issuer(
+    expected_issuer: &str,
+    gateway_issuer: Option<&str>,
+) -> bool {
+    let normalized = |issuer: &str| {
+        url::Url::parse(issuer).map_or_else(
+            |_| {
+                issuer
+                    .trim_end_matches('/')
+                    .to_string()
+            },
+            |url| {
+                url.as_str()
+                    .trim_end_matches('/')
+                    .to_string()
+            },
+        )
+    };
+    gateway_issuer.is_some_and(|gateway| normalized(gateway) == normalized(expected_issuer))
+}
+
+/// Entra's issuers: the global, US government, China and partner cloud login
+/// hosts, `sts.windows.net` for v1 tokens, and the subdomains of
+/// `ciamlogin.com` for External ID tenants.
+fn is_entra_issuer(issuer: &str) -> bool {
+    const HOSTS: [&str; 5] = [
+        "login.microsoftonline.com",
+        "sts.windows.net",
+        "login.microsoftonline.us",
+        "login.chinacloudapi.cn",
+        "login.partner.microsoftonline.cn",
+    ];
+    url::Url::parse(issuer).is_ok_and(|url| {
+        url.host_str()
+            .is_some_and(|host| HOSTS.contains(&host) || host.ends_with(".ciamlogin.com"))
+    })
+}
+
 /// The path the identity provider redirects back to after a consent
 /// confirmation sign-in, appended to the provider's redirect URI.
 pub const CONSENT_CONFIRMATION_PATH: &str = "/confirm";

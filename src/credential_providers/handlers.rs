@@ -65,6 +65,9 @@ pub struct CredentialProviderState {
     pub references: super::references::ReferenceStores,
     /// Decides which referrers a 409 may name; `None` names none.
     pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
+    /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
+    /// tokens, which no `consent_confirmation` strategy may expect.
+    pub gateway_mcp_issuer: Option<String>,
 }
 
 /// A provider as the API returns it, with `resource_origin`, the only origin
@@ -238,25 +241,6 @@ async fn referenceable_strategy(
     }))
 }
 
-/// Entra issues `sub` per application, so the `sub` of an ID token issued to
-/// the login client never equals the one in a caller's access token. Its
-/// issuers are the global, US government, China and partner cloud login hosts,
-/// `sts.windows.net` for v1 tokens, and the subdomains of `ciamlogin.com` for
-/// External ID tenants.
-fn is_entra_issuer(issuer: &str) -> bool {
-    const HOSTS: [&str; 5] = [
-        "login.microsoftonline.com",
-        "sts.windows.net",
-        "login.microsoftonline.us",
-        "login.chinacloudapi.cn",
-        "login.partner.microsoftonline.cn",
-    ];
-    url::Url::parse(issuer).is_ok_and(|url| {
-        url.host_str()
-            .is_some_and(|host| HOSTS.contains(&host) || host.ends_with(".ciamlogin.com"))
-    })
-}
-
 /// The `consent_confirmation` rules, checked when the setting is present: a
 /// legacy consent provider, a configured identity hash pepper, a login client,
 /// an `id_token_principal_claim` that names a caller, endpoints the start POST
@@ -341,13 +325,17 @@ async fn validate_consent_confirmation(
     let strategy_claim = strategy
         .principal_claim_name()
         .map_err(|_| ProviderValidationError::InvalidConfirmationStrategy)?;
-    let id_token_claim = confirmation
-        .id_token_principal_claim
-        .as_deref()
-        .unwrap_or(strategy_claim);
-    if is_entra_issuer(&strategy.expected_issuer)
-        && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
-    {
+    if super::is_gateway_issuer(
+        &strategy.expected_issuer,
+        state
+            .gateway_mcp_issuer
+            .as_deref(),
+    ) {
+        return invalid(
+            "consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else",
+        );
+    }
+    if confirmation.names_entra_caller_by_sub(&strategy.expected_issuer, strategy_claim) {
         return invalid(
             "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid",
         );
@@ -1917,6 +1905,7 @@ mod jwt_provider_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         }
     }
 
@@ -4720,6 +4709,7 @@ mod consent_strategy_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         };
         let mut provider: CredentialProvider = serde_json::from_value(json!({
             "id": "provider", "name": "Provider", "provider_id": "provider", "tenant_id": "tenant-a",
@@ -4869,6 +4859,7 @@ mod consent_strategy_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         };
         state
             .secrets_store
@@ -5059,6 +5050,7 @@ mod external_provider_tests {
             )),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         }
     }
 
@@ -6639,6 +6631,7 @@ mod consent_confirmation_tests {
             issuers: Default::default(),
             references: Default::default(),
             rbac: None,
+            gateway_mcp_issuer: None,
         };
         for (tenant, secret_id) in [
             (None, "CLIENT_ID"),
@@ -6793,6 +6786,56 @@ mod consent_confirmation_tests {
 
     const GOOGLE: &str = "https://accounts.google.com";
     const ENTRA: &str = "https://login.microsoftonline.com/0000-tenant/v2.0";
+
+    /// Callers holding this gateway's own STS tokens have no identity
+    /// provider to sign in at, so a strategy for the gateway's own MCP issuer
+    /// cannot confirm them, however its issuer is spelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_strategy_for_the_gateways_own_issuer_cannot_confirm_callers() {
+        let mut fixture = fixture().await;
+        fixture
+            .state
+            .gateway_mcp_issuer = Some("https://gateway.example/oauth2/mcp".to_string());
+        for (index, issuer) in [
+            "https://gateway.example/oauth2/mcp",
+            "https://gateway.example/oauth2/mcp/",
+            "https://GATEWAY.example/oauth2/mcp",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let own = fixture
+                .strategy(None, issuer, None)
+                .await;
+            let (status, body) = fixture
+                .create(None, with(github(confirmation(&own)), &["provider_id"], json!(format!("own-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{issuer}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else"
+            );
+        }
+        let google = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        let (status, body) = fixture
+            .create(None, github(confirmation(&google)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let mut without_sts = fixture;
+        without_sts
+            .state
+            .gateway_mcp_issuer = None;
+        let own = without_sts
+            .strategy(None, "https://gateway.example/oauth2/mcp", None)
+            .await;
+        let (status, body) = without_sts
+            .create(None, with(github(confirmation(&own)), &["provider_id"], json!("no-sts")))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "no STS issuer is configured: {body}");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_legacy_consent_provider_stores_its_consent_confirmation() {

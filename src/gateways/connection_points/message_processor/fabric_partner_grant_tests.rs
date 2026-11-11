@@ -411,6 +411,7 @@ impl Receiver {
         tenant: Option<&str>,
     ) -> String {
         crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: subject.to_string(),
             claims: json!({ "iss": self.idp.issuer, "sub": subject }),
             principal_claim: "sub".to_string(),

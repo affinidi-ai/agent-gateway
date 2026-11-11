@@ -12,6 +12,7 @@
 pub mod audit;
 pub mod connect_api;
 pub mod connects;
+pub(crate) mod consent_confirmation;
 pub mod consent_cookie;
 pub(crate) mod consent_id_token;
 pub mod grants;
@@ -163,6 +164,7 @@ impl DelegationToken {
 /// OAuth state parameter — encrypted and passed through the OAuth flow
 /// to bind the callback to the original request context.
 #[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct OAuthState {
     /// Agent DID that needs the delegation
     pub agent_did: String,
@@ -195,21 +197,37 @@ pub struct OAuthState {
     pub stage: Option<ConsentStage>,
 }
 
-/// The step of a consent flow a sealed [`OAuthState`] is good for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The step of a consent flow a sealed [`OAuthState`] is good for. Every
+/// stage but `Start` carries the binding the caller is confirmed against, so a
+/// state can carry one only under the confirm seal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentStage {
-    /// The consent start page and its POST.
+    /// The consent start page and its POST. Never sealed: a start state that
+    /// confirms no caller has no stage.
     Start,
     /// The consent start page and its POST, for a caller confirmed at their
     /// identity provider before the vendor.
-    #[allow(dead_code)]
-    ConfirmStart,
+    ConfirmStart(ConsentConfirmBinding),
     /// The identity provider's redirect back to the gateway.
     #[allow(dead_code)]
-    Confirmation,
-    /// The vendor's redirect back to the gateway.
-    Vendor,
+    Confirmation(ConsentConfirmBinding),
+    /// The vendor's redirect back to the gateway, for a confirmed caller.
+    #[allow(dead_code)]
+    Vendor(ConsentConfirmBinding),
+}
+
+/// What a caller is confirmed against at their identity provider: the
+/// `consent_confirmation` strategy, the
+/// [`verification_digest`](crate::jwt_bearer::models::JwtVerificationStrategy::verification_digest)
+/// it had at mint, and the surface tenant the caller's `user_identity_hash`
+/// was computed under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentConfirmBinding {
+    pub strategy_id: String,
+    pub strategy_digest: String,
+    pub tenant_id: Option<String>,
 }
 
 impl std::fmt::Debug for OAuthState {
@@ -532,12 +550,31 @@ mod tests {
         assert_eq!(deserialized.nonce, "nonce-123");
         assert_eq!(deserialized.stage, None);
 
-        let staged = serde_json::to_value(OAuthState {
-            stage: Some(ConsentStage::ConfirmStart),
+        let binding = ConsentConfirmBinding {
+            strategy_id: "strategy-1".to_string(),
+            strategy_digest: "ab".repeat(32),
+            tenant_id: Some("tenant-a".to_string()),
+        };
+        let staged = OAuthState {
+            stage: Some(ConsentStage::ConfirmStart(binding.clone())),
             ..state
-        })
-        .unwrap();
-        assert_eq!(staged["stage"], "confirm_start");
+        };
+        let json = serde_json::to_value(&staged).unwrap();
+        assert_eq!(
+            json["stage"],
+            serde_json::json!({"confirm_start": {
+                "strategy_id": "strategy-1", "strategy_digest": "ab".repeat(32), "tenant_id": "tenant-a"
+            }})
+        );
+        assert_eq!(serde_json::from_value::<OAuthState>(json.clone()).unwrap(), staged);
+
+        let mut extra = json;
+        extra["stage"]["confirm_start"]["confirmed"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<OAuthState>(extra).is_err(),
+            "a confirm binding with a field it does not have is refused"
+        );
+        assert_eq!(serde_json::to_value(ConsentStage::Start).unwrap(), "start");
     }
 
     #[test]

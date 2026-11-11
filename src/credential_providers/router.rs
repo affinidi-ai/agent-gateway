@@ -22,6 +22,7 @@ pub fn create_credential_providers_router(
     resource_origins: std::collections::HashMap<String, Vec<String>>,
     issuers: super::external::PermittedIssuers,
     references: super::references::ReferenceStores,
+    gateway_mcp_issuer: Option<String>,
 ) -> Router {
     let state = handlers::CredentialProviderState {
         store,
@@ -37,6 +38,7 @@ pub fn create_credential_providers_router(
         issuers: Arc::new(issuers),
         references,
         rbac: guard.clone(),
+        gateway_mcp_issuer,
     };
     let gate = guard.as_ref();
     Router::new()
