@@ -777,14 +777,17 @@ mod tests {
                     .collect(),
             )
         };
-        for login_secret in ["LOGIN_CLIENT_ID", "LOGIN_SECRET"] {
+        for (case, login_secret) in ["LOGIN_CLIENT_ID", "LOGIN_SECRET"]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 ids(stores
                     .referrers_of_secret(login_secret)
                     .await
                     .unwrap()),
                 ["confirming"],
-                "{login_secret}"
+                "login client secret {case}"
             );
         }
         assert_eq!(

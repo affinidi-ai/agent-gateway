@@ -939,7 +939,7 @@ mod tests {
         let encoded = consent::query_value(&idp, "state");
         let sealed = decode_confirmation_state(&encoded).unwrap();
         let Some(ConsentStage::Confirmation(sign_in)) = &sealed.stage else {
-            panic!("not a confirmation state: {sealed:?}");
+            panic!("not a confirmation state");
         };
         let verifier = sealed
             .code_verifier
@@ -971,7 +971,10 @@ mod tests {
         assert_ne!(sign_in.nonce, sealed.nonce, "the ID token nonce is not the state's claim nonce");
         assert_ne!(sign_in.nonce, start.nonce);
         assert_ne!(sealed.nonce, start.nonce, "the confirmation state is claimed apart from the start state");
-        assert!(before <= sign_in.issued_at && sign_in.issued_at <= after, "{:?}", sign_in.issued_at);
+        assert!(
+            before <= sign_in.issued_at && sign_in.issued_at <= after,
+            "the sign-in is issued during the start POST"
+        );
         assert!(sealed.expires_at <= start.expires_at);
         assert_eq!(
             (
@@ -2275,7 +2278,10 @@ mod tests {
         let strategy = fixture
             .confirming_at_idp(None, None)
             .await;
-        for client_id_secret_ref in ["missing-login-client-id", "malformed-login-client-id"] {
+        for (case, client_id_secret_ref) in ["missing-login-client-id", "malformed-login-client-id"]
+            .into_iter()
+            .enumerate()
+        {
             let signed_in = fixture
                 .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
                 .await;
@@ -2307,7 +2313,7 @@ mod tests {
             assert_eq!(
                 consent::reasons(&events),
                 [DelegationFailureReason::CredentialsUnavailable],
-                "{client_id_secret_ref}"
+                "start POST, case {case}"
             );
             let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
             assert!(!crate::delegation_vault::oauth::is_claimed(&start).await);
@@ -2317,7 +2323,7 @@ mod tests {
             assert_eq!(
                 consent::reasons(&events),
                 [DelegationFailureReason::CredentialsUnavailable],
-                "{client_id_secret_ref}"
+                "confirmation, case {case}"
             );
 
             provider

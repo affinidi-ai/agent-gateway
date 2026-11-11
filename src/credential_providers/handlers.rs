@@ -7195,8 +7195,10 @@ mod consent_confirmation_tests {
             body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
             body
         };
-        for (login_client_id, login_secret) in
+        for (case, (login_client_id, login_secret)) in
             [("A_LOGIN_CLIENT_ID", "LOGIN_SECRET"), ("LOGIN_CLIENT_ID", "A_LOGIN_SECRET")]
+                .into_iter()
+                .enumerate()
         {
             let (status, body) = fixture
                 .create(tenant_a(), tenant_github(login_client_id, login_secret))
@@ -7204,7 +7206,7 @@ mod consent_confirmation_tests {
             assert_eq!(
                 status,
                 StatusCode::BAD_REQUEST,
-                "an appliance-wide secret for a tenant provider: {login_client_id}, {login_secret}: {body}"
+                "an appliance-wide secret for a tenant provider, case {case}: {body}"
             );
             assert_eq!(body["error"], "Secret reference is not accessible");
         }
@@ -7216,7 +7218,10 @@ mod consent_confirmation_tests {
             .stored(body["id"].as_str().unwrap())
             .await;
         let references = stored.secret_refs();
-        assert!(references.contains(&"A_LOGIN_CLIENT_ID") && references.contains(&"A_LOGIN_SECRET"), "{references:?}");
+        assert!(
+            references.contains(&"A_LOGIN_CLIENT_ID") && references.contains(&"A_LOGIN_SECRET"),
+            "the stored provider refers to both login client secrets"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

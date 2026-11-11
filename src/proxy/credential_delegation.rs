@@ -4027,8 +4027,7 @@ mod tests {
                 Some(ConsentStage::ConfirmStart(binding))
                     if binding.strategy_id == strategy.id && binding.tenant_id.as_deref() == Some("tenant-a")
             ),
-            "{:?}",
-            start_stage(&minted.result)
+            "the start state confirms the caller under tenant-a"
         );
     }
 
@@ -4182,8 +4181,7 @@ mod tests {
         let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
         assert!(
             matches!(&start.stage, Some(ConsentStage::ConfirmStart(binding)) if binding.strategy_id == strategy.id),
-            "{:?}",
-            start.stage
+            "the start state confirms the caller"
         );
     }
 
