@@ -1979,6 +1979,7 @@ provider. It changes how new consent is obtained, not how stored grants are foun
 Register `{redirect URI}/confirm` as the login client's redirect URI at the identity provider,
 where `{redirect URI}` is the provider's own
 ([Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider)).
+The dashboard's credential provider editor shows this Confirmation redirect URI to register.
 
 On create and update, a provider with the setting is refused with `400` and this `error`:
 

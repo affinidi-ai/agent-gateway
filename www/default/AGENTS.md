@@ -1141,6 +1141,29 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   was created and gives the gateway's reason, and the editor still opens the created provider, so
   saving again updates it instead of creating it a second time. The Provider ID input has no
   route prefix, since a new provider's callback path does not contain it.
+- An authorization code provider without an `issuer` (legacy consent) shows a **Consent
+  confirmation** section after the Callback URL (`ConsentConfirmationSection.tsx`,
+  `credential-provider-consent-confirmation-section`), with a switch
+  (`credential-provider-consent-confirmation-switch`) that is off by default and on when the
+  stored provider has `consent_confirmation`. While on it asks for Login Client ID (a plain text
+  input, `credential-provider-consent-confirmation-client-id-input`), Login Client Secret (a
+  `SecretSelect`, `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
+  Endpoint and Login Token Endpoint (`…-authorization-endpoint-input`, `…-token-endpoint-input`),
+  a JWT verification strategy from `GET /jwt-verification-strategies`
+  (`credential-provider-consent-confirmation-strategy-select`; a stored strategy that no longer
+  exists is listed as "(not found)"), and an optional ID-token principal claim
+  (`…-principal-claim-input`). The labels say "Login" so they never share a name with the
+  provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
+  read-only **Confirmation redirect URI**
+  (`credential-provider-consent-confirmation-redirect-uri`, copy button
+  `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
+  shows followed by `/confirm`, which is what the gateway registers; a new provider shows a notice
+  in its place (`credential-provider-consent-confirmation-redirect-uri-after-create`). Save
+  refuses a blank required field first (`missingConsentConfirmationField`) and sends
+  `consentConfirmationField`: the setting while on (a blank principal claim left out), `null`
+  when a stored setting is switched off or the provider is no longer legacy consent, and no field
+  otherwise, so the gateway keeps what it has. The gateway's `400` reason shows like any other
+  save error.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,

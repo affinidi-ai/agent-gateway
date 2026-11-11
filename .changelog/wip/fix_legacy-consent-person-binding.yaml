@@ -1,6 +1,14 @@
 branch: fix/legacy-consent-person-binding
 changes:
-  added: []
+  added:
+    - timestamp: '2026-11-11T14:00:00Z'
+      title: Set consent confirmation in the dashboard's credential provider editor
+      description: >-
+        The credential provider editor of a legacy authorization code provider now has a Consent
+        confirmation switch with the login client ID, client secret, authorization and token
+        endpoints, JWT verification strategy and optional ID-token principal claim, and shows the
+        Confirmation redirect URI to register at the identity provider. Saving sends the setting
+        while the switch is on and clears a stored one when it is switched off.
   changed: []
   fixed: []
   removed: []
