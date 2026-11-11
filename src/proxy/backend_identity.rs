@@ -309,6 +309,10 @@ pub fn slot_reads_response_body(
     matches!(slot_identity_config(surface, slot), Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(_)))
 }
 
+fn no_identity_fields() -> IdentityResolutionError {
+    IdentityResolutionError::ValidationFailed("the identity payload carries no identity fields".to_string())
+}
+
 /// Resolve an agent identity from a response body for a specific channel slot.
 ///
 /// The slot selects which surface accessor to consult (`protected_identity` for
@@ -715,7 +719,9 @@ pub async fn resolve_agent_identity_for_slot(
                                     vp_subject = ?subject_id,
                                     "agent-identity-credential/v1: DID mismatch between params and VP — rejecting"
                                 );
-                                return Err(IdentityResolutionError::IdentityExtensionMissing(source));
+                                return Err(IdentityResolutionError::ValidationFailed(
+                                    "agent-identity-credential/v1 DID does not match its presentation".to_string(),
+                                ));
                             }
                         } else {
                             // VP absent or unparseable — reject to prevent params.did spoofing
@@ -724,7 +730,9 @@ pub async fn resolve_agent_identity_for_slot(
                                 did = %did_str,
                                 "agent-identity-credential/v1: missing or malformed VP — rejecting"
                             );
-                            return Err(IdentityResolutionError::IdentityExtensionMissing(source));
+                            return Err(IdentityResolutionError::ValidationFailed(
+                                "agent-identity-credential/v1 presentation is missing or malformed".to_string(),
+                            ));
                         }
 
                         // Extract identity fields from the signed VP's credentialSubject
@@ -767,7 +775,15 @@ pub async fn resolve_agent_identity_for_slot(
         _ => Err(IdentityExtractionError::ExtensionNotFound),
     };
 
-    let raw_payload = raw_payload.map_err(|_| IdentityResolutionError::IdentityExtensionMissing(source))?;
+    let raw_payload = raw_payload.map_err(|e| match e {
+        IdentityExtractionError::DeclaredButMissing => {
+            IdentityResolutionError::ValidationFailed("agent-identity/v1 is declared without its payload".to_string())
+        }
+        IdentityExtractionError::ExtensionNotFound
+        | IdentityExtractionError::MetaFieldNotFound(_)
+        | IdentityExtractionError::NoMetadata
+        | IdentityExtractionError::InvalidMcpMetadata(_) => IdentityResolutionError::IdentityExtensionMissing(source),
+    })?;
 
     // Step 1.5: Schema validation. When the slot's `PayloadExtractionConfig`
     // declares a `json_schema` (or legacy `extension_rules.json_schema`), the
@@ -802,7 +818,7 @@ pub async fn resolve_agent_identity_for_slot(
     let identity_fields = if selector.has_identity_fields() {
         let fields = selector.extract_identity_fields(&raw_payload);
         if fields.is_empty() {
-            return Err(IdentityResolutionError::IdentityExtensionMissing(source));
+            return Err(no_identity_fields());
         }
         debug!(channel = channel_name, field_count = fields.len(), "Extracted x-identity schema fields from payload");
         fields
@@ -810,7 +826,7 @@ pub async fn resolve_agent_identity_for_slot(
         let mut fields = HashMap::new();
         flatten_json_to_dot_notation(&raw_payload, "", &mut fields);
         if fields.is_empty() {
-            return Err(IdentityResolutionError::IdentityExtensionMissing(source));
+            return Err(no_identity_fields());
         }
         fields
     };
@@ -1435,6 +1451,131 @@ mod tests {
             matches!(&resolved, Ok(ProtectedAgentIdentity::Managed { did, .. }) if did == "did:key:z6MkSelfAsserted"),
             "{resolved:?}"
         );
+    }
+
+    async fn resolve_with_selector(
+        body: &JsonValue,
+        kind: IdentityResponseKind,
+    ) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        resolve_protected_agent_identity(
+            &serde_json::to_vec(body).unwrap(),
+            &payload_extraction_surface("https://agent.example"),
+            Some(&selector),
+            None,
+            "test",
+            kind,
+            None,
+        )
+        .await
+    }
+
+    fn card_with_extensions(extensions: JsonValue) -> JsonValue {
+        json!({"name": "agent", "capabilities": {"extensions": extensions}})
+    }
+
+    #[tokio::test]
+    async fn a_present_but_invalid_card_identity_is_a_validation_failure() {
+        let credential = |params: JsonValue| json!([{"uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION, "params": params}]);
+        let presentation = |holder: &str, subject: &str| {
+            json!({"holder": holder, "verifiableCredential": {"credentialSubject": {"id": subject}}}).to_string()
+        };
+        let public_card = &[IdentityResponseKind::PublicAgentCard][..];
+        let every_card = &[IdentityResponseKind::PublicAgentCard, IdentityResponseKind::ExtendedAgentCard][..];
+        let cases = [
+            (
+                "a DID that is not the presentation's holder",
+                credential(
+                    json!({"did": "did:key:z6MkA", "verifiablePresentation": presentation("did:key:z6MkB", "did:key:z6MkA")}),
+                ),
+                public_card,
+            ),
+            (
+                "a DID that is not the presentation's subject",
+                credential(
+                    json!({"did": "did:key:z6MkA", "verifiablePresentation": presentation("did:key:z6MkA", "did:key:z6MkB")}),
+                ),
+                public_card,
+            ),
+            ("a credential without a presentation", credential(json!({"did": "did:key:z6MkA"})), public_card),
+            (
+                "a presentation that is not JSON",
+                credential(json!({"did": "did:key:z6MkA", "verifiablePresentation": "not json"})),
+                public_card,
+            ),
+            ("an identity extension without params", json!([{"uri": EXT_URI}]), every_card),
+            ("an identity extension without identity fields", json!([{"uri": EXT_URI, "params": {}}]), every_card),
+        ];
+        for (case, extensions, kinds) in cases {
+            for kind in kinds {
+                let err = resolve_with_selector(&card_with_extensions(extensions.clone()), *kind)
+                    .await
+                    .expect_err(case);
+                assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_VALIDATION_FAILED, "{kind:?} {case}: {err}");
+                assert_eq!(err.http_status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{kind:?} {case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_card_without_the_identity_extension_is_reported_missing() {
+        let cards = [
+            ("no capabilities", json!({"name": "agent"})),
+            ("no extensions", json!({"name": "agent", "capabilities": {}})),
+            ("an empty extensions list", card_with_extensions(json!([]))),
+            ("only other extensions", card_with_extensions(json!([{"uri": "https://example.test/other/v1"}]))),
+        ];
+        for kind in [IdentityResponseKind::PublicAgentCard, IdentityResponseKind::ExtendedAgentCard] {
+            for (case, card) in &cards {
+                let err = resolve_with_selector(card, kind)
+                    .await
+                    .expect_err(case);
+                assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "{kind:?} {case}: {err}");
+            }
+        }
+    }
+
+    fn agent_message(extra: JsonValue) -> JsonValue {
+        let mut result = json!({"kind": "message", "messageId": "m-1", "role": "agent", "parts": []});
+        result
+            .as_object_mut()
+            .unwrap()
+            .extend(
+                extra
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        json!({"jsonrpc": "2.0", "id": 1, "result": result})
+    }
+
+    #[tokio::test]
+    async fn a_message_with_an_invalid_identity_is_a_validation_failure() {
+        let cases = [
+            ("an identity extension declared without its payload", json!({"extensions": [EXT_URI], "metadata": {}})),
+            (
+                "an identity payload without identity fields",
+                json!({"extensions": [EXT_URI], "metadata": {EXT_URI: {}}}),
+            ),
+        ];
+        for (case, extra) in cases {
+            let err = resolve_with_selector(&agent_message(extra), IdentityResponseKind::Message)
+                .await
+                .expect_err(case);
+            assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_VALIDATION_FAILED, "{case}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_without_identity_is_reported_missing() {
+        for (case, extra) in [("no metadata", json!({})), ("other metadata", json!({"metadata": {"note": "hi"}}))] {
+            let err = resolve_with_selector(&agent_message(extra), IdentityResponseKind::Message)
+                .await
+                .expect_err(case);
+            assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "{case}: {err}");
+        }
     }
 
     #[test]

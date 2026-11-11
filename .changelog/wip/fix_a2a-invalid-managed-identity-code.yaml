@@ -1,0 +1,19 @@
+branch: fix/a2a-invalid-managed-identity-code
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T00:00:00Z'
+      title: Report an invalid managed identity as identity_validation_failed
+      description: >-
+        An agent card, message response, stream event or MCP response whose managed identity is
+        present but invalid was refused with identity_extension_missing. It is now refused with
+        identity_validation_failed, still 422: an agent-identity/v1 declared without its payload,
+        an identity payload with no identity fields, and, on a public agent card, an
+        agent-identity-credential/v1 whose did is not its presentation's holder and subject or
+        whose presentation is missing or malformed. identity_extension_missing is kept for an
+        identity that was not sent, so callers and operators can tell a missing identity from a
+        bad one.
+  removed: []
+  security: []
+  breaking: []

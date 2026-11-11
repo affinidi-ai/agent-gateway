@@ -42,6 +42,19 @@ Feature: A2A HTTP surface forwarding and identity
     And the agent card does not contain the raw identity extension
     And the agent card contains a valid Verifiable Presentation
 
+  Scenario: A2A agent card whose identity credential names a different DID than its presentation is refused
+    Given the surface has managed identity enabled
+    And managed agent "bravo" publishes an agent card whose identity credential names a different DID than its presentation
+    When the caller fetches the agent card
+    Then the response is a "protected_identity" identity validation error
+
+  Scenario: A2A response from the managed agent without the agent-identity extension is refused
+    Given the surface has managed identity enabled
+    And managed agent "bravo" responds without the agent-identity extension
+    When the caller sends a request to the surface
+    Then the response is a "protected_identity" identity extension missing error
+    And managed agent "bravo" received the forwarded request
+
   Scenario: Caller identity is not enforced when only a Server Identity (MA to AP) is configured
     # The surface configures a protected (MA to AP) Server Identity but no
     # inbound (CA to AP) identity element. A caller that happens to include a

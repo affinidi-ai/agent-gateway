@@ -480,7 +480,7 @@ async fn an_unresolvable_identity_claim_ends_the_stream() {
     assert!(ended);
     assert_eq!(events.len(), 2, "{events:?}");
     assert_eq!(events[0].1["result"], working());
-    assert_eq!(error_code(&events[1].1), Some("identity_extension_missing"));
+    assert_eq!(error_code(&events[1].1), Some("identity_validation_failed"));
     assert!(
         !events
             .iter()

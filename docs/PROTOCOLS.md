@@ -522,6 +522,17 @@ response, public or extended. On inbound and fabric paths it skips response exte
 the public card, so response validation rules do not apply to it; outbound transit points still
 validate response extensions on both kinds of card.
 
+When managed identity reads the identity from the response and cannot resolve it, a card or a
+message response (on MCP, a response whose `_meta` should carry `serverIdentity`) is refused with
+`422`. The code is `identity_extension_missing` when no identity is present: no `agent-identity/v1`
+extension on the card, and no identity payload in a message's metadata or an MCP response's
+`_meta`. It is `identity_validation_failed` when one is present but invalid: an `agent-identity/v1`
+declared without its payload, a payload with no identity fields, a payload the identity schema or
+rules reject, or, on a public card, an `agent-identity-credential/v1` whose `did` is not both the
+holder and the subject of its presentation, or whose presentation is missing or not JSON. On an
+extended card such a credential is ignored, so a card that carries only it is
+`identity_extension_missing`.
+
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
 to a card still has the card rewritten. A card `result` is rewritten whatever the HTTP status. The
