@@ -469,13 +469,15 @@ impl FilesystemIdentityStore {
     /// The rotation history of a record that counts none, kept when one exists: a release
     /// that does not track `rotation_count` drops it when it saves the record. Also returns
     /// how many of the record's inline rotations are already at the end of that history,
-    /// saved there before a failed record save, so the caller does not keep them twice. A
-    /// rotation saved before a failed record save stays when the credential rotates again
-    /// before the retry, since nothing tells it apart from the kept history; it shows as one
-    /// extra version. A history that does not decrypt or parse is replaced, as it was before
-    /// such a history was kept, since nothing counts it. Any other read failure, such as a
-    /// disk or key service outage, fails the write, so a history that may read again is never
-    /// replaced.
+    /// saved there before a failed record save, so the caller does not keep them twice.
+    /// Rotations are matched by value, which is sound because a credential's `updated_at`
+    /// only moves forward: a new rotation equals the history's tail only when it is that
+    /// rotation, saved there before a failed record save. A rotation saved before a failed
+    /// record save stays when the credential rotates again before the retry, since nothing
+    /// tells it apart from the kept history; it shows as one extra version. A history that
+    /// does not decrypt or parse is replaced, as it was before such a history was kept, since
+    /// nothing counts it. Any other read failure, such as a disk or key service outage, fails
+    /// the write, so a history that may read again is never replaced.
     async fn uncounted_rotations(
         &self,
         record: &AgentIdentityRecord,
