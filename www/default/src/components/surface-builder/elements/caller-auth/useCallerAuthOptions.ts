@@ -8,6 +8,13 @@ export interface JwtVerificationStrategyOption {
   tenant_id?: string | null;
 }
 
+export interface ApiKeySecretOption {
+  id: string;
+  name: string;
+  secret_id?: string;
+  secret_type?: string;
+}
+
 export type JwtStrategiesStatus = 'idle' | 'loading' | 'loaded' | 'failed';
 
 /**
