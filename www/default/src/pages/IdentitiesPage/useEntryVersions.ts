@@ -5,6 +5,7 @@ import {
   entryVersions,
   membersWithRotations,
   rotationCount,
+  timelineFields,
   type IdentityVersion,
   type RotationsByHash,
 } from './identityVersions';
@@ -26,7 +27,8 @@ const NO_ROTATIONS: RotationsByHash = {};
 /**
  * The versions of an entry, fetching the rotations of each member that has any when first
  * used. It fetches again only when a member's rotation count changes, so a live row update
- * does not; until that answers, the versions built from the earlier lists stay shown.
+ * does not; until that answers it is loading, because the earlier lists do not match the
+ * updated fields. Unmounting aborts the fetch.
  */
 export function useEntryVersions<T extends Identity>(
   members: T[],
@@ -35,16 +37,21 @@ export function useEntryVersions<T extends Identity>(
   const fetchKey = JSON.stringify(
     membersWithRotations(members).map(member => [member.identity_hash, rotationCount(member)])
   );
+  const timelineKey = JSON.stringify(members.map(timelineFields));
+  const [timelineMembers, setTimelineMembers] = useState({ key: timelineKey, members });
+  if (timelineMembers.key !== timelineKey) {
+    setTimelineMembers({ key: timelineKey, members });
+  }
   const [attempt, setAttempt] = useState(0);
   const [result, setResult] = useState<FetchResult>();
 
   useEffect(() => {
     if (fetchKey === NONE_TO_FETCH) return undefined;
-    let active = true;
+    const controller = new AbortController();
     const hashes = (JSON.parse(fetchKey) as Array<[string, number]>).map(([hash]) => hash);
-    Promise.all(hashes.map(hash => apiClient.getIdentityRotations(hash))).then(
+    Promise.all(hashes.map(hash => apiClient.getIdentityRotations(hash, controller.signal))).then(
       lists => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         const rotations: RotationsByHash = {};
         hashes.forEach((hash, index) => {
           rotations[hash] = lists[index];
@@ -52,7 +59,7 @@ export function useEntryVersions<T extends Identity>(
         setResult({ key: fetchKey, rotations });
       },
       (error: unknown) => {
-        if (!active) return;
+        if (controller.signal.aborted) return;
         setResult({
           key: fetchKey,
           error: error instanceof Error && error.message ? error.message : 'Unknown error',
@@ -60,7 +67,7 @@ export function useEntryVersions<T extends Identity>(
       }
     );
     return () => {
-      active = false;
+      controller.abort();
     };
   }, [fetchKey, attempt]);
 
@@ -69,15 +76,15 @@ export function useEntryVersions<T extends Identity>(
     setAttempt(value => value + 1);
   }, []);
 
-  // A result for an earlier key keeps its versions shown while the new fetch runs.
-  const rotations = fetchKey === NONE_TO_FETCH ? NO_ROTATIONS : result?.rotations;
+  const current = result?.key === fetchKey ? result : undefined;
+  const rotations = fetchKey === NONE_TO_FETCH ? NO_ROTATIONS : current?.rotations;
   const versions = useMemo(
-    () => (rotations ? entryVersions(members, currentDid, rotations) : undefined),
-    [members, currentDid, rotations]
+    () => (rotations ? entryVersions(timelineMembers.members, currentDid, rotations) : undefined),
+    [timelineMembers, currentDid, rotations]
   );
 
-  if (fetchKey !== NONE_TO_FETCH && result?.error && result.key === fetchKey) {
-    return { status: 'error', message: result.error, retry };
+  if (fetchKey !== NONE_TO_FETCH && current?.error) {
+    return { status: 'error', message: current.error, retry };
   }
   return versions ? { status: 'ready', versions } : { status: 'loading' };
 }

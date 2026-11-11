@@ -171,13 +171,19 @@ class APIClient {
     url: string,
     options?: RequestInit & { timeout?: number; onResponse?: (response: Response) => void }
   ): Promise<T> {
-    const { onResponse, ...fetchOptions } = options ?? {};
+    const { onResponse, signal: callerSignal, ...fetchOptions } = options ?? {};
 
     // Setup timeout using AbortController
     const controller = new AbortController();
     const timeoutId = options?.timeout
       ? setTimeout(() => controller.abort(), options.timeout)
       : null;
+    const abortWithCaller = () => controller.abort();
+    if (callerSignal?.aborted) {
+      controller.abort();
+    } else {
+      callerSignal?.addEventListener('abort', abortWithCaller, { once: true });
+    }
 
     try {
       const response = await fetch(url, {
@@ -224,7 +230,7 @@ class APIClient {
       const data = await response.json();
       return data;
     } catch (error: any) {
-      if (error.name === 'AbortError') {
+      if (error.name === 'AbortError' && !callerSignal?.aborted) {
         throw new Error('Request timeout - the webhook endpoint did not respond within 30 seconds');
       }
       throw error;
@@ -232,6 +238,7 @@ class APIClient {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
+      callerSignal?.removeEventListener('abort', abortWithCaller);
     }
   }
 
@@ -1068,14 +1075,18 @@ class APIClient {
   /**
    * Every credential rotation of the identity, oldest first. The backend answers the newest
    * page first; older pages are fetched with `before` until the first rotation is reached.
+   * Aborting `signal` stops the paging and rejects with an `AbortError`.
    */
-  async getIdentityRotations(identityHash: string): Promise<CredentialRotation[]> {
+  async getIdentityRotations(
+    identityHash: string,
+    signal?: AbortSignal
+  ): Promise<CredentialRotation[]> {
     const base = `/identities/by-hash/${encodeURIComponent(identityHash)}/rotations?limit=${IDENTITY_ROTATIONS_PAGE}`;
-    let page = await this.request<IdentityRotationsPage>(base);
+    let page = await this.request<IdentityRotationsPage>(base, { signal });
     const rotations = [...(page.rotations ?? [])];
     while (page.start > 0) {
       const before = page.start;
-      page = await this.request<IdentityRotationsPage>(`${base}&before=${before}`);
+      page = await this.request<IdentityRotationsPage>(`${base}&before=${before}`, { signal });
       // A page that does not move back would loop forever.
       if (!(page.start < before)) {
         throw new Error('The gateway returned an inconsistent rotation history.');

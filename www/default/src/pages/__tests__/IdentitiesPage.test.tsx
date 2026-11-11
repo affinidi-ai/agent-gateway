@@ -207,6 +207,11 @@ describe('IdentitiesPage', () => {
     }));
     (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({ identities: [] });
     (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([]);
+    Element.prototype.scrollIntoView = jest.fn();
+  });
+
+  afterEach(() => {
+    delete (Element.prototype as Partial<Element>).scrollIntoView;
   });
 
   it('renders identities list', async () => {
@@ -833,7 +838,8 @@ describe('IdentitiesPage', () => {
       expect(screen.queryByTestId('identities-version-1')).not.toBeInTheDocument();
       expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(1);
       expect(apiClient.getIdentityRotations).toHaveBeenCalledWith(
-        managedRotatedFixture.identity_hash
+        managedRotatedFixture.identity_hash,
+        expect.any(AbortSignal)
       );
 
       resolve([{ rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } }]);
@@ -842,6 +848,20 @@ describe('IdentitiesPage', () => {
         'Credential rotated'
       );
       expect(screen.queryByTestId('identities-version-history-loading')).not.toBeInTheDocument();
+    });
+
+    it('stops loading the rotations when Version History closes', async () => {
+      (apiClient.getIdentityRotations as jest.Mock).mockReturnValue(new Promise(() => undefined));
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+      const signal = (apiClient.getIdentityRotations as jest.Mock).mock.calls[0][1] as AbortSignal;
+      expect(signal.aborted).toBe(false);
+
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(signal.aborted).toBe(true);
     });
 
     it('says none are recorded when the fetched history is empty', async () => {
@@ -905,14 +925,36 @@ describe('IdentitiesPage', () => {
       expect(screen.getByTestId('identities-version-2')).toBeInTheDocument();
       expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(1);
 
-      (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([
-        { rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } },
-        { rotated_at: '2026-01-03T00:00:00Z', previous: { fingerprint_sha256: 'cc' } },
+      let resolve: (rotations: unknown[]) => void = () => undefined;
+      (apiClient.getIdentityRotations as jest.Mock).mockReturnValue(
+        new Promise(done => {
+          resolve = done;
+        })
+      );
+      stats = statsWith([
+        {
+          ...managedRotatedFixture,
+          rotation_count: 2,
+          agent_identity: { ...managedRotatedFixture.agent_identity, fingerprint_sha256: 'cc' },
+        },
       ]);
-      stats = statsWith([{ ...managedRotatedFixture, rotation_count: 2 }]);
       view.rerender(page());
 
+      expect(screen.getByTestId('identities-version-history-loading')).toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-2')).not.toBeInTheDocument();
+
+      resolve([
+        { rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } },
+        { rotated_at: '2026-01-03T00:00:00Z', previous: { fingerprint_sha256: 'bb' } },
+      ]);
+
       expect(await screen.findByTestId('identities-version-3')).toHaveTextContent('Current');
+      expect(screen.getByTestId('identities-version-3-changes')).toHaveTextContent(
+        'fingerprint_sha256: bb → cc'
+      );
+      expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
+        'fingerprint_sha256: aa → bb'
+      );
       expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(2);
     });
 

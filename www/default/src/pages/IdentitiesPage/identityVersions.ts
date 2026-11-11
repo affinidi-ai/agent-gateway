@@ -79,13 +79,24 @@ const groupKey = (identity: Identity): string => {
   return `surface|${identity.surface_id}`;
 };
 
-/** The identity's fields before its rotation at `index`; `rotations.length` gives the current ones. */
-function fieldsBefore(identity: Identity, rotations: CredentialRotation[], index: number): Fields {
-  const fields: Fields = { ...(identity.agent_identity ?? {}) };
-  for (let i = rotations.length - 1; i >= index; i--) {
-    Object.assign(fields, rotations[i].previous ?? {});
+/** The member fields `entryVersions` reads, so a change to anything else need not rebuild it. */
+export const timelineFields = (identity: Identity): unknown[] => [
+  identity.identity_hash,
+  identity.did,
+  identity.created_at,
+  identity.agent_identity,
+];
+
+/**
+ * The identity's fields before each of its rotations, in one pass from the current ones:
+ * entry `index` holds the fields before rotation `index`, and the last entry the current ones.
+ */
+function fieldSnapshots(identity: Identity, rotations: CredentialRotation[]): Fields[] {
+  const snapshots: Fields[] = [{ ...(identity.agent_identity ?? {}) }];
+  for (let i = rotations.length - 1; i >= 0; i--) {
+    snapshots.push({ ...snapshots[snapshots.length - 1], ...(rotations[i].previous ?? {}) });
   }
-  return fields;
+  return snapshots.reverse();
 }
 
 function diff(before: Fields | undefined, after: Fields): FieldChange[] {
@@ -124,12 +135,12 @@ function timeline<T extends Identity>(
 
   byCreation.forEach(identity => {
     const rotations = rotationsByHash[identity.identity_hash] ?? NO_ROTATIONS;
-    const created = fieldsBefore(identity, rotations, 0);
+    const snapshots = fieldSnapshots(identity, rotations);
     events.push({
       kind: 'did',
       did: identity.did,
       at: identity.created_at,
-      changes: diff(previousDidFields, created),
+      changes: diff(previousDidFields, snapshots[0]),
       sortAt: time(identity.created_at),
     });
     rotations.forEach((rotation, index) => {
@@ -137,14 +148,11 @@ function timeline<T extends Identity>(
         kind: 'rotation',
         did: identity.did,
         at: rotation.rotated_at,
-        changes: diff(
-          fieldsBefore(identity, rotations, index),
-          fieldsBefore(identity, rotations, index + 1)
-        ),
+        changes: diff(snapshots[index], snapshots[index + 1]),
         sortAt: rotation.rotated_at ? time(rotation.rotated_at) : time(identity.created_at),
       });
     });
-    previousDidFields = fieldsBefore(identity, rotations, rotations.length);
+    previousDidFields = snapshots[rotations.length];
   });
 
   const ordered = events

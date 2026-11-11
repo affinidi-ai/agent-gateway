@@ -1266,8 +1266,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,
   through the `useEntryVersions` hook), showing `identities-version-history-loading` while it
   loads and `identities-version-history-error` with `identities-version-history-retry-button`
-  when it fails. It refetches only when a member's `rotation_count` changes, and an entry
-  with no rotations builds its DID versions without a request; see
+  when it fails. It refetches only when a member's `rotation_count` changes, showing the
+  loading state until the new list arrives, and closing Version History aborts the fetch. An
+  entry with no rotations builds its DID versions without a request; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when
