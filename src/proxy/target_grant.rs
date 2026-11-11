@@ -728,6 +728,10 @@ async fn route_unaudited(
         &state
             .network_config
             .external_consent_resource_origins,
+        state
+            .network_config
+            .external_consent_issuer_patterns
+            .as_deref(),
     ) {
         return Err(unavailable(surface, "resource_not_permitted_for_issuer"));
     }
@@ -737,6 +741,10 @@ async fn route_unaudited(
             .network_config
             .external_consent_issuers
             .as_ref(),
+        state
+            .network_config
+            .external_consent_issuer_patterns
+            .as_deref(),
     )
     .is_err()
     {

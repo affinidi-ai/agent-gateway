@@ -5822,6 +5822,10 @@ async fn step_inject_external_grant(
         &state
             .network_config
             .external_consent_resource_origins,
+        state
+            .network_config
+            .external_consent_issuer_patterns
+            .as_deref(),
     ) {
         return Err(refuse_external_grant(ctx, "resource_not_permitted_for_issuer"));
     }
@@ -5831,6 +5835,10 @@ async fn step_inject_external_grant(
             .network_config
             .external_consent_issuers
             .as_ref(),
+        state
+            .network_config
+            .external_consent_issuer_patterns
+            .as_deref(),
     )
     .is_err()
     {

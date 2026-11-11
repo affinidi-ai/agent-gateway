@@ -214,6 +214,9 @@ async fn permitted_provider(
             .issuers
             .as_ref()
             .as_ref(),
+        state
+            .issuer_patterns
+            .as_deref(),
     )
     .is_err()
     {
@@ -224,7 +227,13 @@ async fn permitted_provider(
         );
         return Err((StatusCode::FORBIDDEN, "issuer_not_permitted"));
     }
-    if !crate::credential_providers::external::resource_permitted(&provider, &state.resource_origins) {
+    if !crate::credential_providers::external::resource_permitted(
+        &provider,
+        &state.resource_origins,
+        state
+            .issuer_patterns
+            .as_deref(),
+    ) {
         return Err((StatusCode::FORBIDDEN, "resource_not_permitted"));
     }
     Ok(provider)
@@ -1427,6 +1436,7 @@ mod tests {
                 egress_allowlist: Some(format!("{issuer},{vendor_origin}")),
                 resource_origins: Default::default(),
                 issuers: Default::default(),
+                issuer_patterns: Default::default(),
                 mcp_proxy_store: None,
             };
             Self {

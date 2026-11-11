@@ -3276,6 +3276,14 @@ pub struct BootstrapConfig {
     #[serde(skip)]
     pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
 
+    /// `gateway.json`'s `external_consent_issuer_patterns` as the gateway
+    /// started with it, set or not
+    /// ([`Self::pin_external_consent_issuer_patterns`]); `None` until pinned.
+    /// Every later load of `gateway.json` takes this value instead of the
+    /// file's.
+    #[serde(skip)]
+    pub pinned_external_consent_issuer_patterns: Option<Option<Vec<crate::config::network::IssuerPattern>>>,
+
     /// VP Audit Log rotation (`[audit]`). Omitted from a generated
     /// `config.toml` while it holds the defaults.
     #[serde(default, skip_serializing_if = "AuditConfig::is_default")]

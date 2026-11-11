@@ -516,7 +516,9 @@ List each host on its own: `https://*.googleapis.com` is not a wildcard. An entr
 such an origin permits nothing, not even the literal origin it spells, and is named in an `ERROR`
 at startup. The value is read once, when the gateway starts: provider create, surface save and
 every request use it, and a configuration reload keeps it, with a `WARN` when the file says
-otherwise, so a change takes a restart.
+otherwise, so a change takes a restart. A pattern of `external_consent_issuer_patterns`
+([Permitted issuers](#permitted-issuers)) lists resource origins the same way, for each issuer
+it matches.
 The rule is checked when the provider is created (`400`, `provider_resource_not_permitted`),
 when a surface binds the provider (`400`), and again whenever a grant is released: a provider
 whose resource is no longer permitted, because its entry was removed, releases nothing, and the
@@ -611,6 +613,42 @@ gateway starts: provider create, surface save, the connect API and every request
 configuration reload keeps it, with a `WARN` when the file says otherwise, so a change takes a
 restart.
 
+A vendor whose issuer carries the customer's tenant, such as Microsoft Entra ID
+(`https://login.microsoftonline.com/<tenant id>/v2.0`), cannot be listed issuer by issuer. The
+operator names it once in `external_consent_issuer_patterns`, also set only by the operator's
+file and read once at startup in the same way:
+
+```json
+"external_consent_issuer_patterns": [
+  {"issuer": "https://login.microsoftonline.com/{tenant}/v2.0", "tenant": "uuid",
+   "resource_origins": ["https://graph.microsoft.com"]},
+  {"issuer": "https://{tenant}.my.salesforce.com", "tenant": "label"}
+]
+```
+
+- `issuer` is an `https` issuer written as the URL parser writes it (lower-case host, no default
+  port, no `.` segments), with no credentials, query, fragment or `%`, and exactly one
+  `{tenant}`: either a whole path segment after a fixed host, or the whole leftmost label of a
+  fixed host that has at least two labels besides it, so `https://{tenant}.com` is refused. A
+  wildcard host is refused.
+- `tenant` says what may stand for `{tenant}`: `uuid`, a UUID in its canonical 8-4-4-4-12 hex
+  form in either case, or `label`, 1 to 63 lower-case letters, digits and `-`, not starting or
+  ending with `-`. Neither can hold `/`, `.`, `:`, `@`, `?`, `#` or `%`, so the value is always
+  one segment or one label: `https://login.microsoftonline.com/<id>/extra/v2.0`,
+  `https://login.microsoftonline.com//v2.0` and `https://evil.acme.my.salesforce.com` match
+  nothing.
+- `endpoint_origins` (empty by default) count, for an issuer the pattern matches, as the origins
+  `external_consent_issuers` lists for an issuer, and `resource_origins` (empty by default) as
+  those `external_consent_resource_origins` lists for it. Both are exact origins.
+
+An issuer is matched byte for byte, apart from the value standing for `{tenant}`, as an exact
+entry is compared. With either setting, a provider is permitted when its issuer is listed or
+matches a pattern and each endpoint is on the issuer's host or has an origin listed for it by
+either; a pattern list that is set, even empty, counts as a list, so a tenant's token may then
+create a provider whose issuer matches a pattern. Without both, nothing changes from the rules
+above. A pattern that breaks these rules, or an origin it lists that is not a plain `https`
+origin, permits nothing and is named in an `ERROR` at startup.
+
 The rule is checked when a provider is created, before its issuer's metadata is fetched, so an
 unlisted issuer is never called (`400`, `provider_issuer_not_permitted`, `field` naming the
 issuer or the endpoint); when a surface binds the provider (`400`); when a connect starts and
@@ -627,8 +665,8 @@ cannot help an issuer whose own host serves content its users control.
 | The provider differs from the metadata | `provider_metadata_mismatch` | `field` names the field |
 | An update changes a fixed field | `provider_field_immutable` | `field` names the field |
 | The resource is not permitted for the issuer | `provider_resource_not_permitted` | |
-| `external_consent_issuers` does not permit the issuer or an endpoint | `provider_issuer_not_permitted` | `field`: `issuer`, `authorization_endpoint`, `token_endpoint`, `revocation_endpoint` or `jwks_uri` |
-| A tenant's token creates a provider with an issuer while `external_consent_issuers` is unset | `external_consent_issuers_required` | |
+| `external_consent_issuers` and `external_consent_issuer_patterns` do not permit the issuer or an endpoint | `provider_issuer_not_permitted` | `field`: `issuer`, `authorization_endpoint`, `token_endpoint`, `revocation_endpoint` or `jwks_uri` |
+| A tenant's token creates a provider with an issuer while `external_consent_issuers` and `external_consent_issuer_patterns` are unset | `external_consent_issuers_required` | |
 
 `issuer`, the endpoints, `client_id`, `token_endpoint_auth_method`, the secret references, the
 signed-JWT settings, `callback_url`, `resource`, `send_resource`, `allow_unadvertised_pkce`,

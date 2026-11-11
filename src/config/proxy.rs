@@ -48,10 +48,22 @@ impl BootstrapConfig {
         Ok(issuers)
     }
 
+    /// Reads `external_consent_issuer_patterns` from `gateway.json` when the
+    /// gateway starts and pins it, as [`Self::pin_external_consent_issuers`]
+    /// pins the issuers. A change takes a restart.
+    pub fn pin_external_consent_issuer_patterns(
+        &mut self
+    ) -> anyhow::Result<Option<Vec<crate::config::network::IssuerPattern>>> {
+        let patterns = NetworkConfig::load_from_file(&self.config_files.gateway)?.external_consent_issuer_patterns;
+        self.pinned_external_consent_issuer_patterns = Some(patterns.clone());
+        Ok(patterns)
+    }
+
     /// Load network configuration from the configured path, with the
-    /// `transit_token_max_lifetime_secs`, `external_consent_resource_origins`
-    /// and `external_consent_issuers` pinned at startup, once pinned. A `WARN` says when the file holds a
-    /// different value, which takes a restart.
+    /// `transit_token_max_lifetime_secs`, `external_consent_resource_origins`,
+    /// `external_consent_issuers` and `external_consent_issuer_patterns` pinned
+    /// at startup, once pinned. A `WARN` says when the file holds a different
+    /// value, which takes a restart.
     pub fn load_network_config(&self) -> anyhow::Result<NetworkConfig> {
         let network_path = &self.config_files.gateway;
         info!("Loading network configuration from: {}", network_path);
@@ -80,6 +92,15 @@ impl BootstrapConfig {
                  keeps until it restarts"
             );
             network_config.external_consent_issuers = issuers.clone();
+        }
+        if let Some(patterns) = &self.pinned_external_consent_issuer_patterns
+            && network_config.external_consent_issuer_patterns != *patterns
+        {
+            warn!(
+                "{network_path}: external_consent_issuer_patterns differs from the value the gateway started with, \
+                 which it keeps until it restarts"
+            );
+            network_config.external_consent_issuer_patterns = patterns.clone();
         }
 
         if let Some((old_domain, new_domain)) = network_config.normalize_localhost_did_domain() {
@@ -1957,6 +1978,84 @@ mod tests {
                 .load_network_config()
                 .unwrap()
                 .external_consent_issuers,
+            None,
+            "a list added after startup takes a restart"
+        );
+    }
+
+    /// `external_consent_issuer_patterns` is pinned at startup as the issuers
+    /// are: a later load keeps it, whether the file adds, changes or removes
+    /// it.
+    #[test]
+    fn the_external_consent_issuer_patterns_are_pinned_when_the_gateway_starts() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        let dir = tempfile::tempdir().unwrap();
+        let gateway_json = dir
+            .path()
+            .join("gateway.json");
+        let write = |patterns: Option<serde_json::Value>| {
+            let mut config = serde_json::json!({
+                "did": { "domain": "test.local" },
+                "webauthn": { "rp_id": "localhost", "external_origin": "https://localhost" },
+                "integration": { "types": [], "categories": [] },
+                "listeners": [],
+                "routes": {}
+            });
+            if let Some(patterns) = patterns {
+                config["external_consent_issuer_patterns"] = patterns;
+            }
+            std::fs::write(&gateway_json, config.to_string()).unwrap();
+        };
+        let mut bootstrap: BootstrapConfig =
+            toml::from_str(&crate::render_default_bootstrap_toml("", "").unwrap()).unwrap();
+        bootstrap.config_files.gateway = gateway_json
+            .to_string_lossy()
+            .into_owned();
+        write(Some(serde_json::json!([{
+            "issuer": "https://login.microsoftonline.com/{tenant}/v2.0", "tenant": "uuid",
+            "resource_origins": ["https://graph.microsoft.com"]
+        }])));
+        let expected = Some(vec![IssuerPattern {
+            issuer: "https://login.microsoftonline.com/{tenant}/v2.0".to_string(),
+            tenant: IssuerTenant::Uuid,
+            endpoint_origins: Vec::new(),
+            resource_origins: vec!["https://graph.microsoft.com".to_string()],
+        }]);
+        assert_eq!(
+            bootstrap
+                .pin_external_consent_issuer_patterns()
+                .unwrap(),
+            expected
+        );
+        for on_disk in [
+            None,
+            Some(serde_json::json!([])),
+            Some(serde_json::json!([{ "issuer": "https://{tenant}.my.salesforce.com", "tenant": "label" }])),
+        ] {
+            write(on_disk.clone());
+            assert_eq!(
+                bootstrap
+                    .load_network_config()
+                    .unwrap()
+                    .external_consent_issuer_patterns,
+                expected,
+                "{on_disk:?}"
+            );
+        }
+
+        write(None);
+        assert_eq!(
+            bootstrap
+                .pin_external_consent_issuer_patterns()
+                .unwrap(),
+            None
+        );
+        write(Some(serde_json::json!([])));
+        assert_eq!(
+            bootstrap
+                .load_network_config()
+                .unwrap()
+                .external_consent_issuer_patterns,
             None,
             "a list added after startup takes a restart"
         );

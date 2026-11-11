@@ -61,6 +61,9 @@ pub struct CredentialProviderState {
     /// external consent provider may name, with the origins their endpoints may
     /// use beyond the issuer's own host.
     pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// gateway.json's `external_consent_issuer_patterns`: when set, issuers an
+    /// external consent provider may name besides those `issuers` lists.
+    pub issuer_patterns: Arc<Option<Vec<crate::config::network::IssuerPattern>>>,
     pub references: super::references::ReferenceStores,
     /// Decides which referrers a 409 may name; `None` names none.
     pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
@@ -834,15 +837,30 @@ pub async fn create_provider(
         return response;
     }
 
-    if provider.is_external_consent() && tenant_context(&context).is_some() && state.issuers.is_none() {
+    if provider.is_external_consent()
+        && tenant_context(&context).is_some()
+        && state.issuers.is_none()
+        && state
+            .issuer_patterns
+            .is_none()
+    {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
-            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers"
+            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers or \
+             external_consent_issuer_patterns"
         );
         return super::external::ExternalProviderError::IssuersRequired.into_response();
     }
-    if provider.is_external_consent() && !super::external::resource_permitted(&provider, &state.resource_origins) {
+    if provider.is_external_consent()
+        && !super::external::resource_permitted(
+            &provider,
+            &state.resource_origins,
+            state
+                .issuer_patterns
+                .as_deref(),
+        )
+    {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
@@ -857,13 +875,17 @@ pub async fn create_provider(
                 .issuers
                 .as_ref()
                 .as_ref(),
+            state
+                .issuer_patterns
+                .as_deref(),
         )
     {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
             field,
-            "Refused a credential provider that the gateway's external_consent_issuers does not permit"
+            "Refused a credential provider that the gateway's external_consent_issuers and \
+             external_consent_issuer_patterns do not permit"
         );
         return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
     }
@@ -897,6 +919,9 @@ pub async fn create_provider(
                 .issuers
                 .as_ref()
                 .as_ref(),
+            state
+                .issuer_patterns
+                .as_deref(),
         ) {
             warn!(
                 target: "credential_delegation",
@@ -1772,6 +1797,7 @@ mod jwt_provider_tests {
             egress_allowlist: None,
             resource_origins: Arc::default(),
             issuers: Arc::default(),
+            issuer_patterns: Default::default(),
             references: Default::default(),
             rbac: None,
         }
@@ -4575,6 +4601,7 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            issuer_patterns: Default::default(),
             references: Default::default(),
             rbac: None,
         };
@@ -4724,6 +4751,7 @@ mod consent_strategy_tests {
             egress_allowlist: None,
             resource_origins: Default::default(),
             issuers: Default::default(),
+            issuer_patterns: Default::default(),
             references: Default::default(),
             rbac: None,
         };
@@ -4911,6 +4939,7 @@ mod external_provider_tests {
                 crate::credential_providers::external::tests::ISSUER.to_string(),
                 Vec::new(),
             )]))),
+            issuer_patterns: Default::default(),
             references: Default::default(),
             rbac: None,
         }
@@ -4951,6 +4980,38 @@ mod external_provider_tests {
         )])));
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// `external_consent_issuer_patterns`, even empty, counts as the
+    /// operator's list for a tenant: an issuer it does not match is refused as
+    /// not permitted, and one it matches is created, without
+    /// `external_consent_issuers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_creates_an_external_provider_whose_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        let issuer =
+            format!("{}/72f988bf-86f1-41af-91ab-2d7cd011db47", crate::credential_providers::external::tests::ISSUER);
+        let mut tenant_metadata = metadata();
+        tenant_metadata.issuer = issuer.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(&directory, Ok(tenant_metadata)).await;
+        state.issuers = Arc::new(None);
+        state.issuer_patterns = Arc::new(Some(Vec::new()));
+        let request = || create_request(|body| body["issuer"] = json!(issuer));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_issuer_not_permitted");
+        assert_eq!(body["field"], "issuer");
+
+        state.issuer_patterns = Arc::new(Some(vec![IssuerPattern {
+            issuer: format!("{}/{{tenant}}", crate::credential_providers::external::tests::ISSUER),
+            tenant: IssuerTenant::Uuid,
+            endpoint_origins: Vec::new(),
+            resource_origins: Vec::new(),
+        }]));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["issuer"], json!(issuer));
     }
 
     /// With `external_consent_issuers` set, a provider is created only for a

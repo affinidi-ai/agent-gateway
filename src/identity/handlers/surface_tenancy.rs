@@ -221,6 +221,10 @@ pub async fn validate_external_consent_bindings(
             .network_config
             .external_consent_issuers
             .as_ref(),
+        state
+            .network_config
+            .external_consent_issuer_patterns
+            .as_deref(),
         proxies,
     )
     .await
@@ -507,6 +511,7 @@ async fn check_external_consent_bindings(
     storage: GrantStorage,
     resource_origins: &std::collections::HashMap<String, Vec<String>>,
     issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    issuer_patterns: Option<&[crate::config::network::IssuerPattern]>,
     proxies: Option<&dyn McpProxyStore>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
@@ -525,6 +530,7 @@ async fn check_external_consent_bindings(
         storage,
         resource_origins,
         issuers,
+        issuer_patterns,
         proxies,
     };
     for (prefix, view) in &views {
@@ -721,6 +727,7 @@ struct GrantRules<'a> {
     storage: GrantStorage,
     resource_origins: &'a std::collections::HashMap<String, Vec<String>>,
     issuers: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    issuer_patterns: Option<&'a [crate::config::network::IssuerPattern]>,
     proxies: Option<&'a dyn McpProxyStore>,
 }
 
@@ -806,13 +813,20 @@ impl GrantRules<'_> {
             }
         }
         .map_err(refuse)?;
-        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins) {
+        if !crate::credential_providers::external::resource_permitted(
+            &provider,
+            self.resource_origins,
+            self.issuer_patterns,
+        ) {
             return Err(refuse(
                 "the credential provider's resource is not permitted for its issuer: on the issuer's host or one of \
-                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
+                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins or an \
+                 external_consent_issuer_patterns entry it matches",
             ));
         }
-        if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, self.issuers) {
+        if let Err(field) =
+            crate::credential_providers::external::issuer_permitted(&provider, self.issuers, self.issuer_patterns)
+        {
             return Err(refuse(&format!(
                 "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
             )));
@@ -4415,6 +4429,7 @@ mod tests {
             storage,
             &std::collections::HashMap::new(),
             None,
+            None,
             proxies,
         )
         .await
@@ -4749,6 +4764,7 @@ mod tests {
                 GRANTS_KEPT,
                 &std::collections::HashMap::new(),
                 None,
+                None,
                 Some(&proxies),
             )
             .await;
@@ -4815,6 +4831,7 @@ mod tests {
                     &surface,
                     GRANTS_KEPT,
                     &std::collections::HashMap::new(),
+                    None,
                     None,
                     Some(proxies),
                 )
@@ -5165,6 +5182,7 @@ mod tests {
                     storage,
                     &std::collections::HashMap::new(),
                     issuers.as_ref(),
+                    None,
                     None,
                 )
                 .await
@@ -5836,6 +5854,7 @@ mod tests {
             },
             &std::collections::HashMap::new(),
             Some(&std::collections::HashMap::new()),
+            None,
             None,
         )
         .await;
