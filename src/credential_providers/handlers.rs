@@ -292,27 +292,9 @@ async fn validate_consent_confirmation(
     ) {
         return invalid(&format!("consent_confirmation.id_token_principal_claim: {error}"));
     }
-    let authorization_endpoint =
-        crate::url_validation::validate_oauth_endpoint_url(&confirmation.authorization_endpoint).map_err(|error| {
-            ProviderValidationError::InvalidConsentConfirmation(format!(
-                "consent_confirmation.authorization_endpoint: {error}"
-            ))
-        })?;
-    if !crate::url_validation::is_https_or_bdd_allowed(&authorization_endpoint)
-        || authorization_endpoint
-            .host()
-            .is_none()
-        || authorization_endpoint
-            .query()
-            .is_some()
-        || authorization_endpoint
-            .fragment()
-            .is_some()
-    {
-        return invalid(
-            "consent_confirmation.authorization_endpoint must be an https URL with a host and no query or fragment",
-        );
-    }
+    confirmation
+        .authorization_endpoint_url()
+        .map_err(ProviderValidationError::InvalidConsentConfirmation)?;
     if let Err(error) = crate::url_validation::validate_oauth_endpoint_url(&confirmation.token_endpoint) {
         return invalid(&format!("consent_confirmation.token_endpoint: {error}"));
     }
@@ -339,6 +321,13 @@ async fn validate_consent_confirmation(
         return invalid(
             "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid",
         );
+    }
+    let id_token_claim = confirmation
+        .id_token_principal_claim
+        .as_deref()
+        .unwrap_or(strategy_claim);
+    if [strategy_claim, id_token_claim].contains(&"email") {
+        return invalid("consent_confirmation cannot name a caller by email, which the sign-in does not ask for");
     }
     Ok(())
 }
@@ -7209,6 +7198,38 @@ mod consent_confirmation_tests {
                 .await;
             assert_eq!(status, StatusCode::CREATED, "{index}: {body}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_named_by_email_in_the_strategy_or_the_id_token_is_refused() {
+        let fixture = fixture().await;
+        let email = fixture
+            .strategy(None, GOOGLE, Some("email"))
+            .await;
+        let sub = fixture
+            .strategy(None, GOOGLE, None)
+            .await;
+        for (index, setting) in [
+            confirmation(&email),
+            with(confirmation(&email), &["id_token_principal_claim"], json!("sub")),
+            with(confirmation(&sub), &["id_token_principal_claim"], json!("email")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (status, body) = fixture
+                .create(None, with(github(setting), &["provider_id"], json!(format!("email-{index}"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{index}: {body}");
+            assert_eq!(
+                body["error"],
+                "consent_confirmation cannot name a caller by email, which the sign-in does not ask for"
+            );
+        }
+        let (status, body) = fixture
+            .create(None, github(confirmation(&sub)))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

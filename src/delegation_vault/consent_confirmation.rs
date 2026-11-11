@@ -6,6 +6,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::ConsentConfirmBinding;
+use crate::audit::events::DelegationFailureReason;
 use crate::credential_providers::CredentialProvider;
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
 use crate::source_auth::AuthenticatedIdentity;
@@ -147,6 +148,81 @@ pub(crate) async fn decide(
         strategy_digest,
         tenant_id: surface_tenant_id.map(String::from),
     }))
+}
+
+/// Where the caller of a confirm start state signs in: the login client at
+/// the authorization endpoint, redirected back to the confirmation redirect
+/// URI, with the scope that gives the claim naming the caller.
+pub(crate) struct SignIn {
+    pub authorization_endpoint: url::Url,
+    pub client_id: String,
+    pub redirect_uri: url::Url,
+    pub scope: &'static str,
+}
+
+/// The sign-in a confirm start state sealed with `binding` leads to, checked
+/// again at the start POST: the provider still has `consent_confirmation`, it
+/// names the sealed strategy, the provider's tenant can still reference that
+/// strategy, its verification digest is the sealed one, and the authorization
+/// endpoint passes the save rules without its host being resolved. A start
+/// POST that fails one is refused, never sent to the vendor.
+pub(crate) async fn sign_in(
+    provider: &CredentialProvider,
+    binding: &ConsentConfirmBinding,
+    strategies: &dyn JwtVerificationStrategyStorage,
+    gateway_base_url: &str,
+) -> Result<SignIn, DelegationFailureReason> {
+    let confirmation = provider
+        .consent_confirmation
+        .as_ref()
+        .filter(|confirmation| confirmation.jwt_verification_strategy_id == binding.strategy_id)
+        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let strategy = strategies
+        .get(&binding.strategy_id)
+        .await
+        .map_err(|_| DelegationFailureReason::CredentialsUnavailable)?
+        .filter(|strategy| {
+            crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
+                && strategy
+                    .verification_digest()
+                    .as_deref()
+                    == Some(
+                        binding
+                            .strategy_digest
+                            .as_str(),
+                    )
+        })
+        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let strategy_claim = strategy
+        .principal_claim_name()
+        .map_err(|_| DelegationFailureReason::ConsentStateInvalid)?;
+    let authorization_endpoint = confirmation
+        .authorization_endpoint_url_unresolved()
+        .map_err(|_| DelegationFailureReason::AuthorizationUrlInvalid)?;
+    let redirect_uri = url::Url::parse(&provider.consent_confirmation_redirect_uri(gateway_base_url))
+        .map_err(|_| DelegationFailureReason::RedirectUriInvalid)?;
+    Ok(SignIn {
+        authorization_endpoint,
+        client_id: confirmation.client_id.clone(),
+        redirect_uri,
+        scope: sign_in_scope(
+            confirmation
+                .id_token_principal_claim
+                .as_deref()
+                .unwrap_or(strategy_claim),
+        ),
+    })
+}
+
+/// `openid` alone gives `sub`, the only claim naming the caller it
+/// guarantees; an ID token naming the caller by any other claim needs
+/// `profile` too.
+fn sign_in_scope(id_token_claim: &str) -> &'static str {
+    if id_token_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM {
+        "openid"
+    } else {
+        "openid profile"
+    }
 }
 
 /// Log at debug, once per provider, surface and reason, why a caller of a

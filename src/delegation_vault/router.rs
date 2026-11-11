@@ -98,6 +98,7 @@ mod tests {
     use crate::delegation_vault::storage::DelegationVaultStorage;
     use crate::delegation_vault::test_support::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
+    use crate::jwt_bearer::JwtVerificationStrategyStorage as _;
     use crate::jwt_bearer::models::JwtVerificationStrategy;
     use crate::rbac::RbacConfig;
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, SecretsStore, UpdateSecretRequest};
@@ -768,43 +769,86 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
-    /// A start state that confirms the caller at their identity provider never
-    /// goes to the vendor from the start page, and a confirmation state is no
-    /// vendor callback state.
+    /// The start page shows a start state that confirms its caller. A
+    /// confirmation or vendor state is refused at the start page and its POST,
+    /// and a confirmation state at the vendor callback.
     #[tokio::test]
-    async fn confirmation_stage_states_never_reach_the_vendor() {
+    async fn only_a_start_state_opens_the_start_page_and_a_confirmation_state_never_reaches_the_vendor() {
         use crate::delegation_vault::ConsentStage;
-        use crate::delegation_vault::oauth::{decode_callback_state, decode_start_state, encode_oauth_state};
+        use crate::delegation_vault::oauth::{decode_callback_state, encode_oauth_state};
         let fixture = consent::Fixture::new().await;
-        let confirm_binding = crate::delegation_vault::ConsentConfirmBinding {
-            strategy_id: "strategy-1".to_string(),
-            strategy_digest: "ab".repeat(32),
-            tenant_id: None,
-        };
-        let start = decode_start_state(&consent::start_state(&fixture.start_url())).unwrap();
-        let confirm_start = encode_oauth_state(&crate::delegation_vault::OAuthState {
-            stage: Some(ConsentStage::ConfirmStart(confirm_binding.clone())),
-            ..start
-        })
-        .unwrap();
-        let (callback_state, cookie) = fixture.begin().await;
-        let confirmation = encode_oauth_state(&crate::delegation_vault::OAuthState {
-            stage: Some(ConsentStage::Confirmation(confirm_binding)),
+        let strategy = fixture.confirming(None).await;
+        let confirm_start_url = fixture.confirm_start_url(&strategy);
+        let page = fixture
+            .get(&consent::local(&confirm_start_url), &[])
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        assert!(
+            page.body
+                .contains("<button type=\"submit\">Sign in, then continue to GitHub</button>"),
+            "{}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains("You sign in to your identity provider first"),
+            "{}",
+            page.body
+        );
+        let plain = fixture
+            .get(&consent::local(&fixture.start_url()), &[])
+            .await;
+        assert!(
+            plain
+                .body
+                .contains("<button type=\"submit\">Continue to GitHub</button>"),
+            "{}",
+            plain.body
+        );
+        assert!(
+            !plain
+                .body
+                .contains("identity provider"),
+            "{}",
+            plain.body
+        );
+
+        let signed_in = fixture
+            .start_post(&consent::start_state(&confirm_start_url), &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(signed_in.status, StatusCode::FOUND, "{}", signed_in.body);
+        let confirmation = consent::start_state(
+            signed_in
+                .header("location")
+                .unwrap(),
+        );
+        let (cookie, ..) = consent::set_cookie(&signed_in);
+        let (callback_state, _) = fixture.begin().await;
+        let vendor = encode_oauth_state(&crate::delegation_vault::OAuthState {
+            stage: Some(ConsentStage::Vendor(consent::confirm_binding(&strategy))),
             ..decode_callback_state(&callback_state).unwrap()
         })
         .unwrap();
         let (results, events) = capture(async {
-            vec![
-                fixture
-                    .get(&format!("/v1/identity/oauth/callback/github/start?state={confirm_start}"), &[])
-                    .await,
-                fixture
-                    .start_post(&confirm_start, &[("origin", "https://198.51.100.7")])
-                    .await,
+            let mut results = Vec::new();
+            for state in [&confirmation, &vendor] {
+                results.push(
+                    fixture
+                        .get(&format!("/v1/identity/oauth/callback/github/start?state={state}"), &[])
+                        .await,
+                );
+                results.push(
+                    fixture
+                        .start_post(state, &[("origin", "https://198.51.100.7")])
+                        .await,
+                );
+            }
+            results.push(
                 fixture
                     .callback("github", &format!("code=c&state={confirmation}"), Some(&cookie))
                     .await,
-            ]
+            );
+            results
         })
         .await;
         for refused in &results {
@@ -813,6 +857,571 @@ mod tests {
         assert!(events.is_empty(), "a state of another stage is not audited: {events:?}");
         assert_eq!(fixture.token_calls(), 0);
         assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// A start state that confirms its caller sends the browser to the
+    /// caller's identity provider, never the vendor: the login client, the
+    /// confirmation redirect URI, `openid`, `response_mode=query`, PKCE S256
+    /// and a nonce, with no vendor parameter and no `prompt`. Its state is a
+    /// confirmation state that keeps the start state's consent, the verifier,
+    /// the nonce and when the sign-in began, and the browser gets the binding
+    /// cookie the vendor leg sets.
+    #[tokio::test]
+    async fn a_confirm_start_goes_to_the_identity_provider_with_a_sealed_confirmation_state() {
+        use crate::delegation_vault::ConsentStage;
+        use crate::delegation_vault::oauth::{
+            binding_cookie_name, browser_binding_matches, decode_callback_state, decode_confirmation_state,
+            decode_start_state, generate_pkce_challenge, is_claimed,
+        };
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let encoded_start = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let start = decode_start_state(&encoded_start).unwrap();
+        let before = Utc::now();
+        let started = fixture
+            .start_post(&encoded_start, &[("origin", "https://198.51.100.7")])
+            .await;
+        let after = Utc::now();
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        assert_eq!(started.header("cache-control"), Some("no-store"));
+        assert_eq!(started.header("referrer-policy"), Some("no-referrer"));
+        let idp = url::Url::parse(
+            started
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&idp[..url::Position::AfterPath], consent::IDP_AUTHORIZE);
+        let encoded = consent::query_value(&idp, "state");
+        let sealed = decode_confirmation_state(&encoded).unwrap();
+        let Some(ConsentStage::Confirmation(sign_in)) = &sealed.stage else {
+            panic!("not a confirmation state: {sealed:?}");
+        };
+        let verifier = sealed
+            .code_verifier
+            .clone()
+            .unwrap();
+        let pairs: Vec<(String, String)> = idp
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("response_type", "code"),
+            ("client_id", "login-client"),
+            ("redirect_uri", "https://198.51.100.7/v1/identity/oauth/callback/github/confirm"),
+            ("scope", "openid"),
+            ("state", encoded.as_str()),
+            ("nonce", sign_in.nonce.as_str()),
+            ("code_challenge", generate_pkce_challenge(&verifier).as_str()),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "query"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(pairs, expected);
+
+        assert_eq!(sign_in.binding, consent::confirm_binding(&strategy));
+        assert_eq!(start.stage, Some(ConsentStage::ConfirmStart(sign_in.binding.clone())));
+        assert!(sign_in.nonce.len() >= 32, "{}", sign_in.nonce.len());
+        assert_ne!(sign_in.nonce, sealed.nonce, "the ID token nonce is not the state's claim nonce");
+        assert_ne!(sign_in.nonce, start.nonce);
+        assert_ne!(sealed.nonce, start.nonce, "the confirmation state is claimed apart from the start state");
+        assert!(before <= sign_in.issued_at && sign_in.issued_at <= after, "{:?}", sign_in.issued_at);
+        assert!(sealed.expires_at <= start.expires_at);
+        assert_eq!(
+            (
+                &sealed.agent_did,
+                &sealed.user_identity_hash,
+                &sealed.surface_id,
+                &sealed.credential_provider_id,
+                &sealed.provider_id,
+                &sealed.scopes
+            ),
+            (
+                &start.agent_did,
+                &start.user_identity_hash,
+                &start.surface_id,
+                &start.credential_provider_id,
+                &start.provider_id,
+                &start.scopes
+            ),
+            "the vendor's consent is kept for after the sign-in"
+        );
+        assert!(decode_start_state(&encoded).is_err());
+        assert!(decode_callback_state(&encoded).is_err());
+
+        let (cookie, max_age, attributes) = consent::set_cookie(&started);
+        let (name, value) = cookie
+            .split_once('=')
+            .unwrap();
+        assert_eq!(Some(name.to_string()), binding_cookie_name(&sealed));
+        assert!(browser_binding_matches(&sealed, Some(value)));
+        assert!((590..=600).contains(&max_age), "{max_age}");
+        assert_eq!(attributes, " Path=/; Secure; HttpOnly; SameSite=Lax");
+        assert!(is_claimed(&start).await, "the start state is used up");
+        assert!(!is_claimed(&sealed).await, "the confirmation state is not");
+    }
+
+    /// `openid` gives only `sub`: the sign-in asks for `profile` too when the
+    /// ID token names the caller by another claim.
+    #[tokio::test]
+    async fn the_sign_in_asks_for_profile_only_when_the_id_token_names_the_caller_by_another_claim() {
+        for (strategy_claim, id_token_claim, scope) in [
+            (None, None, "openid"),
+            (None, Some("sub"), "openid"),
+            (Some("oid"), None, "openid profile"),
+            (Some("preferred_username"), None, "openid profile"),
+            (None, Some("oid"), "openid profile"),
+            (Some("oid"), Some("sub"), "openid"),
+        ] {
+            let fixture = consent::Fixture::new().await;
+            let strategy = fixture
+                .confirming(strategy_claim)
+                .await;
+            let mut provider = fixture
+                .providers
+                .get(consent::PROVIDER_ID)
+                .await
+                .unwrap()
+                .unwrap();
+            provider
+                .consent_confirmation
+                .as_mut()
+                .unwrap()
+                .id_token_principal_claim = id_token_claim.map(String::from);
+            fixture
+                .providers
+                .update(provider)
+                .await
+                .unwrap();
+            let started = fixture
+                .start_post(
+                    &consent::start_state(&fixture.confirm_start_url(&strategy)),
+                    &[("origin", "https://198.51.100.7")],
+                )
+                .await;
+            assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+            let idp = url::Url::parse(
+                started
+                    .header("location")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(consent::query_value(&idp, "scope"), scope, "{strategy_claim:?}, {id_token_claim:?}");
+        }
+    }
+
+    /// A start state that confirms its caller is refused, audited and left
+    /// unused, never sent to the vendor, while its provider no longer confirms
+    /// through the sealed strategy, no longer uses legacy consent or has an
+    /// authorization endpoint the save rules refuse; once the provider is
+    /// restored the same state goes to the identity provider.
+    #[tokio::test]
+    async fn a_confirm_start_the_provider_no_longer_confirms_is_refused_and_left_unused() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        let confirming = fixture
+            .providers
+            .get(consent::PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = fixture.confirming(None).await;
+        let changed = |change: &dyn Fn(&mut CredentialProvider)| {
+            let mut provider = confirming.clone();
+            change(&mut provider);
+            provider
+        };
+        let endpoint = |endpoint: &'static str| {
+            changed(&move |provider| {
+                provider
+                    .consent_confirmation
+                    .as_mut()
+                    .unwrap()
+                    .authorization_endpoint = endpoint.to_string()
+            })
+        };
+        let cases = [
+            (
+                "setting removed",
+                changed(&|provider| provider.consent_confirmation = None),
+                DelegationFailureReason::ConsentStateInvalid,
+            ),
+            (
+                "strategy changed",
+                changed(&|provider| {
+                    provider
+                        .consent_confirmation
+                        .as_mut()
+                        .unwrap()
+                        .jwt_verification_strategy_id = other.id.clone()
+                }),
+                DelegationFailureReason::ConsentStateInvalid,
+            ),
+            (
+                "no longer legacy",
+                changed(&|provider| provider.issuer = Some("https://vendor.example".to_string())),
+                DelegationFailureReason::ConsentProviderMismatch,
+            ),
+            (
+                "http endpoint",
+                endpoint("http://203.0.113.20/authorize"),
+                DelegationFailureReason::AuthorizationUrlInvalid,
+            ),
+            (
+                "endpoint query",
+                endpoint("https://203.0.113.20/authorize?a=1"),
+                DelegationFailureReason::AuthorizationUrlInvalid,
+            ),
+            (
+                "endpoint fragment",
+                endpoint("https://203.0.113.20/authorize#f"),
+                DelegationFailureReason::AuthorizationUrlInvalid,
+            ),
+            (
+                "loopback endpoint",
+                endpoint("https://127.0.0.1/authorize"),
+                DelegationFailureReason::AuthorizationUrlInvalid,
+            ),
+            (
+                "metadata endpoint",
+                endpoint("https://169.254.169.254/authorize"),
+                DelegationFailureReason::AuthorizationUrlInvalid,
+            ),
+        ];
+        for (name, provider, reason) in cases {
+            fixture
+                .providers
+                .update(provider)
+                .await
+                .unwrap();
+            let (refused, events) = capture(async {
+                fixture
+                    .start_post(&state, &[("origin", "https://198.51.100.7")])
+                    .await
+            })
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+            assert_eq!(consent::reasons(&events), [reason], "{name}");
+            assert_eq!(audited_providers(&events), [Some("github".to_string())], "{name}");
+            assert!(!crate::delegation_vault::oauth::is_claimed(&start).await, "{name} claimed the start state");
+        }
+
+        let deleted = fixture.confirming(None).await;
+        let deleted_state = consent::start_state(&fixture.confirm_start_url(&deleted));
+        fixture
+            .strategies
+            .delete(&deleted.id)
+            .await
+            .unwrap();
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&deleted_state, &[("origin", "https://198.51.100.7")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid], "strategy deleted");
+        let deleted_start = crate::delegation_vault::oauth::decode_start_state(&deleted_state).unwrap();
+        assert!(
+            !crate::delegation_vault::oauth::is_claimed(&deleted_start).await,
+            "strategy deleted claimed its state"
+        );
+
+        fixture
+            .providers
+            .update(confirming)
+            .await
+            .unwrap();
+        let started = fixture
+            .start_post(&state, &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        assert!(
+            started
+                .header("location")
+                .unwrap()
+                .starts_with(consent::IDP_AUTHORIZE)
+        );
+    }
+
+    /// A start state without a stage goes to the vendor exactly as before
+    /// consent confirmation, whether or not its provider has the setting.
+    #[tokio::test]
+    async fn a_start_state_without_a_stage_goes_to_the_vendor_unchanged() {
+        for confirming in [false, true] {
+            let fixture = consent::Fixture::new().await;
+            if confirming {
+                fixture.confirming(None).await;
+            }
+            let started = fixture
+                .start_post(&consent::start_state(&fixture.start_url()), &[("origin", "https://198.51.100.7")])
+                .await;
+            assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+            let vendor = url::Url::parse(
+                started
+                    .header("location")
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(&vendor[..url::Position::AfterPath], "https://vendor.example/authorize");
+            let masked: Vec<(String, String)> = vendor
+                .query_pairs()
+                .into_owned()
+                .map(|(name, value)| match name.as_str() {
+                    "state" | "code_challenge" => (name, "*".to_string()),
+                    _ => (name, value),
+                })
+                .collect();
+            let mut expected: Vec<(String, String)> = [
+                ("response_type", "code"),
+                ("client_id", "github-client"),
+                ("redirect_uri", consent::REDIRECT_URI),
+                ("scope", "repo read:user"),
+                ("state", "*"),
+                ("code_challenge", "*"),
+                ("code_challenge_method", "S256"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+            if confirming {
+                expected.push(("prompt".to_string(), "consent".to_string()));
+            }
+            assert_eq!(masked, expected, "confirming {confirming}");
+            let callback =
+                crate::delegation_vault::oauth::decode_callback_state(&consent::query_value(&vendor, "state")).unwrap();
+            assert_eq!(callback.stage, None, "confirming {confirming}");
+            let (cookie, max_age, attributes) = consent::set_cookie(&started);
+            assert_eq!(
+                Some(consent::cookie_name(&cookie)),
+                crate::delegation_vault::oauth::binding_cookie_name(&callback)
+            );
+            assert!((590..=600).contains(&max_age), "{max_age}");
+            assert_eq!(attributes, " Path=/; Secure; HttpOnly; SameSite=Lax");
+        }
+    }
+
+    /// A start link that confirms its caller is used once: a second POST of
+    /// it, after the first or racing it, is refused as reused, with no
+    /// redirect and no cookie.
+    #[tokio::test]
+    async fn a_confirm_start_link_is_used_once() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let first = fixture
+            .start_post(&state, &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(first.status, StatusCode::FOUND, "{}", first.body);
+        let (replayed, events) = capture(async {
+            fixture
+                .start_post(&state, &[("origin", "https://198.51.100.7")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&replayed, StatusCode::BAD_REQUEST, None);
+        assert_eq!(replayed.header("location"), None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateReused]);
+
+        let raced = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let (one, other) = tokio::join!(
+            fixture.start_post(&raced, &[("origin", "https://198.51.100.7")]),
+            fixture.start_post(&raced, &[("origin", "https://198.51.100.7")])
+        );
+        let (won, lost) = if one.status == StatusCode::FOUND {
+            (one, other)
+        } else {
+            (other, one)
+        };
+        assert_eq!(won.status, StatusCode::FOUND, "{}", won.body);
+        assert!(
+            won.header("location")
+                .unwrap()
+                .starts_with(consent::IDP_AUTHORIZE)
+        );
+        consent::assert_refused(&lost, StatusCode::BAD_REQUEST, None);
+        assert_eq!(lost.header("location"), None);
+    }
+
+    /// Every confirm start POST draws its own ID token nonce, PKCE verifier
+    /// and binding cookie.
+    #[tokio::test]
+    async fn each_confirm_start_draws_its_own_nonce_verifier_and_cookie() {
+        use crate::delegation_vault::ConsentStage;
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let mut drawn = Vec::new();
+        for _ in 0..2 {
+            let started = fixture
+                .start_post(
+                    &consent::start_state(&fixture.confirm_start_url(&strategy)),
+                    &[("origin", "https://198.51.100.7")],
+                )
+                .await;
+            assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+            let idp = url::Url::parse(
+                started
+                    .header("location")
+                    .unwrap(),
+            )
+            .unwrap();
+            let sealed =
+                crate::delegation_vault::oauth::decode_confirmation_state(&consent::query_value(&idp, "state"))
+                    .unwrap();
+            let Some(ConsentStage::Confirmation(sign_in)) = sealed.stage else {
+                panic!("not a confirmation state");
+            };
+            drawn.push((sign_in.nonce, sealed.code_verifier.unwrap(), consent::set_cookie(&started).0));
+        }
+        assert_ne!(drawn[0].0, drawn[1].0, "the ID token nonce is drawn again");
+        assert_ne!(drawn[0].1, drawn[1].1, "the PKCE verifier is drawn again");
+        assert_ne!(drawn[0].2, drawn[1].2, "the binding cookie is drawn again");
+    }
+
+    /// A start state that confirms its caller is refused and left unused
+    /// when its strategy became another tenant's, or was edited after mint so
+    /// that its verification digest is no longer the sealed one.
+    #[tokio::test]
+    async fn a_confirm_start_through_a_strategy_it_cannot_use_is_refused_and_left_unused() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        for (name, edited) in [
+            (
+                "another tenant's",
+                JwtVerificationStrategy {
+                    tenant_id: Some("tenant-b".to_string()),
+                    ..strategy.clone()
+                },
+            ),
+            (
+                "edited after mint",
+                JwtVerificationStrategy {
+                    expected_issuer: "https://other-idp.example".to_string(),
+                    ..strategy.clone()
+                },
+            ),
+        ] {
+            fixture
+                .strategies
+                .update(edited)
+                .await
+                .unwrap();
+            let (refused, events) = capture(async {
+                fixture
+                    .start_post(&state, &[("origin", "https://198.51.100.7")])
+                    .await
+            })
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+            assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid], "{name}");
+            assert!(!crate::delegation_vault::oauth::is_claimed(&start).await, "{name} claimed the start state");
+        }
+        fixture
+            .strategies
+            .update(strategy)
+            .await
+            .unwrap();
+        let started = fixture
+            .start_post(&state, &[("origin", "https://198.51.100.7")])
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+    }
+
+    /// The start POST checks the identity provider's authorization endpoint
+    /// without resolving its host, so a host no DNS answers for still sends
+    /// the browser there.
+    #[tokio::test]
+    async fn the_start_post_does_not_resolve_the_authorization_endpoint() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let mut provider = fixture
+            .providers
+            .get(consent::PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .authorization_endpoint = "https://login.idp.invalid/authorize".to_string();
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+        let started = fixture
+            .start_post(
+                &consent::start_state(&fixture.confirm_start_url(&strategy)),
+                &[("origin", "https://198.51.100.7")],
+            )
+            .await;
+        assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+        assert!(
+            started
+                .header("location")
+                .unwrap()
+                .starts_with("https://login.idp.invalid/authorize?")
+        );
+    }
+
+    /// A start state that confirms its caller is refused as unavailable,
+    /// audited and left unused while the strategy store fails.
+    #[tokio::test]
+    async fn a_confirm_start_is_refused_and_left_unused_while_the_strategy_store_fails() {
+        struct FailingStrategyStore;
+
+        #[async_trait::async_trait]
+        impl crate::jwt_bearer::JwtVerificationStrategyStorage for FailingStrategyStore {
+            async fn create(
+                &self,
+                _strategy: JwtVerificationStrategy,
+            ) -> anyhow::Result<JwtVerificationStrategy> {
+                anyhow::bail!("strategy store unavailable")
+            }
+            async fn get(
+                &self,
+                _id: &str,
+            ) -> anyhow::Result<Option<JwtVerificationStrategy>> {
+                anyhow::bail!("strategy store unavailable")
+            }
+            async fn list(&self) -> anyhow::Result<Vec<JwtVerificationStrategy>> {
+                anyhow::bail!("strategy store unavailable")
+            }
+            async fn update(
+                &self,
+                _strategy: JwtVerificationStrategy,
+            ) -> anyhow::Result<JwtVerificationStrategy> {
+                anyhow::bail!("strategy store unavailable")
+            }
+            async fn delete(
+                &self,
+                _id: &str,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("strategy store unavailable")
+            }
+        }
+
+        let fixture = consent::Fixture::with_identity_strategies(Some(Arc::new(FailingStrategyStore))).await;
+        let strategy = fixture.confirming(None).await;
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&state, &[("origin", "https://198.51.100.7")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+        assert_eq!(audited_providers(&events), [Some("github".to_string())]);
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        assert!(!crate::delegation_vault::oauth::is_claimed(&start).await);
     }
 
     /// The callback's path must name the state's provider, and the provider the
@@ -1375,6 +1984,39 @@ mod tests {
         pub const PROVIDER_ID: &str = "cp-github";
         pub const REDIRECT_URI: &str = "https://198.51.100.7/v1/identity/oauth/callback/github";
         pub const CALLBACK_PATH: &str = "/v1/identity/oauth/callback/github";
+        pub const IDP_AUTHORIZE: &str = "https://203.0.113.20/authorize";
+
+        pub fn confirm_binding(strategy: &JwtVerificationStrategy) -> crate::delegation_vault::ConsentConfirmBinding {
+            crate::delegation_vault::ConsentConfirmBinding {
+                strategy_id: strategy.id.clone(),
+                strategy_digest: strategy
+                    .verification_digest()
+                    .unwrap(),
+                tenant_id: None,
+            }
+        }
+
+        /// The cookie pair a start POST set, its `Max-Age` and its other
+        /// attributes.
+        pub fn set_cookie(answer: &Answer) -> (String, i64, String) {
+            let set_cookie = answer
+                .header("set-cookie")
+                .unwrap();
+            let (pair, attributes) = set_cookie
+                .split_once(';')
+                .unwrap();
+            let max_age: i64 = attributes
+                .split(';')
+                .find_map(|attribute| {
+                    attribute
+                        .trim()
+                        .strip_prefix("Max-Age=")
+                })
+                .unwrap()
+                .parse()
+                .unwrap();
+            (pair.to_string(), max_age, attributes.replace(&format!(" Max-Age={max_age};"), ""))
+        }
 
         /// The name of a `name=value` cookie pair.
         pub fn cookie_name(pair: &str) -> String {
@@ -1390,6 +2032,7 @@ mod tests {
 
         pub struct Fixture {
             pub providers: Arc<FileSystemCredentialProviderStore>,
+            pub strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
             pub(super) vault: Arc<InMemoryVault>,
             app: Router,
             calls: Arc<AtomicUsize>,
@@ -1481,6 +2124,14 @@ mod tests {
 
         impl Fixture {
             pub async fn new() -> Self {
+                Self::with_identity_strategies(None).await
+            }
+
+            /// A fixture whose start POSTs look strategies up in
+            /// `identity_strategies`, or in [`Fixture::strategies`] when `None`.
+            pub async fn with_identity_strategies(
+                identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>
+            ) -> Self {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let counter = calls.clone();
                 let forms = Arc::new(Mutex::new(Vec::new()));
@@ -1572,12 +2223,22 @@ mod tests {
                 crate::surfaces::AgentSurfaceStore::save(surfaces.as_ref(), &surface)
                     .await
                     .unwrap();
+                let strategies = Arc::new(
+                    crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
+                        directory
+                            .path()
+                            .join("strategies"),
+                    )
+                    .await
+                    .unwrap(),
+                );
                 let vault = Arc::new(InMemoryVault {
                     tokens: Mutex::new(Vec::new()),
                     unreadable: false,
                 });
                 let mut fixture = Self {
                     providers,
+                    strategies,
                     vault: vault.clone(),
                     app: Router::new(),
                     calls,
@@ -1598,6 +2259,7 @@ mod tests {
                 let mut state = state_with(Vec::new());
                 state.vault_store = vault;
                 state.provider_store = fixture.providers.clone();
+                state.identity_strategies = identity_strategies.unwrap_or_else(|| fixture.strategies.clone());
                 state.secrets_store = secrets;
                 state.agent_surface_store = Some(surfaces);
                 state.gateway_base_url = "https://198.51.100.7".to_string();
@@ -1631,6 +2293,62 @@ mod tests {
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
                     None,
+                )
+                .unwrap()
+            }
+
+            /// Stores a strategy naming callers by `principal_claim` and gives
+            /// the provider a `consent_confirmation` that confirms through it,
+            /// and a vendor parameter the sign-in must not carry.
+            pub async fn confirming(
+                &self,
+                principal_claim: Option<&str>,
+            ) -> JwtVerificationStrategy {
+                let strategy = self
+                    .strategies
+                    .create(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "", "name": "Callers", "expected_issuer": "https://idp.example",
+                            "jwks_source": {"type": "remote", "jwks_uri": "https://idp.example/jwks"},
+                            "principal_claim": principal_claim,
+                            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mut provider = self.provider();
+                provider.consent_confirmation = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "client_id": "login-client", "client_secret_secret_ref": "github-client-secret",
+                        "authorization_endpoint": IDP_AUTHORIZE, "token_endpoint": "https://203.0.113.20/token",
+                        "jwt_verification_strategy_id": strategy.id
+                    }))
+                    .unwrap(),
+                );
+                provider
+                    .additional_params
+                    .insert("prompt".to_string(), "consent".to_string());
+                self.providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+                strategy
+            }
+
+            /// A start URL whose state confirms its caller through `strategy`.
+            pub fn confirm_start_url(
+                &self,
+                strategy: &JwtVerificationStrategy,
+            ) -> String {
+                crate::delegation_vault::oauth::build_authorization_url(
+                    &self.provider(),
+                    "did:web:agent.example",
+                    "sha256:user",
+                    "surface",
+                    &["repo".to_string(), "read:user".to_string()],
+                    "https://198.51.100.7",
+                    Some(crate::delegation_vault::ConsentStage::ConfirmStart(confirm_binding(strategy))),
                 )
                 .unwrap()
             }

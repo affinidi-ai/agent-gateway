@@ -536,10 +536,10 @@ struct StartRefused {
     audited: Option<String>,
 }
 
-/// Decodes the start state `params` carry and resolves its provider, whose
-/// redirect URI must follow the consent rules and be no other provider's. A
-/// [`ConsentStage::ConfirmStart`](super::ConsentStage::ConfirmStart) state is
-/// refused: the start page sends only to the vendor.
+/// Decodes the start state `params` carry, one without a stage or a
+/// [`ConsentStage::ConfirmStart`](super::ConsentStage::ConfirmStart) one, and
+/// resolves its provider, whose redirect URI must follow the consent rules and
+/// be no other provider's.
 async fn resolve_consent_start(
     state: &DelegationVaultState,
     path_segment: &str,
@@ -549,7 +549,6 @@ async fn resolve_consent_start(
         .and_then(|params| {
             oauth::decode_start_state(&params.state)
                 .ok()
-                .filter(|start| start.stage.is_none())
                 .map(|start| (params.state, start))
         })
         .ok_or(StartRefused {
@@ -622,6 +621,17 @@ pub async fn consent_start_page(
         None => None,
     }
     .unwrap_or_else(|| start.surface_id.clone());
+    let provider_name = html_escape(&provider.name);
+    let (sign_in_first, button) = match &start.stage {
+        Some(super::ConsentStage::ConfirmStart(_)) => (
+            format!(
+                "<p>You sign in to your identity provider first, to confirm it is you, and then continue to \
+                 {provider_name}.</p>\n"
+            ),
+            format!("Sign in, then continue to {provider_name}"),
+        ),
+        _ => (String::new(), format!("Continue to {provider_name}")),
+    };
     let scopes = if start.scopes.is_empty() {
         "(none)".to_string()
     } else {
@@ -640,12 +650,12 @@ pub async fn consent_start_page(
 <dt>Scopes</dt><dd><code>{scopes}</code></dd>
 </dl>
 <p>Continue only if you started this from your own application.</p>
-<form method="post" action="start">
+{sign_in_first}<form method="post" action="start">
 <input type="hidden" name="state" value="{state}">
-<button type="submit">Continue to {provider}</button>
+<button type="submit">{button}</button>
 </form>
 </body></html>"#,
-        provider = html_escape(&provider.name),
+        provider = provider_name,
         agent = html_escape(&start.agent_did),
         surface = html_escape(&surface_name),
         scopes = html_escape(&scopes),
@@ -698,10 +708,11 @@ fn same_origin_post(
 
 /// POST {callback_path}/start
 ///
-/// The person confirmed the start page: build the vendor's URL and the
+/// The person confirmed the start page: build the vendor's URL, or the
+/// identity provider's for a start state that confirms its caller, and the
 /// binding cookie, then claim the start state, set the cookie and send the
-/// browser to the vendor. A start state is used once on this process, and a
-/// POST refused before the claim leaves it unused.
+/// browser there. A start state is used once on this process, and a POST
+/// refused before the claim leaves it unused.
 pub async fn consent_start(
     State(state): State<DelegationVaultState>,
     Path(provider_id): Path<String>,
@@ -735,24 +746,22 @@ pub async fn consent_start(
             audited,
         );
     }
-    let begun = match oauth::begin_consent(&provider, &start, &redirect_uri, &state.secrets_store).await {
-        Ok(begun) => begun,
-        Err(e) => {
-            let reason = if e.is::<oauth::ProviderSecretError>() {
-                DelegationFailureReason::CredentialsUnavailable
-            } else {
-                DelegationFailureReason::AuthorizationUrlInvalid
-            };
-            warn!(
-                target: "credential_delegation",
-                provider_id = %provider.provider_id,
-                error = %e,
-                "Could not begin OAuth consent"
-            );
-            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited);
+    let begun = match &start.stage {
+        None => begin_vendor_consent(&state, &provider, &start, &redirect_uri).await,
+        Some(super::ConsentStage::ConfirmStart(binding)) => {
+            begin_confirmation(&state, &provider, &start, binding).await
         }
+        Some(_) => Err(DelegationFailureReason::ConsentStateInvalid),
     };
-    let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
+    let begun = match begun {
+        Ok(begun) => begun,
+        Err(reason) => return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited),
+    };
+    let Ok(location) = HeaderValue::from_str(
+        begun
+            .authorization_url
+            .as_str(),
+    ) else {
         return consent_refused(
             ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
             &provider_id,
@@ -797,6 +806,55 @@ pub async fn consent_start(
     consent_page_headers(&mut response, "no-referrer");
     attach_binding_cookie(&mut response, cookie);
     response
+}
+
+async fn begin_vendor_consent(
+    state: &DelegationVaultState,
+    provider: &crate::credential_providers::CredentialProvider,
+    start: &super::OAuthState,
+    redirect_uri: &url::Url,
+) -> Result<oauth::ConsentStart, DelegationFailureReason> {
+    oauth::begin_consent(provider, start, redirect_uri, &state.secrets_store)
+        .await
+        .map_err(|e| {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                error = %e,
+                "Could not begin OAuth consent"
+            );
+            if e.is::<oauth::ProviderSecretError>() {
+                DelegationFailureReason::CredentialsUnavailable
+            } else {
+                DelegationFailureReason::AuthorizationUrlInvalid
+            }
+        })
+}
+
+async fn begin_confirmation(
+    state: &DelegationVaultState,
+    provider: &crate::credential_providers::CredentialProvider,
+    start: &super::OAuthState,
+    binding: &super::ConsentConfirmBinding,
+) -> Result<oauth::ConsentStart, DelegationFailureReason> {
+    let sign_in = super::consent_confirmation::sign_in(
+        provider,
+        binding,
+        state
+            .identity_strategies
+            .as_ref(),
+        &state.gateway_base_url,
+    )
+    .await?;
+    oauth::begin_confirmation(start, binding, &sign_in).map_err(|e| {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            error = %e,
+            "Could not begin consent confirmation"
+        );
+        DelegationFailureReason::ConsentStateInvalid
+    })
 }
 
 /// GET {callback_path}

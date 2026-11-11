@@ -140,10 +140,11 @@ pub async fn mint_consent_link(
     build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url, stage)
 }
 
-/// What the consent start POST answers with: the vendor's authorization URL,
-/// the binding cookie's value and when the callback state expires.
+/// What the consent start POST answers with: the vendor's or, for a caller
+/// confirmed first, the identity provider's authorization URL, the binding
+/// cookie's value and when the state it carries expires.
 pub struct ConsentStart {
-    pub vendor_url: url::Url,
+    pub authorization_url: url::Url,
     pub cookie_name: String,
     pub cookie_value: zeroize::Zeroizing<String>,
     pub expires_at: chrono::DateTime<Utc>,
@@ -169,16 +170,12 @@ pub async fn begin_consent(
         .context("Failed to resolve client_id secret")?;
     let code_verifier = generate_pkce_verifier();
     let code_challenge = generate_pkce_challenge(&code_verifier);
-    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
-    rand::rng().fill(&mut binding[..]);
-    let expires_at = start
-        .expires_at
-        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES));
+    let (cookie_value, browser_binding) = new_browser_binding();
     let callback = OAuthState {
         nonce: Uuid::new_v4().to_string(),
-        expires_at,
+        expires_at: next_state_expiry(start),
         code_verifier: Some(code_verifier),
-        browser_binding: Some(base64_url_encode_bytes(&Sha256::digest(binding.as_slice()))),
+        browser_binding: Some(browser_binding),
         ..start.clone()
     };
     let vendor_url = vendor_authorization_url(
@@ -189,11 +186,84 @@ pub async fn begin_consent(
         &encode_oauth_state(&callback)?,
         &code_challenge,
     )?;
+    consent_started(vendor_url, &callback, cookie_value)
+}
+
+/// Begin confirming the caller of a confirm start state sealed with `binding`
+/// at their identity provider, as [`begin_consent`] begins the vendor's
+/// consent: a PKCE verifier and 32 random binding bytes, sealed with the start
+/// state's consent in a [`ConsentStage::Confirmation`] state with a random ID
+/// token nonce and the time the sign-in began, and the authorization URL of
+/// `sign_in` with `response_mode=query`, since the binding cookie is
+/// `SameSite=Lax`.
+pub(super) fn begin_confirmation(
+    start: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    sign_in: &super::consent_confirmation::SignIn,
+) -> Result<ConsentStart> {
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let id_token_nonce = Uuid::new_v4().to_string();
+    let confirmation = OAuthState {
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: next_state_expiry(start),
+        code_verifier: Some(code_verifier),
+        browser_binding: Some(browser_binding),
+        stage: Some(ConsentStage::Confirmation(super::ConfirmationSignIn {
+            binding: binding.clone(),
+            nonce: id_token_nonce.clone(),
+            issued_at: Utc::now(),
+        })),
+        ..start.clone()
+    };
+    let mut url = sign_in
+        .authorization_endpoint
+        .clone();
+    url.query_pairs_mut()
+        .extend_pairs([
+            ("response_type", "code"),
+            ("client_id", sign_in.client_id.as_str()),
+            ("redirect_uri", sign_in.redirect_uri.as_str()),
+            ("scope", sign_in.scope),
+            ("state", encode_oauth_state(&confirmation)?.as_str()),
+            ("nonce", id_token_nonce.as_str()),
+            ("code_challenge", code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "query"),
+        ]);
+    consent_started(url, &confirmation, cookie_value)
+}
+
+/// When the state a start POST seals expires: with its start state, and at
+/// most [`CONSENT_STATE_LIFETIME_MINUTES`] from now.
+fn next_state_expiry(start: &OAuthState) -> chrono::DateTime<Utc> {
+    start
+        .expires_at
+        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES))
+}
+
+/// 32 random browser binding bytes, as the cookie value that carries them and
+/// the SHA-256 a state seals.
+fn new_browser_binding() -> (zeroize::Zeroizing<String>, String) {
+    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rng().fill(&mut binding[..]);
+    (
+        zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
+        base64_url_encode_bytes(&Sha256::digest(binding.as_slice())),
+    )
+}
+
+fn consent_started(
+    authorization_url: url::Url,
+    state: &OAuthState,
+    cookie_value: zeroize::Zeroizing<String>,
+) -> Result<ConsentStart> {
     Ok(ConsentStart {
-        vendor_url,
-        cookie_name: binding_cookie_name(&callback).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
-        cookie_value: zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
-        expires_at,
+        authorization_url,
+        cookie_name: binding_cookie_name(state).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
+        cookie_value,
+        expires_at: state.expires_at,
     })
 }
 
@@ -2007,7 +2077,7 @@ mod tests {
             ..shape.clone()
         };
         let confirm_start = staged(ConsentStage::ConfirmStart(confirm_binding()), &start);
-        let confirmation = staged(ConsentStage::Confirmation(confirm_binding()), &callback);
+        let confirmation = staged(ConsentStage::Confirmation(sign_in()), &callback);
         let confirmed_vendor = staged(ConsentStage::Vendor(confirm_binding()), &callback);
 
         type Decoder = fn(&str) -> Result<OAuthState>;
@@ -2040,7 +2110,7 @@ mod tests {
         for stage in [
             ConsentStage::Start,
             ConsentStage::ConfirmStart(confirm_binding()),
-            ConsentStage::Confirmation(confirm_binding()),
+            ConsentStage::Confirmation(sign_in()),
             ConsentStage::Vendor(confirm_binding()),
         ] {
             for shape in [&start, &callback] {
@@ -2090,6 +2160,14 @@ mod tests {
             strategy_id: "strategy-1".to_string(),
             strategy_digest: "ab".repeat(32),
             tenant_id: Some("tenant-a".to_string()),
+        }
+    }
+
+    fn sign_in() -> crate::delegation_vault::ConfirmationSignIn {
+        crate::delegation_vault::ConfirmationSignIn {
+            binding: confirm_binding(),
+            nonce: "id-token-nonce".to_string(),
+            issued_at: Utc::now(),
         }
     }
 
@@ -2144,7 +2222,7 @@ mod tests {
                 ..start.clone()
             },
             OAuthState {
-                stage: Some(ConsentStage::Confirmation(confirm_binding())),
+                stage: Some(ConsentStage::Confirmation(sign_in())),
                 ..callback.clone()
             },
             OAuthState {
@@ -2201,7 +2279,7 @@ mod tests {
             (ConsentStage::Start, &start),
             (ConsentStage::Start, &callback),
             (ConsentStage::ConfirmStart(confirm_binding()), &callback),
-            (ConsentStage::Confirmation(confirm_binding()), &start),
+            (ConsentStage::Confirmation(sign_in()), &start),
             (ConsentStage::Vendor(confirm_binding()), &start),
             (ConsentStage::Vendor(confirm_binding()), &sample_state()),
         ] {
@@ -2242,7 +2320,7 @@ mod tests {
                     ..start.clone()
                 },
                 OAuthState {
-                    stage: Some(ConsentStage::Confirmation(confirm_binding())),
+                    stage: Some(ConsentStage::Confirmation(sign_in())),
                     ..callback.clone()
                 },
                 OAuthState {

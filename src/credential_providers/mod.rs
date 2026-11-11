@@ -326,6 +326,36 @@ impl ConsentConfirmation {
         is_entra_issuer(expected_issuer)
             && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
     }
+
+    /// The authorization endpoint parsed, when the save rules accept it: an
+    /// OAuth endpoint URL that is https, with a host and no query or fragment.
+    pub fn authorization_endpoint_url(&self) -> Result<url::Url, String> {
+        self.checked_authorization_endpoint(crate::url_validation::validate_oauth_endpoint_url)
+    }
+
+    /// [`Self::authorization_endpoint_url`] without resolving its host, for
+    /// the consent start POST.
+    pub fn authorization_endpoint_url_unresolved(&self) -> Result<url::Url, String> {
+        self.checked_authorization_endpoint(crate::url_validation::validate_oauth_endpoint_url_unresolved)
+    }
+
+    fn checked_authorization_endpoint(
+        &self,
+        validate: fn(&str) -> Result<url::Url, String>,
+    ) -> Result<url::Url, String> {
+        let url = validate(&self.authorization_endpoint)
+            .map_err(|error| format!("consent_confirmation.authorization_endpoint: {error}"))?;
+        if !crate::url_validation::is_https_or_bdd_allowed(&url)
+            || url.host().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err("consent_confirmation.authorization_endpoint must be an https URL with a host and no query \
+                        or fragment"
+                .to_string());
+        }
+        Ok(url)
+    }
 }
 
 /// Whether `expected_issuer` names `gateway_issuer`, this gateway's own STS

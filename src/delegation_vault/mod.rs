@@ -210,8 +210,7 @@ pub enum ConsentStage {
     /// identity provider before the vendor.
     ConfirmStart(ConsentConfirmBinding),
     /// The identity provider's redirect back to the gateway.
-    #[allow(dead_code)]
-    Confirmation(ConsentConfirmBinding),
+    Confirmation(ConfirmationSignIn),
     /// The vendor's redirect back to the gateway, for a confirmed caller.
     #[allow(dead_code)]
     Vendor(ConsentConfirmBinding),
@@ -228,6 +227,31 @@ pub struct ConsentConfirmBinding {
     pub strategy_id: String,
     pub strategy_digest: String,
     pub tenant_id: Option<String>,
+}
+
+/// The sign-in at the caller's identity provider a
+/// [`ConsentStage::Confirmation`] state answers: the binding it confirms
+/// against, the `nonce` the ID token must carry and when the sign-in began,
+/// the lower bound of the ID token's `iat`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationSignIn {
+    pub binding: ConsentConfirmBinding,
+    pub nonce: String,
+    pub issued_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ConfirmationSignIn {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("ConfirmationSignIn")
+            .field("binding", &self.binding)
+            .field("nonce", &loggable::REDACTED)
+            .field("issued_at", &self.issued_at)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for OAuthState {
@@ -441,6 +465,22 @@ mod tests {
         assert!(!state.contains("csrf-nonce-value"), "{state}");
         assert!(!state.contains("pkce-code-verifier"), "{state}");
         assert!(!state.contains("browser-binding-hash"), "{state}");
+
+        let sign_in = format!(
+            "{:?}",
+            ConsentStage::Confirmation(ConfirmationSignIn {
+                binding: ConsentConfirmBinding {
+                    strategy_id: "strategy-1".to_string(),
+                    strategy_digest: "ab".repeat(32),
+                    tenant_id: None,
+                },
+                nonce: "id-token-nonce-value".to_string(),
+                issued_at: Utc::now(),
+            })
+        );
+        assert!(sign_in.contains(r#"strategy_id: "strategy-1""#), "{sign_in}");
+        assert!(sign_in.contains(r#"nonce: "<redacted>""#), "{sign_in}");
+        assert!(!sign_in.contains("id-token-nonce-value"), "{sign_in}");
     }
 
     #[test]
@@ -575,6 +615,26 @@ mod tests {
             "a confirm binding with a field it does not have is refused"
         );
         assert_eq!(serde_json::to_value(ConsentStage::Start).unwrap(), "start");
+
+        let issued_at = Utc::now();
+        let confirmation = serde_json::to_value(ConsentStage::Confirmation(ConfirmationSignIn {
+            binding: binding.clone(),
+            nonce: "n".to_string(),
+            issued_at,
+        }))
+        .unwrap();
+        assert_eq!(
+            confirmation,
+            serde_json::json!({"confirmation": {
+                "binding": serde_json::to_value(&binding).unwrap(), "nonce": "n", "issued_at": issued_at
+            }})
+        );
+        let mut extra = confirmation;
+        extra["confirmation"]["confirmed"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ConsentStage>(extra).is_err(),
+            "a sign-in with a field it does not have is refused"
+        );
     }
 
     #[test]
