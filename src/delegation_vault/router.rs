@@ -2581,6 +2581,29 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// A confirmation whose surface store cannot be read is refused as
+    /// unavailable credentials before the exchange, stores nothing and leaves
+    /// the state unused.
+    #[tokio::test]
+    async fn a_confirmation_whose_surface_store_cannot_be_read_is_refused_as_unavailable() {
+        use crate::delegation_vault::oauth::{decode_confirmation_state, is_claimed};
+        let mut fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.read_surfaces_from(Arc::new(crate::delegation_vault::test_support::UnreadableSurfaces));
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+        assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
+        assert_eq!(fixture.vault_records(), 0);
+        assert!(!is_claimed(&decode_confirmation_state(&sign_in.state).unwrap()).await);
+    }
+
     /// A confirmation state confirms once: the same redirect again is refused.
     #[tokio::test]
     async fn a_confirmation_state_is_used_once() {
@@ -2762,6 +2785,7 @@ mod tests {
             pub surfaces: Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
             pub(super) vault: Arc<InMemoryVault>,
             app: Router,
+            state: DelegationVaultState,
             calls: Arc<AtomicUsize>,
             forms: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
             egress: crate::delegation_vault::oauth::TokenEgress,
@@ -3054,6 +3078,7 @@ mod tests {
                     surfaces: surfaces.clone(),
                     vault: vault.clone(),
                     app: Router::new(),
+                    state: state_with(Vec::new()),
                     calls,
                     forms,
                     egress: crate::delegation_vault::oauth::TokenEgress {
@@ -3081,9 +3106,27 @@ mod tests {
                 state.gateway_base_url = "https://198.51.100.7".to_string();
                 state.provider_egress = fixture.egress.clone();
                 state.config_surfaces = config_surfaces;
-                fixture.app = create_delegation_vault_oauth_router(state)
-                    .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
+                fixture.serve(state);
                 fixture
+            }
+
+            fn serve(
+                &mut self,
+                state: DelegationVaultState,
+            ) {
+                self.app = create_delegation_vault_oauth_router(state.clone())
+                    .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
+                self.state = state;
+            }
+
+            /// Serves from now on with `surfaces` as the surface store.
+            pub fn read_surfaces_from(
+                &mut self,
+                surfaces: Arc<dyn crate::surfaces::AgentSurfaceStore>,
+            ) {
+                let mut state = self.state.clone();
+                state.agent_surface_store = Some(surfaces);
+                self.serve(state);
             }
 
             /// The provider as first stored: an authorization code provider

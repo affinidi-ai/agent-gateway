@@ -1585,6 +1585,79 @@ mod tests {
         assert_eq!(body["expected_issuer"], "https://other.example.com");
     }
 
+    /// A strategy a provider names only by `consent_identity_strategy_id` keeps
+    /// a canonical https issuer: an `http://` one is refused with 409 naming the
+    /// provider and changes nothing; another canonical https one is saved.
+    #[tokio::test]
+    async fn an_issuer_a_modern_consent_provider_would_refuse_is_not_saved() {
+        use crate::credential_providers::storage::CredentialProviderStorage as _;
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let providers_dir = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                providers_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(crate::credential_providers::references::ReferenceStores {
+            credential_providers: Some(providers.clone()),
+            ..Default::default()
+        }));
+        let (_, created) = create_via_api(&router, "Modern consent").await;
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "modern-provider", "name": "Modern provider", "provider_id": "modern-provider",
+                    "provider_type": "oauth2_authorization_code", "consent_identity_strategy_id": id,
+                    "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let put = |issuer: &str| {
+            serde_json::json!({
+                "name": "Modern consent", "expected_issuer": issuer,
+                "jwks_source": { "type": "remote", "jwks_uri": "https://issuer.example.com/.well-known/jwks.json" }
+            })
+        };
+        let path = format!("/v1/jwt-verification-strategies/{id}");
+        let (status, body) = send_strategy(&router, "PUT", &path, put("http://issuer.example.com")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["message"], STRATEGY_ISSUER_IN_USE);
+        assert_eq!(
+            body["references"],
+            serde_json::json!([{"kind": "credential_provider", "id": "modern-provider", "name": "Modern provider"}])
+        );
+        assert_eq!(
+            store
+                .get(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_issuer,
+            "https://issuer.example.com"
+        );
+        let (status, body) = send_strategy(&router, "PUT", &path, put("https://other.example.com/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["expected_issuer"], "https://other.example.com/");
+    }
+
     #[tokio::test]
     async fn test_delete_returns_204_and_strategy_is_gone() {
         let store = Arc::new(MemStore::default());

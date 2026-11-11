@@ -119,6 +119,48 @@ async fn operator_deletes_confirming_strategy(world: &mut SurfaceWorld) {
     world.admin_response = Some(response);
 }
 
+/// An issuer of the Microsoft identity platform, which names a caller by `sub`
+/// per application.
+const ENTRA_ISSUER: &str = "https://login.microsoftonline.com/bdd-tenant/v2.0";
+
+async fn confirming_strategy(world: &mut SurfaceWorld) -> serde_json::Value {
+    let read = crate::steps::credential_save::send(
+        world,
+        Method::GET,
+        &format!("/v1/jwt-verification-strategies/{CALLERS_STRATEGY_ID}"),
+        None,
+    )
+    .await;
+    assert_eq!(read.status, 200, "read the JWT verification strategy: {}", read.body);
+    read.body
+}
+
+#[when("the operator changes the issuer of the JWT verification strategy that confirms the callers to an Entra issuer")]
+async fn operator_changes_confirming_strategy_issuer_to_entra(world: &mut SurfaceWorld) {
+    let stored = confirming_strategy(world).await;
+    let body = serde_json::json!({
+        "name": stored["name"], "expected_issuer": ENTRA_ISSUER, "jwks_source": stored["jwks_source"]
+    });
+    let response = crate::steps::credential_save::send(
+        world,
+        Method::PUT,
+        &format!("/v1/jwt-verification-strategies/{CALLERS_STRATEGY_ID}"),
+        Some(&body),
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[then("the JWT verification strategy that confirms the callers keeps its issuer")]
+async fn confirming_strategy_keeps_its_issuer(world: &mut SurfaceWorld) {
+    let stored = confirming_strategy(world).await;
+    assert_eq!(
+        stored["expected_issuer"],
+        crate::steps::when::get_jwt_source_auth_issuer(world),
+        "expected the strategy to keep the issuer of the surface's callers"
+    );
+}
+
 #[then("the JWT verification strategy that confirms the callers is still listed")]
 async fn confirming_strategy_is_still_listed(world: &mut SurfaceWorld) {
     let listed = crate::steps::credential_save::send(world, Method::GET, "/v1/jwt-verification-strategies", None).await;

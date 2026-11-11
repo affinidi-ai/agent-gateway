@@ -3066,48 +3066,11 @@ mod tests {
         assert!(file.exists(), "nothing is purged by binding either");
     }
 
-    struct UnreadableSurfaces;
-
-    #[async_trait::async_trait]
-    impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
-        async fn get_checked(
-            &self,
-            surface_id: &str,
-        ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
-            self.get(surface_id).await
-        }
-
-        async fn save(
-            &self,
-            _surface: &AgentSurface,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn get(
-            &self,
-            _surface_id: &str,
-        ) -> anyhow::Result<Option<AgentSurface>> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn list_all(&self) -> anyhow::Result<Vec<AgentSurface>> {
-            anyhow::bail!("disk unavailable")
-        }
-
-        async fn delete(
-            &self,
-            _surface_id: &str,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("disk unavailable")
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_binding_removal_answers_503_while_its_surface_cannot_be_read() {
         let fixture = Fixture::new(vec![]).await;
         let mut state = fixture.state.clone();
-        state.agent_surface_store = Some(Arc::new(UnreadableSurfaces));
+        state.agent_surface_store = Some(Arc::new(crate::delegation_vault::test_support::UnreadableSurfaces));
         let query = |credential_provider_id: Option<&str>| BindingGrantsQuery {
             surface_id: "surface".into(),
             hop: "owner-hop".into(),

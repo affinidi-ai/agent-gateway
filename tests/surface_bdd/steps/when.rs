@@ -2107,7 +2107,7 @@ async fn request_without_token(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;
 }
 
-fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
+pub(crate) fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
     world
         .surface_config
         .source_auth

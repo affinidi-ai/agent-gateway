@@ -78,6 +78,13 @@ Feature: Consent confirmation
     And the admin API error response mentions "credential providers"
     And the JWT verification strategy that confirms the callers is still listed
 
+  Scenario: An issuer a confirming provider would refuse cannot be saved on its strategy
+    Given OAuth provider "calendar" confirms its caller at the identity provider
+    When the operator changes the issuer of the JWT verification strategy that confirms the callers to an Entra issuer
+    Then the admin API response status is 409
+    And the admin API error response mentions "expected_issuer"
+    And the JWT verification strategy that confirms the callers keeps its issuer
+
   Scenario: A JWT caller's consent start goes straight to the OAuth provider without consent confirmation
     Given the callers' identity provider is available
     And caller "alice" has started OAuth consent for provider "calendar"
