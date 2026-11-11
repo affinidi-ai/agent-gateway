@@ -636,6 +636,16 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if let Some(redis_url) = &surface_config.sign_in_event_stream {
+        crate::bdd_support::config::sign_in::write_sign_in_event_integration(
+            &base_dir.join("_storage"),
+            redis_url,
+            surface_config.streams_sign_in_records,
+        );
+    }
+    if surface_config.signs_in_with_saml {
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+    }
     if surface_config.starts_standby {
         start_standby(base_dir);
     }
@@ -1003,6 +1013,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
     let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
     CredentialProviderFixture {
         id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        tenant_id: None,
         name: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_type: if client_credentials {
@@ -1072,7 +1083,8 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             providers
         }
         CredentialProviderKind::ApiKey { secret_id, .. } => vec![CredentialProviderFixture {
-            id: provider_id.clone(),
+            id: surface_config.provider_record_id(&provider_id),
+            tenant_id: delegation.tenant_id.clone(),
             name: provider_id.clone(),
             provider_id: provider_id.clone(),
             provider_type: "api_key".to_string(),
@@ -1105,8 +1117,14 @@ fn oauth_provider_fixture(
         .as_ref()
         .expect("OAuth provider base URL must be configured before writing credential provider fixture");
     let record_id = surface_config.provider_record_id(provider_id);
+    let tenant_id = surface_config
+        .credential_delegation
+        .as_ref()
+        .filter(|delegation| delegation.provider_id == provider_id)
+        .and_then(|delegation| delegation.tenant_id.clone());
     CredentialProviderFixture {
         id: record_id.clone(),
+        tenant_id,
         name: provider_id.to_string(),
         provider_id: provider_id.to_string(),
         provider_type: "oauth2_authorization_code".to_string(),

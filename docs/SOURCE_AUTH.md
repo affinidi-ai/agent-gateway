@@ -1766,6 +1766,14 @@ issuer was deleted (deleting an Issuer does not check whether a surface still us
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
 
+An entry's `authority_source` records whether a literal `authority_did` is linked to an
+Authority (`authority`) or found among the Issuers (`issuer`); see
+[_The authority of a Trust Check_](POLICY.md#the-authority-of-a-trust-check) for how it is set
+and checked on save. An entry linked to an Authority that no longer exists writes nothing and is
+skipped with `authority_not_found`, so no new record is written under a DID nothing vouches for.
+Deleting an Authority is refused while an entry names it. Records already written stay in the
+trust registry.
+
 An entry's `issuer_did` is not a signer and does not set the authority. It is written as
 the `entity_id` of custom records whose `entity_target` is `issuer`, and nothing else. The
 dashboard warns on the Trust Recorder panel and on the entry while the surface has no Issuer
@@ -1786,7 +1794,7 @@ Each entry has one state:
 | Recorded (`recorded`) | At least one record was written or already existed, and none failed. |
 | Partly recorded (`partial`) | Some records were written or already existed and some failed. |
 | Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry sent a problem report) or `error`. |
-| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve) or `error` (the trust registry lookup failed). |
+| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve), `authority_not_found` (the Authority the entry was picked from no longer exists) or `error` (the trust registry lookup failed). |
 | Not attempted yet (`not_attempted`) | The surface has a Trust Recorder and no outcome is stored yet, for example right after it was added. |
 
 An entry that declares no records is not reported. The identity's overall state combines its

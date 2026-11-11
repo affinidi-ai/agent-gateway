@@ -87,6 +87,7 @@ pub(crate) enum FetchFault {
     Status { status: u16, credential_sent: bool },
     TooLarge,
     InvalidCard,
+    Compressed,
     IdentityFailed(crate::proxy::card_preview::CardIdentityError),
     RewriteFailed,
 }
@@ -106,6 +107,7 @@ impl FetchFault {
             UpstreamBodyError::TooLarge(_) => Self::TooLarge,
             UpstreamBodyError::TimedOut => Self::TimedOut,
             UpstreamBodyError::Read(error) => Self::of_send(error),
+            UpstreamBodyError::Compressed => Self::Compressed,
         }
     }
 }
@@ -715,10 +717,15 @@ impl TargetCardFetch<'_> {
                     &credential_headers,
                 ),
             };
-            if forward {
+            if forward
+                && !key
+                    .as_str()
+                    .eq_ignore_ascii_case("accept-encoding")
+            {
                 req = req.header(key.as_str(), value.as_bytes());
             }
         }
+        req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
         if let Some(super::TargetCredential {
             header: (header_name, header_value),
             ..
@@ -782,12 +789,17 @@ impl TargetCardFetch<'_> {
                 .a2a
                 .timeout_seconds,
         );
-        let body = crate::proxy::upstream_body::read_bounded(response, limits)
+        let body = crate::proxy::upstream_body::read_bounded_uncompressed(response, limits)
             .await
             .map_err(|e| {
-                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
                 let (status, message) = e.status_and_message();
-                self.fail(FetchFault::of_body(&e), create_error_response(status, message))
+                let response = create_error_response(status, message);
+                if matches!(e, crate::proxy::upstream_body::UpstreamBodyError::Compressed) {
+                    warn!(channel = channel_name, "The agent compressed its agent card although none was accepted");
+                    return CardFailure::new(FetchFault::Compressed, response);
+                }
+                error!(channel = channel_name, error = %e, "Failed to read agent card from upstream - gateway fault");
+                self.fail(FetchFault::of_body(&e), response)
             })?;
         serde_json::from_slice(&body).map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to parse agent card JSON");

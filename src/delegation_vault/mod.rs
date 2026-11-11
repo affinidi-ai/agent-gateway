@@ -19,12 +19,15 @@ pub mod jwt_assertion;
 pub mod modern_consent;
 pub mod notifier;
 pub mod oauth;
+pub mod read_scope;
 pub mod release;
 pub mod revocation;
 pub mod router;
 pub mod service_token;
 pub mod storage;
 pub mod sweep;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token_endpoint;
 
 use chrono::{DateTime, Utc};

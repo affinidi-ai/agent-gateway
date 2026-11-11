@@ -13,17 +13,17 @@ use axum::{
 /// Create the delegation vault management API router.
 /// Management routes only — must be mounted inside the session-auth boundary.
 ///
-/// Every route is RBAC-gated when `gate` is `Some`: the reads (list/get, which
-/// enumerate every user's/agent's tokens) require `DelegationVaultView`; the
+/// Every route is RBAC-gated when `gate` is `Some`: the reads (list/get of the
+/// agent-keyed tokens) require `DelegationVaultView`; the
 /// revokes (single + mass by-user) and the removals of grants by binding (one
 /// grant, or one binding's) require `DelegationVaultDelete`; starting and
 /// completing an external consent connect, and the report of a surface's
 /// grants by binding, require `DelegationVaultConnect`, so a token provisioned
-/// for the connect API never needs `DelegationVaultView`, whose reads are not
-/// filtered by tenant; all are admin-only by default. The connect API and the
-/// grants by binding also admit a tenant's token, for its own tenant's
-/// surfaces only. When `gate` is `None` (auth backend not configured) every
-/// route refuses.
+/// for the connect API never needs `DelegationVaultView`; all are admin-only by
+/// default. The reads show a tenant's token only the tokens of its own
+/// tenant's credential providers. The connect API and the grants by binding
+/// also admit a tenant's token, for its own tenant's surfaces only. When
+/// `gate` is `None` (auth backend not configured) every route refuses.
 pub fn create_delegation_vault_router(
     state: DelegationVaultState,
     gate: Option<RbacGuard>,
@@ -94,11 +94,13 @@ mod tests {
     use crate::auth_manager::pat::{PatContext, PatDelegationContext};
     use crate::credential_providers::CredentialProvider;
     use crate::credential_providers::storage::CredentialProviderStorage as _;
-    use crate::delegation_vault::audit::DelegationAuditAction;
+    use crate::delegation_vault::audit::{DelegationAuditAction, reading_audit_log_from, without_an_audit_log};
     use crate::delegation_vault::storage::DelegationVaultStorage;
+    use crate::delegation_vault::test_support::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
     use crate::rbac::RbacConfig;
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, SecretsStore, UpdateSecretRequest};
+    use crate::tenancy::PatTenantContext;
     use axum::Extension;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -108,9 +110,16 @@ mod tests {
 
     /// Minimal in-memory delegation vault backing the handler under test.
     /// Only the reads/deletes exercised by the management routes are real.
+    /// An `unreadable` vault fails every read and delete with
+    /// [`VAULT_READ_FAILURE`].
     struct InMemoryVault {
         tokens: Mutex<Vec<DelegationToken>>,
+        unreadable: bool,
     }
+
+    /// The detail of a failed read or delete of an `unreadable`
+    /// [`InMemoryVault`].
+    const VAULT_READ_FAILURE: &str = "vault entry /srv/gateway/_storage/delegation_vault/t1.json unreadable";
 
     #[async_trait::async_trait]
     impl DelegationVaultStorage for InMemoryVault {
@@ -129,6 +138,9 @@ mod tests {
             &self,
             id: &str,
         ) -> anyhow::Result<Option<DelegationToken>> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             Ok(self
                 .tokens
                 .lock()
@@ -148,6 +160,9 @@ mod tests {
         }
 
         async fn list_all(&self) -> anyhow::Result<Vec<DelegationToken>> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             Ok(self
                 .tokens
                 .lock()
@@ -159,6 +174,9 @@ mod tests {
             &self,
             id: &str,
         ) -> anyhow::Result<bool> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             let mut guard = self.tokens.lock().unwrap();
             let before = guard.len();
             guard.retain(|t| t.id != id);
@@ -169,6 +187,9 @@ mod tests {
             &self,
             user_identity_hash: &str,
         ) -> anyhow::Result<usize> {
+            if self.unreadable {
+                anyhow::bail!(VAULT_READ_FAILURE);
+            }
             let mut guard = self.tokens.lock().unwrap();
             let before = guard.len();
             guard.retain(|t| t.user_identity_hash != user_identity_hash);
@@ -190,56 +211,8 @@ mod tests {
         }
     }
 
-    /// Provider/secrets stores are never reached by the management routes under
-    /// test (the gate denies before the handler, and revoke only touches the
-    /// vault), so these panic if invoked — a guard against silent coupling.
-    struct StubProviderStore;
-
-    #[async_trait::async_trait]
-    impl crate::credential_providers::storage::CredentialProviderStorage for StubProviderStore {
-        async fn get_checked(
-            &self,
-            id: &str,
-        ) -> anyhow::Result<Option<crate::credential_providers::CredentialProvider>> {
-            self.get(id).await
-        }
-
-        async fn create(
-            &self,
-            _provider: CredentialProvider,
-        ) -> anyhow::Result<CredentialProvider> {
-            unimplemented!("provider store not used by delegation-vault management routes")
-        }
-        async fn get(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<Option<CredentialProvider>> {
-            Ok(None)
-        }
-        async fn list(&self) -> anyhow::Result<Vec<CredentialProvider>> {
-            unimplemented!()
-        }
-        async fn update(
-            &self,
-            _provider: CredentialProvider,
-        ) -> anyhow::Result<CredentialProvider> {
-            unimplemented!()
-        }
-        async fn delete(
-            &self,
-            _id: &str,
-        ) -> anyhow::Result<bool> {
-            unimplemented!()
-        }
-        async fn find_by_provider_id(
-            &self,
-            _tenant_id: Option<&str>,
-            _provider_id: &str,
-        ) -> anyhow::Result<Option<CredentialProvider>> {
-            unimplemented!()
-        }
-    }
-
+    /// The secrets store is never reached by the management routes under test,
+    /// so it panics if invoked — a guard against silent coupling.
     struct StubSecretsStore;
 
     #[async_trait::async_trait]
@@ -302,10 +275,42 @@ mod tests {
         }
     }
 
+    /// A token of the credential provider `credential_provider_id`.
+    fn seed_token_of(
+        id: &str,
+        credential_provider_id: &str,
+    ) -> DelegationToken {
+        DelegationToken {
+            credential_provider_id: credential_provider_id.to_string(),
+            ..seed_token(id)
+        }
+    }
+
+    /// A token of each provider of [`InMemoryProviders::of_two_tenants`], and
+    /// `t-deleted` of a provider that no longer exists.
+    fn tokens_of_two_tenants() -> Vec<DelegationToken> {
+        vec![
+            seed_token_of("t-a", "cp-a"),
+            seed_token_of("t-b", "cp-b"),
+            seed_token_of("t-global", "cp-global"),
+            seed_token_of("t-deleted", "cp-deleted"),
+        ]
+    }
+
     fn state_with(tokens: Vec<DelegationToken>) -> DelegationVaultState {
+        state_with_providers(tokens, InMemoryProviders::of_two_tenants())
+    }
+
+    fn state_with_providers(
+        tokens: Vec<DelegationToken>,
+        providers: InMemoryProviders,
+    ) -> DelegationVaultState {
         DelegationVaultState {
-            vault_store: Arc::new(InMemoryVault { tokens: Mutex::new(tokens) }),
-            provider_store: Arc::new(StubProviderStore),
+            vault_store: Arc::new(InMemoryVault {
+                tokens: Mutex::new(tokens),
+                unreadable: false,
+            }),
+            provider_store: Arc::new(providers),
             secrets_store: Arc::new(StubSecretsStore),
             gateway_base_url: "https://gw.example".to_string(),
             agent_surface_store: None,
@@ -1479,7 +1484,10 @@ mod tests {
                 crate::surfaces::AgentSurfaceStore::save(surfaces.as_ref(), &surface)
                     .await
                     .unwrap();
-                let vault = Arc::new(InMemoryVault { tokens: Mutex::new(Vec::new()) });
+                let vault = Arc::new(InMemoryVault {
+                    tokens: Mutex::new(Vec::new()),
+                    unreadable: false,
+                });
                 let mut fixture = Self {
                     providers,
                     vault: vault.clone(),
@@ -1913,8 +1921,8 @@ mod tests {
 
     /// The report of grants by binding needs `delegation_vault.connect`, which
     /// a token provisioned for the connect API holds, not
-    /// `delegation_vault.view`, which also opens the legacy reads of every
-    /// tenant's agent-keyed tokens.
+    /// `delegation_vault.view`, which also opens the legacy reads of the
+    /// agent-keyed tokens.
     #[tokio::test]
     async fn the_grants_report_needs_the_connect_permission_not_the_legacy_view() {
         let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
@@ -2070,5 +2078,332 @@ mod tests {
         assert_eq!(status, StatusCode::OK.as_u16(), "authorized admin get must be 200");
         assert!(body.contains("\"id\":\"t1\""), "authorized get must serialise the token id");
         assert!(!body.contains("secret-access"), "get must never expose the access token");
+    }
+
+    /// A failed vault read answers `500` with a fixed body: the error's
+    /// detail goes to the log only.
+    #[tokio::test]
+    async fn a_failed_vault_read_answers_without_its_detail() {
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let state = DelegationVaultState {
+            vault_store: Arc::new(InMemoryVault {
+                tokens: Mutex::new(vec![seed_token("t1")]),
+                unreadable: true,
+            }),
+            ..state_with(Vec::new())
+        };
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        for (uri, refusal) in [
+            ("/api/v1/delegation-vault", r#"{"error":"Failed to list"}"#),
+            ("/api/v1/delegation-vault/t1", r#"{"error":"Failed to get"}"#),
+        ] {
+            let (status, body) = response_of(app.clone(), "GET", uri).await;
+            assert_eq!((status, body.as_str()), (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), refusal), "{uri}");
+        }
+    }
+
+    /// A failed revoke answers `500` with a fixed body. The error's detail,
+    /// which can quote the caller's id, goes to the log only, escaped.
+    #[tokio::test]
+    async fn a_failed_revoke_answers_without_its_detail() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let (storage, _dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let state = DelegationVaultState {
+            vault_store: Arc::new(InMemoryVault {
+                tokens: Mutex::new(vec![seed_token("t1")]),
+                unreadable: true,
+            }),
+            ..state_with(Vec::new())
+        };
+        let app = create_delegation_vault_router(state, Some(gate_for(storage)))
+            .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        for uri in ["/api/v1/delegation-vault/t1", "/api/v1/delegation-vault/by-user/sha256:user-1"] {
+            let (status, body) = response_of(app.clone(), "DELETE", uri).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to revoke"}"#),
+                "{uri}"
+            );
+        }
+        let text = logs.text();
+        let failures: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("revoke failed"))
+            .collect();
+        assert_eq!(failures.len(), 2, "{text}");
+        assert!(
+            failures
+                .iter()
+                .all(|line| line.contains(&format!("error={VAULT_READ_FAILURE:?}"))),
+            "{text}"
+        );
+    }
+
+    // ── A tenant's token reads only its own tenant's agent-keyed tokens ──
+
+    async fn admin_reader(providers: InMemoryProviders) -> (Router, tempfile::TempDir) {
+        let (storage, dir) = storage_with_user("admin-1", UserRole::Administrator).await;
+        let app = create_delegation_vault_router(
+            state_with_providers(tokens_of_two_tenants(), providers),
+            Some(gate_for(storage)),
+        )
+        .layer(Extension(AuthGuardOk("admin-1".to_string())));
+        (app, dir)
+    }
+
+    /// `app` as reached with a tenant's access token, which is always
+    /// resource-scoped.
+    fn as_tenant(
+        app: Router,
+        tenant_id: &str,
+    ) -> Router {
+        app.layer(Extension(PatTenantContext {
+            token_id: "pat-t".to_string(),
+            tenant_id: tenant_id.to_string(),
+        }))
+        .layer(Extension(PatDelegationContext {
+            token_id: "pat-t".to_string(),
+            delegation_depth: 0,
+            resource_scoped: true,
+        }))
+    }
+
+    /// `app` as reached with an access token scoped by required headers alone.
+    fn as_header_scoped(app: Router) -> Router {
+        app.layer(Extension(PatDelegationContext {
+            token_id: "pat-h".to_string(),
+            delegation_depth: 0,
+            resource_scoped: true,
+        }))
+    }
+
+    fn listed_ids(body: &str) -> Vec<String> {
+        let mut ids: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(body)
+            .unwrap()
+            .iter()
+            .map(|item| {
+                item["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_lists_only_its_own_tenants_vault_tokens() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        for (tenant_id, expected) in [("tenant-a", "t-a"), ("tenant-b", "t-b")] {
+            let (status, body) =
+                response_of(as_tenant(app.clone(), tenant_id), "GET", "/api/v1/delegation-vault").await;
+            assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+            assert_eq!(listed_ids(&body), vec![expected.to_string()], "{tenant_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tenant_token_gets_another_tenants_vault_token_as_not_found() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let tenant_a = || as_tenant(app.clone(), "tenant-a");
+        let missing = response_of(tenant_a(), "GET", "/api/v1/delegation-vault/no-such-token").await;
+        assert_eq!(missing, (StatusCode::NOT_FOUND.as_u16(), r#"{"error":"Delegation token not found"}"#.to_string()));
+        assert_eq!(response_of(tenant_a(), "GET", "/api/v1/delegation-vault/t-b").await, missing);
+        let (status, body) = response_of(tenant_a(), "GET", "/api/v1/delegation-vault/t-a").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        assert!(body.contains(r#""id":"t-a""#), "{body}");
+        assert!(!body.contains("secret-access"), "{body}");
+    }
+
+    /// A token of an appliance-wide provider can belong to any tenant's
+    /// caller, and one of a deleted provider to no known tenant.
+    #[tokio::test]
+    async fn untenanted_and_deleted_provider_tokens_are_hidden_from_a_tenant_token() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let missing =
+            response_of(as_tenant(app.clone(), "tenant-a"), "GET", "/api/v1/delegation-vault/no-such-token").await;
+        for id in ["t-global", "t-deleted"] {
+            for tenant_id in ["tenant-a", "tenant-b"] {
+                let uri = format!("/api/v1/delegation-vault/{id}");
+                assert_eq!(
+                    response_of(as_tenant(app.clone(), tenant_id), "GET", &uri).await,
+                    missing,
+                    "{tenant_id} {id}"
+                );
+            }
+        }
+    }
+
+    /// Only an appliance-wide caller revokes. A tenant's token, which the
+    /// middleware refuses before the handler, and a token scoped by required
+    /// headers alone, which the middleware lets through, both get a bare 403
+    /// here, and the vault keeps every token.
+    #[tokio::test]
+    async fn only_an_appliance_wide_caller_revokes_vault_tokens() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        for (caller, scoped) in [
+            ("a tenant token", as_tenant(app.clone(), "tenant-a")),
+            ("a token scoped by required headers alone", as_header_scoped(app.clone())),
+        ] {
+            for uri in ["/api/v1/delegation-vault/t-a", "/api/v1/delegation-vault/by-user/sha256:user-1"] {
+                let (status, body) = response_of(scoped.clone(), "DELETE", uri).await;
+                assert_eq!((status, body.as_str()), (StatusCode::FORBIDDEN.as_u16(), ""), "{caller} {uri}");
+            }
+        }
+        let (status, body) = response_of(app, "GET", "/api/v1/delegation-vault").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        assert_eq!(listed_ids(&body), ["t-a", "t-b", "t-deleted", "t-global"]);
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_admin_session_reads_every_vault_token() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, body) = response_of(app.clone(), "GET", "/api/v1/delegation-vault").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        assert_eq!(listed_ids(&body), ["t-a", "t-b", "t-deleted", "t-global"]);
+        for id in ["t-global", "t-deleted"] {
+            let (status, body) = response_of(app.clone(), "GET", &format!("/api/v1/delegation-vault/{id}")).await;
+            assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+            assert!(body.contains(&format!(r#""id":"{id}""#)), "{body}");
+        }
+    }
+
+    /// A resource pattern without a tenant reads no token, even for a caller
+    /// that is otherwise appliance-wide.
+    #[tokio::test]
+    async fn a_resource_scope_without_a_tenant_reads_no_vault_token() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let app = app.layer(Extension(crate::delegation_vault::test_support::pattern("tenant-a")));
+        let (status, body) = response_of(app.clone(), "GET", "/api/v1/delegation-vault").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK.as_u16(), "[]"));
+        let missing = response_of(app.clone(), "GET", "/api/v1/delegation-vault/no-such-token").await;
+        assert_eq!(missing, (StatusCode::NOT_FOUND.as_u16(), r#"{"error":"Delegation token not found"}"#.to_string()));
+        assert_eq!(response_of(app, "GET", "/api/v1/delegation-vault/t-a").await, missing);
+    }
+
+    #[tokio::test]
+    async fn a_token_scoped_by_required_headers_alone_reads_no_vault_token() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, body) = response_of(as_header_scoped(app.clone()), "GET", "/api/v1/delegation-vault").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK.as_u16(), "[]"));
+        let (status, body) = response_of(as_header_scoped(app), "GET", "/api/v1/delegation-vault/t-a").await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::NOT_FOUND.as_u16(), r#"{"error":"Delegation token not found"}"#)
+        );
+    }
+
+    /// While the credential providers cannot be read, a tenant's token reads
+    /// nothing and the answer names no detail; an appliance-wide caller, which
+    /// needs no provider, still reads.
+    #[tokio::test]
+    async fn a_tenant_read_fails_closed_when_the_provider_store_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::unreadable()).await;
+        for (uri, refusal) in [
+            ("/api/v1/delegation-vault", r#"{"error":"Failed to list"}"#),
+            ("/api/v1/delegation-vault/t-a", r#"{"error":"Failed to get"}"#),
+            ("/api/v1/delegation-audit", r#"{"error":"Failed to read audit log"}"#),
+        ] {
+            let (status, body) =
+                reading_audit_log_from(log.clone(), response_of(as_tenant(app.clone(), "tenant-a"), "GET", uri)).await;
+            assert_eq!((status, body.as_str()), (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), refusal), "{uri}");
+        }
+        let (status, body) = response_of(app.clone(), "GET", "/api/v1/delegation-vault").await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+        assert_eq!(listed_ids(&body), ["t-a", "t-b", "t-deleted", "t-global"]);
+        let (status, page) = audit_page(app, "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["total"], 6);
+    }
+
+    // ── A tenant's token reads only its own tenant's delegation audit ──
+
+    async fn audit_page(
+        app: Router,
+        uri: &str,
+        log: &std::path::Path,
+    ) -> (u16, serde_json::Value) {
+        let (status, body) = reading_audit_log_from(log.to_path_buf(), response_of(app, "GET", uri)).await;
+        (status, serde_json::from_str(&body).unwrap())
+    }
+
+    fn provider_ids(page: &serde_json::Value) -> Vec<Option<&str>> {
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["provider_id"].as_str())
+            .collect()
+    }
+
+    /// Totals and category counts count only the records the token reads, and
+    /// the text filter finds nothing among the others.
+    #[tokio::test]
+    async fn a_tenant_token_reads_only_its_own_tenants_delegation_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+
+        let (status, page) = audit_page(as_tenant(app.clone(), "tenant-a"), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(provider_ids(&page), [Some("cp-a")]);
+        assert_eq!((&page["total"], &page["total_pages"]), (&serde_json::json!(1), &serde_json::json!(1)));
+        assert_eq!(page["category_counts"], serde_json::json!({"consent_granted": 1}));
+
+        let (_, page) = audit_page(as_tenant(app.clone(), "tenant-b"), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(provider_ids(&page), [Some("cp-b")]);
+        assert_eq!(page["category_counts"], serde_json::json!({"token_injected": 1}));
+
+        let (status, page) = audit_page(as_tenant(app, "tenant-a"), "/api/v1/delegation-audit?filter=cp-b", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["events"], serde_json::json!([]));
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["category_counts"], serde_json::json!({}));
+    }
+
+    #[tokio::test]
+    async fn an_appliance_wide_admin_session_reads_the_whole_delegation_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, page) = audit_page(app, "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["total"], 6);
+        assert_eq!(
+            provider_ids(&page),
+            [Some("github"), None, Some("cp-deleted"), Some("cp-global"), Some("cp-b"), Some("cp-a")]
+        );
+        assert_eq!(
+            page["category_counts"],
+            serde_json::json!({"consent_granted": 2, "token_injected": 3, "token_revoked": 1})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_scoped_by_required_headers_alone_reads_no_delegation_audit_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = audit_log_of_two_tenants(directory.path()).await;
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, page) = audit_page(as_header_scoped(app), "/api/v1/delegation-audit", &log).await;
+        assert_eq!(status, StatusCode::OK.as_u16(), "{page}");
+        assert_eq!(page["events"], serde_json::json!([]));
+        assert_eq!(page["total"], 0);
+        assert_eq!(page["category_counts"], serde_json::json!({}));
+    }
+
+    /// A failed read of the audit log answers `500` with a fixed body: the
+    /// error's detail goes to the log only.
+    #[tokio::test]
+    async fn a_failed_delegation_audit_read_answers_without_its_detail() {
+        let (app, _dir) = admin_reader(InMemoryProviders::of_two_tenants()).await;
+        let (status, body) = without_an_audit_log(response_of(app, "GET", "/api/v1/delegation-audit")).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR.as_u16(), r#"{"error":"Failed to read the audit log"}"#)
+        );
     }
 }

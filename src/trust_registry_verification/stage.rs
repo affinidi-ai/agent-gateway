@@ -10,13 +10,15 @@
 
 use serde_json::{Value, json};
 
-use crate::observability::trust_check_audit::TrustCheckOrigin;
+use crate::authorities::AuthorityStore;
+use crate::observability::trust_check_audit::{TrustCheckAuditEvent, TrustCheckOrigin, record_trust_check};
+use crate::trust_registry_verification::authority_source::MissingAuthorities;
 use crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures;
 use crate::trust_registry_verification::trust_check_element::{
     TrustCheckElement, TrustCheckLeg, TrustCheckResult, TrustCheckResultsContext,
 };
 use crate::trust_registry_verification::trust_check_executor::{
-    ExecutionContext, NOT_AUTHORIZED, NOT_RECOGNIZED, TrqpClient, execute_list,
+    AUTHORITY_NOT_FOUND, ExecutionContext, NOT_AUTHORIZED, NOT_RECOGNIZED, TrqpClient, execute_list, synthesize_failure,
 };
 
 /// Consolidate all trust check results and log the summary for visibility
@@ -73,19 +75,118 @@ pub async fn run_trust_check_stage<'o, C: TrqpClient + ?Sized>(
     if elements.is_empty() {
         return None;
     }
-    let origin = origin.into();
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    run_trust_check_stage_with(origin.into(), leg, elements, input, client, authorities.as_deref()).await
+}
+
+async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    elements: &[TrustCheckElement],
+    input: &Value,
+    client: &C,
+    authorities: Option<&dyn AuthorityStore>,
+) -> Option<TrustCheckResultsContext> {
     let wrapped = json!({ "input": input });
+    let missing = MissingAuthorities::find(
+        elements
+            .iter()
+            .map(|element| {
+                (
+                    element
+                        .query
+                        .authority_id
+                        .as_str(),
+                    element.authority_source,
+                )
+            }),
+        authorities,
+    )
+    .await;
+    let results = if missing.is_empty() {
+        evaluate(origin, leg, elements, &wrapped, client).await
+    } else {
+        let runnable: Vec<TrustCheckElement> = elements
+            .iter()
+            .filter(|element| !missing.fails_check(element))
+            .cloned()
+            .collect();
+        let mut evaluated = evaluate(origin, leg, &runnable, &wrapped, client)
+            .await
+            .into_iter();
+        elements
+            .iter()
+            .filter_map(|element| {
+                if missing.fails_check(element) {
+                    Some(authority_not_found(origin, leg, element))
+                } else {
+                    evaluated.next()
+                }
+            })
+            .collect()
+    };
+    log_consolidated(origin, leg, &results);
+    Some(match leg {
+        TrustCheckLeg::Caller => TrustCheckResultsContext {
+            caller: results,
+            target: Vec::new(),
+        },
+        TrustCheckLeg::Target => TrustCheckResultsContext {
+            caller: Vec::new(),
+            target: results,
+        },
+    })
+}
+
+/// Fails `element` with `AUTHORITY_NOT_FOUND` without querying its registry, recording it
+/// like an executed check.
+fn authority_not_found(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    element: &TrustCheckElement,
+) -> TrustCheckResult {
+    let detail = format!(
+        "Authority {} no longer exists; pick another Authority or remove the Trust Check",
+        element.query.authority_id
+    );
+    record_trust_check(TrustCheckAuditEvent {
+        surface_id: origin.surface_id,
+        transit_point: origin.transit_point,
+        leg,
+        element_id: &element.id,
+        element_name: element.name.as_deref(),
+        authority_id: Some(&element.query.authority_id),
+        entity_id: Some(&element.query.entity_id),
+        trust_registry_id: &element.trust_registry_id,
+        query_type: element.query_type,
+        ok: false,
+        error_code: Some(AUTHORITY_NOT_FOUND),
+        error_detail: Some(&detail),
+        latency_ms: 0,
+    });
+    synthesize_failure(element, AUTHORITY_NOT_FOUND, detail)
+}
+
+/// Runs the metadata gate and the TRQP executor over `elements`, returning one result per
+/// element in order.
+async fn evaluate<C: TrqpClient + ?Sized>(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    elements: &[TrustCheckElement],
+    wrapped: &Value,
+    client: &C,
+) -> Vec<TrustCheckResult> {
     // Per-element metadata gate — synthesizes TRUST_REGISTRY_METADATA_UNAVAILABLE
     // for elements whose query template references TR-metadata leaves
     // the built `input.agent` doesn't populate. Runs on both legs; each
     // leg has its own allow-list. Runnable elements (gate-clear) go
     // through the TRQP executor; synthesized entries are merged back at
     // their configured index so the result list preserves order.
-    let (synthesized_by_index, runnable) = synthesize_metadata_gate_failures(origin, leg, elements, &wrapped);
+    let (synthesized_by_index, runnable) = synthesize_metadata_gate_failures(origin, leg, elements, wrapped);
     let executor_results: Vec<TrustCheckResult> = if runnable.is_empty() {
         Vec::new()
     } else {
-        execute_list(origin, leg, &runnable, &ExecutionContext { input: &wrapped }, client).await
+        execute_list(origin, leg, &runnable, &ExecutionContext { input: wrapped }, client).await
     };
     let mut executor_iter = executor_results.into_iter();
     let mut results: Vec<TrustCheckResult> = Vec::with_capacity(synthesized_by_index.len());
@@ -99,7 +200,15 @@ pub async fn run_trust_check_stage<'o, C: TrqpClient + ?Sized>(
             }
         }
     }
-    let (ok_count, denied_count, error_count) = consolidate_trust_check_results(&results);
+    results
+}
+
+fn log_consolidated(
+    origin: TrustCheckOrigin<'_>,
+    leg: TrustCheckLeg,
+    results: &[TrustCheckResult],
+) {
+    let (ok_count, denied_count, error_count) = consolidate_trust_check_results(results);
     let leg_label = match leg {
         TrustCheckLeg::Caller => "caller",
         TrustCheckLeg::Target => "target",
@@ -117,17 +226,6 @@ pub async fn run_trust_check_stage<'o, C: TrqpClient + ?Sized>(
         error = error_count,
         "Trust Check Consolidated Result:"
     );
-    let ctx = match leg {
-        TrustCheckLeg::Caller => TrustCheckResultsContext {
-            caller: results,
-            target: Vec::new(),
-        },
-        TrustCheckLeg::Target => TrustCheckResultsContext {
-            caller: Vec::new(),
-            target: results,
-        },
-    };
-    Some(ctx)
 }
 
 /// Run the caller-leg Trust Check stage from a typed [`PolicyInput`].
@@ -179,6 +277,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: "tr-a".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:a".to_string(),
@@ -662,5 +761,142 @@ mod tests {
                 .code,
             "TEMPLATE_RESOLUTION_FAILED"
         );
+    }
+
+    struct CountingClient(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl TrqpClient for CountingClient {
+        async fn query(
+            &self,
+            _registry_id: &str,
+            _query_type: TrqpQueryType,
+            params: &TrqpQueryParams,
+        ) -> Result<TrqpOutcome, TrqpClientError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(params.authority_id.clone());
+            Ok(TrqpOutcome::Allowed)
+        }
+    }
+
+    fn authority_sourced(
+        id: &str,
+        did: &str,
+    ) -> TrustCheckElement {
+        let mut element = elem(id);
+        element.query.authority_id = did.to_string();
+        element.authority_source =
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority);
+        element
+    }
+
+    async fn authority_store(did: &str) -> (crate::authorities::FileSystemAuthorityStore, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = crate::authorities::FileSystemAuthorityStore::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .create(&crate::authorities::types::Authority::new(
+                "authority-1".to_string(),
+                "Acme".to_string(),
+                did.to_string(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn a_check_whose_authority_is_gone_fails_without_querying_its_registry() {
+        let (store, _dir) = authority_store("did:web:present").await;
+        let client = CountingClient(std::sync::Mutex::new(Vec::new()));
+        let elements = vec![
+            authority_sourced("present", "did:web:present"),
+            authority_sourced("gone", "did:web:gone"),
+            elem("plain"),
+        ];
+
+        let (ctx, records) = crate::audit::producer::capture(run_trust_check_stage_with(
+            "surf".into(),
+            TrustCheckLeg::Caller,
+            &elements,
+            &json!({}),
+            &client,
+            Some(&store),
+        ))
+        .await;
+        let results = ctx
+            .expect("expected Some")
+            .caller;
+
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect();
+        assert_eq!(ids, ["present", "gone", "plain"], "results keep the configured order");
+        assert!(results[0].ok && results[2].ok);
+        assert!(!results[1].ok);
+        let error = results[1]
+            .error
+            .as_ref()
+            .unwrap();
+        assert_eq!(error.code, "AUTHORITY_NOT_FOUND");
+        assert_eq!(
+            error.message,
+            "Authority did:web:gone no longer exists; pick another Authority or remove the Trust Check"
+        );
+        assert_eq!(
+            results[1]
+                .authority_id
+                .as_deref(),
+            Some("did:web:gone")
+        );
+        assert_eq!(*client.0.lock().unwrap(), ["did:web:present", "did:a"]);
+        let error_codes: Vec<Option<String>> = records
+            .iter()
+            .map(|record| match &record.event {
+                crate::delegation_vault::audit::DelegationAuditAction::TrustCheck { error_code, .. } => {
+                    error_code.clone()
+                }
+                other => panic!("expected a trust check, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(error_codes.len(), 3, "every check is audited");
+        assert_eq!(
+            error_codes
+                .iter()
+                .filter(|code| code.as_deref() == Some("AUTHORITY_NOT_FOUND"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_whose_authorities_exist_run_as_before() {
+        let (store, _dir) = authority_store("did:web:present").await;
+        let client = CountingClient(std::sync::Mutex::new(Vec::new()));
+        let elements = vec![authority_sourced("present", "did:web:present"), elem("plain")];
+
+        let ctx = run_trust_check_stage_with(
+            "surf".into(),
+            TrustCheckLeg::Target,
+            &elements,
+            &json!({}),
+            &client,
+            Some(&store),
+        )
+        .await
+        .expect("expected Some");
+
+        assert!(
+            ctx.target
+                .iter()
+                .all(|result| result.ok)
+        );
+        assert_eq!(client.0.lock().unwrap().len(), 2);
     }
 }

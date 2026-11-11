@@ -107,7 +107,7 @@ fields; and `variable_pattern`, the placeholder syntax in use (see _Templates_)
 | Family | Events |
 | --- | --- |
 | Gateway | `gateway.created`, `updated`, `deleted`, `status_changed`, `accessed` |
-| User | `user.created`, `approved`, `updated`, `deleted`, `login`, `accessed` |
+| User | `user.created`, `approved`, `updated`, `deleted`, `login`, `login_failed`, `accessed` |
 | Connection point | `connection_point.created`, `updated`, `deleted`, `connected` |
 | x402 | `x402.verification.failed`, `x402.settlement.failed`, `x402.transaction.completed`, `x402.cleanup.completed` |
 | MPP | `mpp.verification.failed`, `mpp.payment.verified`, `mpp.challenge.issued` |
@@ -123,6 +123,43 @@ SAML sign-in that creates the user raises `user.created`; SAML users are approve
 so no `user.approved` follows. A later SAML sign-in that changes the user's role, status, or
 primary flag raises `user.updated`. Every SAML sign-in then raises `user.login`, in that order
 ([`saml/user_provisioning.rs`](../src/auth/saml/user_provisioning.rs)).
+
+### Sign-in events
+
+A console sign-in raises `user.login`, with `LOGIN_METHOD` set to `passkey` or `saml`. A failed one
+raises `user.login_failed` ([`user_integration_triggers.rs`](../src/integrations/user_integration_triggers.rs)):
+a passkey sign-in whose credential does not verify, and a SAML response the gateway rejects at the
+Assertion Consumer Service (bad or missing signature, untrusted certificate, wrong destination or
+audience, an unknown, used or expired AuthnRequest, expired conditions). A passkey sign-in whose
+challenge is unknown or expired has nothing to verify and raises nothing, and neither does a
+failure after verification, such as provisioning a SAML user or opening the session.
+
+`user.login_failed` carries the user variables of `user.login`, `LOGIN_METHOD`, and
+`FAILURE_REASON`:
+
+| `FAILURE_REASON` | Meaning |
+| --- | --- |
+| `invalid_credential` | The account exists and is approved, but the passkey presented is not one of its passkeys |
+| `not_approved` | The account exists but is not approved |
+| `unknown_user` | No account has the username the sign-in named, or the account was deleted before the sign-in finished |
+| `saml_rejected` | The SAML response was rejected |
+
+`USER_ID`, `USERNAME`, `USER_EMAIL`, `USER_ROLE`, `USER_STATUS` and `NEW_STATE` are set only when the
+account exists, from the account as stored. For `unknown_user` and `saml_rejected` they are absent:
+a template placeholder for them is empty and `EVENT_DATA` leaves them out, so neither the username a
+caller typed nor anything in a rejected SAML response leaves the appliance. With the default
+`webhook` or `stream` template, `data` holds `login_method`, `failure_reason` and, for an existing
+account, `user_id` and the other user fields. Each shape, `user.login` and `user.login_failed`
+with and without an account, is kept as a reference payload in the default envelope, with run-
+specific values as placeholders, under
+[`tests/fixtures/integration_events/`](../tests/fixtures/integration_events/); the behaviour
+tests compare an event of each shape with it. The caller's answer to a failed sign-in does not
+depend on the event: it is the same `401` whether the account exists or not.
+
+Anyone can fail a sign-in, so the background tasks of `user.login_failed`, routing it and each of
+its deliveries, are held to 10 of the 100 described under _How an event becomes a message_. Beyond
+that a failed sign-in event is not delivered and a warning is logged, and the other 90 stay free for
+every other event.
 
 The connection point management API raises `connection_point.created`, `updated` and `deleted`,
 as the gateway API raises the gateway events. `updated` is raised when a save changes the name,

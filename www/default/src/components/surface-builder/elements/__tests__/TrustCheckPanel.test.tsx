@@ -1,6 +1,20 @@
 import React from 'react';
-import { render, screen, within, fireEvent } from '@testing-library/react';
+import { act, render, screen, within, fireEvent } from '@testing-library/react';
 import TrustCheckPanel from '../trust-check/TrustCheckPanel';
+import TrustCheckFullscreenPanel from '../trust-check/TrustCheckFullscreenPanel';
+import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../SurfaceMetaContext';
+
+jest.mock('../../../../api', () => ({
+  apiClient: { listTrustRegistries: () => Promise.resolve([]) },
+}));
+jest.mock('../../../../utils/issuersCache', () => ({
+  getIssuers: () =>
+    Promise.resolve([{ id: 'd-1', name: 'Acme Issuer', did: 'did:web:issuer.example' }]),
+}));
+jest.mock('../../../../utils/authoritiesCache', () => ({
+  getAuthorities: () =>
+    Promise.resolve([{ id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' }]),
+}));
 
 const AP_SLOT = 'request:trust-check-access_point_trust_check_list';
 const TP_SLOT = 'request:trust-check-transit_points_trust_check_list';
@@ -169,5 +183,116 @@ describe('TrustCheckPanel — sidebar context block', () => {
 
     // Title row stays visible.
     expect(screen.getByText(/sender of an incoming request/i)).toBeInTheDocument();
+  });
+});
+
+describe('TrustCheckPanel — deleted Authority', () => {
+  const GONE = 'did:web:deleted-authority.example';
+  const query = (id: string, authority_id: string, authority_source?: string) => ({
+    id,
+    trust_registry_id: 'tr-1',
+    query_type: 'recognition',
+    ...(authority_source ? { authority_source } : {}),
+    query: { authority_id },
+  });
+
+  function renderWithRegister(
+    config: Record<string, unknown>,
+    authorityDids: ReadonlySet<string> | null
+  ) {
+    const meta = { authorityDids } as unknown as SurfaceMetaValue;
+    return render(
+      <SurfaceMetaProvider value={meta}>
+        <TrustCheckPanel {...(baseProps(AP_SLOT, config) as any)} />
+      </SurfaceMetaProvider>
+    );
+  }
+
+  it('shows Configuration required with the DID while the Authority is gone', () => {
+    renderWithRegister(
+      { queries: [query('q-1', GONE, 'authority')] },
+      new Set(['did:web:auth.example'])
+    );
+    const warning = screen.getByTestId('trust-check-panel-authority-missing');
+    expect(warning).toHaveTextContent('Configuration required');
+    expect(warning).toHaveTextContent(
+      'The Authority this Trust Check uses no longer exists, so the check fails with AUTHORITY_NOT_FOUND until this is fixed.'
+    );
+    expect(screen.getByTestId('trust-check-panel-authority-missing-dids')).toHaveTextContent(
+      `Authority DID: ${GONE}`
+    );
+  });
+
+  it('names the query when the Trust Check has several', () => {
+    renderWithRegister(
+      {
+        queries: [
+          query('q-1', 'did:web:auth.example', 'authority'),
+          query('q-2', GONE, 'authority'),
+        ],
+      },
+      new Set(['did:web:auth.example'])
+    );
+    expect(screen.getByTestId('trust-check-panel-authority-missing-dids')).toHaveTextContent(
+      `Query 2: ${GONE}`
+    );
+  });
+
+  it('says nothing while the register has not loaded', () => {
+    renderWithRegister({ queries: [query('q-1', GONE, 'authority')] }, null);
+    expect(screen.queryByTestId('trust-check-panel-authority-missing')).toBeNull();
+  });
+
+  it('says nothing for a DID that did not come from the Authorities register', () => {
+    renderWithRegister({ queries: [query('q-1', GONE, 'issuer')] }, new Set());
+    expect(screen.queryByTestId('trust-check-panel-authority-missing')).toBeNull();
+  });
+});
+
+describe('TrustCheckFullscreenPanel — Authority source', () => {
+  const flush = () => act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
+
+  async function openEditor(queries: unknown[]) {
+    const props = { ...baseProps(TP_SLOT, { queries }), closeFullscreenEditor: jest.fn() } as any;
+    render(<TrustCheckFullscreenPanel {...props} />);
+    await flush();
+    return props;
+  }
+
+  async function pickAuthority(label: string) {
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
+    fireEvent.click(screen.getByText(label));
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+  }
+
+  const stored = (authority_id: string, authority_source: string) => ({
+    id: 'q-1',
+    trust_registry_id: 'tr-1',
+    query_type: 'recognition',
+    authority_source,
+    query: { authority_id },
+  });
+
+  it('saves authority_source "authority" beside a picked Authority', async () => {
+    const { updateFields } = await openEditor([stored('did:web:issuer.example', 'issuer')]);
+    await pickAuthority('Payments Authority');
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.authority_source).toBe('authority');
+    expect(query.query.authority_id).toBe('did:web:auth.example');
+  });
+
+  it('saves authority_source "issuer" beside a picked Issuer', async () => {
+    const { updateFields } = await openEditor([stored('did:web:auth.example', 'authority')]);
+    await pickAuthority('Acme Issuer');
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.authority_source).toBe('issuer');
+    expect(query.query.authority_id).toBe('did:web:issuer.example');
+  });
+
+  it('flags a deleted Authority once the register has loaded', async () => {
+    await openEditor([stored('did:web:deleted-authority.example', 'authority')]);
+    expect(screen.getByTestId('trust-check-query-0-authority-missing')).toHaveTextContent(
+      'did:web:deleted-authority.example'
+    );
   });
 });

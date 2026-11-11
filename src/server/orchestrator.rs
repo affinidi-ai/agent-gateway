@@ -1858,6 +1858,21 @@ pub async fn run_axum_proxy(
                 }
             }
         };
+        if let (Some(sts_clients), Some(authorities)) = (sts_client_store.as_deref(), authority_store.as_deref())
+            && !crate::server::mode::is_standby()
+        {
+            match crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+                authorities,
+                issuer_store
+                    .as_deref()
+                    .map(|store| store as &dyn crate::issuers::IssuerStore),
+            )
+            .await
+            {
+                Ok(registers) => crate::sts::store::record_authority_sources(sts_clients, &registers).await,
+                Err(e) => warn!("Failed to read the Authorities; STS client authority DIDs stay unclassified: {}", e),
+            }
+        }
 
         // ── Credential Delegation stores ──────────────────────────────────
         let credential_provider_store: Option<

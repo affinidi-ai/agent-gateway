@@ -1784,8 +1784,10 @@ audit event whose `reason` names the check, but only when the request carried a 
 gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
 only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
 and the event name the provider by its `provider_id` when the path's segment is the sealed
-state's own credential provider id, as it is at a callback path ending in that id, so they match
-`consent_granted`; otherwise they name it by the path's segment:
+state's own credential provider id, as it is at a callback path ending in that id; otherwise they
+name it by the path's segment. The audit routes therefore show a refusal only to appliance-wide
+callers, while `consent_granted`, which names the provider's record id, also reaches the
+provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)):
 
 | `reason` | Refused because |
 | --- | --- |
@@ -2227,8 +2229,9 @@ Who may call it:
 
 - Starting and completing a connect, and the report, need `delegation_vault.connect`, and
   removal `delegation_vault.delete`; only administrators hold them by default. A token
-  provisioned for the connect API never needs `delegation_vault.view`, which also reads every
-  tenant's agent-keyed tokens.
+  provisioned for the connect API never needs `delegation_vault.view`, which also reads the
+  agent-keyed tokens: every tenant's for an appliance-wide caller, and only its own tenant's for
+  a tenant's token (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens)).
 - A tenant's access token reaches only its own tenant's surfaces and their connects and grants,
   and within its resource pattern, which names them as `delegation-vault:<surface id>` (for
   example `TENANT:${x-tenant}:(?:delegation-vault:.*|...)`); another tenant's surface answers
@@ -2475,6 +2478,18 @@ Nor can a provider move into a tenant that already has a provider with its `prov
 for its whole check and change, so no surface write binds the provider in between; a delete
 releases it before its grants are revoked.
 
+A move carries the provider's agent-keyed vault entries and delegation audit records into the
+new tenant's view and out of the old one's, since they belong to their provider's current tenant
+([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-vault-tokens)). An appliance-wide provider's
+entries and records can belong to any tenant's callers: revoke its entries before moving it into
+a tenant, which then also reads its audit history.
+
+A delete takes them out of every tenant's view the same way. The deleted provider's remaining
+agent-keyed vault entries and its delegation audit records are no longer any tenant's, so a
+tenant's access token stops reading them, while sessions and appliance-wide access tokens still
+read them. Who reads a record is decided when it is read, from the provider's tenant at that
+moment, not when it was written.
+
 ### Removing grants
 
 Grants by binding are removed one by one or by binding, and each removed grant is deleted, then
@@ -2589,13 +2604,17 @@ leave out all four.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens |
-| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry |
-| `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted |
+| `GET /api/v1/delegation-vault` | List vault entries, as metadata only, without tokens; a tenant's access token lists only its own tenant's |
+| `GET`, `DELETE /api/v1/delegation-vault/{id}` | Read or revoke one entry; a tenant's access token reads only its own tenant's, and only an appliance-wide caller revokes |
+| `DELETE /api/v1/delegation-vault/by-user/{user_hash}` | Revoke every delegation one user has granted; only an appliance-wide caller revokes |
 | `POST /api/v1/delegation-vault/connects`, `POST /api/v1/delegation-vault/connects/{connect_id}/complete` | Start and complete an external consent connect ([The connect API](#the-connect-api)) |
 | `GET /api/v1/delegation-vault/grants?surface_id=...` | Report a surface's grants by binding, as metadata only |
 | `DELETE /api/v1/delegation-vault/grants/{grant_id}`, `DELETE /api/v1/delegation-vault/grants?...` | Remove and revoke a grant by binding, or one binding's grants; an operator also purges one that cannot be read ([Removing grants](#removing-grants)) |
-| `GET /api/v1/delegation-audit` | The delegation audit log |
+| `GET /api/v1/delegation-audit` | The delegation audit log; a tenant's access token reads only its own tenant's records |
+
+On these routes, a vault entry and an audit record belong to the tenant of their credential provider; see
+[Delegation vault tokens](ACCESS_TOKENS.md#delegation-vault-tokens) and
+[Delegation audit records](ACCESS_TOKENS.md#delegation-audit-records) in `ACCESS_TOKENS.md`.
 
 ### Removing grants keyed by the old identity hash
 

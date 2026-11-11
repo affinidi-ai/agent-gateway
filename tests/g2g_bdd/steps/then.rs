@@ -1009,6 +1009,29 @@ pub async fn response_status_is(
     );
 }
 
+#[then(expr = "the agent card points callers at gateway {int} surface {string}")]
+pub async fn agent_card_points_callers_at_surface(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+) {
+    let (_gw, surface_id) = world.surface(&surface_name);
+    let port = world
+        .harness()
+        .gw(gw_index)
+        .port;
+    let body = world
+        .response_body
+        .as_ref()
+        .expect("a When must record the response body before this Then");
+    assert_eq!(
+        body.get("url")
+            .and_then(Value::as_str),
+        Some(format!("http://localhost:{port}/{surface_id}").as_str()),
+        "agent card should point at gateway {gw_index} surface '{surface_name}': {body}"
+    );
+}
+
 #[then(expr = "the response says {string}")]
 pub async fn response_says(
     world: &mut G2gWorld,

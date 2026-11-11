@@ -95,7 +95,9 @@ provisioned for the connect API needs no `delegation_vault.view`; removing grant
 tenant, as the vault's other writes do: only an operator purges a grant it cannot read. The
 vault's other routes (the agent-keyed tokens, the mass revoke and the delegation audit) are not
 a resource-scoped family, and a PAT with a `resource_pattern` is still refused there for
-anything but a read. See
+anything but a read. Those reads show a tenant's token only its own tenant's agent-keyed tokens
+and delegation audit records; see [Delegation vault tokens](#delegation-vault-tokens),
+[Delegation audit records](#delegation-audit-records) and
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-connect-api).
 
 Header validation patterns are fully anchored and must match the entire sample
@@ -136,8 +138,9 @@ apply. See [`RBAC.md`](RBAC.md#token-info-endpoint) for the response shape.
 Tenant-owned top-level management records carry an optional `tenant_id`. Its absence
 means appliance-global, for backward compatibility.
 
-A tenant PAT sees same-tenant records plus global ones. Dashboard sessions remain
-appliance-wide. A record that belongs to another tenant answers `404` on read and on every
+A tenant PAT sees same-tenant records plus global ones (except agent-keyed vault tokens and the
+records of `/api/v1/delegation-audit` and `/v1/audit`, [below](#delegation-vault-tokens)).
+Dashboard sessions remain appliance-wide. A record that belongs to another tenant answers `404` on read and on every
 write (update, delete, trigger, reconnect, retry and the other record actions), with the same
 body as a missing record, so its ID cannot be probed. A record whose ID falls outside the PAT's
 resource pattern answers `404` on read and `403` on write; secrets, certificates and API keys
@@ -212,6 +215,48 @@ A tenant-owned Gateway record is limited the other way: its peer reaches only it
 Agent Surfaces and appliance-wide ones over Fabric, whatever its exposure mode says. See
 [`FABRIC.md`](FABRIC.md#peer-exposure).
 
+### Delegation vault tokens
+
+An agent-keyed delegation vault token, read with `GET /api/v1/delegation-vault` and
+`GET /api/v1/delegation-vault/{id}`, belongs to the tenant of its credential provider: the
+provider's `tenant_id` must equal the PAT's tenant exactly. A tenant PAT lists only its own
+tenant's tokens, and reading another answers `404` with the body of a missing token. A token
+whose provider is appliance-wide, missing or deleted is shown only to appliance-wide callers
+(sessions, and PATs with neither a resource pattern nor required headers): a tenant surface may
+use an appliance-wide `oauth2_authorization_code` provider, so its tokens can belong to any
+tenant's callers. A PAT scoped by required headers alone, or by a resource pattern without a
+tenant, reads no token: its list is empty and every token answers `404`. The tenant is the only
+boundary on these reads; the PAT's resource pattern is not matched against them. While the
+credential providers cannot be read, a tenant PAT's read answers `500` and shows nothing. A
+token follows its provider's current tenant, so moving a provider to another tenant moves its
+tokens with it.
+
+Only an appliance-wide caller revokes agent-keyed tokens, with
+`DELETE /api/v1/delegation-vault/{id}` or `DELETE /api/v1/delegation-vault/by-user/{user_hash}`.
+A tenant PAT, and a PAT scoped by required headers alone or by a resource pattern, gets `403` and
+the tokens are kept, whichever tenant they belong to.
+
+### Delegation audit records
+
+This section covers the two routes that read the VP Audit Log as a delegation audit,
+`GET /api/v1/delegation-audit` and `GET /v1/audit`. On them, a record belongs to the tenant of the
+credential provider it names, matched exactly as for [vault tokens](#delegation-vault-tokens), and a
+tenant PAT sees only its own tenant's records. Their `total`, `total_pages` and `category_counts`
+count only those records, and the `filter` text search looks only among them. A record that names no
+provider, such as a policy decision or a revoke through the management API, and a record of an
+appliance-wide, missing or deleted provider, are shown only to appliance-wide callers. The OAuth
+callback's `consent_granted` names its provider's id, so the provider's tenant reads it; one written
+by an earlier release names the provider's `provider_id` slug instead and is shown only to
+appliance-wide callers, as is the `delegation_failed` of a refused consent, which names the provider
+by its slug. A provider's slug never decides who reads a record, since two tenants can each have a
+provider with the same slug. A line of the log that does not parse as a record names no provider, so
+`dropped_records` counts it only for an appliance-wide caller. Only such a caller is told the size of
+the whole history, `history_bytes` and `soft_cap_bytes`; other callers read `0` for both. A PAT
+scoped by required headers alone, or by a resource pattern without a tenant, reads no record. While
+the credential providers cannot be read, a tenant PAT gets `500` from `/api/v1/delegation-audit` and
+an empty page marked `truncated` from `/v1/audit`. A record follows its provider's current tenant,
+as a vault token does.
+
 ### Ownership of child records
 
 API keys and Connection Points take their ownership from their Agent Surface or Gateway
@@ -271,7 +316,17 @@ out of service; see [`SOURCE_AUTH.md`](SOURCE_AUTH.md#tenant-check-of-provider-k
 ### What tenancy does not partition
 
 Runtime stores, listeners, policy compilation, hot reload, and the data-plane protocols
-are unpartitioned. Tenancy constrains management records, not the running data plane.
+are unpartitioned. Tenancy constrains management records, not the running data plane. The
+delegation vault's agent-keyed tokens and the audit log are stored unpartitioned too; the vault
+reads and the two delegation audit routes filter them by the tenant of each record's credential
+provider
+([Delegation vault tokens](#delegation-vault-tokens),
+[Delegation audit records](#delegation-audit-records)).
+
+The server logs are unpartitioned as well and hold every tenant's request and credential
+delegation detail, so `GET /v1/logs/download` serves them only to an appliance-wide caller: a
+session, or a PAT with neither a resource pattern nor required headers. A tenant PAT, and a PAT
+scoped by a resource pattern or by required headers alone, gets `403`, `audit.view` or not.
 
 A feature-gated management route checks both the bound user's role and the PAT's feature
 scopes. The role-only routes listed in [`RBAC.md`](RBAC.md#permissions-endpoint) check only the
@@ -320,7 +375,18 @@ unavailable" while a key folder cannot be loaded; see
 Templates are immovable, and so is a mediator provided by the mediator directory (`409`);
 child API keys and Connection Points move with their parent. A credential provider that any
 surface binds, of any tenant, cannot move to another tenant (`409`); remove the bindings first
-([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#deleting-a-provider)).
+([`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#deleting-a-provider)). A provider's
+agent-keyed vault tokens and delegation audit records follow it: a move shows them to the new
+tenant's PATs and hides them from the old tenant's
+([Delegation vault tokens](#delegation-vault-tokens),
+[Delegation audit records](#delegation-audit-records)). An appliance-wide provider's tokens and
+records can belong to any tenant's callers, so revoke its tokens before moving it into a tenant,
+and expect the tenant to read its history.
+
+Deleting a provider likewise hides its remaining agent-keyed vault tokens and its delegation audit
+records from every tenant PAT, its former tenant's included; sessions and appliance-wide PATs still
+read them. Both follow from ownership being decided at read time, from the provider's current
+tenant.
 
 ## Dashboard
 

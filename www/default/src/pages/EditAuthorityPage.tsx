@@ -8,6 +8,8 @@ import { DeleteButton } from '../components/shared/DeleteButton';
 import { useSafeNavigate } from '../hooks/useSafeNavigate';
 import { clearAuthoritiesCache } from '../utils/authoritiesCache';
 import FieldHelp from '../components/shared/FieldHelp';
+import { AuthorityInUseDialog } from '../components/authorities/AuthorityInUseDialog';
+import { authorityInUse, type AuthorityInUse } from '../components/authorities/authorityInUse';
 
 interface EditAuthorityPageProps {
   embeddedId?: string;
@@ -55,6 +57,7 @@ const EditAuthorityPage: React.FC<EditAuthorityPageProps> = ({ embeddedId, onDon
   const [error, setError] = useState<string | null>(null);
   const [createdAt, setCreatedAt] = useState<string | null>(null);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
+  const [inUse, setInUse] = useState<AuthorityInUse | null>(null);
 
   const fetchAuthority = useCallback(async () => {
     if (!id) return;
@@ -143,11 +146,13 @@ const EditAuthorityPage: React.FC<EditAuthorityPageProps> = ({ embeddedId, onDon
   const handleDelete = async () => {
     if (!id) return;
     try {
-      await apiClient.delete(`/authorities/${id}`);
+      await apiClient.deleteAuthority(id);
       clearAuthoritiesCache();
       onDone ? onDone() : navigate(-1);
     } catch (err: any) {
-      showToast('error', err.message || 'Failed to delete authority');
+      const refused = authorityInUse(err);
+      if (refused) setInUse(refused);
+      else showToast('error', err.message || 'Failed to delete authority');
     }
   };
 
@@ -345,6 +350,13 @@ const EditAuthorityPage: React.FC<EditAuthorityPageProps> = ({ embeddedId, onDon
             </div>
           </div>
         </div>
+      )}
+      {inUse && (
+        <AuthorityInUseDialog
+          authorityName={name.trim() || undefined}
+          inUse={inUse}
+          onClose={() => setInUse(null)}
+        />
       )}
     </div>
   );

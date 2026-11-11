@@ -211,6 +211,12 @@ pub const AUDIT_EVENTS: &[AuditEventSpec] = &[
         Auth,
     ),
     event(
+        "authority_force_deleted",
+        "Authority Force-Deleted",
+        "An Authority was deleted with force, whether or not Trust Checks or Trust Recorder entries still used it",
+        Trust,
+    ),
+    event(
         "delegation_failed",
         "Delegation Failed",
         "An OAuth consent start or callback was refused, with the reason",

@@ -217,6 +217,12 @@ The Trust Recorder panel and its entries warn while an entry uses the surface Is
 Authority and the surface has no Issuer or its Issuer no longer exists; see _Trust Recorder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
+Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
+Authority pickers set it. One whose Authority was deleted from the Authorities register is drawn
+unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
+delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
+Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface
 variants and refusals_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#audit-page-surface-variants-and-refusals).

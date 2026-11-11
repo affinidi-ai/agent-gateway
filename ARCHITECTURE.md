@@ -168,7 +168,7 @@ logic.
 | Credential delegation | Injecting delegated OAuth tokens, or signalling consent. A Target bound by external consent is instead sent its grant by binding, in place of the caller's credentials and caller-info headers, only at its endpoint path on the provider's resource through Strict egress, its route chosen before any payment; the Target's refusal of the token gets one refresh and one retry after the response | [`src/proxy/credential_delegation.rs`](src/proxy/credential_delegation.rs), [`src/proxy/target_grant.rs`](src/proxy/target_grant.rs) |
 | VP injection | The deferred identity presentation added to the upstream request | [`src/identity/`](src/identity/) |
 | Forward | Vetting the target and sending the request | [`src/egress.rs`](src/egress.rs) |
-| Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
+| Upstream response bounds | Buffering the upstream response within `[a2a] max_body_size`, the target's `networking.timeout.idle_secs` and its request timeout; `502` over the size or for a compressed body where none was accepted, `504` on a stall. An MCP event-stream passthrough is not buffered. | [`src/proxy/upstream_body.rs`](src/proxy/upstream_body.rs) |
 | A2A event streams | Forwarding a direct Target's `text/event-stream` one event at a time, each event given the response checks below; a refused event ends the stream with a JSON-RPC error event | [`src/a2a/streaming.rs`](src/a2a/streaming.rs), [`src/proxy/handler/a2a_stream.rs`](src/proxy/handler/a2a_stream.rs) |
 | Protected identity resolution | Deriving the managed agent's DID from its response | [`src/proxy/backend_identity.rs`](src/proxy/backend_identity.rs) |
 | Response processing | Rewrites, tool-list filtering, agent cards | [`src/proxy/response_policy.rs`](src/proxy/response_policy.rs) |
@@ -400,7 +400,7 @@ from.
 | [`certificates/`](src/certificates/) | TLS and mTLS certificate records | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#mtls) |
 | [`vault_identity/`](src/vault_identity/) | Identity material for API keys and certificates | Source only: [`src/vault_identity/mod.rs`](src/vault_identity/mod.rs) |
 | [`issuers/`](src/issuers/) | Issuer records with generated `did:web` / `did:webvh` DIDs | Source only: [`src/issuers/mod.rs`](src/issuers/mod.rs) |
-| [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors | Source only: [`src/authorities/mod.rs`](src/authorities/mod.rs) |
+| [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors; a delete is refused while a Trust Check or Trust Recorder entry uses one | [`POLICY.md`](docs/POLICY.md#the-authority-of-a-trust-check) |
 | [`trust_registries/`](src/trust_registries/) | Trust registry connection records, display-name reference fields | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
 | [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder and its last-outcome status | [`POLICY.md`](docs/POLICY.md), [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status) |
 | [`sts/`](src/sts/) | RFC 8693 token exchange, and ID-JAG issuance and redemption | [`STS.md`](docs/STS.md) |

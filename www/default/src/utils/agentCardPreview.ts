@@ -20,6 +20,7 @@ export const CARD_FETCH_CAUSES = [
   'timeout',
   'too_large',
   'invalid_card',
+  'compressed',
   'blocked_by_egress',
   'proxy_unavailable',
   'identity_failed',
@@ -259,6 +260,7 @@ export const CARD_FETCH_CAUSE_LABEL: Record<CardFetchCause, string> = {
   timeout: 'Timed out',
   too_large: 'Card too large',
   invalid_card: 'Not an agent card',
+  compressed: 'Card compressed',
   blocked_by_egress: 'Address not resolvable or not allowed',
   proxy_unavailable: 'A2A proxy unavailable',
   identity_failed: 'Identity failed',
@@ -280,6 +282,8 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
   timeout: 'The agent did not answer in time. Check that the agent is running, then Refresh.',
   too_large: "The agent's card is larger than the gateway accepts. Shrink the agent card.",
   invalid_card: "The agent's answer is not a JSON agent card. Check the agent card location.",
+  compressed:
+    'The agent compressed its card although the gateway asked for an uncompressed one. Have the agent, or the proxy in front of it, honour Accept-Encoding: identity.',
   blocked_by_egress:
     "The gateway could not resolve the agent's host name, or it resolves to a cloud metadata address, which the gateway never calls. Check the endpoint host name and DNS from the gateway host, then Refresh.",
   proxy_unavailable: 'The A2A proxy behind this surface is missing or disabled.',

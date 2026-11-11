@@ -207,8 +207,8 @@ mod tests {
         RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails,
-        SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
+        AuthorityForceDeleteDetails, McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage,
+        PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -566,6 +566,7 @@ mod tests {
             | DelegationAuditAction::PolicyChangeRefused(_)
             | DelegationAuditAction::TargetAuthChanged(_)
             | DelegationAuditAction::SecretForceDeleted(_)
+            | DelegationAuditAction::AuthorityForceDeleted(_)
             | DelegationAuditAction::McpProxyPinChanged(_) => {}
         }
     }
@@ -694,6 +695,13 @@ mod tests {
             DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
                 actor: Actor::user("u-1"),
                 secret_id: "billing_api_key".to_string(),
+                force: true,
+                referrers: Vec::new(),
+            })),
+            DelegationAuditAction::AuthorityForceDeleted(Box::new(AuthorityForceDeleteDetails {
+                actor: Actor::user("u-1"),
+                authority_id: "authority-1".to_string(),
+                did: "did:web:authority.example".to_string(),
                 force: true,
                 referrers: Vec::new(),
             })),

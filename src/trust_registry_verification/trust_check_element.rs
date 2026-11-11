@@ -102,6 +102,11 @@ pub struct TrustCheckElement {
     /// Foreign key into the trust-registries store.
     pub trust_registry_id: String,
 
+    /// The register `query.authority_id` was picked from. Absent on a
+    /// template and on an element not yet classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_source: Option<super::authority_source::AuthoritySource>,
+
     pub query_type: TrqpQueryType,
 
     pub query: TrqpQueryParams,
@@ -324,6 +329,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: "tr-x".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: base_query("did:a"),
             timeout_secs: None,
@@ -336,6 +342,7 @@ mod tests {
         let elem = TrustCheckElement {
             id: "tc-1".to_string(),
             trust_registry_id: "tr-a".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Authorization,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
@@ -358,6 +365,7 @@ mod tests {
         let elem = TrustCheckElement {
             id: "tc-2".to_string(),
             trust_registry_id: "tr-b".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "{{input.target.gateway.did}}".to_string(),
@@ -415,6 +423,7 @@ mod tests {
         let elem = TrustCheckElement {
             id: "tc-3c".to_string(),
             trust_registry_id: "tr-c".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:a".to_string(),

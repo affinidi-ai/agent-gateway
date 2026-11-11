@@ -977,10 +977,42 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
         surfaces::RetiredA2aSwitches::read(bootstrap)
     })
     .await;
+    if let Some(registers) = authority_registers(bootstrap).await {
+        surfaces::record_authority_sources(&store, &mut channels, !crate::server::mode::is_standby(), &registers).await;
+    }
 
     info!("✅ Loaded {} surface(s) from local storage", channels.len());
 
     Ok(channels)
+}
+
+/// The Authorities and Issuers stored surfaces classify their authority DIDs against, or
+/// `None` when the Authorities cannot be read.
+async fn authority_registers(
+    bootstrap: &BootstrapConfig
+) -> Option<crate::trust_registry_verification::authority_source::AuthorityRegisters> {
+    let paths = &bootstrap.storage_paths;
+    let authorities = crate::authorities::FileSystemAuthorityStore::new(PathBuf::from(&paths.authorities))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Authority store; stored authority DIDs stay unclassified"),
+        )
+        .ok()?;
+    let issuers = crate::issuers::FileSystemIssuerStore::new(PathBuf::from(&paths.issuers))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Issuer store; no authority DID is classified as an Issuer"),
+        )
+        .ok();
+    crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+        &authorities,
+        issuers
+            .as_ref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .inspect_err(|error| warn!(%error, "Failed to read the Authorities; stored authority DIDs stay unclassified"))
+    .ok()
 }
 
 /// Auto-disable surfaces whose access-point `(port, route)` claim duplicates

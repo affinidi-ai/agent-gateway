@@ -310,6 +310,53 @@ fn agent_card_describes_a2a_proxy(
     );
 }
 
+fn served_card_url(world: &mut SurfaceWorld) -> String {
+    let response = get_caller_response(world);
+    response
+        .body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("agent card url must be present, got {}", response.body))
+        .to_string()
+}
+
+#[then("the agent card points callers at the surface Access Point")]
+fn agent_card_points_callers_at_the_access_point(world: &mut SurfaceWorld) {
+    let url = served_card_url(world);
+    let gateway_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .gateway_port;
+    let route = world
+        .surface_config
+        .route
+        .trim_end_matches('/');
+    assert_eq!(
+        url,
+        format!("http://localhost:{gateway_port}{route}"),
+        "agent card url should be the Access Point at route '{route}'"
+    );
+}
+
+#[then(expr = "the agent card points callers at Transit Point {string}")]
+fn agent_card_points_callers_at_transit_point(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    let url = served_card_url(world);
+    let outbound_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .outbound_port;
+    assert_eq!(
+        url,
+        format!("http://localhost:{outbound_port}/transit/{transit_point}"),
+        "agent card url should be Transit Point '{transit_point}'"
+    );
+}
+
 #[then(expr = "the agent card url points to the surface Access Point")]
 fn agent_card_url_points_to_surface_access_point(world: &mut SurfaceWorld) {
     let response = get_caller_response(world);
@@ -1432,6 +1479,12 @@ fn response_body_is_error(
             "title": "Bad Gateway",
             "status": 502,
             "detail": "Upstream redirected"
+        }),
+        "agent_card_upstream_compressed" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Bad Gateway",
+            "status": 502,
+            "detail": "Upstream response is compressed"
         }),
         other => panic!("unsupported expected response error: {}", other),
     };
@@ -3492,12 +3545,17 @@ fn oauth_provider_received_refresh_request(
     );
 }
 
+/// Delegation audit records name a provider by its record id, which is not
+/// its `provider_id` slug when the gateway gave it an id of its own.
 #[then(expr = "the delegation audit trail contains event {string} for OAuth provider {string}")]
 async fn delegation_audit_trail_contains_event(
     world: &mut SurfaceWorld,
     event: String,
     provider: String,
 ) {
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
     let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|entry| {
             entry
@@ -3507,11 +3565,11 @@ async fn delegation_audit_trail_contains_event(
                 && entry
                     .get("provider_id")
                     .and_then(|value| value.as_str())
-                    == Some(provider.as_str())
+                    == Some(record_id.as_str())
         })
     })
     .await;
-    assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+    assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
 }
 
 #[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]

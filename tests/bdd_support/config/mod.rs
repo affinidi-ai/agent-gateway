@@ -19,6 +19,7 @@ pub mod mcp_proxy;
 pub mod modern_consent;
 pub mod policy_definitions;
 pub mod secrets;
+pub mod sign_in;
 pub mod single_surface_fixture;
 pub mod single_surface_writer;
 pub mod source_auth;

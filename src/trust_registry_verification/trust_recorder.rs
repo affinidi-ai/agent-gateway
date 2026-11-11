@@ -19,8 +19,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
+use super::authority_source::MissingAuthorities;
 use super::recorder_status::{EntryStatus, RecorderReason, global_store};
 
+use crate::authorities::AuthorityStore;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::types::{EntityTarget, TrustRecorderConfig, TrustRecorderEntry};
 use crate::identity::display_name::DisplayName;
@@ -117,7 +119,15 @@ async fn resolve_entries<'a>(
     cfg: &'a TrustRecorderConfig,
     resolved_issuer_did: Option<&str>,
     tr_store: &dyn TrustRegistryStore,
+    authorities: Option<&dyn AuthorityStore>,
 ) -> Vec<Resolution<'a>> {
+    let missing = MissingAuthorities::find(
+        cfg.entries
+            .iter()
+            .map(|entry| (entry.authority_did.as_str(), entry.authority_source)),
+        authorities,
+    )
+    .await;
     let mut resolutions = Vec::with_capacity(cfg.entries.len());
     for entry in &cfg.entries {
         let Some(authority_did) = resolve_authority_did(entry, resolved_issuer_did) else {
@@ -127,6 +137,18 @@ async fn resolve_entries<'a>(
             )));
             continue;
         };
+        if missing.fails_entry(entry) {
+            warn!(
+                trust_registry_id = %entry.trust_registry_id,
+                authority = %entry.authority_did,
+                "Trust Recorder: the entry's Authority no longer exists, skipping entry"
+            );
+            resolutions.push(Resolution::Skipped(EntryStatus::skipped(
+                &entry.trust_registry_id,
+                RecorderReason::AuthorityNotFound,
+            )));
+            continue;
+        }
         match lookup_entry_tr_did(tr_store, &entry.trust_registry_id).await {
             Ok(tr_did) => resolutions.push(Resolution::Ready(ReadyEntry { entry, authority_did, tr_did })),
             Err(reason) => {
@@ -242,7 +264,8 @@ pub async fn apply_trust_recorder(
         cfg.entries.len()
     );
 
-    let resolutions = resolve_entries(cfg, resolved_issuer_did, tr_store.as_ref()).await;
+    let authorities = crate::gateways::connection_points::get_authority_store();
+    let resolutions = resolve_entries(cfg, resolved_issuer_did, tr_store.as_ref(), authorities.as_deref()).await;
     let context = display_name.map(record_context);
     let statuses = write_entries(tr_manager.as_ref(), &resolutions, agent_did, context.as_ref()).await;
 
@@ -253,7 +276,6 @@ pub async fn apply_trust_recorder(
             Resolution::Skipped(_) => None,
         })
         .collect();
-    let authorities = crate::gateways::connection_points::get_authority_store();
     let issuers = crate::gateways::connection_points::get_issuer_store();
     let fields = recorder_reference_fields(
         &targets,
@@ -572,6 +594,7 @@ mod tests {
             trust_registry_id: "tr-1".into(),
             issuer_did: "did:example:issuer".into(),
             authority_did: "did:example:authority".into(),
+            authority_source: None,
             include_owned_agent: false,
             custom_resources: vec![],
         }
@@ -1159,7 +1182,7 @@ mod tests {
             templated,
         ];
 
-        let resolutions = resolve_entries(&cfg, None, &store).await;
+        let resolutions = resolve_entries(&cfg, None, &store, None).await;
 
         let summary: Vec<String> = resolutions
             .iter()
@@ -1180,13 +1203,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_entry_whose_authority_is_gone_is_skipped_before_its_registry_is_looked_up() {
+        use crate::authorities::AuthorityStore;
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+        let (store, _dir) = store_with(&[("tr-connected", Some("did:example:tr"))]).await;
+        let authorities_dir = tempfile::TempDir::new().unwrap();
+        let authorities = crate::authorities::FileSystemAuthorityStore::new(
+            authorities_dir
+                .path()
+                .to_path_buf(),
+        )
+        .await
+        .unwrap();
+        authorities
+            .create(&crate::authorities::types::Authority::new(
+                "authority-1".into(),
+                "Present".into(),
+                "did:example:present".into(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let linked = |trust_registry_id: &str, did: &str| {
+            let mut entry = entry_writing(trust_registry_id, &["a"]);
+            entry.authority_did = did.into();
+            entry.authority_source = Some(AuthoritySource::Authority);
+            entry
+        };
+        let cfg = TrustRecorderConfig {
+            entries: vec![
+                linked("tr-connected", "did:example:present"),
+                linked("tr-missing", "did:example:gone"),
+                entry_writing("tr-connected", &["a"]),
+            ],
+        };
+
+        let resolutions = resolve_entries(&cfg, None, &store, Some(&authorities)).await;
+
+        let summary: Vec<String> = resolutions
+            .iter()
+            .map(|r| match r {
+                Resolution::Ready(ready) => {
+                    format!("ready {} as {}", ready.entry.trust_registry_id, ready.authority_did)
+                }
+                Resolution::Skipped(status) => format!("skipped {} {:?}", status.trust_registry_id, status.reason),
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                "ready tr-connected as did:example:present".to_string(),
+                "skipped tr-missing Some(AuthorityNotFound)".to_string(),
+                "ready tr-connected as did:example:authority".to_string(),
+            ],
+            "a missing Authority is reported over the missing registry of the same entry"
+        );
+    }
+
+    #[tokio::test]
     async fn the_template_authority_resolves_when_the_surface_has_an_issuer() {
         let (store, _dir) = store_with(&[("tr-1", Some("did:example:tr"))]).await;
         let mut entry = entry_writing("tr-1", &["a"]);
         entry.authority_did = SURFACE_ISSUER_DID_TEMPLATE.into();
         let cfg = TrustRecorderConfig { entries: vec![entry] };
 
-        let resolutions = resolve_entries(&cfg, Some("did:example:issuer-runtime"), &store).await;
+        let resolutions = resolve_entries(&cfg, Some("did:example:issuer-runtime"), &store, None).await;
 
         match &resolutions[0] {
             Resolution::Ready(ready) => assert_eq!(ready.authority_did, "did:example:issuer-runtime"),

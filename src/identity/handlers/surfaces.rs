@@ -3231,6 +3231,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
     // Reject overlapping outbound listener routes before they can reach
@@ -4228,6 +4229,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
+    super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
@@ -9444,6 +9446,7 @@ mod validation_tests {
             .trust_check_list = vec![crate::trust_registry_verification::trust_check_element::TrustCheckElement {
             id: "tc-1".to_string(),
             trust_registry_id: "tr-1".to_string(),
+            authority_source: None,
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
@@ -11486,6 +11489,7 @@ mod tests {
             trust_registry_id: registry.into(),
             issuer_did: "did:example:issuer".into(),
             authority_did: "did:example:authority".into(),
+            authority_source: None,
             include_owned_agent: true,
             custom_resources: vec![],
         }
