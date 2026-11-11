@@ -15,7 +15,7 @@ use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::config::TargetAuthMethod;
 use crate::config::agent_surface::AgentSurface;
 use crate::rbac::{Feature, RbacConfig};
-use crate::tenancy::{PatTenantContext, ResourceKind, can_access, scope_allows_resource};
+use crate::tenancy::{PatTenantContext, ResourceKind, can_access, can_reference, scope_allows_resource};
 use crate::trust_registry_verification::authority_source::{
     AuthorityReference, AuthorityUse, surface_references, trust_check_references,
 };
@@ -226,14 +226,22 @@ impl ReferenceStores {
     }
 
     /// The surfaces and STS clients whose Trust Checks or Trust Recorder entries name the
-    /// Authority whose DID is `did`, each with the elements that name it.
+    /// Authority whose DID is `did` and owned by `tenant_id`, each with the elements that name
+    /// it. A record of a tenant that may not use the Authority only names the same DID, so it
+    /// neither holds the Authority nor learns of it.
     pub async fn referrers_of_authority(
         &self,
         did: &str,
+        tenant_id: Option<&str>,
     ) -> anyhow::Result<Vec<Referrer>> {
         let mut referrers = Vec::new();
         if let Some(store) = &self.surfaces {
-            for surface in store.list_all().await? {
+            for surface in store
+                .list_all()
+                .await?
+                .into_iter()
+                .filter(|surface| can_reference(surface.tenant_id.as_deref(), tenant_id))
+            {
                 let uses = uses_of_authority(surface_references(&surface), did);
                 if !uses.is_empty() {
                     referrers.push(Referrer {
@@ -244,7 +252,12 @@ impl ReferenceStores {
             }
         }
         if let Some(store) = &self.sts_clients {
-            for client in store.list().await? {
+            for client in store
+                .list()
+                .await?
+                .into_iter()
+                .filter(|client| can_reference(client.tenant_id.as_deref(), tenant_id))
+            {
                 let uses = uses_of_authority(trust_check_references(&client.trust_check_list), did);
                 if !uses.is_empty() {
                     referrers.push(Referrer {
@@ -580,13 +593,13 @@ mod tests {
         };
 
         let mut referrers = stores
-            .referrers_of_authority("did:web:acme")
+            .referrers_of_authority("did:web:acme", None)
             .await
             .unwrap();
         referrers.sort_by(|a, b| a.id.cmp(&b.id));
         assert!(
             stores
-                .referrers_of_authority("did:web:unused")
+                .referrers_of_authority("did:web:unused", None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -610,6 +623,60 @@ mod tests {
         let partial = body(conflict_response("in use", &referrers, &surfaces_only, None, None)).await;
         assert_eq!(partial["references"][0]["id"], "orders");
         assert_eq!(partial["hidden_references"], 1, "the STS client is counted, not named or described");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_authority_is_used_only_by_records_of_its_own_tenant() {
+        use crate::surfaces::AgentSurfaceStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let surfaces = Arc::new(
+            crate::surfaces::FileSystemAgentSurfaceStore::new(dir.path().join("surfaces"))
+                .await
+                .unwrap(),
+        );
+        for (id, tenant) in [("own", Some("tenant-a")), ("other", Some("tenant-b")), ("appliance", None)] {
+            let surface: AgentSurface = serde_json::from_value(json!({
+                "surface_id": id, "name": id, "tenant_id": tenant,
+                "access_point": {
+                    "listen_address": "0.0.0.0:8443", "route": format!("/{id}"), "protocol": "a2a",
+                    "trust_check_list": [{
+                        "id": "check", "trust_registry_id": "tr-1", "query_type": "recognition",
+                        "query": {"authority_id": "did:web:acme", "entity_id": "{{ input.agent.did }}"}
+                    }]
+                },
+                "target": {"endpoint": "https://api.example.com"}
+            }))
+            .unwrap();
+            surfaces
+                .save(&surface)
+                .await
+                .unwrap();
+        }
+        let stores = ReferenceStores {
+            surfaces: Some(surfaces),
+            ..Default::default()
+        };
+        let ids = |referrers: Vec<Referrer>| {
+            let mut ids: Vec<String> = referrers
+                .into_iter()
+                .map(|referrer| referrer.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        let tenant_owned = stores
+            .referrers_of_authority("did:web:acme", Some("tenant-a"))
+            .await
+            .unwrap();
+        let appliance_wide = stores
+            .referrers_of_authority("did:web:acme", None)
+            .await
+            .unwrap();
+
+        assert_eq!(ids(tenant_owned), ["own"], "another tenant's or an appliance-wide record does not hold it");
+        assert_eq!(ids(appliance_wide), ["appliance", "other", "own"]);
     }
 
     async fn body(response: Response) -> serde_json::Value {

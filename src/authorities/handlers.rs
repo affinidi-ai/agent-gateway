@@ -274,7 +274,7 @@ pub async fn delete_authority<S: AuthorityStore>(
 
     let _bindings = crate::identity::handlers::surface_grants::hold_provider_bindings_exclusively().await;
     let referrers = match references
-        .referrers_of_authority(&authority.did)
+        .referrers_of_authority(&authority.did, authority.tenant_id.as_deref())
         .await
     {
         Ok(referrers) => referrers,
@@ -978,6 +978,22 @@ mod tests {
                 "force": true,
                 "referrers": [{"kind": "surface", "id": "orders"}],
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_delete_outside_a_management_request_is_recorded_as_the_gateways() {
+        let (store, _dir) = test_store().await;
+        let created = create_for_tenant(&store, None, "did:web:acme.example.com").await;
+
+        let (status, records) =
+            crate::audit::producer::capture(delete(&store, ReferenceStores::default(), &created.id, None, true)).await;
+
+        assert_eq!(status.status(), StatusCode::NO_CONTENT);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(
+            serde_json::to_value(&records[0]).unwrap()["event"]["authority_force_deleted"]["actor"],
+            json!({"kind": "system", "id": "gateway"})
         );
     }
 

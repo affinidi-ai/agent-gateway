@@ -1,7 +1,9 @@
 //! The record of an Authority deleted with `force=true`. It names the actor of the management
-//! request it is built in and is written only when a sink selects its event.
+//! request it is built in, or the gateway outside one, and is written only when a sink selects
+//! its event.
 
 use crate::audit::context::current_actor;
+use crate::audit::events::Actor;
 use crate::audit::secret_force_deletes::referrer_details;
 use crate::authorities::types::Authority;
 use crate::credential_providers::references::Referrer;
@@ -10,14 +12,13 @@ use crate::delegation_vault::audit::{
 };
 
 /// Records that `authority` was force-deleted while `referrers` still used it, listed by
-/// kind and id. Writes nothing outside a management request.
+/// kind and id. Outside a management request the gateway is named as the actor, so no forced
+/// delete goes unrecorded.
 pub fn authority_force_deleted(
     authority: &Authority,
     referrers: &[Referrer],
 ) {
-    let Some(actor) = current_actor() else {
-        return;
-    };
+    let actor = current_actor().unwrap_or_else(Actor::system);
     let action = DelegationAuditAction::AuthorityForceDeleted(Box::new(AuthorityForceDeleteDetails {
         actor,
         authority_id: authority.id.clone(),
