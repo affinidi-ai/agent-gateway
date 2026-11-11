@@ -2087,9 +2087,10 @@ Consent confirmation therefore does not cover:
    - the `state` is a confirmation state this gateway sealed;
    - the browser presents its binding cookie;
    - the surface the link was minted on still exists and is still of the sealed tenant, or
-     the request is refused with `consent_state_invalid`. The surface store is read first, and
-     a surface it does not hold is looked up among those served from the gateway configuration
-     (static or the configured source); a surface store that cannot be read refuses the
+     the request is refused with `consent_state_invalid`. Every copy of the surface the gateway
+     holds, in the surface store and among those served from the gateway configuration (static
+     or the configured source), must be of the sealed tenant, so a copy of another tenant
+     refuses the request whichever copy is served; a surface store that cannot be read refuses the
      request with `credentials_unavailable` and logs a `WARN` with the provider and surface ids;
    - the state has not been used. It is claimed now, so every later refusal, an identity
      provider `error` included, uses it up;

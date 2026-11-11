@@ -2189,7 +2189,7 @@ fn create_valid_jwt_for_subject(
     jwt::sign_jwt(claims)
 }
 
-fn create_valid_jwt_for_subject_with_world_claims(
+pub(crate) fn create_valid_jwt_for_subject_with_world_claims(
     world: &SurfaceWorld,
     subject: &str,
     extra_claims: serde_json::Value,
@@ -2943,7 +2943,7 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
     .await;
 }
 
-async fn send_mcp_request_through_transit_point_path_with_headers(
+pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
     world: &mut SurfaceWorld,
     agent_name: &str,
     path: &str,

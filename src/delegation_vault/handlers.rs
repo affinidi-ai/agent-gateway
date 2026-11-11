@@ -906,9 +906,9 @@ fn provider_error(error: &str) -> (DelegationFailureReason, &str) {
 
 /// Refuses a confirmation state whose surface no longer exists under the
 /// tenant the caller's `user_identity_hash` was computed for, or cannot be
-/// read. The surface store is read first, as it holds the current tenant of a
-/// stored surface; a surface it does not hold is looked up among those served
-/// from the gateway configuration.
+/// read. Every copy of the surface this gateway holds, in the surface store
+/// and among those served from the gateway configuration, must be of that
+/// tenant, so the check holds whichever copy is served.
 async fn sealed_surface_unchanged(
     state: &DelegationVaultState,
     provider_id: &str,
@@ -934,18 +934,28 @@ async fn sealed_surface_unchanged(
         },
         None => None,
     };
-    let surface = match (stored, &state.config_surfaces) {
-        (Some(surface), _) => Some(surface),
-        (None, Some(configured)) => {
+    let configured = match &state.config_surfaces {
+        Some(configured) => {
             configured
                 .config_surface(&sealed.surface_id)
                 .await
         }
-        (None, None) => None,
+        None => None,
     };
-    match surface {
-        Some(surface) if surface.tenant_id == binding.tenant_id => Ok(()),
-        _ => Err(DelegationFailureReason::ConsentStateInvalid),
+    let copies = [stored, configured];
+    let present = copies
+        .iter()
+        .flatten()
+        .count();
+    if present > 0
+        && copies
+            .iter()
+            .flatten()
+            .all(|surface| surface.tenant_id == binding.tenant_id)
+    {
+        Ok(())
+    } else {
+        Err(DelegationFailureReason::ConsentStateInvalid)
     }
 }
 

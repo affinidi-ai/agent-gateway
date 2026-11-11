@@ -147,6 +147,88 @@ async fn operator_has_deleted_consent_surface(world: &mut SurfaceWorld) {
     assert!(status.is_some_and(|status| (200..300).contains(&status)), "the operator deletes the surface: {status:?}");
 }
 
+#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
+fn transit_point_injects_oauth_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    crate::steps::given::transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    crate::steps::given::surface_requires_oauth_delegated_credentials(world, provider);
+}
+
+/// The audience a Transit Point's JWT callers' tokens are issued for.
+const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
+
+#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer")]
+fn transit_point_authenticates_its_callers_with_jwt_bearer(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    crate::steps::given::transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "jwt_bearer",
+        "jwt_verification_strategy_id": CALLERS_STRATEGY_ID,
+        "audiences": [TRANSIT_AUDIENCE],
+        "forward_header": false,
+    }));
+}
+
+/// The JWT caller calls the Access Point, and the managed agent then calls a
+/// tool through the Transit Point with the transit token it was handed, named
+/// as the managed agent, and the caller's JWT.
+#[given(
+    expr = "managed agent {string} has started OAuth consent for provider {string} through Transit Point {string} for JWT caller {string}"
+)]
+async fn managed_agent_has_started_oauth_consent_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    _provider: String,
+    transit_point: String,
+    caller: String,
+) {
+    ensure_gateway_running(world).await;
+    let access_point_token =
+        crate::steps::when::create_valid_jwt_for_subject_with_world_claims(world, &caller, serde_json::json!({}));
+    crate::steps::when::send_request_and_record(
+        world,
+        vec![("authorization".to_string(), format!("Bearer {access_point_token}"))],
+    )
+    .await;
+    let transit_token = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must exist")
+        .mock
+        .last_request()
+        .await
+        .and_then(|forwarded| {
+            forwarded
+                .headers
+                .get("x-transit-token")
+                .cloned()
+        })
+        .expect("the Access Point hands the managed agent a transit token");
+    let transit_token = crate::steps::when::reissued_transit_token(
+        world,
+        &transit_token,
+        serde_json::json!({ "sub": format!("did:web:{agent_name}.example") }),
+    );
+    let token = crate::steps::when::create_valid_jwt_for_subject_with_world_claims(
+        world,
+        &caller,
+        serde_json::json!({ "aud": TRANSIT_AUDIENCE }),
+    );
+    let body = crate::bdd_support::json_rpc::build_mcp_tool_call_body("schedule_meeting", serde_json::json!({}));
+    crate::steps::when::send_mcp_request_through_transit_point_path_with_headers(
+        world,
+        &agent_name,
+        &format!("/transit/{transit_point}"),
+        body,
+        vec![("x-transit-token".to_string(), transit_token), ("authorization".to_string(), format!("Bearer {token}"))],
+    )
+    .await;
+}
+
 #[given("the identity provider issues ID tokens without the nonce of the sign-in")]
 async fn identity_provider_omits_nonce(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;

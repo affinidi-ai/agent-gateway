@@ -2509,6 +2509,50 @@ mod tests {
         assert_eq!(&vendor[..url::Position::AfterPath], "https://vendor.example/authorize");
     }
 
+    /// A surface held both in the surface store and in the gateway
+    /// configuration confirms only while every copy is of the sealed tenant:
+    /// a copy of another tenant, either one, refuses the confirmation.
+    #[tokio::test]
+    async fn a_confirmation_needs_every_copy_of_its_surface_in_the_sealed_tenant() {
+        use crate::surfaces::AgentSurfaceStore as _;
+        let surface = |tenant: Option<&str>| -> crate::config::agent_surface::AgentSurface {
+            serde_json::from_value(serde_json::json!({
+                "surface_id": "surface", "name": "Agent Surface", "tenant_id": tenant,
+                "access_point": {"listen_address": "https://gw.example", "route": "/mcp", "protocol": "mcp"},
+                "target": {"endpoint": "https://203.0.113.9/mcp"}
+            }))
+            .unwrap()
+        };
+        for (stored, configured, confirmed) in
+            [(None, Some("tenant-b"), false), (Some("tenant-b"), None, false), (None, None, true)]
+        {
+            let fixture = consent::Fixture::with_config_surfaces(vec![surface(configured)]).await;
+            fixture
+                .surfaces
+                .save(&surface(stored))
+                .await
+                .unwrap();
+            let strategy = fixture
+                .confirming_at_idp(None, None)
+                .await;
+            let sign_in = fixture
+                .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+                .await;
+            fixture
+                .idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+            let (answer, events) = capture(fixture.confirm_code(&sign_in)).await;
+            let case = format!("stored {stored:?}, configured {configured:?}");
+            if confirmed {
+                assert_eq!(answer.status, StatusCode::FOUND, "{case}: {}", answer.body);
+                assert!(events.is_empty(), "{case}: {events:?}");
+            } else {
+                consent::assert_refused(&answer, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+                assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid], "{case}");
+                assert!(fixture.idp_forms().is_empty(), "{case}: no code is exchanged");
+            }
+        }
+    }
+
     /// A confirmation whose strategy's remote JWKS cannot be fetched, with the
     /// strategy unchanged since the link was minted, is refused as
     /// unavailable credentials, not as an identity refusal, and stores

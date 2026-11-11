@@ -3880,7 +3880,7 @@ fn mcp_server_returns_tool_result(
 }
 
 #[given(expr = "the surface requires delegated credentials from OAuth provider {string}")]
-fn surface_requires_oauth_delegated_credentials(
+pub(crate) fn surface_requires_oauth_delegated_credentials(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
