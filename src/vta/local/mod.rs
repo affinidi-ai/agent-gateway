@@ -70,6 +70,15 @@ pub async fn shared() -> Result<Arc<LocalVta>, VtaError> {
         .cloned()
 }
 
+/// Remove the working store of the shared signer, when the process is about to
+/// exit. A process that is killed leaves it behind, and the next start removes
+/// it.
+pub fn remove_working_store() {
+    if let Some(vta) = SHARED.get() {
+        vta.remove_directory();
+    }
+}
+
 fn config_error(detail: impl std::fmt::Display) -> VtaError {
     VtaError::Config(format!("local signing: {detail}"))
 }
@@ -153,6 +162,10 @@ fn public_key_of(secret: &[u8; 32]) -> [u8; 32] {
 }
 
 impl LocalVta {
+    fn remove_directory(&self) {
+        let _ = std::fs::remove_dir_all(self._dir.path());
+    }
+
     /// Open a fresh working store under `root`.
     pub fn open(root: &Path) -> Result<Self, VtaError> {
         std::fs::create_dir_all(root).map_err(|e| config_error(format!("cannot create {}: {e}", root.display())))?;
@@ -501,6 +514,18 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn the_working_store_can_be_removed_before_the_process_exits() {
+        let root = tempfile::tempdir().expect("root");
+        let vta = LocalVta::open(root.path()).expect("open");
+        let dir = vta._dir.path().to_path_buf();
+        assert!(dir.exists());
+
+        vta.remove_directory();
+
+        assert!(!dir.exists());
     }
 
     #[test]

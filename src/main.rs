@@ -588,6 +588,7 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     };
+    vta::local::remove_working_store();
     if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, payments_ledger::flush_global())
         .await
         .is_err()
