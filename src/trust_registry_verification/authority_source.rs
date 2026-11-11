@@ -397,6 +397,44 @@ impl AuthorityRegisters {
     }
 }
 
+/// The literal DIDs of `references` found in neither register, each once.
+fn unlinked_dids(references: &[AuthorityReference]) -> Vec<&str> {
+    let mut dids: Vec<&str> = references
+        .iter()
+        .filter(|reference| {
+            reference.source.is_none()
+                && !is_template(&reference.did)
+                && !reference
+                    .did
+                    .trim()
+                    .is_empty()
+        })
+        .map(|reference| reference.did.as_str())
+        .collect();
+    dids.sort_unstable();
+    dids.dedup();
+    dids
+}
+
+/// Warns about the literal DIDs `record` names that are in neither register. One that named an
+/// Authority deleted before its link was recorded is indistinguishable from a DID typed in, so
+/// its Trust Check keeps querying the registry and its Trust Recorder entry keeps writing.
+pub fn warn_unlinked(
+    record: &str,
+    references: &[AuthorityReference],
+) {
+    let dids = unlinked_dids(references);
+    if !dids.is_empty() {
+        warn!(
+            record,
+            dids = ?dids,
+            "Trust Checks or Trust Recorder entries name DIDs in neither the Authorities nor the Issuers register; \
+             one that named an Authority deleted earlier is not checked against it, so point it at an Authority \
+             or remove it"
+        );
+    }
+}
+
 fn authority_dids(references: &[AuthorityReference]) -> HashSet<String> {
     references
         .iter()
@@ -775,6 +813,22 @@ mod tests {
                 .unwrap();
         }
         (store, dir)
+    }
+
+    #[test]
+    fn unlinked_dids_are_the_literal_dids_in_neither_register() {
+        let mut surface = surface(
+            vec![
+                check("issuer", BILLING, None),
+                check("typed", TYPED, None),
+                check("typed-again", TYPED, None),
+                check("template", "{{ input.agent.authority_did }}", None),
+            ],
+            "{{ surface.issuer_did }}",
+        );
+        registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None);
+
+        assert_eq!(unlinked_dids(&surface_references(&surface)), [TYPED]);
     }
 
     #[tokio::test]

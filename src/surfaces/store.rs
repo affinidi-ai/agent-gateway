@@ -40,31 +40,58 @@ pub trait AgentSurfaceStore: Send + Sync {
 }
 
 /// Classifies each literal authority DID of a stored surface by the register it is in, and
-/// saves a surface whose sources changed when `persist`, so a Trust Check or Trust Recorder
+/// when `persist` saves a surface whose sources changed, so a Trust Check or Trust Recorder
 /// entry whose Authority is deleted later fails instead of carrying on under a plain DID. A
-/// link to an Authority is never dropped, so registers read only in part cannot undo one; a
-/// surface that fails to save keeps its classification in memory and is saved on the next
-/// load.
+/// link to an Authority is never dropped, so registers read only in part cannot undo one.
+/// Before saving, the surface is read again and that copy is classified and served, so a
+/// write that landed since `surfaces` was listed is kept; a surface deleted since is dropped.
+/// A surface that fails to save keeps its classification in memory and is saved on the next
+/// load. Literal DIDs in neither register are logged, since one may name an Authority deleted
+/// before its link was recorded.
 ///
 /// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`].
 pub async fn record_authority_sources<S: AgentSurfaceStore + ?Sized>(
     store: &S,
-    surfaces: &mut [AgentSurface],
+    surfaces: &mut Vec<AgentSurface>,
     persist: bool,
     registers: &crate::trust_registry_verification::authority_source::AuthorityRegisters,
 ) {
+    use crate::trust_registry_verification::authority_source::{surface_references, warn_unlinked};
+
+    let mut gone = Vec::new();
     for surface in surfaces.iter_mut() {
-        if !registers.classify_surface(surface, None) || !persist {
-            continue;
+        let changed = registers.classify_surface(surface, None);
+        if changed && persist {
+            match store
+                .get(&surface.surface_id)
+                .await
+            {
+                Ok(Some(mut stored)) => {
+                    let stored_changed = registers.classify_surface(&mut stored, None);
+                    *surface = stored;
+                    if stored_changed && let Err(error) = store.save(surface).await {
+                        warn!(
+                            surface_id = %surface.surface_id,
+                            %error,
+                            "Failed to save where the authority DIDs of a surface's Trust Checks and Trust Recorder \
+                             entries come from"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    gone.push(surface.surface_id.clone());
+                    continue;
+                }
+                Err(error) => warn!(
+                    surface_id = %surface.surface_id,
+                    %error,
+                    "Failed to read a surface again before saving where its authority DIDs come from"
+                ),
+            }
         }
-        if let Err(error) = store.save(surface).await {
-            warn!(
-                surface_id = %surface.surface_id,
-                %error,
-                "Failed to save where the authority DIDs of a surface's Trust Checks and Trust Recorder entries come from"
-            );
-        }
+        warn_unlinked(&surface.surface_id, &surface_references(surface));
     }
+    surfaces.retain(|surface| !gone.contains(&surface.surface_id));
 }
 
 /// Auto-clear `header_metadata_mapping` config that targets a protocol other
@@ -944,8 +971,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = test_store(dir.path()).await;
         let registers = registers_with_authority("did:web:acme").await;
-        let mut surfaces =
-            vec![surface_linking("linked", "did:web:acme"), surface_linking("unlinked", "did:web:typed")];
+        let mut surfaces = listed(
+            &store,
+            vec![surface_linking("linked", "did:web:acme"), surface_linking("unlinked", "did:web:typed")],
+        )
+        .await;
 
         record_authority_sources(&store, &mut surfaces, true, &registers).await;
 
@@ -953,18 +983,62 @@ mod tests {
             .get("linked")
             .await
             .expect("get")
-            .expect("the linked surface is saved");
+            .expect("the linked surface is stored");
         assert_eq!(
             source_of(&saved),
             Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
         );
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_since_the_listing_is_classified_and_kept_rather_than_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = listed(&store, vec![surface_linking("linked", "did:web:acme")]).await;
+        let mut written = surface_linking("linked", "did:web:acme");
+        written.name = "renamed since".to_string();
+        store
+            .save(&written)
+            .await
+            .expect("save");
+
+        record_authority_sources(&store, &mut surfaces, true, &registers).await;
+
+        let saved = store
+            .get("linked")
+            .await
+            .expect("get")
+            .expect("stored");
+        assert_eq!(saved.name, "renamed since");
+        assert_eq!(
+            source_of(&saved),
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
+        assert_eq!(surfaces[0].name, "renamed since", "the copy served is the one stored");
+    }
+
+    #[tokio::test]
+    async fn a_surface_deleted_since_the_listing_is_not_saved_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = listed(&store, vec![surface_linking("linked", "did:web:acme")]).await;
+        store
+            .delete("linked")
+            .await
+            .expect("delete");
+
+        record_authority_sources(&store, &mut surfaces, true, &registers).await;
+
+        assert!(surfaces.is_empty());
         assert!(
             store
-                .get("unlinked")
+                .get("linked")
                 .await
                 .expect("get")
-                .is_none(),
-            "a surface whose sources did not change is not rewritten"
+                .is_none()
         );
     }
 

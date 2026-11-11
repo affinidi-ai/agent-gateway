@@ -141,7 +141,12 @@ pub async fn record_authority_sources(
         }
     };
     for mut client in clients {
-        if !registers.classify_trust_checks(&mut client.trust_check_list, client.tenant_id.as_deref(), None) {
+        let changed = registers.classify_trust_checks(&mut client.trust_check_list, client.tenant_id.as_deref(), None);
+        crate::trust_registry_verification::authority_source::warn_unlinked(
+            &client.id,
+            &crate::trust_registry_verification::authority_source::trust_check_references(&client.trust_check_list),
+        );
+        if !changed {
             continue;
         }
         let id = client.id.clone();
