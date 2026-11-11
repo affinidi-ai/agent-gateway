@@ -5,6 +5,7 @@ use crate::bdd_support::actors::TargetActorKind;
 use crate::bdd_support::admin_client::RecordedResponse;
 use crate::bdd_support::agent_card_preview::{CardPreviewApi, PreviewCaller};
 use crate::bdd_support::mock_server::MockResponse;
+use crate::steps::given::AGENT_IDENTITY_URI;
 use crate::steps::when::{ensure_admin_session, ensure_gateway_running};
 use crate::world::SurfaceWorld;
 
@@ -95,7 +96,7 @@ async fn managed_agent_serves_card_with_identity_extension_without_payload(
         "name": "Orders agent",
         "url": address,
         "skills": [],
-        "capabilities": {"extensions": [{"uri": "https://fabric.affinidi.io/extensions/agent-identity/v1"}]}
+        "capabilities": {"extensions": [{"uri": AGENT_IDENTITY_URI}]}
     })))
     .await;
 }

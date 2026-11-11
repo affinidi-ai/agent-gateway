@@ -36,7 +36,7 @@ use crate::bdd_support::config::agent_surface::{
     AccessPointFixture, AgentSurfaceFixture, TargetFixture, TransitPointFixture,
 };
 
-const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+pub(crate) const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
 const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 
 fn set_primary_target_response(

@@ -1236,7 +1236,8 @@ on a direct request to an inbound `from_api_key` surface, where the key's DID re
 
 On the protected slot, `payload_extraction` refuses a response that carries no identity with
 `422 identity_extension_missing`, and one whose identity is present but invalid with `422
-identity_validation_failed`. The public agent card of an A2A or AP2 surface is the exception for
+identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
+which any identity error serves without an identity credential. The public agent card of an A2A or AP2 surface is the exception for
 a missing identity: a card
 with neither `agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no
 identity credential and no Trust Recorder write, and the gateway logs a `WARN` once per surface.

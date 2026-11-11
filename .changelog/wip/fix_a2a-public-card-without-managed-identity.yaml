@@ -1,8 +1,7 @@
 branch: fix/a2a-public-card-without-managed-identity
 changes:
   added: []
-  changed: []
-  fixed:
+  changed:
     - timestamp: '2026-11-11T00:00:00Z'
       title: Report an invalid managed identity as identity_validation_failed
       description: >-
@@ -14,6 +13,7 @@ changes:
         whose presentation is missing or malformed. identity_extension_missing is kept for an
         identity that was not sent, so callers and operators can tell a missing identity from a
         bad one.
+  fixed:
     - timestamp: '2026-11-11T12:00:00Z'
       title: ⭐ Serve the public agent card when the managed agent publishes no identity
       description: >-
