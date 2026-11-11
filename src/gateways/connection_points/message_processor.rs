@@ -3173,7 +3173,9 @@ async fn read_forward_target_body(
     limits: crate::proxy::upstream_body::UpstreamBodyLimits,
     config_id: &str,
 ) -> Result<String, crate::proxy::upstream_body::UpstreamBodyError> {
-    let body_error = if is_sse_response {
+    let body_error = if crate::proxy::upstream_body::is_compressed(response.headers()) {
+        crate::proxy::upstream_body::UpstreamBodyError::Compressed
+    } else if is_sse_response {
         channel_info!(config_id, "GW2: Upstream responded with SSE — consuming stream for final response");
         match crate::mcp::sse_transport::consume_sse_response(response, request, limits).await {
             Ok(json_response) => return Ok(json_response),
@@ -5848,6 +5850,11 @@ async fn process_charged_forward_request(
                 );
                 continue;
             }
+            // The Target's answer is carried back as text, so it is asked for
+            // an uncompressed one below, whatever the sender accepts.
+            if key_lower == "accept-encoding" {
+                continue;
+            }
             // Skip host - reqwest sets :authority from the URL in HTTP/2;
             // forwarding an explicit Host header causes PROTOCOL_ERROR resets
             // from strict HTTP/2 servers (e.g. Google Frontend).
@@ -5885,6 +5892,7 @@ async fn process_charged_forward_request(
     } else {
         channel_info!(config_id, "  ↳ No headers to add");
     }
+    req = req.header(reqwest::header::ACCEPT_ENCODING, "identity");
 
     // Inject target authentication credentials (if configured on the channel)
     let mut target_token = None;
@@ -10817,6 +10825,27 @@ mod tests {
         assert!(body.contains("Upstream response timed out"), "{body}");
     }
 
+    /// The Target is asked for an uncompressed answer, which is carried back as
+    /// text; one compressed all the same is refused rather than corrupted.
+    #[tokio::test]
+    async fn a_compressed_forward_target_body_answers_502() {
+        use crate::proxy::upstream_body::tests::{PATIENT, chunk, limits, upstream};
+        use std::time::Duration;
+        for (head, is_sse) in [(JSON_HEAD, false), (SSE_HEAD, true)] {
+            let head = head.replace("\r\n\r\n", "\r\ncontent-encoding: gzip\r\n\r\n");
+            let response =
+                upstream(head, vec![(Duration::ZERO, chunk(b"\x1f\x8b\x08")), (Duration::ZERO, chunk(b""))]).await;
+
+            let result =
+                read_forward_target_body(response, is_sse, b"", limits(1024, Some(PATIENT), PATIENT), "surface-1")
+                    .await;
+
+            let (status, body) = forward_error_of(result).await;
+            assert_eq!(status, 502, "sse: {is_sse}");
+            assert!(body.contains("Upstream response is compressed"), "sse: {is_sse}: {body}");
+        }
+    }
+
     #[tokio::test]
     async fn forward_target_sse_body_is_reduced_to_its_response_and_bounded() {
         use crate::proxy::upstream_body::tests::{PATIENT, chunk, limits, upstream};
@@ -11446,7 +11475,9 @@ mod tests {
 
     /// The caller-info and DID identity headers and the caller's cookies a peer
     /// gateway sends, in any case, never reach the agent behind the receiving
-    /// surface; the peer's other headers do.
+    /// surface, and the agent is asked for an uncompressed answer whatever the
+    /// peer accepts, as an older sending gateway forwards its caller's value;
+    /// the peer's other headers reach the agent.
     #[tokio::test]
     async fn fabric_receive_drops_the_caller_info_headers_a_peer_sends() {
         use crate::surfaces::AgentSurfaceStore;
@@ -11513,6 +11544,7 @@ mod tests {
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
                 "Cookie": "__Host-session_token=peer-dashboard-session",
+                "Accept-Encoding": "gzip, br",
                 "x-peer-context": "kept"
             },
             "body": {"jsonrpc": "2.0", "method": "test", "id": 1}
@@ -11540,6 +11572,15 @@ mod tests {
             );
         }
         assert_eq!(received[0]["x-peer-context"], "kept");
+        assert_eq!(
+            received[0]
+                .get_all(axum::http::header::ACCEPT_ENCODING)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["identity"],
+            "{:?}",
+            received[0]
+        );
     }
 
     #[tokio::test]
