@@ -343,6 +343,29 @@ pub struct VtaConfig {
     pub max_contexts: usize,
 }
 
+/// `[local_signing]`: where the gateway's in-process signing library keeps its
+/// working store. The store holds nothing that needs backing up: it is rebuilt
+/// from the gateway's key files on every start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalSigningConfig {
+    /// A writable directory for the working store. Absent, the system
+    /// temporary directory is used. Never inside `_storage`.
+    #[serde(default)]
+    pub store_dir: Option<String>,
+}
+
+impl LocalSigningConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.store_dir.as_deref() {
+            Some(dir) if dir.trim().is_empty() => Err("[local_signing] store_dir must not be empty".to_string()),
+            Some(dir) if !std::path::Path::new(dir).is_absolute() => {
+                Err("[local_signing] store_dir must be an absolute path".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl Default for VtaConfig {
     fn default() -> Self {
         Self {
@@ -901,6 +924,30 @@ mod tests {
             .validate()
             .expect_err("a zero quota would refuse the very first surface");
         assert!(err.contains("max_contexts"), "explains the quota: {err}");
+    }
+
+    #[test]
+    fn local_signing_defaults_to_the_system_temporary_directory() {
+        let cfg: LocalSigningConfig = toml::from_str("").expect("parse");
+        assert_eq!(cfg.store_dir, None);
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn a_local_signing_store_dir_must_be_an_absolute_path() {
+        let absolute: LocalSigningConfig = toml::from_str("store_dir = \"/var/tmp/gw\"").expect("parse");
+        absolute
+            .validate()
+            .expect("valid");
+        for bad in ["", "  ", "relative/dir"] {
+            let cfg: LocalSigningConfig = toml::from_str(&format!("store_dir = \"{bad}\"")).expect("parse");
+            assert!(
+                cfg.validate()
+                    .expect_err(bad)
+                    .contains("store_dir"),
+                "{bad}"
+            );
+        }
     }
 
     // ── Deployment tier ──────────────────────────────────────────────────

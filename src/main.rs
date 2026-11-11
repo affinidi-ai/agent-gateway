@@ -1473,6 +1473,7 @@ fn render_default_bootstrap_toml(
         trust_registry: Default::default(),
         tenancy: Default::default(),
         vta: Default::default(),
+        local_signing: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),

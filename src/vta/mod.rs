@@ -42,6 +42,7 @@ pub mod inventory;
 pub mod isolation;
 pub mod key_directory;
 pub mod key_surfaces;
+pub mod local;
 pub mod onboarding;
 pub mod onboarding_default;
 pub mod pairing;

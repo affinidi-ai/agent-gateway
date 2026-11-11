@@ -37,6 +37,23 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   rotated without a new grant. After a rotation the trust agent keeps accepting the old key for
   its DID cache time (60 seconds by default, 300 at most).
 
+## Local signing
+
+- **The gateway's own keys still live in its files.** The VTA library signs with them from an
+  in-process working store, but the private keys are generated and kept by the gateway, so local
+  signing is a single code path, not a custody improvement. Generating keys inside the library
+  needs a storage design for a store shared by an Active and a Standby node.
+- **Credential proofs are `eddsa-rdfc-2022`.** The library signs `eddsa-jcs-2022` documents
+  itself; the gateway keeps building the RDFC hash data and has the library sign it, because
+  gateways that predate `eddsa-jcs-2022` verification would refuse JCS proofs. Moving to JCS
+  waits until every peer runs a release that verifies it.
+- **AP2 gateway presentations always sign locally.** They build their own local authority
+  instead of using the one selected for the surface, so a connected trust agent never signs them.
+- **The library's signing path decrypts the imported key and writes an audit row per
+  signature.** If that shows up in signing latency, a per-key cache belongs inside the library.
+- **`vta-service` needs `rest` and `didcomm` enabled to build.** Its default-features-off build
+  does not compile, and its HTTP dependency selects the aws-lc backend of the JWT library.
+
 ## Tenancy and publication
 
 - **No per-tenant default.** `KeyDirectory::with_tenant_mapping` exists but nothing calls it, and

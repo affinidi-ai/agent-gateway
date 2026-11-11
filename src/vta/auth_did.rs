@@ -439,15 +439,12 @@ async fn append_key_entry(
             .collect::<Vec<_>>()
     );
 
-    let multibase = signer.public_key_multibase();
-    let key_id = format!("did:key:{multibase}#{multibase}");
-    let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, &control_key_jwk(signer))
-        .map_err(|e| config("build the signing key", e.to_string()))?;
-    secret.id = key_id;
+    let secret = crate::vta::local::VtaDiSigner::from_jwk(&control_key_jwk(signer))
+        .map_err(|e| config("build the signing key", e.log_detail().to_string()))?;
 
     after_version_time(last).await;
     let updated = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(state)
             .signing_key(secret)
             .update_keys(
@@ -1440,12 +1437,9 @@ mod live_tests {
                 .map(|(id, _)| format!("{did}#{id}"))
                 .collect::<Vec<_>>()
         );
-        let mb = signer.public_key_multibase();
-        let key_id = format!("did:key:{mb}#{mb}");
-        let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, &control_key_jwk(signer)).expect("secret");
-        secret.id = key_id;
+        let secret = crate::vta::local::VtaDiSigner::from_jwk(&control_key_jwk(signer)).expect("secret");
         let result = didwebvh_rs::prelude::update_did(
-            didwebvh_rs::prelude::UpdateDIDConfig::builder()
+            didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
                 .state(state)
                 .signing_key(secret)
                 .update_keys(

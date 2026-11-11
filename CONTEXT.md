@@ -127,6 +127,7 @@ flowchart LR
 | Term | Meaning |
 | --- | --- |
 | **Trust agent** (VTA) | A Verifiable Trust Agent: a service that holds private keys and signs on request, within an access entry's grant. The gateway delegates its signing to one so that many stealable keys become one authority that can be withdrawn. It is a key-management improvement, not by itself a custody claim. _Avoid: signer, vault._ |
+| **Local signing** | What the gateway does with its own keys when no trust agent signs for it: the keys and DIDs stay as they are on disk, and every signature is made by the VTA library running inside the gateway process. It holds no custody claim: the keys are on the gateway's own host. _Avoid: embedded trust agent, built-in trust agent._ |
 | **Control key** | The key the gateway authenticates to a trust agent with. When it is a `did:key` held in a file it is rotated with `acl/swap-key`, on demand or on an optional schedule. _Avoid: auth key, admin key._ |
 
 ## Terms and consent

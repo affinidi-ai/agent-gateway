@@ -1009,6 +1009,7 @@ fn build_bootstrap_config(
         trust_registry: Default::default(),
         tenancy: Default::default(),
         vta: Default::default(),
+        local_signing: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),

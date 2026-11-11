@@ -209,6 +209,11 @@ proxy as before.
 | Encryption-at-rest key | When the gateway holds real credentials | A 32-byte key. Encryption at rest is off by default, so `_storage/` holds secrets in plain text until you turn it on. Choose the key source before the gateway stores data. See [Secrets and encryption at rest](CAPABILITIES.md#secrets-and-encryption-at-rest). |
 | `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance or keep grants by binding (`consent_mode: external`); otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. |
 
+The gateway also creates a small working store for its signing library under the system
+temporary directory (or `[local_signing] store_dir`). It holds only ciphertext that nothing
+outside the running process can decrypt, is rebuilt on every start and needs no backup, so the
+directory may be ephemeral but must be writable.
+
 Store the backup key and the encryption-at-rest key away from the backups. Losing either
 key makes the backups or `_storage/` unreadable. See [Secret references](CONFIGURATION_REFERENCE.md#secret-references)
 and [Environment variables](CONFIGURATION_REFERENCE.md#environment-variables).

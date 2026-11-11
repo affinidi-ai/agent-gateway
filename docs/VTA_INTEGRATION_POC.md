@@ -18,6 +18,35 @@ vehicle for the VTA integration PoC (VTA-01…07).
 - It **fails closed**: an unreachable VTA yields an error, never a fabricated
   token. Inputs are **verified before** any signing call (no signing oracle).
 
+## Local signing
+
+With no trust agent connected, the gateway signs with its own keys exactly as it always has:
+the same keys, the same DIDs, the same JWKS and the same `kid`s. What changed is who makes the
+signature: every signature is made by the VTA library running inside the gateway process, so a
+signing bug is fixed in one place for local and for remote signing alike.
+
+- The key files stay the source of truth (`issuer_config.json`, agent identity records,
+  `did:webvh` key pairs). Nothing new is persisted: the gateway imports each private key once
+  into an in-process VTA store the first time it signs with it, and the VTA signs from there.
+- The store is a working copy, in a directory this process alone owns (the system temporary
+  directory, or `[local_signing] store_dir`), encrypted with a key that only exists in memory.
+  It is rebuilt on every start, needs no backup, and is never inside `_storage`: the VTA's
+  embedded database locks its directory, and an Active and a Standby node share `_storage`. A
+  store left behind by a process that crashed is removed the next time any gateway starts in
+  the same directory.
+- Startup proves the library signs under the gateway's published key; the gateway refuses to
+  start otherwise.
+- Tokens (`sign-jws`) are signed over the exact payload bytes the gateway builds, so claims are
+  not reserialised. The only difference a verifier can see is the order of the header members,
+  which the VTA sorts.
+- Credential and presentation proofs stay `eddsa-rdfc-2022`: the gateway builds the canonical
+  hash data and the VTA signs those bytes, so gateways that predate `eddsa-jcs-2022`
+  verification still accept them. `did:webvh` log entries are signed the same way.
+- Not covered: DIDComm (the messaging library needs the key material for key agreement), the
+  HMAC transit token, third-party client assertion keys, x402 chain keys, and the control key
+  the gateway authenticates to a trust agent with.
+- Local signing claims no custody: the keys are on the gateway's own host.
+
 ## Architecture (one picture)
 
 ```

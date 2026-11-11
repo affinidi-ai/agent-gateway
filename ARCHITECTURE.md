@@ -402,7 +402,7 @@ from.
 | [`trust_registries/`](src/trust_registries/) | Trust registry connection records, display-name reference fields | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
 | [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder and its last-outcome status | [`POLICY.md`](docs/POLICY.md), [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status) |
 | [`sts/`](src/sts/) | RFC 8693 token exchange, and ID-JAG issuance and redemption | [`STS.md`](docs/STS.md) |
-| [`vta/`](src/vta/) | Delegating private-key operations to a Verifiable Trust Agent: the signing backends (`CredentialAuthority`, DI issuers), the Trust Task client, stored connections, per-surface key selection (`key_directory.rs`), control-key rotation (`control_rotation.rs`) and network isolation (`isolation.rs`) | [`VTA_INTEGRATION_POC.md`](docs/VTA_INTEGRATION_POC.md), [`VTA_OPEN_ITEMS.md`](docs/VTA_OPEN_ITEMS.md) |
+| [`vta/`](src/vta/) | Signing with the gateway's own keys through the in-process VTA library (`local/`), and delegating private-key operations to a Verifiable Trust Agent: the signing backends (`CredentialAuthority`, DI issuers), the Trust Task client, stored connections, per-surface key selection (`key_directory.rs`), control-key rotation (`control_rotation.rs`) and network isolation (`isolation.rs`) | [`VTA_INTEGRATION_POC.md`](docs/VTA_INTEGRATION_POC.md), [`VTA_OPEN_ITEMS.md`](docs/VTA_OPEN_ITEMS.md) |
 
 ### Policy
 

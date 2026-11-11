@@ -11,7 +11,7 @@ use ssi::claims::vc;
 use ssi::crypto::ed25519::VerifyingKey;
 use ssi::dids::DIDKey;
 use ssi::jwk::JWK;
-use ssi::prelude::{AnyMethod, AnySuite, CryptographicSuite, ProofOptions, SingleSecretSigner};
+use ssi::prelude::{AnyMethod, AnySuite, CryptographicSuite, ProofOptions};
 use ssi::verification_methods::LocalSigner as SsiLocalSigner;
 use ssi::verification_methods::{Multikey, ReferenceOrOwned};
 use ssi_json_ld::IriBuf;
@@ -184,7 +184,7 @@ impl LocalVpSigner {
             verification_method_unwrapped,
         );
 
-        let signer: SsiLocalSigner<SingleSecretSigner<JWK>> = SingleSecretSigner::new(holder_key.clone()).into_local();
+        let signer = SsiLocalSigner(crate::vta::local::VtaSsiSigner::new(crate::vta::local::secret_of(holder_key)?));
 
         let mut options = ProofOptions::from_method_and_options(verification_method, Default::default());
 

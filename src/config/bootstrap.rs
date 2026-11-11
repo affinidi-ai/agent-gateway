@@ -296,6 +296,10 @@ impl BootstrapConfig {
             .vta
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid [vta] configuration: {e}"))?;
+        config
+            .local_signing
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid [local_signing] configuration: {e}"))?;
 
         Ok(config)
     }

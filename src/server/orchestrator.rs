@@ -829,6 +829,16 @@ pub async fn run_axum_proxy(
         .await?,
     ));
     if let Some(ref issuer) = vc_issuer {
+        if let Some(dir) = &bootstrap_config
+            .local_signing
+            .store_dir
+        {
+            crate::vta::local::set_root(PathBuf::from(dir));
+        }
+        issuer
+            .verify_local_signing()
+            .await
+            .context("Local signing could not start")?;
         crate::payment_credentials::set_global_payment_vc_issuer(Arc::clone(issuer));
     }
 

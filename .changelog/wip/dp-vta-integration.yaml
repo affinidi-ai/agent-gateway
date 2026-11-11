@@ -80,6 +80,26 @@ changes:
         shows its signing key once connected, so a surface can be pinned to it
         while the appliance default is another trust agent.
   changed:
+    - timestamp: '2026-11-11T18:00:00Z'
+      title: ⭐ Sign with the gateway's own keys through the VTA library
+      description: >-
+        With no trust agent connected, the gateway now signs its tokens, agent
+        credentials, presentations and did:webvh log entries through the VTA
+        library running inside the gateway process, instead of with its own
+        signing code. Keys, DIDs, key ids and the published JWKS are unchanged,
+        credential proofs stay eddsa-rdfc-2022 so peers that verify them keep
+        accepting them, and a signing fix now lands in one place for local and
+        remote signing. The gateway refuses to start if the library does not
+        sign under its published key.
+    - timestamp: '2026-11-11T18:05:00Z'
+      title: Choose where local signing keeps its working store
+      description: >-
+        A new `[local_signing] store_dir` setting names the directory for the
+        encrypted working store the signing library uses. It defaults to the
+        system temporary directory, holds nothing that needs a backup, is
+        rebuilt on every start and is never inside the storage folder shared by
+        Active and Standby nodes. The gateway now builds against the aws-lc
+        backend of the JWT library, as the VTA crates require.
     - timestamp: '2026-11-08T21:30:00Z'
       title: Stop granting raw sign to the gateway on a trust agent
       description: >-

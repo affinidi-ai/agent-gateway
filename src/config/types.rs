@@ -3150,6 +3150,11 @@ pub struct BootstrapConfig {
     /// its local issuer key. Startup-only. See `src/config/vta.rs`.
     #[serde(default)]
     pub vta: crate::config::vta::VtaConfig,
+
+    /// Where the gateway keeps the working store its signing library uses when
+    /// no trust agent signs for it. Startup-only. See `src/config/vta.rs`.
+    #[serde(default)]
+    pub local_signing: crate::config::vta::LocalSigningConfig,
     /// Credential provider rules (`[credential_policy]`): https token endpoints,
     /// tenant credential isolation, and the exact http endpoints allowed.
     /// Startup-only; every rule defaults to `warn`.

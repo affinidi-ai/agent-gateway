@@ -72,7 +72,7 @@ VP (`urn:affinidi:params:oauth:token-type:vp`).
   verified via `VCIssuer::verify_agent_presentation_full` (`VcIssuerVpVerifier`)
   and the exchanged token's subject becomes the cryptographically-proven
   credential-subject DID.
-- **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`,
+- **Issued tokens** are EdDSA-signed via `VCIssuer::sign_jwt_with_gateway_key`, which signs through the in-process VTA library (see [Local signing](VTA_INTEGRATION_POC.md#local-signing)),
   verifiable by resolving the gateway DID document or the JWKS endpoint. An
   issued **ID-JAG additionally carries the explicit JOSE `typ:
   oauth-id-jag+jwt` header** (`ID_JAG_JWT_TYP`, via

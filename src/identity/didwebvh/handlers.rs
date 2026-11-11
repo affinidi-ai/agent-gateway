@@ -72,23 +72,14 @@ fn format_did_domain(base_url: &str) -> String {
     domain.replace(':', "%3A")
 }
 
-/// Build a didwebvh-rs `Secret` suitable for signing from a JWK private key.
+/// Build the log signer for a JWK private key.
 ///
-/// The library requires the `Secret.id` to be a `did:key:` URI matching one of the
-/// DID log's `update_keys`.  We derive the multibase public key from the JWK,
-/// construct the canonical `did:key:<mb>#<mb>` identifier, and build the secret.
-fn build_signing_secret(private_key_jwk: &serde_json::Value) -> Result<didwebvh_rs::prelude::Secret, String> {
-    let temp_id = "did:key:temp#temp";
-    let raw = didwebvh_rs::prelude::Secret::from_str(temp_id, private_key_jwk)
-        .map_err(|e| format!("Failed to build key Secret: {e}"))?;
-    let mb = raw
-        .get_public_keymultibase()
-        .map_err(|e| format!("Failed to get key multibase: {e}"))?;
-    let key_id = format!("did:key:{0}#{0}", mb);
-    let mut secret = didwebvh_rs::prelude::Secret::from_str(&key_id, private_key_jwk)
-        .map_err(|e| format!("Failed to build signing Secret: {e}"))?;
-    secret.id = key_id;
-    Ok(secret)
+/// The library requires the signer's verification method to be a `did:key:` URI
+/// matching one of the DID log's `update_keys`; the signer derives the canonical
+/// `did:key:<mb>#<mb>` identifier from the key itself.
+fn build_signing_secret(private_key_jwk: &serde_json::Value) -> Result<crate::vta::local::VtaDiSigner, String> {
+    crate::vta::local::VtaDiSigner::from_jwk(private_key_jwk)
+        .map_err(|e| format!("Failed to build signing key: {}", e.log_detail()))
 }
 
 /// Load raw log entries and build a validated `DIDWebVHState`.
@@ -642,7 +633,7 @@ pub async fn delete_identity(
 
     // Deactivate via library — handles pre-rotation teardown automatically
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(signing_secret)
             .deactivate(true)
@@ -899,10 +890,13 @@ pub async fn update_identity(
     })?;
 
     // Build update config with optional parameter changes
-    let mut builder = didwebvh_rs::prelude::UpdateDIDConfig::builder()
-        .state(webvh_state)
-        .signing_key(signing_secret)
-        .document(new_doc_json);
+    let mut builder = didwebvh_rs::prelude::UpdateDIDConfig::<
+        crate::vta::local::VtaDiSigner,
+        crate::vta::local::VtaDiSigner,
+    >::builder_generic()
+    .state(webvh_state)
+    .signing_key(signing_secret)
+    .document(new_doc_json);
 
     if let Some(ttl) = request.ttl {
         builder = builder.ttl(ttl);
@@ -1135,14 +1129,8 @@ pub async fn rotate_keys(
         (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse::with_details("Failed to build new key", e)))
     })?;
     let new_mb = new_secret
-        .get_public_keymultibase()
-        .map_err(|e| {
-            error!("Failed to get new key multibase: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse::with_details("Failed to get new key multibase", e.to_string())),
-            )
-        })?;
+        .public_multibase()
+        .to_string();
 
     // Build DIDWebVHState from raw log entries (preserves original bytes for validation)
     let (_, webvh_state) = load_raw_and_build_state(state.log_storage.as_ref(), &did)
@@ -1154,7 +1142,7 @@ pub async fn rotate_keys(
 
     // Call update_did() — library computes entry hash, verifies auth, signs
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(old_secret)
             .update_keys(vec![didwebvh_rs::Multibase::new(new_mb)])
@@ -1619,7 +1607,7 @@ pub async fn transfer_ownership(
 
     // Use update_did() with no document change — just creates a signed log entry
     let update_result = didwebvh_rs::prelude::update_did(
-        didwebvh_rs::prelude::UpdateDIDConfig::builder()
+        didwebvh_rs::prelude::UpdateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .state(webvh_state)
             .signing_key(signing_secret)
             .build()

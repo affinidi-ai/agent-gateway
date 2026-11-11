@@ -35,16 +35,11 @@ pub(crate) async fn create_webvh_did(
     did_document: serde_json::Value,
     base_url: &str,
 ) -> Result<WebVhCreateResult> {
-    let temp_key_id = "did:key:temp#temp".to_string();
-    let raw_secret = didwebvh_rs::prelude::Secret::from_str(&temp_key_id, ed25519_private_jwk)
-        .map_err(|e| anyhow::anyhow!("Failed to convert Ed25519 key to Secret: {}", e))?;
-    let multibase_pubkey = raw_secret
-        .get_public_keymultibase()
-        .map_err(|e| anyhow::anyhow!("Failed to get multibase public key: {}", e))?;
-    let did_key_id = format!("did:key:{0}#{0}", multibase_pubkey);
-    let mut auth_secret = didwebvh_rs::prelude::Secret::from_str(&did_key_id, ed25519_private_jwk)
-        .map_err(|e| anyhow::anyhow!("Failed to build auth secret: {}", e))?;
-    auth_secret.id = did_key_id;
+    let auth_signer = crate::vta::local::VtaDiSigner::from_jwk(ed25519_private_jwk)
+        .map_err(|e| anyhow::anyhow!("Failed to build the signing key: {}", e.log_detail()))?;
+    let multibase_pubkey = auth_signer
+        .public_multibase()
+        .to_string();
 
     let parameters = Parameters {
         update_keys: Some(std::sync::Arc::new(vec![didwebvh_rs::Multibase::new(multibase_pubkey.clone())])),
@@ -53,9 +48,9 @@ pub(crate) async fn create_webvh_did(
 
     let normalized_base = format!("{}/", base_url.trim_end_matches('/'));
     let create_result = create_did(
-        CreateDIDConfig::builder()
+        CreateDIDConfig::<crate::vta::local::VtaDiSigner, crate::vta::local::VtaDiSigner>::builder_generic()
             .address(normalized_base)
-            .authorization_key(auth_secret)
+            .authorization_key(auth_signer)
             .did_document(did_document)
             .parameters(parameters)
             .build()

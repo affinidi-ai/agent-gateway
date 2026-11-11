@@ -146,11 +146,11 @@ pub async fn build_issuer_attestation(
 
 /// Sign explicit claims with an explicit key.
 #[cfg(test)]
-pub(crate) fn sign_issuer_attestation(
+pub(crate) async fn sign_issuer_attestation(
     claims: &IssuerAttestationClaims,
     key: &ssi::jwk::JWK,
 ) -> anyhow::Result<String> {
-    VCIssuer::sign_jwt_with_typ(&serde_json::to_value(claims)?, key, ISSUER_ATTESTATION_TYP)
+    VCIssuer::sign_jwt_with_typ(&serde_json::to_value(claims)?, key, ISSUER_ATTESTATION_TYP).await
 }
 
 /// Verify an attestation carried in a message body, resolving the issuer DID
@@ -463,20 +463,24 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn build_then_verify_returns_iss() {
+    #[tokio::test]
+    async fn build_then_verify_returns_iss() {
         let a = issuer(GW_A);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
 
         let iss = verify_issuer_attestation_with_document(&jwt, expected(), &a.document);
 
         assert_eq!(iss, Ok(GW_A.to_string()));
     }
 
-    #[test]
-    fn header_typ_is_gateway_issuer_attestation() {
+    #[tokio::test]
+    async fn header_typ_is_gateway_issuer_attestation() {
         let a = issuer(GW_A);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
 
         let header = decode_header(&jwt);
 
@@ -485,11 +489,13 @@ mod tests {
         assert_eq!(header["kid"], "key-1");
     }
 
-    #[test]
-    fn claims_carry_sub_aud_nonce_iat_exp() {
+    #[tokio::test]
+    async fn claims_carry_sub_aud_nonce_iat_exp() {
         let a = issuer(GW_A);
         let claims = claims_for(&a);
-        let jwt = sign_issuer_attestation(&claims, &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims, &a.key)
+            .await
+            .unwrap();
 
         let decoded = decode_claims(&jwt);
 
@@ -501,21 +507,25 @@ mod tests {
         assert_eq!(decoded.exp - decoded.iat, ISSUER_ATTESTATION_LIFETIME_SECS);
     }
 
-    #[test]
-    fn wrong_signer_same_iss_is_rejected() {
+    #[tokio::test]
+    async fn wrong_signer_same_iss_is_rejected() {
         let a = issuer(GW_A);
         let b = issuer(GW_B);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &b.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &b.key)
+            .await
+            .unwrap();
 
         let result = verify_issuer_attestation_with_document(&jwt, expected(), &a.document);
 
         assert_eq!(result, Err(IssuerAttestationError::InvalidSignature));
     }
 
-    #[test]
-    fn sub_mismatch_is_rejected() {
+    #[tokio::test]
+    async fn sub_mismatch_is_rejected() {
         let a = issuer(GW_A);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
         let other_sub = ExpectedAttestation {
             sub: "did:web:gw-c.example:connection-points:3333",
             ..expected()
@@ -532,10 +542,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn aud_mismatch_is_rejected() {
+    #[tokio::test]
+    async fn aud_mismatch_is_rejected() {
         let a = issuer(GW_A);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
         let other_aud = ExpectedAttestation {
             aud: "did:web:gw-c.example:connection-points:3333",
             ..expected()
@@ -552,10 +564,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nonce_mismatch_is_rejected() {
+    #[tokio::test]
+    async fn nonce_mismatch_is_rejected() {
         let a = issuer(GW_A);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
         let other_nonce = ExpectedAttestation { nonce: "nonce-2", ..expected() };
 
         let result = verify_issuer_attestation_with_document(&jwt, other_nonce, &a.document);
@@ -563,26 +577,30 @@ mod tests {
         assert_eq!(result, Err(IssuerAttestationError::NonceMismatch));
     }
 
-    #[test]
-    fn expired_is_rejected() {
+    #[tokio::test]
+    async fn expired_is_rejected() {
         let a = issuer(GW_A);
         let mut claims = claims_for(&a);
         claims.iat -= 1_000;
         claims.exp = claims.iat + ISSUER_ATTESTATION_LIFETIME_SECS;
-        let jwt = sign_issuer_attestation(&claims, &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims, &a.key)
+            .await
+            .unwrap();
 
         let result = verify_issuer_attestation_with_document(&jwt, expected(), &a.document);
 
         assert_eq!(result, Err(IssuerAttestationError::Expired));
     }
 
-    #[test]
-    fn iat_beyond_skew_is_rejected() {
+    #[tokio::test]
+    async fn iat_beyond_skew_is_rejected() {
         let a = issuer(GW_A);
         let mut claims = claims_for(&a);
         claims.iat += 600;
         claims.exp = claims.iat + ISSUER_ATTESTATION_LIFETIME_SECS;
-        let jwt = sign_issuer_attestation(&claims, &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims, &a.key)
+            .await
+            .unwrap();
 
         let result = verify_issuer_attestation_with_document(&jwt, expected(), &a.document);
 
@@ -619,23 +637,27 @@ mod tests {
         assert_eq!(result, Err(IssuerAttestationError::InvalidSignature));
     }
 
-    #[test]
-    fn non_did_iss_is_rejected() {
+    #[tokio::test]
+    async fn non_did_iss_is_rejected() {
         let a = issuer(GW_A);
         let mut claims = claims_for(&a);
         claims.iss = "https://gw-a.example".into();
-        let jwt = sign_issuer_attestation(&claims, &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims, &a.key)
+            .await
+            .unwrap();
 
         let result = verify_issuer_attestation_with_document(&jwt, expected(), &a.document);
 
         assert_eq!(result, Err(IssuerAttestationError::InvalidIssuer("https://gw-a.example".into())));
     }
 
-    #[test]
-    fn document_for_a_different_did_is_rejected() {
+    #[tokio::test]
+    async fn document_for_a_different_did_is_rejected() {
         let a = issuer(GW_A);
         let b = issuer(GW_B);
-        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key).unwrap();
+        let jwt = sign_issuer_attestation(&claims_for(&a), &a.key)
+            .await
+            .unwrap();
 
         let result = verify_issuer_attestation_with_document(&jwt, expected(), &b.document);
 
