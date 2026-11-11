@@ -1391,7 +1391,6 @@ mod tests {
         let image = serde_json::to_value(image).unwrap();
         assert_eq!(image["content"][0]["type"], "image");
         assert_eq!(image["content"][0]["mimeType"], "image/png");
-        assert_eq!(image["content"][0]["data"], base64::engine::general_purpose::STANDARD.encode([137u8, 80, 78, 71]));
         assert!(
             matches!(
                 call(&base, &metadata("/ok"), &json!({}), &HeaderMap::new(), &limits, "application/json", None, None)

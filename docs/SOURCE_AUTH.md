@@ -339,8 +339,9 @@ On a closed surface the admin API, on create and on every update:
 #### Legacy Access Points after upgrading
 
 v1.0.7 and earlier handed a caller whose credential was missing or invalid to policy on
-a legacy surface (no `public`) that authenticates callers, so such a caller reached the Target
-unless a policy denied `input.source_auth.method == "failed"`. Every surface created before
+a legacy surface (no `public`) that authenticates callers without `on_failure: reject`, an
+inbound `from_jwt_claim` identity or protected resource metadata, so such a caller reached the
+Target unless a policy denied `input.source_auth.method == "failed"`. Every surface created before
 v1.0.4 (2026-11-02), built from DynamoDB, restored from an older backup or edited by hand
 without `public` is legacy, unless it was later closed or made public. Such a surface now
 refuses that caller with `401` before policy and the Target, on direct inbound, `proxy://` MCP
@@ -368,6 +369,9 @@ concern.
 
 To find the affected surfaces and callers:
 
+- from storage, with no traffic needed: a surface is affected when it stores no `public` and
+  its Access Point, or an enabled variant, sets `caller_authentication` without
+  `on_failure: reject`, an inbound `from_jwt_claim` identity or protected resource metadata;
 - before upgrading, look in the audit log for `auth_failed` events with `blocking: false` on
   surfaces stored without `public`: each is a caller that is now refused. Public surfaces
   record the same event and are unaffected. The VP Audit Log keeps `auth_failed` only while
@@ -377,7 +381,8 @@ To find the affected surfaces and callers:
 - after upgrading, the gateway logs a warning when it starts (not on a configuration reload,
   a storage refresh or a backup restore, so restart after one) for each active legacy surface
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
-  resource metadata or `on_failure: reject`, which refused already), naming the surface:
+  resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
+  already), naming the surface:
   `This Access Point is neither closed nor public, and it refuses callers whose credential is
   missing or invalid with 401, as a closed one does …`;
 - the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
@@ -855,8 +860,10 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
 - A legacy surface (no `public`) with source authentication refuses a failed caller with
   `401`; v1.0.7 and earlier handed that caller to policy. Nothing is written to the stored
   surface, so a rollback to v1.0.7 or earlier loads it unchanged, and hands its failed callers
-  to policy again. See [Legacy Access Points after upgrading](#legacy-access-points-after-upgrading)
-  to find the callers that are refused and to keep admitting them.
+  to policy again. A surface closed with `public: false` before upgrading keeps refusing failed
+  callers after a rollback to v1.0.4–v1.0.7; releases before v1.0.4 cannot load it. See
+  [Legacy Access Points after upgrading](#legacy-access-points-after-upgrading) to find the
+  callers that are refused and to keep admitting them.
 
 ### Transit Point source authentication
 

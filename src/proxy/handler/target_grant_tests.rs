@@ -393,6 +393,29 @@ async fn the_owners_grant_goes_to_the_target_in_place_of_the_callers_credentials
         1,
         "an unidentified caller reaches no vendor"
     );
+
+    let mut public = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+    public.access_point.public = Some(true);
+    fixture.serve(public).await;
+    for (case, key) in
+        [("no API key on a public surface", None), ("another API key on a public surface", Some("key-b"))]
+    {
+        let (status, headers, body) = fixture
+            .send(mcp_call(key))
+            .await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{case}: {body}");
+        assert_eq!(body["id"], 7, "{case}");
+        assert_eq!(body["error"]["code"], -32001, "{case}");
+        assert_eq!(headers["cache-control"], "no-store", "{case}");
+    }
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        1,
+        "a public surface releases the owner's grant to no unidentified caller"
+    );
 }
 
 /// A caller's grant goes to that caller only: another caller's grant is never

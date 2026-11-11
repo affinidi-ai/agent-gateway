@@ -12,7 +12,8 @@ changes:
         In v1.0.7 and earlier, a legacy surface, one stored without access_point.public (created before v1.0.4,
         built from DynamoDB, restored from an older backup or edited by hand, and never closed
         or made public since), handed a caller whose credential was missing or invalid to
-        policy even when it requires caller authentication, so unless a policy denied
+        policy when it requires caller authentication without on_failure: reject, an inbound
+        from_jwt_claim identity or protected resource metadata, so unless a policy denied
         input.source_auth.method == "failed" the request reached the Target. Such a caller is
         now refused with 401 before policy and the Target, as on a closed Access Point, on
         direct inbound, proxy:// MCP Targets, a2a-proxy:// Targets and Fabric receive. Only a
@@ -27,7 +28,8 @@ changes:
         start for each legacy surface that now refuses them. To keep admitting failed callers,
         mark the surface public (the Public access switch, or a public attribute of true on a
         DynamoDB item). Nothing is written to the stored surface, so a rollback to v1.0.7 or
-        earlier loads it unchanged and reopens it. Like a closed Access Point's, these refusals
+        earlier loads it unchanged and reopens it; a surface closed with public false before
+        upgrading keeps refusing failed callers after a rollback to v1.0.4 to v1.0.7. Like a closed Access Point's, these refusals
         return before the surface rate limit, so repeated wrong credentials no longer count
         against it. The dashboard's legacy
         notice now says failed callers are refused. See "Legacy Access Points after upgrading"

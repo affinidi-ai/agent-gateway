@@ -578,6 +578,11 @@ pub(crate) fn build_surface_payload(
                     .surface_config
                     .additional_source_auth
                     .is_empty()
+                && world
+                    .surface_config
+                    .mcp_http
+                    .as_ref()
+                    .is_none_or(|mcp_http| mcp_http["authorization"].is_null())
         });
 
     serde_json::json!({

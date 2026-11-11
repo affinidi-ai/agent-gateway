@@ -3961,11 +3961,16 @@ impl AgentSurface {
     /// resource token (`mcp_http.authorization`, which replaces caller
     /// authentication), and its base or
     /// an enabled variant authenticates callers with neither protected
-    /// resource metadata nor `on_failure: reject`, which refuse failed callers
-    /// on any Access Point.
+    /// resource metadata, `on_failure: reject` nor an inbound `from_jwt_claim`
+    /// identity, which refuse failed callers on any Access Point.
     pub fn legacy_access_point_notice(&self) -> Option<&'static str> {
         let refused_only_as_legacy = |surface: &AgentSurface| {
             surface.has_source_auth()
+                && !surface
+                    .inbound_identity()
+                    .is_some_and(|identity| {
+                        matches!(identity, crate::source_auth::ManagedIdentityConfig::FromJwtClaim { .. })
+                    })
                 && surface
                     .access_point
                     .caller_authentication
@@ -4723,6 +4728,30 @@ mod tests {
                 .legacy_access_point_notice(),
             None,
             "a resource token replaces caller authentication"
+        );
+        let mut from_jwt_claim = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+        ]}}));
+        from_jwt_claim["identity_slots"] =
+            serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}});
+        assert_eq!(
+            serde_json::from_value::<super::AgentSurface>(from_jwt_claim)
+                .unwrap()
+                .legacy_access_point_notice(),
+            None,
+            "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
+        );
+        let mut from_jwt_claim = surface_with_access_point(serde_json::json!({"caller_authentication": {"methods": [
+            {"type": "jwt_bearer", "jwt_verification_strategy_id": "idp", "audiences": []}
+        ]}}));
+        from_jwt_claim["identity_slots"] =
+            serde_json::json!({"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}});
+        assert_eq!(
+            serde_json::from_value::<super::AgentSurface>(from_jwt_claim)
+                .unwrap()
+                .legacy_access_point_notice(),
+            None,
+            "an inbound from_jwt_claim identity refuses failed callers on any Access Point"
         );
         for status in ["disabled", "deleted"] {
             let mut stopped = surface_with_access_point(

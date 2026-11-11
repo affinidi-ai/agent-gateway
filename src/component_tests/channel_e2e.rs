@@ -348,7 +348,8 @@ async fn source_auth_credential_header_not_forwarded_upstream() {
 
 /// With `forward_header`, the caller's token reaches the target only when it
 /// verified; an expired token, one from another issuer, or a second token
-/// beside a valid one is refused with `401` before the target.
+/// beside a valid one is refused with `401` before the target, and a public
+/// Access Point forwards such a caller without its token.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_header_passes_on_only_a_verified_token() {
     let fixture = JwksFixture::start().await;
@@ -423,6 +424,44 @@ async fn forward_header_passes_on_only_a_verified_token() {
             "{case}"
         );
     }
+
+    let public = GatewayHarness::start(|temp_dir, gw_config, _bootstrap| {
+        setup_jwt_bearer_auth_rejects_missing_then_accepts_valid(&fixture, temp_dir, gw_config);
+        let surface = &mut gw_config.surfaces[0];
+        surface.access_point.public = Some(true);
+        if let Some(crate::source_auth::SourceAuthConfig::JwtBearer(jwt)) = surface
+            .access_point
+            .caller_authentication
+            .as_mut()
+            .and_then(|caller| caller.methods.first_mut())
+        {
+            jwt.forward_header = true;
+        }
+    })
+    .await;
+    let resp = client
+        .post(&public.gateway_url)
+        .header("authorization", format!("Bearer {}", sign(&fixture.issuer, now_secs() - 3600)))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("request failed");
+    assert_response(resp).await;
+    assert_forwarded_request(&public.mock, body);
+    let received = public
+        .mock
+        .last_request_rx
+        .borrow()
+        .clone()
+        .expect("mock did not receive a request");
+    assert!(
+        !received
+            .headers
+            .contains_key("authorization"),
+        "a public Access Point forwards an unverified caller without its token: {:?}",
+        received.headers
+    );
 }
 
 /// The managed agent learns who is calling only from the caller-info and DID
