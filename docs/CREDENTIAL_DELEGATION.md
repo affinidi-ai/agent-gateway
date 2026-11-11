@@ -1969,7 +1969,7 @@ provider. It changes how new consent is obtained, not how stored grants are foun
 
 | Field | Meaning |
 | --- | --- |
-| `client_id` | The gateway's login client at the callers' identity provider. A plain value: a client id is not a secret |
+| `client_id_secret_ref` | The secret ID of the client ID of the gateway's login client at the callers' identity provider, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant). The secret's value is the client ID |
 | `client_secret_secret_ref` | The secret ID of the login client's secret, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant) |
 | `authorization_endpoint` | The identity provider's authorization endpoint |
 | `token_endpoint` | The identity provider's token endpoint. The code exchange goes through the provider egress |
@@ -1987,8 +1987,9 @@ On create and update, a provider with the setting is refused with `400` and this
 | --- | --- |
 | The provider is not legacy consent | `consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer` |
 | `AG_IDENTITY_HASH_PEPPER` is not set | `consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set` |
-| A required field is blank | `consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id` |
-| `client_id` is too long or has whitespace | `consent_confirmation.client_id must be at most 2048 characters, without whitespace` |
+| A required field is blank | `consent_confirmation needs client_id_secret_ref, client_secret_secret_ref and jwt_verification_strategy_id` |
+| `client_id_secret_ref` or `client_secret_secret_ref` names no secret of the provider's own tenant, or one the token's scope does not cover | `Secret reference is not accessible` |
+| The client ID in `client_id_secret_ref` is longer than 2048 characters or has whitespace or control characters | `consent_confirmation.client_id_secret_ref must hold a client ID of at most 2048 characters, without whitespace` |
 | `id_token_principal_claim` names no caller | `consent_confirmation.id_token_principal_claim: …` |
 | `authorization_endpoint` is not an `https` URL with a host and no query or fragment | `consent_confirmation.authorization_endpoint: …`, or `consent_confirmation.authorization_endpoint must be an https URL with a host and no query or fragment` |
 | `token_endpoint` breaks the [token endpoint rules](#https-token-endpoints) | `consent_confirmation.token_endpoint: …`, or `consent_confirmation.token_endpoint must be an https URL` |
@@ -2010,8 +2011,8 @@ A consent link confirms its caller when all of these hold:
 - the request reached the surface's Access Point;
 - the provider is still legacy consent, the pepper is set, and the setting's strategy still
   exists, can be referenced by the provider's tenant and passes the strategy and claim rules
-  above (the endpoints, `client_id` and the client secret are checked at the start POST and at
-  `/confirm`, not at mint);
+  above (the endpoints and the login client ID and secret are read and checked at the start POST
+  and at `/confirm`, not at mint);
 - the caller is a `jwt_bearer` caller whose `iss` is the strategy's `expected_issuer` and whose
   principal claim is the strategy's `principal_claim`;
 - the caller's identity hash is the one the strategy gives that caller.
@@ -2059,8 +2060,11 @@ Consent confirmation therefore does not cover:
 2. The start POST checks the setting again. The setting must still name the sealed strategy,
    the strategy must exist with the provider's tenant able to reference it, and its issuer,
    JWKS source and principal claim must be unchanged. The `authorization_endpoint` must pass
-   the save rules, without its host being resolved. The POST then answers `302` to the
-   `authorization_endpoint` with `response_type=code`, the login `client_id`,
+   the save rules, without its host being resolved. The login client ID is read from
+   `client_id_secret_ref` as the provider's other
+   [secrets](#provider-secrets-belong-to-the-providers-tenant) are read; a secret that
+   cannot be read refuses the POST with `credentials_unavailable`. The POST then answers `302`
+   to the `authorization_endpoint` with `response_type=code`, the login `client_id`,
    `redirect_uri={redirect URI}/confirm`, `scope`, a confirmation `state`, a random `nonce`
    sealed in that state, a PKCE `S256` challenge and `response_mode=query`. The scope is
    `openid` when the ID-token claim is `sub`, and `openid profile` otherwise. The binding
@@ -2076,6 +2080,8 @@ Consent confirmation therefore does not cover:
      source and principal claim are unchanged, and the setting still passes the save rules;
    - an `iss` (RFC 9207), when sent, is the strategy's `expected_issuer`. A response without
      `iss` is accepted, since no identity provider metadata is fetched;
+   - the login client ID and secret can be read as at the start POST, or the request is
+     refused with `credentials_unavailable` before the exchange;
    - the code exchange at `token_endpoint`, with the login client's id and secret and the PKCE
      verifier, through the pinned provider egress within its timeout, answers an `id_token`.
      A failed exchange is logged as a `WARN` with its cause, or with the HTTP status and the

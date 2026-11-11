@@ -73,27 +73,18 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
 
       {form.consent_confirmation_enabled && (
         <>
-          <div className="mb-3">
-            <div className="field-label-with-help">
-              <label htmlFor="cc_client_id" className="mb-0">
-                Login Client ID <span className="text-danger">*</span>
-              </label>
-              <FieldHelp ariaLabel="About Login Client ID" testId="field-help-cc-client-id">
-                The client ID of the gateway&apos;s login client at the callers&apos; identity
-                provider. A client ID is not a secret, so it is typed here.
-              </FieldHelp>
-            </div>
-            <input
-              id="cc_client_id"
-              name="cc_client_id"
-              data-testid="credential-provider-consent-confirmation-client-id-input"
-              type="text"
-              className="form-control"
-              value={form.cc_client_id}
-              onChange={onChange}
-              required
-            />
-          </div>
+          <SecretSelect
+            id="cc_client_id_secret_ref"
+            label="Login Client ID"
+            required
+            help="The value itself is never shown or copied into this form, only a reference to where it's stored."
+            hint="Pick the secret holding the client ID of the gateway's login client at the callers' identity provider."
+            value={form.cc_client_id_secret_ref}
+            secrets={secrets}
+            ownerTenant={ownerTenant}
+            loading={loadingSecrets}
+            onChange={onChange}
+          />
 
           <SecretSelect
             id="cc_client_secret_secret_ref"
@@ -267,10 +258,10 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                 data-testid="credential-provider-consent-confirmation-redirect-uri-where"
               >
                 Add this URI to the allowed redirect URIs of the login client
-                {form.cc_client_id.trim() ? (
+                {form.cc_client_id_secret_ref ? (
                   <>
                     {' '}
-                    <code>{form.cc_client_id.trim()}</code>
+                    whose ID is in secret <code>{form.cc_client_id_secret_ref}</code>
                   </>
                 ) : null}{' '}
                 at your identity provider. Don&apos;t add it at the vendor: the vendor&apos;s OAuth

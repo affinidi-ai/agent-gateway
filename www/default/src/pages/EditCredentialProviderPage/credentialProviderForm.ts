@@ -323,7 +323,7 @@ export interface ConsentConfirmationFormFields {
   consent_confirmation_enabled: boolean;
   /** Whether the loaded provider has the setting; false for a new one. */
   consent_confirmation_stored: boolean;
-  cc_client_id: string;
+  cc_client_id_secret_ref: string;
   cc_client_secret_secret_ref: string;
   cc_authorization_endpoint: string;
   cc_token_endpoint: string;
@@ -334,7 +334,7 @@ export interface ConsentConfirmationFormFields {
 export const EMPTY_CONSENT_CONFIRMATION_FIELDS: ConsentConfirmationFormFields = {
   consent_confirmation_enabled: false,
   consent_confirmation_stored: false,
-  cc_client_id: '',
+  cc_client_id_secret_ref: '',
   cc_client_secret_secret_ref: '',
   cc_authorization_endpoint: '',
   cc_token_endpoint: '',
@@ -353,7 +353,7 @@ export function consentConfirmationFieldsOf(
   return {
     consent_confirmation_enabled: true,
     consent_confirmation_stored: true,
-    cc_client_id: text('client_id'),
+    cc_client_id_secret_ref: text('client_id_secret_ref'),
     cc_client_secret_secret_ref: text('client_secret_secret_ref'),
     cc_authorization_endpoint: text('authorization_endpoint'),
     cc_token_endpoint: text('token_endpoint'),
@@ -366,7 +366,7 @@ export function consentConfirmationFieldsOf(
 export function missingConsentConfirmationField(
   form: ConsentConfirmationFormFields
 ): string | null {
-  if (!form.cc_client_id.trim()) return 'Login Client ID is required for consent confirmation.';
+  if (!form.cc_client_id_secret_ref) return 'Login Client ID is required for consent confirmation.';
   if (!form.cc_client_secret_secret_ref) {
     return 'Login Client Secret is required for consent confirmation.';
   }
@@ -394,7 +394,7 @@ export function consentConfirmationField(
   if (usesConsentFlow && form.consent_confirmation_enabled) {
     const claim = form.cc_id_token_principal_claim.trim();
     return {
-      client_id: form.cc_client_id.trim(),
+      client_id_secret_ref: form.cc_client_id_secret_ref,
       client_secret_secret_ref: form.cc_client_secret_secret_ref,
       authorization_endpoint: form.cc_authorization_endpoint.trim(),
       token_endpoint: form.cc_token_endpoint.trim(),

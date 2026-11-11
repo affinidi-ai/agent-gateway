@@ -25,6 +25,7 @@ use crate::bdd_support::config::target_auth::{
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OIDC_CLIENT_SECRET};
 
 /// The secret ID of the consent confirmation login client's secret.
+const CONSENT_CONFIRMATION_CLIENT_ID: &str = "bdd-consent-confirmation-client-id";
 const CONSENT_CONFIRMATION_CLIENT_SECRET: &str = "bdd-consent-confirmation-client-secret";
 
 struct SingleSurfaceOptions<'a> {
@@ -993,6 +994,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
                     secrets.push(SecretFixture::new(format!("bdd-{provider_id}-client-secret"), "bdd-client-secret"));
                 }
                 if surface_config.consent_confirmation {
+                    secrets.push(SecretFixture::new(CONSENT_CONFIRMATION_CLIENT_ID, OIDC_CLIENT_ID));
                     secrets.push(SecretFixture::new(CONSENT_CONFIRMATION_CLIENT_SECRET, OIDC_CLIENT_SECRET));
                 }
             }
@@ -1194,7 +1196,7 @@ fn consent_confirmation_json(surface_config: &SurfaceConfigBuilder) -> serde_jso
         .as_ref()
         .expect("the identity provider must run before a provider that confirms its caller is written");
     serde_json::json!({
-        "client_id": OIDC_CLIENT_ID,
+        "client_id_secret_ref": CONSENT_CONFIRMATION_CLIENT_ID,
         "client_secret_secret_ref": CONSENT_CONFIRMATION_CLIENT_SECRET,
         "authorization_endpoint": endpoints.authorization_endpoint,
         "token_endpoint": endpoints.token_endpoint,

@@ -685,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_consent_confirmation_client_secret_makes_its_provider_a_referrer_of_the_secret() {
+    async fn a_consent_confirmation_client_id_and_secret_make_their_provider_a_referrer_of_the_secrets() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
             crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
@@ -705,7 +705,7 @@ mod tests {
                 .unwrap()
             };
         let confirmation = json!({
-            "client_id": "login-client", "client_secret_secret_ref": "LOGIN_SECRET",
+            "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
             "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
             "jwt_verification_strategy_id": "strategy"
         });
@@ -727,13 +727,16 @@ mod tests {
                     .collect(),
             )
         };
-        assert_eq!(
-            ids(stores
-                .referrers_of_secret("LOGIN_SECRET")
-                .await
-                .unwrap()),
-            ["confirming"]
-        );
+        for login_secret in ["LOGIN_CLIENT_ID", "LOGIN_SECRET"] {
+            assert_eq!(
+                ids(stores
+                    .referrers_of_secret(login_secret)
+                    .await
+                    .unwrap()),
+                ["confirming"],
+                "{login_secret}"
+            );
+        }
         assert_eq!(
             ids(stores
                 .referrers_of_secret("CLIENT_SECRET")

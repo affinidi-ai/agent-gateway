@@ -1835,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provider_with_consent_confirmation_references_its_login_secret_and_strategy() {
+    fn a_provider_with_consent_confirmation_references_its_login_secrets_and_strategy() {
         let provider = |consent_confirmation: serde_json::Value| -> crate::credential_providers::CredentialProvider {
             serde_json::from_value(serde_json::json!({
                 "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
@@ -1848,7 +1848,7 @@ mod tests {
             .unwrap()
         };
         let confirming = provider(serde_json::json!({
-            "client_id": "login-client", "client_secret_secret_ref": "LOGIN_SECRET",
+            "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
             "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
             "jwt_verification_strategy_id": "confirmation-strategy"
         }));
@@ -1857,6 +1857,7 @@ mod tests {
             [
                 (ResourceKind::Secrets, "CLIENT_ID", "credential provider secret", true),
                 (ResourceKind::Secrets, "CLIENT_SECRET", "credential provider secret", true),
+                (ResourceKind::Secrets, "LOGIN_CLIENT_ID", "credential provider secret", true),
                 (ResourceKind::Secrets, "LOGIN_SECRET", "credential provider secret", true),
                 (
                     ResourceKind::JwtVerificationStrategies,

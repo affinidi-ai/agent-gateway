@@ -928,7 +928,7 @@ describe('EditCredentialProviderPage consent confirmation', () => {
   const REDIRECT_URI = 'credential-provider-consent-confirmation-redirect-uri';
   const CALLBACK = 'https://gw.example/prefix/v1/identity/oauth/callback/p1';
   const SETTING = {
-    client_id: 'login-client',
+    client_id_secret_ref: 'LOGIN_CLIENT_ID',
     client_secret_secret_ref: 'LOGIN_SECRET',
     authorization_endpoint: 'https://idp.example/authorize',
     token_endpoint: 'https://idp.example/token',
@@ -963,6 +963,12 @@ describe('EditCredentialProviderPage consent confirmation', () => {
           json: () =>
             Promise.resolve([
               { id: 's1', secret_id: 'LOGIN_SECRET', name: 'Login secret', tenant_id: null },
+              {
+                id: 's2',
+                secret_id: 'LOGIN_CLIENT_ID',
+                name: 'Login client ID',
+                tenant_id: null,
+              },
             ]),
         });
       }
@@ -1014,7 +1020,7 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     expect(screen.getByTestId(REDIRECT_URI)).toHaveValue(`${CALLBACK}/confirm`);
     const where = screen.getByTestId('credential-provider-consent-confirmation-redirect-uri-where');
     expect(where).toHaveTextContent(
-      `Add this URI to the allowed redirect URIs of the login client ${SETTING.client_id} at your identity provider.`
+      `Add this URI to the allowed redirect URIs of the login client whose ID is in secret ${SETTING.client_id_secret_ref} at your identity provider.`
     );
     expect(where).toHaveTextContent('Callback URL above');
     expect(await screen.findByRole('option', { name: 'Entra callers' })).toBeInTheDocument();
@@ -1030,10 +1036,12 @@ describe('EditCredentialProviderPage consent confirmation', () => {
       fireEvent.change(screen.getByTestId(`credential-provider-consent-confirmation-${testId}`), {
         target: { value },
       });
-    type('client-id-input', 'login-client');
     type('authorization-endpoint-input', 'https://idp.example/authorize');
     type('token-endpoint-input', 'https://idp.example/token');
     await screen.findAllByRole('option', { name: /LOGIN_SECRET/ });
+    fireEvent.change(screen.getByTestId('credential-provider-cc_client_id_secret_ref-select'), {
+      target: { value: 'LOGIN_CLIENT_ID' },
+    });
     fireEvent.change(screen.getByTestId('credential-provider-cc_client_secret_secret_ref-select'), {
       target: { value: 'LOGIN_SECRET' },
     });

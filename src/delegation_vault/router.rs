@@ -2264,6 +2264,55 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// A login client ID that cannot be read refuses the start POST, leaving
+    /// its start state unclaimed, and a `/confirm` before the exchange, with
+    /// `credentials_unavailable`: never the vendor.
+    #[tokio::test]
+    async fn an_unreadable_login_client_id_refuses_the_sign_in_and_the_confirmation() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let signed_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        let mut provider = fixture
+            .providers
+            .get(consent::PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .client_id_secret_ref = "missing-login-client-id".to_string();
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&state, &[("origin", "https://198.51.100.7")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        assert!(!crate::delegation_vault::oauth::is_claimed(&start).await);
+
+        let (refused, events) = capture(fixture.confirm_code(&signed_in)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&signed_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+        assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// A provider edited after the sign-in began to name the caller by a
     /// claim the save rules refuse is refused before the exchange.
     #[tokio::test]
@@ -2723,7 +2772,11 @@ mod tests {
                     .await
                     .unwrap(),
                 );
-                for (secret_id, value) in [("github-client-id", "github-client"), ("github-client-secret", "secret")] {
+                for (secret_id, value) in [
+                    ("github-client-id", "github-client"),
+                    ("github-client-secret", "secret"),
+                    ("login-client-id", "login-client"),
+                ] {
                     secrets
                         .create(CreateSecretRequest {
                             tenant_id: None,
@@ -2865,7 +2918,7 @@ mod tests {
                 let mut provider = self.provider();
                 provider.consent_confirmation = Some(
                     serde_json::from_value(serde_json::json!({
-                        "client_id": "login-client", "client_secret_secret_ref": "github-client-secret",
+                        "client_id_secret_ref": "login-client-id", "client_secret_secret_ref": "github-client-secret",
                         "authorization_endpoint": IDP_AUTHORIZE, "token_endpoint": "https://203.0.113.20/token",
                         "jwt_verification_strategy_id": strategy.id
                     }))
@@ -2930,7 +2983,7 @@ mod tests {
                 let mut provider = self.provider();
                 provider.consent_confirmation = Some(
                     serde_json::from_value(serde_json::json!({
-                        "client_id": "login-client", "client_secret_secret_ref": "github-client-secret",
+                        "client_id_secret_ref": "login-client-id", "client_secret_secret_ref": "github-client-secret",
                         "authorization_endpoint": IDP_AUTHORIZE, "token_endpoint": self.idp_token_endpoint,
                         "jwt_verification_strategy_id": strategy.id,
                         "id_token_principal_claim": id_token_principal_claim

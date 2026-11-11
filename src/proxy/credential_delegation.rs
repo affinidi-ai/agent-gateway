@@ -3715,7 +3715,7 @@ mod tests {
             let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
             provider.consent_confirmation = Some(
                 serde_json::from_value(serde_json::json!({
-                    "client_id": "login-client", "client_secret_secret_ref": "CLIENT_SECRET",
+                    "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
                     "authorization_endpoint": "https://idp.example/authorize",
                     "token_endpoint": "https://idp.example/token",
                     "jwt_verification_strategy_id": strategy_id
@@ -3870,7 +3870,7 @@ mod tests {
         provider.tenant_id = tenant_id.map(String::from);
         provider.consent_confirmation = Some(
             serde_json::from_value(serde_json::json!({
-                "client_id": "login-client", "client_secret_secret_ref": "CLIENT_SECRET",
+                "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
                 "authorization_endpoint": "https://idp.example/authorize",
                 "token_endpoint": "https://idp.example/token",
                 "jwt_verification_strategy_id": strategy.id
@@ -4143,7 +4143,7 @@ mod tests {
         let mut provider = make_credential_provider("cp-1", CredentialProviderType::OAuth2AuthorizationCode);
         provider.consent_confirmation = Some(
             serde_json::from_value(serde_json::json!({
-                "client_id": "login-client", "client_secret_secret_ref": "CLIENT_ID",
+                "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "CLIENT_ID",
                 "authorization_endpoint": "https://idp.example/authorize",
                 "token_endpoint": "https://idp.example/token",
                 "jwt_verification_strategy_id": strategy.id

@@ -188,8 +188,8 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
-The credential provider editor shows a **Consent confirmation** switch and its login client,
-endpoints, strategy and principal claim on a legacy consent provider (authorization code, no
+The credential provider editor shows a **Consent confirmation** switch and its login client
+(ID and secret, both picked from the secrets store), endpoints, strategy and principal claim on a legacy consent provider (authorization code, no
 `issuer`), with the read-only Confirmation redirect URI to register; Save sends the setting
 while on, `null` when a stored one is switched off, and nothing otherwise; see _Credential
 provider editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).

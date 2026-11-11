@@ -401,7 +401,7 @@ describe('callbackUrlToSave', () => {
 
 describe('consent confirmation', () => {
   const STORED = {
-    client_id: 'login-client',
+    client_id_secret_ref: 'LOGIN_CLIENT_ID',
     client_secret_secret_ref: 'LOGIN_SECRET',
     authorization_endpoint: 'https://idp.example/authorize',
     token_endpoint: 'https://idp.example/token',
@@ -412,7 +412,7 @@ describe('consent confirmation', () => {
   it('reads a stored setting as switched on, and none as switched off', () => {
     expect(loaded.consent_confirmation_enabled).toBe(true);
     expect(loaded.consent_confirmation_stored).toBe(true);
-    expect(loaded.cc_client_id).toBe('login-client');
+    expect(loaded.cc_client_id_secret_ref).toBe('LOGIN_CLIENT_ID');
     expect(consentConfirmationFieldsOf({})).toEqual(EMPTY_CONSENT_CONFIRMATION_FIELDS);
   });
 
@@ -436,7 +436,7 @@ describe('consent confirmation', () => {
 
   it('names the first missing required field', () => {
     expect(missingConsentConfirmationField(loaded)).toBeNull();
-    expect(missingConsentConfirmationField({ ...loaded, cc_client_id: ' ' })).toBe(
+    expect(missingConsentConfirmationField({ ...loaded, cc_client_id_secret_ref: '' })).toBe(
       'Login Client ID is required for consent confirmation.'
     );
     expect(

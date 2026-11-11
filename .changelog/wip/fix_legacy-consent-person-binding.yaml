@@ -5,8 +5,9 @@ changes:
       title: Set consent confirmation in the dashboard's credential provider editor
       description: >-
         The credential provider editor of a legacy authorization code provider now has a Consent
-        confirmation switch with the login client ID, client secret, authorization and token
-        endpoints, JWT verification strategy and optional ID-token principal claim, and shows the
+        confirmation switch with the login client ID and client secret, both picked from the
+        secrets store, the authorization and token endpoints, JWT verification strategy and
+        optional ID-token principal claim, and shows the
         Confirmation redirect URI to register at the identity provider. Saving sends the setting
         while the switch is on and clears a stored one when it is switched off.
   changed: []
@@ -17,13 +18,14 @@ changes:
       title: ⭐ Confirm the caller at their identity provider before legacy consent
       description: >-
         A legacy authorization code credential provider can now carry a consent_confirmation
-        setting that names a login client at the callers' identity provider and the JWT
+        setting that names a login client at the callers' identity provider, whose client ID and
+        secret are both read from the secrets store in the provider's own tenant, and the JWT
         verification strategy that identifies them. When a JWT caller verified by that strategy
         opens a consent link, the gateway first signs them in at the identity provider, verifies
         the ID token and checks that it names the same person the link was issued to, and only
         then continues to the vendor. Another person is refused with 403 before the vendor is
         reached. Saving the setting checks the provider type, the strategy and its tenant, both
-        endpoints, the client secret, the confirmation redirect URI, the principal claim and the
+        endpoints, the client ID and secret, the confirmation redirect URI, the principal claim and the
         identity hash pepper. Providers without the setting, API key callers, and Transit and
         Fabric consent behave as before.
   breaking: []

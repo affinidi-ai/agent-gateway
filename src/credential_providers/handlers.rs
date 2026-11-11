@@ -246,8 +246,9 @@ async fn referenceable_strategy(
 /// an `id_token_principal_claim` that names a caller, endpoints the start POST
 /// and the confirmation exchange accept, and a strategy the provider's tenant
 /// can reference that names no Entra caller by `sub`, neither in the strategy
-/// nor in the ID token. The client secret reference is checked with the
-/// provider's other secret references.
+/// nor in the ID token. The client ID and secret references are checked with
+/// the provider's other secret references, and the client ID's value after
+/// them ([`validate_consent_confirmation_client_id`]).
 async fn validate_consent_confirmation(
     state: &CredentialProviderState,
     provider: &CredentialProvider,
@@ -268,22 +269,17 @@ async fn validate_consent_confirmation(
     if !crate::identity::credential_identity::pepper_is_configured() {
         return invalid("consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set");
     }
-    if [&confirmation.client_id, &confirmation.client_secret_secret_ref, &confirmation.jwt_verification_strategy_id]
-        .iter()
-        .any(|value| value.trim().is_empty())
+    if [
+        &confirmation.client_id_secret_ref,
+        &confirmation.client_secret_secret_ref,
+        &confirmation.jwt_verification_strategy_id,
+    ]
+    .iter()
+    .any(|value| value.trim().is_empty())
     {
         return invalid(
-            "consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id",
+            "consent_confirmation needs client_id_secret_ref, client_secret_secret_ref and jwt_verification_strategy_id",
         );
-    }
-    if confirmation
-        .client_id
-        .chars()
-        .count()
-        > super::external::MAX_CLIENT_ID_CHARS
-        || super::external::has_whitespace_or_control(&confirmation.client_id)
-    {
-        return invalid("consent_confirmation.client_id must be at most 2048 characters, without whitespace");
     }
     confirmation
         .authorization_endpoint_url()
@@ -323,6 +319,35 @@ async fn validate_consent_confirmation(
              use an immutable claim the identity provider assigns, such as sub or oid",
         ),
     }
+}
+
+/// The login client ID a `consent_confirmation` reads from the secrets store is at most
+/// [`MAX_CLIENT_ID_CHARS`](super::external::MAX_CLIENT_ID_CHARS) characters, without
+/// whitespace or control characters. Run once the secret references are checked, so only a
+/// secret the provider may use is read.
+async fn validate_consent_confirmation_client_id(
+    state: &CredentialProviderState,
+    provider: &CredentialProvider,
+) -> Result<(), ProviderValidationError> {
+    let Some(confirmation) = provider
+        .consent_confirmation
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    let client_id = stored_secret(state, &confirmation.client_id_secret_ref)
+        .await?
+        .value;
+    if client_id.chars().count() > super::external::MAX_CLIENT_ID_CHARS
+        || super::external::has_whitespace_or_control(&client_id)
+    {
+        return Err(ProviderValidationError::InvalidConsentConfirmation(
+            "consent_confirmation.client_id_secret_ref must hold a client ID of at most 2048 characters, without \
+             whitespace"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn stored_secret(
@@ -643,6 +668,7 @@ async fn validate_provider_settings(
         scope,
     )
     .await?;
+    validate_consent_confirmation_client_id(state, provider).await?;
     validate_jwt_key_material(state, provider.jwt_signing_algorithm(), &provider.jwt).await?;
     validate_consent_strategy(state, provider, context, scope).await
 }
@@ -6615,13 +6641,15 @@ mod consent_confirmation_tests {
             rbac: None,
             gateway_mcp_issuer: None,
         };
-        for (tenant, secret_id) in [
-            (None, "CLIENT_ID"),
-            (None, "CLIENT_SECRET"),
-            (None, "LOGIN_SECRET"),
-            (Some("tenant-a"), "A_CLIENT_ID"),
-            (Some("tenant-a"), "A_CLIENT_SECRET"),
-            (Some("tenant-a"), "A_LOGIN_SECRET"),
+        for (tenant, secret_id, value) in [
+            (None, "CLIENT_ID", "value"),
+            (None, "CLIENT_SECRET", "value"),
+            (None, "LOGIN_CLIENT_ID", "login-client"),
+            (None, "LOGIN_SECRET", "value"),
+            (Some("tenant-a"), "A_CLIENT_ID", "value"),
+            (Some("tenant-a"), "A_CLIENT_SECRET", "value"),
+            (Some("tenant-a"), "A_LOGIN_CLIENT_ID", "login-client"),
+            (Some("tenant-a"), "A_LOGIN_SECRET", "value"),
         ] {
             state
                 .secrets_store
@@ -6630,7 +6658,7 @@ mod consent_confirmation_tests {
                     name: secret_id.into(),
                     secret_id: secret_id.into(),
                     description: None,
-                    value: "value".into(),
+                    value: value.into(),
                     secret_type: "general".into(),
                     tags: vec![],
                 })
@@ -6734,12 +6762,18 @@ mod consent_confirmation_tests {
 
     fn confirmation(strategy_id: &str) -> Value {
         json!({
-            "client_id": "login-client",
+            "client_id_secret_ref": "LOGIN_CLIENT_ID",
             "client_secret_secret_ref": "LOGIN_SECRET",
             "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
             "token_endpoint": "https://oauth2.googleapis.com/token",
             "jwt_verification_strategy_id": strategy_id
         })
+    }
+
+    /// [`confirmation`] with tenant-a's login client ID and secret.
+    fn tenant_a_confirmation(strategy_id: &str) -> Value {
+        let confirmation = with(confirmation(strategy_id), &["client_id_secret_ref"], json!("A_LOGIN_CLIENT_ID"));
+        with(confirmation, &["client_secret_secret_ref"], json!("A_LOGIN_SECRET"))
     }
 
     fn github(confirmation: Value) -> Value {
@@ -6836,7 +6870,7 @@ mod consent_confirmation_tests {
         let stored = stored
             .consent_confirmation
             .unwrap();
-        assert_eq!(stored.client_id, "login-client");
+        assert_eq!(stored.client_id_secret_ref, "LOGIN_CLIENT_ID");
         assert_eq!(stored.jwt_verification_strategy_id, strategy);
         assert_eq!(stored.id_token_principal_claim, None);
     }
@@ -6956,7 +6990,7 @@ mod consent_confirmation_tests {
             .strategy(Some("tenant-b"), GOOGLE, None)
             .await;
         let tenant_github = |strategy: &str, provider_id: &str| {
-            let mut body = github(with(confirmation(strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")));
+            let mut body = github(tenant_a_confirmation(strategy));
             body["provider_id"] = json!(provider_id);
             body["client_id_secret_ref"] = json!("A_CLIENT_ID");
             body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
@@ -7017,7 +7051,7 @@ mod consent_confirmation_tests {
             .strategy(None, GOOGLE, None)
             .await;
         for (field, blank) in
-            [("client_id", " "), ("client_secret_secret_ref", ""), ("jwt_verification_strategy_id", " ")]
+            [("client_id_secret_ref", " "), ("client_secret_secret_ref", ""), ("jwt_verification_strategy_id", " ")]
         {
             let (status, body) = fixture
                 .create(None, github(with(confirmation(&strategy), &[field], json!(blank))))
@@ -7025,7 +7059,7 @@ mod consent_confirmation_tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
             assert_eq!(
                 body["error"],
-                "consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id"
+                "consent_confirmation needs client_id_secret_ref, client_secret_secret_ref and jwt_verification_strategy_id"
             );
         }
         let (status, body) = fixture
@@ -7035,26 +7069,73 @@ mod consent_confirmation_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_login_client_id_takes_no_whitespace() {
+    async fn the_login_client_id_in_its_secret_takes_no_whitespace() {
         let fixture = fixture().await;
         let strategy = fixture
             .strategy(None, GOOGLE, None)
             .await;
-        for client_id in [" login-client".to_string(), "login-client\n".into(), "login client".into(), "a".repeat(2049)]
-        {
+        let client_id_secret = |secret_id: &str, tenant: Option<&str>, value: String| {
+            let fixture = &fixture;
+            let request = crate::secrets::CreateSecretRequest {
+                tenant_id: tenant.map(Into::into),
+                name: secret_id.into(),
+                secret_id: secret_id.into(),
+                description: None,
+                value,
+                secret_type: "general".into(),
+                tags: vec![],
+            };
+            async move {
+                fixture
+                    .state
+                    .secrets_store
+                    .create(request)
+                    .await
+                    .unwrap();
+            }
+        };
+        let invalid = [" login-client".to_string(), "login-client\n".into(), "login client".into(), "a".repeat(2049)];
+        for (index, client_id) in invalid.iter().enumerate() {
+            let secret_id = format!("BAD_LOGIN_CLIENT_ID_{index}");
+            client_id_secret(&secret_id, None, client_id.clone()).await;
             let (status, body) = fixture
-                .create(None, github(with(confirmation(&strategy), &["client_id"], json!(client_id))))
+                .create(None, github(with(confirmation(&strategy), &["client_id_secret_ref"], json!(secret_id))))
                 .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{client_id:?}: {body}");
             assert_eq!(
                 body["error"],
-                "consent_confirmation.client_id must be at most 2048 characters, without whitespace"
+                "consent_confirmation.client_id_secret_ref must hold a client ID of at most 2048 characters, without \
+                 whitespace"
+            );
+            assert!(
+                !body
+                    .to_string()
+                    .contains("login client"),
+                "{body}"
             );
         }
+        client_id_secret("LONGEST_LOGIN_CLIENT_ID", None, "a".repeat(2048)).await;
         let (status, body) = fixture
-            .create(None, github(with(confirmation(&strategy), &["client_id"], json!("a".repeat(2048)))))
+            .create(
+                None,
+                github(with(confirmation(&strategy), &["client_id_secret_ref"], json!("LONGEST_LOGIN_CLIENT_ID"))),
+            )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        client_id_secret("B_LOGIN_CLIENT_ID", Some("tenant-b"), "login client".into()).await;
+        let mut body =
+            github(with(tenant_a_confirmation(&strategy), &["client_id_secret_ref"], json!("B_LOGIN_CLIENT_ID")));
+        body["client_id_secret_ref"] = json!("A_CLIENT_ID");
+        body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
+        let (status, body) = fixture
+            .create(tenant_a(), body)
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"], "Secret reference is not accessible",
+            "another tenant's value is never read, so its shape is not told"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7067,7 +7148,7 @@ mod consent_confirmation_tests {
             "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
             "provider_type": "oauth2_authorization_code",
             "client_id_secret_ref": "A_CLIENT_ID", "client_secret_secret_ref": "A_CLIENT_SECRET",
-            "consent_confirmation": with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")),
+            "consent_confirmation": tenant_a_confirmation(&strategy),
             "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
         }))
         .unwrap();
@@ -7094,40 +7175,48 @@ mod consent_confirmation_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_client_secret_must_exist_in_the_providers_own_tenant() {
+    async fn the_login_client_id_and_secret_must_exist_in_the_providers_own_tenant() {
         let fixture = fixture().await;
         let strategy = fixture
             .strategy(None, GOOGLE, None)
             .await;
-        let (status, body) = fixture
-            .create(None, github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!("MISSING"))))
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"], "Secret reference is not accessible");
+        for field in ["client_id_secret_ref", "client_secret_secret_ref"] {
+            let (status, body) = fixture
+                .create(None, github(with(confirmation(&strategy), &[field], json!("MISSING"))))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {body}");
+            assert_eq!(body["error"], "Secret reference is not accessible", "{field}");
+        }
 
-        let tenant_github = |login_secret: &str| {
-            let mut body = github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!(login_secret)));
+        let tenant_github = |login_client_id: &str, login_secret: &str| {
+            let confirmation = with(confirmation(&strategy), &["client_id_secret_ref"], json!(login_client_id));
+            let mut body = github(with(confirmation, &["client_secret_secret_ref"], json!(login_secret)));
             body["client_id_secret_ref"] = json!("A_CLIENT_ID");
             body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
             body
         };
+        for (login_client_id, login_secret) in
+            [("A_LOGIN_CLIENT_ID", "LOGIN_SECRET"), ("LOGIN_CLIENT_ID", "A_LOGIN_SECRET")]
+        {
+            let (status, body) = fixture
+                .create(tenant_a(), tenant_github(login_client_id, login_secret))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "an appliance-wide secret for a tenant provider: {login_client_id}, {login_secret}: {body}"
+            );
+            assert_eq!(body["error"], "Secret reference is not accessible");
+        }
         let (status, body) = fixture
-            .create(tenant_a(), tenant_github("LOGIN_SECRET"))
-            .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "an appliance-wide secret for a tenant provider: {body}");
-        assert_eq!(body["error"], "Secret reference is not accessible");
-        let (status, body) = fixture
-            .create(tenant_a(), tenant_github("A_LOGIN_SECRET"))
+            .create(tenant_a(), tenant_github("A_LOGIN_CLIENT_ID", "A_LOGIN_SECRET"))
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let stored = fixture
             .stored(body["id"].as_str().unwrap())
             .await;
-        assert!(
-            stored
-                .secret_refs()
-                .contains(&"A_LOGIN_SECRET")
-        );
+        let references = stored.secret_refs();
+        assert!(references.contains(&"A_LOGIN_CLIENT_ID") && references.contains(&"A_LOGIN_SECRET"), "{references:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7376,8 +7465,7 @@ mod consent_confirmation_tests {
                 .unwrap()
                 .remove(field);
         }
-        body["consent_confirmation"] =
-            with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET"));
+        body["consent_confirmation"] = tenant_a_confirmation(&strategy);
         let (status, body) = fixture
             .create(tenant_a(), body)
             .await;
@@ -7434,7 +7522,14 @@ mod consent_confirmation_tests {
                 with(confirmation(&strategy), &["id_token_principal_claim"], json!("iss")),
                 "consent_confirmation.id_token_principal_claim",
             ),
-            (with(confirmation(&strategy), &["client_id"], json!("")), "consent_confirmation needs client_id"),
+            (
+                with(confirmation(&strategy), &["client_id_secret_ref"], json!("")),
+                "consent_confirmation needs client_id_secret_ref",
+            ),
+            (
+                with(confirmation(&strategy), &["client_id_secret_ref"], json!("MISSING")),
+                "Secret reference is not accessible",
+            ),
         ];
         for (setting, error) in refused {
             let (status, body) = fixture
@@ -7486,7 +7581,7 @@ mod consent_confirmation_tests {
         let strategy = fixture
             .strategy(None, GOOGLE, None)
             .await;
-        let mut body = github(with(confirmation(&strategy), &["client_secret_secret_ref"], json!("A_LOGIN_SECRET")));
+        let mut body = github(tenant_a_confirmation(&strategy));
         body["client_id_secret_ref"] = json!("A_CLIENT_ID");
         body["client_secret_secret_ref"] = json!("A_CLIENT_SECRET");
         let (status, body) = fixture

@@ -2,6 +2,8 @@
 //! provider before the vendor: only for a JWT caller of the provider's
 //! `consent_confirmation` strategy whose vault key the strategy recomputes.
 
+use std::sync::Arc;
+
 use chrono::Utc;
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -14,6 +16,7 @@ use crate::credential_providers::{
     ConfirmationClaims, ConfirmationStrategyRefusal, ConsentConfirmation, CredentialProvider,
 };
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
+use crate::secrets::SecretsStore;
 use crate::source_auth::AuthenticatedIdentity;
 
 /// How a consent link for one caller is minted.
@@ -205,13 +208,15 @@ pub(crate) struct SignIn {
 /// The sign-in a confirm start state sealed with `binding` leads to, checked
 /// again at the start POST: the provider still has `consent_confirmation`, it
 /// names the sealed strategy, the provider's tenant can still reference that
-/// strategy, its verification digest is the sealed one, and the authorization
-/// endpoint passes the save rules without its host being resolved. A start
-/// POST that fails one is refused, never sent to the vendor.
+/// strategy, its verification digest is the sealed one, the authorization
+/// endpoint passes the save rules without its host being resolved, and the
+/// login client ID can be read from the provider's tenant. A start POST that
+/// fails one is refused, never sent to the vendor.
 pub(crate) async fn sign_in(
     provider: &CredentialProvider,
     binding: &ConsentConfirmBinding,
     strategies: &dyn JwtVerificationStrategyStorage,
+    secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
 ) -> Result<SignIn, DelegationFailureReason> {
     let confirmation = provider
@@ -243,9 +248,10 @@ pub(crate) async fn sign_in(
         .map_err(|_| DelegationFailureReason::AuthorizationUrlInvalid)?;
     let redirect_uri = url::Url::parse(&provider.consent_confirmation_redirect_uri(gateway_base_url))
         .map_err(|_| DelegationFailureReason::RedirectUriInvalid)?;
+    let client_id = login_client_id(provider, confirmation, secrets_store).await?;
     Ok(SignIn {
         authorization_endpoint,
-        client_id: confirmation.client_id.clone(),
+        client_id,
         redirect_uri,
         scope: sign_in_scope(
             confirmation
@@ -254,6 +260,22 @@ pub(crate) async fn sign_in(
                 .unwrap_or(strategy_claim),
         ),
     })
+}
+
+/// The login client ID, read from the secrets store in the provider's tenant.
+async fn login_client_id(
+    provider: &CredentialProvider,
+    confirmation: &ConsentConfirmation,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<String, DelegationFailureReason> {
+    super::oauth::resolve_secret(
+        provider,
+        secrets_store,
+        &confirmation.client_id_secret_ref,
+        super::oauth::isolation_mode(),
+    )
+    .await
+    .map_err(|_| DelegationFailureReason::CredentialsUnavailable)
 }
 
 /// `openid` alone gives `sub`, the only claim naming the caller it
@@ -334,9 +356,10 @@ pub(crate) async fn confirm_caller(
         .code_verifier
         .as_deref()
         .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
-    let id_token = exchange_code(vault, provider, confirmation, code, code_verifier, &redirect_uri).await?;
+    let client_id = login_client_id(provider, confirmation, &vault.secrets_store).await?;
+    let id_token = exchange_code(vault, provider, confirmation, &client_id, code, code_verifier, &redirect_uri).await?;
     let expected = ConsentIdTokenExpectation {
-        client_id: &confirmation.client_id,
+        client_id: &client_id,
         principal_claim: claims.id_token_claim,
         nonce: &sign_in.nonce,
         issued_at: unix_seconds(sign_in.issued_at),
@@ -390,6 +413,7 @@ async fn exchange_code(
     vault: &DelegationVaultState,
     provider: &CredentialProvider,
     confirmation: &ConsentConfirmation,
+    client_id: &str,
     code: &str,
     code_verifier: &str,
     redirect_uri: &url::Url,
@@ -430,12 +454,7 @@ async fn exchange_code(
                 ("grant_type", "authorization_code"),
                 ("code", code),
                 ("redirect_uri", redirect_uri.as_str()),
-                (
-                    "client_id",
-                    confirmation
-                        .client_id
-                        .as_str(),
-                ),
+                ("client_id", client_id),
                 ("client_secret", client_secret.as_str()),
                 ("code_verifier", code_verifier),
             ],
@@ -635,7 +654,7 @@ mod tests {
         .unwrap();
         provider.consent_confirmation = confirmation.then(|| {
             serde_json::from_value(json!({
-                "client_id": "login-client", "client_secret_secret_ref": "LOGIN_SECRET",
+                "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
                 "authorization_endpoint": "https://idp.example/authorize",
                 "token_endpoint": "https://idp.example/token",
                 "jwt_verification_strategy_id": "confirming"

@@ -1145,9 +1145,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   confirmation** section after the Callback URL (`ConsentConfirmationSection.tsx`,
   `credential-provider-consent-confirmation-section`), with a switch
   (`credential-provider-consent-confirmation-switch`) that is off by default and on when the
-  stored provider has `consent_confirmation`. While on it asks for Login Client ID (a plain text
-  input, `credential-provider-consent-confirmation-client-id-input`), Login Client Secret (a
-  `SecretSelect`, `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
+  stored provider has `consent_confirmation`. While on it asks for Login Client ID and Login
+  Client Secret (each a `SecretSelect`, `credential-provider-cc_client_id_secret_ref-select` and
+  `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
   Endpoint and Login Token Endpoint (`…-authorization-endpoint-input`, `…-token-endpoint-input`),
   a JWT verification strategy from `GET /jwt-verification-strategies`
   (`credential-provider-consent-confirmation-strategy-select`; a stored strategy that no longer
@@ -1159,7 +1159,7 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
   shows followed by `/confirm`, which is what the gateway registers. Under it a line
   (`credential-provider-consent-confirmation-redirect-uri-where`) says to add it to the allowed
-  redirect URIs of the login client, naming the Login Client ID once one is typed, at the
+  redirect URIs of the login client, naming the secret that holds its ID once one is picked, at the
   identity provider, and not at the vendor, whose OAuth app keeps the Callback URL; a new provider shows a notice
   in its place (`credential-provider-consent-confirmation-redirect-uri-after-create`). Save
   refuses a blank required field first (`missingConsentConfirmationField`) and sends

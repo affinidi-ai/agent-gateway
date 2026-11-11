@@ -297,8 +297,8 @@ impl TokenEndpointAuthMethod {
 /// the value, never the name the value is hashed under.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConsentConfirmation {
-    /// The login client's id, a plain value: a client id is not a secret.
-    pub client_id: String,
+    /// Secret ID for the login client's id.
+    pub client_id_secret_ref: String,
     /// Secret ID for the login client's secret.
     pub client_secret_secret_ref: String,
     pub authorization_endpoint: String,
@@ -654,23 +654,31 @@ impl StorableEntity for CredentialProvider {
 
 impl CredentialProvider {
     /// The secret ids this provider reads: client, API key, signing key, certificate and
-    /// consent confirmation client secret.
+    /// consent confirmation client ID and secret.
     pub fn secret_refs(&self) -> Vec<&str> {
         self.secret_ref_fields()
             .into_iter()
-            .chain([self.consent_confirmation_secret_ref()])
+            .chain(self.consent_confirmation_secret_refs())
             .flatten()
             .collect()
     }
 
-    fn consent_confirmation_secret_ref(&self) -> Option<&str> {
-        self.consent_confirmation
-            .as_ref()
-            .map(|confirmation| {
+    fn consent_confirmation_secret_refs(&self) -> [Option<&str>; 2] {
+        let confirmation = self
+            .consent_confirmation
+            .as_ref();
+        [
+            confirmation.map(|confirmation| {
+                confirmation
+                    .client_id_secret_ref
+                    .as_str()
+            }),
+            confirmation.map(|confirmation| {
                 confirmation
                     .client_secret_secret_ref
                     .as_str()
-            })
+            }),
+        ]
     }
 
     /// The secret ids a service token of this provider's type reads: the API key; the client
@@ -722,8 +730,8 @@ impl CredentialProvider {
     /// Each secret reference, paired with whether `previous` held it in the same field while
     /// this provider keeps the type and sends it to the same place: the token and
     /// authorization endpoints, resource, additional parameters, default scopes, JWT issuer,
-    /// subject and audience, and client authentication. The consent confirmation client
-    /// secret is never kept.
+    /// subject and audience, and client authentication. The consent confirmation client ID
+    /// and secret are never kept.
     fn secret_refs_kept_from(
         &self,
         previous: Option<&Self>,
@@ -753,7 +761,9 @@ impl CredentialProvider {
             .zip(stored)
             .filter_map(|(reference, stored)| reference.map(|reference| (reference, stored == Some(reference))))
             .chain(
-                self.consent_confirmation_secret_ref()
+                self.consent_confirmation_secret_refs()
+                    .into_iter()
+                    .flatten()
                     .map(|reference| (reference, false)),
             )
             .collect()
@@ -1423,7 +1433,7 @@ mod tests {
 
     fn confirming(mut provider: CredentialProvider) -> CredentialProvider {
         provider.consent_confirmation = Some(ConsentConfirmation {
-            client_id: "login-client".into(),
+            client_id_secret_ref: "LOGIN_CLIENT_ID".into(),
             client_secret_secret_ref: "LOGIN_SECRET".into(),
             authorization_endpoint: "https://idp.example/authorize".into(),
             token_endpoint: "https://idp.example/token".into(),
@@ -1763,6 +1773,18 @@ mod tests {
             stored.secret_refs_kept_from(Some(&sending)),
             none_kept,
             "dropping the client authentication is a change of what the provider sends too"
+        );
+    }
+
+    #[test]
+    fn the_consent_confirmation_client_id_and_secret_are_read_and_never_kept() {
+        let mut stored = confirming(consent_provider("a", "a", None));
+        stored.client_id_secret_ref = Some("CLIENT_ID".into());
+        stored.client_secret_secret_ref = Some("CLIENT_SECRET".into());
+        assert_eq!(stored.secret_refs(), vec!["CLIENT_ID", "CLIENT_SECRET", "LOGIN_CLIENT_ID", "LOGIN_SECRET"]);
+        assert_eq!(
+            stored.secret_refs_kept_from(Some(&stored)),
+            vec![("CLIENT_ID", true), ("CLIENT_SECRET", true), ("LOGIN_CLIENT_ID", false), ("LOGIN_SECRET", false)]
         );
     }
 
