@@ -67,34 +67,18 @@ pub fn start_logging_warnings() {
     }
 }
 
-/// The longest scalar value the warning for an ignored attribute quotes.
-const QUOTED_VALUE_LIMIT: usize = 64;
-
-/// What an ignored `public` attribute held: its text for a string or number,
-/// cut short, and only the type for anything else.
-fn describe_attribute(value: &aws_sdk_dynamodb::types::AttributeValue) -> String {
+/// The type of an ignored `public` attribute's value; its content is never logged.
+fn describe_attribute(value: &aws_sdk_dynamodb::types::AttributeValue) -> &'static str {
     use aws_sdk_dynamodb::types::AttributeValue;
-    let cut = |text: &str| {
-        let mut chars = text.chars();
-        let kept: String = chars
-            .by_ref()
-            .take(QUOTED_VALUE_LIMIT)
-            .collect();
-        if chars.next().is_some() {
-            format!("{kept}…")
-        } else {
-            kept
-        }
-    };
     match value {
-        AttributeValue::S(text) => format!("string {:?}", cut(text)),
-        AttributeValue::N(number) => format!("number {}", cut(number)),
-        AttributeValue::Null(_) => "null".to_string(),
-        AttributeValue::M(_) => "map".to_string(),
-        AttributeValue::L(_) => "list".to_string(),
-        AttributeValue::B(_) => "binary value".to_string(),
-        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_) => "set".to_string(),
-        _ => "value of an unsupported type".to_string(),
+        AttributeValue::S(_) => "string",
+        AttributeValue::N(_) => "number",
+        AttributeValue::Null(_) => "null",
+        AttributeValue::M(_) => "map",
+        AttributeValue::L(_) => "list",
+        AttributeValue::B(_) => "binary value",
+        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_) => "set",
+        _ => "value of an unsupported type",
     }
 }
 
@@ -483,36 +467,28 @@ mod tests {
     }
 
     #[test]
-    fn the_ignored_public_message_names_the_item_and_the_scalar_value_found() {
+    fn the_ignored_public_message_names_the_item_and_only_the_type_of_the_value() {
         let message = |value: AttributeValue| super::ignored_public_message("orders", &value);
 
         assert_eq!(
             message(AttributeValue::S("yes".to_string())),
-            "Ignoring the DynamoDB channel attribute 'public' of item 'orders': found string \"yes\", expected a \
+            "Ignoring the DynamoDB channel attribute 'public' of item 'orders': found string, expected a \
              boolean, or the string 'true' or 'false'; the surface stays legacy"
         );
-        assert!(message(AttributeValue::N("1".to_string())).contains("found number 1,"));
+        assert!(message(AttributeValue::N("1".to_string())).contains("found number,"));
         assert!(message(AttributeValue::Null(true)).contains("found null,"));
+        assert!(message(AttributeValue::L(Vec::new())).contains("found list,"));
     }
 
     #[test]
-    fn the_ignored_public_message_names_only_the_type_of_a_compound_value() {
+    fn the_ignored_public_message_never_contains_the_value() {
         let map = AttributeValue::M(HashMap::from([("secret".to_string(), AttributeValue::S("hidden".to_string()))]));
-        let message = super::ignored_public_message("orders", &map);
-
-        assert!(message.contains("found map,"), "{message}");
-        assert!(!message.contains("hidden") && !message.contains("secret"), "{message}");
-        assert!(super::ignored_public_message("orders", &AttributeValue::L(Vec::new())).contains("found list,"));
-    }
-
-    #[test]
-    fn the_ignored_public_message_cuts_a_long_value_short() {
-        let long = "x".repeat(500);
-        let message = super::ignored_public_message("orders", &AttributeValue::S(long));
-
-        assert!(message.len() < 300, "{} bytes", message.len());
-        assert!(message.contains("found string \""), "{message}");
-        assert!(message.contains("…\""), "the cut is marked: {message}");
+        for value in [map, AttributeValue::S("hunter2".to_string()), AttributeValue::N("424242".to_string())] {
+            let message = super::ignored_public_message("orders", &value);
+            for leaked in ["hidden", "secret", "hunter2", "424242"] {
+                assert!(!message.contains(leaked), "{message}");
+            }
+        }
     }
 
     #[test]
