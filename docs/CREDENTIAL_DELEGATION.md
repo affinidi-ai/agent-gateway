@@ -2184,7 +2184,11 @@ revoked; when the person connected again while it ran, the call uses the new gra
   refresh token may be spent: the grant is never refreshed again, and once its access token
   expires the call answers `connect_required`.
 - A provider with `token_refresh_enabled: false`, or a grant without a refresh token, is never
-  refreshed: once its access token expires, `connect_required`.
+  refreshed: once its access token expires, `connect_required`. A connect for a provider with
+  `token_refresh_enabled` keeps no grant whose access token expires without a refresh token
+  (`no_refresh_token`, [The connect API](#the-connect-api)), so a grant without one is one whose
+  token never expires, or one connected while its provider's `token_refresh_enabled` was
+  `false`.
 
 Each refresh is audited, `token_refreshed` or `refresh_failed` with the cause in `detail`.
 
@@ -2241,12 +2245,19 @@ only decides, by the file names, which claim came first. Then:
    `false`), as a refresh is sent.
 3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
    for, as the provider compares them ([Granted scopes](#granted-scopes)).
-4. The grant is kept only while the surface still serves its binding, and the scopes asked for
+4. For a provider with `token_refresh_enabled` (the default), an answer whose access token
+   expires (`expires_in`) must carry a refresh token: a grant that could never be refreshed
+   would ask the person to connect again once its token expired. An answer without
+   `expires_in` needs none, since such a grant is never refreshed, and neither does any answer
+   for a provider with `token_refresh_enabled: false`. An empty refresh token makes the whole
+   answer unusable (`invalid_token_response`).
+5. The grant is kept only while the surface still serves its binding, and the scopes asked for
    still lie within the binding's (or the provider's default scopes when it names none), checked
    under the surface's lock; a grant it replaces for the same key is revoked.
 
-Tokens obtained but not kept, because the scopes were wider, or the binding was removed or
-narrowed while the person consented, are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
+Tokens obtained but not kept, because the scopes were wider, no refresh token came with an
+access token that expires, or the binding was removed or narrowed while the person consented,
+are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
 "expires_at"}`, or `{"status": "failed", "reason"}` with a fixed reason; the authorization
 server's words are never echoed or logged, with one exception. A `scope_widened` answer adds
 `widened_scopes`, the scopes granted beyond those asked for (as the provider compares them), so
@@ -2260,7 +2271,7 @@ out. The connect's log line names the same, and a refresh refused for a wider gr
 | `409` | `already_used` | The connect was completed, or tried, before |
 | `410` | `expired` | Ten minutes passed |
 | `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is not claimed, and stays open |
-| `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, or more scopes were granted than asked for |
+| `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened`, `no_refresh_token` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, more scopes were granted than asked for, or an access token that expires came without a refresh token for a provider with `token_refresh_enabled` (ask the vendor for offline access, or turn the provider's refresh off) |
 | `409` | `binding_removed`, `binding_changed`, `provider_unavailable` | The binding or the provider went away, or the binding was narrowed below the scopes asked for, while the person consented |
 | `403` | `issuer_not_permitted`, `resource_not_permitted` | The operator's rules no longer permit the provider |
 

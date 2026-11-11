@@ -700,6 +700,10 @@ async fn redeem(
             widened,
         });
     }
+    if provider.token_refresh_enabled && grant.expires_at.is_some() && grant.refresh_token.is_none() {
+        revoke_unkept(state, &provider, grant, &manager.actor);
+        return Err((StatusCode::BAD_GATEWAY, "no_refresh_token").into());
+    }
     let Some(surfaces) = state
         .agent_surface_store
         .as_ref()
@@ -2238,6 +2242,130 @@ mod tests {
         fixture
             .revoked_eventually("wide-refresh")
             .await;
+    }
+
+    /// Start an owner connect and complete it with a code.
+    async fn connect_owner(fixture: &Fixture) -> (StatusCode, serde_json::Value) {
+        let (_, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        fixture
+            .complete(
+                started["connect_id"]
+                    .as_str()
+                    .unwrap(),
+                json!({"code": "c", "iss": fixture.issuer()}),
+            )
+            .await
+    }
+
+    /// A provider that refreshes its grants keeps none that will expire with
+    /// no refresh token: the connect answers `no_refresh_token`, stores
+    /// nothing, and the access token is revoked; the log names the reason,
+    /// never the token. An empty refresh token is no token answer at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refreshing_provider_keeps_no_expiring_grant_without_a_refresh_token() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let fixture = Fixture::new(vec![
+            Answer::json(
+                200,
+                json!({"access_token": "empty-refresh-access", "token_type": "Bearer", "expires_in": 3600,
+                    "refresh_token": "", "scope": "read"}),
+            ),
+            Answer::json(
+                200,
+                json!({"access_token": "no-refresh-access", "token_type": "Bearer", "expires_in": 3600, "scope": "read"}),
+            ),
+            Answer::status(200),
+        ])
+        .await;
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
+        let logs = FormattedLogs::capture();
+        for expected in [
+            json!({"status": "failed", "reason": "invalid_token_response"}),
+            json!({"status": "failed", "reason": "no_refresh_token"}),
+        ] {
+            assert_eq!(connect_owner(&fixture).await, (StatusCode::BAD_GATEWAY, expected.clone()));
+            assert!(
+                fixture
+                    .state
+                    .vault_store
+                    .grant(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{expected}"
+            );
+        }
+        let text = logs.text();
+        assert!(text.contains("no_refresh_token"), "{text}");
+        assert!(!text.contains("no-refresh-access"), "{text}");
+        fixture
+            .revoked_eventually("no-refresh-access")
+            .await;
+    }
+
+    /// A grant without a refresh token is kept where it never needs one: at a
+    /// provider that does not refresh its grants, or when its access token
+    /// never expires. A refreshing provider keeps a grant that has one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_without_a_refresh_token_is_kept_only_where_it_is_never_refreshed() {
+        let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
+        for (case, answer, refreshes, refresh_token) in [
+            (
+                "a provider that does not refresh",
+                json!({"access_token": "access", "token_type": "Bearer", "expires_in": 3600, "scope": "read"}),
+                false,
+                None,
+            ),
+            (
+                "a token that never expires",
+                json!({"access_token": "access", "token_type": "Bearer", "scope": "read"}),
+                true,
+                None,
+            ),
+            (
+                "a refresh token",
+                json!({"access_token": "access", "token_type": "Bearer", "expires_in": 3600,
+                    "refresh_token": "access-refresh", "scope": "read"}),
+                true,
+                Some("access-refresh"),
+            ),
+        ] {
+            let fixture = Fixture::new(vec![Answer::json(200, answer)]).await;
+            let mut provider = fixture
+                .state
+                .provider_store
+                .get("vendor")
+                .await
+                .unwrap()
+                .unwrap();
+            provider.token_refresh_enabled = refreshes;
+            fixture
+                .state
+                .provider_store
+                .update(provider)
+                .await
+                .unwrap();
+            let (status, body) = connect_owner(&fixture).await;
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            assert_eq!(body["status"], "connected", "{case}");
+            let grant = fixture
+                .state
+                .vault_store
+                .grant(&key)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{case}: the grant is kept"));
+            assert_eq!(grant.refresh_token.as_deref(), refresh_token, "{case}");
+            assert!(
+                fixture
+                    .authorization_server
+                    .revoked_tokens()
+                    .is_empty(),
+                "{case}"
+            );
+        }
     }
 
     /// Set the provider's scope comparison, and the scopes the owner binding
