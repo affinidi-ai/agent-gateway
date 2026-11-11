@@ -1,0 +1,18 @@
+branch: feat/provider-resource-in-token-requests
+changes:
+  added:
+    - timestamp: '2026-11-11T10:00:00Z'
+      title: Let an external consent provider leave resource out of its token requests
+      description: >-
+        An external consent provider takes a new `send_resource` setting, `true` by default.
+        Created with `false`, its authorization code exchange and every refresh of its grants
+        send no `resource` parameter to the token endpoint, so a token endpoint that refuses it,
+        such as the Microsoft identity platform v2.0 one, can still issue grants. The provider's
+        `resource` stays required and still decides the only origin its grants are sent to. The
+        setting is fixed for the provider's life: an update that sends another value is refused
+        with `provider_field_immutable`, and a provider without an issuer cannot turn it off.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

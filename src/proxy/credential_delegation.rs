@@ -1988,6 +1988,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         }
     }
 

@@ -3247,6 +3247,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         let consent =
@@ -3299,6 +3300,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         // Test without signer (unsigned fallback)
@@ -3479,6 +3481,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
 
         let vc = build_delegation_vc(

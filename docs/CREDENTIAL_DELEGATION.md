@@ -377,7 +377,10 @@ tenant](#provider-secrets-belong-to-the-providers-tenant)).
 - `resource` is sent only when the provider sets it, on every path including legacy bindings.
   The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
   in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
-  list when an Entra v2.0 provider sets `resource`.
+  list when an Entra v2.0 provider sets `resource`. An [external consent
+  provider](#external-consent-providers) must set `resource`, which binds where its grants go:
+  for such an issuer, create it with `send_resource: false`, so its code exchange and refresh
+  leave the parameter out.
 
 Each replica sends one token request per cache key at a time. Requests that miss the cache
 meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
@@ -470,6 +473,7 @@ authorization server, whose grants another system obtains through the browser wi
 | `allow_unadvertised_pkce` | Optional, `false` by default. `true` admits an issuer whose metadata does not list `code_challenge_methods_supported`; see below |
 | `scope_comparison` | Optional, `exact` by default: how the scopes the token endpoint grants are compared with those asked for ([Granted scopes](#granted-scopes)) |
 | `revocation_ends_authorization` | Optional, `false` by default. `true` for a vendor whose revocation of any one token ends the person's whole authorization of the client, as Google's does ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)) |
+| `send_resource` | Optional, `true` by default: the code exchange and every refresh send `resource` to the token endpoint. `false` sends it on neither, for a token endpoint that refuses it, such as the Microsoft identity platform v2.0 one (AADSTS901002). `resource` is still required and is still the only origin the grants go to. The API names it only when `false` |
 | `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
 
 An external consent provider uses its own tenant's secrets only, for its client secret, its
@@ -486,8 +490,8 @@ posture's static check). At create only the issuer's metadata fetch resolves a n
 name that resolves to a blocked address is refused when the gateway calls it, since every call
 to a vendor endpoint goes through pinned Strict egress. A provider without an `issuer` cannot
 set `revocation_endpoint`, `token_endpoint_auth_method`, `client_id`, `allow_unadvertised_pkce`,
-`scope_comparison` or `revocation_ends_authorization`, the last three of which are fixed for the
-provider's life.
+`scope_comparison`, `revocation_ends_authorization` or `send_resource: false`, the last four of
+which are fixed for the provider's life.
 
 A provider's resource must be permitted for its issuer. By default its host must be the
 issuer's host or one of its subdomains: for the issuer `https://mcp.notion.com`, a resource on
@@ -624,8 +628,8 @@ cannot help an issuer whose own host serves content its users control.
 | A tenant's token creates a provider with an issuer while `external_consent_issuers` is unset | `external_consent_issuers_required` | |
 
 `issuer`, the endpoints, `client_id`, `token_endpoint_auth_method`, the secret references, the
-signed-JWT settings, `callback_url`, `resource`, `allow_unadvertised_pkce`, `provider_type` and
-the refused fields never change: an update that
+signed-JWT settings, `callback_url`, `resource`, `send_resource`, `allow_unadvertised_pkce`,
+`provider_type` and the refused fields never change: an update that
 sends another value is refused, and one that sends the stored value, such as a round trip of
 the whole record, is accepted. The name, description, default scopes and
 `token_refresh_enabled` stay editable. A change to the client or its server is a new
@@ -2090,8 +2094,8 @@ the provider's `token_endpoint` with the refresh token, the scopes the connect a
 spelling the person consented to, not the vendor's) that the grant still holds, as its provider
 compares them ([Granted scopes](#granted-scopes)), so a grant the person consented to more
 narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
-provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
-(a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
+provider's `resource` unless its `send_resource` is `false`, through pinned Strict egress, the
+client authenticating as at revocation (a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
 the scopes the grant held. The request is sent and read by `post_token_request`, with a fixed
 30-second timeout and a 64 KiB cap on the answer, which must be a `Bearer` token. The service
 token requests use the same routine, but within `credential_policy.token_request_timeout_secs`. The rotated tokens are written
@@ -2184,7 +2188,8 @@ only decides, by the file names, which claim came first. Then:
    when it is sent, and must be sent unless the issuer's metadata said its responses do not
    carry it (a provider created before that was recorded needs it too).
 2. The code is redeemed at the provider's pinned token endpoint with the verifier, the
-   connect's `redirect_uri` and the provider's `resource`, as a refresh is sent.
+   connect's `redirect_uri` and the provider's `resource` (left out when its `send_resource` is
+   `false`), as a refresh is sent.
 3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
    for, as the provider compares them ([Granted scopes](#granted-scopes)).
 4. The grant is kept only while the surface still serves its binding, and the scopes asked for
