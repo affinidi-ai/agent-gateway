@@ -11,7 +11,8 @@ changes:
         DELETE /v1/authorities/{id} now answers 409 while a Trust Check or Trust Recorder entry on
         a surface (base or variant) or a managed connection names the Authority's DID, listing
         the surfaces and managed connections the caller may view with the Trust Checks and Trust
-        Recorder entries that name it, and counting the rest. Before, the Authority was deleted
+        Recorder entries that name it, and counting the rest; records of a tenant that may not use
+        the Authority do not count. Before, the Authority was deleted
         and the checks kept passing. force=true deletes it anyway only when the caller may view
         every record that names it, and records an authority_force_deleted event in the VP Audit
         Log. Moving an Authority, a surface or a managed connection to a tenant that would make
@@ -28,5 +29,8 @@ changes:
         authority_not_found, instead of both carrying on under a DID nothing vouches for. A save
         linking to such an Authority, or to another tenant's, is refused with 400, and the
         Surface Builder marks the element "Configuration required" and blocks Save until it names
-        another Authority or is removed.
+        another Authority or is removed. A record that named an Authority deleted before this
+        release has no link to it and keeps running; each load logs the DIDs a surface or managed
+        connection names that are in neither the Authorities nor the Issuers register, so it can be
+        found and fixed.
   breaking: []

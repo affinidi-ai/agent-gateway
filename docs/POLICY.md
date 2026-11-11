@@ -264,6 +264,11 @@ Element validation is in
 The two caps are separate constants that happen to share a value today, because `id` is
 addressable from policy while `name` is only a label. Counts are code points, not bytes.
 
+When an audit sink selects `trust_check`, each element's outcome is recorded with the
+surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
+and MCP-proxy paths), so a trust check can be tied to the request and principal that
+triggered it. On the outbound path the record also names the Transit Point.
+
 ### The authority of a Trust Check
 
 `query.authority_id` is stored as text: a literal DID, or a template resolved per request.
@@ -292,7 +297,9 @@ Authority, the surface or the STS client to a tenant that would make it cross-te
 with `409`, like any other cross-tenant reference.
 
 `DELETE /v1/authorities/{id}` is refused with `409` while a Trust Check or a Trust Recorder
-entry on any surface (base or variant) or STS client names the Authority's DID. The answer lists
+entry on any surface (base or variant) or STS client names the Authority's DID, counting only
+records whose tenant may use the Authority: a record of another tenant that names the same DID
+neither holds the Authority nor learns of it. The answer lists
 the surfaces and STS clients the caller may view, each with `uses`: the Trust Checks
 (`element: trust_check`, `id`, `name`, `placement` (`access_point`, `target` or
 `transit_point`), `transit_point`, `variant`) and Trust Recorder entries
@@ -311,6 +318,10 @@ refused. The check looks the DID up among all Authorities, whose DIDs are unique
 record's tenant may use it is checked on save and on tenant moves. A DID with no source is not
 checked, so a forced delete leaves a record that a node has not classified yet, such as an STS
 client stored while the node was in standby, querying the DID until its next save or startup.
+Likewise a record naming an Authority that was deleted before this check existed has no source
+on its first load, because no register has the DID any more, and its Trust Check keeps running.
+Each load logs, per surface and STS client, the literal DIDs it names that are in neither
+register, so such a record can be found and pointed at an Authority or removed.
 
 ## Failed caller authentication
 
