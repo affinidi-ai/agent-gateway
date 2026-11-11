@@ -22,7 +22,7 @@ const PUBLIC_ACCESS_HELP =
   'Let anyone call this Access Point without credentials. Leave this off unless your agent is meant to be public.';
 
 export const LEGACY_ACCESS_POINT_TEXT =
-  'Legacy: this Access Point is neither closed nor public. A caller whose credential is missing or invalid is refused, and without caller authentication every caller is admitted.';
+  'This Access Point has no Public access setting. A missing or invalid credential is refused with 401 if you set up caller authentication, as on a closed Access Point. Only on a public Access Point does the request continue to policy as source_auth.method == "failed". Without caller authentication every caller is admitted.';
 export const CLOSE_ACCESS_POINT_LABEL = 'Close Access Point';
 export const CLOSING_ACCESS_POINT_TEXT =
   'Closed when you save: a caller whose credential is missing or invalid is refused, and without a Caller Context every caller is refused.';

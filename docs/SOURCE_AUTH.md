@@ -383,8 +383,8 @@ To find the affected surfaces and callers:
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
   resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
   already), naming the surface:
-  `This Access Point is neither closed nor public, and it refuses callers whose credential is
-  missing or invalid with 401, as a closed one does …`;
+  `This Access Point has caller authentication but no Public access setting. A caller whose
+  credential is missing or invalid is refused with 401, as on a closed Access Point …`;
 - the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
   Point** button.
 
@@ -394,7 +394,7 @@ the **Public access** switch). To make the refusal explicit in storage, close it
 before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
 surface built from DynamoDB takes the same setting from an optional `public` attribute on its
 item: a boolean, or the string `"true"` or `"false"`. Any other value is ignored, so the surface
-stays legacy, and the gateway logs a warning naming the item and the type of value it held (never
+keeps no Public access setting, and the gateway logs a warning naming the item and the type of value it held (never
 the value), at start and on a later load.
 
 #### Not ready Access Points

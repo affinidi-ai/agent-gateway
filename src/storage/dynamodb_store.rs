@@ -89,7 +89,7 @@ fn ignored_public_message(
 ) -> String {
     format!(
         "Ignoring the DynamoDB channel attribute 'public' of item '{config_id}': found {}, expected a boolean, or the \
-         string 'true' or 'false'; the surface stays legacy",
+         string 'true' or 'false'; the surface keeps no Public access setting",
         describe_attribute(value)
     )
 }
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(
             message(AttributeValue::S("yes".to_string())),
             "Ignoring the DynamoDB channel attribute 'public' of item 'orders': found string, expected a \
-             boolean, or the string 'true' or 'false'; the surface stays legacy"
+             boolean, or the string 'true' or 'false'; the surface keeps no Public access setting"
         );
         assert!(message(AttributeValue::N("1".to_string())).contains("found number,"));
         assert!(message(AttributeValue::Null(true)).contains("found null,"));
