@@ -1023,6 +1023,9 @@ describe('EditCredentialProviderPage consent confirmation', () => {
       `Add this URI to the allowed redirect URIs of the login client whose ID is in secret ${SETTING.client_id_secret_ref} at your identity provider.`
     );
     expect(where).toHaveTextContent('Callback URL above');
+    expect(where).toHaveTextContent(
+      'This URI follows the Callback URL, so register it again whenever the Callback URL changes.'
+    );
     expect(await screen.findByRole('option', { name: 'Entra callers' })).toBeInTheDocument();
     expect(
       screen.getByTestId('credential-provider-consent-confirmation-strategy-select')

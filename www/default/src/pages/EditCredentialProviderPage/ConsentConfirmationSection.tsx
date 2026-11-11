@@ -231,7 +231,9 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                 ariaLabel="About Confirmation redirect URI"
                 testId="field-help-cc-redirect-uri"
               >
-                Register this URI as a redirect URI on the login client at the identity provider.
+                Register this URI as a redirect URI on the login client at the identity provider. It
+                is the Callback URL followed by <code>/confirm</code>, so it can&apos;t be edited on
+                its own: change the Callback URL to change it, then register the new URI.
               </FieldHelp>
             </div>
             {redirectUri ? (
@@ -265,7 +267,8 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                   </>
                 ) : null}{' '}
                 at your identity provider. Don&apos;t add it at the vendor: the vendor&apos;s OAuth
-                app keeps the Callback URL above.
+                app keeps the Callback URL above. This URI follows the Callback URL, so register it
+                again whenever the Callback URL changes.
               </div>
             )}
             {redirectUri
