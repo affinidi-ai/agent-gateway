@@ -3647,6 +3647,26 @@ fn managed_agent_streams_a_task_claiming_identity(
     set_primary_target_response(world, streamed_task(Some(message)));
 }
 
+#[given(
+    expr = "managed agent {string} streams a task whose final status message declares its identity without the payload"
+)]
+fn managed_agent_streams_a_task_with_an_invalid_identity_claim(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {}
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
 #[given(expr = "managed agent {string} streams the error {string}")]
 fn managed_agent_streams_an_error(
     world: &mut SurfaceWorld,

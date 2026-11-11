@@ -546,11 +546,18 @@ extended card such a credential is ignored, so a card that carries only it is
 `identity_extension_missing`.
 
 A public card of an A2A or AP2 surface is the exception for a missing identity on the protected
-slot: when it carries neither `agent-identity/v1` nor `agent-identity-credential/v1`, it is served
-without an identity credential, with its other changes (URL rewrite, `agentDid` and `agentDNA`)
-applied and no Trust Recorder write. The gateway logs a `WARN` naming the surface, the
-`protected_identity` slot and `identity_extension_missing` the first time a surface's card is
-built without an identity, and again only after that card carried one or after a restart. This
+slot: when it is a JSON object with a string `name` that carries neither `agent-identity/v1` nor
+`agent-identity-credential/v1`, it is served without an identity credential, with its other
+changes (URL rewrite, `agentDid` and `agentDNA`) applied and no Trust Recorder write. Any other
+body keeps the `422`: one that is not a JSON object or has no `name`, one whose `capabilities` or
+`capabilities.extensions` has another shape, and one listing either identity extension URI in any
+letter case, so an identity the gateway did not check is never passed on. `agentDid` and
+`agentDNA` name the surface's own did:webvh identity, which the operator configures, not the
+agent's; the managed identity signal is the `agent-identity-credential/v1` extension, which such
+a card does not carry. The gateway logs a `WARN` naming the surface, the `protected_identity` slot
+and `identity_extension_missing` the first time a surface's card is built without an identity,
+and again only after that card carried one, after the surface is created, changed or deleted, or
+after a configuration reload or restart. This
 holds on the card route, the agent card preview, a well-known card answered through ordinary
 forwarding, a public card this gateway reads over Fabric, and a public card it serves to a peer
 over Fabric. An invalid identity on a public card is still refused on the first four of those

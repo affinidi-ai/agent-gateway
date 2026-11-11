@@ -228,14 +228,14 @@ pub async fn resolve_protected_agent_identity(
         return resolved;
     }
     match resolved {
-        Err(IdentityResolutionError::IdentityExtensionMissing(_)) if !carries_identity_credential(response_body) => {
+        Err(IdentityResolutionError::IdentityExtensionMissing(_)) if card_has_no_identity(response_body) => {
             if note_card_without_identity(&surface.surface_id) {
                 warn!(
                     surface = %surface.surface_id,
                     channel = channel_name,
                     slot = IdentitySlot::Protected.name(),
                     reason = crate::a2a::ERR_IDENTITY_EXTENSION_MISSING,
-                    "Managed agent's card has no identity extension; serving it without an identity credential"
+                    "Managed agent's card carries no identity extension; resolving it without a managed identity"
                 );
             } else {
                 debug!(
@@ -270,6 +270,16 @@ fn note_card_with_identity(surface_id: &str) {
     }
 }
 
+/// Forgets a created, changed or deleted surface, so its card warns again.
+pub(crate) fn forget_card_identity_warning(surface_id: &str) {
+    note_card_with_identity(surface_id);
+}
+
+/// Forgets every surface, so each card warns again after a configuration reload.
+pub(crate) fn forget_card_identity_warnings() {
+    CARDS_WITHOUT_IDENTITY.clear();
+}
+
 /// The card's `agent-identity-credential/v1` extension, if any.
 fn identity_credential_extension(card: &JsonValue) -> Option<&JsonValue> {
     card.pointer("/capabilities/extensions")
@@ -283,10 +293,50 @@ fn identity_credential_extension(card: &JsonValue) -> Option<&JsonValue> {
         })
 }
 
-/// Whether the card carries an identity credential, which an anonymous card would
-/// otherwise pass on unchecked.
-fn carries_identity_credential(card: &[u8]) -> bool {
-    serde_json::from_slice::<JsonValue>(card).is_ok_and(|card| identity_credential_extension(&card).is_some())
+/// Whether the body is an agent card that names itself and carries no identity
+/// extension in any form, the only card served without a managed identity. A body
+/// that is not a JSON object, has no string `name`, has `capabilities` or
+/// `capabilities.extensions` of another shape, or lists an extension whose URI is an
+/// identity extension in any letter case keeps the refusal, so an identity the
+/// gateway did not check is never passed on.
+fn card_has_no_identity(card: &[u8]) -> bool {
+    let Ok(JsonValue::Object(card)) = serde_json::from_slice::<JsonValue>(card) else {
+        return false;
+    };
+    if !card
+        .get("name")
+        .is_some_and(JsonValue::is_string)
+    {
+        return false;
+    }
+    let extensions = match card.get("capabilities") {
+        None => return true,
+        Some(JsonValue::Object(capabilities)) => match capabilities.get("extensions") {
+            None => return true,
+            Some(JsonValue::Array(extensions)) => extensions,
+            Some(_) => return false,
+        },
+        Some(_) => return false,
+    };
+    extensions
+        .iter()
+        .all(|extension| {
+            let uri = extension
+                .as_str()
+                .or_else(|| {
+                    extension
+                        .get("uri")
+                        .and_then(JsonValue::as_str)
+                })
+                .unwrap_or_default()
+                .trim();
+            ![
+                crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION,
+                crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+            ]
+            .iter()
+            .any(|identity| uri.eq_ignore_ascii_case(identity))
+        })
 }
 
 /// Resolve the **external** agent's identity from an upstream response.
@@ -1625,6 +1675,103 @@ mod tests {
         assert!(note_card_without_identity(&format!("{surface_id}-2")), "another surface is warned about");
         note_card_with_identity(&surface_id);
         assert!(note_card_without_identity(&surface_id), "a card that lost its identity is warned about again");
+        forget_card_identity_warning(&surface_id);
+        assert!(note_card_without_identity(&surface_id), "a changed surface is warned about again");
+    }
+
+    async fn resolve_public_card_bytes(body: &[u8]) -> Result<ProtectedAgentIdentity, IdentityResolutionError> {
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        resolve_protected_agent_identity(
+            body,
+            &payload_extraction_surface("https://agent.example"),
+            Some(&selector),
+            None,
+            "test",
+            IdentityResponseKind::PublicAgentCard,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_public_card_that_could_carry_an_unchecked_identity_is_still_refused() {
+        let credential = crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION;
+        let identity = crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION;
+        let forged = json!({"did": "did:key:z6MkForged", "verifiablePresentation": "{}"});
+        let cases = [
+            (
+                "extensions in an object",
+                json!({"name": "agent", "capabilities": {"extensions": {"a": {"uri": credential, "params": forged}}}}),
+            ),
+            (
+                "a credential URI in another letter case",
+                card_with_extensions(json!([{"uri": credential.to_uppercase(), "params": forged}])),
+            ),
+            (
+                "an identity URI in another letter case",
+                card_with_extensions(json!([{"uri": identity.to_uppercase(), "params": {"name": "agent"}}])),
+            ),
+            ("a credential URI as a bare string", card_with_extensions(json!([credential]))),
+            ("capabilities that are not an object", json!({"name": "agent", "capabilities": "none"})),
+            ("a card without a name", json!({"capabilities": {}})),
+            ("an error body", json!({"error": "unauthorized"})),
+            ("a JSON array", json!([])),
+        ];
+        for (case, body) in cases {
+            let err = resolve_public_card_bytes(&serde_json::to_vec(&body).unwrap())
+                .await
+                .expect_err(case);
+            assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "{case}: {err}");
+        }
+        let err = resolve_public_card_bytes(b"")
+            .await
+            .expect_err("an empty body");
+        assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "an empty body: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_extended_card_with_only_an_identity_credential_is_reported_missing() {
+        let card = card_with_extensions(json!([{
+            "uri": crate::config::AFFINIDI_AGENT_IDENTITY_CREDENTIAL_EXTENSION,
+            "params": {"did": "did:key:z6MkA", "verifiablePresentation": json!({
+                "holder": "did:key:z6MkA",
+                "verifiableCredential": {"credentialSubject": {"id": "did:key:z6MkA"}}
+            }).to_string()}
+        }]));
+        let err = resolve_with_selector(&card, IdentityResponseKind::ExtendedAgentCard)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_external_slot_still_refuses_a_public_card_without_identity() {
+        let mut surface = crate::config::agent_surface::AgentSurface::default();
+        surface.access_point.protocol = crate::config::agent_surface::SurfaceProtocol::A2a;
+        surface
+            .identity_slots
+            .external = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        for (case, card) in cards_without_identity() {
+            let err = resolve_external_agent_identity(
+                &serde_json::to_vec(&card).unwrap(),
+                &surface,
+                None,
+                None,
+                "test",
+                IdentityResponseKind::PublicAgentCard,
+                None,
+            )
+            .await
+            .expect_err(case);
+            assert_eq!(err.code(), crate::a2a::ERR_IDENTITY_EXTENSION_MISSING, "{case}: {err}");
+        }
     }
 
     #[tokio::test]

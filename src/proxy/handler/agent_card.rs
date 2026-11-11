@@ -1200,6 +1200,10 @@ mod tests {
         assert_eq!(served.upstream, Some(card));
         assert!(!preview.generated && !served.generated);
         assert_eq!(preview.served, served.served);
+        assert!(
+            !preview.served_without_identity && !served.served_without_identity,
+            "a surface without managed identity has nothing missing"
+        );
         assert_ne!(served.served["url"], "http://agent.internal/a2a", "the card points at the Access Point");
         assert_eq!(recorded(&metrics, 1).await, vec![crate::metrics::ConnectionStatus::Success]);
     }
@@ -1236,6 +1240,7 @@ mod tests {
                 None,
                 "{mode:?}: no identity credential"
             );
+            assert!(built.served_without_identity, "{mode:?}");
         }
     }
 

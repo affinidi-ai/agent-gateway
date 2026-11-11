@@ -1238,12 +1238,13 @@ On the protected slot, `payload_extraction` refuses a response that carries no i
 `422 identity_extension_missing`, and one whose identity is present but invalid with `422
 identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
 which is served without an identity credential on any identity error. The public agent card of
-an A2A or AP2 surface is the exception for a missing identity: a card with neither
+an A2A or AP2 surface is the exception for a missing identity: a named card with neither
 `agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no identity
-credential and no Trust Recorder write, and the gateway logs a `WARN` once per surface. An agent
-that publishes no identity, such as a Microsoft Foundry agent, stays discoverable. Its messages
-are still refused while the slot reads the identity from the response. See
-[`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for the codes.
+credential and no Trust Recorder write. The gateway logs a `WARN` once per surface, and again
+only after that card carried an identity, after the surface changes, or after a configuration
+reload or restart. An agent that publishes no identity, such as a Microsoft Foundry agent, stays
+discoverable. Its messages are still refused while the slot reads the identity from the response.
+See [`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for which cards qualify and the codes.
 
 ### `from_api_key` on the inbound slot
 

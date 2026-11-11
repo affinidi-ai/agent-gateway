@@ -10,10 +10,11 @@ changes:
         identity_extension_missing when the managed agent's card had no identity extension, as a
         Microsoft Foundry agent's has not, so the agent could not be discovered. The gateway now
         serves that card without an identity credential, with every other change applied, and logs
-        a warning once per surface. This applies to A2A and AP2 surfaces. A card whose identity is
-        present but invalid, or that carries only an identity credential the gateway cannot use, is
-        still refused, and messages, streams and extended cards without an identity are still
-        refused.
+        a warning once per surface. This applies to A2A and AP2 surfaces, and only to a JSON object
+        with a string name whose extensions list neither identity extension in any letter case. A
+        card whose identity is present but invalid, that carries an identity credential the gateway
+        cannot use, whose extensions are not a list, or that is not a named card is still refused,
+        and messages, streams and extended cards without an identity are still refused.
     - timestamp: '2026-11-11T15:00:00Z'
       title: Show a card served without a managed identity on the Agent Cards view
       description: >-
