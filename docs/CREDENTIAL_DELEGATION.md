@@ -376,11 +376,14 @@ tenant](#provider-secrets-belong-to-the-providers-tenant)).
   refuses the token.
 - `resource` is sent only when the provider sets it, on every path including legacy bindings.
   The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
-  in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
-  list when an Entra v2.0 provider sets `resource`. An [external consent
-  provider](#external-consent-providers) must set `resource`, which binds where its grants go:
-  for such an issuer, create it with `send_resource: false`, so its code exchange and refresh
-  leave the parameter out.
+  in the scopes as `<resource>/.default` instead. An [external consent
+  provider](#external-consent-providers) must set `resource`, which binds where its grants go,
+  and cannot change it: for such an issuer, create it with `send_resource: false`, so its code
+  exchange and refresh leave the parameter out. The dashboard warns on the provider form and
+  list when a provider's token requests send `resource` to an Entra v2.0 token endpoint: a
+  provider without an issuer is told to move the audience into its scopes and clear `resource`,
+  and an external consent provider to be re-created with `send_resource: false`. An external
+  consent provider with `send_resource: false` is not warned.
 
 Each replica sends one token request per cache key at a time. Requests that miss the cache
 meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
@@ -473,7 +476,7 @@ authorization server, whose grants another system obtains through the browser wi
 | `allow_unadvertised_pkce` | Optional, `false` by default. `true` admits an issuer whose metadata does not list `code_challenge_methods_supported`; see below |
 | `scope_comparison` | Optional, `exact` by default: how the scopes the token endpoint grants are compared with those asked for ([Granted scopes](#granted-scopes)) |
 | `revocation_ends_authorization` | Optional, `false` by default. `true` for a vendor whose revocation of any one token ends the person's whole authorization of the client, as Google's does ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)) |
-| `send_resource` | Optional, `true` by default: the code exchange and every refresh send `resource` to the token endpoint. `false` sends it on neither, for a token endpoint that refuses it, such as the Microsoft identity platform v2.0 one (AADSTS901002). `resource` is still required and is still the only origin the grants go to. The API names it only when `false` |
+| `send_resource` | Optional, `true` by default: the code exchange and every refresh send `resource` to the token endpoint, which binds the token's audience to it (RFC 8707). `false` sends it on neither, so the token carries no such binding and its audience follows the scopes alone (Entra: `<resource>/.default`); use it only for a token endpoint that refuses the parameter, such as the Microsoft identity platform v2.0 one (AADSTS901002). It never loosens where the grants may be sent: `resource` is still required and is still the only origin they go to. The API names it only when `false` |
 | `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
 
 An external consent provider uses its own tenant's secrets only, for its client secret, its

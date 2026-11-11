@@ -53,6 +53,8 @@ interface CredentialProviderForm extends JwtFormFields {
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
   issuer: string;
+  /** Whether an external consent provider's token requests send its resource; never sent on save. */
+  send_resource: boolean;
 }
 
 interface RoutingConfig {
@@ -80,6 +82,7 @@ const EMPTY_FORM: CredentialProviderForm = {
   callback_url: '',
   resource: '',
   issuer: '',
+  send_resource: true,
   ...EMPTY_JWT_FIELDS,
 };
 
@@ -179,6 +182,7 @@ const EditCredentialProviderPage: React.FC = () => {
         callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
+        send_resource: data.send_resource ?? true,
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
       });
@@ -489,6 +493,17 @@ const EditCredentialProviderPage: React.FC = () => {
                 resource were checked against that server when it was created and are fixed: only
                 its name, description, default scopes and token refresh can be changed here. Create
                 a new provider to change anything else.
+              </div>
+            )}
+
+            {form.issuer && entraRejectsResource(form.token_endpoint, form.resource, form) && (
+              <div
+                className="alert alert-warning py-2"
+                role="status"
+                data-testid="credential-provider-entra-resource-warning"
+              >
+                <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                {entraResourceMessage(form.resource, form)}
               </div>
             )}
 

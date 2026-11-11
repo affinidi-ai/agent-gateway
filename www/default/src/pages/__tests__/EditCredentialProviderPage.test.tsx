@@ -81,6 +81,53 @@ describe('EditCredentialProviderPage Entra resource warning', () => {
 describe('EditCredentialProviderPage external consent provider', () => {
   beforeEach(() => jest.clearAllMocks());
 
+  const entraExternal = (send_resource?: boolean) => ({
+    id: 'p1',
+    name: 'Mail',
+    provider_id: 'mail',
+    provider_type: 'oauth2_authorization_code',
+    issuer: 'https://login.microsoftonline.com/tenant-id/v2.0',
+    authorization_endpoint: 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/authorize',
+    token_endpoint: ENTRA_V2,
+    token_endpoint_auth_method: 'none',
+    client_id: 'client-1',
+    callback_url: 'https://gateway.example/callback/mail',
+    resource: 'https://graph.microsoft.com',
+    default_scopes: ['Mail.Read'],
+    token_refresh_enabled: true,
+    ...(send_resource === undefined ? {} : { send_resource }),
+  });
+
+  const renderExternal = (record: Record<string, unknown>) => {
+    mockFetch.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.startsWith('/api/v1/credential-providers/')
+          ? { ok: true, json: () => Promise.resolve(record) }
+          : { ok: false, json: () => Promise.resolve([]) }
+      )
+    );
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  };
+
+  it('tells an Entra v2.0 provider that sends its resource to re-create it without sending it', async () => {
+    renderExternal(entraExternal());
+    expect(await screen.findByTestId(WARNING)).toHaveTextContent(
+      're-create the provider with send_resource set to false'
+    );
+  });
+
+  it('does not warn an Entra v2.0 provider that leaves its resource out', async () => {
+    renderExternal(entraExternal(false));
+    await screen.findByTestId('credential-provider-external-notice');
+    expect(screen.queryByTestId(WARNING)).not.toBeInTheDocument();
+  });
+
   it('shows the fixed settings as read-only and saves only the editable fields', async () => {
     const external = {
       id: 'p1',
