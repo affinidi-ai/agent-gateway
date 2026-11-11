@@ -14,6 +14,38 @@ changes:
         instances starting together still create one key between them, and an instance
         reading the file while another fills it waits for it to be complete. No
         configuration is needed.
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: ⭐ Recover from an empty transit token key file after an interrupted start
+      description: >-
+        Where the storage volume has no hard links, the gateway creates the transit token
+        key file and fills it in place. A first start killed in between left the file
+        empty, and every later start then refused it after waiting 5 seconds for a creator
+        to finish, so the deployment stayed down until an operator deleted the file. An
+        empty key file is now removed and a new key created in its place; a key file with
+        any content in it, even damaged, is still never replaced, and the error naming it
+        now says it is empty and what to do about it. An instance whose own key file is
+        removed while it fills it reads the file back, finds the key that replaced it and
+        uses that one, so the instances still share a key. Only an instance that found the
+        file unchanged across those 5 seconds removes it, and an instance creating the key
+        removes nothing, so a file another instance is filling is left alone; an instance
+        that finds the key gone between reading and creating it tries both again rather
+        than stopping.
+    - timestamp: '2026-11-11T12:01:00Z'
+      title: Wait out a transit token key file that cannot be read yet
+      description: >-
+        An instance reading the key file while another filled it waited only for content
+        that did not parse. With encryption at rest on, a file caught half written comes
+        back as a failed decryption, and a share that drops a read as a read error, and
+        both stopped the start at once instead of waiting. Those failures are now retried
+        for the same 5 seconds, and the start that gives up still reports the real cause.
+    - timestamp: '2026-11-11T12:02:00Z'
+      title: Warn when a volume keeps a secret file readable beyond its owner
+      description: >-
+        An SMB share mounted without file_mode=0600 accepts the permission change the
+        gateway makes on a key file without applying it. The gateway now reads the mode
+        back and warns that the file is still readable beyond its owner, instead of
+        logging that it restricted it, and the deployment requirements state the mount
+        options to give such a share.
   removed: []
   security: []
   breaking: []

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
+use tracing::warn;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Clock difference tolerated on a token's `iat` and `exp`.
@@ -26,7 +27,7 @@ const CLOCK_LEEWAY_SECS: u64 = 5;
 /// File, in the VC key directory, holding the transit token signing key.
 const KEY_FILE_NAME: &str = "transit_token_key.json";
 
-/// How long a key file that does not parse is read again before it is refused.
+/// How long a key file that cannot be read or does not parse is read again before it is refused.
 /// Where the storage directory has no hard links the file is created empty and
 /// filled in place, so another instance's key file is briefly unreadable. Filling
 /// it takes milliseconds; this covers a storage backend that stalls, such as a
@@ -70,38 +71,78 @@ impl TransitTokenKey {
 
     /// The key kept in `directory`, created there on first use. Instances starting on one
     /// storage directory at the same moment create one key between them and all use it. A key
-    /// file that cannot be read or parsed is an error, never replaced. An existing key file,
-    /// such as one a restore wrote, is restricted to its owner.
+    /// file that cannot be read or parsed is an error, never replaced, with one exception: a
+    /// key file that holds no content at all for [`UNREADABLE_KEY_FILE_WAIT`], as a first start
+    /// killed between creating the file and filling it leaves it, is removed and a new key
+    /// created. Only the reader that watched it stay the same empty file for that long removes
+    /// it, so a file another instance is filling right now is never taken, and a creator whose
+    /// own file is removed in the moment before it fills it adopts the key that replaced it.
+    /// Reading and creating are retried for the same window, so an instance that finds the key
+    /// gone between the two does not fail its start.
+    /// An existing key file, such as one a restore wrote, is restricted to its owner.
     pub async fn load_or_create(directory: &Path) -> Result<Self> {
         let path = directory.join(KEY_FILE_NAME);
-        if let Some(key) = Self::read_existing(&path).await? {
-            return Ok(key);
-        }
-        let generated = Self::generate()?;
-        if crate::encryption::secret_file::create_secret_file(&path, &generated.to_stored()?).await? {
-            return Ok(generated);
-        }
-        Self::read_existing(&path)
-            .await?
-            .with_context(|| format!("Transit token signing key {} disappeared while it was created", path.display()))
-    }
-
-    /// The key stored in `path`, or `None` when no key file exists there. A file
-    /// that does not parse is read again for up to [`UNREADABLE_KEY_FILE_WAIT`]
-    /// before it is refused: where the storage directory has no hard links the
-    /// instance creating the key fills the file in place, so another instance can
-    /// read it while it is still empty or half written. The file is restricted to
-    /// its owner as soon as it can be read.
-    async fn read_existing(path: &Path) -> Result<Option<Self>> {
         let give_up_at = Instant::now() + UNREADABLE_KEY_FILE_WAIT;
         loop {
-            let Some(stored) = crate::encryption::secret_file::read_secret_file(path).await? else {
-                return Ok(None);
+            if let Some(key) = Self::read_existing(&path).await? {
+                return Ok(key);
+            }
+            let generated = Self::generate()?;
+            if crate::encryption::secret_file::create_secret_file(&path, &generated.to_stored()?).await? {
+                return Ok(generated);
+            }
+            if Instant::now() >= give_up_at {
+                anyhow::bail!(
+                    "Transit token signing key {} disappeared or stayed empty as it was created",
+                    path.display()
+                );
+            }
+            tokio::time::sleep(UNREADABLE_KEY_FILE_RETRY_DELAY).await;
+        }
+    }
+
+    /// The key stored in `path`, or `None` when no key file exists there or the
+    /// one that does is empty, which the caller creates again. A file that cannot
+    /// be read or does not parse is read again for up to
+    /// [`UNREADABLE_KEY_FILE_WAIT`] before it is refused: where the storage
+    /// directory has no hard links the instance creating the key fills the file in
+    /// place, so another instance can read it while it is still empty or half
+    /// written, and under encryption at rest a half-written ciphertext fails to
+    /// decrypt rather than to parse. The file is restricted to its owner as soon
+    /// as it can be read. A file that held no content when the wait began and is
+    /// still the same empty file when it runs out is removed, and `None` returned
+    /// so the caller creates the key again; one that changed in the meantime, or
+    /// that only fell empty along the way, is left alone, because another
+    /// instance is filling it.
+    async fn read_existing(path: &Path) -> Result<Option<Self>> {
+        // Captured before the wait starts, so a file that is removed only once the
+        // wait runs out is one that held no content for the whole of it, never one
+        // that fell empty along the way.
+        let empty_when_first_read = crate::encryption::secret_file::empty_secret_files(path).await;
+        let give_up_at = Instant::now() + UNREADABLE_KEY_FILE_WAIT;
+        loop {
+            let read = match crate::encryption::secret_file::read_secret_file(path).await {
+                Ok(None) => return Ok(None),
+                Ok(Some(stored)) => {
+                    crate::encryption::secret_file::restrict_secret_file_to_owner(path).await;
+                    Self::parse(&Zeroizing::new(stored))
+                }
+                Err(error) => Err(error),
             };
-            crate::encryption::secret_file::restrict_secret_file_to_owner(path).await;
-            match Self::parse(&Zeroizing::new(stored)) {
+            match read {
                 Ok(key) => return Ok(Some(key)),
                 Err(error) if Instant::now() >= give_up_at => {
+                    if let Some(empty) = &empty_when_first_read
+                        && crate::encryption::secret_file::remove_unchanged_empty_secret_files(empty).await
+                    {
+                        warn!(
+                            "Transit token signing key {} held no content for {} seconds, as a first start \
+                             interrupted while filling it leaves it: creating a new key in its place",
+                            path.display(),
+                            UNREADABLE_KEY_FILE_WAIT.as_secs()
+                        );
+                        return Ok(None);
+                    }
                     return Err(error)
                         .with_context(|| format!("Invalid transit token signing key in {}", path.display()));
                 }
@@ -111,6 +152,12 @@ impl TransitTokenKey {
     }
 
     fn parse(stored: &str) -> Result<Self> {
+        if stored.is_empty() {
+            anyhow::bail!(
+                "the file is empty, as a first start interrupted while filling it leaves it; removing it lets the \
+                 gateway create a new key"
+            );
+        }
         let stored: StoredTransitTokenKey =
             serde_json::from_str(stored).map_err(|_| anyhow::anyhow!("the file is not a transit token key record"))?;
         if stored.kid.is_empty()
@@ -863,6 +910,72 @@ mod tests {
         creator.await.unwrap();
         assert_eq!(loaded.kid, "filled-in-place");
         assert_eq!(loaded.secret.as_ref(), &[3u8; 32][..]);
+    }
+
+    /// Under encryption at rest the file created in place is the `.enc` sibling,
+    /// and a ciphertext caught half written fails to decrypt rather than to
+    /// parse. That read failure is waited out the same way.
+    #[tokio::test]
+    async fn a_half_written_encrypted_key_file_is_read_once_it_is_complete() {
+        crate::encryption::global::set_test_encryption(
+            crate::config::EncryptionConfig {
+                enabled: true,
+                key_source: crate::config::KeySourceConfig::Environment,
+                ..crate::config::EncryptionConfig::default()
+            },
+            crate::encryption::EncryptionService::new(crate::encryption::KeySource::Raw { key: [9u8; 32] }).unwrap(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        let enc_path = crate::encryption::secret_file::secret_enc_path(&path);
+        crate::encryption::secret_file::write_secret_file(
+            &path,
+            &format!(r#"{{"kid":"filled-in-place","key":"{}"}}"#, hex::encode([3u8; 32])),
+        )
+        .await
+        .unwrap();
+        let complete = std::fs::read_to_string(&enc_path).unwrap();
+        std::fs::write(&enc_path, &complete[..complete.len() - 4]).unwrap();
+        let creator = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            std::fs::write(&enc_path, complete).unwrap();
+        });
+
+        let loaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        creator.await.unwrap();
+        assert_eq!(loaded.kid, "filled-in-place");
+        assert_eq!(loaded.secret.as_ref(), &[3u8; 32][..]);
+    }
+
+    /// A first start killed between creating the key file and filling it leaves
+    /// it empty. The next start waits out the window for a creator that may still
+    /// be filling it, then creates the key again instead of refusing the empty
+    /// file for good. The clock is paused so the wait passes instantly.
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_key_file_left_by_an_interrupted_first_start_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        std::fs::write(&path, "").unwrap();
+
+        let created = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+
+        let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["kid"].as_str(), Some(created.kid.as_str()));
+        assert_eq!(
+            stored["key"].as_str(),
+            Some(hex::encode(created.secret.as_ref()).as_str()),
+            "the new key is the one written to the empty file"
+        );
+        let reloaded = TransitTokenKey::load_or_create(dir.path())
+            .await
+            .unwrap();
+        assert_eq!(reloaded.kid, created.kid);
+        assert_eq!(reloaded.secret.as_ref(), created.secret.as_ref());
     }
 
     /// The clock is paused so the retries of each damaged file pass instantly

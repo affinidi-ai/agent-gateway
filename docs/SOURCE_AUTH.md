@@ -1037,16 +1037,31 @@ The signing key is 32 random bytes the gateway creates on its first start, in
 encrypted like the gateway's other keys when encryption at rest is on. A key file that is
 not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
 loads it, and the file written when encryption at rest is turned on later is owner-only
-too. The file is created by linking a complete copy into place. When that link fails for any
-reason other than the file already existing, as every link does on a filesystem without hard
-links such as an Azure Files SMB share, the gateway logs a warning and creates the file
-exclusively instead, filling it in place; one instance still wins the creation, and an
-instance reading the file while another fills it waits up to 5 seconds for it to be complete.
-Filling it takes milliseconds, so the wait covers a storage backend that stalls; an instance
-that still cannot read the file by then stops with an error and reads the complete file when
-it is restarted, so a stall costs one restart and never a second key. A directory the file
-cannot be made in at all still stops the start. A key file that cannot be read stops the gateway from starting. Every token names
-the key in its `kid` header, and a token that names another key, or none, is refused.
+too. A volume that applies its own mode, such as an SMB share mounted without
+`file_mode=0600`, keeps the key readable beyond its owner; the gateway warns about it and
+starts, so mount such a share with the options under
+[Storage](DEPLOYMENT_REQUIREMENTS.md#storage). The file is created by linking a complete
+copy into place. When that link fails for any reason other than the file already existing,
+as every link does on a filesystem without hard links such as an Azure Files SMB share, the
+gateway logs a warning and creates the file exclusively instead, filling it in place; one
+instance still wins the creation, and an instance reading the file while another fills it
+waits up to 5 seconds for it to be complete. Filling it takes milliseconds, so the wait
+covers a storage backend that stalls; an instance that still cannot read a file with content
+in it by then stops with an error and reads the complete file when it is restarted, so such
+a stall costs one restart and never a second key. A directory the file cannot be made in at
+all still stops the start. A key file that cannot be read stops the gateway from starting
+and is never replaced, with one exception: a key file that holds no content at all, which a
+first start killed between creating the file and filling it leaves behind, is removed and a
+new key created in its place, so an interrupted first start does not stop every later one.
+Only an instance that read the file empty and found it unchanged 5 seconds later removes it,
+and an instance creating the key removes nothing, so a file another instance is filling at
+that moment is left alone. A file with any content in it, even damaged, is kept and named in
+the error instead. Should an instance lose its file in the moment between that check and the
+removal, it reads its own file back once it has filled it, finds the other key there, and
+uses that key rather than the one it generated, so the two still share one key; and an
+instance that finds the key gone between reading and creating it tries both again for the
+same 5 seconds rather than stopping. Every token names the key in its `kid`
+header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
 accepts the tokens the Active instance issued; instances that do not share it refuse each
 other's tokens, so every instance that serves a managed agent's Transit Point calls must share

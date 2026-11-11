@@ -137,7 +137,13 @@ pub async fn write_secret_file(
 /// filesystem without hard links such as an SMB share, falls back to creating
 /// the file exclusively and filling it in place (see
 /// [`create_secret_file_in_place`]), which still lets exactly one creator win but
-/// can leave a reader seeing it empty for a moment. Creators that disagree on
+/// can leave a reader seeing it empty for a moment. Any existing form refuses
+/// this creation, an empty one included: an empty file is what a creator killed
+/// in that window leaves behind, but this creation cannot tell such a leftover
+/// from a file another creator is filling right now, so removing one is the job
+/// of a reader that has watched it stay the same empty file for as long as it is
+/// willing to wait (see [`empty_secret_files`] and
+/// [`remove_unchanged_empty_secret_files`]). Creators that disagree on
 /// encryption at rest can each create a different form at once; a creator that
 /// then finds the other form beside its own removes its own and fails, so no two
 /// keys stay in use.
@@ -146,8 +152,13 @@ pub async fn create_secret_file(
     contents: &str,
 ) -> Result<bool> {
     let enc_path = secret_enc_path(path);
-    if path.exists() || enc_path.exists() {
-        return Ok(false);
+    for existing in [path, enc_path.as_path()] {
+        if tokio::fs::metadata(existing)
+            .await
+            .is_ok()
+        {
+            return Ok(false);
+        }
     }
     let (target, other_form, bytes) = match active_encryption() {
         Some(service) => (
@@ -186,6 +197,127 @@ pub async fn create_secret_file(
             create_secret_file_in_place(&target, &other_form, bytes.as_bytes()).await
         }
     }
+}
+
+/// An empty form of a secret file, identified closely enough that only this file
+/// is removed later: on unix by its device and inode, so a form another creator
+/// removed and created again is usually not mistaken for it, though a filesystem
+/// that reuses the inode can hide the difference. Elsewhere only its path and
+/// emptiness are compared, which is as much as the platform offers. Neither rules
+/// out a file created between the check and the removal; the creator's own
+/// read-back catches that instead.
+pub struct EmptySecretFile {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl EmptySecretFile {
+    #[cfg(unix)]
+    fn of(
+        path: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Self {
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            path: path.to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn of(
+        path: &Path,
+        _metadata: &std::fs::Metadata,
+    ) -> Self {
+        Self { path: path.to_path_buf() }
+    }
+
+    /// Whether the path still holds the same empty file this captured.
+    async fn is_unchanged(&self) -> bool {
+        let Ok(metadata) = tokio::fs::metadata(&self.path).await else {
+            return false;
+        };
+        metadata.len() == 0 && self.is_same_file(&metadata)
+    }
+
+    #[cfg(unix)]
+    fn is_same_file(
+        &self,
+        metadata: &std::fs::Metadata,
+    ) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.dev() == self.device && metadata.ino() == self.inode
+    }
+
+    #[cfg(not(unix))]
+    fn is_same_file(
+        &self,
+        _metadata: &std::fs::Metadata,
+    ) -> bool {
+        true
+    }
+}
+
+/// The forms of the secret in `path` when every one that exists is empty, as a
+/// creation interrupted while filling it leaves them. `None` when any form holds
+/// content, when no form exists, or when a form's metadata cannot be read, so a
+/// file that cannot be judged is never taken for a leftover. This removes
+/// nothing: the caller waits as long as it is willing to, then calls
+/// [`remove_unchanged_empty_secret_files`].
+pub async fn empty_secret_files(path: &Path) -> Option<Vec<EmptySecretFile>> {
+    let enc_path = secret_enc_path(path);
+    let mut empty = Vec::new();
+    for form in [path, enc_path.as_path()] {
+        match tokio::fs::metadata(form).await {
+            Ok(metadata) if metadata.len() == 0 => empty.push(EmptySecretFile::of(form, &metadata)),
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    (!empty.is_empty()).then_some(empty)
+}
+
+/// Remove the empty files [`empty_secret_files`] captured, but only while every
+/// one of them is still the same empty file, so a creator that has since made its
+/// own file and is filling it does not lose it. Returns whether anything was
+/// removed; a failure is logged and leaves the file in place, where the creation
+/// that follows refuses it as an existing file.
+///
+/// The check and the removal are not one operation, so a creator that creates its
+/// file in the moment between them still loses it. That creator reads its own
+/// file back once it is filled, finds the winner's content, and gives up its
+/// creation, so the two converge on one secret (see
+/// [`created_secret_file_is_still_ours`]).
+pub async fn remove_unchanged_empty_secret_files(empty: &[EmptySecretFile]) -> bool {
+    for form in empty {
+        if !form.is_unchanged().await {
+            return false;
+        }
+    }
+    let mut removed = false;
+    for form in empty {
+        warn!(
+            "Secret file {} stayed empty, as a creation interrupted while filling it leaves it: removing it and \
+             creating the secret again",
+            form.path.display()
+        );
+        match tokio::fs::remove_file(&form.path).await {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                error!("Failed to remove the empty secret file {}: {}", form.path.display(), error);
+                return false;
+            }
+        }
+    }
+    removed
 }
 
 /// Hard-link `staged` to `target`, or, under test, fail the way a filesystem
@@ -233,7 +365,10 @@ fn simulated_link_failure() -> std::io::Error {
 /// directory sees the file empty or half written, so readers of a file created
 /// this way retry one that does not parse yet instead of failing at once. A
 /// creation that fails while filling the file removes it again, so the window
-/// does not outlive the creator.
+/// does not outlive the creator. The file is read back once it is filled: a
+/// creator whose file another one removed as an empty leftover and replaced in
+/// that window returns `false`, so it adopts the secret now in place instead of
+/// running on one that is on no disk.
 async fn create_secret_file_in_place(
     target: &Path,
     other_form: &Path,
@@ -258,7 +393,33 @@ async fn create_secret_file_in_place(
         }
         return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
     }
+    if !created_secret_file_is_still_ours(target, bytes).await? {
+        warn!(
+            "Secret file {} was replaced by another creator while it was filled: giving up this creation and \
+             adopting the secret now in place",
+            target.display()
+        );
+        return Ok(false);
+    }
     settle_created_secret_file(target, other_form).await
+}
+
+/// Whether the file just filled still holds what this creator wrote. Another
+/// creator can remove it as an empty leftover and create its own between the
+/// exclusive create and the fill, so the content on disk decides who won: a
+/// creator that finds anything else, or nothing, lost its file and must adopt
+/// the secret now in place.
+async fn created_secret_file_is_still_ours(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<bool> {
+    match tokio::fs::read(target).await {
+        Ok(written) => Ok(written.as_slice() == bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to read back the created secret file {}", target.display()))
+        }
+    }
 }
 
 /// Write `bytes` to a just-created secret file and make them durable.
@@ -305,8 +466,11 @@ async fn settle_created_secret_file(
 }
 
 /// Restrict a secret file, in whichever form exists, to its owner, when it was
-/// written with the process default mode, as a restore writes every file. A
-/// failure is logged and does not stop the caller.
+/// written with the process default mode, as a restore writes every file. The
+/// mode is read back, so a volume that accepts the change without applying it,
+/// as an SMB share mounted without `file_mode=0600` does, is warned about
+/// instead of reported as restricted. A failure is logged and does not stop the
+/// caller.
 pub async fn restrict_secret_file_to_owner(path: &Path) {
     #[cfg(unix)]
     for path in [path.to_path_buf(), secret_enc_path(path)] {
@@ -319,13 +483,30 @@ pub async fn restrict_secret_file_to_owner(path: &Path) {
         if mode & 0o077 == 0 {
             continue;
         }
-        match tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
-            Ok(()) => tracing::info!(
+        if let Err(error) = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await {
+            warn!("Failed to restrict secret file {} to its owner: {}", path.display(), error);
+            continue;
+        }
+        match tokio::fs::metadata(&path)
+            .await
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+        {
+            Ok(applied) if applied & 0o077 == 0 => tracing::info!(
                 path = %path.display(),
                 previous_mode = format!("{mode:o}"),
                 "Restricted secret file to its owner"
             ),
-            Err(error) => warn!("Failed to restrict secret file {} to its owner: {}", path.display(), error),
+            Ok(applied) => warn!(
+                "Secret file {} is still readable beyond its owner (mode {:o}) after restricting it: the volume it \
+                 sits on applies its own mode, as an SMB share mounted without file_mode=0600 does",
+                path.display(),
+                applied
+            ),
+            Err(error) => warn!(
+                "Failed to read the mode of secret file {} back after restricting it to its owner: {}",
+                path.display(),
+                error
+            ),
         }
     }
     #[cfg(not(unix))]
@@ -368,7 +549,9 @@ async fn read_encrypted_secret_file(
 /// When encryption is active this also converges the on-disk state: a plaintext
 /// file sitting beside an authoritative `.enc` is removed (ciphertext wins), and
 /// a plaintext-only file is migrated to `.enc` and its plaintext deleted — so
-/// enabling encryption removes lingering plaintext on the next read.
+/// enabling encryption removes lingering plaintext on the next read. An empty
+/// file is returned as it is and never migrated: it holds nothing, and is what a
+/// creator sharing the directory leaves while it fills the file in place.
 ///
 /// When encryption is disabled but an encrypted-only `.enc` sibling exists (no
 /// readable plaintext), this fails loudly instead of reporting the secret as
@@ -392,6 +575,12 @@ pub async fn read_secret_file(path: &Path) -> Result<Option<String>> {
                 // in place.
                 return read_encrypted_secret_file(&service, path).await;
             };
+            // An empty file is one a creator sharing the directory is still filling:
+            // return it as it is, so in-flight content is never promoted to the
+            // authoritative encrypted form, which nothing would replace.
+            if content.is_empty() {
+                return Ok(Some(content));
+            }
             // Migrate plaintext-only to whole-file encryption, then drop the plaintext.
             write_secret_file(path, &content).await?;
             Ok(Some(content))
@@ -741,6 +930,128 @@ mod tests {
         );
         assert!(!path.exists());
         assert_eq!(std::fs::read_to_string(&not_a_directory).unwrap(), "in the way");
+    }
+
+    /// The content on disk decides who won when another creator removed this
+    /// file as an empty leftover and made its own while it was being filled:
+    /// only a creator that still finds its own bytes keeps its creation.
+    #[tokio::test]
+    async fn a_creator_keeps_its_creation_only_while_the_file_holds_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        std::fs::write(&path, "ours").unwrap();
+        assert!(
+            created_secret_file_is_still_ours(&path, b"ours")
+                .await
+                .unwrap()
+        );
+
+        std::fs::write(&path, "theirs").unwrap();
+        assert!(
+            !created_secret_file_is_still_ours(&path, b"ours")
+                .await
+                .unwrap(),
+            "a creator whose file was replaced must report that it lost"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !created_secret_file_is_still_ours(&path, b"ours")
+                .await
+                .unwrap(),
+            "a creator whose file was removed must report that it lost"
+        );
+    }
+
+    /// A creator killed between creating the file and filling it leaves it
+    /// empty. The creation itself never removes it, in either form: the reader
+    /// that watched it stay the same empty file does, and only then is the
+    /// secret created again.
+    #[tokio::test]
+    async fn an_empty_leftover_is_removed_only_by_the_reader_that_waited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(&path, "").unwrap();
+
+        assert!(
+            !create_secret_file(&path, "first")
+                .await
+                .unwrap(),
+            "the creation refuses an empty file rather than removing it"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        let empty = empty_secret_files(&path)
+            .await
+            .expect("an empty file must be captured");
+        assert!(remove_unchanged_empty_secret_files(&empty).await);
+        assert!(!path.exists());
+        assert!(
+            create_secret_file(&path, "first")
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        assert!(
+            empty_secret_files(&path)
+                .await
+                .is_none(),
+            "a file with content is never taken for a leftover"
+        );
+
+        // The empty leftover of the other form is captured and removed the same
+        // way, so the creation is not refused by a file that holds nothing.
+        let other = dir.path().join("other.json");
+        std::fs::write(secret_enc_path(&other), "").unwrap();
+        let empty = empty_secret_files(&other)
+            .await
+            .expect("the empty encrypted form must be captured");
+
+        assert!(remove_unchanged_empty_secret_files(&empty).await);
+        assert!(!secret_enc_path(&other).exists(), "the empty leftover must be removed");
+        assert!(
+            create_secret_file(&other, "first")
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "first");
+    }
+
+    /// The removal is refused once the file is no longer the empty one that was
+    /// captured, so a creator that filled it in the meantime does not lose it.
+    #[tokio::test]
+    async fn an_empty_leftover_that_gained_content_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(&path, "").unwrap();
+        let empty = empty_secret_files(&path)
+            .await
+            .expect("an empty file must be captured");
+
+        std::fs::write(&path, "another creator's secret").unwrap();
+
+        assert!(!remove_unchanged_empty_secret_files(&empty).await, "a file that gained content must be kept");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "another creator's secret");
+    }
+
+    /// A file another instance is still filling in place is empty. Reading it
+    /// must not promote that emptiness to the authoritative encrypted form,
+    /// which nothing would replace.
+    #[tokio::test]
+    async fn read_leaves_an_empty_plaintext_file_unmigrated_when_enabled() {
+        install_enabled_encryption();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key_0.json");
+        std::fs::write(&path, "").unwrap();
+
+        let read = read_secret_file(&path)
+            .await
+            .unwrap();
+
+        assert_eq!(read.as_deref(), Some(""));
+        assert!(!secret_enc_path(&path).exists(), "an in-flight file must not be promoted to .enc");
+        assert!(path.exists(), "the file another instance is filling must be left alone");
     }
 
     #[tokio::test]
