@@ -43,9 +43,13 @@ pub enum CardFetchStatus {
     Ok,
     Failed,
     NotServed,
+    /// The card is served, but without an identity credential, because the agent's
+    /// card carries no identity.
+    ServedWithoutIdentity,
 }
 
-/// Why the card was not obtained or not served. Fixed strings only: no upstream
+/// Why the card was not obtained or not served, or why a served card carries no
+/// identity credential. Fixed strings only: no upstream
 /// body, header, address or error text ever rides along.
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -64,12 +68,14 @@ pub enum CardFetchCause {
     ProxyUnavailable,
     IdentityFailed,
     RewriteFailed,
+    IdentityMissing,
 }
 
 impl CardFetchCause {
     /// `not_served` when the card was obtained but the gateway will not serve it.
     pub fn status(self) -> CardFetchStatus {
         match self {
+            Self::IdentityMissing => CardFetchStatus::ServedWithoutIdentity,
             Self::IdentityFailed | Self::RewriteFailed => CardFetchStatus::NotServed,
             Self::NeedsToken
             | Self::AuthFailed
@@ -628,10 +634,13 @@ async fn fetch_preview(
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut auth = CardAuthReport::for_surface(surface);
-    let (failure, upstream, served) = match built {
+    let (reported, upstream, served) = match built {
         Some(Ok(card)) => {
             auth.sent(card.credential_sent);
-            (None, card.upstream, Some(card.served))
+            let cause = card
+                .served_without_identity
+                .then_some((CardFetchCause::IdentityMissing, None));
+            (cause, card.upstream, Some(card.served))
         }
         Some(Err(failure)) => {
             auth.sent(failure.credential_sent);
@@ -644,9 +653,9 @@ async fn fetch_preview(
         None => (Some((CardFetchCause::Timeout, None)), None, None),
     };
     let fetch = CardFetchReport {
-        status: failure.map_or(CardFetchStatus::Ok, |(cause, _)| cause.status()),
-        cause: failure.map(|(cause, _)| cause),
-        http_status: failure.and_then(|(_, http_status)| http_status),
+        status: reported.map_or(CardFetchStatus::Ok, |(cause, _)| cause.status()),
+        cause: reported.map(|(cause, _)| cause),
+        http_status: reported.and_then(|(_, http_status)| http_status),
         duration_ms,
     };
     let generated = surface.is_a2a_proxy_target();
@@ -845,7 +854,8 @@ mod tests {
                     BlockedByEgress,
                     ProxyUnavailable,
                     IdentityFailed,
-                    RewriteFailed
+                    RewriteFailed,
+                    IdentityMissing
                 ]
                 .iter()
                 .map(|cause| json!(cause))
@@ -865,7 +875,8 @@ mod tests {
                 "blocked_by_egress",
                 "proxy_unavailable",
                 "identity_failed",
-                "rewrite_failed"
+                "rewrite_failed",
+                "identity_missing"
             ]
         );
         assert_eq!(
@@ -895,6 +906,7 @@ mod tests {
                 json!(CardFetchStatus::Ok),
                 json!(CardFetchStatus::Failed),
                 json!(CardFetchStatus::NotServed),
+                json!(CardFetchStatus::ServedWithoutIdentity),
                 json!(CardAuthKind::None),
                 json!(CardAuthKind::StaticSecret),
                 json!(CardAuthKind::CredentialProvider),
@@ -912,6 +924,7 @@ mod tests {
                 "ok",
                 "failed",
                 "not_served",
+                "served_without_identity",
                 "none",
                 "static_secret",
                 "credential_provider",
@@ -929,6 +942,7 @@ mod tests {
         assert_eq!(IdentityFailed.status(), CardFetchStatus::NotServed);
         assert_eq!(RewriteFailed.status(), CardFetchStatus::NotServed);
         assert_eq!(NeedsToken.status(), CardFetchStatus::Failed);
+        assert_eq!(IdentityMissing.status(), CardFetchStatus::ServedWithoutIdentity);
     }
 
     #[test]
@@ -1121,6 +1135,59 @@ mod tests {
         let surface = |endpoint: &str| surface_with("s", json!({"endpoint": endpoint}));
         assert_eq!(surface_digest(&surface("https://a.example")), surface_digest(&surface("https://a.example")));
         assert_ne!(surface_digest(&surface("https://a.example")), surface_digest(&surface("https://b.example")));
+    }
+
+    #[tokio::test]
+    async fn a_card_without_an_identity_previews_as_served_without_identity() {
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let mut surface = surface_with("orders", json!({"endpoint": target.url()}));
+        surface
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        let state = running(surface).await;
+
+        let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
+        let preview = memory
+            .preview(&state, &caller("u-no-identity"), PreviewRequest::Read)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fetch_of(&preview),
+            (CardFetchStatus::ServedWithoutIdentity, Some(CardFetchCause::IdentityMissing), None)
+        );
+        assert_eq!(preview.before, Some(agent_card()));
+        let served = preview
+            .after
+            .clone()
+            .expect("the served card is shown");
+        assert_ne!(served["url"], agent_card()["url"], "the card points at the gateway");
+        assert!(
+            memory
+                .good_cards
+                .get("orders")
+                .await
+                .is_some(),
+            "the card counts as the last good card"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_without_an_identity_on_a_surface_without_managed_identity_previews_ok() {
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let state = state(json!({"endpoint": target.url()})).await;
+
+        let preview = PreviewMemory::new(FETCHES_PER_MINUTE)
+            .preview(&state, &caller("u-unmanaged"), PreviewRequest::Read)
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_of(&preview), (CardFetchStatus::Ok, None, None));
     }
 
     #[tokio::test]

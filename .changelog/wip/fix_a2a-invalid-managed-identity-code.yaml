@@ -25,6 +25,15 @@ changes:
         present but invalid, or that carries only an identity credential the gateway cannot use, is
         still refused, and messages, streams and extended cards without an identity are still
         refused.
+    - timestamp: '2026-11-11T15:00:00Z'
+      title: Show a card served without a managed identity on the Agent Cards view
+      description: >-
+        The agent card preview reports a card served without an identity credential as fetch status
+        served_without_identity with cause identity_missing, and keeps it as the last good card.
+        The Agent Cards view shows "Served – No managed identity" with a warning that the managed
+        agent's card has no identity extension, and the Managed Agent panel's fetch line shows the
+        same status in the warning tone, so operators see why the card carries no identity
+        credential instead of a failure.
   removed: []
   security: []
   breaking: []

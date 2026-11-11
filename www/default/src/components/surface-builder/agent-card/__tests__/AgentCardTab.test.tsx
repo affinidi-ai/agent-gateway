@@ -279,6 +279,53 @@ describe('AgentCardTab, failed fetches', () => {
     );
     expect(screen.queryByTestId('agent-card-row-signin')).not.toBeInTheDocument();
   });
+
+  it('warns that a card served without a managed identity has no identity credential', async () => {
+    await showBody(
+      previewBody({
+        fetch: {
+          status: 'served_without_identity',
+          cause: 'identity_missing',
+          http_status: null,
+          duration_ms: 5,
+        },
+      })
+    );
+    expect(screen.getByTestId('agent-card-fetch-status')).toHaveTextContent(
+      'Served – No managed identity'
+    );
+    expect(screen.queryByTestId('agent-card-fetch-cause')).not.toBeInTheDocument();
+    const warning = screen.getByTestId('agent-card-served-without-identity');
+    expect(warning).toHaveClass('alert-warning');
+    expect(warning).toHaveTextContent(
+      "The managed agent's card has no identity extension, so the gateway serves it without an identity credential."
+    );
+    expect(screen.queryByTestId('agent-card-failed')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-card-summary')).toBeInTheDocument();
+  });
+
+  it('announces a refresh that serves the card without a managed identity', async () => {
+    await showBody(previewBody());
+    mockFetch.mockResolvedValueOnce(
+      reply(
+        200,
+        previewBody({
+          fetch: {
+            status: 'served_without_identity',
+            cause: 'identity_missing',
+            http_status: null,
+            duration_ms: 5,
+          },
+        })
+      )
+    );
+    fireEvent.click(screen.getByTestId('agent-card-refresh-button'));
+    await waitFor(() =>
+      expect(screen.getByTestId('agent-card-refresh-status')).toHaveTextContent(
+        'Card refreshed. The card is served without a managed identity.'
+      )
+    );
+  });
 });
 
 describe('AgentCardTab, the served card on a failed fetch', () => {

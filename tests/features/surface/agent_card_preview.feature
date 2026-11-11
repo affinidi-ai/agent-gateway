@@ -18,6 +18,15 @@ Feature: Agent card preview
     And the agent card preview shows the card the gateway serves, pointing at the gateway
     And managed agent "bravo" received a request for its agent card without the operator's credentials
 
+  Scenario: The preview reports a card served without a managed identity
+    Given the surface has managed identity enabled
+    And managed agent "bravo" serves an Agent Card that names its own address
+    When the operator reads the agent card preview of the surface
+    Then the agent card preview answers 200
+    And the agent card preview field "fetch.status" is "served_without_identity"
+    And the agent card preview field "fetch.cause" is "identity_missing"
+    And the agent card preview shows the card the gateway serves, pointing at the gateway
+
   Scenario: A target token the provider refuses is reported while the preview still answers
     Given the gateway authenticates to the managed agent with a client credentials provider
     And the credential provider is refusing token requests

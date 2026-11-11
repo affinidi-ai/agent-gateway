@@ -4,6 +4,7 @@ import {
   CARD_FETCH_CAUSES,
   CARD_FETCH_CAUSE_LABEL,
   CARD_FETCH_CAUSE_TEXT,
+  CARD_FETCH_STATUS_LABEL,
   CARD_PEER_REFUSED_TEXT,
   CARD_REJECTED_CREDENTIAL_TEXT,
   describeCardAuth,
@@ -11,6 +12,7 @@ import {
   describeFetchFailure,
   fetchAgentCardPreview,
   formatRelativeTime,
+  isCardServed,
   parseAgentCardPreview,
   refreshAgentCardPreview,
   safeHttpUrl,
@@ -123,7 +125,11 @@ describe('parseAgentCardPreview', () => {
   it('accepts every documented cause', () => {
     for (const cause of CARD_FETCH_CAUSES) {
       const status =
-        cause === 'identity_failed' || cause === 'rewrite_failed' ? 'not_served' : 'failed';
+        cause === 'identity_missing'
+          ? 'served_without_identity'
+          : cause === 'identity_failed' || cause === 'rewrite_failed'
+            ? 'not_served'
+            : 'failed';
       const body = previewBody({ fetch: { status, cause, http_status: null, duration_ms: 1 } });
       expect(supported(body).fetch.cause).toBe(cause);
     }
@@ -291,6 +297,30 @@ describe('describeFetchCause', () => {
     expect(text).toContain("could not resolve the agent's host name");
     expect(text).toContain('cloud metadata address');
     expect(text).not.toContain('Allow the address');
+  });
+
+  it('says a card served without a managed identity has no identity extension', () => {
+    const fetch = {
+      status: 'served_without_identity' as const,
+      cause: 'identity_missing' as const,
+      http_status: null,
+      duration_ms: 1,
+    };
+    expect(CARD_FETCH_STATUS_LABEL.served_without_identity).toBe('Served – No managed identity');
+    expect(describeFetchCause(fetch, auth())).toBe(
+      "The managed agent's card has no identity extension, so the gateway serves it without an identity credential."
+    );
+    expect(isCardServed('served_without_identity')).toBe(true);
+    expect(isCardServed('ok')).toBe(true);
+    expect(isCardServed('not_served')).toBe(false);
+    expect(isCardServed('failed')).toBe(false);
+  });
+
+  it('rejects a card served without identity that names no cause', () => {
+    const body = previewBody({
+      fetch: { status: 'served_without_identity', cause: null, http_status: null, duration_ms: 1 },
+    });
+    expect(parseAgentCardPreview(body)).toBeNull();
   });
 
   it('returns nothing for a fetch that worked', () => {

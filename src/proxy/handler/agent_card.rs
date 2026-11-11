@@ -46,6 +46,9 @@ pub(crate) struct BuiltCard {
     pub generated: bool,
     /// Whether the fetch carried the Target credential.
     pub credential_sent: bool,
+    /// Whether the agent's card carried no identity, so the card is served without
+    /// an identity credential although the surface reads the managed identity from it.
+    pub served_without_identity: bool,
 }
 
 /// Why the card was not built, and exactly what the card route answers.
@@ -184,11 +187,18 @@ pub(crate) async fn build_public_card(
     if mode.serves() {
         record_served_effects(state, source_addr, &resolved_identity);
     }
+    let served_without_identity = !generated
+        && matches!(resolved_identity, ProtectedAgentIdentity::Anonymous)
+        && crate::proxy::backend_identity::slot_reads_response_body(
+            &state.surface,
+            crate::proxy::backend_identity::IdentitySlot::Protected,
+        );
     Ok(BuiltCard {
         upstream,
         served: agent_card,
         generated,
         credential_sent,
+        served_without_identity,
     })
 }
 

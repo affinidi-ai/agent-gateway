@@ -1,5 +1,13 @@
-export const CARD_FETCH_STATUSES = ['ok', 'failed', 'not_served'] as const;
+export const CARD_FETCH_STATUSES = [
+  'ok',
+  'failed',
+  'not_served',
+  'served_without_identity',
+] as const;
 export type CardFetchStatus = (typeof CARD_FETCH_STATUSES)[number];
+
+export const isCardServed = (status: CardFetchStatus): boolean =>
+  status === 'ok' || status === 'served_without_identity';
 
 export const CARD_FETCH_CAUSES = [
   'needs_token',
@@ -16,6 +24,7 @@ export const CARD_FETCH_CAUSES = [
   'proxy_unavailable',
   'identity_failed',
   'rewrite_failed',
+  'identity_missing',
 ] as const;
 export type CardFetchCause = (typeof CARD_FETCH_CAUSES)[number];
 
@@ -235,6 +244,7 @@ export const CARD_FETCH_CAUSE_LABEL: Record<CardFetchCause, string> = {
   proxy_unavailable: 'A2A proxy unavailable',
   identity_failed: 'Identity failed',
   rewrite_failed: 'Rewrite failed',
+  identity_missing: 'No managed identity',
 };
 
 export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
@@ -258,6 +268,8 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
     "The gateway could not attach the agent's identity to the card. Check the gateway logs, then Refresh.",
   rewrite_failed:
     "The gateway could not rewrite the card's URLs and security. Check the gateway logs, then Refresh.",
+  identity_missing:
+    "The managed agent's card has no identity extension, so the gateway serves it without an identity credential.",
 };
 
 export const AUTH_FAILED_ACTION_TEXT = 'Check Target Authentication on the Managed Agent.';
@@ -348,4 +360,5 @@ export const CARD_FETCH_STATUS_LABEL: Record<CardFetchStatus, string> = {
   ok: 'OK',
   failed: 'Failing',
   not_served: 'Not served',
+  served_without_identity: 'Served – No managed identity',
 };
