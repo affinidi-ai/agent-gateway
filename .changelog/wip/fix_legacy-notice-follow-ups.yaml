@@ -1,0 +1,19 @@
+branch: fix/legacy-notice-follow-ups
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T13:00:00Z'
+      title: Log a DynamoDB public attribute the gateway ignored, also at start
+      description: >-
+        A surface built from DynamoDB takes access_point.public from an optional public
+        attribute on its item, a boolean or the string true or false. Any other value, such as
+        yes, True or a number, is ignored and the surface stays legacy, so it refuses failed
+        callers. The warning saying so was raised while the DynamoDB configuration was read,
+        before the gateway installs its log subscriber, so it never reached the log at start
+        and an operator whose opt-out had no effect got no reason. The gateway now holds such
+        warnings until logging starts and logs them then, naming the item and what it held, and
+        logs later ones at once.
+  removed: []
+  security: []
+  breaking: []
