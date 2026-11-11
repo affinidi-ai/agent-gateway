@@ -84,11 +84,17 @@ pub(crate) enum FetchFault {
     BlockedByEgress,
     Unreachable,
     TimedOut,
-    Status { status: u16, credential_sent: bool },
+    Status {
+        status: u16,
+        credential_sent: bool,
+    },
     TooLarge,
     InvalidCard,
     Compressed,
-    IdentityFailed(crate::proxy::card_preview::CardIdentityError),
+    IdentityFailed {
+        slot: crate::proxy::card_preview::CardIdentitySlot,
+        error: crate::proxy::card_preview::CardIdentityError,
+    },
     RewriteFailed,
 }
 
@@ -263,7 +269,10 @@ async fn resolve_card_identity(
             "Protected agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::of(&e)),
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -311,7 +320,10 @@ async fn resolve_external_card_identity(
             "External agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::of(&e)),
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ExternalIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -375,7 +387,10 @@ async fn inject_identity_credential(
         .map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
             CardFailure::new(
-                FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed),
+                FetchFault::IdentityFailed {
+                    slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                    error: crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed,
+                },
                 create_error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("Agent card identity credential injection failed: {}", e),

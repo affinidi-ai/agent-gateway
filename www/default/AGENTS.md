@@ -895,8 +895,11 @@ surface, never the unsaved form.
   `fetch.identity_error` with its own text (`CARD_IDENTITY_ERROR_TEXT`: an identity extension the
   gateway can use is missing, the extension is invalid, the card could not be read for its
   identity, a DID could not be issued, or the gateway could not attach its credential), and keeps
-  the generic "Check the gateway logs, then Refresh." only when the gateway names none. The parser
-  rejects an `identity_error` beside any other cause. The managed panel reads "Not available:
+  the generic "Check the gateway logs, then Refresh." only when the gateway names none. When
+  `fetch.identity_slot` is `external_identity` the alert uses `CARD_EXTERNAL_IDENTITY_ERROR_TEXT`
+  instead, which points at the external Identity element rather than the managed agent's card. The
+  parser rejects an `identity_error` or `identity_slot` beside any other cause. The managed panel
+  reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
   fetched it but will not serve it. The served panel shows, in this order: the card the gateway
   returns in `after` whatever the fetch status, with "The card the gateway last served for this

@@ -38,6 +38,9 @@ export const CARD_IDENTITY_ERRORS = [
 ] as const;
 export type CardIdentityError = (typeof CARD_IDENTITY_ERRORS)[number];
 
+export const CARD_IDENTITY_SLOTS = ['protected_identity', 'external_identity'] as const;
+export type CardIdentitySlot = (typeof CARD_IDENTITY_SLOTS)[number];
+
 export const CARD_AUTH_KINDS = [
   'none',
   'static_secret',
@@ -71,6 +74,7 @@ export interface CardFetch {
   http_status: number | null;
   duration_ms: number;
   identity_error: CardIdentityError | null;
+  identity_slot: CardIdentitySlot | null;
 }
 
 export interface CardAuthReport {
@@ -146,12 +150,21 @@ function parseFetch(raw: unknown): CardFetch | null {
     return null;
   }
   if (identity_error !== null && cause !== 'identity_failed') return null;
+  const identity_slot =
+    raw.identity_slot === null || raw.identity_slot === undefined
+      ? null
+      : oneOf(CARD_IDENTITY_SLOTS, raw.identity_slot);
+  if (raw.identity_slot !== null && raw.identity_slot !== undefined && !identity_slot) {
+    return null;
+  }
+  if (identity_slot !== null && cause !== 'identity_failed') return null;
   return {
     status,
     cause,
     http_status: asNumber(raw.http_status),
     duration_ms: asNumber(raw.duration_ms) ?? 0,
     identity_error,
+    identity_slot,
   };
 }
 
@@ -308,6 +321,18 @@ export const CARD_IDENTITY_ERROR_TEXT: Record<CardIdentityError, string> = {
     'The gateway could not sign or attach its identity credential to the card. Check the gateway logs, then Refresh.',
 };
 
+export const CARD_EXTERNAL_IDENTITY_ERROR_TEXT: Record<CardIdentityError, string> = {
+  identity_extension_missing:
+    "The card has no identity extension the surface's external Identity can read. Check the external Identity element, then Refresh.",
+  identity_validation_failed:
+    "The card's identity extension does not match the external Identity element's schema or rules. Check the external Identity element, then Refresh.",
+  identity_invalid_response:
+    'The gateway could not read the card for the external identity. Check the agent card, then Refresh.',
+  identity_did_failed:
+    'The gateway could not issue a DID for the external agent. Check the gateway logs and the identity issuer, then Refresh.',
+  credential_injection_failed: CARD_IDENTITY_ERROR_TEXT.credential_injection_failed,
+};
+
 export const AUTH_FAILED_ACTION_TEXT = 'Check Target Authentication on the Managed Agent.';
 
 export const CARD_REJECTED_CREDENTIAL_TEXT =
@@ -352,7 +377,11 @@ export function describeFetchCause(fetch: CardFetch, auth: CardAuthReport): stri
       .join(' ');
   }
   if (cause === 'identity_failed' && fetch.identity_error) {
-    return CARD_IDENTITY_ERROR_TEXT[fetch.identity_error];
+    const texts =
+      fetch.identity_slot === 'external_identity'
+        ? CARD_EXTERNAL_IDENTITY_ERROR_TEXT
+        : CARD_IDENTITY_ERROR_TEXT;
+    return texts[fetch.identity_error];
   }
   const text = CARD_FETCH_CAUSE_TEXT[cause];
   if (!text.includes('{s}')) return text;

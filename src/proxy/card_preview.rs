@@ -21,7 +21,7 @@ use tracing::info;
 use crate::config::TargetAuthMethod;
 use crate::config::agent_surface::AgentSurface;
 use crate::proxy::handler::TargetAuthError;
-use crate::proxy::handler::agent_card::{CardMode, FetchFault, build_public_card, card_target_url};
+use crate::proxy::handler::agent_card::{CardFailure, CardMode, FetchFault, build_public_card, card_target_url};
 use crate::state::ProxyState;
 
 /// A card larger than this, serialized, is reported by size only.
@@ -241,6 +241,14 @@ impl CardIdentityError {
     }
 }
 
+/// The identity slot whose resolution failed, spelled as the card route's `slot`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CardIdentitySlot {
+    ProtectedIdentity,
+    ExternalIdentity,
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct CardFetchReport {
     pub status: CardFetchStatus,
@@ -249,6 +257,8 @@ pub struct CardFetchReport {
     pub duration_ms: u64,
     /// Set only when `cause` is `identity_failed`.
     pub identity_error: Option<CardIdentityError>,
+    /// Set only when `cause` is `identity_failed`.
+    pub identity_slot: Option<CardIdentitySlot>,
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,7 +380,7 @@ fn classify_fault(
         FetchFault::TooLarge => (CardFetchCause::TooLarge, None),
         FetchFault::InvalidCard => (CardFetchCause::InvalidCard, None),
         FetchFault::Compressed => (CardFetchCause::Compressed, None),
-        FetchFault::IdentityFailed(_) => (CardFetchCause::IdentityFailed, None),
+        FetchFault::IdentityFailed { .. } => (CardFetchCause::IdentityFailed, None),
         FetchFault::RewriteFailed => (CardFetchCause::RewriteFailed, None),
     }
 }
@@ -666,12 +676,12 @@ async fn fetch_preview(
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut auth = CardAuthReport::for_surface(surface);
-    let identity_error = match &built {
-        Some(Err(failure)) => match failure.fault {
-            FetchFault::IdentityFailed(error) => Some(error),
-            _ => None,
-        },
-        _ => None,
+    let (identity_error, identity_slot) = match &built {
+        Some(Err(CardFailure {
+            fault: FetchFault::IdentityFailed { slot, error },
+            ..
+        })) => (Some(*error), Some(*slot)),
+        _ => (None, None),
     };
     let (reported, upstream, served) = match built {
         Some(Ok(card)) => {
@@ -697,6 +707,7 @@ async fn fetch_preview(
         http_status: reported.and_then(|(_, http_status)| http_status),
         duration_ms,
         identity_error,
+        identity_slot,
     };
     let generated = surface.is_a2a_proxy_target();
     let (source_url, source_url_query_hidden) = if generated {
@@ -1209,13 +1220,50 @@ mod tests {
 
         assert_eq!(fetch_of(&preview), (CardFetchStatus::NotServed, Some(CardFetchCause::IdentityFailed), None));
         assert_eq!(
-            preview
-                .fetch
-                .as_ref()
-                .and_then(|fetch| fetch.identity_error),
-            Some(CardIdentityError::IdentityValidationFailed)
+            identity_failure_of(&preview),
+            (Some(CardIdentityError::IdentityValidationFailed), Some(CardIdentitySlot::ProtectedIdentity))
         );
         assert_eq!(preview.before, Some(card));
+    }
+
+    fn identity_failure_of(preview: &AgentCardPreview) -> (Option<CardIdentityError>, Option<CardIdentitySlot>) {
+        let fetch = preview
+            .fetch
+            .as_ref()
+            .expect("a supported preview reports its fetch");
+        (fetch.identity_error, fetch.identity_slot)
+    }
+
+    #[tokio::test]
+    async fn a_failure_of_the_external_identity_names_the_external_slot() {
+        let target = MockServer::start_with_response(agent_card().to_string()).await;
+        let mut surface = surface_with("orders", json!({"endpoint": target.url()}));
+        surface
+            .identity_slots
+            .external = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let selector =
+            Arc::new(crate::identity::IdentitySelector::new(&json!({"type": "object"}), Arc::new(issuer)).unwrap());
+        let state = ProxyState {
+            external_selector: Some(selector),
+            ..running(surface).await
+        };
+
+        let preview = PreviewMemory::new(FETCHES_PER_MINUTE)
+            .preview(&state, &caller("u-external-identity"), PreviewRequest::Read)
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_of(&preview), (CardFetchStatus::NotServed, Some(CardFetchCause::IdentityFailed), None));
+        assert_eq!(
+            identity_failure_of(&preview),
+            (Some(CardIdentityError::IdentityExtensionMissing), Some(CardIdentitySlot::ExternalIdentity))
+        );
     }
 
     #[test]
@@ -1232,6 +1280,8 @@ mod tests {
             assert_eq!(json!(CardIdentityError::of(&error)), json!(error.code()), "{error}");
         }
         assert_eq!(json!(CardIdentityError::CredentialInjectionFailed), json!("credential_injection_failed"));
+        assert_eq!(json!(CardIdentitySlot::ProtectedIdentity), json!("protected_identity"));
+        assert_eq!(json!(CardIdentitySlot::ExternalIdentity), json!("external_identity"));
     }
 
     #[tokio::test]
@@ -1248,13 +1298,7 @@ mod tests {
             fetch_of(&preview),
             (CardFetchStatus::ServedWithoutIdentity, Some(CardFetchCause::IdentityMissing), None)
         );
-        assert_eq!(
-            preview
-                .fetch
-                .as_ref()
-                .and_then(|fetch| fetch.identity_error),
-            None
-        );
+        assert_eq!(identity_failure_of(&preview), (None, None));
         assert_eq!(preview.before, Some(agent_card()));
         let served = preview
             .after
