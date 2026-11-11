@@ -1,0 +1,19 @@
+branch: fix/storage-no-hard-links
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T00:00:00Z'
+      title: ⭐ Start on storage without hard links, such as an Azure Files SMB share
+      description: >-
+        The transit token signing key was created by hard-linking a complete copy into
+        place, which an SMB share refuses with "Operation not supported", so a gateway
+        whose vc_keys directory sits on Azure Files stopped on its first start after
+        upgrading and on any new deployment. When that link fails, the gateway now logs
+        a warning and creates the key file exclusively instead, filling it in place, so
+        instances starting together still create one key between them, and an instance
+        reading the file while another fills it waits for it to be complete. No
+        configuration is needed.
+  removed: []
+  security: []
+  breaking: []

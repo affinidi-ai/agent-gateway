@@ -82,11 +82,14 @@ inside that folder, except `backup_restore`. Put `backup_restore` on persistent,
 storage next to `_storage`, never inside it: a restore empties `_storage`. A full backup
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
-[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). The volume must
-support hard links where `[storage_paths] vc_keys` points: the gateway creates its transit
-token key there on its first start by linking a complete copy into place, and stops with an
-error saying so on a filesystem without them, such as an object-store mount. Local disks,
-EFS and NFS support them.
+[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). Where
+`[storage_paths] vc_keys` points, the gateway creates its transit token key on its first
+start by linking a complete copy into place, so that instances starting together create one
+key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
+does on a volume without them such as an Azure Files SMB share, the gateway logs a warning
+and creates the key file exclusively instead, filling it in place; instances still share one
+key, and one reading the file while another fills it waits for it to be complete. No
+configuration is needed: the gateway reacts to what the volume does.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat

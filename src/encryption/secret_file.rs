@@ -132,11 +132,15 @@ pub async fn write_secret_file(
 /// including when another process sharing the directory creates it at the same
 /// moment: the content is written in full to a temporary file and then
 /// hard-linked into place, which fails rather than replacing a file, so exactly
-/// one creator wins and no reader sees a partly written file. The directory must
-/// therefore support hard links; one that does not fails the creation with an
-/// error saying so. Creators that disagree on encryption at rest can each create
-/// a different form at once; a creator that then finds the other form beside its
-/// own removes its own and fails, so no two keys stay in use.
+/// one creator wins and no reader sees a partly written file. A link that fails
+/// for any reason other than the file already existing, as every link does on a
+/// filesystem without hard links such as an SMB share, falls back to creating
+/// the file exclusively and filling it in place (see
+/// [`create_secret_file_in_place`]), which still lets exactly one creator win but
+/// can leave a reader seeing it empty for a moment. Creators that disagree on
+/// encryption at rest can each create a different form at once; a creator that
+/// then finds the other form beside its own removes its own and fails, so no two
+/// keys stay in use.
 pub async fn create_secret_file(
     path: &Path,
     contents: &str,
@@ -164,24 +168,114 @@ pub async fn create_secret_file(
         let _ = tokio::fs::remove_file(&staged).await;
         return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
     }
-    let linked = tokio::fs::hard_link(&staged, &target).await;
+    let linked = hard_link_into_place(&staged, &target).await;
     if let Err(error) = tokio::fs::remove_file(&staged).await {
         warn!("Failed to remove staged secret file {}: {}", staged.display(), error);
     }
     match linked {
         Ok(()) => settle_created_secret_file(&target, &other_form).await,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "Failed to create secret file {} by hard-linking a complete copy into place; its directory must be on \
-                 a filesystem that supports hard links",
-                target.display()
-            )
-        }),
+        Err(error) => {
+            warn!(
+                "Creating secret file {} in place: linking a complete copy into place failed ({}), as it does on a \
+                 filesystem without hard links, such as an SMB share. Exactly one creator still wins, but a reader \
+                 may briefly see the new file empty",
+                target.display(),
+                error
+            );
+            create_secret_file_in_place(&target, &other_form, bytes.as_bytes()).await
+        }
     }
 }
 
-/// Make a just-linked secret file durable, and give it up again when the other
+/// Hard-link `staged` to `target`, or, under test, fail the way a filesystem
+/// without hard links does when [`simulate_link_failure`] asked for it.
+async fn hard_link_into_place(
+    staged: &Path,
+    target: &Path,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if SIMULATED_LINK_FAILURE.get() {
+        return Err(simulated_link_failure());
+    }
+    tokio::fs::hard_link(staged, target).await
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether [`simulate_link_failure`] made this thread's links fail.
+    static SIMULATED_LINK_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail every link [`create_secret_file`] makes on the calling thread, as a
+/// filesystem without hard links does. Each test runs on its own thread.
+#[cfg(test)]
+pub(crate) fn simulate_link_failure(simulated: bool) {
+    SIMULATED_LINK_FAILURE.set(simulated);
+}
+
+/// The failure an SMB share answers `link` with.
+#[cfg(test)]
+fn simulated_link_failure() -> std::io::Error {
+    #[cfg(unix)]
+    return std::io::Error::from_raw_os_error(libc::EOPNOTSUPP);
+    #[cfg(not(unix))]
+    return std::io::Error::from(std::io::ErrorKind::Unsupported);
+}
+
+/// Create a secret file without a hard link: the file is created exclusively
+/// (`O_CREAT | O_EXCL`), so exactly one creator still wins and an existing file
+/// is never replaced, and is then filled and synced in place. Returns `false`
+/// when another creator already made it. A directory that genuinely cannot be
+/// written fails here as it did on the link.
+///
+/// Unlike the hard-link path this leaves a window in which a reader sharing the
+/// directory sees the file empty or half written, so readers of a file created
+/// this way retry one that does not parse yet instead of failing at once. A
+/// creation that fails while filling the file removes it again, so the window
+/// does not outlive the creator.
+async fn create_secret_file_in_place(
+    target: &Path,
+    other_form: &Path,
+    bytes: &[u8],
+) -> Result<bool> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let created = match options.open(target).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to create secret file {}", target.display()));
+        }
+    };
+    if let Err(error) = fill_created_secret_file(created, bytes).await {
+        if let Err(error) = tokio::fs::remove_file(target).await {
+            error!("Failed to remove the unwritten secret file {}: {}", target.display(), error);
+        }
+        return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
+    }
+    settle_created_secret_file(target, other_form).await
+}
+
+/// Write `bytes` to a just-created secret file and make them durable.
+async fn fill_created_secret_file(
+    mut created: tokio::fs::File,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    created
+        .write_all(bytes)
+        .await?;
+    created.flush().await?;
+    created.sync_all().await
+}
+
+/// Make a just-created secret file durable, and give it up again when the other
 /// form of the same secret now exists beside it. Every creator checks after
 /// linking, so of two creators of different forms at least one sees the other.
 async fn settle_created_secret_file(
@@ -560,6 +654,93 @@ mod tests {
                 .as_deref(),
             Some(winner)
         );
+    }
+
+    /// Azure Files and other SMB shares answer `link` with `EOPNOTSUPP`. The
+    /// file is then created exclusively and filled in place: it is still created
+    /// once, readable by its owner only, never replaced, and no staged file is
+    /// left behind.
+    #[tokio::test]
+    async fn create_falls_back_to_an_exclusive_create_when_the_link_fails() {
+        simulate_link_failure(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        assert!(
+            create_secret_file(&path, "first")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !create_secret_file(&path, "second")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            read_secret_file(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        #[cfg(unix)]
+        assert_eq!(file_mode(&path), 0o600);
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("key.json")], "no staged file may be left behind");
+    }
+
+    /// Exclusive creation keeps the one-winner guarantee the hard link gives.
+    #[tokio::test]
+    async fn create_lets_exactly_one_concurrent_creator_win_without_a_hard_link() {
+        simulate_link_failure(true);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+
+        let (first, second) = tokio::join!(create_secret_file(&path, "first"), create_secret_file(&path, "second"));
+        let (first, second) = (first.unwrap(), second.unwrap());
+
+        assert!(first ^ second, "exactly one creator must win, got {first} and {second}");
+        let winner = if first {
+            "first"
+        } else {
+            "second"
+        };
+        assert_eq!(
+            read_secret_file(&path)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(winner)
+        );
+    }
+
+    /// A directory the file cannot be made in fails the creation loudly. Falling
+    /// back whatever the link failure was never turns a real failure into a
+    /// silent success: the same directory refuses the exclusive create too.
+    #[tokio::test]
+    async fn create_fails_when_the_file_cannot_be_made_at_all() {
+        simulate_link_failure(true);
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("occupied");
+        std::fs::write(&not_a_directory, "in the way").unwrap();
+        let path = not_a_directory.join("key.json");
+
+        let error = create_secret_file(&path, "first")
+            .await
+            .expect_err("a file that cannot be made must fail the creation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("secret file"),
+            "{error:#}"
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(&not_a_directory).unwrap(), "in the way");
     }
 
     #[tokio::test]

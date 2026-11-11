@@ -1037,9 +1037,15 @@ The signing key is 32 random bytes the gateway creates on its first start, in
 encrypted like the gateway's other keys when encryption at rest is on. A key file that is
 not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
 loads it, and the file written when encryption at rest is turned on later is owner-only
-too. The file is created by linking a complete copy into place, so the directory must be on
-a filesystem that supports hard links; one that does not stops the first start with an error
-saying so. A key file that cannot be read stops the gateway from starting. Every token names
+too. The file is created by linking a complete copy into place. When that link fails for any
+reason other than the file already existing, as every link does on a filesystem without hard
+links such as an Azure Files SMB share, the gateway logs a warning and creates the file
+exclusively instead, filling it in place; one instance still wins the creation, and an
+instance reading the file while another fills it waits up to 5 seconds for it to be complete.
+Filling it takes milliseconds, so the wait covers a storage backend that stalls; an instance
+that still cannot read the file by then stops with an error and reads the complete file when
+it is restarted, so a stall costs one restart and never a second key. A directory the file
+cannot be made in at all still stops the start. A key file that cannot be read stops the gateway from starting. Every token names
 the key in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
 accepts the tokens the Active instance issued; instances that do not share it refuse each
