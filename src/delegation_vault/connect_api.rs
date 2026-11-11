@@ -1440,6 +1440,7 @@ mod tests {
                 ))),
                 provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
                 gateway_mcp_issuer: None,
+                config_surfaces: None,
             };
             Self {
                 _directory: directory,

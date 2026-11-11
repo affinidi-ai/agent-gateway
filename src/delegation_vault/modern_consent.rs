@@ -908,6 +908,7 @@ mod tests {
                 verifier: verifier.clone(),
                 provider_egress: provider_egress.clone(),
                 gateway_mcp_issuer: None,
+                config_surfaces: None,
             },
             network: Arc::new(network),
             identity_strategies: strategies,

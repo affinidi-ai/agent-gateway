@@ -24,25 +24,41 @@ export interface JwtVerificationStrategy {
   updated_at: string;
 }
 
+const nonEmpty = (value: unknown): value is string => typeof value === 'string' && value !== '';
+
 /**
  * Why a strategy delete failed: the API's message, the credential providers a `409` names as
- * still using the strategy, and the status.
+ * still using the strategy (by name, else id) and how many more the caller can't view, where
+ * to change them, and the status.
  */
 export function strategyDeleteError(status: number, body: string, statusText: string): string {
-  let ids: string[] = [];
+  let names: string[] = [];
+  let hidden = 0;
   try {
-    const references: unknown = JSON.parse(body)?.references;
-    if (Array.isArray(references)) {
-      ids = references
-        .map(reference => reference?.id)
-        .filter((id): id is string => typeof id === 'string' && id !== '');
+    const parsed = JSON.parse(body);
+    if (Array.isArray(parsed?.references)) {
+      names = parsed.references
+        .map((reference: { name?: unknown; id?: unknown }) =>
+          nonEmpty(reference?.name) ? reference.name : reference?.id
+        )
+        .filter(nonEmpty);
     }
+    const count = Number(parsed?.hidden_references);
+    hidden = Number.isInteger(count) && count > 0 ? count : 0;
   } catch {
-    ids = [];
+    names = [];
   }
   const message = formatApiError(undefined, body, statusText);
-  const named = ids.length > 0 ? `${message} (providers ${ids.join(', ')})` : message;
-  return `${named} (${status})`;
+  const listed = [
+    ...(names.length > 0 ? [names.join(', ')] : []),
+    ...(hidden > 0 ? [`${hidden} you can't view`] : []),
+  ];
+  const named = listed.length > 0 ? `${message} (providers ${listed.join(' and ')})` : message;
+  const where =
+    status === 409
+      ? ". Change a provider's consent confirmation in its editor; its consent_identity_strategy_id is changed through the API"
+      : '';
+  return `${named}${where} (${status})`;
 }
 
 interface StrategiesTabProps {
@@ -92,7 +108,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const handleDelete = async (strategy: JwtVerificationStrategy) => {
     if (
       !window.confirm(
-        `Delete JWT verification strategy "${strategy.name}"?\n\nWarning: any channel still referencing this strategy will return 403.`
+        `Delete JWT verification strategy "${strategy.name}"?\n\nCredential providers that use this strategy block the delete. Warning: any surface still referencing it will return 403.`
       )
     ) {
       return;

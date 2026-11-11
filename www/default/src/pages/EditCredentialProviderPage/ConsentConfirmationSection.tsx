@@ -14,6 +14,11 @@ interface ConsentConfirmationSectionProps {
   redirectUri: string;
   secrets: SecretOption[];
   ownerTenant: OwnerTenant;
+  /**
+   * The tenant the provider's strategy must be usable by: the stored provider's, or `null` for a
+   * new one, which the dashboard creates appliance-wide.
+   */
+  strategyOwnerTenant: OwnerTenant;
   loadingSecrets: boolean;
   onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
 }
@@ -27,12 +32,13 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
   redirectUri,
   secrets,
   ownerTenant,
+  strategyOwnerTenant,
   loadingSecrets,
   onChange,
 }) => {
   const { strategies, status } = useJwtStrategyList(form.consent_confirmation_enabled);
   // A tenant provider may name its own tenant's strategies or appliance-wide ones, as the gateway allows.
-  const { offered, outside } = splitByTenant(strategies, ownerTenant, () => true);
+  const { offered, outside } = splitByTenant(strategies, strategyOwnerTenant, () => true);
   const storedId = form.cc_jwt_verification_strategy_id;
   const storedOffered = offered.some(strategy => strategy.id === storedId);
   const storedOutside = outside.find(strategy => strategy.id === storedId);
@@ -291,7 +297,7 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
               <div
                 className="alert alert-info mt-2 mb-0"
                 style={{ fontSize: '14px' }}
-                data-testid="credential-provider-consent-confirmation-redirect-uri-after-create"
+                data-testid="credential-provider-consent-confirmation-redirect-uri-pending"
               >
                 <i className="fas fa-info-circle me-2"></i>
                 The Confirmation redirect URI is shown once the provider has a Callback URL, since

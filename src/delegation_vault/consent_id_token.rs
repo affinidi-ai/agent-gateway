@@ -336,7 +336,7 @@ mod tests {
         for (value, rejection) in [
             (Some(json!("https://other.example/")), Rejection::Issuer),
             (Some(json!("")), Rejection::Issuer),
-            (None, Rejection::Audience),
+            (None, Rejection::Issuer),
         ] {
             assert_eq!(
                 fixture

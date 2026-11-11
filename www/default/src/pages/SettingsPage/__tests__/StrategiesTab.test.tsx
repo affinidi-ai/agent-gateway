@@ -8,18 +8,33 @@ jest.mock('../../../context/PermissionsContext', () => ({
 }));
 
 describe('strategyDeleteError', () => {
-  it('names the credential providers a refused delete lists', () => {
+  const message =
+    'The strategy is used by credential providers; remove their references to it first';
+  const where =
+    ". Change a provider's consent confirmation in its editor; its consent_identity_strategy_id is changed through the API";
+
+  it('names the credential providers a refused delete lists and counts the hidden ones', () => {
     const body = JSON.stringify({
-      message: 'The strategy is used by credential providers; remove their references to it first',
+      message,
       references: [
         { kind: 'credential_provider', id: 'github', name: 'GitHub' },
-        { kind: 'credential_provider', id: 'linear', name: 'Linear' },
+        { kind: 'credential_provider', id: 'linear', name: '' },
       ],
       hidden_references: 1,
     });
     expect(strategyDeleteError(409, body, '')).toBe(
-      'The strategy is used by credential providers; remove their references to it first (providers github, linear) (409)'
+      `${message} (providers GitHub, linear and 1 you can't view)${where} (409)`
     );
+  });
+
+  it('counts the providers a caller cannot view when it may view none', () => {
+    const body = JSON.stringify({ message, references: [], hidden_references: 2 });
+    expect(strategyDeleteError(409, body, '')).toBe(
+      `${message} (providers 2 you can't view)${where} (409)`
+    );
+  });
+
+  it('shows another failure without providers or where to change them', () => {
     expect(strategyDeleteError(500, '', '')).toBe('Request failed (500)');
   });
 });

@@ -1055,7 +1055,10 @@ same issuer's callers by a different claim, are shown in a warning toast that st
 
 The Settings page's strategies tab (`SettingsPage/StrategiesTab.tsx`) shows a refused delete in
 its alert with the gateway's message, the credential providers a `409` lists as still using the
-strategy, and the status (`strategyDeleteError`).
+strategy by name (else id), "and N you can't view" for its `hidden_references`, that a
+provider's consent confirmation is changed in its editor and its `consent_identity_strategy_id`
+through the API, and the status (`strategyDeleteError`). The delete's confirm dialog says
+credential providers that use the strategy block the delete.
 
 ## Credentials audit tab
 
@@ -1156,7 +1159,8 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   a JWT verification strategy from `GET /jwt-verification-strategies`
   (`credential-provider-consent-confirmation-strategy-select`, loaded by `useJwtStrategyList`),
   offering only strategies of the provider's tenant and appliance-wide ones, as the gateway's
-  reference rule allows. A stored strategy is listed by its id while the list loads, as
+  reference rule allows; a new provider, which the dashboard creates appliance-wide, is offered
+  appliance-wide ones only. A stored strategy is listed by its id while the list loads, as
   "(not found)" only once the list loaded without it, and with the other-tenant label when it is
   another tenant's; a list that cannot be read shows "Strategies could not be loaded"
   (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
@@ -1172,7 +1176,7 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   the field's `FieldHelp` both say the URI follows the Callback URL and cannot be edited on its
   own, so it is registered again whenever the Callback URL changes. Without a Callback URL to
   show, new or stored, a notice stands in its place
-  (`credential-provider-consent-confirmation-redirect-uri-after-create`) saying the URI is shown
+  (`credential-provider-consent-confirmation-redirect-uri-pending`) saying the URI is shown
   once the provider has a Callback URL. The Login Client Secret's `FieldHelp` says to register
   the login client with `client_secret_post`. Save
   refuses a blank required field first (`missingConsentConfirmationField`) and sends

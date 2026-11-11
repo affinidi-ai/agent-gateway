@@ -368,6 +368,7 @@ mod tests {
             ))),
             provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
             gateway_mcp_issuer: None,
+            config_surfaces: None,
         }
     }
 
@@ -2472,6 +2473,70 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// A confirmation whose surface is served only from the gateway
+    /// configuration confirms its caller and goes on to the vendor.
+    #[tokio::test]
+    async fn a_confirmation_on_a_surface_served_from_the_configuration_goes_on_to_the_vendor() {
+        use crate::surfaces::AgentSurfaceStore as _;
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "surface", "name": "Configured Surface",
+            "access_point": {"listen_address": "https://gw.example", "route": "/mcp", "protocol": "mcp"},
+            "target": {"endpoint": "https://203.0.113.9/mcp"}
+        }))
+        .unwrap();
+        let fixture = consent::Fixture::with_config_surfaces(vec![surface]).await;
+        fixture
+            .surfaces
+            .delete("surface")
+            .await
+            .unwrap();
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        let (confirmed, events) = capture(fixture.confirm_code(&sign_in)).await;
+        assert_eq!(confirmed.status, StatusCode::FOUND, "{}", confirmed.body);
+        assert!(events.is_empty(), "{events:?}");
+        let vendor = url::Url::parse(
+            confirmed
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&vendor[..url::Position::AfterPath], "https://vendor.example/authorize");
+    }
+
+    /// A confirmation whose strategy's remote JWKS cannot be fetched, with the
+    /// strategy unchanged since the link was minted, is refused as
+    /// unavailable credentials, not as an identity refusal, and stores
+    /// nothing.
+    #[tokio::test]
+    async fn a_confirmation_whose_jwks_is_unreachable_is_refused_as_unavailable() {
+        let fixture = consent::Fixture::new().await;
+        let mut strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        strategy.jwks_source = crate::jwt_bearer::models::JwksSource::Remote {
+            jwks_uri: "https://idp.example/jwks".to_string(),
+        };
+        let strategy = fixture
+            .strategies
+            .update(strategy)
+            .await
+            .unwrap();
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// A confirmation state confirms once: the same redirect again is refused.
     #[tokio::test]
     async fn a_confirmation_state_is_used_once() {
@@ -2772,6 +2837,22 @@ mod tests {
                 .unwrap()
         }
 
+        /// Surfaces served from the gateway configuration.
+        struct ConfigSurfaceList(Vec<crate::config::agent_surface::AgentSurface>);
+
+        #[async_trait::async_trait]
+        impl crate::delegation_vault::handlers::ConfigSurfaces for ConfigSurfaceList {
+            async fn config_surface(
+                &self,
+                surface_id: &str,
+            ) -> Option<crate::config::agent_surface::AgentSurface> {
+                self.0
+                    .iter()
+                    .find(|surface| surface.surface_id == surface_id)
+                    .cloned()
+            }
+        }
+
         impl Fixture {
             pub async fn new() -> Self {
                 Self::with_identity_strategies(None).await
@@ -2781,6 +2862,19 @@ mod tests {
             /// `identity_strategies`, or in [`Fixture::strategies`] when `None`.
             pub async fn with_identity_strategies(
                 identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>
+            ) -> Self {
+                Self::build(identity_strategies, None).await
+            }
+
+            /// A fixture whose gateway also serves `surfaces` from its
+            /// configuration.
+            pub async fn with_config_surfaces(surfaces: Vec<crate::config::agent_surface::AgentSurface>) -> Self {
+                Self::build(None, Some(Arc::new(ConfigSurfaceList(surfaces)))).await
+            }
+
+            async fn build(
+                identity_strategies: Option<Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>>,
+                config_surfaces: Option<Arc<dyn crate::delegation_vault::handlers::ConfigSurfaces>>,
             ) -> Self {
                 let calls = Arc::new(AtomicUsize::new(0));
                 let counter = calls.clone();
@@ -2942,6 +3036,7 @@ mod tests {
                 state.agent_surface_store = Some(surfaces);
                 state.gateway_base_url = "https://198.51.100.7".to_string();
                 state.provider_egress = fixture.egress.clone();
+                state.config_surfaces = config_surfaces;
                 fixture.app = create_delegation_vault_oauth_router(state)
                     .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
                 fixture

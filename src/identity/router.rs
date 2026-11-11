@@ -921,10 +921,19 @@ pub fn create_identity_api_router(
                 .clone(),
             ..Default::default()
         };
+        let gateway_issuer = crate::jwt_bearer::handlers::GatewayMcpIssuer(
+            state
+                .network_config
+                .sts
+                .mcp_issuer
+                .as_ref()
+                .map(|profile| profile.issuer.clone()),
+        );
         let state: crate::jwt_bearer::handlers::JwtVerificationStrategyState = store;
         info!("JWT verification strategy management routes registered");
         let router = crate::jwt_bearer::router::create_jwt_verification_strategies_router(state)
             .layer(Extension(references))
+            .layer(Extension(gateway_issuer))
             .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
             .layer(Extension(sess_mgr.clone()))
             .layer(Extension(storage.clone()))

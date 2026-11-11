@@ -756,6 +756,7 @@ const EditCredentialProviderPage: React.FC = () => {
                     redirectUri={consentConfirmationRedirectUri(shownCallbackUrl)}
                     secrets={secrets}
                     ownerTenant={ownerTenant}
+                    strategyOwnerTenant={isNew ? null : ownerTenant}
                     loadingSecrets={loadingSecrets}
                     onChange={handleChange}
                   />

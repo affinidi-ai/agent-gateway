@@ -521,6 +521,7 @@ impl Receiver {
             ))),
             provider_egress: self.egress(),
             gateway_mcp_issuer: None,
+            config_surfaces: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));

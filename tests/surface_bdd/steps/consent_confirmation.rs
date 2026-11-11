@@ -103,6 +103,50 @@ async fn operator_creates_provider_with_consent_confirmation(
     world.admin_response = Some(response);
 }
 
+/// The JWT verification strategy that verifies the surface's JWT callers, which a
+/// confirming OAuth provider confirms them through.
+const CALLERS_STRATEGY_ID: &str = "bdd-jwt-strategy";
+
+#[when("the operator deletes the JWT verification strategy that confirms the callers")]
+async fn operator_deletes_confirming_strategy(world: &mut SurfaceWorld) {
+    let response = crate::steps::credential_save::send(
+        world,
+        Method::DELETE,
+        &format!("/v1/jwt-verification-strategies/{CALLERS_STRATEGY_ID}"),
+        None,
+    )
+    .await;
+    world.admin_response = Some(response);
+}
+
+#[then("the JWT verification strategy that confirms the callers is still listed")]
+async fn confirming_strategy_is_still_listed(world: &mut SurfaceWorld) {
+    let listed = crate::steps::credential_save::send(world, Method::GET, "/v1/jwt-verification-strategies", None).await;
+    assert_eq!(listed.status, 200, "list the JWT verification strategies: {}", listed.body);
+    let ids: Vec<&str> = listed
+        .body
+        .as_array()
+        .expect("the strategies are listed as an array")
+        .iter()
+        .filter_map(|strategy| strategy["id"].as_str())
+        .collect();
+    assert!(ids.contains(&CALLERS_STRATEGY_ID), "expected strategy {CALLERS_STRATEGY_ID} to be listed, got {ids:?}");
+}
+
+/// The id the single-surface fixture stores the surface under.
+const SURFACE_ID: &str = "bdd-surface";
+
+#[given("the operator has deleted the surface the consent link was minted on")]
+async fn operator_has_deleted_consent_surface(world: &mut SurfaceWorld) {
+    world.created_surface_id = Some(SURFACE_ID.to_string());
+    crate::steps::when::delete_surface(world).await;
+    let status = world
+        .admin_response
+        .as_ref()
+        .map(|response| response.status);
+    assert!(status.is_some_and(|status| (200..300).contains(&status)), "the operator deletes the surface: {status:?}");
+}
+
 #[given("the identity provider issues ID tokens without the nonce of the sign-in")]
 async fn identity_provider_omits_nonce(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;

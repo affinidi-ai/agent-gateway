@@ -60,6 +60,24 @@ Feature: Consent confirmation
     And OAuth provider "calendar" was not asked to exchange an authorization code
     And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "consent_identity_missing"
 
+  Scenario: A sign-in whose surface was deleted meanwhile is refused before the OAuth provider
+    Given OAuth provider "calendar" confirms its caller at the identity provider
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And caller "alice" has signed in at the identity provider as "alice"
+    And the operator has deleted the surface the consent link was minted on
+    When the identity provider sends the caller back to the gateway
+    Then the OAuth callback response status is 400
+    And the OAuth callback response shows an authorization failure page
+    And OAuth provider "calendar" was not asked to exchange an authorization code
+    And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "consent_state_invalid"
+
+  Scenario: A JWT verification strategy that confirms a provider's callers cannot be deleted
+    Given OAuth provider "calendar" confirms its caller at the identity provider
+    When the operator deletes the JWT verification strategy that confirms the callers
+    Then the admin API response status is 409
+    And the admin API error response mentions "credential providers"
+    And the JWT verification strategy that confirms the callers is still listed
+
   Scenario: A JWT caller's consent start goes straight to the OAuth provider without consent confirmation
     Given the callers' identity provider is available
     And caller "alice" has started OAuth consent for provider "calendar"

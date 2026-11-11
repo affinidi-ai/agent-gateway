@@ -521,8 +521,8 @@ async fn exchange_code(
 
 /// Log once per provider, surface and reason why a caller of a provider with
 /// `consent_confirmation` was minted a link that does not confirm them: at
-/// warn for a setting that confirms nobody or a Transit Point or Fabric
-/// caller, at debug otherwise. Also note at debug that a confirmed caller was
+/// warn for a setting that confirms nobody, a Transit Point or Fabric caller,
+/// or a caller of another issuer or principal claim, at debug otherwise. Also note at debug that a confirmed caller was
 /// verified by another strategy than the one that confirms them. Nothing
 /// about the caller is logged.
 pub(crate) fn note(
@@ -550,8 +550,18 @@ pub(crate) fn note(
                     target: "credential_delegation",
                     provider_id = %provider.provider_id,
                     surface_id = %surface_id,
-                    "Consent link minted unconfirmed for a Transit Point or Fabric caller: its grant is also \
-                     released to the surface's Access Point callers"
+                    "Consent link minted unconfirmed for a Transit Point or Fabric caller: its grant can also be \
+                     released to the surface's Access Point callers when the Transit Point has no managed \
+                     identity of its own"
+                );
+            } else if matches!(reason, Unconfirmed::OtherIssuer | Unconfirmed::OtherPrincipalClaim) {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    surface_id = %surface_id,
+                    reason = ?reason,
+                    "Consent link minted unconfirmed: the caller's issuer or principal claim is not the confirming \
+                     strategy's"
                 );
             } else {
                 debug!(
@@ -1146,6 +1156,29 @@ mod tests {
             } else {
                 assert!(text.is_empty(), "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn another_issuer_or_principal_claim_is_warned_of_once_and_another_hash_is_not() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let provider = provider(true);
+        let surface_id = uuid::Uuid::new_v4().to_string();
+        for (reason, warned) in [
+            (Unconfirmed::OtherIssuer, true),
+            (Unconfirmed::OtherPrincipalClaim, true),
+            (Unconfirmed::OtherIdentityHash, false),
+        ] {
+            let decision = ConfirmDecision::Unconfirmed(reason);
+            let logs = FormattedLogs::capture();
+            note(&provider, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+            note(&provider, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+            let text = logs.text();
+            let warnings = text
+                .lines()
+                .filter(|line| line.contains(" WARN "))
+                .count();
+            assert_eq!(warnings, usize::from(warned), "{reason:?}: {text}");
         }
     }
 

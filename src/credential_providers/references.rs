@@ -131,6 +131,16 @@ impl Referrer {
         }
     }
 
+    pub fn credential_provider(provider: &super::CredentialProvider) -> Self {
+        Self {
+            kind: ResourceKind::CredentialProviders,
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            tenant_id: provider.tenant_id.clone(),
+            uses: Vec::new(),
+        }
+    }
+
     fn surface(surface: &AgentSurface) -> Self {
         Self {
             kind: ResourceKind::Surfaces,
@@ -277,6 +287,19 @@ impl ReferenceStores {
         &self,
         strategy_id: &str,
     ) -> anyhow::Result<Vec<Referrer>> {
+        Ok(self
+            .providers_of_jwt_strategy(strategy_id)
+            .await?
+            .iter()
+            .map(Referrer::credential_provider)
+            .collect())
+    }
+
+    /// The credential providers [`Self::referrers_of_jwt_strategy`] names.
+    pub async fn providers_of_jwt_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> anyhow::Result<Vec<super::CredentialProvider>> {
         let Some(store) = &self.credential_providers else {
             return Ok(Vec::new());
         };
@@ -293,13 +316,6 @@ impl ReferenceStores {
                         .consent_identity_strategy_id
                         .as_deref()
                         == Some(strategy_id)
-            })
-            .map(|provider| Referrer {
-                kind: ResourceKind::CredentialProviders,
-                id: provider.id,
-                name: provider.name,
-                tenant_id: provider.tenant_id,
-                uses: Vec::new(),
             })
             .collect())
     }

@@ -70,6 +70,33 @@ pub struct DelegationVaultState {
     /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
     /// tokens, through which no consent confirmation confirms a caller.
     pub gateway_mcp_issuer: Option<String>,
+    /// The surfaces served from the gateway configuration (static or the
+    /// configured source), for a surface `agent_surface_store` does not hold.
+    pub config_surfaces: Option<Arc<dyn ConfigSurfaces>>,
+}
+
+/// Looks up a surface the gateway serves from its configuration, as it is now.
+#[async_trait::async_trait]
+pub trait ConfigSurfaces: Send + Sync {
+    async fn config_surface(
+        &self,
+        surface_id: &str,
+    ) -> Option<crate::config::agent_surface::AgentSurface>;
+}
+
+#[async_trait::async_trait]
+impl ConfigSurfaces for crate::proxy::surface_manager::SurfaceTaskManager {
+    async fn config_surface(
+        &self,
+        surface_id: &str,
+    ) -> Option<crate::config::agent_surface::AgentSurface> {
+        self.get_config()
+            .await
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .cloned()
+    }
 }
 
 /// A read refused because the credential providers could not be read. It
@@ -877,20 +904,49 @@ fn provider_error(error: &str) -> (DelegationFailureReason, &str) {
     }
 }
 
-/// Whether the surface a confirmation state was minted on still exists under
-/// the tenant the caller's `user_identity_hash` was computed for.
+/// Refuses a confirmation state whose surface no longer exists under the
+/// tenant the caller's `user_identity_hash` was computed for, or cannot be
+/// read. The surface store is read first, as it holds the current tenant of a
+/// stored surface; a surface it does not hold is looked up among those served
+/// from the gateway configuration.
 async fn sealed_surface_unchanged(
     state: &DelegationVaultState,
+    provider_id: &str,
     sealed: &super::OAuthState,
     binding: &super::ConsentConfirmBinding,
-) -> bool {
-    let Some(surfaces) = &state.agent_surface_store else {
-        return false;
+) -> Result<(), DelegationFailureReason> {
+    let stored = match &state.agent_surface_store {
+        Some(surfaces) => match surfaces
+            .get(&sealed.surface_id)
+            .await
+        {
+            Ok(surface) => surface,
+            Err(error) => {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider_id,
+                    surface_id = %sealed.surface_id,
+                    error = %error,
+                    "Consent confirmation refused: the surface could not be read"
+                );
+                return Err(DelegationFailureReason::CredentialsUnavailable);
+            }
+        },
+        None => None,
     };
-    matches!(
-        surfaces.get(&sealed.surface_id).await,
-        Ok(Some(surface)) if surface.tenant_id == binding.tenant_id
-    )
+    let surface = match (stored, &state.config_surfaces) {
+        (Some(surface), _) => Some(surface),
+        (None, Some(configured)) => {
+            configured
+                .config_surface(&sealed.surface_id)
+                .await
+        }
+        (None, None) => None,
+    };
+    match surface {
+        Some(surface) if surface.tenant_id == binding.tenant_id => Ok(()),
+        _ => Err(DelegationFailureReason::ConsentStateInvalid),
+    }
 }
 
 /// GET {callback_path}/confirm
@@ -951,8 +1007,8 @@ pub async fn consent_confirmation_callback(
     if !oauth::browser_binding_matches(sealed, presented) {
         return refuse(DelegationFailureReason::BrowserBindingMismatch);
     }
-    if !sealed_surface_unchanged(&state, sealed, &sign_in.binding).await {
-        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    if let Err(reason) = sealed_surface_unchanged(&state, &provider_id, sealed, &sign_in.binding).await {
+        return refuse(reason);
     }
     if !oauth::claim_oauth_state(sealed).await {
         return refuse(DelegationFailureReason::ConsentStateReused);

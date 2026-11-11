@@ -227,6 +227,15 @@ mod tests {
                 .await
                 .is_err()
         );
+        let mut unreachable = strategy.clone();
+        unreachable.jwks_source = crate::jwt_bearer::models::JwksSource::Remote {
+            jwks_uri: "https://idp.example/jwks".to_string(),
+        };
+        assert_eq!(
+            verify_id_token(&verifier, &unreachable, &profile, &ticket, "provider-client", &sign(&claims), now).await,
+            Err(ContinuationError::InvalidState),
+            "keys that cannot be fetched refuse the continuation"
+        );
     }
 
     /// A consent identity strategy that names callers by `oid` binds the

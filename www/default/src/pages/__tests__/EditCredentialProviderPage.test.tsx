@@ -957,7 +957,8 @@ describe('EditCredentialProviderPage consent confirmation', () => {
       Promise.resolve({
         ok: true,
         json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
-      })
+      }),
+    path = '/credential-providers/p1'
   ) => {
     mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
       if (init?.method === 'PUT') return Promise.resolve({ ok: true });
@@ -983,13 +984,24 @@ describe('EditCredentialProviderPage consent confirmation', () => {
       return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
     });
     render(
-      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+      <MemoryRouter initialEntries={[path]}>
         <Routes>
           <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
         </Routes>
       </MemoryRouter>
     );
   };
+
+  const TENANT_STRATEGIES = () =>
+    Promise.resolve({
+      ok: true,
+      json: () =>
+        Promise.resolve([
+          { id: 'own', name: 'Own callers', tenant_id: 'tenant-a' },
+          { id: 'shared', name: 'Shared callers', tenant_id: null },
+          { id: 'other', name: 'Other callers', tenant_id: 'tenant-b' },
+        ]),
+    });
 
   const savedBody = async () => {
     fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
@@ -1064,12 +1076,39 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
   });
 
+  it('labels a stored strategy of another tenant as refused by the gateway', async () => {
+    setup(
+      legacy({
+        tenant_id: 'tenant-a',
+        consent_confirmation: { ...SETTING, jwt_verification_strategy_id: 'other' },
+      }),
+      TENANT_STRATEGIES
+    );
+    expect(
+      await screen.findByRole('option', {
+        name: 'Other callers (another tenant, refused by the gateway)',
+      })
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
+    ).toHaveValue('other');
+  });
+
+  it('offers a new provider, which the dashboard creates appliance-wide, only appliance-wide strategies', async () => {
+    setup(legacy(), TENANT_STRATEGIES, '/credential-providers/new');
+    fireEvent.change(await screen.findByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_authorization_code' },
+    });
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    expect(await screen.findByRole('option', { name: 'Shared callers' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Own callers/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
+  });
+
   it('says where the redirect URI will show on a stored provider without a Callback URL', async () => {
     setup(legacy({ consent_confirmation: SETTING, callback_url: null }));
     expect(
-      await screen.findByTestId(
-        'credential-provider-consent-confirmation-redirect-uri-after-create'
-      )
+      await screen.findByTestId('credential-provider-consent-confirmation-redirect-uri-pending')
     ).toHaveTextContent(
       'The Confirmation redirect URI is shown once the provider has a Callback URL, since it is the Callback URL followed by /confirm.'
     );

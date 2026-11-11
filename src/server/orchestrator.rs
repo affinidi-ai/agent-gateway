@@ -3741,6 +3741,9 @@ pub async fn run_axum_proxy(
                     .mcp_issuer
                     .as_ref()
                     .map(|profile| profile.issuer.clone()),
+                config_surfaces: Some(
+                    channel_manager.clone() as Arc<dyn crate::delegation_vault::handlers::ConfigSurfaces>
+                ),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");

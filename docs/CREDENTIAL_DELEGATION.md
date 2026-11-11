@@ -48,15 +48,18 @@ already lacks one is refused every update until the update names it.
 
 ### Records that are still in use
 
-A credential provider, secret or JWT verification strategy is not deleted while another record
-uses it, so a surface or provider does not fail on its next request.
+A credential provider or secret is not deleted while another record uses it, so a surface or
+provider does not fail on its next request. A JWT verification strategy is not deleted while a
+credential provider uses it; surface caller authentication methods are not checked, so repoint
+them at another strategy before deleting one.
 
 | Request | Refused with `409` while | Override |
 | --- | --- | --- |
 | `DELETE /api/v1/credential-providers/{id}` | A surface binds the provider or uses it for Target authentication; the answer is the `provider_in_use` one described in [Deleting a provider](#deleting-a-provider), not the body below | None: remove the references first |
 | `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
 | `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity, caller key), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
-| `DELETE /v1/jwt-verification-strategies/{id}` | A credential provider's `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names the strategy. Surface methods are not checked | None: point the providers at another strategy first |
+| `DELETE /api/v1/jwt-verification-strategies/{id}` | A credential provider's `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names the strategy. Surface methods are not checked | None: point the providers at another strategy first |
+| `PUT /api/v1/jwt-verification-strategies/{id}` that changes `expected_issuer` | A credential provider names the strategy and its own save would refuse the new issuer: for `consent_confirmation`, this gateway's own `sts.mcp_issuer` or an Entra issuer while a caller is named by `sub`; for `consent_identity_strategy_id`, an issuer that is not an https URL | None: point the providers at another strategy first |
 
 The other refusals answer a `409` body that keeps the `message` field current clients show:
 
@@ -2030,9 +2033,13 @@ the provider (`NotLegacyConsent`, `PepperUnset`, `StrategyUnavailable`, `Gateway
 `EntraCallerNamedBySub`, `IdTokenClaimInvalid`, `EditableClaim`) is a setting that confirms
 nobody, logged at `WARN` as `Consent confirmation confirms no caller of this provider: consent
 links are minted unconfirmed`. `PathNotCovered` is logged at `WARN` as `Consent link minted
-unconfirmed for a Transit Point or Fabric caller: its grant is also released to the surface's
-Access Point callers`. The other reasons concern one caller or request, and are logged at
-`DEBUG` as `Consent link minted without confirming its caller at their identity provider`.
+unconfirmed for a Transit Point or Fabric caller: its grant can also be released to the
+surface's Access Point callers when the Transit Point has no managed identity of its own`.
+`OtherIssuer` and `OtherPrincipalClaim` are logged at `WARN` as `Consent link minted
+unconfirmed: the caller's issuer or principal claim is not the confirming strategy's`, since a
+strategy whose issuer or claim differs from every caller's confirms nobody. The other reasons
+concern one caller or request, and are logged at `DEBUG` as `Consent link minted without
+confirming its caller at their identity provider`.
 The link fails instead only when the strategy cannot be read.
 
 | `reason` | The link does not confirm its caller because |
@@ -2052,8 +2059,8 @@ Consent confirmation therefore does not cover:
 
 - API key, mTLS and DID callers;
 - consent through a Transit Point or over Fabric, which is not confirmed. A grant obtained
-  this way is stored under the same key, and is also released to the surface's Access Point
-  callers;
+  this way can also be released to the surface's Access Point callers when the Transit Point
+  has no managed identity of its own;
 - callers holding this gateway's own STS tokens, who sign in at no other identity provider;
 - a person who signs in as themselves on a link minted for them. They are confirmed, whoever
   sent them the link;
@@ -2080,7 +2087,10 @@ Consent confirmation therefore does not cover:
    - the `state` is a confirmation state this gateway sealed;
    - the browser presents its binding cookie;
    - the surface the link was minted on still exists and is still of the sealed tenant, or
-     the request is refused with `consent_state_invalid`;
+     the request is refused with `consent_state_invalid`. The surface store is read first, and
+     a surface it does not hold is looked up among those served from the gateway configuration
+     (static or the configured source); a surface store that cannot be read refuses the
+     request with `credentials_unavailable` and logs a `WARN` with the provider and surface ids;
    - the state has not been used. It is claimed now, so every later refusal, an identity
      provider `error` included, uses it up;
    - the provider is unchanged, and its setting still names the sealed strategy;
@@ -2167,7 +2177,7 @@ Otherwise every confirmation is refused with `consent_identity_mismatch`.
 - When replacing a strategy, point `consent_confirmation.jwt_verification_strategy_id` at the
   new one before deleting the old
   ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)).
-  `DELETE /v1/jwt-verification-strategies/{id}` answers `409` while a credential provider's
+  `DELETE /api/v1/jwt-verification-strategies/{id}` answers `409` while a credential provider's
   `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names
   the strategy ([Records that are still in use](#records-that-are-still-in-use)).
 - Before rolling back to a release without the setting, switch it off. An older release
@@ -2177,7 +2187,7 @@ Otherwise every confirmation is refused with `consent_identity_mismatch`.
   start state. A link opened late can expire at the vendor callback after the person
   authorized at the vendor; they then start again from the agent.
 - Grants stored before the setting was enabled are kept as they are. To have callers consent
-  again through the confirmation, remove the provider's entries from the vault
+  again through the confirmation, list the provider's vault entries and delete each one
   ([Management API](#management-api)).
 - An identity provider `redirect_uri` error right after the start page means
   `{redirect URI}/confirm` is not registered on the login client.
