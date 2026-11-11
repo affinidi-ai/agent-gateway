@@ -1,0 +1,18 @@
+branch: feat/identity-source-method
+changes:
+  added:
+    - timestamp: '2026-11-11T17:10:00Z'
+      title: Choose which Caller Context method supplies the inbound identity
+      description: >-
+        A surface with several Caller Context methods can now derive its inbound From JWT Claims or
+        From API Key identity from one named method, so it can accept JWT users and partner API
+        keys and still identify callers. The Identity panel offers an Identity source method select
+        that lists the methods the identity can read and pre-selects the first. The gateway saves
+        the choice as identity_slots.inbound_source_method, the id of a Caller Context method, and
+        refuses a caller authenticated by any other method with 401 before policy. A surface
+        without a choice keeps today's rules.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -11,6 +11,13 @@ export const LATER_JWT_BEARER_BESIDE_DISCOVERY =
  * shape (`method_type`, `jwt_strategy_id`, `extraction_field`, …).
  */
 export interface CallerAuthMethodConfig {
+  /** Stable id an inbound Identity names to read this method. Never shown. */
+  id?: string;
+  /**
+   * The id was made here, not stored: it is saved only once an Identity
+   * names the method, so a surface that never needs one saves unchanged.
+   */
+  id_generated?: boolean;
   method_type?: CallerAuthMethodType;
   jwt_strategy_id?: string;
   audiences?: string[];
@@ -74,9 +81,46 @@ export const CALLER_AUTH_METHOD_SHORT_LABEL: Record<CallerAuthMethodType, string
   mtls: 'mTLS',
 };
 
+const METHOD_ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
+
+/** A new method id: lowercase letters, digits and dashes, at most 32 characters. */
+export function newMethodId(): string {
+  const random = Array.from(
+    { length: 8 },
+    () => METHOD_ID_ALPHABET[Math.floor(Math.random() * METHOD_ID_ALPHABET.length)]
+  ).join('');
+  return `method-${random}`;
+}
+
+/**
+ * Gives every method without an id one, named by its position: a surface
+ * stored before ids existed gets the same ids on every load, so nothing looks
+ * edited, and an id already taken is never reused.
+ */
+export function withMethodIds(methods: CallerAuthMethodConfig[]): CallerAuthMethodConfig[] {
+  const taken = new Set(methods.map(method => method.id).filter(Boolean));
+  return methods.map((method, position) => {
+    if (method.id) return method;
+    let n = position + 1;
+    while (taken.has(`method-${n}`)) n += 1;
+    taken.add(`method-${n}`);
+    return { ...method, id: `method-${n}`, id_generated: true };
+  });
+}
+
 export function defaultMethodConfig(
   type: CallerAuthMethodType,
   current: CallerAuthMethodConfig = {}
+): CallerAuthMethodConfig {
+  const id = current.id
+    ? { id: current.id, ...(current.id_generated ? { id_generated: true } : {}) }
+    : { id: newMethodId(), id_generated: true };
+  return { ...methodConfigFor(type, current), ...id };
+}
+
+function methodConfigFor(
+  type: CallerAuthMethodType,
+  current: CallerAuthMethodConfig
 ): CallerAuthMethodConfig {
   switch (type) {
     case 'jwt_bearer':
@@ -197,7 +241,17 @@ export function methodSelectionProblems(config: CallerAuthConfig | undefined) {
 }
 
 /** The runtime `SourceAuthConfig` for one method, or `undefined` while incomplete. */
-export function buildMethod(c: CallerAuthMethodConfig, surfaceId: string | undefined): any {
+export function buildMethod(
+  c: CallerAuthMethodConfig,
+  surfaceId: string | undefined,
+  referencedId?: string
+): any {
+  const method = buildMethodBody(c, surfaceId);
+  const saved = c.id && (!c.id_generated || c.id === referencedId);
+  return method && saved ? { ...method, id: c.id } : method;
+}
+
+function buildMethodBody(c: CallerAuthMethodConfig, surfaceId: string | undefined): any {
   const extraction = {
     source: c.extraction_source || 'http_header',
     ...(c.extraction_source === 'http_header'
@@ -243,6 +297,7 @@ export function buildMethod(c: CallerAuthMethodConfig, surfaceId: string | undef
 /** The flat panel fields for one runtime `SourceAuthConfig`. */
 export function methodConfigFromPayload(m: any): CallerAuthMethodConfig {
   const out: CallerAuthMethodConfig = { method_type: m.type };
+  if (typeof m.id === 'string' && m.id) out.id = m.id;
   if (m.extraction) {
     out.extraction_source = m.extraction.source;
     if (m.extraction.field) out.extraction_field = m.extraction.field;
