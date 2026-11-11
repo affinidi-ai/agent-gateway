@@ -2033,8 +2033,9 @@ the provider (`NotLegacyConsent`, `PepperUnset`, `StrategyUnavailable`, `Gateway
 `EntraCallerNamedBySub`, `IdTokenClaimInvalid`, `EditableClaim`) is a setting that confirms
 nobody, logged at `WARN` as `Consent confirmation confirms no caller of this provider: consent
 links are minted unconfirmed`. `PathNotCovered` is logged at `WARN` as `Consent link minted
-unconfirmed for a Transit Point or Fabric caller: its grant can also be released to the
-surface's Access Point callers when the Transit Point has no managed identity of its own`.
+unconfirmed for a Transit Point or Fabric caller: a Transit Point caller's grant can also be
+released to the surface's Access Point callers when the Transit Point has no managed identity
+of its own`.
 `OtherIssuer` and `OtherPrincipalClaim` are logged at `WARN` as `Consent link minted
 unconfirmed: the caller's issuer or principal claim is not the confirming strategy's`. It is
 expected on a surface that also accepts callers of another strategy; on a surface whose
@@ -2061,8 +2062,9 @@ Consent confirmation therefore does not cover:
 
 - API key, mTLS and DID callers;
 - consent through a Transit Point or over Fabric, which is not confirmed. A grant obtained
-  this way can also be released to the surface's Access Point callers when the Transit Point
-  has no managed identity of its own;
+  through a Transit Point can also be released to the surface's Access Point callers when the
+  Transit Point has no managed identity of its own. A Fabric caller's grant is looked up only
+  under the Transit Point's managed identity, so it is not shared with Access Point callers;
 - callers holding this gateway's own STS tokens, who sign in at no other identity provider;
 - a person who signs in as themselves on a link minted for them. They are confirmed, whoever
   sent them the link;

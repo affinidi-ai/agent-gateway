@@ -550,9 +550,9 @@ pub(crate) fn note(
                     target: "credential_delegation",
                     provider_id = %provider.provider_id,
                     surface_id = %surface_id,
-                    "Consent link minted unconfirmed for a Transit Point or Fabric caller: its grant can also be \
-                     released to the surface's Access Point callers when the Transit Point has no managed \
-                     identity of its own"
+                    "Consent link minted unconfirmed for a Transit Point or Fabric caller: a Transit Point \
+                     caller's grant can also be released to the surface's Access Point callers when the \
+                     Transit Point has no managed identity of its own"
                 );
             } else if matches!(reason, Unconfirmed::OtherIssuer | Unconfirmed::OtherPrincipalClaim) {
                 warn!(

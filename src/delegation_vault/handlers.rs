@@ -70,8 +70,9 @@ pub struct DelegationVaultState {
     /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
     /// tokens, through which no consent confirmation confirms a caller.
     pub gateway_mcp_issuer: Option<String>,
-    /// The surfaces served from the gateway configuration (static or the
-    /// configured source), for a surface `agent_surface_store` does not hold.
+    /// The surfaces the gateway serves from its configuration snapshot: static
+    /// or configured-source surfaces, plus its copies of stored surfaces. Each
+    /// copy is checked alongside `agent_surface_store`.
     pub config_surfaces: Option<Arc<dyn ConfigSurfaces>>,
 }
 

@@ -30,7 +30,13 @@ changes:
         callers are named by sub for consent_confirmation, or an issuer that is not a canonical
         https URL for consent_identity_strategy_id. Before, such an edit silently made consent
         confirmation confirm nobody, or stopped modern consent from finding the strategy.
-  fixed: []
+  fixed:
+    - timestamp: '2026-11-11T21:00:00Z'
+      title: Report a caller JWT without an iss claim as an invalid issuer
+      description: >-
+        A JWT Bearer caller whose token has no iss claim is now refused with the reason Invalid
+        issuer instead of Invalid audience, in the gateway log and in the cause a consent
+        confirmation logs for an ID token. The response and the audit record are unchanged.
   removed: []
   security:
     - timestamp: '2026-11-11T12:00:00Z'
