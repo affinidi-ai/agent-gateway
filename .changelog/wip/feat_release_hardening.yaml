@@ -14,7 +14,12 @@ changes:
         Each release tag builds linux/amd64 and linux/arm64 images, boot-probes both, and
         publishes one multi-arch manifest to ghcr.io/affinidi-ai/agent-gateway tagged X.Y.Z, X.Y
         and latest, with an attested build provenance.
-  changed: []
+  changed:
+    - timestamp: '2026-11-11T00:00:00.000Z'
+      title: Wait seven days before proposing new dependency versions
+      description: >-
+        Dependabot now opens version update pull requests only for releases that have been
+        published for at least seven days. Security updates are not delayed.
   fixed: []
   removed: []
   security:
@@ -39,5 +44,4 @@ changes:
         The release gate now requires the merged release pull request to be authored by the release
         app, not by any bot account, and the tag push passes the app token to git through its
         environment instead of the remote URL, so it no longer appears in a process listing.
-        Dependabot waits seven days before proposing a new release of a dependency.
   breaking: []
