@@ -426,12 +426,24 @@ pub struct CredentialProvider {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revocation_ends_authorization: bool,
 
+    /// Whether an external consent provider's code exchange and refresh send
+    /// its `resource` (RFC 8707) to the token endpoint. Off for a token
+    /// endpoint that refuses the parameter, such as the Microsoft identity
+    /// platform v2.0 one; the resource still decides where the grants may
+    /// go. An external consent provider only, fixed for its life.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub send_resource: bool,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl StorableEntity for CredentialProvider {
@@ -892,6 +904,8 @@ pub struct CreateCredentialProviderRequest {
     pub scope_comparison: scope_comparison::ScopeComparison,
     #[serde(default)]
     pub revocation_ends_authorization: bool,
+    #[serde(default = "default_true")]
+    pub send_resource: bool,
     #[serde(default)]
     pub authorization_response_issuer: Option<String>,
 }
@@ -952,6 +966,9 @@ pub struct UpdateCredentialProviderRequest {
     /// Never changes a provider: a value other than the stored one is refused.
     #[serde(default)]
     pub revocation_ends_authorization: Option<bool>,
+    /// Never changes a provider: a value other than the stored one is refused.
+    #[serde(default)]
+    pub send_resource: Option<bool>,
     /// A blank value clears the stored one.
     #[serde(default)]
     pub authorization_response_issuer: Option<String>,
@@ -1023,6 +1040,8 @@ pub struct CredentialProviderListItem {
     pub scope_comparison: scope_comparison::ScopeComparison,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub revocation_ends_authorization: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub send_resource: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1066,6 +1085,7 @@ impl From<&CredentialProvider> for CredentialProviderListItem {
             allow_unadvertised_pkce: p.allow_unadvertised_pkce,
             scope_comparison: p.scope_comparison,
             revocation_ends_authorization: p.revocation_ends_authorization,
+            send_resource: p.send_resource,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -1451,6 +1471,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         }
     }
 
@@ -1582,6 +1603,7 @@ mod tests {
             authorization_response_issuer: None,
             scope_comparison: Default::default(),
             revocation_ends_authorization: false,
+            send_resource: true,
         };
         let json = serde_json::to_string(&provider).unwrap();
         assert!(json.contains("api_key"));

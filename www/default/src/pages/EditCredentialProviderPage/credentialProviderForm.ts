@@ -175,14 +175,26 @@ const ENTRA_HOSTS = new Set([
 ]);
 
 /**
- * True when `resource` is set and the token endpoint is a Microsoft identity platform v2.0
- * endpoint, which rejects the parameter (AADSTS901002). A v1.0 endpoint accepts it.
+ * What decides whether a provider's token requests carry its `resource`: an external consent
+ * provider (one with an `issuer`) leaves it out when `send_resource` is `false`; every other
+ * provider sends it whenever it is set.
+ */
+export interface ResourceSending {
+  issuer?: string | null;
+  send_resource?: boolean;
+}
+
+/**
+ * True when the provider's token requests send `resource` to a Microsoft identity platform
+ * v2.0 token endpoint, which rejects the parameter (AADSTS901002). A v1.0 endpoint accepts it.
  */
 export function entraRejectsResource(
   tokenEndpoint: string,
-  resource: string | null | undefined
+  resource: string | null | undefined,
+  sending: ResourceSending = {}
 ): boolean {
   if (!resource?.trim()) return false;
+  if (sending.issuer && sending.send_resource === false) return false;
   try {
     const url = new URL(tokenEndpoint);
     return ENTRA_HOSTS.has(url.hostname.toLowerCase()) && url.pathname.includes('/oauth2/v2.0/');
@@ -191,8 +203,20 @@ export function entraRejectsResource(
   }
 }
 
-/** Why an Entra v2.0 provider with `resource` fails, and what to set instead. */
-export function entraResourceMessage(resource: string): string {
+/**
+ * Why an Entra v2.0 provider that sends `resource` fails, and what to do instead. An external
+ * consent provider needs its resource, which is fixed, so it is re-created without sending it.
+ */
+export function entraResourceMessage(resource: string, sending: ResourceSending = {}): string {
+  if (sending.issuer) {
+    return (
+      `This provider sends resource "${resource}" to a Microsoft identity platform v2.0 ` +
+      'token endpoint, which rejects it (AADSTS901002), so every connect and refresh will ' +
+      'fail. Its resource is required and cannot change: re-create the provider with ' +
+      'send_resource set to false, which leaves resource out of its token requests and keeps ' +
+      'it as the only place its grants may go.'
+    );
+  }
   return (
     `This provider sets resource "${resource}", which the Microsoft identity platform v2.0 ` +
     'token endpoint rejects (AADSTS901002), so every token request will fail. Put the ' +

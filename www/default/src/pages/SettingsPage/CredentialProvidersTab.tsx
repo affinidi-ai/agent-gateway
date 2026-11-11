@@ -45,6 +45,8 @@ interface CredentialProviderListItem {
   client_authentication?: ClientAuthentication;
   token_endpoint?: string;
   resource?: string | null;
+  issuer?: string | null;
+  send_resource?: boolean;
   default_scopes: string[];
   token_refresh_enabled: boolean;
   description?: string;
@@ -229,12 +231,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                     <td>
                       <strong>{provider.name}</strong>
                       {provider.resource &&
-                        entraRejectsResource(provider.token_endpoint ?? '', provider.resource) && (
+                        entraRejectsResource(
+                          provider.token_endpoint ?? '',
+                          provider.resource,
+                          provider
+                        ) && (
                           <i
                             className="fas fa-exclamation-triangle text-warning ms-2"
                             role="img"
-                            aria-label={entraResourceMessage(provider.resource)}
-                            title={entraResourceMessage(provider.resource)}
+                            aria-label={entraResourceMessage(provider.resource, provider)}
+                            title={entraResourceMessage(provider.resource, provider)}
                             data-testid="credential-provider-entra-resource-badge"
                           />
                         )}

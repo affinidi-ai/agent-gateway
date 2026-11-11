@@ -5,6 +5,7 @@ import {
   isHttpsAddress,
   ProviderFormValues,
   entraRejectsResource,
+  entraResourceMessage,
   clientAuthenticationOf,
   jwtFieldsOf,
   jwtKeyUnidentified,
@@ -245,6 +246,20 @@ describe('credential provider form', () => {
       )
     ).toBe(true);
     expect(entraRejectsResource('not a url', 'https://ai.azure.com')).toBe(false);
+  });
+
+  it('flags an external consent provider only while it still sends its resource', () => {
+    const v2 = 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token';
+    const resource = 'https://graph.microsoft.com';
+    const issuer = 'https://login.microsoftonline.com/tenant-id/v2.0';
+    expect(entraRejectsResource(v2, resource, { issuer, send_resource: false })).toBe(false);
+    expect(entraRejectsResource(v2, resource, { issuer, send_resource: true })).toBe(true);
+    expect(entraRejectsResource(v2, resource, { issuer })).toBe(true);
+    expect(entraRejectsResource(v2, resource, { send_resource: false })).toBe(true);
+    const external = entraResourceMessage(resource, { issuer });
+    expect(external).toContain('re-create the provider with send_resource set to false');
+    expect(external).not.toContain('/.default');
+    expect(entraResourceMessage(resource)).toContain(`"${resource}/.default"`);
   });
 
   it('drops a signing algorithm the selected type does not support', () => {
