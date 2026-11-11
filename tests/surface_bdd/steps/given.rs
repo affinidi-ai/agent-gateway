@@ -1153,6 +1153,16 @@ fn transit_point_injects_api_key_delegated_credentials(
     surface_requires_api_key_delegated_credentials(world, provider);
 }
 
+#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
+fn transit_point_injects_oauth_delegated_credentials(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    provider: String,
+) {
+    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
+    surface_requires_oauth_delegated_credentials(world, provider);
+}
+
 #[given(
     expr = "Transit Point {string} injects delegated credentials from credential provider {string}, which the gateway does not have"
 )]
