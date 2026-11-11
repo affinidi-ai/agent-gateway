@@ -54,6 +54,16 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 - **`vta-service` needs `rest` and `didcomm` enabled to build.** Its default-features-off build
   does not compile, and its HTTP dependency selects the aws-lc backend of the JWT library.
 
+- **The two-gateway suite (`make gw-e2e`) fails intermittently under parallelism.** Linking the
+  VTA crates moves the DID resolver libraries to newer versions, and with them the suite fails
+  in roughly half of its full runs, in scenarios that depend on DID resolution between the
+  gateways (the restart backfill of a peer's issuer DID, 50 concurrent MCP calls over the
+  fabric). Each of those scenarios passes when run alone, and the commit before the VTA crates
+  were linked passed every full run. The failures also appear on the commit that only adds the
+  dependencies, so they do not come from the signing change. Until it is traced to a resolver
+  version, run the suite more than once and read a single failing scenario as suspect, not as
+  proof.
+
 ## Tenancy and publication
 
 - **No per-tenant default.** `KeyDirectory::with_tenant_mapping` exists but nothing calls it, and
