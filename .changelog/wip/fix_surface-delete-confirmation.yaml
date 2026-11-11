@@ -1,0 +1,23 @@
+branch: fix/surface-delete-confirmation
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T10:46:34Z'
+      title: Ask for confirmation in a dialog before deleting a surface
+      description: >-
+        The surface page's delete button deleted the surface on a second click of the same
+        button, so a quick double-click removed it without warning. It now opens a "Delete
+        Surface?" dialog that names the surface and says the delete is permanent, and the
+        surface is deleted only after Delete surface in that dialog; Cancel or closing the
+        dialog keeps it.
+    - timestamp: '2026-11-11T14:05:00Z'
+      title: Show a surface's page again instead of a blank page
+      description: >-
+        Opening a surface in the dashboard showed a blank page, because the Trust Check
+        element's code read two of its own values before they were defined in the built
+        dashboard. They are now defined before anything reads them, and the surface page
+        loads again.
+  removed: []
+  security: []
+  breaking: []

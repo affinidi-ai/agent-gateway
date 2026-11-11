@@ -182,6 +182,10 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
+Deleting a surface on its page opens a "Delete Surface?" confirmation dialog that names the
+surface and says the delete is permanent, and deletes only after **Delete surface** in that
+dialog; see _Surface delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-delete).
+
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).

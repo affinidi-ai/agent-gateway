@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import SurfaceDetailPage from '../SurfaceDetailPage';
@@ -530,4 +530,91 @@ describe('SurfaceDetailPage serving status', () => {
       expect(screen.queryByTestId('surface-refusing-requests')).toBeNull();
     }
   );
+});
+
+describe('SurfaceDetailPage delete', () => {
+  const openDeleteDialog = async () => {
+    render(
+      <MemoryRouter initialEntries={['/surfaces/s1']}>
+        <Routes>
+          <Route path="/surfaces/:surfaceId" element={<SurfaceDetailPage />} />
+          <Route path="/surfaces" element={<p>Surfaces list</p>} />
+        </Routes>
+      </MemoryRouter>
+    );
+    fireEvent.click(await screen.findByTestId('surface-delete-button'));
+    return screen.getByRole('dialog', { name: 'Delete Surface?' });
+  };
+
+  it('asks before deleting, naming the surface, and sends nothing until confirmed', async () => {
+    const remove = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+
+    const dialog = await openDeleteDialog();
+
+    expect(dialog).toHaveTextContent(
+      'You are about to permanently delete agent and all associated configuration. This action cannot be undone.'
+    );
+    expect(dialog).toHaveTextContent('Are you sure you want to continue?');
+    expect(within(dialog).getByText('agent').tagName).toBe('STRONG');
+    expect(screen.getByTestId('surface-delete-dialog-confirm')).toBeEnabled();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('deletes once after Delete surface, then returns to the surfaces list', async () => {
+    const remove = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    await openDeleteDialog();
+
+    fireEvent.click(screen.getByTestId('surface-delete-dialog-confirm'));
+
+    expect(await screen.findByText('Surfaces list')).toBeInTheDocument();
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith('s1');
+    expect(showToast).toHaveBeenCalledWith('success', 'Surface "agent" deleted');
+  });
+
+  it.each(['Cancel', 'Close'])('%s closes the dialog and deletes nothing', async name => {
+    const remove = jest.spyOn(apiClient, 'deleteSurface').mockResolvedValue();
+    const dialog = await openDeleteDialog();
+
+    fireEvent.click(within(dialog).getByRole('button', { name }));
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByTestId('surface-delete-button')).toBeEnabled();
+    expect(screen.queryByText('Surfaces list')).not.toBeInTheDocument();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('disables Delete surface while the delete runs', async () => {
+    let finish: () => void = () => {};
+    const remove = jest
+      .spyOn(apiClient, 'deleteSurface')
+      .mockReturnValue(new Promise<void>(resolve => (finish = resolve)));
+    await openDeleteDialog();
+    const confirm = screen.getByTestId('surface-delete-dialog-confirm');
+
+    fireEvent.click(confirm);
+    await waitFor(() => expect(confirm).toBeDisabled());
+    fireEvent.click(confirm);
+    finish();
+
+    expect(await screen.findByText('Surfaces list')).toBeInTheDocument();
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a failed delete in the error banner and stays on the surface', async () => {
+    jest
+      .spyOn(apiClient, 'deleteSurface')
+      .mockRejectedValue(new Error('Surface store unavailable'));
+    await openDeleteDialog();
+
+    fireEvent.click(screen.getByTestId('surface-delete-dialog-confirm'));
+
+    expect(await screen.findByTestId('surface-error-alert')).toHaveTextContent(
+      'Surface store unavailable'
+    );
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByTestId('surface-delete-button')).toBeEnabled();
+    expect(screen.queryByText('Surfaces list')).not.toBeInTheDocument();
+    expect(showToast).not.toHaveBeenCalledWith('success', expect.anything());
+  });
 });

@@ -43,7 +43,7 @@ import {
   useVariantSnapshots,
   BASE_VARIANT_ID,
 } from '../components/surface-builder/variants/useVariantSnapshots';
-import { DeleteButton } from '../components/shared/DeleteButton';
+import { SurfaceDeleteDialog } from '../components/surface-builder/SurfaceDeleteDialog';
 import {
   hydrateSurfaceCanvas,
   nodesFromSurface,
@@ -130,6 +130,7 @@ const SurfaceDetailPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // `Warning` headers of the last save but the Access Point's, shown in the
   // banner and on the Transit Points they name.
@@ -1459,6 +1460,7 @@ const SurfaceDetailPage: React.FC = () => {
       showToast('success', `Surface "${surface.name}" deleted`);
       navigate('/surfaces');
     } catch (err: any) {
+      setConfirmingDelete(false);
       setError(err.message || 'Failed to delete surface');
       setDeleting(false);
     }
@@ -1831,18 +1833,30 @@ const SurfaceDetailPage: React.FC = () => {
               </button>
             )}
             {canEdit && (
-              <DeleteButton
-                onDelete={handleDelete}
+              <button
+                type="button"
+                className="btn btn-danger btn-sm"
+                data-testid="surface-delete-button"
+                onClick={() => setConfirmingDelete(true)}
                 disabled={deleting || saving}
-                size="sm"
                 title="Delete this surface"
-              />
+              >
+                <i className="fas fa-trash" />
+              </button>
             )}
           </div>
         }
         surfaceSizeRef={surfaceSizeRef}
         canvasViewRef={canvasViewRef}
       />
+      {confirmingDelete && surface && (
+        <SurfaceDeleteDialog
+          surfaceName={surface.name}
+          deleting={deleting}
+          onCancel={() => setConfirmingDelete(false)}
+          onConfirm={handleDelete}
+        />
+      )}
     </div>
   );
 };

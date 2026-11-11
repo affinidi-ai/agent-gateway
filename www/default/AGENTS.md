@@ -70,8 +70,9 @@ are the consumer; the convention is documented in
 | Canvas node   | `surface-node-<type>`, for example `surface-node-payment`                            |
 
 An indexed or per-row button keeps the `-button` suffix before the index or id, for example
-`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`
-and the banner for a refused save is `surface-error-alert`.
+`payments-details-button-<id>`. On `/surfaces/<id>` the save button is `surface-save-button`,
+the delete button is `surface-delete-button`, and the banner for a refused save or delete is
+`surface-error-alert`.
 
 ## CLI consent page
 
@@ -1195,6 +1196,20 @@ with "in variant <alias>" for a variant. "N more you can't view." (`authority-in
 follows while `hidden_references` is above zero. Its only action is **Close**
 (`authority-in-use-dialog-close`): the dashboard never sends `force=true`. Any other failure keeps
 the list page's error alert and the editor's error toast. Every value is rendered as React text.
+
+## Surface delete
+
+The surface page's trash button (`surface-delete-button`, on `/surfaces/<id>` for users with
+`surfaces.edit`) sends nothing: it opens the confirmation dialog `surface-delete-dialog`
+(`components/surface-builder/SurfaceDeleteDialog.tsx`), built on the shared `WarningDialog` and
+titled "Delete Surface?". Its body says "You are about to permanently delete **<surface name>**
+and all associated configuration. This action cannot be undone." and then "Are you sure you want
+to continue?", with the name rendered as React text in bold. **Delete surface**
+(`surface-delete-dialog-confirm`, `btn-danger`) sends `DELETE /surfaces/{id}`; it is enabled on
+open and disabled, with a spinner, only while the delete runs. **Cancel** and the close button
+delete nothing. The confirmation is the dashboard's; the API takes none. A delete succeeds with
+the toast `Surface "<name>" deleted` and returns to `/surfaces`. A failed delete closes the
+dialog, stays on the surface and shows the gateway's message in `surface-error-alert`.
 
 ## Policy definition editor
 
