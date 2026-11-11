@@ -365,6 +365,17 @@ describe('Caller Context accepted audiences', () => {
     expect(input).toHaveValue('https://api.exa');
   });
 
+  it('adds a typed audience when the field loses focus', async () => {
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual(['https://api.example.com']);
+    expect(input).toHaveValue('');
+  });
+
   it('commits a pending audience before the save handler reads the config on Cmd+S', async () => {
     const savedAudiences: unknown[] = [];
     await openEditor({
