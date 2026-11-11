@@ -1078,10 +1078,14 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
   secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
-  `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
-  rejects it (AADSTS901002), the form warns under Token Endpoint
-  (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
-  (`credential-provider-entra-resource-badge`).
+  `entraRejectsResource` finds the provider's token requests send it to a Microsoft identity
+  platform v2.0 token endpoint, which rejects it (AADSTS901002), the form warns
+  (`credential-provider-entra-resource-warning`: under Token Endpoint, or under the external
+  consent notice for a provider with an `issuer`) and the list row shows a warning icon
+  (`credential-provider-entra-resource-badge`). An external consent provider with
+  `send_resource: false` sends no `resource` and is not warned; one that sends it is told to be
+  re-created with `send_resource: false` (`entraResourceMessage`), since its resource is required
+  and fixed. `send_resource` is never sent on save.
 - The secret pickers offer only secrets of the provider's own tenant (`SecretOptions` in
   `SecretSelect.tsx`; the tenant is the loaded provider's `tenant_id`, unknown while creating). A
   stored secret outside that tenant stays selectable with the same labels: "appliance-wide, stops

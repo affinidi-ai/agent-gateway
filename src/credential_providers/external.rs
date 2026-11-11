@@ -199,10 +199,11 @@ pub fn validate(provider: &CredentialProvider) -> Result<(), ExternalProviderErr
                 .scope_comparison
                 .is_exact()
             || provider.revocation_ends_authorization
+            || !provider.send_resource
         {
             return Err(Invalid(
                 "revocation_endpoint, token_endpoint_auth_method, client_id, allow_unadvertised_pkce, \
-                 scope_comparison and revocation_ends_authorization need an issuer",
+                 scope_comparison, revocation_ends_authorization and send_resource need an issuer",
             ));
         }
         return Ok(());
@@ -464,18 +465,19 @@ pub fn refuse_changes(
                 .scope_comparison
                 .is_some_and(|comparison| !comparison.is_exact())
             || request.revocation_ends_authorization == Some(true)
+            || request.send_resource == Some(false)
         {
             return Err(ExternalProviderError::Invalid(
                 "an existing provider cannot take an issuer, revocation_endpoint, token_endpoint_auth_method, \
-                 client_id, allow_unadvertised_pkce, scope_comparison or revocation_ends_authorization; create a \
-                 new provider instead",
+                 client_id, allow_unadvertised_pkce, scope_comparison, revocation_ends_authorization or \
+                 send_resource; create a new provider instead",
             ));
         }
         return Ok(());
     }
     let jwt = &request.jwt;
     let stored = &existing.jwt;
-    let fields: [(&'static str, bool); 24] = [
+    let fields: [(&'static str, bool); 25] = [
         (
             "scope_comparison",
             changes(
@@ -565,6 +567,7 @@ pub fn refuse_changes(
         ),
         ("callback_url", changes(request.callback_url.as_ref(), existing.callback_url.as_ref())),
         ("resource", changes(request.resource.as_ref(), existing.resource.as_ref())),
+        ("send_resource", changes(request.send_resource.as_ref(), Some(&existing.send_resource))),
         (
             "additional_params",
             changes(
@@ -1839,6 +1842,7 @@ pub(crate) mod tests {
                 p.scope_comparison = crate::credential_providers::scope_comparison::ScopeComparison::Google
             },
             |p: &mut CredentialProvider| p.revocation_ends_authorization = true,
+            |p: &mut CredentialProvider| p.send_resource = false,
         ] {
             let mut provider = legacy.clone();
             change(&mut provider);
@@ -2003,6 +2007,7 @@ pub(crate) mod tests {
             ("allow_unadvertised_pkce", json!(true)),
             ("scope_comparison", json!("google")),
             ("revocation_ends_authorization", json!(true)),
+            ("send_resource", json!(false)),
         ] {
             assert_eq!(
                 refuse_changes(&existing, &update(json!({ field: value }))),
@@ -2010,6 +2015,22 @@ pub(crate) mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn an_external_provider_keeps_its_send_resource_setting() {
+        let mut quiet = external_provider();
+        quiet.send_resource = false;
+        assert_eq!(validate(&quiet), Ok(()));
+        assert_eq!(
+            refuse_changes(&quiet, &update(json!({"send_resource": true}))),
+            Err(ExternalProviderError::Immutable("send_resource"))
+        );
+        assert_eq!(refuse_changes(&quiet, &update(json!({"send_resource": false, "name": "Entra"}))), Ok(()));
+        let round_trip = serde_json::to_value(&quiet).unwrap();
+        assert_eq!(round_trip["send_resource"], json!(false));
+        assert_eq!(refuse_changes(&quiet, &update(round_trip)), Ok(()));
+        assert_eq!(refuse_changes(&external_provider(), &update(json!({"send_resource": true}))), Ok(()));
     }
 
     #[test]
@@ -2037,12 +2058,14 @@ pub(crate) mod tests {
         existing.token_endpoint_auth_method = None;
         existing.revocation_endpoint = None;
         assert_eq!(refuse_changes(&existing, &update(json!({"token_endpoint": "https://203.0.113.66/t"}))), Ok(()));
+        assert_eq!(refuse_changes(&existing, &update(json!({"send_resource": true}))), Ok(()));
         for field in [
             json!({"issuer": ISSUER}),
             json!({"client_id": "client"}),
             json!({"token_endpoint_auth_method": "none"}),
             json!({"revocation_endpoint": format!("{ISSUER}/token")}),
             json!({"allow_unadvertised_pkce": true}),
+            json!({"send_resource": false}),
         ] {
             assert!(
                 matches!(refuse_changes(&existing, &update(field.clone())), Err(ExternalProviderError::Invalid(_))),

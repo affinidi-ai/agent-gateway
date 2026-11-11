@@ -776,6 +776,7 @@ pub async fn create_provider(
         authorization_response_issuer: blank_to_none(req.authorization_response_issuer),
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
+        send_resource: req.send_resource,
         created_at: now,
         updated_at: now,
     };
@@ -1153,6 +1154,7 @@ pub async fn update_provider(
         ),
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
+        send_resource: existing.send_resource,
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
@@ -5349,6 +5351,98 @@ mod external_provider_tests {
                 .as_deref(),
             Some("https://203.0.113.10/token")
         );
+    }
+
+    /// `send_resource` is chosen when an external consent provider is created,
+    /// shown by the record and the list, and fixed: an update that sends the
+    /// stored value is accepted, one that changes it refused. Left out, it is
+    /// on, and neither the record nor the list names it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_resource_is_chosen_at_create_listed_and_fixed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(&directory, Ok(metadata())).await;
+        let (status, created) = create(
+            &state,
+            "tenant-a",
+            create_request(|body| {
+                body["provider_id"] = json!("entra");
+                body["send_resource"] = json!(false);
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["send_resource"], json!(false));
+        let (status, default) =
+            create(&state, "tenant-a", create_request(|body| body["provider_id"] = json!("linear"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{default}");
+        assert!(
+            default
+                .get("send_resource")
+                .is_none(),
+            "{default}"
+        );
+
+        let response = list_providers(State(state.clone()), tenant("tenant-a"), None)
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let listed_item = |slug: &str| {
+            listed
+                .iter()
+                .find(|item| item["provider_id"] == slug)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(listed_item("entra")["send_resource"], json!(false));
+        assert!(
+            listed_item("linear")
+                .get("send_resource")
+                .is_none()
+        );
+
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let put = |body: serde_json::Value| {
+            let state = state.clone();
+            let id = id.clone();
+            async move {
+                let response = update_provider(
+                    State(state),
+                    Path(id),
+                    tenant("tenant-a"),
+                    None,
+                    None,
+                    None,
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .into_response();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default())
+            }
+        };
+        let (status, body) = put(json!({"send_resource": true})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_field_immutable");
+        assert_eq!(body["field"], "send_resource");
+        let (status, body) = put(json!({"name": "Entra (work)", "send_resource": false})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let entra = state
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entra.name, "Entra (work)");
+        assert!(!entra.send_resource);
     }
 
     fn bound_surface(binding: serde_json::Value) -> crate::config::agent_surface::AgentSurface {

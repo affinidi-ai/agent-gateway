@@ -171,6 +171,12 @@ The credential provider editor's **Client authentication** select (JWT Bearer) k
 explanation behind `FieldHelp`; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
+The credential provider editor and list warn when a provider's token requests send `resource`
+to a Microsoft identity platform v2.0 token endpoint, never for an external consent provider
+with `send_resource: false`, and tell an external consent provider that sends it to be
+re-created with `send_resource: false`; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
