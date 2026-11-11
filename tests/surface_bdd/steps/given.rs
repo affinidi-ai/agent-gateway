@@ -2501,6 +2501,20 @@ fn surface_requires_source_auth(
         .source_auth = Some(source_auth_fixture(&auth_type));
 }
 
+#[given("the surface is stored as a legacy surface")]
+fn surface_is_stored_as_a_legacy_surface(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .legacy_access_point = true;
+}
+
+#[given("the surface is stored with a public Access Point")]
+fn surface_is_stored_with_a_public_access_point(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .access_point_public = Some(true);
+}
+
 #[given(expr = "the surface accepts {string} and {string} source authentication")]
 fn surface_accepts_two_source_auth_methods(
     world: &mut SurfaceWorld,

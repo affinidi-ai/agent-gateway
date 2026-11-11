@@ -1370,7 +1370,7 @@ export interface CallerAuthentication {
   methods: unknown[];
   /** `null` on a PUT removes the stored setting; leaving it out keeps it. */
   protected_resource?: ProtectedResourceConfig | null;
-  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed`. */
+  /** `reject` refuses a missing or invalid credential with 401; `continue` forwards it to policy as `failed` on a public Access Point only. */
   on_failure?: 'reject' | 'continue';
 }
 

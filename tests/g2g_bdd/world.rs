@@ -151,7 +151,13 @@ pub(crate) fn fabric_route_probe(
     let source = surface_spec(topology, link.from_gw, &link.from_surface);
     let target = surface_spec(topology, link.to_gw, &link.to_surface);
 
+    // The sending gateway strips only the credential headers its own surface
+    // checks, so a receiving surface that authenticates callers gets its key
+    // from the probe when the sender checks none.
     let mut extra_headers = source_auth_headers(source);
+    if extra_headers.is_empty() {
+        extra_headers = source_auth_headers(target);
+    }
     let body = match source.protocol.as_str() {
         "a2a" => build_a2a_request_body(),
         // An MCP surface in front of a modern upstream is probed the way its

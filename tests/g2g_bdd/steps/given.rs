@@ -680,6 +680,14 @@ pub async fn surface_requires_api_key(
     });
 }
 
+#[given(expr = "surface {string} is stored as a legacy surface")]
+fn surface_is_stored_as_a_legacy_surface(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).legacy_access_point = true;
+}
+
 /// Saves the surface through its gateway's admin API with
 /// `access_point.public: false`, the state a surface created through the
 /// admin API has: its Access Point refuses a caller whose credential is
@@ -704,6 +712,16 @@ async fn operator_has_closed_the_access_point(
         .update_surface(&surface_id, &surface)
         .await
         .expect("close the Access Point");
+}
+
+/// Its Access Point hands a caller whose credential is missing or invalid to
+/// policy instead of refusing it.
+#[given(expr = "surface {string} is stored with a public Access Point")]
+fn surface_is_stored_with_a_public_access_point(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).access_point_public = Some(true);
 }
 
 #[given(

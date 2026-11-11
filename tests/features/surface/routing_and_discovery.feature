@@ -176,8 +176,9 @@ Feature: Surface routing, variants, and discovery
     And MCP server "charlie" received the forwarded MCP request
     And MCP server "bravo" was not called
 
-  Scenario: Variant in complete mode clears base source authentication on the alternate route
+  Scenario: Variant in complete mode clears base source authentication on the alternate route of a public surface
     Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the alternate variant is declared in complete mode
     And A2A surface "alpha" exists for route "/example" with default managed agent "bravo" and alternate managed agent "charlie"
     When the caller sends a request to the surface path "/example$alternate/foo"
@@ -187,11 +188,10 @@ Feature: Surface routing, variants, and discovery
 
   Scenario: Complete-mode variant does not clear source authentication on the base route
     Given the surface requires "API Key" source authentication
-    And the surface has a policy denying callers whose source authentication failed
     And the alternate variant is declared in complete mode
     And A2A surface "alpha" exists for route "/example" with default managed agent "bravo" and alternate managed agent "charlie"
     When the caller sends a request to the surface path "/example/foo"
-    Then the response status is 403
+    Then the response status is 401
     And managed agent "bravo" was not called
     And managed agent "charlie" was not called
 

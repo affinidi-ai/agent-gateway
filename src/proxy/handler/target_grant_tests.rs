@@ -53,6 +53,7 @@ fn vendor_surface(
     serde_json::from_value(json!({
         "surface_id": "vendor-agent", "name": "vendor-agent", "tenant_id": TENANT,
         "access_point": {"listen_address": "https://gateway.example", "route": "/vendor", "protocol": protocol,
+            "public": false,
             "caller_authentication": {"methods": [{"type": "api_key",
                 "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "caller-key"}]}},
         "target": {"endpoint": target},
@@ -373,6 +374,35 @@ async fn the_owners_grant_goes_to_the_target_in_place_of_the_callers_credentials
         let (status, headers, body) = fixture
             .send(mcp_call(key))
             .await;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED, "{case}: {body}");
+        assert_eq!(body["id"], 7, "{case}");
+        assert_eq!(body["error"]["code"], -32603, "{case}");
+        assert_eq!(body["error"]["message"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED, "{case}");
+        assert!(
+            headers
+                .get("set-cookie")
+                .is_none(),
+            "{case}: {headers:?}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .vendor
+            .requests()
+            .len(),
+        1,
+        "an unidentified caller reaches no vendor"
+    );
+
+    let mut public = vendor_surface("mcp", &format!("{}/mcp", fixture.vendor.origin()), "owner");
+    public.access_point.public = Some(true);
+    fixture.serve(public).await;
+    for (case, key) in
+        [("no API key on a public surface", None), ("another API key on a public surface", Some("key-b"))]
+    {
+        let (status, headers, body) = fixture
+            .send(mcp_call(key))
+            .await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{case}: {body}");
         assert_eq!(body["id"], 7, "{case}");
         assert_eq!(body["error"]["code"], -32001, "{case}");
@@ -384,7 +414,7 @@ async fn the_owners_grant_goes_to_the_target_in_place_of_the_callers_credentials
             .requests()
             .len(),
         1,
-        "an unidentified caller reaches no vendor"
+        "a public surface releases the owner's grant to no unidentified caller"
     );
 }
 

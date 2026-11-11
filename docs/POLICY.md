@@ -325,22 +325,24 @@ register, so such a record can be found and pointed at an Authority or removed.
 
 ## Failed caller authentication
 
-A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
-it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
-refuse a missing or invalid credential with `401` before policy, see
+Every Access Point that is not public refuses a missing or invalid credential with `401`
+before policy: a closed one (`access_point.public: false`, which the admin API sets on every
+surface it creates unless it is public), a legacy one stored without `public`, and any whose
+`caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
-inbound identity is `from_jwt_claim`, direct or over fabric, refuses one the same way, because
-no caller identity can be derived without a valid JWT. That refusal runs before gateway policy,
-so a gateway deny does not apply to it, and surface policy never sees the request. Its body is
-the generic `Caller credential missing or invalid`; the reason is logged. Otherwise source auth
-does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
+inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
+same way, because no caller identity can be derived without a valid JWT. These refusals run
+before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
+the request. Their body is the generic `Caller credential missing or invalid`; the reason is
+logged. Only on any other public Access Point (`public: true`) does source auth hand a request
+whose credential is missing or invalid to policy. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
 the method selected for the request (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A legacy surface that
+vouches that the gateway vetted the caller. A public surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -356,8 +358,9 @@ itself, with `401`, before any policy runs, so an outbound policy never sees
 
 Over Fabric, the sending Gateway strips the credential headers of every method its own
 surface configures before forwarding. A receiving surface without protected resource metadata that requires
-source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
+source authentication on that same header therefore sees every Fabric caller as failed: a
+public one forwards them without its target credential, and every other one refuses them
+with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input

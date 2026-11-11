@@ -153,9 +153,9 @@ that method:
 3. A request that carries credentials for more than one method fails source authentication
    as the primary method, audited as `ambiguous_credentials`, and neither credential is
    verified, so a caller can't choose the identity the gateway asserts. Like any failed
-   credential, it is refused on a closed Access Point, with `on_failure: reject`, on an inbound
-   `from_jwt_claim` identity, or beside protected resource metadata, and otherwise passed to
-   policy as
+   credential, it is refused on every Access Point that is not public (closed or legacy), with
+   `on_failure: reject`, on an inbound `from_jwt_claim` identity, or beside protected resource
+   metadata, and otherwise passed to policy as
    `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
    connection that presents a client certificate, on a surface that also accepts mTLS, and an
    MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
@@ -322,7 +322,7 @@ admits callers without a valid credential
 
 | `access_point.public` | Meaning |
 | --- | --- |
-| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. It keeps the behaviour its stored fields describe: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
+| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. A caller whose credential is missing or invalid is refused, as on a closed Access Point, whatever `on_failure` stores; the gateway decides this when it serves the request and writes nothing to the stored surface. Without `caller_authentication` it admits every caller and is always ready. |
 | `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. A failed caller is refused whatever `on_failure` stores, including on a surface edited by hand. |
 | `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save answers with a `Warning` header. |
 
@@ -335,6 +335,65 @@ On a closed surface the admin API, on create and on every update:
   override that sets `caller_authentication`;
 - keeps the stored `public` value when an update leaves it out, so a client that drops the
   field cannot reopen the surface.
+
+#### Legacy Access Points after upgrading
+
+v1.0.7 and earlier handed a caller whose credential was missing or invalid to policy on
+a legacy surface (no `public`) that authenticates callers without `on_failure: reject`, an
+inbound `from_jwt_claim` identity or protected resource metadata, so such a caller reached the
+Target unless a policy denied `input.source_auth.method == "failed"`. Every surface created before
+v1.0.4 (2026-11-02), built from DynamoDB, restored from an older backup or edited by hand
+without `public` is legacy, unless it was later closed or made public. Such a surface now
+refuses that caller with `401` before policy and the Target, on direct inbound, `proxy://` MCP
+Targets, `a2a-proxy://` Targets and Fabric receive, as a closed Access Point does. Nothing is
+written to the stored surface.
+
+Callers that stop working after the upgrade:
+
+- clients whose key or token is revoked, expired, wrong or for another audience, which reached
+  the Target unnoticed;
+- callers that send no credential at all, such as internal services, scripts and monitors;
+- anonymous callers a policy admitted on purpose (an "anonymous tier");
+- partners over Fabric when the sending surface checks the same credential header: the sending
+  gateway strips that header, so every partner request arrives without it (see
+  [`POLICY.md`](POLICY.md#failed-caller-authentication)).
+
+Callers with a valid credential, public and closed surfaces, and legacy surfaces without
+`caller_authentication` (which still admit every caller) are unaffected.
+
+These refusals return before the surface rate limit, as on a closed Access Point (see
+[Closed and public Access Points](#closed-and-public-access-points)), so repeated wrong
+credentials no longer use up its budget, and are not throttled by it either. Use high-entropy
+API keys, and limit requests per client upstream of the gateway if credential guessing is a
+concern.
+
+To find the affected surfaces and callers:
+
+- from storage, with no traffic needed: a surface is affected when it stores no `public` and
+  its Access Point, or an enabled variant, sets `caller_authentication` without
+  `on_failure: reject`, an inbound `from_jwt_claim` identity or protected resource metadata;
+- before upgrading, look in the audit log for `auth_failed` events with `blocking: false` on
+  surfaces stored without `public`: each is a caller that is now refused. Public surfaces
+  record the same event and are unaffected. The VP Audit Log keeps `auth_failed` only while
+  it is in the `audit_events` selection (Settings › VP Audit; see
+  [`OBSERVABILITY.md`](OBSERVABILITY.md)), so select it, ahead of the upgrade, to see these
+  callers;
+- after upgrading, the gateway logs a warning when it starts (not on a configuration reload,
+  a storage refresh or a backup restore, so restart after one) for each active legacy surface
+  whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
+  resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
+  already), naming the surface:
+  `This Access Point is neither closed nor public, and it refuses callers whose credential is
+  missing or invalid with 401, as a closed one does …`;
+- the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
+  Point** button.
+
+To keep handing failed callers to policy, mark the surface public (`access_point.public: true`,
+the **Public access** switch). To make the refusal explicit in storage, close it
+(`access_point.public: false`, **Close Access Point**). Either writes `public`, which releases
+before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
+surface built from DynamoDB takes the same setting from an optional `public` attribute on its
+item: a boolean, or the string `"true"` or `"false"`.
 
 #### Not ready Access Points
 
@@ -410,7 +469,9 @@ owning surface no longer exists, which the gate does not refuse. It is `false` f
 or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
 `serving_status` already shows that it does not serve.
 
-On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
+On every Access Point that is not public (closed or legacy), on a public one stored with
+`on_failure: reject`, and with an inbound `from_jwt_claim` identity, a missing or invalid
+credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
@@ -434,7 +495,9 @@ them, which is every surface created after the upgrade; see
 
 ### Failed credentials with `on_failure: continue`
 
-With `on_failure: continue`, a missing or invalid credential does not refuse the request.
+On a public Access Point, whose saves store `on_failure: continue`, a missing or invalid
+credential does not refuse the request. `on_failure: continue` stored on any other Access Point
+has no effect: closed and legacy ones refuse the caller.
 That includes an mTLS certificate that lacks the configured binding field. The request
 continues with no caller identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
@@ -450,7 +513,7 @@ all sends that credential for every caller, and is held to
 in `warn` a warning is logged once, in `enforce` the credential is withheld and a new or
 changed Target authentication, or a new `a2a-proxy://` Target, on such a surface is refused on
 save. To reject
-unauthenticated callers at such an Access Point, close it (`public: false` with caller
+unauthenticated callers at a public Access Point, close it (`public: false` with caller
 authentication), or attach a policy that denies them:
 
 ```rego
@@ -794,6 +857,13 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
   the fields to load such a surface on the older release opens it: one without source
   authentication then admits every caller, and one with it hands a failed caller to policy.
   Back up `_storage/agent_surfaces/` before upgrading.
+- A legacy surface (no `public`) with source authentication refuses a failed caller with
+  `401`; v1.0.7 and earlier handed that caller to policy. Nothing is written to the stored
+  surface, so a rollback to v1.0.7 or earlier loads it unchanged, and hands its failed callers
+  to policy again. A surface closed with `public: false` before upgrading keeps refusing failed
+  callers after a rollback to v1.0.4–v1.0.7; releases before v1.0.4 cannot load it. See
+  [Legacy Access Points after upgrading](#legacy-access-points-after-upgrading) to find the
+  callers that are refused and to keep admitting them.
 
 ### Transit Point source authentication
 
@@ -1244,9 +1314,9 @@ presents to the surface's caller authentication:
 
 Per-key caller identity therefore needs an API Key Provider.
 
-- A missing, invalid or revoked key resolves no caller identity. On a closed Access Point, or
-  with `on_failure: reject`, the request is refused with `401` before policy; otherwise policy
-  sees `input.source_auth.method == "failed"` and decides; see
+- A missing, invalid or revoked key resolves no caller identity. On an Access Point that is
+  not public (closed or legacy), or with `on_failure: reject`, the request is refused with `401`
+  before policy; on a public one policy sees `input.source_auth.method == "failed"` and decides; see
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
 - A key is checked against this node's cached copy of its record; validation reads and writes
   no key record. A key another node revoked, rotated or deleted stops authenticating here at

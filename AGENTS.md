@@ -67,6 +67,7 @@ changes:
   - One behaviour per scenario, in the vocabulary of [`CONTEXT.md`](CONTEXT.md).
   - Exercise the real gateway through its public interfaces.
   - Assert what the caller or operator observes, not internal state.
+  - Fixtures store an Access Point as the admin API creates it: closed when it authenticates callers, public when it does not. Test a caller whose credential fails on that protected flow (refused with `401`, the Target never called). Only a scenario about what a public Access Point still guarantees (the failed caller reaches policy, gets no Target credential and no caller identity, and a policy can deny it) says `the surface is stored with a public Access Point`, and only one about a legacy surface says `the surface is stored as a legacy surface`.
 - **Legacy component**: `src/component_tests/` is frozen. No new files, test functions or helpers; existing tests may be fixed or deleted. The `freeze` tests in `src/component_tests/mod.rs` pin each file's test count in `FROZEN_FILES` and fail on a new file or a count that moves without its pin. Pins only go down. New helpers are a review rule; the tests do not catch them.
 - **MCP conformance**: `make mcp-conformance` (`scripts/mcp-conformance/`) runs the published MCP suite and the legacy compatibility checks against the ordinary gateway binary; `ARGS=--unit-tests` adds the full binary test suite.
 
@@ -323,16 +324,20 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. Four exceptions refuse
-a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
-(`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
-`reject`, an Access Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
+let OPA decide instead: Trust Check, and caller source authentication. Source authentication
+hands a failed caller to policy only on a public Access Point (`access_point.public: true`);
+every other Access Point refuses it before policy with a `401`, direct or over Fabric: a closed
+one (`public: false`), a legacy one stored without `public`, and any whose
+`caller_authentication.on_failure` is `reject`. Two more refuse it, public or not: an Access
+Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a
+valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
-credential of another method a plain `401`). Each such refusal's body says only `Caller credential missing or invalid`; the reason is logged, not sent. The
-admin API creates every surface closed unless `access_point.public` is `true`; a closed
-surface without source authentication is not ready and refuses every request with `503`.
-Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is
-`reject` or the inbound identity is `from_jwt_claim`, and policy must deny `input.source_auth.method == "failed"` to reject them.
+credential of another method a plain `401`). Each such refusal's body says only `Caller
+credential missing or invalid`; the reason is logged, not sent. The admin API creates every
+surface closed unless `access_point.public` is `true`; a closed surface without source
+authentication is not ready and refuses every request with `503`. A legacy surface without
+source authentication admits every caller. On a public Access Point, policy must deny
+`input.source_auth.method == "failed"` to reject failed callers.
 See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
 [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 

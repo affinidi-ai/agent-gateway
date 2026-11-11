@@ -504,7 +504,7 @@ const LogsViewer: React.FC<LogsViewerProps> = ({
       : -1;
 
   const emptyStateMessage = anyFilterActive
-    ? 'No logs match the current filters. Tip: an auth 401 often appears as a WARN ("Source authentication failed … deferring to policy"), not an ERROR — try including Warning.'
+    ? 'No logs match the current filters. Tip: an auth 401 often appears as a WARN ("Source authentication failed …"), not an ERROR — try including Warning.'
     : `No logs available${subtitle ? ` for ${subtitle}` : ''}`;
 
   // Whether the current buffer has any error/warning lines — drives the Audit call-to-action

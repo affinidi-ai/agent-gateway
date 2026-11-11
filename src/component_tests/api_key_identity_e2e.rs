@@ -180,8 +180,9 @@ fn transit_with_one_point() -> serde_json::Value {
     })
 }
 
-/// A surface on `route` whose callers present a key of [`PROVIDER_AGENT_ID`]
-/// and are identified by it, with `policy_id` as its target policy.
+/// A surface on `route` with a closed Access Point whose callers present a key
+/// of [`PROVIDER_AGENT_ID`] and are identified by it, with `policy_id` as its
+/// target policy.
 fn provider_caller_surface(
     surface_id: &str,
     route: &str,
@@ -195,6 +196,7 @@ fn provider_caller_surface(
             "listen_address": "inbound_port_placeholder",
             "route": route,
             "protocol": "a2a",
+            "public": false,
             "caller_authentication": provider_caller_authentication()
         },
         "target": { "endpoint": "inbound_target_placeholder" },
@@ -539,15 +541,15 @@ async fn a_transit_point_workload_binding_names_each_provider_key() {
     assert_ne!(bound[0], bound[1]);
 }
 
-/// A revoked provider key identifies no caller: policy sees a failed source
-/// auth with no caller DID, and a policy wanting a caller denies the request.
+/// A revoked provider key identifies no caller: a closed Access Point refuses
+/// it with `401` before policy, and it gets no DID, while an active key gets
+/// one and reaches the policy that wants a caller.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_provider_key_identifies_no_caller() {
     const POLICY: &str = "revoked-key-policy";
-    let cases = [
-        (
-            "revoked-key-needs-caller",
-            r#"package surface.policy
+    let cases = [(
+        "revoked-key-needs-caller",
+        r#"package surface.policy
 
 default allow := false
 
@@ -557,24 +559,8 @@ allow if {
     input.agent.did == input.extension_identity.did
 }
 "#,
-            [403, 200],
-        ),
-        (
-            "revoked-key-sees-failure",
-            r#"package surface.policy
-
-default allow := false
-
-allow if {
-    input.source_auth.method == "failed"
-    input.source_auth.attempted_method == "api_key_provider"
-    not input.agent.did
-    not input.extension_identity
-}
-"#,
-            [200, 403],
-        ),
-    ];
+        [401, 200],
+    )];
     for (surface_id, rego, [revoked_status, active_status]) in cases {
         let mut keys = Vec::new();
         let mut identities_dir = String::new();
@@ -842,7 +828,7 @@ fn shared_key_surface(
 }
 
 /// A Managed Agent key that an older build recorded as a caller keeps that
-/// record: an unknown caller key adds no identity record, another caller key
+/// record: an unknown caller key is refused and adds no identity record, another caller key
 /// adds only its own, the Managed Agent and the Transit Point reuse the record,
 /// and a caller presenting the Managed Agent key on the same surface is served
 /// with the record's DID. The record keeps its DID and role throughout.
@@ -867,7 +853,7 @@ async fn a_managed_agent_key_recorded_as_a_caller_keeps_its_record() {
 
     let unknown = send_with_key(&h.gateway_url, "atgk_unknown_caller_key").await;
 
-    assert_eq!(unknown.status(), 200, "{}", unknown.text().await.unwrap());
+    assert_eq!(unknown.status(), 401, "{}", unknown.text().await.unwrap());
     let records = identity_records(&identities_dir);
     assert_eq!(records.len(), 1, "identity record count");
     assert_eq!(records[0].identity_hash, managed_hash);

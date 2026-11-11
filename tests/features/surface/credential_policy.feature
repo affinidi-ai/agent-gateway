@@ -200,13 +200,12 @@ Feature: Credential policy on the request path
       | with a valid token   |
       | with a valid API key |
 
-  Scenario Outline: A caller carrying credentials for two source authentication methods gets no Target credential
+  Scenario Outline: A caller carrying credentials for two source authentication methods is refused and gets no Target credential
     Given the surface accepts "JWT Bearer" and "API Key" source authentication
     And the gateway <rule mode> the credential rule "target_source_auth"
     When the caller sends a request to the surface with a valid token and a valid API key
-    Then the response status is 200
-    And managed agent "bravo" did not receive header "authorization"
-    And managed agent "bravo" did not receive header "x-api-key"
+    Then the response status is 401
+    And managed agent "bravo" was not called
     And the credential provider received 0 token requests
     And the gateway log has no warning containing "credential_policy.target_source_auth is enforce"
 

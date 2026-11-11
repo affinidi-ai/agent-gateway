@@ -542,6 +542,16 @@ pub fn log_unchecked_audience_warnings(surfaces: &[crate::config::agent_surface:
     }
 }
 
+/// Log each surface's [`AgentSurface::legacy_access_point_notice`](crate::config::agent_surface::AgentSurface::legacy_access_point_notice)
+/// at `WARN`, as the gateway does once when it starts.
+pub fn log_legacy_access_point_notices(surfaces: &[crate::config::agent_surface::AgentSurface]) {
+    for surface in surfaces {
+        if let Some(notice) = surface.legacy_access_point_notice() {
+            warn!("Surface '{}' ({}): {notice}", surface.name, surface.surface_id);
+        }
+    }
+}
+
 /// Apply [`fall_back_to_first_source_auth_method`] to surfaces held in memory,
 /// as a DynamoDB load does, logging each trim.
 pub fn fall_back_to_first_source_auth_methods_in_memory(surfaces: &mut [crate::config::agent_surface::AgentSurface]) {

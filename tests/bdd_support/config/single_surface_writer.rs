@@ -282,6 +282,12 @@ fn write_single_surface_config_inner(
     if let Some(path) = &surface_config.agent_card_path {
         surface_fixture = surface_fixture.with_agent_card_path(path);
     }
+    if let Some(public) = surface_config.access_point_public {
+        surface_fixture = surface_fixture.with_public(public);
+    }
+    if surface_config.legacy_access_point {
+        surface_fixture = surface_fixture.with_legacy_access_point();
+    }
     for auth in surface_config
         .source_auth
         .iter()

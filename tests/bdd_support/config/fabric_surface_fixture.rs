@@ -35,6 +35,10 @@ pub struct SurfaceSpec {
     /// Credential provider whose delegated credentials the Access Point
     /// obtains with modern consent. Callers then present MCP access tokens.
     pub delegated_credentials: Option<String>,
+    /// Store no `access_point.public`, as a legacy surface does.
+    pub legacy_access_point: bool,
+    /// The stored `access_point.public`; `None` stores what the admin API writes.
+    pub access_point_public: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +116,8 @@ impl SurfaceSpec {
             external_target: false,
             transit_points: Vec::new(),
             delegated_credentials: None,
+            legacy_access_point: false,
+            access_point_public: None,
         }
     }
 }
