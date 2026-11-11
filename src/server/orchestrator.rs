@@ -3695,12 +3695,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .external_consent_resource_origins
                     .clone(),
-                network_config
-                    .external_consent_issuers
-                    .clone(),
-                network_config
-                    .external_consent_issuer_patterns
-                    .clone(),
+                crate::credential_providers::external::PermittedIssuers::of(&network_config),
                 reference_stores.clone(),
             );
 
@@ -3729,16 +3724,7 @@ pub async fn run_axum_proxy(
                         .external_consent_resource_origins
                         .clone(),
                 ),
-                issuers: Arc::new(
-                    network_config
-                        .external_consent_issuers
-                        .clone(),
-                ),
-                issuer_patterns: Arc::new(
-                    network_config
-                        .external_consent_issuer_patterns
-                        .clone(),
-                ),
+                issuers: Arc::new(crate::credential_providers::external::PermittedIssuers::of(&network_config)),
                 mcp_proxy_store: identity_state
                     .mcp_proxy_store
                     .clone(),

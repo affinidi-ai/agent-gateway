@@ -45,7 +45,7 @@ use futures::future::BoxFuture;
 
 use super::{CredentialProvider, CredentialProviderType, TokenEndpointAuthMethod, UpdateCredentialProviderRequest};
 use crate::authz_metadata::{ClientAuthzMetadata, DiscoveryError, DiscoveryFailure, DiscoveryOptions, EgressPosture};
-use crate::config::network::{IssuerPattern, IssuerTenant};
+use crate::config::network::{IssuerPattern, IssuerTenant, NetworkConfig};
 
 const MAX_URL_CHARS: usize = 2048;
 const MAX_CLIENT_ID_CHARS: usize = 2048;
@@ -729,14 +729,14 @@ pub fn invalid_resource_origin_entries(permitted: &std::collections::HashMap<Str
 /// a look-alike name never passes for the issuer's. Any other resource origin
 /// must be one that `permitted`, gateway.json's
 /// `external_consent_resource_origins`, lists for the issuer's origin, or that
-/// a pattern of `patterns`, gateway.json's `external_consent_issuer_patterns`,
-/// lists in its `resource_origins` and the issuer matches: only the operator's
-/// file sets them, never a tenant or an API caller. Both URLs must parse; the
-/// `https` rules of [`validate`] and [`check_grant_destination`] apply as well.
+/// a pattern of `issuers` lists in its `resource_origins` and the issuer
+/// matches: only the operator's file sets them, never a tenant or an API
+/// caller. Both URLs must parse; the `https` rules of [`validate`] and
+/// [`check_grant_destination`] apply as well.
 pub fn resource_permitted(
     provider: &CredentialProvider,
     permitted: &std::collections::HashMap<String, Vec<String>>,
-    patterns: Option<&[IssuerPattern]>,
+    issuers: IssuerRules<'_>,
 ) -> bool {
     let parse = |value: Option<&str>| value.and_then(|value| url::Url::parse(value).ok());
     let (Some(issuer), Some(resource)) = (parse(provider.issuer.as_deref()), parse(provider.resource.as_deref()))
@@ -770,11 +770,87 @@ pub fn resource_permitted(
         .issuer
         .as_deref()
         .into_iter()
-        .flat_map(|issuer| matching_patterns(issuer, patterns))
+        .flat_map(|issuer| matching_patterns(issuer, issuers.patterns))
         .flat_map(|pattern| &pattern.resource_origins);
     listed_for_issuer
         .chain(listed_by_pattern)
         .any(|listed| configured_origin(listed).as_deref() == Some(resource_origin.as_str()))
+}
+
+/// The operator's rules for the issuers external consent providers may name:
+/// gateway.json's `external_consent_issuers` and
+/// `external_consent_issuer_patterns`, always read together, so no check can
+/// consult one and miss the other. With neither set every issuer is
+/// permitted; with either set, only what one of them permits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IssuerRules<'a> {
+    listed: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    patterns: Option<&'a [IssuerPattern]>,
+}
+
+impl<'a> IssuerRules<'a> {
+    /// The rules `network` sets.
+    pub fn of(network: &'a NetworkConfig) -> Self {
+        Self {
+            listed: network
+                .external_consent_issuers
+                .as_ref(),
+            patterns: network
+                .external_consent_issuer_patterns
+                .as_deref(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        listed: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+        patterns: Option<&'a [IssuerPattern]>,
+    ) -> Self {
+        Self { listed, patterns }
+    }
+
+    /// Whether the operator set either list.
+    pub fn is_set(self) -> bool {
+        self.listed.is_some() || self.patterns.is_some()
+    }
+}
+
+/// gateway.json's `external_consent_issuers` and
+/// `external_consent_issuer_patterns` as a handler's state keeps them, read
+/// through [`Self::rules`].
+#[derive(Debug, Clone, Default)]
+pub struct PermittedIssuers {
+    listed: Option<std::collections::HashMap<String, Vec<String>>>,
+    patterns: Option<Vec<IssuerPattern>>,
+}
+
+impl PermittedIssuers {
+    /// The rules `network` sets.
+    pub fn of(network: &NetworkConfig) -> Self {
+        Self {
+            listed: network
+                .external_consent_issuers
+                .clone(),
+            patterns: network
+                .external_consent_issuer_patterns
+                .clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        listed: Option<std::collections::HashMap<String, Vec<String>>>,
+        patterns: Option<Vec<IssuerPattern>>,
+    ) -> Self {
+        Self { listed, patterns }
+    }
+
+    pub fn rules(&self) -> IssuerRules<'_> {
+        IssuerRules {
+            listed: self.listed.as_ref(),
+            patterns: self.patterns.as_deref(),
+        }
+    }
 }
 
 /// The origins the operator lists for the endpoints of `issuer`: those
@@ -785,15 +861,15 @@ pub fn resource_permitted(
 /// counts for nothing.
 fn listed_issuer_origins(
     issuer: &str,
-    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
-    patterns: Option<&[IssuerPattern]>,
+    issuers: IssuerRules<'_>,
 ) -> Option<Vec<String>> {
     let listed = issuers
+        .listed
         .into_iter()
         .flatten()
         .find(|(entry, _)| entry.as_str() == issuer && configured_issuer(entry))
         .map(|(_, origins)| origins);
-    let matched: Vec<&IssuerPattern> = matching_patterns(issuer, patterns).collect();
+    let matched: Vec<&IssuerPattern> = matching_patterns(issuer, issuers.patterns).collect();
     if listed.is_none() && matched.is_empty() {
         return None;
     }
@@ -819,8 +895,13 @@ const TENANT_PLACEHOLDER: &str = "{tenant}";
 /// serializes it, with a plain host, no credentials, query, fragment, `%` or
 /// whitespace, and exactly one `{tenant}`, which is either a whole path
 /// segment, after a fixed host, or the whole leftmost label of a host whose
-/// fixed part has at least two labels, so it never stands for a domain under
-/// a top-level one. `None` for any other pattern, which matches nothing.
+/// fixed part has at least two labels. That keeps `{tenant}` from standing for
+/// a domain directly under a top-level one, such as `https://{tenant}.com`,
+/// and nothing more: without the public suffix list it cannot tell a vendor's
+/// own host from a public suffix such as `co.uk` or a shared hosting suffix
+/// such as `github.io`, under which anyone can create a label, so the operator
+/// must name a fixed host only the vendor creates labels under. `None` for any
+/// other pattern, which matches nothing.
 fn issuer_template(template: &str) -> Option<(&str, &str)> {
     let (prefix, suffix) = template.split_once(TENANT_PLACEHOLDER)?;
     if [prefix, suffix]
@@ -967,16 +1048,15 @@ fn endpoint_on_issuer(
 /// connect starts or completes, and whenever its grants are refreshed or sent.
 pub fn issuer_permitted(
     provider: &CredentialProvider,
-    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
-    patterns: Option<&[IssuerPattern]>,
+    issuers: IssuerRules<'_>,
 ) -> Result<(), &'static str> {
-    if issuers.is_none() && patterns.is_none() {
+    if !issuers.is_set() {
         return Ok(());
     }
     let Some(issuer) = provider.issuer.as_deref() else {
         return Err("issuer");
     };
-    let listed = listed_issuer_origins(issuer, issuers, patterns).ok_or("issuer")?;
+    let listed = listed_issuer_origins(issuer, issuers).ok_or("issuer")?;
     for (field, endpoint) in [
         (
             "authorization_endpoint",
@@ -1010,17 +1090,47 @@ pub fn issuer_permitted(
 /// The error names the field.
 pub fn metadata_permitted(
     metadata: &ClientAuthzMetadata,
-    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
-    patterns: Option<&[IssuerPattern]>,
+    issuers: IssuerRules<'_>,
 ) -> Result<(), &'static str> {
-    if issuers.is_none() && patterns.is_none() {
+    if !issuers.is_set() {
         return Ok(());
     }
-    let listed = listed_issuer_origins(&metadata.issuer, issuers, patterns).ok_or("issuer")?;
+    let listed = listed_issuer_origins(&metadata.issuer, issuers).ok_or("issuer")?;
     match metadata.jwks_uri.as_deref() {
         Some(jwks_uri) if !endpoint_on_issuer(&metadata.issuer, jwks_uri, &listed) => Err("jwks_uri"),
         _ => Ok(()),
     }
+}
+
+/// Logs a `WARN` for each stored external consent provider that `issuers`
+/// does not permit, naming it by record id and slug and the field refused,
+/// while `external_consent_issuer_patterns` is set: such a provider connects,
+/// refreshes and releases nothing, which a pattern written too narrowly, or
+/// an exact entry it was meant to replace, would otherwise leave unnoticed.
+/// Returns their record ids.
+pub fn warn_unpermitted_providers<'p>(
+    providers: &'p [CredentialProvider],
+    issuers: IssuerRules<'_>,
+) -> Vec<&'p str> {
+    if issuers.patterns.is_none() {
+        return Vec::new();
+    }
+    providers
+        .iter()
+        .filter(|provider| provider.is_external_consent())
+        .filter_map(|provider| {
+            let field = issuer_permitted(provider, issuers).err()?;
+            tracing::warn!(
+                target: "credential_delegation",
+                credential_provider_id = %provider.id,
+                provider_id = ?provider.provider_id,
+                field,
+                "A stored external consent provider is not permitted by external_consent_issuers or \
+                 external_consent_issuer_patterns; it connects, refreshes and releases nothing"
+            );
+            Some(provider.id.as_str())
+        })
+        .collect()
 }
 
 /// Whether `entry`, a key of `external_consent_issuers`, is a plain `https`
@@ -1618,7 +1728,7 @@ pub(crate) mod tests {
             "https://mcp.notion.com:8443/mcp",
             "https://api.mcp.notion.com/v1",
         ] {
-            assert!(resource_permitted(&issued_for(issuer, resource), &none, None), "{resource}");
+            assert!(resource_permitted(&issued_for(issuer, resource), &none, IssuerRules::default()), "{resource}");
         }
         for (case, resource) in [
             ("another site", "https://collector.example/mcp"),
@@ -1633,13 +1743,24 @@ pub(crate) mod tests {
             ("a trailing dot", "https://mcp.notion.com./mcp"),
             ("an IP address", "https://203.0.113.10/mcp"),
         ] {
-            assert!(!resource_permitted(&issued_for(issuer, resource), &none, None), "{case}: {resource}");
+            assert!(
+                !resource_permitted(&issued_for(issuer, resource), &none, IssuerRules::default()),
+                "{case}: {resource}"
+            );
         }
-        assert!(resource_permitted(&issued_for("https://203.0.113.10", "https://203.0.113.10/mcp"), &none, None));
-        assert!(!resource_permitted(&issued_for("https://203.0.113.10", "https://203.0.113.11/mcp"), &none, None));
+        assert!(resource_permitted(
+            &issued_for("https://203.0.113.10", "https://203.0.113.10/mcp"),
+            &none,
+            IssuerRules::default()
+        ));
+        assert!(!resource_permitted(
+            &issued_for("https://203.0.113.10", "https://203.0.113.11/mcp"),
+            &none,
+            IssuerRules::default()
+        ));
         let mut without_resource = external_provider();
         without_resource.resource = None;
-        assert!(!resource_permitted(&without_resource, &none, None));
+        assert!(!resource_permitted(&without_resource, &none, IssuerRules::default()));
     }
 
     /// The operator's `external_consent_resource_origins` permits other origins
@@ -1652,12 +1773,16 @@ pub(crate) mod tests {
             ("https://other-issuer.example".to_string(), vec!["https://collector.example".to_string()]),
             ("not an origin".to_string(), vec!["https://collector.example/path".to_string()]),
         ]);
-        assert!(resource_permitted(&issued_for(google, "https://www.googleapis.com/calendar/v3"), &permitted, None));
+        assert!(resource_permitted(
+            &issued_for(google, "https://www.googleapis.com/calendar/v3"),
+            &permitted,
+            IssuerRules::default()
+        ));
         assert!(
             !resource_permitted(
                 &issued_for(google, "https://www.googleapis.com/calendar/v3"),
                 &std::collections::HashMap::new(),
-                None
+                IssuerRules::default()
             ),
             "without the operator's entry the sibling site is refused"
         );
@@ -1667,7 +1792,10 @@ pub(crate) mod tests {
             "https://www.googleapis.com:8443/calendar",
             "https://www.googleapis.com.evil.example/calendar",
         ] {
-            assert!(!resource_permitted(&issued_for(google, resource), &permitted, None), "{resource}");
+            assert!(
+                !resource_permitted(&issued_for(google, resource), &permitted, IssuerRules::default()),
+                "{resource}"
+            );
         }
         assert_eq!(invalid_resource_origin_entries(&permitted), ["https://collector.example/path", "not an origin"]);
     }
@@ -1707,7 +1835,10 @@ pub(crate) mod tests {
             "https://www_googleapis.com/calendar",
             "https://www.googleapis.com./calendar",
         ] {
-            assert!(!resource_permitted(&issued_for(google, resource), &permitted, None), "{resource}");
+            assert!(
+                !resource_permitted(&issued_for(google, resource), &permitted, IssuerRules::default()),
+                "{resource}"
+            );
         }
 
         let wildcard_issuer = std::collections::HashMap::from([(
@@ -1718,7 +1849,7 @@ pub(crate) mod tests {
         assert!(!resource_permitted(
             &issued_for("https://*.google.com", "https://www.googleapis.com/calendar"),
             &wildcard_issuer,
-            None
+            IssuerRules::default()
         ));
         let plain = std::collections::HashMap::from([(
             "https://login.microsoftonline.com".to_string(),
@@ -1753,14 +1884,18 @@ pub(crate) mod tests {
     #[test]
     fn only_a_listed_issuer_with_its_endpoints_on_its_host_or_listed_is_permitted() {
         let provider = external_provider();
-        assert_eq!(issuer_permitted(&provider, None, None), Ok(()), "no allow-list permits any issuer");
-        assert_eq!(issuer_permitted(&provider, Some(&issuers(&[(ISSUER, &[])])), None), Ok(()));
-        assert_eq!(issuer_permitted(&provider, Some(&issuers(&[])), None), Err("issuer"), "an empty list permits none");
+        assert_eq!(issuer_permitted(&provider, IssuerRules::default()), Ok(()), "no allow-list permits any issuer");
+        assert_eq!(issuer_permitted(&provider, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), None)), Ok(()));
+        assert_eq!(
+            issuer_permitted(&provider, IssuerRules::new(Some(&issuers(&[])), None)),
+            Err("issuer"),
+            "an empty list permits none"
+        );
         for listed in
             ["https://203.0.113.11", "https://203.0.113.10/", "https://203.0.113.10/tenant", "https://203.0.113.10:443"]
         {
             assert_eq!(
-                issuer_permitted(&provider, Some(&issuers(&[(listed, &[])])), None),
+                issuer_permitted(&provider, IssuerRules::new(Some(&issuers(&[(listed, &[])])), None)),
                 Err("issuer"),
                 "{listed} is not the issuer {ISSUER}"
             );
@@ -1773,35 +1908,50 @@ pub(crate) mod tests {
         provider.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
         provider.revocation_endpoint = Some("https://oauth2.googleapis.com/revoke".into());
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &[])])), None),
+            issuer_permitted(&provider, IssuerRules::new(Some(&issuers(&[(google, &[])])), None)),
             Err("token_endpoint"),
             "a token endpoint off the issuer's host must be listed"
         );
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None),
+            issuer_permitted(
+                &provider,
+                IssuerRules::new(Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None)
+            ),
             Ok(())
         );
         provider.token_endpoint = Some("https://collector.example/token".into());
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None),
+            issuer_permitted(
+                &provider,
+                IssuerRules::new(Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None)
+            ),
             Err("token_endpoint")
         );
         provider.token_endpoint = Some("https://oauth2.googleapis.com/token".into());
         provider.authorization_endpoint = Some("https://accounts.google.com.evil.example/auth".into());
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None),
+            issuer_permitted(
+                &provider,
+                IssuerRules::new(Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None)
+            ),
             Err("authorization_endpoint")
         );
         provider.authorization_endpoint = Some(format!("{google}/o/oauth2/v2/auth"));
         provider.revocation_endpoint = Some("https://oauth2.googleapis.com:8443/revoke".into());
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None),
+            issuer_permitted(
+                &provider,
+                IssuerRules::new(Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None)
+            ),
             Err("revocation_endpoint"),
             "a listed origin is exact, port included"
         );
         provider.revocation_endpoint = None;
         assert_eq!(
-            issuer_permitted(&provider, Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None),
+            issuer_permitted(
+                &provider,
+                IssuerRules::new(Some(&issuers(&[(google, &["https://oauth2.googleapis.com"])])), None)
+            ),
             Ok(())
         );
 
@@ -1811,7 +1961,10 @@ pub(crate) mod tests {
         subdomain.token_endpoint = Some("https://api.login.vendor.example/token".into());
         subdomain.revocation_endpoint = None;
         assert_eq!(
-            issuer_permitted(&subdomain, Some(&issuers(&[("https://login.vendor.example", &[])])), None),
+            issuer_permitted(
+                &subdomain,
+                IssuerRules::new(Some(&issuers(&[("https://login.vendor.example", &[])])), None)
+            ),
             Err("token_endpoint"),
             "only the issuer's own host, not a subdomain"
         );
@@ -1821,13 +1974,22 @@ pub(crate) mod tests {
     #[test]
     fn a_jwks_uri_off_the_issuers_host_must_be_listed() {
         let mut metadata = metadata();
-        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])])), None), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), None)), Ok(()));
         metadata.jwks_uri = Some(format!("{ISSUER}/jwks"));
-        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])])), None), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), None)), Ok(()));
         metadata.jwks_uri = Some("https://203.0.113.66/jwks".into());
-        assert_eq!(metadata_permitted(&metadata, None, None), Ok(()));
-        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &[])])), None), Err("jwks_uri"));
-        assert_eq!(metadata_permitted(&metadata, Some(&issuers(&[(ISSUER, &["https://203.0.113.66"])])), None), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::default()), Ok(()));
+        assert_eq!(
+            metadata_permitted(&metadata, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), None)),
+            Err("jwks_uri")
+        );
+        assert_eq!(
+            metadata_permitted(
+                &metadata,
+                IssuerRules::new(Some(&issuers(&[(ISSUER, &["https://203.0.113.66"])])), None)
+            ),
+            Ok(())
+        );
     }
 
     /// Entries that are not plain `https` issuers or origins are named at
@@ -1856,11 +2018,11 @@ pub(crate) mod tests {
         );
         let mut provider = external_provider();
         provider.issuer = Some("https://*.google.com".into());
-        assert_eq!(issuer_permitted(&provider, Some(&entries), None), Err("issuer"));
+        assert_eq!(issuer_permitted(&provider, IssuerRules::new(Some(&entries), None)), Err("issuer"));
     }
 
     const ENTRA: &str = "https://login.microsoftonline.com/{tenant}/v2.0";
-    const TENANT_ID: &str = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+    const TENANT_ID: &str = "0c7a1e52-3b9d-4f68-a2e4-5d81f6b39c07";
 
     fn pattern(
         issuer: &str,
@@ -2015,32 +2177,42 @@ pub(crate) mod tests {
     fn an_issuer_that_matches_a_pattern_is_permitted_with_its_endpoints() {
         let mut entra = entra_provider();
         let patterns = [pattern(ENTRA, IssuerTenant::Uuid)];
-        assert_eq!(issuer_permitted(&entra, None, Some(&patterns)), Ok(()));
-        assert_eq!(issuer_permitted(&entra, Some(&issuers(&[(ISSUER, &[])])), Some(&patterns)), Ok(()));
-        assert_eq!(issuer_permitted(&entra, Some(&issuers(&[(ISSUER, &[])])), None), Err("issuer"));
-        assert_eq!(issuer_permitted(&entra, None, Some(&[])), Err("issuer"), "an empty pattern list permits none");
-        assert_eq!(issuer_permitted(&external_provider(), None, Some(&patterns)), Err("issuer"));
-        assert_eq!(issuer_permitted(&external_provider(), Some(&issuers(&[(ISSUER, &[])])), Some(&patterns)), Ok(()));
+        assert_eq!(issuer_permitted(&entra, IssuerRules::new(None, Some(&patterns))), Ok(()));
+        assert_eq!(
+            issuer_permitted(&entra, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), Some(&patterns))),
+            Ok(())
+        );
+        assert_eq!(issuer_permitted(&entra, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), None)), Err("issuer"));
+        assert_eq!(
+            issuer_permitted(&entra, IssuerRules::new(None, Some(&[]))),
+            Err("issuer"),
+            "an empty pattern list permits none"
+        );
+        assert_eq!(issuer_permitted(&external_provider(), IssuerRules::new(None, Some(&patterns))), Err("issuer"));
+        assert_eq!(
+            issuer_permitted(&external_provider(), IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), Some(&patterns))),
+            Ok(())
+        );
 
         entra.token_endpoint = Some(format!("https://login.windows.net/{TENANT_ID}/oauth2/v2.0/token"));
-        assert_eq!(issuer_permitted(&entra, None, Some(&patterns)), Err("token_endpoint"));
+        assert_eq!(issuer_permitted(&entra, IssuerRules::new(None, Some(&patterns))), Err("token_endpoint"));
         let mut listing = pattern(ENTRA, IssuerTenant::Uuid);
         listing.endpoint_origins = vec!["https://login.windows.net".into()];
         let listing = [listing];
-        assert_eq!(issuer_permitted(&entra, None, Some(&listing)), Ok(()));
+        assert_eq!(issuer_permitted(&entra, IssuerRules::new(None, Some(&listing))), Ok(()));
         let mut elsewhere = entra_provider();
         elsewhere.issuer = Some("https://login.windows.net/common/v2.0".into());
-        assert_eq!(issuer_permitted(&elsewhere, None, Some(&listing)), Err("issuer"));
+        assert_eq!(issuer_permitted(&elsewhere, IssuerRules::new(None, Some(&listing))), Err("issuer"));
 
         let mut metadata = metadata();
         metadata.issuer = format!("https://login.microsoftonline.com/{TENANT_ID}/v2.0");
         metadata.jwks_uri = Some(format!("https://login.microsoftonline.com/{TENANT_ID}/discovery/v2.0/keys"));
-        assert_eq!(metadata_permitted(&metadata, None, Some(&patterns)), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(None, Some(&patterns))), Ok(()));
         metadata.jwks_uri = Some("https://login.windows.net/common/discovery/v2.0/keys".into());
-        assert_eq!(metadata_permitted(&metadata, None, Some(&patterns)), Err("jwks_uri"));
-        assert_eq!(metadata_permitted(&metadata, None, Some(&listing)), Ok(()));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(None, Some(&patterns))), Err("jwks_uri"));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(None, Some(&listing))), Ok(()));
         metadata.issuer = "https://login.microsoftonline.com/common/v2.0".into();
-        assert_eq!(metadata_permitted(&metadata, None, Some(&listing)), Err("issuer"));
+        assert_eq!(metadata_permitted(&metadata, IssuerRules::new(None, Some(&listing))), Err("issuer"));
     }
 
     /// A pattern's `resource_origins` permit a resource origin only for an
@@ -2052,19 +2224,64 @@ pub(crate) mod tests {
         graph.resource_origins = vec!["https://graph.microsoft.com".into(), "https://*.office.com".into()];
         let patterns = [graph];
         let entra = entra_provider();
-        assert!(resource_permitted(&entra, &none, Some(&patterns)));
-        assert!(!resource_permitted(&entra, &none, None), "without the pattern");
-        assert!(!resource_permitted(&entra, &none, Some(&[pattern(ENTRA, IssuerTenant::Uuid)])), "not listed");
+        assert!(resource_permitted(&entra, &none, IssuerRules::new(None, Some(&patterns))));
+        assert!(!resource_permitted(&entra, &none, IssuerRules::default()), "without the pattern");
+        assert!(
+            !resource_permitted(&entra, &none, IssuerRules::new(None, Some(&[pattern(ENTRA, IssuerTenant::Uuid)]))),
+            "not listed"
+        );
         let mut common = entra_provider();
         common.issuer = Some("https://login.microsoftonline.com/common/v2.0".into());
-        assert!(!resource_permitted(&common, &none, Some(&patterns)), "an issuer the pattern does not match");
+        assert!(
+            !resource_permitted(&common, &none, IssuerRules::new(None, Some(&patterns))),
+            "an issuer the pattern does not match"
+        );
         for resource in
             ["https://outlook.office.com/api", "https://*.office.com/api", "https://graph.microsoft.com:8443/v1"]
         {
             let mut other = entra_provider();
             other.resource = Some(resource.into());
-            assert!(!resource_permitted(&other, &none, Some(&patterns)), "{resource}");
+            assert!(!resource_permitted(&other, &none, IssuerRules::new(None, Some(&patterns))), "{resource}");
         }
+    }
+
+    /// While patterns are set, each stored external consent provider that
+    /// neither they nor the exact list permit is named in a `WARN`, by record
+    /// id and slug; a permitted provider, or one without an issuer, is not.
+    /// Without patterns nothing is named.
+    #[test]
+    fn stored_providers_the_rules_do_not_permit_are_named_while_patterns_are_set() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let mut legacy = external_provider();
+        legacy.id = "legacy".into();
+        legacy.issuer = None;
+        let mut entra = entra_provider();
+        entra.id = "entra".into();
+        let mut stale = external_provider();
+        stale.id = "stale".into();
+        stale.provider_id = "stale-slug".into();
+        let providers = [legacy, entra, stale];
+        let patterns = [pattern(ENTRA, IssuerTenant::Uuid)];
+
+        let logs = FormattedLogs::capture();
+        assert_eq!(warn_unpermitted_providers(&providers, IssuerRules::new(None, Some(&patterns))), ["stale"]);
+        let text = logs.text();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("stale-slug"), "{text}");
+        assert!(
+            text.contains("not permitted by external_consent_issuers or external_consent_issuer_patterns"),
+            "{text}"
+        );
+
+        assert!(
+            warn_unpermitted_providers(&providers, IssuerRules::new(Some(&issuers(&[(ISSUER, &[])])), Some(&patterns)))
+                .is_empty(),
+            "the exact list permits the rest"
+        );
+        assert!(
+            warn_unpermitted_providers(&providers, IssuerRules::new(Some(&issuers(&[])), None)).is_empty(),
+            "without patterns nothing is named"
+        );
     }
 
     pub(crate) fn external_provider() -> CredentialProvider {

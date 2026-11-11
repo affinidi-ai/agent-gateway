@@ -5817,31 +5817,17 @@ async fn step_inject_external_grant(
         Err(crate::credential_providers::external::PROXY_CHANGED) => return Err(refuse_a_changed_mcp_proxy(ctx)),
         Err(_) => return Err(refuse_external_grant(ctx, "destination_not_the_resource")),
     };
+    let issuers = crate::credential_providers::external::IssuerRules::of(&state.network_config);
     if !crate::credential_providers::external::resource_permitted(
         &provider,
         &state
             .network_config
             .external_consent_resource_origins,
-        state
-            .network_config
-            .external_consent_issuer_patterns
-            .as_deref(),
+        issuers,
     ) {
         return Err(refuse_external_grant(ctx, "resource_not_permitted_for_issuer"));
     }
-    if crate::credential_providers::external::issuer_permitted(
-        &provider,
-        state
-            .network_config
-            .external_consent_issuers
-            .as_ref(),
-        state
-            .network_config
-            .external_consent_issuer_patterns
-            .as_deref(),
-    )
-    .is_err()
-    {
+    if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         return Err(refuse_external_grant(ctx, "issuer_not_permitted"));
     }
     let surface = ctx.surface.clone();
@@ -17994,6 +17980,65 @@ mod tests {
         step_inject_credentials(&state, &mut ctx)
             .await
             .expect("the listed issuer is permitted");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+    }
+
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a grant is released while its provider's issuer matches a
+    /// pattern, and refused, with the reason logged, while none does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "vendor-tenant", "name": "vendor-tenant", "provider_id": "vendor-tenant",
+                    "issuer": "https://vendor.example/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b",
+                    "resource": "https://vendor.example/mcp", "default_scopes": ["read"],
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-tenant", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-tenant"), "access", 3600).await;
+        let caller = "a".repeat(64);
+        let patterns = |issuer: &str| {
+            Some(vec![IssuerPattern {
+                issuer: issuer.to_string(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }])
+        };
+
+        Arc::make_mut(&mut state.network_config).external_consent_issuer_patterns =
+            patterns("https://other.example/{tenant}");
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("issuer_not_permitted"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_issuer_patterns =
+            patterns("https://vendor.example/{tenant}");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("a matching pattern permits the issuer");
         assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
     }
 

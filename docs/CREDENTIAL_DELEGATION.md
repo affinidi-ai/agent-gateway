@@ -630,7 +630,11 @@ file and read once at startup in the same way:
   port, no `.` segments), with no credentials, query, fragment or `%`, and exactly one
   `{tenant}`: either a whole path segment after a fixed host, or the whole leftmost label of a
   fixed host that has at least two labels besides it, so `https://{tenant}.com` is refused. A
-  wildcard host is refused.
+  wildcard host is refused. The two-label rule does not make every such host safe: the gateway
+  carries no public suffix list, so it cannot tell a vendor's own host from a public suffix such
+  as `co.uk` or a shared hosting suffix such as `github.io` or `herokuapp.com`, under which
+  anyone can create a label and serve metadata naming itself. Use a host label pattern only for
+  a fixed host under which the vendor alone creates labels, such as `my.salesforce.com`.
 - `tenant` says what may stand for `{tenant}`: `uuid`, a UUID in its canonical 8-4-4-4-12 hex
   form in either case, or `label`, 1 to 63 lower-case letters, digits and `-`, not starting or
   ending with `-`. Neither can hold `/`, `.`, `:`, `@`, `?`, `#` or `%`, so the value is always
@@ -647,7 +651,11 @@ matches a pattern and each endpoint is on the issuer's host or has an origin lis
 either; a pattern list that is set, even empty, counts as a list, so a tenant's token may then
 create a provider whose issuer matches a pattern. Without both, nothing changes from the rules
 above. A pattern that breaks these rules, or an origin it lists that is not a plain `https`
-origin, permits nothing and is named in an `ERROR` at startup.
+origin, permits nothing and is named in an `ERROR` at startup. While patterns are set, the
+credential policy report at startup and on a configuration reload names, in a `WARN` with its
+record id, slug and the field refused, each stored external consent provider that neither list
+permits, so a pattern written too narrowly, or an exact entry removed in its favour, shows before
+its grants stop being released.
 
 The rule is checked when a provider is created, before its issuer's metadata is fetched, so an
 unlisted issuer is never called (`400`, `provider_issuer_not_permitted`, `field` naming the

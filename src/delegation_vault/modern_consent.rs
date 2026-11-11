@@ -899,7 +899,6 @@ mod tests {
                 egress_allowlist: None,
                 resource_origins: Default::default(),
                 issuers: Default::default(),
-                issuer_patterns: Default::default(),
                 mcp_proxy_store: None,
             },
             network: Arc::new(network),
