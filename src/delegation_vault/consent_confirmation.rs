@@ -48,6 +48,27 @@ pub(crate) enum Unconfirmed {
     OtherIdentityHash,
 }
 
+impl Unconfirmed {
+    /// Whether the reason holds for every caller of the provider, a setting
+    /// that confirms nobody, rather than for this caller or request only.
+    fn covers_every_caller(self) -> bool {
+        match self {
+            Self::NotLegacyConsent
+            | Self::PepperUnset
+            | Self::StrategyUnavailable
+            | Self::GatewayIssuer
+            | Self::EntraCallerNamedBySub
+            | Self::IdTokenClaimInvalid
+            | Self::EditableClaim => true,
+            Self::PathNotCovered
+            | Self::NotJwtCaller
+            | Self::OtherIssuer
+            | Self::OtherPrincipalClaim
+            | Self::OtherIdentityHash => false,
+        }
+    }
+}
+
 /// Who a consent link is minted for.
 #[derive(Clone, Copy)]
 pub(crate) enum ConsentCaller<'a> {
@@ -469,7 +490,18 @@ pub(crate) fn note(
     match decision {
         ConfirmDecision::Off => {}
         ConfirmDecision::Unconfirmed(reason) => {
-            if first_note(&provider.id, surface_id, &format!("{reason:?}")) {
+            if !first_note(&provider.id, surface_id, &format!("{reason:?}")) {
+                return;
+            }
+            if reason.covers_every_caller() {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    surface_id = %surface_id,
+                    reason = ?reason,
+                    "Consent confirmation confirms no caller of this provider: consent links are minted unconfirmed"
+                );
+            } else {
                 debug!(
                     target: "credential_delegation",
                     provider_id = %provider.provider_id,
@@ -1016,6 +1048,27 @@ mod tests {
         assert_ne!(id_token(json!({"iss": ISSUER, "sub": "mallory"}), "sub", "sub"), access_token("sub", "alice"));
         assert_eq!(id_token(json!({"iss": ISSUER, "sub": 7}), "sub", "sub"), None);
         assert_eq!(id_token(json!({"sub": "alice"}), "sub", "sub"), None, "no issuer");
+    }
+
+    /// A setting that confirms nobody is warned of; a caller or request it
+    /// does not cover is only noted at debug.
+    #[test]
+    fn only_a_reason_that_holds_for_every_caller_is_provider_wide() {
+        use Unconfirmed::*;
+        for reason in [
+            NotLegacyConsent,
+            PepperUnset,
+            StrategyUnavailable,
+            GatewayIssuer,
+            EntraCallerNamedBySub,
+            IdTokenClaimInvalid,
+            EditableClaim,
+        ] {
+            assert!(reason.covers_every_caller(), "{reason:?}");
+        }
+        for reason in [PathNotCovered, NotJwtCaller, OtherIssuer, OtherPrincipalClaim, OtherIdentityHash] {
+            assert!(!reason.covers_every_caller(), "{reason:?}");
+        }
     }
 
     #[test]

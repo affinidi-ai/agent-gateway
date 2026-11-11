@@ -70,10 +70,14 @@ Point, identifies callers by the same claim.
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
   use another claim:
   1. Create a new strategy for the issuer that names the claim.
-  2. Point every surface method, and every credential provider whose
-     `consent_identity_strategy_id` names the old strategy, at the new one.
+  2. Point every surface method, every credential provider whose
+     `consent_identity_strategy_id` names the old strategy, and every credential provider whose
+     `consent_confirmation.jwt_verification_strategy_id` names it, at the new one.
   3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
-     would answer its consents with not found.
+     in `consent_identity_strategy_id` would answer its consents with not found, and a legacy
+     consent provider whose `consent_confirmation` still names it mints its links without
+     confirming their caller
+     ([Consent confirmation](CREDENTIAL_DELEGATION.md#turning-it-on)).
   4. Have callers connect again, since their identity hashes have changed.
 
   From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens

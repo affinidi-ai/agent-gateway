@@ -2007,7 +2007,10 @@ update sends `consent_confirmation: null`.
 A consent link confirms its caller when all of these hold:
 
 - the request reached the surface's Access Point;
-- the setting and its strategy still pass the save rules above;
+- the provider is still legacy consent, the pepper is set, and the setting's strategy still
+  exists, can be referenced by the provider's tenant and passes the strategy and claim rules
+  above (the endpoints, `client_id` and the client secret are checked at the start POST and at
+  `/confirm`, not at mint);
 - the caller is a `jwt_bearer` caller whose `iss` is the strategy's `expected_issuer` and whose
   principal claim is the strategy's `principal_claim`;
 - the caller's identity hash is the one the strategy gives that caller.
@@ -2016,9 +2019,14 @@ Which strategy verified the caller does not matter. Another strategy with the sa
 claim gives the same identity hash, so its callers are confirmed too.
 
 Any other caller is minted a link as if the provider had no setting, and its start page leads
-straight to the vendor. The gateway logs this at `DEBUG`, once per provider, surface and
-reason, as `Consent link minted without confirming its caller at their identity provider`,
-with no detail of the caller. The link fails instead only when the strategy cannot be read.
+straight to the vendor. The gateway logs this once per provider, surface and reason, with the
+provider and surface ids and no detail of the caller. A reason that holds for every caller of
+the provider (`NotLegacyConsent`, `PepperUnset`, `StrategyUnavailable`, `GatewayIssuer`,
+`EntraCallerNamedBySub`, `IdTokenClaimInvalid`, `EditableClaim`) is a setting that confirms
+nobody, logged at `WARN` as `Consent confirmation confirms no caller of this provider: consent
+links are minted unconfirmed`. The other reasons concern one caller or request, and are logged
+at `DEBUG` as `Consent link minted without confirming its caller at their identity provider`.
+The link fails instead only when the strategy cannot be read.
 
 | `reason` | The link does not confirm its caller because |
 | --- | --- |
@@ -2136,6 +2144,11 @@ Otherwise every confirmation is refused with `consent_identity_mismatch`.
   again (see
   [Removing grants keyed by the old identity hash](#removing-grants-keyed-by-the-old-identity-hash)).
   On Entra, use `oid` from the start.
+- When replacing a strategy, point `consent_confirmation.jwt_verification_strategy_id` at the
+  new one before deleting the old
+  ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)). Nothing
+  checks that a deleted strategy is unused: while the setting still names it, the provider's
+  legacy consent links are minted without confirming their caller (`StrategyUnavailable`).
 
 ### State
 
