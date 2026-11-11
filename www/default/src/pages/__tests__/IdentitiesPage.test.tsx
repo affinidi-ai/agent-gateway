@@ -207,11 +207,6 @@ describe('IdentitiesPage', () => {
     }));
     (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({ identities: [] });
     (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([]);
-    Element.prototype.scrollIntoView = jest.fn();
-  });
-
-  afterEach(() => {
-    delete (Element.prototype as Partial<Element>).scrollIntoView;
   });
 
   it('renders identities list', async () => {
@@ -660,6 +655,14 @@ describe('IdentitiesPage', () => {
   });
 
   describe('naming metadata', () => {
+    beforeEach(() => {
+      Element.prototype.scrollIntoView = jest.fn();
+    });
+
+    afterEach(() => {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    });
+
     const statsWith = (identities: any[], channels: any[] = []) => ({
       ...mockAppContext.getCurrentStats(),
       identities,

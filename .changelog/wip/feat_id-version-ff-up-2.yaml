@@ -27,7 +27,8 @@ changes:
       title: Stop loading rotation pages when Version History closes
       description: >-
         Closing Version History or collapsing its row while the rotations load now aborts the
-        remaining page requests instead of fetching every page and discarding the result.
+        remaining page requests instead of fetching every page and discarding the result. When
+        one identity's rotations fail to load, the other identities' page requests now stop too.
   removed: []
   security: []
   breaking: []

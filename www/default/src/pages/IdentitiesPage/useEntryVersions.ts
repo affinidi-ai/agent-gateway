@@ -28,7 +28,7 @@ const NO_ROTATIONS: RotationsByHash = {};
  * The versions of an entry, fetching the rotations of each member that has any when first
  * used. It fetches again only when a member's rotation count changes, so a live row update
  * does not; until that answers it is loading, because the earlier lists do not match the
- * updated fields. Unmounting aborts the fetch.
+ * updated fields. Unmounting, or any member's fetch failing, aborts the fetch.
  */
 export function useEntryVersions<T extends Identity>(
   members: T[],
@@ -60,6 +60,7 @@ export function useEntryVersions<T extends Identity>(
       },
       (error: unknown) => {
         if (controller.signal.aborted) return;
+        controller.abort();
         setResult({
           key: fetchKey,
           error: error instanceof Error && error.message ? error.message : 'Unknown error',

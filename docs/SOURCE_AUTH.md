@@ -1704,7 +1704,7 @@ same session authentication as the other dashboard routes:
 
 | Query | Meaning |
 | --- | --- |
-| `limit` | Rotations per page. Default 1000; values outside 1 to 1000 are clamped to that range. |
+| `limit` | Rotations per page. Default 1000; a value from 0 up is clamped to 1 to 1000, and a negative or non-numeric value is refused with `400`. |
 | `before` | History index the page ends before. Default: the end of the history, so the first page is the newest. |
 
 The answer is `{ "rotations": [...], "total": n, "start": i }`: the history's entries
