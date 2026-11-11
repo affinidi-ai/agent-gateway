@@ -9,7 +9,8 @@ changes:
         An identity record saved by a release that does not track rotation_count, as after a
         rollback to 1.0.6, no longer has a readable rotation history overwritten by its next
         rotation: that rotation keeps the history on file and adds to it, without recording the
-        same rotation twice, and fails instead when the history cannot be loaded because of a
+        same rotation twice unless the credential rotated again before a failed save was
+        retried, which leaves one extra version, and fails instead when the history cannot be loaded because of a
         disk or key service failure. Such an identity's history shows again only after that
         rotation. The history is now written through a temporary file, so a write interrupted
         from now on leaves the earlier history instead of a torn file that fails every later

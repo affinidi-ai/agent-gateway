@@ -1689,7 +1689,10 @@ A record that counts no rotations beside an existing history file, as after the 
 saved by a release that does not track `rotation_count`, lists only the rotations it holds
 inline, if any, until the history is next written: on its next rotation, or on its next write
 of any kind while it holds rotations inline. That write keeps the history on file and adds to
-it, or replaces it when the file does not decrypt or parse. Any other failure to read the file,
+it, or replaces it when the file does not decrypt or parse. Rotations it already saved at the
+end of the history before a failed record save are not added again; when the credential
+rotated again before that write, the saved rotation stays and shows as one extra version. Any
+other failure to read the file,
 such as a disk or key service outage, fails the write and leaves the file in place. A history
 file that cannot be read, such as one torn by an interrupted write before writes went through
 a temporary file, fails every rotation of a record that counts rotations, and its rotations
