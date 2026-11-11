@@ -919,3 +919,144 @@ describe('EditCredentialProviderPage client authentication requests', () => {
     expect(body.client_secret_secret_ref).toBe('');
   });
 });
+
+describe('EditCredentialProviderPage consent confirmation', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const SWITCH = 'credential-provider-consent-confirmation-switch';
+  const SECTION = 'credential-provider-consent-confirmation-section';
+  const REDIRECT_URI = 'credential-provider-consent-confirmation-redirect-uri';
+  const CALLBACK = 'https://gw.example/prefix/v1/identity/oauth/callback/p1';
+  const SETTING = {
+    client_id: 'login-client',
+    client_secret_secret_ref: 'LOGIN_SECRET',
+    authorization_endpoint: 'https://idp.example/authorize',
+    token_endpoint: 'https://idp.example/token',
+    jwt_verification_strategy_id: 'strategy-1',
+  };
+
+  const legacy = (extra: Record<string, unknown> = {}) => ({
+    id: 'p1',
+    name: 'GitHub',
+    provider_id: 'github',
+    provider_type: 'oauth2_authorization_code',
+    authorization_endpoint: 'https://github.com/login/oauth/authorize',
+    token_endpoint: 'https://github.com/login/oauth/access_token',
+    client_id_secret_ref: 'CLIENT_ID',
+    client_secret_secret_ref: 'CLIENT_SECRET',
+    default_scopes: [],
+    token_refresh_enabled: true,
+    callback_path: '/v1/identity/oauth/callback/p1',
+    callback_url: CALLBACK,
+    ...extra,
+  });
+
+  const setup = (record: Record<string, unknown>) => {
+    mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') return Promise.resolve({ ok: true });
+      if (url.startsWith('/api/v1/credential-providers/')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(record) });
+      }
+      if (url.startsWith('/api/v1/secrets/')) {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve([
+              { id: 's1', secret_id: 'LOGIN_SECRET', name: 'Login secret', tenant_id: null },
+            ]),
+        });
+      }
+      if (url === '/api/v1/jwt-verification-strategies') {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
+        });
+      }
+      return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
+    });
+    render(
+      <MemoryRouter initialEntries={['/credential-providers/p1']}>
+        <Routes>
+          <Route path="/credential-providers/:id" element={<EditCredentialProviderPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+  };
+
+  const savedBody = async () => {
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    await waitFor(() =>
+      expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(true)
+    );
+    const [, init] = mockFetch.mock.calls.find(([, options]) => options?.method === 'PUT')!;
+    return JSON.parse(init.body);
+  };
+
+  it('shows the section, switched off, only on a legacy authorization code provider', async () => {
+    setup(legacy());
+    expect(await screen.findByTestId(SWITCH)).not.toBeChecked();
+    expect(screen.queryByTestId(REDIRECT_URI)).not.toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_client_credentials' },
+    });
+    expect(screen.queryByTestId(SECTION)).not.toBeInTheDocument();
+  });
+
+  it('does not show the section on an external consent provider', async () => {
+    setup(legacy({ issuer: 'https://linear.example' }));
+    await screen.findByTestId('credential-provider-external-notice');
+    expect(screen.queryByTestId(SECTION)).not.toBeInTheDocument();
+  });
+
+  it('shows a stored setting switched on with the Callback URL plus /confirm', async () => {
+    setup(legacy({ consent_confirmation: SETTING }));
+    expect(await screen.findByTestId(SWITCH)).toBeChecked();
+    expect(screen.getByTestId(REDIRECT_URI)).toHaveValue(`${CALLBACK}/confirm`);
+    expect(await screen.findByRole('option', { name: 'Entra callers' })).toBeInTheDocument();
+    expect(
+      screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
+    ).toHaveValue('strategy-1');
+  });
+
+  it('sends the setting once switched on and filled in', async () => {
+    setup(legacy());
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const type = (testId: string, value: string) =>
+      fireEvent.change(screen.getByTestId(`credential-provider-consent-confirmation-${testId}`), {
+        target: { value },
+      });
+    type('client-id-input', 'login-client');
+    type('authorization-endpoint-input', 'https://idp.example/authorize');
+    type('token-endpoint-input', 'https://idp.example/token');
+    await screen.findAllByRole('option', { name: /LOGIN_SECRET/ });
+    fireEvent.change(screen.getByTestId('credential-provider-cc_client_secret_secret_ref-select'), {
+      target: { value: 'LOGIN_SECRET' },
+    });
+    await screen.findByRole('option', { name: 'Entra callers' });
+    type('strategy-select', 'strategy-1');
+    expect((await savedBody()).consent_confirmation).toEqual(SETTING);
+  });
+
+  it('refuses to save a switched-on setting with a required field empty', async () => {
+    setup(legacy());
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    fireEvent.click(screen.getByTestId('credential-provider-editor-save-button'));
+    expect(
+      await screen.findByText('Login Client ID is required for consent confirmation.')
+    ).toBeInTheDocument();
+    expect(mockFetch.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false);
+  });
+
+  it('sends null when a stored setting is switched off', async () => {
+    setup(legacy({ consent_confirmation: SETTING }));
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const body = await savedBody();
+    expect(body).toHaveProperty('consent_confirmation', null);
+  });
+
+  it('leaves the field out while the switch stays off', async () => {
+    setup(legacy());
+    await screen.findByTestId(SWITCH);
+    expect(await savedBody()).not.toHaveProperty('consent_confirmation');
+  });
+});
