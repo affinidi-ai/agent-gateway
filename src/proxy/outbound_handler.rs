@@ -449,6 +449,12 @@ impl IntoResponse for OutboundPipelineError {
                 },
             );
         }
+        if matches!(
+            self,
+            Self::OutboundDisabled | Self::MissingVirtualChannelAlias | Self::UnknownVirtualChannelAlias(_)
+        ) {
+            return crate::protocols::no_transit_point_response();
+        }
         // ConsentRequired carries a pre-formed JSON body for the caller
         if let Self::ConsentRequired(body) = self {
             return Response::builder()
@@ -10001,6 +10007,31 @@ mod tests {
     fn test_resolve_virtual_channel_unknown_alias() {
         let result = resolve_virtual_channel("/outbound/surfaces/order/unknown/foo", &test_surface());
         assert!(matches!(result, Err(OutboundPipelineError::UnknownVirtualChannelAlias(_))));
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_miss_gets_one_neutral_no_route_response() {
+        let expected = serde_json::json!({
+            "type": "about:blank",
+            "title": "Not Found",
+            "status": 404,
+            "code": "no_route",
+            "detail": "No Transit Point is served at this path. Check the Transit Point URL, and that the Transit Point is saved and enabled.",
+        });
+        for error in [
+            OutboundPipelineError::OutboundDisabled,
+            OutboundPipelineError::MissingVirtualChannelAlias,
+            OutboundPipelineError::UnknownVirtualChannelAlias("partner-z".into()),
+        ] {
+            let label = error.to_string();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(response.headers()["content-type"], "application/problem+json", "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), expected, "{label}");
+        }
     }
 
     #[test]

@@ -36,6 +36,25 @@ pub fn problem_response(
         .unwrap()
 }
 
+/// The `404` a caller gets when nothing is served where it asked: same
+/// `about:blank` body whatever the protocol and whichever way the target is
+/// missing, so it never says whether the target is disabled, deleted or unknown.
+pub fn no_route_response(detail: &str) -> Response {
+    problem_response(StatusCode::NOT_FOUND, "no_route", detail)
+}
+
+/// [`no_route_response`] for a Transit Point path that no enabled Transit Point serves.
+pub fn no_transit_point_response() -> Response {
+    no_route_response(
+        "No Transit Point is served at this path. Check the Transit Point URL, and that the Transit Point is saved and enabled.",
+    )
+}
+
+/// [`no_route_response`] for an entry point whose MCP Proxy is missing.
+pub fn no_mcp_proxy_response() -> Response {
+    no_route_response("No MCP Proxy is served at this entry point. Check that the MCP Proxy is saved and enabled.")
+}
+
 /// Detect the wire "protocol family" of a JSON-RPC request body from its
 /// `method` prefix. Returns `Some("a2a")` or `Some("mcp")` only when the body
 /// is positively identifiable; `None` for non-JSON bodies, bodies without a

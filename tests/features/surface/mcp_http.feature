@@ -184,9 +184,8 @@ Feature: HTTP MCP surface forwarding
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
 
-  Scenario: A disabled MCP surface answers with the protocol-neutral route-miss refusal
-    Given MCP surface "delta" exists for route "/smoke" with default MCP server "echo" and alternate MCP server "foxtrot"
-    And the operator has disabled the surface
-    When the caller sends a request to the surface path "/smoke/mcp"
-    Then the response status is 404
-    And the response says only that no surface is served at "/smoke/mcp"
+  Scenario: A legacy JSON-RPC batch is refused with the protocol-neutral batch refusal
+    When the caller sends a legacy batch of MCP tool catalog requests
+    Then the response status is 422
+    And the response says only that JSON-RPC batches are not supported
+    And MCP server "bravo" was not called

@@ -10,6 +10,13 @@ changes:
         application/problem+json body with type about:blank and code: no_route, whose detail
         names the path and says to check the entry point URL and that the surface is saved and
         enabled. The body is the same for disabled, deleted and unknown surfaces.
+    - timestamp: '2026-11-11T09:00:00Z'
+      title: Answer Transit Point and MCP Proxy misses with a neutral 404
+      description: >-
+        A Transit Point path that no enabled Transit Point serves, and an entry point whose MCP
+        Proxy is missing, now get a 404 application/problem+json body with type about:blank and
+        code: no_route instead of an A2A error type. The body is the same whether Outbound is
+        off, the alias is missing or the alias is unknown.
     - timestamp: '2026-11-09T12:30:00Z'
       title: Drop the A2A error type from the MCP batch refusal
       description: >-

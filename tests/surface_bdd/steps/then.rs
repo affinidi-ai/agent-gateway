@@ -939,6 +939,21 @@ fn admin_api_error_response_mentions(
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
 }
 
+fn assert_neutral_problem_response(
+    world: &SurfaceWorld,
+    expected: &serde_json::Value,
+    context: &str,
+) {
+    assert_eq!(
+        get_response_headers_value(world)
+            .get("content-type")
+            .map(String::as_str),
+        Some("application/problem+json"),
+        "{context} content type"
+    );
+    assert_json_bodies_equal(get_response_body_value(world), expected, context);
+}
+
 #[then(expr = "the response says only that no surface is served at {string}")]
 fn response_says_only_no_surface_is_served_at(
     world: &mut SurfaceWorld,
@@ -953,14 +968,19 @@ fn response_says_only_no_surface_is_served_at(
             "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
         )
     });
-    assert_eq!(
-        get_response_headers_value(world)
-            .get("content-type")
-            .map(String::as_str),
-        Some("application/problem+json"),
-        "route miss refusal content type"
-    );
-    assert_json_bodies_equal(get_response_body_value(world), &expected, "route miss refusal");
+    assert_neutral_problem_response(world, &expected, "route miss refusal");
+}
+
+#[then("the response says only that JSON-RPC batches are not supported")]
+fn response_says_only_batches_are_not_supported(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "about:blank",
+        "title": "Unprocessable Entity",
+        "status": 422,
+        "code": "batch_not_supported",
+        "detail": "JSON-RPC batches are not supported"
+    });
+    assert_neutral_problem_response(world, &expected, "batch refusal");
 }
 
 #[then("the response says only that the Access Point is not available")]

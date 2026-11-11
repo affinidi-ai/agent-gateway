@@ -3838,6 +3838,15 @@ async fn mcp_modern_batch_sent(world: &mut SurfaceWorld) {
     send_json_request_and_record(world, batch, modern_mcp_request_headers(&McpVersion::Modern, "tools/list")).await;
 }
 
+#[when("the caller sends a legacy batch of MCP tool catalog requests")]
+async fn mcp_legacy_batch_sent(world: &mut SurfaceWorld) {
+    let batch = serde_json::Value::Array(vec![
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-first")),
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-second")),
+    ]);
+    send_json_request_and_record(world, batch, vec![]).await;
+}
+
 #[when(expr = "the caller asks the MCP surface for available tools with header {string} set to {string}")]
 async fn caller_asks_mcp_surface_with_header(
     world: &mut SurfaceWorld,

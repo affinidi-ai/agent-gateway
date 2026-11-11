@@ -459,6 +459,9 @@ Reasons are fixed codes; no record carries a credential, token or validator mess
       `{"type":"about:blank","title":"Not Found","status":404,"code":"no_route","detail":"No surface is served at <path>. Check the entry point URL, and that the surface is saved and enabled."}`.
       `<path>` is the request path without its query. The body applies to a path under a channel
       or proxy prefix; any other path gets the listener's own `404` without it.
+      A Transit Point path that no enabled Transit Point serves, whether Outbound is off, the alias
+      is missing or the alias is unknown, and an entry point whose MCP Proxy is missing, get the
+      same `application/problem+json` shape and `code` with their own `detail`.
     - `unknown_variant` (404): the URL names a variant the surface doesn't have, including on a
       surface with no variants. `requested_variant` holds the alias the URL named, cut to 32
       characters; it is caller-chosen text and appears on no other record.
