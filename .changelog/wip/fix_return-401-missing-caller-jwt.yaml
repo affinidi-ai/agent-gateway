@@ -1,0 +1,36 @@
+branch: fix/return-401-missing-caller-jwt
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-05T08:10:06Z'
+      title: Return 401 when the caller JWT is missing on from_jwt_claim surfaces
+      description: >-
+        An Access Point whose inbound identity is from_jwt_claim answered 500 when a caller sent
+        no bearer token or an invalid one, on direct and fabric paths. It now refuses such a caller
+        with 401 before gateway policy and never calls the target. The body says only that the
+        caller credential is missing or invalid; the reason is logged, not sent.
+    - timestamp: '2026-11-06T09:00:00Z'
+      title: Refuse from_jwt_claim surfaces unless jwt_bearer is their only caller method
+      description: >-
+        Saving a surface whose inbound identity, protected identity or Transit Point identity is
+        from_jwt_claim now requires jwt_bearer as its only caller authentication method. A surface
+        with no method, or with another method beside jwt_bearer, can never supply the JWT claims
+        the identity reads, so it is refused at save time instead of answering 500 per request.
+        Stored surfaces that break the rule still load with a warning.
+    - timestamp: '2026-11-10T10:36:15Z'
+      title: Fix flaky credential provider delete test race condition
+      description: >-
+        The a_provider_delete_dropped_part_way_still_revokes_what_was_deferred test waited only for
+        the first revocation token to arrive, then immediately asserted both tokens were present.
+        In CI with different timing, only the second token arrived before the assertion, causing
+        intermittent failures. Now explicitly waits for both tokens before asserting.
+  removed: []
+  security:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Hide internal source authentication errors from 500 response bodies
+      description: >-
+        A caller that hit an internal source authentication failure received the underlying error
+        text in a 500 body. The body now carries a generic message only, and the full error is
+        logged on the gateway.
+  breaking: []

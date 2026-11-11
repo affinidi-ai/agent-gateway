@@ -166,6 +166,10 @@ The endpoint editor picks a Kafka endpoint's security protocol (`plaintext`, `ss
 `SCRAM-SHA-256` or `SCRAM-SHA-512`); see
 _Endpoint editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#endpoint-editor).
 
+The credential provider editor's **Client authentication** select (JWT Bearer) keeps its
+explanation behind `FieldHelp`; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
 The secret editor has one save button and never shows a stored secret value; see
 _Secret editor_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#secret-editor).
 
@@ -255,8 +259,8 @@ and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its
 responses and from its Transit Points) and certificate or API key rotations listed as
-versions in the expanded row, each earlier DID with its own actions, from the `rotations` the
-backend sends on each identity; see _Identities page_ in
+versions in the expanded row, each earlier DID with its own actions; rows carry only
+`rotation_count`, and Version History loads the rotations when opened; see _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page) and
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#identity-versions).
 
@@ -319,16 +323,16 @@ Legacy `package channel.policy` is migrated to `surface.policy` at boot. Deny re
 are `data.gateway.policy.deny_reason` and `data.surface.policy.deny_reason`.
 
 **Policy planes and identity attribution fail closed.** Two stages publish results and
-let OPA decide instead: Trust Check, and caller source authentication. Three exceptions refuse
+let OPA decide instead: Trust Check, and caller source authentication. Four exceptions refuse
 a failed caller before policy with a `401`, direct or over Fabric: a closed Access Point
 (`access_point.public: false`), an Access Point whose `caller_authentication.on_failure` is
-`reject`, and an MCP Access Point that publishes protected resource metadata (a missing or
+`reject`, an Access Point whose inbound identity is `from_jwt_claim` (no caller identity can be derived without a valid JWT), and an MCP Access Point that publishes protected resource metadata (a missing or
 refused JWT Bearer credential gets the discovery challenge on direct requests, a failed
-credential of another method a plain `401`). The
+credential of another method a plain `401`). Each such refusal's body says only `Caller credential missing or invalid`; the reason is logged, not sent. The
 admin API creates every surface closed unless `access_point.public` is `true`; a closed
 surface without source authentication is not ready and refuses every request with `503`.
 Surfaces without `public` keep forwarding failed callers to policy unless `on_failure` is
-`reject`, and policy must deny `input.source_auth.method == "failed"` to reject them.
+`reject` or the inbound identity is `from_jwt_claim`, and policy must deny `input.source_auth.method == "failed"` to reject them.
 See [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#closed-and-public-access-points) and
 [`docs/POLICY.md`](docs/POLICY.md#failed-caller-authentication).
 

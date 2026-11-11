@@ -61,6 +61,10 @@ use crate::config::PepperCacheConfig;
 use crate::secrets::{Secret, SecretsStore};
 use crate::source_auth::ManagedIdentityConfig;
 
+/// `credential_type` of an mTLS-derived identity, whose identity fields describe the
+/// certificate's value, so a rotation is a change of those fields.
+pub const MTLS_CREDENTIAL_TYPE: &str = "mtls";
+
 // ── Pepper ────────────────────────────────────────────────────────────────
 
 struct Pepper {
@@ -398,7 +402,7 @@ impl CredentialIdentityResolver {
         let fields = build_mtls_identity_fields(certificate_id, &parsed);
         // Hash keyed on the stable identifier only — rotation of the PEM
         // under the same certificate_id keeps the DID stable.
-        let hash = hash_credential(&[("credential_type", "mtls"), ("certificate_id", certificate_id)]);
+        let hash = hash_credential(&[("credential_type", MTLS_CREDENTIAL_TYPE), ("certificate_id", certificate_id)]);
 
         self.mtls_cache.insert(
             certificate_id.to_string(),
@@ -737,7 +741,7 @@ fn build_mtls_identity_fields(
     parsed: &ParsedLeaf,
 ) -> HashMap<String, JsonValue> {
     let mut fields = HashMap::new();
-    fields.insert("credential_type".to_string(), json!("mtls"));
+    fields.insert("credential_type".to_string(), json!(MTLS_CREDENTIAL_TYPE));
     fields.insert("certificate_id".to_string(), json!(certificate_id));
     fields.insert("fingerprint_sha256".to_string(), json!(parsed.fingerprint_sha256_hex));
     fields.insert("subject_dn".to_string(), json!(parsed.subject_dn));

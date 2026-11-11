@@ -76,6 +76,7 @@ impl StsClient {
     /// Project the runtime record the token endpoint enforces against.
     pub fn to_record(&self) -> StsClientRecord {
         StsClientRecord {
+            id: self.id.clone(),
             client_id: self.client_id.clone(),
             tenant_id: self.tenant_id.clone(),
             allowed_audiences: self.allowed_audiences.clone(),

@@ -56,16 +56,18 @@ async fn create_managed_connection(
     allowed_audiences: Vec<String>,
     issue_id_jag: bool,
 ) {
-    create_managed_connection_full(world, agent, allowed_audiences, Vec::new(), issue_id_jag, true).await;
+    create_managed_connection_full(world, agent, None, allowed_audiences, Vec::new(), issue_id_jag, true).await;
 }
 
-/// Seed a managed connection with full control over allowed scopes, ID-JAG
-/// permission, and whether a client secret is configured. A connection created
-/// with `with_secret = false` has no `client_secret_ref`, so the gateway must
+/// Seed a managed connection with full control over its tenant (`None` for an
+/// appliance-global connection), allowed scopes, ID-JAG permission, and
+/// whether a client secret is configured. A connection created with
+/// `with_secret = false` has no `client_secret_ref`, so the gateway must
 /// reject it fail-closed at authentication.
 async fn create_managed_connection_full(
     world: &mut SurfaceWorld,
     agent: &str,
+    tenant_id: Option<&str>,
     allowed_audiences: Vec<String>,
     allowed_scopes: Vec<String>,
     issue_id_jag: bool,
@@ -78,6 +80,7 @@ async fn create_managed_connection_full(
         .expect("admin client must exist");
 
     let mut connection = serde_json::json!({
+        "tenant_id": tenant_id,
         "client_id": agent,
         "name": format!("BDD agent {agent}"),
         "allowed_audiences": allowed_audiences,
@@ -521,7 +524,7 @@ async fn managed_connection_can_issue_id_jag_with_scopes(
         .split_whitespace()
         .map(|s| s.to_string())
         .collect();
-    create_managed_connection_full(world, &agent, Vec::new(), allowed_scopes, true, true).await;
+    create_managed_connection_full(world, &agent, None, Vec::new(), allowed_scopes, true, true).await;
 }
 
 #[given(expr = "the operator has a managed connection for agent {string} with no client secret")]
@@ -529,7 +532,121 @@ async fn managed_connection_without_secret(
     world: &mut SurfaceWorld,
     agent: String,
 ) {
-    create_managed_connection_full(world, &agent, Vec::new(), Vec::new(), false, false).await;
+    create_managed_connection_full(world, &agent, None, Vec::new(), Vec::new(), false, false).await;
+}
+
+#[given(expr = "tenant {string} has a managed connection for agent {string} allowing audience {string}")]
+async fn tenant_managed_connection_allowing_audience(
+    world: &mut SurfaceWorld,
+    tenant: String,
+    agent: String,
+    audience: String,
+) {
+    create_managed_connection_full(world, &agent, Some(&tenant), vec![audience], Vec::new(), false, true).await;
+}
+
+/// The Transit Point authenticates its callers with JWT Bearer tokens for
+/// `audience`, verified by the BDD JWT verification strategy.
+#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer tokens for audience {string}")]
+fn transit_point_authenticates_callers_with_jwt_bearer(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    audience: String,
+) {
+    crate::steps::given::transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
+        "type": "jwt_bearer",
+        "jwt_verification_strategy_id": "bdd-jwt-strategy",
+        "audiences": [audience],
+    }));
+}
+
+#[given(expr = "the operator has deleted the managed connection for agent {string}")]
+async fn operator_deleted_managed_connection(
+    world: &mut SurfaceWorld,
+    agent: String,
+) {
+    crate::steps::when::ensure_admin_session(world).await;
+    let admin = world
+        .admin_client
+        .clone()
+        .expect("admin client must exist");
+    let listing = admin
+        .send_recorded_json::<Value>(reqwest::Method::GET, "/v1/sts/clients", None)
+        .await
+        .unwrap_or_else(|error| panic!("list managed connections: {error}"));
+    let id = listing
+        .body
+        .as_array()
+        .and_then(|clients| {
+            clients
+                .iter()
+                .find(|client| client["client_id"] == agent.as_str())
+        })
+        .and_then(|client| client["id"].as_str())
+        .unwrap_or_else(|| panic!("agent '{agent}' must have a managed connection, got {}", listing.body))
+        .to_string();
+    let response = admin
+        .send_recorded_json::<Value>(reqwest::Method::DELETE, &format!("/v1/sts/clients/{id}"), None)
+        .await
+        .unwrap_or_else(|error| panic!("delete managed connection: {error}"));
+    assert!(
+        (200..300).contains(&response.status),
+        "managed connection deletion expected 2xx, got {} body {}",
+        response.status,
+        response.body
+    );
+}
+
+/// Point the surface's JWT verification strategy at the gateway's own Security
+/// Token Service: its issuer from the authorization server metadata and its
+/// signing keys from its JWKS.
+#[given("the surface trusts tokens issued by the gateway's Security Token Service")]
+async fn surface_trusts_gateway_sts(world: &mut SurfaceWorld) {
+    crate::steps::when::ensure_admin_session(world).await;
+    let port = world
+        .infra
+        .as_ref()
+        .expect("gateway infra must be running")
+        .gateway_port;
+    let fetch = |path: &str| {
+        let url = format!("http://127.0.0.1:{port}/api{path}");
+        async move {
+            reqwest::Client::new()
+                .get(&url)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("fetch {url}: {error}"))
+                .json::<Value>()
+                .await
+                .unwrap_or_else(|error| panic!("parse {url}: {error}"))
+        }
+    };
+    let issuer = fetch("/.well-known/oauth-authorization-server").await["issuer"]
+        .as_str()
+        .expect("authorization server metadata must name its issuer")
+        .to_string();
+    let keys = fetch("/oauth2/jwks.json").await["keys"].clone();
+    let admin = world
+        .admin_client
+        .clone()
+        .expect("admin client must exist");
+    let response = admin
+        .send_recorded_json(
+            reqwest::Method::PUT,
+            "/v1/jwt-verification-strategies/bdd-jwt-strategy",
+            Some(&serde_json::json!({
+                "name": "BDD gateway Security Token Service",
+                "expected_issuer": issuer,
+                "jwks_source": { "type": "static", "jwks": keys },
+            })),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("point the surface strategy at the gateway STS: {error}"));
+    assert_eq!(
+        response.status, 200,
+        "surface strategy update expected 200, got {} body {}",
+        response.status, response.body
+    );
 }
 
 #[given(expr = "agent {string} has obtained an ID-JAG redeemable at the gateway")]

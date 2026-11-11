@@ -16,6 +16,7 @@ jest.mock('../../api', () => ({
     getIdentityTrustScore: jest.fn(),
     createDidWebVhIdentity: jest.fn(),
     listDidWebVhIdentities: jest.fn().mockResolvedValue({ identities: [] }),
+    getIdentityRotations: jest.fn(),
   },
 }));
 
@@ -205,6 +206,7 @@ describe('IdentitiesPage', () => {
       unread_count: 0,
     }));
     (apiClient.listDidWebVhIdentities as jest.Mock).mockResolvedValue({ identities: [] });
+    (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([]);
   });
 
   it('renders identities list', async () => {
@@ -801,14 +803,132 @@ describe('IdentitiesPage', () => {
       expect(screen.getByTestId('identities-version-1')).not.toHaveTextContent('Current');
     });
 
+    it('builds the versions of DIDs without rotations without fetching', async () => {
+      renderWithStats([gpt4o, gpt41]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${gpt41.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-2')).toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-history-loading')).not.toBeInTheDocument();
+      expect(apiClient.getIdentityRotations).not.toHaveBeenCalled();
+    });
+
+    it('fetches the rotations when Version History opens, showing a loading state until they arrive', async () => {
+      let resolve: (rotations: unknown[]) => void = () => undefined;
+      (apiClient.getIdentityRotations as jest.Mock).mockReturnValue(
+        new Promise(done => {
+          resolve = done;
+        })
+      );
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      expect(apiClient.getIdentityRotations).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(screen.getByTestId('identities-version-history-loading')).toHaveTextContent(
+        'Loading version history…'
+      );
+      expect(screen.queryByTestId('identities-version-1')).not.toBeInTheDocument();
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(1);
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledWith(
+        managedRotatedFixture.identity_hash
+      );
+
+      resolve([{ rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } }]);
+
+      expect(await screen.findByTestId('identities-version-2')).toHaveTextContent(
+        'Credential rotated'
+      );
+      expect(screen.queryByTestId('identities-version-history-loading')).not.toBeInTheDocument();
+    });
+
+    it('says none are recorded when the fetched history is empty', async () => {
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      expect(await screen.findByTestId('identities-version-history-empty')).toHaveTextContent(
+        'No earlier DIDs or credential rotations recorded.'
+      );
+      expect(screen.queryByTestId('identities-version-1')).not.toBeInTheDocument();
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(1);
+    });
+
+    it('shows a failed load with a Retry that fetches again', async () => {
+      (apiClient.getIdentityRotations as jest.Mock)
+        .mockRejectedValueOnce(new Error('Gateway unavailable'))
+        .mockResolvedValueOnce([{ rotated_at: '2026-01-02T00:00:00Z' }]);
+      renderWithStats([managedRotatedFixture]);
+
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+
+      const error = await screen.findByTestId('identities-version-history-error');
+      expect(error).toHaveTextContent('Could not load version history: Gateway unavailable');
+      expect(screen.queryByTestId('identities-version-history-empty')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('identities-version-1')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByTestId('identities-version-history-retry-button'));
+
+      expect(await screen.findByTestId('identities-version-2')).toHaveTextContent(
+        'Credential updated'
+      );
+      expect(screen.queryByTestId('identities-version-history-error')).not.toBeInTheDocument();
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(2);
+    });
+
+    it('fetches again when a rotation count changes, not on other row updates', async () => {
+      (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([
+        { rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } },
+      ]);
+      let stats = statsWith([managedRotatedFixture]);
+      const page = () => (
+        <MemoryRouter initialEntries={['/identities']}>
+          <AppContext.Provider value={{ ...mockAppContext, getCurrentStats: jest.fn(() => stats) }}>
+            <Routes>
+              <Route path="/identities" element={<IdentitiesPage />} />
+              <Route path="/identities/:did" element={<IdentitiesPage />} />
+            </Routes>
+          </AppContext.Provider>
+        </MemoryRouter>
+      );
+      const view = render(page());
+      fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
+      fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
+      expect(await screen.findByTestId('identities-version-2')).toBeInTheDocument();
+
+      stats = statsWith([{ ...managedRotatedFixture, usage_count: 7 }]);
+      view.rerender(page());
+      expect(screen.getByTestId('identities-version-2')).toBeInTheDocument();
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(1);
+
+      (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([
+        { rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } },
+        { rotated_at: '2026-01-03T00:00:00Z', previous: { fingerprint_sha256: 'cc' } },
+      ]);
+      stats = statsWith([{ ...managedRotatedFixture, rotation_count: 2 }]);
+      view.rerender(page());
+
+      expect(await screen.findByTestId('identities-version-3')).toHaveTextContent('Current');
+      expect(apiClient.getIdentityRotations).toHaveBeenCalledTimes(2);
+    });
+
     it('lists a credential rotation inside the DID that kept it', async () => {
+      (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([
+        { rotated_at: '2026-01-02T00:00:00Z', previous: { fingerprint_sha256: 'aa' } },
+      ]);
       renderWithStats([managedRotatedFixture]);
 
       const row = await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`);
       fireEvent.click(row);
       fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
 
-      expect(screen.getByTestId('identities-version-2')).toHaveTextContent('Credential rotated');
+      expect(await screen.findByTestId('identities-version-2')).toHaveTextContent(
+        'Credential rotated'
+      );
       expect(screen.getByTestId('identities-version-2-changes')).toHaveTextContent(
         'fingerprint_sha256: aa → bb'
       );
@@ -821,14 +941,16 @@ describe('IdentitiesPage', () => {
       const apiKeyRow = {
         ...managedRotatedFixture,
         agent_identity: { credential_type: 'api_key', api_key_id: 'key-1' },
-        rotations: [{ rotated_at: '2026-01-02T00:00:00Z' }],
       };
+      (apiClient.getIdentityRotations as jest.Mock).mockResolvedValue([
+        { rotated_at: '2026-01-02T00:00:00Z' },
+      ]);
       renderWithStats([apiKeyRow]);
 
       fireEvent.click(await screen.findByTestId(`identities-row-${apiKeyRow.did}`));
       fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
 
-      const update = screen.getByTestId('identities-version-2');
+      const update = await screen.findByTestId('identities-version-2');
       expect(update).toHaveTextContent('Credential updated');
       expect(update).toHaveTextContent('The stored credential was updated');
       expect(update).not.toHaveTextContent('Credential rotated');
@@ -836,13 +958,16 @@ describe('IdentitiesPage', () => {
 
     it('says no rotations are recorded yet for a certificate identity, and nothing for a payload one', async () => {
       renderWithStats([
-        { ...managedRotatedFixture, rotations: [] },
+        { ...managedRotatedFixture, rotation_count: undefined },
         { ...managedFixture, surface_id: 'beta' },
       ]);
 
       fireEvent.click(await screen.findByTestId(`identities-row-${managedRotatedFixture.did}`));
       fireEvent.click(screen.getByTestId('identities-version-history-toggle'));
-      expect(screen.getByTestId('identities-version-history-empty')).toBeInTheDocument();
+      expect(screen.getByTestId('identities-version-history-empty')).toHaveTextContent(
+        'No earlier DIDs or credential rotations recorded.'
+      );
+      expect(apiClient.getIdentityRotations).not.toHaveBeenCalled();
 
       fireEvent.click(screen.getByTestId(`identities-row-${managedRotatedFixture.did}`));
       fireEvent.click(screen.getByTestId(`identities-row-${managedFixture.did}`));

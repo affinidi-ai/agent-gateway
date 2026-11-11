@@ -12,8 +12,8 @@ use crate::bdd_support::config::mcp_proxy::WEATHER_OPENAPI_SPEC;
 use crate::bdd_support::config::reserve_free_port;
 use crate::bdd_support::config::single_surface_fixture::{
     A2aProxyTargetFixture, DidWebVhIdentityFixture, McpProxyTargetFixture, McpToolPolicyFixture,
-    McpWildcardToolPolicyFixture, ProtectedResourceFixture, SurfaceTargetAuthProviderConfig, TargetAuthProviderGrant,
-    VariantInboundPolicyFixture, VariantTargetPolicyFixture,
+    McpWildcardToolPolicyFixture, ProtectedResourceFixture, SurfaceTargetAuthProviderConfig,
+    TargetAuthClientAuthentication, TargetAuthProviderGrant, VariantInboundPolicyFixture, VariantTargetPolicyFixture,
 };
 use crate::bdd_support::config::source_auth::caller_authentication_method_json;
 use crate::bdd_support::gateway_process::SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN;
@@ -2859,6 +2859,30 @@ fn surface_authenticates_target_with_jwt_bearer_without_subject(world: &mut Surf
         .target_auth_provider = Some(provider);
 }
 
+fn jwt_bearer_target_auth_provider(world: &mut SurfaceWorld) -> &mut SurfaceTargetAuthProviderConfig {
+    let provider = target_auth_provider(world);
+    assert_eq!(
+        provider.grant,
+        TargetAuthProviderGrant::JwtBearer,
+        "only a JWT Bearer provider has a client authentication"
+    );
+    provider
+}
+
+#[given("the credential provider stores a client ID and a client secret but sets no client authentication")]
+fn target_credential_provider_stores_unused_client_references(world: &mut SurfaceWorld) {
+    jwt_bearer_target_auth_provider(world).stores_unused_client_references = true;
+}
+
+#[given(expr = "the credential provider authenticates its client with {string}")]
+fn target_credential_provider_authenticates_its_client(
+    world: &mut SurfaceWorld,
+    wording: String,
+) {
+    jwt_bearer_target_auth_provider(world).client_authentication =
+        Some(TargetAuthClientAuthentication::from_wording(&wording));
+}
+
 #[given("the credential provider is refusing token requests")]
 fn target_credential_provider_refuses_tokens(world: &mut SurfaceWorld) {
     target_auth_provider(world).token_status = 401;
@@ -3012,6 +3036,13 @@ fn surface_has_mcp_inbound_identity_strip_raw(world: &mut SurfaceWorld) {
     world
         .surface_config
         .mcp_inbound_identity_strip_raw = true;
+}
+
+#[given("the surface derives the inbound identity from a JWT claim")]
+fn surface_derives_inbound_identity_from_jwt_claim(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .jwt_claim_inbound_identity = true;
 }
 
 #[given(expr = "the surface injects custom metadata key {string} value {string} into {string}")]

@@ -1,9 +1,10 @@
 Feature: Identity versions on the Identities dashboard
-  The Identities dashboard groups a managed agent's identity versions by the
-  Identity slot that produced them. A Transit Point with a managed identity of
-  its own has a slot of its own; a Transit Point that inherits the surface's
-  managed identity shares the protected slot. A managed identity taken from a
-  client certificate gets a new version when the certificate is renewed.
+  The gateway records which Identity slot produced each managed identity. A
+  Transit Point with a managed identity of its own has a slot of its own; a
+  Transit Point that inherits the surface's managed identity shares the
+  protected slot. A managed identity taken from a stored client certificate or
+  API key gets a new version when that credential is renewed or edited. The
+  dashboard row counts those versions, and Version History lists them.
 
   Scenario: A Transit Point with its own managed identity records it under its own slot
     Given A2A surface "alpha" is defined for route "/alpha" with managed agent "bravo" as its target
@@ -33,3 +34,15 @@ Feature: Identity versions on the Identities dashboard
     When the operator reads the Identities dashboard
     Then the admin API response status is 200
     And the Managed Agent identity has 2 versions in the protected slot
+    And the Version History of the Managed Agent identity shows the certificate fingerprint it replaced
+
+  Scenario: Editing the stored API key behind the protected slot adds an identity version
+    Given A2A surface "alpha" is defined for route "/alpha" with managed agent "bravo" as its target
+    And surface "alpha" takes its managed identity from API key "bravo-key"
+    And the caller has sent a request to the surface
+    And the value of API key "bravo-key" has been changed
+    And the caller has sent a request to the surface
+    When the operator reads the Identities dashboard
+    Then the admin API response status is 200
+    And the Managed Agent identity has 2 versions in the protected slot
+    And the Version History of the Managed Agent identity shows a credential update without field changes

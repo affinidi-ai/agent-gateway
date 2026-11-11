@@ -34,6 +34,7 @@ async fn init_source_auth_middleware(
     api_key_validator: Option<Arc<dyn crate::api_keys::ApiKeyValidator>>,
     didauth_session_store: Arc<crate::didauth::DidAuthSessionStore>,
     cert_store: Option<Arc<dyn crate::certificates::CertificateStore>>,
+    sts_token_origins: Option<Arc<dyn crate::sts::token_origin::StsTokenOrigins>>,
 ) -> anyhow::Result<Arc<crate::source_auth::SourceAuthMiddleware>> {
     let storage_path = PathBuf::from(secrets_storage_path)
         .parent()
@@ -63,7 +64,7 @@ async fn init_source_auth_middleware(
         });
     }
     let jwks_client = Arc::new(crate::jwt_bearer::JwksClient::new());
-    Ok(Arc::new(crate::source_auth::SourceAuthMiddleware::new(
+    let middleware = crate::source_auth::SourceAuthMiddleware::new(
         didauth_session_store,
         store_arc,
         jwks_client,
@@ -71,7 +72,11 @@ async fn init_source_auth_middleware(
         secrets_cache,
         api_key_validator,
         cert_store,
-    )))
+    );
+    Ok(Arc::new(match sts_token_origins {
+        Some(origins) => middleware.with_sts_token_origins(origins),
+        None => middleware,
+    }))
 }
 
 /// Register live entity counters for appliance resource-limit enforcement.
@@ -3412,6 +3417,17 @@ pub async fn run_axum_proxy(
             api_key_validator.clone(),
             didauth_session_store.clone(),
             Some(certificates_store.clone()),
+            Some(Arc::new(crate::sts::token_origin::GatewayStsTokenOrigins::new(
+                vc_issuer_for_api.clone(),
+                network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
+                sts_client_store
+                    .clone()
+                    .map(|clients| clients as Arc<dyn crate::sts::store::StsClientStorage>),
+            )) as Arc<dyn crate::sts::token_origin::StsTokenOrigins>),
         )
         .await?;
         identity_state.certificate_store = Some(certificates_store.clone());
@@ -4869,6 +4885,7 @@ mod tests {
             std::sync::Arc::new(dashmap::DashMap::new()),
             None,
             std::sync::Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            None,
             None,
         )
         .await

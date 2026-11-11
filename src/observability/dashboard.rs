@@ -389,8 +389,9 @@ pub struct IdentityInfo {
     pub trust_recorder_surface: Option<ManagedSurfaceInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<ManagedSlot>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rotations: Vec<CredentialRotation>,
+    /// Number of credential rotations, listed by `GET /v1/identities/by-hash/{identity_hash}/rotations`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rotation_count: usize,
 }
 
 /// A live surface where a DID is the managed agent.
@@ -402,6 +403,10 @@ pub struct ManagedSurfaceInfo {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2474,7 +2479,7 @@ pub(crate) async fn build_identity_list_with(
                 trust_recorder: None,
                 trust_recorder_surface: None,
                 slot: r.slot.clone(),
-                rotations: r.rotations.clone(),
+                rotation_count: r.total_rotations(),
             }
         })
         .collect();
@@ -3003,7 +3008,7 @@ mod tests {
         };
         use crate::config::agent_surface::AgentSurface;
         use crate::identity::IdentityStore;
-        use crate::identity::filesystem::{AgentIdentityRecord, CredentialRotation, IdentityOrigin, ManagedSlot};
+        use crate::identity::filesystem::{AgentIdentityRecord, IdentityOrigin, ManagedSlot};
         use crate::identity::target_card_names::{NoTargetCards, TargetCardNameService};
         use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
         use crate::metrics::MetricsStore;
@@ -3840,16 +3845,7 @@ mod tests {
                 ("certificate_id".to_string(), json!("NITROGEN")),
                 ("fingerprint_sha256".to_string(), json!("bb")),
             ]);
-            rotated
-                .rotations
-                .push(CredentialRotation {
-                    rotated_at: Some(
-                        chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
-                            .unwrap()
-                            .with_timezone(&Utc),
-                    ),
-                    previous: HashMap::from([("fingerprint_sha256".to_string(), json!("aa"))]),
-                });
+            rotated.rotation_count = 1;
 
             let rows = list(
                 vec![fixed_time(payload), fixed_time(rotated), fixed_time(caller(CALLER_DID))],
@@ -3958,6 +3954,133 @@ mod tests {
 
         assert_eq!(entry.level, "DEBUG");
         assert_eq!(entry.message, "request details");
+    }
+
+    mod identity_rotations {
+        use super::super::{MAX_ROTATIONS_PAGE, RotationsPage, RotationsQuery, identity_rotations_page};
+        use crate::identity::IdentityStore;
+        use crate::identity::filesystem::CredentialRotation;
+        use crate::identity::test_helpers::{MockIdentityStore, test_surface_identity_record};
+
+        fn rotation(minute: i64) -> CredentialRotation {
+            CredentialRotation {
+                rotated_at: chrono::DateTime::from_timestamp(minute * 60, 0),
+                previous: std::collections::HashMap::new(),
+            }
+        }
+
+        fn history(len: i64) -> Vec<CredentialRotation> {
+            (0..len)
+                .map(rotation)
+                .collect()
+        }
+
+        fn query(
+            limit: Option<usize>,
+            before: Option<usize>,
+        ) -> RotationsQuery {
+            RotationsQuery { limit, before }
+        }
+
+        #[test]
+        fn returns_the_whole_history_oldest_first_by_default() {
+            let page = RotationsPage::of(history(3), &query(None, None));
+
+            assert_eq!(
+                page,
+                RotationsPage {
+                    rotations: history(3),
+                    total: 3,
+                    start: 0
+                }
+            );
+        }
+
+        #[test]
+        fn pages_back_from_the_newest_rotation() {
+            let newest = RotationsPage::of(history(5), &query(Some(2), None));
+            assert_eq!((newest.start, newest.total), (3, 5));
+            assert_eq!(newest.rotations, vec![rotation(3), rotation(4)]);
+
+            let older = RotationsPage::of(history(5), &query(Some(2), Some(newest.start)));
+            assert_eq!(older.start, 1);
+            assert_eq!(older.rotations, vec![rotation(1), rotation(2)]);
+
+            let oldest = RotationsPage::of(history(5), &query(Some(2), Some(older.start)));
+            assert_eq!(oldest.start, 0);
+            assert_eq!(oldest.rotations, vec![rotation(0)]);
+        }
+
+        #[test]
+        fn caps_the_limit_and_bounds_before() {
+            let capped = RotationsPage::of(history(1001), &query(Some(5000), None));
+            assert_eq!(capped.rotations.len(), MAX_ROTATIONS_PAGE);
+            assert_eq!(capped.start, 1);
+
+            let at_least_one = RotationsPage::of(history(3), &query(Some(0), None));
+            assert_eq!(at_least_one.rotations, vec![rotation(2)]);
+
+            let past_the_end = RotationsPage::of(history(3), &query(None, Some(99)));
+            assert_eq!(past_the_end.rotations, history(3));
+
+            let nothing_before_the_first = RotationsPage::of(history(3), &query(None, Some(0)));
+            assert!(
+                nothing_before_the_first
+                    .rotations
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn answers_the_rotations_of_a_known_identity() {
+            let store = MockIdentityStore::new();
+            let mut record = test_surface_identity_record("did:example:a", "alpha");
+            record.rotations = history(2);
+            store
+                .create(record)
+                .await
+                .unwrap();
+
+            let page = identity_rotations_page(&store, "did:example:a", &query(None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(page.rotations, history(2));
+            assert_eq!(page.total, 2);
+        }
+
+        #[tokio::test]
+        async fn answers_404_for_an_unknown_identity() {
+            let store = MockIdentityStore::new();
+
+            let error = identity_rotations_page(&store, "unknown", &query(None, None))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error, (axum::http::StatusCode::NOT_FOUND, "Identity not found".to_string()));
+        }
+
+        #[tokio::test]
+        async fn answers_an_empty_page_for_an_identity_without_rotations() {
+            let store = MockIdentityStore::new();
+            store
+                .create(test_surface_identity_record("did:example:b", "alpha"))
+                .await
+                .unwrap();
+
+            let page = identity_rotations_page(&store, "did:example:b", &query(None, None))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                page,
+                RotationsPage {
+                    rotations: vec![],
+                    total: 0,
+                    start: 0
+                }
+            );
+        }
     }
 
     mod log_access {
@@ -4432,6 +4555,80 @@ pub async fn get_surface_metrics(
         time_series,
         latency_time_series,
     }))
+}
+
+/// Most rotations one page of `GET /v1/identities/by-hash/{identity_hash}/rotations` returns.
+pub const MAX_ROTATIONS_PAGE: usize = 1000;
+
+#[derive(Debug, Deserialize)]
+pub struct RotationsQuery {
+    /// Rotations per page, at most [`MAX_ROTATIONS_PAGE`] (the default).
+    pub limit: Option<usize>,
+    /// Index into the history; the page ends before it. Defaults to the end of the history.
+    pub before: Option<usize>,
+}
+
+/// A page of an identity's rotation history: `rotations` are the history's entries
+/// `start..start + rotations.len()` of `total`, oldest first.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct RotationsPage {
+    pub rotations: Vec<CredentialRotation>,
+    pub total: usize,
+    pub start: usize,
+}
+
+impl RotationsPage {
+    fn of(
+        mut rotations: Vec<CredentialRotation>,
+        query: &RotationsQuery,
+    ) -> Self {
+        let total = rotations.len();
+        let end = query
+            .before
+            .unwrap_or(total)
+            .min(total);
+        let limit = query
+            .limit
+            .unwrap_or(MAX_ROTATIONS_PAGE)
+            .clamp(1, MAX_ROTATIONS_PAGE);
+        let start = end.saturating_sub(limit);
+        rotations.truncate(end);
+        Self {
+            rotations: rotations.split_off(start),
+            total,
+            start,
+        }
+    }
+}
+
+/// API endpoint to get a page of the credential rotations of the identity keyed by
+/// `identity_hash`, newest page first.
+pub async fn get_identity_rotations(
+    State(state): State<DashboardState>,
+    axum::extract::Path(identity_hash): axum::extract::Path<String>,
+    Query(query): Query<RotationsQuery>,
+) -> Result<Json<RotationsPage>, (axum::http::StatusCode, String)> {
+    identity_rotations_page(state.identity_store.as_ref(), &identity_hash, &query)
+        .await
+        .map(Json)
+}
+
+async fn identity_rotations_page(
+    identity_store: &dyn IdentityStore,
+    identity_hash: &str,
+    query: &RotationsQuery,
+) -> Result<RotationsPage, (axum::http::StatusCode, String)> {
+    match identity_store
+        .rotations(identity_hash)
+        .await
+    {
+        Ok(Some(rotations)) => Ok(RotationsPage::of(rotations, query)),
+        Ok(None) => Err((axum::http::StatusCode::NOT_FOUND, "Identity not found".to_string())),
+        Err(e) => {
+            error!(error = %e, "Failed to read identity rotations");
+            Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to read identity rotations".to_string()))
+        }
+    }
 }
 
 /// Hierarchical metrics response

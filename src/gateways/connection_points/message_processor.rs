@@ -4874,7 +4874,8 @@ async fn process_charged_forward_request(
                     return axum_response_to_forward_result(authorization.challenge(ResourceTokenError::Invalid)).await;
                 }
             };
-            let identity = match authorization.authenticate(&auth_headers, profile, issuer, middleware.jwks_client()).await {
+            let reach = middleware.token_reach(&surface.name, surface.tenant_id.as_deref());
+            let identity = match authorization.authenticate(&auth_headers, profile, issuer, middleware.jwks_client(), reach).await {
                 Ok(identity) => identity,
                 Err(error) => {
                     token_refused(error);
@@ -4935,6 +4936,9 @@ async fn process_charged_forward_request(
                 let view = crate::didauth::sessions::SessionView {
                     surface_id: &surface.surface_id,
                     variant_id: active_variant_id.as_deref(),
+                    tenant_id: surface
+                        .tenant_id
+                        .as_deref(),
                 };
                 let verified = if selection.ambiguous {
                     Err(crate::source_auth::errors::SourceAuthError::AmbiguousCredentials)

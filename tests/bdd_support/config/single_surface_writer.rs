@@ -17,10 +17,10 @@ use crate::bdd_support::config::single_surface_fixture::{
     SurfaceTransitPointConfig, TargetAuthProviderGrant,
 };
 use crate::bdd_support::config::target_auth::{
-    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE,
-    TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE, TARGET_AUTH_SIGNING_KEY_SECRET,
-    credential_provider_target_auth_json, static_secret_target_auth_json, target_auth_service_account_key_file,
-    target_auth_signing_key,
+    TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE, TARGET_AUTH_CLIENT_SECRET_SECRET,
+    TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID, TARGET_AUTH_PROVIDER_SCOPE,
+    TARGET_AUTH_SIGNING_KEY_SECRET, credential_provider_target_auth_json, static_secret_target_auth_json,
+    target_auth_service_account_key_file, target_auth_signing_key,
 };
 
 struct SingleSurfaceOptions<'a> {
@@ -468,6 +468,17 @@ fn write_single_surface_config_inner(
         }
     }
 
+    if surface_config.jwt_claim_inbound_identity {
+        surface_fixture = surface_fixture.with_identity_slot(
+            "inbound",
+            serde_json::json!({
+                "type": "from_jwt_claim",
+                "claim": "sub",
+                "namespace_claims": ["iss"]
+            }),
+        );
+    }
+
     if surface_config.mcp_inbound_identity {
         let mut inbound_slot = serde_json::json!({
             "type": "payload_extraction",
@@ -625,6 +636,16 @@ fn write_single_surface_config_inner(
     }
 
     write_gateway_config_tree(base_dir, &config_tree, true);
+    if let Some(redis_url) = &surface_config.sign_in_event_stream {
+        crate::bdd_support::config::sign_in::write_sign_in_event_integration(
+            &base_dir.join("_storage"),
+            redis_url,
+            surface_config.streams_sign_in_records,
+        );
+    }
+    if surface_config.signs_in_with_saml {
+        crate::bdd_support::config::sign_in::sign_in_with_saml(base_dir, gateway_port);
+    }
     if surface_config.starts_standby {
         start_standby(base_dir);
     }
@@ -916,15 +937,8 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         secrets.push(SecretFixture::new(&proxy.secret_id, &proxy.secret_value));
     }
-    match surface_config
-        .target_auth_provider
-        .as_ref()
-    {
-        Some(provider) if provider.grant == TargetAuthProviderGrant::ClientCredentials => {
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, "bdd-target-client"));
-            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
-        }
-        Some(provider) => {
+    if let Some(provider) = &surface_config.target_auth_provider {
+        if provider.grant == TargetAuthProviderGrant::JwtBearer {
             let signing_key = if provider.signing_key_is_service_account_file {
                 target_auth_service_account_key_file()
             } else {
@@ -934,7 +948,12 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
             };
             secrets.push(SecretFixture::new(TARGET_AUTH_SIGNING_KEY_SECRET, &signing_key));
         }
-        None => {}
+        if provider.stores_client_id() {
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
+        }
+        if provider.stores_client_secret() {
+            secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
+        }
     }
     if let Some(delegation) = &surface_config.credential_delegation {
         match &delegation.provider_kind {
@@ -1009,8 +1028,12 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
                 .clone()
                 .expect("the target credential provider's token endpoint must run before its fixture is written"),
         ),
-        client_id_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_ID_SECRET.to_string()),
-        client_secret_secret_ref: client_credentials.then(|| TARGET_AUTH_CLIENT_SECRET_SECRET.to_string()),
+        client_id_secret_ref: provider
+            .stores_client_id()
+            .then(|| TARGET_AUTH_CLIENT_ID_SECRET.to_string()),
+        client_secret_secret_ref: provider
+            .stores_client_secret()
+            .then(|| TARGET_AUTH_CLIENT_SECRET_SECRET.to_string()),
         default_scopes: vec![TARGET_AUTH_PROVIDER_SCOPE.to_string()],
         callback_path: String::new(),
         callback_url: None,
@@ -1023,6 +1046,9 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
                 "jwt_signing_key_secret_ref": TARGET_AUTH_SIGNING_KEY_SECRET,
                 "jwt_key_id": (!provider.signing_key_is_service_account_file).then_some("bdd-target-key-id"),
                 "jwt_subject": provider.jwt_subject,
+                "client_authentication": provider
+                    .client_authentication
+                    .map(|method| method.api_value()),
             })
         }),
         created_at: now,

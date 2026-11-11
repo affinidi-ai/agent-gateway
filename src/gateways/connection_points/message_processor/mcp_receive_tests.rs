@@ -2718,6 +2718,158 @@ fn fabric_receive_refuses_a_failed_caller_on_a_closed_access_point() {
     run_in_own_process(closed_access_point_fabric_flow);
 }
 
+#[test]
+fn fabric_receive_admits_an_sts_token_only_from_a_connection_of_the_surface_tenant() {
+    run_in_own_process(sts_tenant_fabric_flow);
+}
+
+/// Every token of `issuer` was minted for the managed connection of
+/// `tenant-a` it names as `alpha`.
+struct TenantAOrigins {
+    issuer: String,
+}
+
+#[async_trait::async_trait]
+impl crate::sts::token_origin::StsTokenOrigins for TenantAOrigins {
+    async fn origin(
+        &self,
+        claims: &Value,
+    ) -> anyhow::Result<crate::sts::token_origin::TokenOrigin> {
+        use crate::sts::token_origin::TokenOrigin;
+        if claims["iss"] != self.issuer.as_str() {
+            return Ok(TokenOrigin::Elsewhere);
+        }
+        Ok(match claims["client_id"].as_str() {
+            Some("alpha") => TokenOrigin::Connection {
+                tenant_id: Some("tenant-a".into()),
+            },
+            _ => TokenOrigin::UnknownConnection,
+        })
+    }
+}
+
+/// Fabric receive checks a token the gateway's STS minted against the tenant
+/// of the surface it reached: it refuses one of another tenant's managed
+/// connection before the Target, and forwards one of the surface's tenant.
+async fn sts_tenant_fabric_flow() {
+    use std::sync::Arc;
+
+    use crate::component_tests::helpers::jwt::{JwksFixture, now_secs, sign_jwt};
+    use crate::jwt_bearer::storage::{FileSystemJwtVerificationStrategyStore, JwtVerificationStrategyStorage};
+
+    let fixture = JwksFixture::start().await;
+    let target =
+        MockServer::start_with_response(json!({"jsonrpc": "2.0", "id": "call", "result": {"tools": []}}).to_string())
+            .await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let _issuer_dir = install_listener_manager_with_sender(temp_dir.path()).await;
+    let storage_path = temp_dir
+        .path()
+        .join("surfaces");
+    let strategies = Arc::new(
+        FileSystemJwtVerificationStrategyStore::new(
+            temp_dir
+                .path()
+                .join("strategies"),
+        )
+        .await
+        .unwrap(),
+    );
+    let strategy = strategies
+        .create(
+            serde_json::from_value(json!({
+                "id": "sts", "name": "Gateway STS", "expected_issuer": fixture.issuer,
+                "jwks_source": {"type": "remote", "jwks_uri": format!("{}/.well-known/jwks.json", fixture.issuer)},
+                "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let store = FileSystemAgentSurfaceStore::new(storage_path.clone())
+        .await
+        .unwrap();
+    for tenant in ["tenant-a", "tenant-b"] {
+        let surface = serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": tenant, "name": tenant, "tenant_id": tenant,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{tenant}"), "protocol": "mcp",
+                "caller_authentication": {"on_failure": "reject", "methods": [
+                    {"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}
+                ]}},
+            "target": {"endpoint": format!("http://{}", target.addr)}
+        }))
+        .unwrap();
+        store
+            .save(&surface)
+            .await
+            .unwrap();
+    }
+    super::init_source_auth_middleware(Arc::new(
+        crate::source_auth::SourceAuthMiddleware::new(
+            Arc::new(crate::didauth::DidAuthSessionStore::new()),
+            strategies,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+            None,
+            Arc::new(dashmap::DashMap::new()),
+            None,
+            None,
+        )
+        .with_sts_token_origins(Arc::new(TenantAOrigins { issuer: fixture.issuer.clone() })),
+    ))
+    .await;
+
+    let now = super::super::envelope_replay::now_secs();
+    let token = sign_jwt(
+        json!({"iss": fixture.issuer, "sub": "user-1", "client_id": "alpha", "exp": now_secs() + 300}),
+        &fixture.kid,
+    );
+    let send = |channel_id: &'static str| {
+        let headers = json!({"MCP-Protocol-Version": MCP_LEGACY_VERSION, "authorization": format!("Bearer {token}")});
+        let message = ReceivedMessage::new(
+            "receiver-connection".to_string(),
+            "receiver-gateway".to_string(),
+            MessageType::ForwardRequest.to_string(),
+            uuid::Uuid::new_v4().to_string(),
+            None,
+            Some(SENDER_CONNECTION_POINT_DID.to_string()),
+            vec!["did:web:receiver.example".to_string()],
+            None,
+            Some(now + 60),
+            json!({"channel_id": channel_id, "method": "POST", "path": format!("/{channel_id}"), "headers": headers,
+                "body": {"jsonrpc": "2.0", "id": "call", "method": "tools/list"}}),
+            MessageMetadata {
+                encrypted: true,
+                authenticated: true,
+                from_key: None,
+                extra: Value::Null,
+            },
+        )
+        .with_context("agent_surface_storage_path", json!(storage_path));
+        async move {
+            let result = tokio::time::timeout(Duration::from_secs(10), Box::pin(process_forward_request(&message)))
+                .await
+                .expect("Fabric receive handler timed out");
+            let ProcessingResult::RequiresResponse { response_body, .. } = result else {
+                panic!("expected a ForwardResponse, got {result:?}");
+            };
+            response_body
+        }
+    };
+    let reached = || {
+        target
+            .request_count
+            .load(Ordering::SeqCst)
+    };
+
+    let refused = send("tenant-b").await;
+    assert_eq!(refused["status"], 401, "{refused}");
+    assert_eq!(reached(), 0, "another tenant's token never reaches the Target");
+
+    let admitted = send("tenant-a").await;
+    assert_eq!(admitted["status"], 200, "{admitted}");
+    assert_eq!(reached(), 1, "the surface tenant's token reaches the Target");
+}
+
 /// A closed Access Point refuses a Fabric caller without a valid credential
 /// before policy and the Target, in the caller's protocol shape, while a
 /// surface stored without `on_failure` still forwards it. A closed Access
@@ -2784,10 +2936,22 @@ async fn closed_access_point_fabric_flow() {
         }))
         .unwrap()
     };
+    let from_jwt_claim = |id: &str, protocol: &str| {
+        serde_json::from_value::<AgentSurface>(json!({
+            "surface_id": id, "name": id,
+            "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}]}},
+            "target": {"endpoint": format!("http://{}", target.addr)},
+            "identity_slots": {"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}}
+        }))
+        .unwrap()
+    };
     for stored in [
         surface("closed-mcp", "mcp", Some("reject")),
         surface("closed-a2a", "a2a", Some("reject")),
         surface("legacy-mcp", "mcp", None),
+        from_jwt_claim("jwt-claim-mcp", "mcp"),
+        from_jwt_claim("jwt-claim-a2a", "a2a"),
         not_ready("unready-mcp", "mcp"),
         not_ready("unready-a2a", "a2a"),
     ] {
@@ -2859,23 +3023,25 @@ async fn closed_access_point_fabric_flow() {
         .unwrap()
     };
 
-    for token in [None, Some(foreign_token.clone())] {
-        let refused = send("closed-mcp", token.clone()).await;
-        assert_eq!(refused["status"], 401, "{refused}");
-        assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
-        assert_eq!(
-            body(&refused),
-            json!({"jsonrpc": "2.0", "id": "call", "error": {
-                "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
-                "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
-            }})
-        );
+    for (mcp_channel, a2a_channel) in [("closed-mcp", "closed-a2a"), ("jwt-claim-mcp", "jwt-claim-a2a")] {
+        for token in [None, Some(foreign_token.clone())] {
+            let refused = send(mcp_channel, token.clone()).await;
+            assert_eq!(refused["status"], 401, "{refused}");
+            assert_eq!(refused["headers"]["www-authenticate"], "Bearer realm=\"agent-gateway\"", "{refused}");
+            assert_eq!(
+                body(&refused),
+                json!({"jsonrpc": "2.0", "id": "call", "error": {
+                    "code": crate::mcp::errors::error_codes::INTERNAL_ERROR,
+                    "message": crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED
+                }})
+            );
 
-        let refused = send("closed-a2a", token).await;
-        assert_eq!(refused["status"], 401, "{refused}");
-        assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
-        assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
-        assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+            let refused = send(a2a_channel, token).await;
+            assert_eq!(refused["status"], 401, "{refused}");
+            assert_eq!(refused["headers"]["content-type"], "application/problem+json", "{refused}");
+            assert_eq!(body(&refused)["detail"], crate::source_auth::errors::CALLER_CREDENTIAL_REFUSED);
+            assert_eq!(reached(), 0, "a refused caller never reaches the Target");
+        }
     }
 
     let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);

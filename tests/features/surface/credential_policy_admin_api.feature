@@ -1,12 +1,13 @@
 Feature: Credential rules when saving through the admin API
   The admin API refuses to store a credential provider that sends its token request over
   plain http, and refuses to give a tenant's credential provider or surface a secret that is
-  appliance-wide or belongs to another tenant. A surface that already stores an appliance-wide
-  secret keeps it while tenant credential isolation only warns, and is refused once the gateway
-  enforces it. A surface whose stored Target credential, on the Target or a Transit Point,
-  breaks the https or caller rule saves again unchanged and the save answers with a Warning
-  header for each breach; once that credential is edited it is checked as new, and refused
-  while the rule is enforced.
+  appliance-wide or belongs to another tenant. An update cannot remove the client references
+  an OAuth credential provider needs, even from a provider that keeps a plain http token
+  endpoint. A surface that already stores an appliance-wide secret keeps it while tenant
+  credential isolation only warns, and is refused once the gateway enforces it. A surface
+  whose stored Target credential, on the Target or a Transit Point, breaks the https or caller
+  rule saves again unchanged and the save answers with a Warning header for each breach; once
+  that credential is edited it is checked as new, and refused while the rule is enforced.
 
   Scenario: A credential provider with an http token endpoint is refused and not stored
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -24,6 +25,15 @@ Feature: Credential rules when saving through the admin API
     When the operator creates the credential provider "secure-https" with token endpoint "https://192.0.2.1/token" using secrets "provider-id-secret" and "provider-password-secret"
     Then the admin API response status is 201
     And the credential provider "secure-https" is stored
+
+  Scenario: A stored credential provider with an http token endpoint is refused an update that clears its client secret
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    When the operator clears the credential provider's client secret
+    Then the admin API response status is 400
+    And the admin API error response mentions "client_id_secret_ref and client_secret_secret_ref are required for OAuth providers"
+    And the stored credential provider still has the client secret "bdd-target-client-secret"
 
   Scenario: A tenant credential provider cannot reference appliance-wide secrets
     Given the operator can use the admin API and no surface is configured for route "/example"

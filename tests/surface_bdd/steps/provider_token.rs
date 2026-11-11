@@ -6,6 +6,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 
 use crate::bdd_support::caller::post_json;
+use crate::bdd_support::config::single_surface_fixture::TargetAuthClientAuthentication;
 use crate::bdd_support::config::target_auth::{
     TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE, TARGET_AUTH_JWT_ISSUER, TARGET_AUTH_PROVIDER_ID,
     TARGET_AUTH_PROVIDER_TOKEN, target_auth_signing_key,
@@ -297,6 +298,106 @@ async fn operator_clears_provider_subject(world: &mut SurfaceWorld) {
     change_stored_provider(world, json!({ "jwt_subject": "" }), None).await;
 }
 
+#[when("the operator clears the credential provider's client secret")]
+async fn operator_clears_provider_client_secret(world: &mut SurfaceWorld) {
+    change_stored_provider(world, json!({ "client_secret_secret_ref": "" }), None).await;
+}
+
+#[given("the operator has cleared the credential provider's client authentication")]
+async fn operator_has_cleared_provider_client_authentication(world: &mut SurfaceWorld) {
+    change_stored_provider(world, json!({ "client_authentication": "" }), None).await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the update was recorded");
+    assert_eq!(response.status, 200, "clearing the client authentication answered {}", response.body);
+}
+
+#[given("the operator has cleared the credential provider's client authentication and client ID")]
+async fn operator_has_cleared_provider_client_authentication_and_client_id(world: &mut SurfaceWorld) {
+    change_stored_provider(
+        world,
+        json!({ "client_authentication": "", "client_id_secret_ref": "", "client_secret_secret_ref": "" }),
+        None,
+    )
+    .await;
+    let response = world
+        .admin_response
+        .as_ref()
+        .expect("the update was recorded");
+    assert_eq!(response.status, 200, "clearing the client authentication answered {}", response.body);
+}
+
+#[when(expr = "the operator changes the credential provider's client authentication to {string}")]
+async fn operator_changes_provider_client_authentication(
+    world: &mut SurfaceWorld,
+    authentication: String,
+) {
+    let method = TargetAuthClientAuthentication::from_wording(&authentication).api_value();
+    change_stored_provider(world, json!({ "client_authentication": method }), None).await;
+}
+
+#[when(expr = "the operator changes the credential provider's type to {string}")]
+async fn operator_changes_provider_type(
+    world: &mut SurfaceWorld,
+    provider_type: String,
+) {
+    change_stored_provider(world, json!({ "provider_type": provider_type }), None).await;
+}
+
+#[then("the stored credential provider is still a JWT Bearer provider")]
+async fn stored_provider_is_still_a_jwt_bearer_provider(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["provider_type"], json!("oauth2_jwt_bearer"), "the stored provider: {stored}");
+}
+
+#[then(expr = "the stored credential provider has the client authentication {string}")]
+async fn stored_provider_has_client_authentication(
+    world: &mut SurfaceWorld,
+    authentication: String,
+) {
+    let expected = TargetAuthClientAuthentication::from_wording(&authentication).api_value();
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["client_authentication"], json!(expected), "the stored provider: {stored}");
+}
+
+#[then("the stored credential provider has no client authentication")]
+async fn stored_provider_has_no_client_authentication(world: &mut SurfaceWorld) {
+    let stored = stored_target_auth_provider(world).await;
+    assert!(
+        stored
+            .get("client_authentication")
+            .is_none(),
+        "the stored provider: {stored}"
+    );
+}
+
+#[then(expr = "the stored credential provider still has the client secret {string}")]
+async fn stored_provider_still_has_client_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    let stored = stored_target_auth_provider(world).await;
+    assert_eq!(stored["client_secret_secret_ref"], json!(secret_id), "the stored provider: {stored}");
+}
+
+/// The Target's credential provider as the admin API returns it.
+async fn stored_target_auth_provider(world: &mut SurfaceWorld) -> Value {
+    ensure_admin_session(world).await;
+    world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<Value>(
+            Method::GET,
+            &format!("/api/v1/credential-providers/{TARGET_AUTH_PROVIDER_ID}"),
+            None,
+        )
+        .await
+        .expect("read the credential provider through the admin API")
+        .body
+}
+
 #[then(expr = "the credential provider stores the subject {string}")]
 async fn stored_provider_has_subject(
     world: &mut SurfaceWorld,
@@ -392,6 +493,73 @@ async fn latest_token_request_carries_client_secret(
             .map(String::as_str),
         Some(secret.as_str()),
         "the latest token request carried a different client secret"
+    );
+}
+
+async fn latest_token_request_authorization(world: &SurfaceWorld) -> Option<String> {
+    token_endpoint(world)
+        .requests()
+        .await
+        .pop()
+        .expect("the token endpoint received a grant")
+        .headers
+        .get("authorization")
+        .cloned()
+}
+
+#[then(expr = "the credential provider's latest token request carries client ID {string}")]
+async fn latest_token_request_carries_client_id(
+    world: &mut SurfaceWorld,
+    client_id: String,
+) {
+    let grant = latest_token_request(world).await;
+    assert_eq!(
+        grant
+            .get("client_id")
+            .map(String::as_str),
+        Some(client_id.as_str()),
+        "the latest token request carried a different client ID"
+    );
+}
+
+#[then("the credential provider's latest token request has no client ID or secret in its form body")]
+async fn latest_token_request_carries_no_client_identity(world: &mut SurfaceWorld) {
+    let grant = latest_token_request(world).await;
+    for field in ["client_id", "client_secret"] {
+        assert!(!grant.contains_key(field), "the latest token request carries {field}");
+    }
+}
+
+#[then(
+    expr = "the credential provider's latest token request carries HTTP Basic credentials for client {string} and secret {string}"
+)]
+async fn latest_token_request_carries_basic_credentials(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    secret: String,
+) {
+    use base64::Engine;
+    // RFC 6749 section 2.3.1: the client ID and secret are form-urlencoded before the Basic encoding.
+    let encode = |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", encode(&client_id), encode(&secret)))
+    );
+    let authorization = latest_token_request_authorization(world).await;
+    assert!(
+        authorization.as_deref() == Some(expected.as_str()),
+        "the latest token request carried HTTP Basic credentials other than those of client {client_id}"
+    );
+}
+
+#[then("the credential provider's latest token request carries no HTTP Basic credentials")]
+async fn latest_token_request_carries_no_basic_credentials(world: &mut SurfaceWorld) {
+    let authorization = latest_token_request_authorization(world).await;
+    assert!(
+        authorization.is_none_or(|value| !value
+            .to_ascii_lowercase()
+            .starts_with("basic ")),
+        "the latest token request carries HTTP Basic credentials"
     );
 }
 

@@ -953,9 +953,7 @@ impl VCIssuer {
         };
         if let Some(source) = managed_source
             && effective_origin == Some(IdentityOrigin::Managed)
-            && record
-                .clone()
-                .apply_managed_source(source, &identity_fields)
+            && record.would_change(source)
             && let Err(e) = self
                 .identity_store
                 .apply_managed_source(identity_hash, source, &identity_fields)
@@ -3342,7 +3340,9 @@ mod tests {
             std::fs::read_dir(dir)
                 .unwrap()
                 .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.path().is_dir())
+                .filter(|entry| {
+                    entry.path().is_dir() && entry.file_name() != crate::identity::filesystem::ROTATION_HISTORY_DIR
+                })
                 .count()
         }
 

@@ -1598,8 +1598,19 @@ async fn step_source_auth(
             )
             .map_err(|_| fail(ResourceTokenError::Unavailable))?;
         let keys = Arc::new(crate::jwt_bearer::JwksClient::new());
+        let reach = state
+            .source_auth_middleware
+            .as_deref()
+            .and_then(|middleware| {
+                middleware.token_reach(
+                    &ctx.surface.name,
+                    ctx.surface
+                        .tenant_id
+                        .as_deref(),
+                )
+            });
         let identity = authorization
-            .authenticate(&ctx.original_headers, profile, issuer, keys)
+            .authenticate(&ctx.original_headers, profile, issuer, keys, reach)
             .await
             .map_err(|error| OutboundPipelineError::McpResourceAuthorization {
                 config: Box::new(authorization.clone()),
@@ -1656,6 +1667,10 @@ async fn authenticate_transit_caller(
         surface_id: &ctx.surface.surface_id,
         variant_id: ctx
             .active_variant_id
+            .as_deref(),
+        tenant_id: ctx
+            .surface
+            .tenant_id
             .as_deref(),
     };
     let authenticated = middleware
@@ -11494,6 +11509,47 @@ mod tests {
             None,
         )));
         state
+    }
+
+    /// A Transit Point checks a token the gateway's STS minted against the
+    /// tenant of its own surface: it refuses one of another tenant's managed
+    /// connection and admits one of its tenant's.
+    #[tokio::test]
+    async fn a_transit_point_admits_an_sts_token_only_from_a_connection_of_its_surface_tenant() {
+        let (middleware, config, token, _jwks) =
+            crate::source_auth::middleware::tests::sts_minted_token_fixture("https://api.example.com").await;
+        let mut state = test_outbound_state();
+        state.source_auth_middleware = Some(Arc::new(middleware));
+        let context = |tenant: &str| {
+            let mut ctx = test_pipeline_context();
+            ctx.virtual_channel
+                .require_transit_token = false;
+            ctx.virtual_channel
+                .source_auth = Some(config.clone());
+            let mut surface = (*ctx.surface).clone();
+            surface.tenant_id = Some(tenant.into());
+            ctx.surface = Arc::new(surface);
+            ctx.original_headers
+                .insert(axum::http::header::AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+            ctx
+        };
+
+        let mut theirs = context("tenant-b");
+        let refused = step_source_auth(&state, &mut theirs).await;
+        assert!(matches!(refused, Err(OutboundPipelineError::TransitCallerUnauthenticated { .. })), "{refused:?}");
+        assert!(
+            theirs
+                .authenticated_identity
+                .is_none()
+        );
+
+        let mut ours = context("tenant-a");
+        let admitted = step_source_auth(&state, &mut ours).await;
+        assert!(admitted.is_ok(), "{admitted:?}");
+        assert!(
+            ours.authenticated_identity
+                .is_some()
+        );
     }
 
     /// A Transit Point records every caller its `source_auth` refuses as an

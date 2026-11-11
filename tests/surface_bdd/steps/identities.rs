@@ -225,7 +225,7 @@ fn self_signed_client_certificate_pem(common_name: &str) -> String {
         .pem()
 }
 
-async fn send_certificate_request(
+async fn send_admin_request(
     world: &mut SurfaceWorld,
     method: reqwest::Method,
     path: &str,
@@ -254,7 +254,7 @@ async fn surface_takes_protected_identity_from_client_certificate(
     world: &mut SurfaceWorld,
     certificate_name: String,
 ) {
-    let stored = send_certificate_request(
+    let stored = send_admin_request(
         world,
         reqwest::Method::POST,
         "/api/v1/certificates",
@@ -294,12 +294,45 @@ async fn client_certificate_has_been_renewed(
         .get(&certificate_name)
         .cloned()
         .unwrap_or_else(|| panic!("client certificate {certificate_name:?} must have been stored before this step"));
-    send_certificate_request(
+    send_admin_request(
         world,
         reqwest::Method::PUT,
         &format!("/api/v1/certificates/{certificate_id}"),
         &serde_json::json!({ "certificate_pem": self_signed_client_certificate_pem(&certificate_name) }),
         "renewing the client certificate",
+    )
+    .await;
+}
+
+#[given(expr = "the value of API key {string} has been changed")]
+async fn api_key_value_has_been_changed(
+    world: &mut SurfaceWorld,
+    api_key_id: String,
+) {
+    ensure_admin_session(world).await;
+    let secrets: Value = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_json::<(), _>(reqwest::Method::GET, "/api/v1/secrets", None)
+        .await
+        .unwrap_or_else(|error| panic!("list secrets through admin API: {error}"));
+    let id = secrets
+        .as_array()
+        .and_then(|secrets| {
+            secrets
+                .iter()
+                .find(|secret| secret["secret_id"] == api_key_id.as_str())
+        })
+        .and_then(|secret| secret["id"].as_str())
+        .unwrap_or_else(|| panic!("API key secret {api_key_id:?} must have been stored, secrets: {secrets}"))
+        .to_string();
+    send_admin_request(
+        world,
+        reqwest::Method::PUT,
+        &format!("/api/v1/secrets/{id}"),
+        &serde_json::json!({ "value": format!("{}-changed", api_key_value(&api_key_id)), "update_value": true }),
+        "changing the API key value",
     )
     .await;
 }
@@ -545,9 +578,9 @@ fn managed_identity_has_versions_in_protected_slot(
         .iter()
         .map(|identity| {
             1 + identity
-                .get("rotations")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len)
+                .get("rotation_count")
+                .and_then(Value::as_u64)
+                .map_or(0, |count| usize::try_from(count).expect("rotation count fits usize"))
         })
         .sum();
     assert_eq!(
@@ -556,6 +589,59 @@ fn managed_identity_has_versions_in_protected_slot(
         "unexpected identity versions in the protected slot, observed identities: {:?}",
         dashboard_identities(world)
     );
+}
+
+/// The Managed Agent identity's row, and the rotations its Version History loads.
+async fn managed_identity_version_history(world: &SurfaceWorld) -> (Value, Vec<Value>) {
+    let identity = single_identity_with_origin(world, "managed").clone();
+    let identity_hash = identity["identity_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the Managed Agent identity should carry its hash, observed: {identity}"));
+    let page: Value = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_json::<(), _>(reqwest::Method::GET, &format!("/v1/identities/by-hash/{identity_hash}/rotations"), None)
+        .await
+        .unwrap_or_else(|error| panic!("read the Version History through the admin API: {error}"));
+    let rotations = page["rotations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the Version History should list rotations, got: {page}"))
+        .clone();
+    assert_eq!(page["total"], rotations.len(), "the Version History should fit one page, got: {page}");
+    (identity, rotations)
+}
+
+#[then("the Version History of the Managed Agent identity shows the certificate fingerprint it replaced")]
+async fn version_history_shows_replaced_certificate_fingerprint(world: &mut SurfaceWorld) {
+    let (identity, rotations) = managed_identity_version_history(world).await;
+    let [rotation] = rotations.as_slice() else {
+        panic!("expected one credential rotation, got: {rotations:?}");
+    };
+    let replaced = rotation["previous"]["fingerprint_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rotation should name the fingerprint it replaced, got: {rotation}"));
+    let current = identity["agent_identity"]["fingerprint_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the identity should carry its certificate fingerprint, observed: {identity}"));
+    assert_eq!(replaced.len(), 64, "the replaced fingerprint should be a SHA-256, got: {replaced}");
+    assert_ne!(replaced, current, "the rotation should name the renewed certificate's earlier fingerprint");
+    assert!(rotation["rotated_at"].is_string(), "the rotation should have a time, got: {rotation}");
+}
+
+#[then("the Version History of the Managed Agent identity shows a credential update without field changes")]
+async fn version_history_shows_credential_update(world: &mut SurfaceWorld) {
+    let (_, rotations) = managed_identity_version_history(world).await;
+    let [rotation] = rotations.as_slice() else {
+        panic!("expected one credential update, got: {rotations:?}");
+    };
+    assert!(
+        rotation
+            .get("previous")
+            .is_none(),
+        "an API key update replaces no identity fields, got: {rotation}"
+    );
+    assert!(rotation["rotated_at"].is_string(), "the update should have a time, got: {rotation}");
 }
 
 fn recorder_state_and_reason(status: &Value) -> (Option<&str>, Option<&str>) {

@@ -11,6 +11,8 @@ import { DOCS_URL } from '../../config/docs';
 import { formatDateTime } from '../../utils/stringUtils';
 import { formatApiError } from '../../utils/apiError';
 import {
+  CLIENT_AUTHENTICATION_LABELS,
+  ClientAuthentication,
   CredentialProviderType,
   PROVIDER_TYPE_LABELS,
   entraRejectsResource,
@@ -40,6 +42,7 @@ interface CredentialProviderListItem {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
+  client_authentication?: ClientAuthentication;
   token_endpoint?: string;
   resource?: string | null;
   default_scopes: string[];
@@ -250,6 +253,16 @@ const CredentialProvidersTab: React.FC<CredentialProvidersTabProps> = ({
                       >
                         {PROVIDER_TYPE_LABELS[provider.provider_type] ?? provider.provider_type}
                       </span>
+                      {provider.provider_type === 'oauth2_jwt_bearer' &&
+                        provider.client_authentication &&
+                        CLIENT_AUTHENTICATION_LABELS[provider.client_authentication] && (
+                          <span
+                            className="badge text-bg-secondary ms-1"
+                            data-testid="credential-provider-client-authentication-badge"
+                          >
+                            {CLIENT_AUTHENTICATION_LABELS[provider.client_authentication]}
+                          </span>
+                        )}
                     </td>
                     <td>
                       {provider.default_scopes.length > 0 ? (

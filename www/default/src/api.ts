@@ -5,6 +5,7 @@ import {
   Authority,
   CliLoginRequest,
   CreateAccessTokenRequest,
+  CredentialRotation,
   DashboardStats,
   GatewayInfo,
   Issuer,
@@ -33,6 +34,16 @@ import type { GatewayListItem } from './utils/gateways';
 
 const API_BASE = '/api/v1';
 const ADMIN_API_BASE = '/api/admin';
+
+/** The most rotations the gateway returns per page. */
+const IDENTITY_ROTATIONS_PAGE = 1000;
+
+/** Rotations at history indices `[start, start + rotations.length)` of `total`, oldest first. */
+interface IdentityRotationsPage {
+  rotations: CredentialRotation[];
+  total: number;
+  start: number;
+}
 
 /**
  * A request the server answered with an error status. The message is the
@@ -1055,6 +1066,26 @@ class APIClient {
   async getIdentityTrustScore(id: string): Promise<any> {
     const response = await this.get<any>(`/identities/${encodeURIComponent(id)}/trust-score`);
     return response.data;
+  }
+
+  /**
+   * Every credential rotation of the identity, oldest first. The backend answers the newest
+   * page first; older pages are fetched with `before` until the first rotation is reached.
+   */
+  async getIdentityRotations(identityHash: string): Promise<CredentialRotation[]> {
+    const base = `/identities/by-hash/${encodeURIComponent(identityHash)}/rotations?limit=${IDENTITY_ROTATIONS_PAGE}`;
+    let page = await this.request<IdentityRotationsPage>(base);
+    const rotations = [...(page.rotations ?? [])];
+    while (page.start > 0) {
+      const before = page.start;
+      page = await this.request<IdentityRotationsPage>(`${base}&before=${before}`);
+      // A page that does not move back would loop forever.
+      if (!(page.start < before)) {
+        throw new Error('The gateway returned an inconsistent rotation history.');
+      }
+      rotations.unshift(...(page.rotations ?? []));
+    }
+    return rotations;
   }
 
   async rotateIdentityKeys(id: string, params?: { pre_rotation_seconds?: number }): Promise<any> {
