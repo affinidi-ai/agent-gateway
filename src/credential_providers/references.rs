@@ -1,5 +1,6 @@
-//! What still uses a credential provider, a secret or an Authority, so deleting it, or
-//! retyping a provider, can be refused while something would break.
+//! What still uses a credential provider, a secret, a JWT verification strategy or an
+//! Authority, so deleting it, or retyping a provider, can be refused while something would
+//! break.
 
 use std::sync::Arc;
 
@@ -268,6 +269,39 @@ impl ReferenceStores {
             }
         }
         Ok(referrers)
+    }
+
+    /// The credential providers whose `consent_confirmation` or
+    /// `consent_identity_strategy_id` names JWT verification strategy `strategy_id`.
+    pub async fn referrers_of_jwt_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> anyhow::Result<Vec<Referrer>> {
+        let Some(store) = &self.credential_providers else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|provider| {
+                provider
+                    .consent_confirmation
+                    .as_ref()
+                    .is_some_and(|confirmation| confirmation.jwt_verification_strategy_id == strategy_id)
+                    || provider
+                        .consent_identity_strategy_id
+                        .as_deref()
+                        == Some(strategy_id)
+            })
+            .map(|provider| Referrer {
+                kind: ResourceKind::CredentialProviders,
+                id: provider.id,
+                name: provider.name,
+                tenant_id: provider.tenant_id,
+                uses: Vec::new(),
+            })
+            .collect())
     }
 
     async fn surfaces_where(

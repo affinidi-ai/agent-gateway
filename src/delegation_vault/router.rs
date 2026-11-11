@@ -2264,50 +2264,72 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
-    /// A login client ID that cannot be read refuses the start POST, leaving
-    /// its start state unclaimed, and a `/confirm` before the exchange, with
-    /// `credentials_unavailable`: never the vendor.
+    /// A login client ID that cannot be read, or that the save rules would
+    /// refuse, refuses the start POST, leaving its start state unclaimed, and
+    /// a `/confirm` before the exchange, with `credentials_unavailable`: never
+    /// the vendor.
     #[tokio::test]
-    async fn an_unreadable_login_client_id_refuses_the_sign_in_and_the_confirmation() {
+    async fn an_unreadable_or_malformed_login_client_id_refuses_the_sign_in_and_the_confirmation() {
         let fixture = consent::Fixture::new().await;
         let strategy = fixture
             .confirming_at_idp(None, None)
             .await;
-        let signed_in = fixture
-            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
-            .await;
-        let mut provider = fixture
-            .providers
-            .get(consent::PROVIDER_ID)
-            .await
-            .unwrap()
-            .unwrap();
-        provider
-            .consent_confirmation
-            .as_mut()
-            .unwrap()
-            .client_id_secret_ref = "missing-login-client-id".to_string();
-        fixture
-            .providers
-            .update(provider)
-            .await
-            .unwrap();
-
-        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
-        let (refused, events) = capture(async {
-            fixture
-                .start_post(&state, &[("origin", "https://198.51.100.7")])
+        for client_id_secret_ref in ["missing-login-client-id", "malformed-login-client-id"] {
+            let signed_in = fixture
+                .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+                .await;
+            let mut provider = fixture
+                .providers
+                .get(consent::PROVIDER_ID)
                 .await
-        })
-        .await;
-        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
-        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
-        assert!(!crate::delegation_vault::oauth::is_claimed(&start).await);
+                .unwrap()
+                .unwrap();
+            let confirmation = provider
+                .consent_confirmation
+                .as_mut()
+                .unwrap();
+            confirmation.client_id_secret_ref = client_id_secret_ref.to_string();
+            fixture
+                .providers
+                .update(provider.clone())
+                .await
+                .unwrap();
 
-        let (refused, events) = capture(fixture.confirm_code(&signed_in)).await;
-        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&signed_in.cookie)));
-        assert_eq!(consent::reasons(&events), [DelegationFailureReason::CredentialsUnavailable]);
+            let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+            let (refused, events) = capture(async {
+                fixture
+                    .start_post(&state, &[("origin", "https://198.51.100.7")])
+                    .await
+            })
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+            assert_eq!(
+                consent::reasons(&events),
+                [DelegationFailureReason::CredentialsUnavailable],
+                "{client_id_secret_ref}"
+            );
+            let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+            assert!(!crate::delegation_vault::oauth::is_claimed(&start).await);
+
+            let (refused, events) = capture(fixture.confirm_code(&signed_in)).await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&signed_in.cookie)));
+            assert_eq!(
+                consent::reasons(&events),
+                [DelegationFailureReason::CredentialsUnavailable],
+                "{client_id_secret_ref}"
+            );
+
+            provider
+                .consent_confirmation
+                .as_mut()
+                .unwrap()
+                .client_id_secret_ref = "login-client-id".to_string();
+            fixture
+                .providers
+                .update(provider)
+                .await
+                .unwrap();
+        }
         assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
         assert_eq!(fixture.token_calls(), 0);
         assert_eq!(fixture.vault_records(), 0);
@@ -2392,6 +2414,62 @@ mod tests {
         assert_eq!(consent::reasons(&events), [DelegationFailureReason::BrowserBindingMismatch; 3]);
         assert!(!is_claimed(&decode_confirmation_state(&sign_in.state).unwrap()).await);
         assert!(fixture.idp_forms().is_empty());
+    }
+
+    /// A confirmation whose surface was deleted, or moved to another tenant,
+    /// after the sign-in began is refused before the exchange and leaves the
+    /// state unused.
+    #[tokio::test]
+    async fn a_confirmation_whose_surface_is_gone_or_moved_is_refused_and_left_unused() {
+        use crate::delegation_vault::oauth::{decode_confirmation_state, is_claimed};
+        use crate::surfaces::AgentSurfaceStore as _;
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let mut surface = fixture
+            .surfaces
+            .get("surface")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let moved = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        surface.tenant_id = Some("tenant-b".to_string());
+        fixture
+            .surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&moved.nonce, serde_json::json!({}))}));
+        let (refused, events) = capture(fixture.confirm_code(&moved)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&moved.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(!is_claimed(&decode_confirmation_state(&moved.state).unwrap()).await);
+
+        surface.tenant_id = None;
+        fixture
+            .surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        let deleted = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        fixture
+            .surfaces
+            .delete("surface")
+            .await
+            .unwrap();
+        let (refused, events) = capture(fixture.confirm_code(&deleted)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&deleted.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(!is_claimed(&decode_confirmation_state(&deleted.state).unwrap()).await);
+        assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
+        assert_eq!(fixture.vault_records(), 0);
     }
 
     /// A confirmation state confirms once: the same redirect again is refused.
@@ -2572,6 +2650,7 @@ mod tests {
         pub struct Fixture {
             pub providers: Arc<FileSystemCredentialProviderStore>,
             pub strategies: Arc<crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore>,
+            pub surfaces: Arc<crate::surfaces::FileSystemAgentSurfaceStore>,
             pub(super) vault: Arc<InMemoryVault>,
             app: Router,
             calls: Arc<AtomicUsize>,
@@ -2776,6 +2855,7 @@ mod tests {
                     ("github-client-id", "github-client"),
                     ("github-client-secret", "secret"),
                     ("login-client-id", "login-client"),
+                    ("malformed-login-client-id", "login-client\n"),
                 ] {
                     secrets
                         .create(CreateSecretRequest {
@@ -2833,6 +2913,7 @@ mod tests {
                 let mut fixture = Self {
                     providers,
                     strategies,
+                    surfaces: surfaces.clone(),
                     vault: vault.clone(),
                     app: Router::new(),
                     calls,

@@ -334,8 +334,8 @@ fn vendor_authorization_url(
     Ok(url)
 }
 
-/// Decode a consent start state: a [`ConsentStage::Start`] state, which only
-/// [`build_authorization_url`] seals, or a [`ConsentStage::ConfirmStart`] one.
+/// Decode a consent start state: a start state without a stage, as
+/// [`build_authorization_url`] seals it, or a [`ConsentStage::ConfirmStart`] one.
 pub fn decode_start_state(encoded: &str) -> Result<OAuthState> {
     decode_consent_state(encoded, "start", &[StageKind::Start, StageKind::ConfirmStart])
 }

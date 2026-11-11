@@ -2,9 +2,9 @@ import React from 'react';
 import AddResourceLink from '../../components/shared/AddResourceLink';
 import { CopyButton } from '../../components/shared/CopyButton';
 import FieldHelp from '../../components/shared/FieldHelp';
-import { useJwtStrategies } from '../../components/surface-builder/elements/caller-auth/useCallerAuthOptions';
+import { useJwtStrategyList } from '../../components/surface-builder/elements/caller-auth/useCallerAuthOptions';
 import { deepLinks } from '../../utils/deepLinks';
-import type { OwnerTenant } from '../../utils/tenantScope';
+import { OTHER_TENANT_LABEL, splitByTenant, type OwnerTenant } from '../../utils/tenantScope';
 import SecretSelect, { SecretOption } from './SecretSelect';
 import type { ConsentConfirmationFormFields } from './credentialProviderForm';
 
@@ -12,7 +12,6 @@ interface ConsentConfirmationSectionProps {
   form: ConsentConfirmationFormFields;
   /** The confirmation redirect URI, empty until the provider's Callback URL is known. */
   redirectUri: string;
-  isNew: boolean;
   secrets: SecretOption[];
   ownerTenant: OwnerTenant;
   loadingSecrets: boolean;
@@ -26,16 +25,23 @@ interface ConsentConfirmationSectionProps {
 const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
   form,
   redirectUri,
-  isNew,
   secrets,
   ownerTenant,
   loadingSecrets,
   onChange,
 }) => {
-  const strategies = useJwtStrategies(form.consent_confirmation_enabled);
-  const storedStrategyMissing =
-    !!form.cc_jwt_verification_strategy_id &&
-    !strategies.some(strategy => strategy.id === form.cc_jwt_verification_strategy_id);
+  const { strategies, status } = useJwtStrategyList(form.consent_confirmation_enabled);
+  // A tenant provider may name its own tenant's strategies or appliance-wide ones, as the gateway allows.
+  const { offered, outside } = splitByTenant(strategies, ownerTenant, () => true);
+  const storedId = form.cc_jwt_verification_strategy_id;
+  const storedOffered = offered.some(strategy => strategy.id === storedId);
+  const storedOutside = outside.find(strategy => strategy.id === storedId);
+  let storedLabel: string | null = null;
+  if (storedId && !storedOffered) {
+    if (status !== 'loaded') storedLabel = storedId;
+    else if (storedOutside) storedLabel = `${storedOutside.name} (${OTHER_TENANT_LABEL})`;
+    else storedLabel = `${storedId} (not found)`;
+  }
   return (
     <div data-testid="credential-provider-consent-confirmation-section">
       <hr />
@@ -90,7 +96,13 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
             id="cc_client_secret_secret_ref"
             label="Login Client Secret"
             required
-            help="The value itself is never shown or copied into this form, only a reference to where it's stored."
+            help={
+              <>
+                The value itself is never shown or copied into this form, only a reference to where
+                it&apos;s stored. Register the login client with <code>client_secret_post</code>:
+                the gateway sends this secret in the form body.
+              </>
+            }
             hint="Pick the secret holding the login client's secret."
             value={form.cc_client_secret_secret_ref}
             secrets={secrets}
@@ -174,17 +186,21 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
               required
             >
               <option value="">-- Select a strategy --</option>
-              {strategies.map(strategy => (
+              {offered.map(strategy => (
                 <option key={strategy.id} value={strategy.id}>
                   {strategy.name}
                 </option>
               ))}
-              {storedStrategyMissing && (
-                <option value={form.cc_jwt_verification_strategy_id}>
-                  {form.cc_jwt_verification_strategy_id} (not found)
-                </option>
-              )}
+              {storedLabel && <option value={storedId}>{storedLabel}</option>}
             </select>
+            {status === 'failed' && (
+              <div
+                className="form-text text-danger"
+                data-testid="credential-provider-consent-confirmation-strategies-failed"
+              >
+                Strategies could not be loaded
+              </div>
+            )}
             <div className="form-text">
               {"Don't see the one you need? "}
               <AddResourceLink
@@ -271,19 +287,17 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                 again whenever the Callback URL changes.
               </div>
             )}
-            {redirectUri
-              ? null
-              : isNew && (
-                  <div
-                    className="alert alert-info mt-2 mb-0"
-                    style={{ fontSize: '14px' }}
-                    data-testid="credential-provider-consent-confirmation-redirect-uri-after-create"
-                  >
-                    <i className="fas fa-info-circle me-2"></i>
-                    The Confirmation redirect URI is shown once the provider is created, since it
-                    ends in the provider&apos;s Callback URL.
-                  </div>
-                )}
+            {redirectUri ? null : (
+              <div
+                className="alert alert-info mt-2 mb-0"
+                style={{ fontSize: '14px' }}
+                data-testid="credential-provider-consent-confirmation-redirect-uri-after-create"
+              >
+                <i className="fas fa-info-circle me-2"></i>
+                The Confirmation redirect URI is shown once the provider has a Callback URL, since
+                it is the Callback URL followed by <code>/confirm</code>.
+              </div>
+            )}
           </div>
         </>
       )}

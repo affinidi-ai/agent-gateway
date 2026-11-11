@@ -951,7 +951,14 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     ...extra,
   });
 
-  const setup = (record: Record<string, unknown>) => {
+  const setup = (
+    record: Record<string, unknown>,
+    strategies: () => Promise<unknown> = () =>
+      Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
+      })
+  ) => {
     mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
       if (init?.method === 'PUT') return Promise.resolve({ ok: true });
       if (url.startsWith('/api/v1/credential-providers/')) {
@@ -972,12 +979,7 @@ describe('EditCredentialProviderPage consent confirmation', () => {
             ]),
         });
       }
-      if (url === '/api/v1/jwt-verification-strategies') {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
-        });
-      }
+      if (url === '/api/v1/jwt-verification-strategies') return strategies();
       return Promise.resolve({ ok: false, json: () => Promise.resolve([]) });
     });
     render(
@@ -1030,6 +1032,48 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     expect(
       screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
     ).toHaveValue('strategy-1');
+  });
+
+  it('says the strategies could not be loaded, without calling the stored one not found', async () => {
+    setup(legacy({ consent_confirmation: SETTING }), () =>
+      Promise.resolve({ ok: false, status: 403, json: () => Promise.resolve({}) })
+    );
+    expect(
+      await screen.findByTestId('credential-provider-consent-confirmation-strategies-failed')
+    ).toHaveTextContent('Strategies could not be loaded');
+    const select = screen.getByTestId('credential-provider-consent-confirmation-strategy-select');
+    expect(select).toHaveValue('strategy-1');
+    expect(within(select).queryByText(/not found/)).not.toBeInTheDocument();
+  });
+
+  it("offers only the provider tenant's own and appliance-wide strategies", async () => {
+    setup(legacy({ tenant_id: 'tenant-a' }), () =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve([
+            { id: 'own', name: 'Own callers', tenant_id: 'tenant-a' },
+            { id: 'shared', name: 'Shared callers', tenant_id: null },
+            { id: 'other', name: 'Other callers', tenant_id: 'tenant-b' },
+          ]),
+      })
+    );
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    expect(await screen.findByRole('option', { name: 'Own callers' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Shared callers' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
+  });
+
+  it('says where the redirect URI will show on a stored provider without a Callback URL', async () => {
+    setup(legacy({ consent_confirmation: SETTING, callback_url: null }));
+    expect(
+      await screen.findByTestId(
+        'credential-provider-consent-confirmation-redirect-uri-after-create'
+      )
+    ).toHaveTextContent(
+      'The Confirmation redirect URI is shown once the provider has a Callback URL, since it is the Callback URL followed by /confirm.'
+    );
+    expect(screen.queryByTestId(REDIRECT_URI)).not.toBeInTheDocument();
   });
 
   it('sends the setting once switched on and filled in', async () => {

@@ -7,6 +7,7 @@ import { formatDateTime, topAndTail } from '../../utils/stringUtils';
 import { AppButton } from '../../components/shared/AppButton';
 import { EmptyState } from '../../components/shared/EmptyState';
 import { DOCS_URL } from '../../config/docs';
+import { formatApiError } from '../../utils/apiError';
 
 export interface JwksSource {
   type: 'remote' | 'static';
@@ -21,6 +22,27 @@ export interface JwtVerificationStrategy {
   jwks_source: JwksSource;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Why a strategy delete failed: the API's message, the credential providers a `409` names as
+ * still using the strategy, and the status.
+ */
+export function strategyDeleteError(status: number, body: string, statusText: string): string {
+  let ids: string[] = [];
+  try {
+    const references: unknown = JSON.parse(body)?.references;
+    if (Array.isArray(references)) {
+      ids = references
+        .map(reference => reference?.id)
+        .filter((id): id is string => typeof id === 'string' && id !== '');
+    }
+  } catch {
+    ids = [];
+  }
+  const message = formatApiError(undefined, body, statusText);
+  const named = ids.length > 0 ? `${message} (providers ${ids.join(', ')})` : message;
+  return `${named} (${status})`;
 }
 
 interface StrategiesTabProps {
@@ -82,7 +104,9 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
         { method: 'DELETE' }
       );
       if (!response.ok) {
-        throw new Error(`Delete failed: ${response.statusText}`);
+        throw new Error(
+          strategyDeleteError(response.status, await response.text(), response.statusText)
+        );
       }
       setStrategies(prev => prev.filter(s => s.id !== strategy.id));
     } catch (e: any) {

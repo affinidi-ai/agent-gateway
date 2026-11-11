@@ -74,3 +74,9 @@ Feature: Consent confirmation
     When caller "alice" confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to OAuth provider "calendar"
+
+  Scenario: Consent confirmation cannot be saved while the identity hash pepper is unset
+    When the operator creates the authorization code provider "mail" with consent confirmation
+    Then the admin API response status is 400
+    And the admin API error response mentions "AG_IDENTITY_HASH_PEPPER"
+    And no credential provider "mail" is stored

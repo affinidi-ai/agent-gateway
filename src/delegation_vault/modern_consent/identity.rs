@@ -81,7 +81,7 @@ pub async fn verify_id_token(
         .await
         .map_err(|error| match error {
             ConsentIdTokenError::Malformed => ContinuationError::InvalidInputResponse,
-            ConsentIdTokenError::Rejected => ContinuationError::InvalidState,
+            ConsentIdTokenError::KeysUnavailable | ConsentIdTokenError::Rejected(_) => ContinuationError::InvalidState,
         })?;
     let subject = profile
         .bound_subject(&claims, principal_claim)

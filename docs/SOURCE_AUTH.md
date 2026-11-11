@@ -73,11 +73,10 @@ Point, identifies callers by the same claim.
   2. Point every surface method, every credential provider whose
      `consent_identity_strategy_id` names the old strategy, and every credential provider whose
      `consent_confirmation.jwt_verification_strategy_id` names it, at the new one.
-  3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
-     in `consent_identity_strategy_id` would answer its consents with not found, and a legacy
-     consent provider whose `consent_confirmation` still names it mints its links without
-     confirming their caller
-     ([Consent confirmation](CREDENTIAL_DELEGATION.md#turning-it-on)).
+  3. Delete the old strategy. The delete answers `409`, naming the providers, while a credential
+     provider's `consent_identity_strategy_id` or `consent_confirmation.jwt_verification_strategy_id`
+     still names it ([Consent confirmation](CREDENTIAL_DELEGATION.md#turning-it-on)). Nothing
+     checks surface methods, so point them at the new strategy first.
   4. Have callers connect again, since their identity hashes have changed.
 
   From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens

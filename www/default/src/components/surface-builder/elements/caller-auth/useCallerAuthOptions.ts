@@ -5,29 +5,49 @@ export interface JwtVerificationStrategyOption {
   id: string;
   name: string;
   expected_issuer?: string;
+  tenant_id?: string | null;
 }
 
-export interface ApiKeySecretOption {
-  id: string;
-  name: string;
-  secret_id?: string;
-  secret_type?: string;
+export type JwtStrategiesStatus = 'idle' | 'loading' | 'loaded' | 'failed';
+
+/**
+ * The JWT verification strategies, loaded while `enabled`, and whether the list loaded or could
+ * not be read; a refused request is `failed`, never an empty list.
+ */
+export function useJwtStrategyList(enabled = true): {
+  strategies: JwtVerificationStrategyOption[];
+  status: JwtStrategiesStatus;
+} {
+  const [strategies, setStrategies] = useState<JwtVerificationStrategyOption[]>([]);
+  const [status, setStatus] = useState<JwtStrategiesStatus>('idle');
+  useEffect(() => {
+    if (!enabled) return;
+    let current = true;
+    setStatus('loading');
+    apiClient
+      .fetch('/api/v1/jwt-verification-strategies')
+      .then(async r => {
+        if (!r.ok) throw new Error(`${r.status}`);
+        const data: unknown = await r.json();
+        if (!current) return;
+        setStrategies(Array.isArray(data) ? data : []);
+        setStatus('loaded');
+      })
+      .catch(() => {
+        if (!current) return;
+        setStrategies([]);
+        setStatus('failed');
+      });
+    return () => {
+      current = false;
+    };
+  }, [enabled]);
+  return { strategies, status };
 }
 
 /** The JWT verification strategies a caller authentication method can name, loaded while `enabled`. */
 export function useJwtStrategies(enabled = true): JwtVerificationStrategyOption[] {
-  const [strategies, setStrategies] = useState<JwtVerificationStrategyOption[]>([]);
-  useEffect(() => {
-    if (!enabled) return;
-    apiClient
-      .fetch('/api/v1/jwt-verification-strategies')
-      .then(r => (r.ok ? r.json() : []))
-      .then((data: JwtVerificationStrategyOption[]) =>
-        setStrategies(Array.isArray(data) ? data : [])
-      )
-      .catch(() => setStrategies([]));
-  }, [enabled]);
-  return strategies;
+  return useJwtStrategyList(enabled).strategies;
 }
 
 const apiKeyTypeFirst = (a: ApiKeySecretOption, b: ApiKeySecretOption): number =>

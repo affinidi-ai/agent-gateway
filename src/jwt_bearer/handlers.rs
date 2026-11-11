@@ -443,13 +443,19 @@ pub async fn update_strategy(
     }
 }
 
-/// `DELETE /v1/jwt-verification-strategies/{id}`  — delete a strategy.
+const STRATEGY_IN_USE: &str = "The strategy is used by credential providers; remove their references to it first";
+
+/// `DELETE /v1/jwt-verification-strategies/{id}`  — delete a strategy, unless a
+/// credential provider's `consent_confirmation` or `consent_identity_strategy_id`
+/// names it (`409`).
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_strategy(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    references: Option<Extension<crate::credential_providers::references::ReferenceStores>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -490,6 +496,40 @@ pub async fn delete_strategy(
     if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("strategy is outside this token's permitted scope"))
             .into_response();
+    }
+    if let Some(Extension(references)) = &references {
+        let referrers = match references
+            .referrers_of_jwt_strategy(&existing.id)
+            .await
+        {
+            Ok(referrers) => referrers,
+            Err(error) => {
+                error!(%error, "Failed to find the credential providers using JWT strategy {}", id);
+                return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to delete strategy"))
+                    .into_response();
+            }
+        };
+        if !referrers.is_empty() {
+            let pat = pat
+                .as_ref()
+                .map(|Extension(pat)| pat);
+            let viewable = match passkey_storage
+                .load_user_by_id(&user_id)
+                .await
+            {
+                Ok(Some(user)) => {
+                    crate::credential_providers::references::ViewableKinds::for_role(&rbac_config, &user.role, pat)
+                }
+                _ => Default::default(),
+            };
+            return crate::credential_providers::references::conflict_response(
+                STRATEGY_IN_USE,
+                &referrers,
+                &viewable,
+                tenant_context(&context),
+                resource_scope(&scope),
+            );
+        }
     }
 
     match store.delete(&id).await {
@@ -1263,6 +1303,120 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A strategy a credential provider's `consent_confirmation` or
+    /// `consent_identity_strategy_id` names is not deleted: 409 naming the
+    /// provider. An unreferenced one is.
+    #[tokio::test]
+    async fn a_strategy_a_credential_provider_names_is_not_deleted() {
+        use crate::credential_providers::storage::CredentialProviderStorage as _;
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let providers_dir = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                providers_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(crate::credential_providers::references::ReferenceStores {
+            credential_providers: Some(providers.clone()),
+            ..Default::default()
+        }));
+        let mut ids = Vec::new();
+        for name in ["Confirming", "Modern consent", "Unused"] {
+            let (_, created) = create_via_api(&router, name).await;
+            ids.push(
+                created["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let provider = |id: &str, extra: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+            let mut value = serde_json::json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(value).unwrap()
+        };
+        for stored in [
+            provider(
+                "confirming-provider",
+                serde_json::json!({"consent_confirmation": {
+                    "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+                    "authorization_endpoint": "https://idp.example/authorize",
+                    "token_endpoint": "https://idp.example/token", "jwt_verification_strategy_id": ids[0]
+                }}),
+            ),
+            provider("modern-provider", serde_json::json!({"consent_identity_strategy_id": ids[1]})),
+        ] {
+            providers
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let delete = |id: &str| {
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/jwt-verification-strategies/{id}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (id, provider_id) in [(&ids[0], "confirming-provider"), (&ids[1], "modern-provider")] {
+            let resp = router
+                .clone()
+                .oneshot(delete(id))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = response_body(resp).await;
+            assert_eq!(body["message"], STRATEGY_IN_USE);
+            assert_eq!(
+                body["references"],
+                serde_json::json!([{"kind": "credential_provider", "id": provider_id, "name": provider_id}])
+            );
+            assert!(
+                store
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{provider_id}"
+            );
+        }
+        let resp = router
+            .oneshot(delete(&ids[2]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&ids[2])
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

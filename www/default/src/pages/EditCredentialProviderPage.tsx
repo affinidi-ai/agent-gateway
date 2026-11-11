@@ -754,7 +754,6 @@ const EditCredentialProviderPage: React.FC = () => {
                   <ConsentConfirmationSection
                     form={form}
                     redirectUri={consentConfirmationRedirectUri(shownCallbackUrl)}
-                    isNew={isNew}
                     secrets={secrets}
                     ownerTenant={ownerTenant}
                     loadingSecrets={loadingSecrets}

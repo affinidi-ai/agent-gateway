@@ -1,4 +1,5 @@
 use cucumber::{given, then, when};
+use reqwest::Method;
 
 use crate::bdd_support::oidc::{OIDC_CLIENT_ID, OidcProvider};
 use crate::steps::when::{
@@ -80,6 +81,26 @@ fn oauth_provider_confirms_its_caller(
     world
         .surface_config
         .consent_confirmation = true;
+}
+
+#[when(expr = "the operator creates the authorization code provider {string} with consent confirmation")]
+async fn operator_creates_provider_with_consent_confirmation(
+    world: &mut SurfaceWorld,
+    provider_id: String,
+) {
+    let body = serde_json::json!({
+        "name": provider_id, "provider_id": provider_id, "provider_type": "oauth2_authorization_code",
+        "authorization_endpoint": "https://192.0.2.1/authorize", "token_endpoint": "https://192.0.2.1/token",
+        "client_id_secret_ref": "vendor-client-id", "client_secret_secret_ref": "vendor-client-secret",
+        "consent_confirmation": {
+            "client_id_secret_ref": "login-client-id", "client_secret_secret_ref": "login-client-secret",
+            "authorization_endpoint": "https://192.0.2.2/authorize", "token_endpoint": "https://192.0.2.2/token",
+            "jwt_verification_strategy_id": "callers"
+        }
+    });
+    let response =
+        crate::steps::credential_save::send(world, Method::POST, "/v1/credential-providers", Some(&body)).await;
+    world.admin_response = Some(response);
 }
 
 #[given("the identity provider issues ID tokens without the nonce of the sign-in")]

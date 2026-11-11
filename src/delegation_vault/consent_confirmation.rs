@@ -8,7 +8,7 @@ use chrono::Utc;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::consent_id_token::{ConsentIdTokenExpectation, verify_consent_id_token};
+use super::consent_id_token::{ConsentIdTokenError, ConsentIdTokenExpectation, verify_consent_id_token};
 use super::handlers::DelegationVaultState;
 use super::{ConfirmationSignIn, ConsentConfirmBinding, OAuthState};
 use crate::audit::events::DelegationFailureReason;
@@ -262,12 +262,14 @@ pub(crate) async fn sign_in(
     })
 }
 
-/// The login client ID, read from the secrets store in the provider's tenant.
+/// The login client ID, read from the secrets store in the provider's tenant
+/// and held to the format the provider save checks.
 async fn login_client_id(
     provider: &CredentialProvider,
     confirmation: &ConsentConfirmation,
     secrets_store: &Arc<dyn SecretsStore>,
 ) -> Result<String, DelegationFailureReason> {
+    use crate::credential_providers::external::{MAX_CLIENT_ID_CHARS, has_whitespace_or_control};
     super::oauth::resolve_secret(
         provider,
         secrets_store,
@@ -275,7 +277,9 @@ async fn login_client_id(
         super::oauth::isolation_mode(),
     )
     .await
-    .map_err(|_| DelegationFailureReason::CredentialsUnavailable)
+    .ok()
+    .filter(|client_id| client_id.chars().count() <= MAX_CLIENT_ID_CHARS && !has_whitespace_or_control(client_id))
+    .ok_or(DelegationFailureReason::CredentialsUnavailable)
 }
 
 /// `openid` alone gives `sub`, the only claim naming the caller it
@@ -366,7 +370,18 @@ pub(crate) async fn confirm_caller(
     };
     let verified = verify_consent_id_token(&vault.verifier, &strategy, &expected, &id_token, unix_seconds(Utc::now()))
         .await
-        .map_err(|_| DelegationFailureReason::ConsentIdentityMissing)?;
+        .map_err(|error| {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                cause = error.cause(),
+                "Consent confirmation ID token refused"
+            );
+            match error {
+                ConsentIdTokenError::KeysUnavailable => DelegationFailureReason::CredentialsUnavailable,
+                _ => DelegationFailureReason::ConsentIdentityMissing,
+            }
+        })?;
     let confirmed = confirmed_identity_hash(verified, claims, &strategy.id, binding.tenant_id.as_deref())
         .ok_or(DelegationFailureReason::ConsentIdentityMissing)?;
     if confirmed != sealed.user_identity_hash {
@@ -489,17 +504,27 @@ async fn exchange_code(
             .and_then(|answer| answer.id_token)
             .filter(|id_token| !id_token.is_empty())
             .map(zeroize::Zeroizing::new)
-            .ok_or(DelegationFailureReason::ConsentIdentityMissing)
+            .ok_or_else(|| {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    cause = "no_id_token",
+                    "Consent confirmation ID token refused"
+                );
+                DelegationFailureReason::ConsentIdentityMissing
+            })
     };
     tokio::time::timeout(egress.timeout, exchange)
         .await
         .map_err(|_| DelegationFailureReason::TokenExchangeFailed)?
 }
 
-/// Log at debug, once per provider, surface and reason, why a caller of a
-/// provider with `consent_confirmation` was minted a link that does not
-/// confirm them, or that a confirmed caller was verified by another strategy
-/// than the one that confirms them. Nothing about the caller is logged.
+/// Log once per provider, surface and reason why a caller of a provider with
+/// `consent_confirmation` was minted a link that does not confirm them: at
+/// warn for a setting that confirms nobody or a Transit Point or Fabric
+/// caller, at debug otherwise. Also note at debug that a confirmed caller was
+/// verified by another strategy than the one that confirms them. Nothing
+/// about the caller is logged.
 pub(crate) fn note(
     provider: &CredentialProvider,
     surface_id: &str,
@@ -519,6 +544,14 @@ pub(crate) fn note(
                     surface_id = %surface_id,
                     reason = ?reason,
                     "Consent confirmation confirms no caller of this provider: consent links are minted unconfirmed"
+                );
+            } else if *reason == Unconfirmed::PathNotCovered {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    surface_id = %surface_id,
+                    "Consent link minted unconfirmed for a Transit Point or Fabric caller: its grant is also \
+                     released to the surface's Access Point callers"
                 );
             } else {
                 debug!(
@@ -1069,8 +1102,8 @@ mod tests {
         assert_eq!(id_token(json!({"sub": "alice"}), "sub", "sub"), None, "no issuer");
     }
 
-    /// A setting that confirms nobody is warned of; a caller or request it
-    /// does not cover is only noted at debug.
+    /// Only a setting that confirms nobody is provider-wide; a caller or
+    /// request it does not cover is not.
     #[test]
     fn only_a_reason_that_holds_for_every_caller_is_provider_wide() {
         use Unconfirmed::*;
@@ -1087,6 +1120,32 @@ mod tests {
         }
         for reason in [PathNotCovered, NotJwtCaller, OtherIssuer, OtherPrincipalClaim, OtherIdentityHash] {
             assert!(!reason.covers_every_caller(), "{reason:?}");
+        }
+    }
+
+    /// A Transit Point or Fabric caller of a provider with the setting is
+    /// warned of once per provider and surface; a provider without the
+    /// setting logs nothing.
+    #[tokio::test]
+    async fn a_transit_or_fabric_link_of_a_confirming_provider_is_warned_of_once() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let surface_id = uuid::Uuid::new_v4().to_string();
+        for confirming in [false, true] {
+            let provider = provider(confirming);
+            let decision = decide(&provider, ConsentCaller::TransitOrFabric, TENANT, "hash")
+                .await
+                .unwrap();
+            let logs = FormattedLogs::capture();
+            note(&provider, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+            note(&provider, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+            let text = logs.text();
+            if confirming {
+                assert_eq!(text.lines().count(), 1, "{text}");
+                assert!(text.contains(" WARN ") && text.contains("Transit Point or Fabric caller"), "{text}");
+            } else {
+                assert!(text.is_empty(), "{text}");
+            }
         }
     }
 

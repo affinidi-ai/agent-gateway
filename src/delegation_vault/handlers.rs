@@ -877,12 +877,29 @@ fn provider_error(error: &str) -> (DelegationFailureReason, &str) {
     }
 }
 
+/// Whether the surface a confirmation state was minted on still exists under
+/// the tenant the caller's `user_identity_hash` was computed for.
+async fn sealed_surface_unchanged(
+    state: &DelegationVaultState,
+    sealed: &super::OAuthState,
+    binding: &super::ConsentConfirmBinding,
+) -> bool {
+    let Some(surfaces) = &state.agent_surface_store else {
+        return false;
+    };
+    matches!(
+        surfaces.get(&sealed.surface_id).await,
+        Ok(Some(surface)) if surface.tenant_id == binding.tenant_id
+    )
+}
+
 /// GET {callback_path}/confirm
 ///
 /// The identity provider's redirect after a consent confirmation sign-in. The
 /// state must be a confirmation state of this gateway, held by the browser
-/// that posted its start page, and is used once; its provider must still
-/// confirm through the sealed strategy. An identity provider error is a denied
+/// that posted its start page, and is used once; its surface must still exist
+/// under the sealed tenant, and its provider must still confirm through the
+/// sealed strategy. An identity provider error is a denied
 /// consent. Once the caller is confirmed
 /// ([`confirm_caller`](super::consent_confirmation::confirm_caller)) the
 /// browser goes on to the vendor with a vendor state on the same browser
@@ -933,6 +950,9 @@ pub async fn consent_confirmation_callback(
         .and_then(|Extension(cookies)| cookies.get(cookie_name));
     if !oauth::browser_binding_matches(sealed, presented) {
         return refuse(DelegationFailureReason::BrowserBindingMismatch);
+    }
+    if !sealed_surface_unchanged(&state, sealed, &sign_in.binding).await {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
     }
     if !oauth::claim_oauth_state(sealed).await {
         return refuse(DelegationFailureReason::ConsentStateReused);

@@ -1,12 +1,58 @@
 use serde_json::Value;
 
 use crate::jwt_bearer::JwtBearerVerifier;
+use crate::jwt_bearer::errors::JwtBearerError;
 use crate::jwt_bearer::models::{AudienceClaim, JwtVerificationStrategy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConsentIdTokenError {
     Malformed,
-    Rejected,
+    /// The strategy's JWKS could not be fetched, so the ID token was not checked.
+    KeysUnavailable,
+    Rejected(Rejection),
+}
+
+/// The check an ID token failed, coarse enough to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// Its header, signature, key or `nbf`.
+    Token,
+    Issuer,
+    Audience,
+    Expired,
+    /// The issuer and principal claim, `exp` and `nbf` a subject needs.
+    Claims,
+    Nonce,
+    IssuedAt,
+}
+
+impl ConsentIdTokenError {
+    /// A cause that names no claim value.
+    pub(crate) fn cause(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::KeysUnavailable => "jwks_unavailable",
+            Self::Rejected(Rejection::Token) => "token",
+            Self::Rejected(Rejection::Issuer) => "issuer",
+            Self::Rejected(Rejection::Audience) => "audience",
+            Self::Rejected(Rejection::Expired) => "expired",
+            Self::Rejected(Rejection::Claims) => "claims",
+            Self::Rejected(Rejection::Nonce) => "nonce",
+            Self::Rejected(Rejection::IssuedAt) => "iat",
+        }
+    }
+}
+
+impl From<JwtBearerError> for ConsentIdTokenError {
+    fn from(error: JwtBearerError) -> Self {
+        match error {
+            JwtBearerError::JwksFetchFailed(_) | JwtBearerError::JwksUriBlocked => Self::KeysUnavailable,
+            JwtBearerError::ExpiredToken => Self::Rejected(Rejection::Expired),
+            JwtBearerError::InvalidIssuer => Self::Rejected(Rejection::Issuer),
+            JwtBearerError::InvalidAudience => Self::Rejected(Rejection::Audience),
+            _ => Self::Rejected(Rejection::Token),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,35 +79,37 @@ pub(crate) async fn verify_consent_id_token(
     if token.is_empty() || token.len() > 32 * 1024 || client_id.is_empty() || client_id.len() > 4096 {
         return Err(ConsentIdTokenError::Malformed);
     }
-    let header = jsonwebtoken::decode_header(token).map_err(|_| ConsentIdTokenError::Rejected)?;
+    let header = jsonwebtoken::decode_header(token).map_err(|_| ConsentIdTokenError::Rejected(Rejection::Token))?;
     if header
         .typ
         .as_deref()
         .is_some_and(|typ| typ != "JWT")
     {
-        return Err(ConsentIdTokenError::Rejected);
+        return Err(ConsentIdTokenError::Rejected(Rejection::Token));
     }
     let claims = verifier
         .validate(token, strategy, &[client_id.to_string()], AudienceClaim::Aud)
-        .await
-        .map_err(|_| ConsentIdTokenError::Rejected)?;
+        .await?;
     crate::sts::mcp_profile::validate_subject_claims(&claims, principal_claim, now)
-        .map_err(|_| ConsentIdTokenError::Rejected)?;
+        .map_err(|_| ConsentIdTokenError::Rejected(Rejection::Claims))?;
     if claims
         .get("nonce")
         .and_then(Value::as_str)
         != Some(nonce)
-        || claims
-            .get("iat")
-            .and_then(Value::as_u64)
-            .is_none_or(|issued| issued > now.saturating_add(120) || issued.saturating_add(120) < issued_at)
     {
-        return Err(ConsentIdTokenError::Rejected);
+        return Err(ConsentIdTokenError::Rejected(Rejection::Nonce));
+    }
+    if claims
+        .get("iat")
+        .and_then(Value::as_u64)
+        .is_none_or(|issued| issued > now.saturating_add(120) || issued.saturating_add(120) < issued_at)
+    {
+        return Err(ConsentIdTokenError::Rejected(Rejection::IssuedAt));
     }
     let multiple_audiences = match claims.get("aud") {
         Some(Value::String(audience)) => {
             if audience != client_id {
-                return Err(ConsentIdTokenError::Rejected);
+                return Err(ConsentIdTokenError::Rejected(Rejection::Audience));
             }
             false
         }
@@ -74,11 +122,11 @@ pub(crate) async fn verify_consent_id_token(
                 .iter()
                 .any(|value| value.as_str() == Some(client_id))
             {
-                return Err(ConsentIdTokenError::Rejected);
+                return Err(ConsentIdTokenError::Rejected(Rejection::Audience));
             }
             audiences.len() > 1
         }
-        _ => return Err(ConsentIdTokenError::Rejected),
+        _ => return Err(ConsentIdTokenError::Rejected(Rejection::Audience)),
     };
     if (multiple_audiences || claims.get("azp").is_some())
         && claims
@@ -86,7 +134,7 @@ pub(crate) async fn verify_consent_id_token(
             .and_then(Value::as_str)
             != Some(client_id)
     {
-        return Err(ConsentIdTokenError::Rejected);
+        return Err(ConsentIdTokenError::Rejected(Rejection::Audience));
     }
     Ok(claims)
 }
@@ -239,7 +287,7 @@ mod tests {
         let fixture = Fixture::new();
         let token =
             fixture.sign_with_header(&json!({"alg": "EdDSA", "typ": "at+jwt", "kid": "key-1"}), &fixture.claims());
-        assert_eq!(fixture.verify(&token).await, Err(ConsentIdTokenError::Rejected));
+        assert_eq!(fixture.verify(&token).await, Err(ConsentIdTokenError::Rejected(Rejection::Token)));
     }
 
     #[tokio::test]
@@ -279,18 +327,22 @@ mod tests {
                 .unwrap()
                 .0
         );
-        assert_eq!(fixture.verify(&forged).await, Err(ConsentIdTokenError::Rejected));
+        assert_eq!(fixture.verify(&forged).await, Err(ConsentIdTokenError::Rejected(Rejection::Token)));
     }
 
     #[tokio::test]
     async fn an_id_token_from_another_issuer_or_without_one_is_rejected() {
         let fixture = Fixture::new();
-        for value in [Some(json!("https://other.example/")), Some(json!("")), None] {
+        for (value, rejection) in [
+            (Some(json!("https://other.example/")), Rejection::Issuer),
+            (Some(json!("")), Rejection::Issuer),
+            (None, Rejection::Audience),
+        ] {
             assert_eq!(
                 fixture
                     .verify_changed("iss", value.clone())
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(rejection)),
                 "{value:?}"
             );
         }
@@ -304,7 +356,7 @@ mod tests {
                 fixture
                     .verify_changed("sub", value.clone())
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(Rejection::Claims)),
                 "{value:?}"
             );
         }
@@ -322,7 +374,7 @@ mod tests {
             fixture
                 .verify_expecting(&fixture.sign(&claims), expected)
                 .await,
-            Err(ConsentIdTokenError::Rejected),
+            Err(ConsentIdTokenError::Rejected(Rejection::Claims)),
             "sub without oid"
         );
         claims["oid"] = json!("person-1");
@@ -337,20 +389,20 @@ mod tests {
     #[tokio::test]
     async fn an_id_token_for_another_audience_is_rejected() {
         let fixture = Fixture::new();
-        for value in [
-            Some(json!("other-client")),
-            Some(json!(["other-client"])),
-            Some(json!([])),
-            Some(json!([CLIENT, ""])),
-            Some(json!([CLIENT, 7])),
-            Some(json!(7)),
-            None,
+        for (value, rejection) in [
+            (Some(json!("other-client")), Rejection::Audience),
+            (Some(json!(["other-client"])), Rejection::Audience),
+            (Some(json!([])), Rejection::Audience),
+            (Some(json!([CLIENT, ""])), Rejection::Audience),
+            (Some(json!([CLIENT, 7])), Rejection::Audience),
+            (Some(json!(7)), Rejection::Audience),
+            (None, Rejection::Audience),
         ] {
             assert_eq!(
                 fixture
                     .verify_changed("aud", value.clone())
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(rejection)),
                 "{value:?}"
             );
         }
@@ -367,7 +419,7 @@ mod tests {
                 fixture
                     .verify(&fixture.sign(&claims))
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(Rejection::Audience)),
                 "{audience}"
             );
         }
@@ -382,7 +434,7 @@ mod tests {
             fixture
                 .verify(&fixture.sign(&claims))
                 .await,
-            Err(ConsentIdTokenError::Rejected),
+            Err(ConsentIdTokenError::Rejected(Rejection::Audience)),
             "no azp"
         );
         claims["azp"] = json!("other-client");
@@ -390,7 +442,7 @@ mod tests {
             fixture
                 .verify(&fixture.sign(&claims))
                 .await,
-            Err(ConsentIdTokenError::Rejected),
+            Err(ConsentIdTokenError::Rejected(Rejection::Audience)),
             "other azp"
         );
         claims["azp"] = json!(CLIENT);
@@ -410,7 +462,7 @@ mod tests {
                 fixture
                     .verify_changed("azp", Some(value.clone()))
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(Rejection::Audience)),
                 "{value}"
             );
         }
@@ -427,15 +479,33 @@ mod tests {
     #[tokio::test]
     async fn an_expired_id_token_is_rejected() {
         let fixture = Fixture::new();
-        for value in [json!(fixture.now), json!(fixture.now - 30), json!(fixture.now - 3600)] {
+        for (value, rejection) in [
+            (json!(fixture.now), Rejection::Claims),
+            (json!(fixture.now - 30), Rejection::Claims),
+            (json!(fixture.now - 3600), Rejection::Expired),
+        ] {
             assert_eq!(
                 fixture
                     .verify_changed("exp", Some(value.clone()))
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(rejection)),
                 "{value}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn an_id_token_whose_keys_cannot_be_fetched_is_not_checked() {
+        let mut fixture = Fixture::new();
+        fixture.strategy.jwks_source = crate::jwt_bearer::models::JwksSource::Remote {
+            jwks_uri: "https://127.0.0.1/jwks".to_string(),
+        };
+        let error = fixture
+            .verify(&fixture.sign(&fixture.claims()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, ConsentIdTokenError::KeysUnavailable);
+        assert_eq!(error.cause(), "jwks_unavailable");
     }
 
     #[tokio::test]
@@ -445,7 +515,7 @@ mod tests {
             fixture
                 .verify_changed("nbf", Some(json!(fixture.now + 30)))
                 .await,
-            Err(ConsentIdTokenError::Rejected)
+            Err(ConsentIdTokenError::Rejected(Rejection::Claims))
         );
     }
 
@@ -457,7 +527,7 @@ mod tests {
                 fixture
                     .verify_changed("iat", value.clone())
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(Rejection::IssuedAt)),
                 "{value:?}"
             );
         }
@@ -480,7 +550,7 @@ mod tests {
             fixture
                 .verify_issued_at(&fixture.sign(&claims), fixture.now)
                 .await,
-            Err(ConsentIdTokenError::Rejected)
+            Err(ConsentIdTokenError::Rejected(Rejection::IssuedAt))
         );
         claims["iat"] = json!(fixture.now - 120);
         assert_eq!(
@@ -501,7 +571,7 @@ mod tests {
             fixture
                 .verify_issued_at(&fixture.sign(&claims), issued_at)
                 .await,
-            Err(ConsentIdTokenError::Rejected)
+            Err(ConsentIdTokenError::Rejected(Rejection::IssuedAt))
         );
         claims["iat"] = json!(fixture.now - 200);
         assert_eq!(
@@ -520,7 +590,7 @@ mod tests {
                 fixture
                     .verify_changed("nonce", value.clone())
                     .await,
-                Err(ConsentIdTokenError::Rejected),
+                Err(ConsentIdTokenError::Rejected(Rejection::Nonce)),
                 "{value:?}"
             );
         }

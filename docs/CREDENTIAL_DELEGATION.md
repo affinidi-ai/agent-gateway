@@ -48,14 +48,15 @@ already lacks one is refused every update until the update names it.
 
 ### Records that are still in use
 
-A credential provider or secret is not deleted while another record uses it, so a surface does
-not fail on its next request.
+A credential provider, secret or JWT verification strategy is not deleted while another record
+uses it, so a surface or provider does not fail on its next request.
 
 | Request | Refused with `409` while | Override |
 | --- | --- | --- |
 | `DELETE /api/v1/credential-providers/{id}` | A surface binds the provider or uses it for Target authentication; the answer is the `provider_in_use` one described in [Deleting a provider](#deleting-a-provider), not the body below | None: remove the references first |
 | `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
 | `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity, caller key), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
+| `DELETE /v1/jwt-verification-strategies/{id}` | A credential provider's `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names the strategy. Surface methods are not checked | None: point the providers at another strategy first |
 
 The other refusals answer a `409` body that keeps the `message` field current clients show:
 
@@ -76,6 +77,7 @@ caller's tenant or appliance-wide and within its resource pattern. The rest are 
 
 - provider type change: `The credential provider is used for Target authentication, which cannot use a provider that needs a user's consent`
 - secret delete: `The secret is in use; remove its references first, or delete it with force=true`
+- JWT verification strategy delete: `The strategy is used by credential providers; remove their references to it first`
 
 The scan reads every surface, provider, A2A proxy and STS client at the time of the request
 ([`credential_providers/references.rs`](../src/credential_providers/references.rs)); a lookup
@@ -84,7 +86,7 @@ credential provider, A2A proxy or STS client that names the secret do not overla
 that serves the admin API, which serialises them with an in-process lock: a save stored first
 makes the delete answer `409` unless the delete adds `force=true`, and a save whose check found
 the secret before the delete removed it is refused with `400`, as a reference to a missing
-secret is.
+secret is. A strategy delete takes no such lock.
 
 ### Auditing a forced secret delete
 
@@ -1911,7 +1913,7 @@ provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-record
 
 | `reason` | Refused because |
 | --- | --- |
-| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of another stage, or the start POST's binding cookie cannot be sent; or the provider's [`consent_confirmation`](#consent-confirmation) or its strategy changed since the link was minted |
+| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of another stage, or the start POST's binding cookie cannot be sent; or the provider's [`consent_confirmation`](#consent-confirmation) or its strategy changed since the link was minted, or, at `/confirm`, the surface it was minted on is gone or now another tenant's |
 | `consent_state_reused` | The start state or callback state was already used on this process |
 | `consent_provider_mismatch` | The path's last segment is not that of the state's provider's `callback_path`, or that provider is gone or changed |
 | `browser_binding_mismatch` | The callback or the confirmation callback has no binding cookie, or another browser's (`403`) |
@@ -1923,7 +1925,7 @@ provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-record
 | `redirect_uri_invalid` | The provider's redirect URI breaks the rules in [Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider) or is another provider's |
 | `authorization_url_invalid` | The provider's authorization endpoint or `additional_params` break the rules in [The start page](#the-start-page) |
 | `cross_site_consent_start` | The start POST did not come from the start page's origin |
-| `credentials_unavailable` | The provider, its client ID, the consent confirmation strategy or the login client's secret could not be read |
+| `credentials_unavailable` | The provider, its client ID, the consent confirmation strategy, its JWKS or the login client's secret could not be read, or the login client ID no longer has the format the save checks |
 | `token_exchange_failed` | The provider's token endpoint, or the consent confirmation login client's, refused or failed the exchange |
 | `vault_store_rejected` | The token was obtained but could not be stored (`500`) |
 
@@ -1970,7 +1972,7 @@ provider. It changes how new consent is obtained, not how stored grants are foun
 | Field | Meaning |
 | --- | --- |
 | `client_id_secret_ref` | The secret ID of the client ID of the gateway's login client at the callers' identity provider, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant). The secret's value is the client ID |
-| `client_secret_secret_ref` | The secret ID of the login client's secret, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant) |
+| `client_secret_secret_ref` | The secret ID of the login client's secret, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant). The code exchange sends it in the form body, so register the login client with `client_secret_post` |
 | `authorization_endpoint` | The identity provider's authorization endpoint |
 | `token_endpoint` | The identity provider's token endpoint. The code exchange goes through the provider egress |
 | `jwt_verification_strategy_id` | The JWT verification strategy that verifies the ID token. Its `expected_issuer` and `principal_claim` decide which callers are confirmed |
@@ -2001,8 +2003,8 @@ On create and update, a provider with the setting is refused with `400` and this
 
 On update, an absent `consent_confirmation` keeps the stored setting, `null` clears it, and a
 value replaces it. Every update checks the setting it keeps. Once `AG_IDENTITY_HASH_PEPPER` is
-unset or the strategy is deleted, every edit of the provider is therefore refused until the
-update sends `consent_confirmation: null`.
+unset or the provider's tenant can no longer reference the strategy, every edit of the provider
+is therefore refused until the update sends `consent_confirmation: null`.
 
 #### Who is confirmed
 
@@ -2011,8 +2013,9 @@ A consent link confirms its caller when all of these hold:
 - the request reached the surface's Access Point;
 - the provider is still legacy consent, the pepper is set, and the setting's strategy still
   exists, can be referenced by the provider's tenant and passes the strategy and claim rules
-  above (the endpoints and the login client ID and secret are read and checked at the start POST
-  and at `/confirm`, not at mint);
+  above (not at mint: the start POST checks the authorization endpoint and reads the login
+  client ID, and `/confirm` reads the login client ID and secret and calls the token endpoint;
+  both refuse a login client ID without the format the save checks);
 - the caller is a `jwt_bearer` caller whose `iss` is the strategy's `expected_issuer` and whose
   principal claim is the strategy's `principal_claim`;
 - the caller's identity hash is the one the strategy gives that caller.
@@ -2026,8 +2029,10 @@ provider and surface ids and no detail of the caller. A reason that holds for ev
 the provider (`NotLegacyConsent`, `PepperUnset`, `StrategyUnavailable`, `GatewayIssuer`,
 `EntraCallerNamedBySub`, `IdTokenClaimInvalid`, `EditableClaim`) is a setting that confirms
 nobody, logged at `WARN` as `Consent confirmation confirms no caller of this provider: consent
-links are minted unconfirmed`. The other reasons concern one caller or request, and are logged
-at `DEBUG` as `Consent link minted without confirming its caller at their identity provider`.
+links are minted unconfirmed`. `PathNotCovered` is logged at `WARN` as `Consent link minted
+unconfirmed for a Transit Point or Fabric caller: its grant is also released to the surface's
+Access Point callers`. The other reasons concern one caller or request, and are logged at
+`DEBUG` as `Consent link minted without confirming its caller at their identity provider`.
 The link fails instead only when the strategy cannot be read.
 
 | `reason` | The link does not confirm its caller because |
@@ -2046,7 +2051,9 @@ The link fails instead only when the strategy cannot be read.
 Consent confirmation therefore does not cover:
 
 - API key, mTLS and DID callers;
-- consent through a Transit Point or over Fabric, which is not confirmed;
+- consent through a Transit Point or over Fabric, which is not confirmed. A grant obtained
+  this way is stored under the same key, and is also released to the surface's Access Point
+  callers;
 - callers holding this gateway's own STS tokens, who sign in at no other identity provider;
 - a person who signs in as themselves on a link minted for them. They are confirmed, whoever
   sent them the link;
@@ -2072,6 +2079,8 @@ Consent confirmation therefore does not cover:
 3. `GET {callback_path}/confirm` checks, in order:
    - the `state` is a confirmation state this gateway sealed;
    - the browser presents its binding cookie;
+   - the surface the link was minted on still exists and is still of the sealed tenant, or
+     the request is refused with `consent_state_invalid`;
    - the state has not been used. It is claimed now, so every later refusal, an identity
      provider `error` included, uses it up;
    - the provider is unchanged, and its setting still names the sealed strategy;
@@ -2089,7 +2098,11 @@ Consent confirmation therefore does not cover:
    - the strategy verifies the ID token: its signature, `typ` `JWT` when set, `iss`, an `aud`
      naming the login client (and `azp` naming it when set or when there are several
      audiences), `exp`, an `iat` no earlier than the sign-in began less clock skew, and the
-     sealed `nonce`;
+     sealed `nonce`. A token that fails is refused with `consent_identity_missing` and logged
+     as a `WARN` with a coarse `cause` (`token`, `issuer`, `audience`, `expired`, `claims`,
+     `nonce`, `iat` or `malformed`, or `no_id_token` for an answer without one) and no claim
+     value. A JWKS that cannot be fetched refuses
+     the request with `credentials_unavailable` instead (`cause` `jwks_unavailable`);
    - the identity hash recomputed from the ID token is the sealed one. The value is the
      ID-token claim's, and it is hashed under the strategy's claim name, as the caller's access
      token was.
@@ -2153,9 +2166,21 @@ Otherwise every confirmation is refused with `consent_identity_mismatch`.
   On Entra, use `oid` from the start.
 - When replacing a strategy, point `consent_confirmation.jwt_verification_strategy_id` at the
   new one before deleting the old
-  ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)). Nothing
-  checks that a deleted strategy is unused: while the setting still names it, the provider's
-  legacy consent links are minted without confirming their caller (`StrategyUnavailable`).
+  ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)).
+  `DELETE /v1/jwt-verification-strategies/{id}` answers `409` while a credential provider's
+  `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names
+  the strategy ([Records that are still in use](#records-that-are-still-in-use)).
+- Before rolling back to a release without the setting, switch it off. An older release
+  ignores it and mints every link unconfirmed, with no `WARN`. After rolling forward again,
+  check that the provider still stores the setting.
+- A start link's ten-minute lifetime covers both sign-ins: the vendor state expires with the
+  start state. A link opened late can expire at the vendor callback after the person
+  authorized at the vendor; they then start again from the agent.
+- Grants stored before the setting was enabled are kept as they are. To have callers consent
+  again through the confirmation, remove the provider's entries from the vault
+  ([Management API](#management-api)).
+- An identity provider `redirect_uri` error right after the start page means
+  `{redirect URI}/confirm` is not registered on the login client.
 
 ### State
 
