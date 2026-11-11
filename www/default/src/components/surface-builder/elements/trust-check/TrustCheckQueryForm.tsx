@@ -6,9 +6,8 @@ import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import FormSelect, { type FormSelectOption } from '../../../shared/FormSelect';
 import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
+import { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE } from './templates';
 import {
-  AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
-  INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
   authorityNeedsSelection,
   classifyTargetAuthoritySelection,
   readSubjectPickerState,
