@@ -3737,6 +3737,26 @@ async fn delegation_audit_trail_contains_event(
     assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
 }
 
+#[then(expr = "the delegation audit trail has no event {string} for OAuth provider {string}")]
+async fn delegation_audit_trail_has_no_event(
+    world: &mut SurfaceWorld,
+    event: String,
+    provider: String,
+) {
+    let events = read_delegation_audit_events(world).await;
+    let found = events.iter().find(|entry| {
+        entry
+            .get("event")
+            .and_then(|value| value.as_str())
+            == Some(event.as_str())
+            && entry
+                .get("provider_id")
+                .and_then(|value| value.as_str())
+                == Some(provider.as_str())
+    });
+    assert!(found.is_none(), "expected no delegation audit event '{event}' for provider '{provider}', got {found:?}");
+}
+
 #[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]
 async fn delegation_audit_trail_records_refused_consent(
     world: &mut SurfaceWorld,
