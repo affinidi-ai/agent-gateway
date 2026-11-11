@@ -33,4 +33,11 @@ changes:
         in the job summary. A finding blocks the run, so a release image with a fixable finding never
         gets a version tag, unless the TRIVY_ENFORCE repository variable is set to false. The boot
         probe also checks for missing shared libraries.
+    - timestamp: '2026-11-11T00:00:00.000Z'
+      title: Publish a release only from a pull request opened by the release app
+      description: >-
+        The release gate now requires the merged release pull request to be authored by the release
+        app, not by any bot account, and the tag push passes the app token to git through its
+        environment instead of the remote URL, so it no longer appears in a process listing.
+        Dependabot waits seven days before proposing a new release of a dependency.
   breaking: []

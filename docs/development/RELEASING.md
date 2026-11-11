@@ -88,7 +88,7 @@ PR title as its message, so keep it in the `chore(release): …` form if you edi
 ## Publish release
 
 "Publish release" runs on a push to `main` that touches `Cargo.toml` or `CHANGELOG.md`, but only
-publishes when the pushed commit is the squash-merge of a pull request that was opened by a bot from a
+publishes when the pushed commit is the squash-merge of a pull request that was opened by the release app (`affinidi-semantic-release[bot]`) from a
 `release/v*` branch of this repository. A `gate` job checks that through the GitHub API, so an
 unrelated merge (a Dependabot bump, a hand-edited `CHANGELOG.md`) never reaches the `release`
 environment or its secrets. The `publish` job then:
