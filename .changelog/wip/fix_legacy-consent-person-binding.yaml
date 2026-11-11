@@ -1,0 +1,21 @@
+branch: fix/legacy-consent-person-binding
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: ⭐ Confirm the caller at their identity provider before legacy consent
+      description: >-
+        A legacy authorization code credential provider can now carry a consent_confirmation
+        setting that names a login client at the callers' identity provider and the JWT
+        verification strategy that identifies them. When a JWT caller verified by that strategy
+        opens a consent link, the gateway first signs them in at the identity provider, verifies
+        the ID token and checks that it names the same person the link was issued to, and only
+        then continues to the vendor. Another person is refused with 403 before the vendor is
+        reached. Saving the setting checks the provider type, the strategy and its tenant, both
+        endpoints, the client secret, the confirmation redirect URI, the principal claim and the
+        identity hash pepper. Providers without the setting, API key callers, and Transit and
+        Fabric consent behave as before.
+  breaking: []
