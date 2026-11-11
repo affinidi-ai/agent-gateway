@@ -124,7 +124,7 @@ affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = [
     "agent-names",
 ] }
 affinidi-messaging-sdk = "0.30.1"
-trust-tasks-rs = "0.24.8"
+trust-tasks-rs = "0.37.2"
 
 affinidi-messaging-didcomm = "0.15.9"
 affinidi-tdk-common = "0.6.11"
