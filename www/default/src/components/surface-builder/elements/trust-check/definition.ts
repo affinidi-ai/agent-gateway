@@ -10,6 +10,7 @@ import * as Cap from '../capabilities';
 import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } from '../types';
 import TrustCheckPanel from './TrustCheckPanel';
 import TrustCheckFullscreenPanel from './TrustCheckFullscreenPanel';
+import { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE } from './templates';
 import { DOCS_URL } from '../../../../config/docs';
 import {
   authoritySourceFor,
@@ -50,16 +51,7 @@ export const AUTHORITY_ID_TEMPLATE = '{{ input.agent.provider_did }}';
 export const AGENT_DID_TEMPLATE = '{{ input.agent.did }}';
 export const AGENT_AUTHORITY_DID_TEMPLATE = '{{ input.agent.authority_did }}';
 export const EXTENSION_IDENTITY_DID_TEMPLATE = '{{ input.extension_identity.did }}';
-export const AGENT_IDENTITY_ISSUER_DID_TEMPLATE = '{{ input.agent.identity_issuer_did }}';
-/**
- * The `{{ input.gateway.source_id }}` template resolves at runtime to
- * the DID of the **sending gateway** on the fabric-inbound receive path
- * (populated by `process_forward_request` on GW2). On direct inbound
- * (non-fabric) the value is `null` and the template resolves empty — the
- * Trust Check probe then denies fail-safe. Only meaningful on the caller
- * leg (`ap-ma`) of surfaces that are reachable via `fabric://`.
- */
-export const INPUT_GATEWAY_SOURCE_ID_TEMPLATE = '{{ input.gateway.source_id }}';
+export { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE };
 
 /**
  * Auto-injected `entity_id` template. Both legs default to the single
