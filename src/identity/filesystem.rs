@@ -2088,7 +2088,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("rotation_count");
-        legacy["rotations"] = serde_json::json!([{ "rotated_at": "1970-01-01T00:02:00Z" }]);
+        legacy["rotations"] = serde_json::json!([{ "rotated_at": at(120) }]);
         std::fs::write(temp_dir.path().join("h.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
         let store = FilesystemIdentityStore::new(temp_dir.path())
             .await
