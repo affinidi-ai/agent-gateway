@@ -60,9 +60,10 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   gateways (the restart backfill of a peer's issuer DID, 50 concurrent MCP calls over the
   fabric). Each of those scenarios passes when run alone, and the commit before the VTA crates
   were linked passed every full run. The failures also appear on the commit that only adds the
-  dependencies, so they do not come from the signing change. Until it is traced to a resolver
-  version, run the suite more than once and read a single failing scenario as suspect, not as
-  proof.
+  dependencies, so they do not come from the signing change. Until it is traced, run the suite more than once and read a single failing scenario as
+  suspect, not as proof. Pinning the resolver to 0.8.43 with `vta-service` 0.78 lowered the
+  failure rate (one failing full run in four) without removing it, so the resolver version alone
+  does not explain it.
 
 ## Tenancy and publication
 
