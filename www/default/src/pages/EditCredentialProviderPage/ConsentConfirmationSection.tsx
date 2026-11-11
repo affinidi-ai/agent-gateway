@@ -260,19 +260,36 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                   data-testid="credential-provider-consent-confirmation-redirect-uri-copy"
                 />
               </div>
-            ) : (
-              isNew && (
-                <div
-                  className="alert alert-info mt-2 mb-0"
-                  style={{ fontSize: '14px' }}
-                  data-testid="credential-provider-consent-confirmation-redirect-uri-after-create"
-                >
-                  <i className="fas fa-info-circle me-2"></i>
-                  The Confirmation redirect URI is shown once the provider is created, since it ends
-                  in the provider&apos;s Callback URL.
-                </div>
-              )
+            ) : null}
+            {redirectUri && (
+              <div
+                className="form-text"
+                data-testid="credential-provider-consent-confirmation-redirect-uri-where"
+              >
+                Add this URI to the allowed redirect URIs of the login client
+                {form.cc_client_id.trim() ? (
+                  <>
+                    {' '}
+                    <code>{form.cc_client_id.trim()}</code>
+                  </>
+                ) : null}{' '}
+                at your identity provider. Don&apos;t add it at the vendor: the vendor&apos;s OAuth
+                app keeps the Callback URL above.
+              </div>
             )}
+            {redirectUri
+              ? null
+              : isNew && (
+                  <div
+                    className="alert alert-info mt-2 mb-0"
+                    style={{ fontSize: '14px' }}
+                    data-testid="credential-provider-consent-confirmation-redirect-uri-after-create"
+                  >
+                    <i className="fas fa-info-circle me-2"></i>
+                    The Confirmation redirect URI is shown once the provider is created, since it
+                    ends in the provider&apos;s Callback URL.
+                  </div>
+                )}
           </div>
         </>
       )}

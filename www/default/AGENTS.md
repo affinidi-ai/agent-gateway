@@ -1157,7 +1157,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   read-only **Confirmation redirect URI**
   (`credential-provider-consent-confirmation-redirect-uri`, copy button
   `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
-  shows followed by `/confirm`, which is what the gateway registers; a new provider shows a notice
+  shows followed by `/confirm`, which is what the gateway registers. Under it a line
+  (`credential-provider-consent-confirmation-redirect-uri-where`) says to add it to the allowed
+  redirect URIs of the login client, naming the Login Client ID once one is typed, at the
+  identity provider, and not at the vendor, whose OAuth app keeps the Callback URL; a new provider shows a notice
   in its place (`credential-provider-consent-confirmation-redirect-uri-after-create`). Save
   refuses a blank required field first (`missingConsentConfirmationField`) and sends
   `consentConfirmationField`: the setting while on (a blank principal claim left out), `null`

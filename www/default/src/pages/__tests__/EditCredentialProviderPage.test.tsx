@@ -1012,6 +1012,11 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     setup(legacy({ consent_confirmation: SETTING }));
     expect(await screen.findByTestId(SWITCH)).toBeChecked();
     expect(screen.getByTestId(REDIRECT_URI)).toHaveValue(`${CALLBACK}/confirm`);
+    const where = screen.getByTestId('credential-provider-consent-confirmation-redirect-uri-where');
+    expect(where).toHaveTextContent(
+      `Add this URI to the allowed redirect URIs of the login client ${SETTING.client_id} at your identity provider.`
+    );
+    expect(where).toHaveTextContent('Callback URL above');
     expect(await screen.findByRole('option', { name: 'Entra callers' })).toBeInTheDocument();
     expect(
       screen.getByTestId('credential-provider-consent-confirmation-strategy-select')
