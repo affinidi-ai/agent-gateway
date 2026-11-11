@@ -477,7 +477,7 @@ authorization server, whose grants another system obtains through the browser wi
 | `scope_comparison` | Optional, `exact` by default: how the scopes the token endpoint grants are compared with those asked for ([Granted scopes](#granted-scopes)) |
 | `revocation_ends_authorization` | Optional, `false` by default. `true` for a vendor whose revocation of any one token ends the person's whole authorization of the client, as Google's does ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)) |
 | `send_resource` | Optional, `true` by default: the code exchange and every refresh send `resource` to the token endpoint, which binds the token's audience to it (RFC 8707). `false` sends it on neither, so the token carries no such binding and its audience follows the scopes alone (Entra: `<resource>/.default`); use it only for a token endpoint that refuses the parameter, such as the Microsoft identity platform v2.0 one (AADSTS901002). It never loosens where the grants may be sent: `resource` is still required and is still the only origin they go to. The API names it only when `false` |
-| `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
+| `additional_params`, `consent_identity_strategy_id`, `consent_confirmation`, `api_key_secret_ref` | Refused |
 
 An external consent provider uses its own tenant's secrets only, for its client secret, its
 signing key and its certificate: never an untenanted secret, nor another tenant's, since its
@@ -1911,18 +1911,20 @@ provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-record
 
 | `reason` | Refused because |
 | --- | --- |
-| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of the other stage, or the start POST's binding cookie cannot be sent |
+| `consent_state_invalid` | The state is missing, not sealed by this gateway, expired, or of another stage, or the start POST's binding cookie cannot be sent; or the provider's [`consent_confirmation`](#consent-confirmation) or its strategy changed since the link was minted |
 | `consent_state_reused` | The start state or callback state was already used on this process |
 | `consent_provider_mismatch` | The path's last segment is not that of the state's provider's `callback_path`, or that provider is gone or changed |
-| `browser_binding_mismatch` | The callback has no binding cookie, or another browser's |
-| `iss_missing`, `iss_mismatch` | The callback lacks, or differs from, the provider's `authorization_response_issuer` |
+| `browser_binding_mismatch` | The callback or the confirmation callback has no binding cookie, or another browser's (`403`) |
+| `iss_missing`, `iss_mismatch` | The callback lacks, or differs from, the provider's `authorization_response_issuer`; or the confirmation callback carries an `iss` other than its strategy's `expected_issuer` |
 | `consent_response_invalid` | The callback is malformed, carries no code, or an `error` outside `[A-Za-z0-9_]{1,128}` |
-| `consent_denied` | The provider answered with an `error` |
+| `consent_denied` | The provider, or the identity provider of a consent confirmation, answered with an `error` |
+| `consent_identity_missing` | The consent confirmation sign-in gave no ID token, one that fails verification, or one without the claim that names the caller (`403`) |
+| `consent_identity_mismatch` | The consent confirmation ID token names another caller than the one the link was minted for (`403`) |
 | `redirect_uri_invalid` | The provider's redirect URI breaks the rules in [Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider) or is another provider's |
 | `authorization_url_invalid` | The provider's authorization endpoint or `additional_params` break the rules in [The start page](#the-start-page) |
 | `cross_site_consent_start` | The start POST did not come from the start page's origin |
-| `credentials_unavailable` | The provider or its client ID could not be read |
-| `token_exchange_failed` | The provider's token endpoint refused or failed the exchange |
+| `credentials_unavailable` | The provider, its client ID, the consent confirmation strategy or the login client's secret could not be read |
+| `token_exchange_failed` | The provider's token endpoint, or the consent confirmation login client's, refused or failed the exchange |
 | `vault_store_rejected` | The token was obtained but could not be stored (`500`) |
 
 Once the state is claimed the code is exchanged; an exchange that fails uses the state up, as
@@ -1943,13 +1945,197 @@ They do not stop a person who opens and confirms a start link someone else sent 
 someone who opens a forwarded start link before its intended person: the browser that confirms
 the start page first is the one the grant is bound to, and the grant is stored under the agent
 and user the link was made for. The start page names the agent, surface and provider so a
-person can notice a link that is not theirs. Single use of start and callback states is
+person can notice a link that is not theirs. A provider with
+[consent confirmation](#consent-confirmation) also has the person sign in at the callers'
+identity provider first, and refuses anyone but the caller the link was minted for. Single use of start and callback states is
 remembered per gateway process, for 15 minutes, so a restart or another replica behind the same
 callback URL does not know a state was used; see
 [Network](DEPLOYMENT_REQUIREMENTS.md#network). Script served on the gateway's own origin, such
 as the dashboard, could still set a binding cookie, since `__Host-` only keeps other hosts out,
 though in a browser that sends fetch metadata it cannot confirm a start page without the
 person's click.
+
+### Consent confirmation
+
+A provider's `consent_confirmation` has the person sign in at the callers' identity provider
+before the gateway sends them to the vendor. The gateway checks that the ID token names the
+caller the consent link was minted for, by recomputing that caller's
+[identity hash](#the-callers-identity-hash). For a caller it can confirm
+([Who is confirmed](#who-is-confirmed)), anyone else who opens the link is refused before the
+vendor, so the vendor issues them no token. The setting is off by default and is set per
+provider. It changes how new consent is obtained, not how stored grants are found or sent.
+
+#### The setting
+
+| Field | Meaning |
+| --- | --- |
+| `client_id` | The gateway's login client at the callers' identity provider. A plain value: a client id is not a secret |
+| `client_secret_secret_ref` | The secret ID of the login client's secret, checked with the provider's other [secret references](#provider-secrets-belong-to-the-providers-tenant) |
+| `authorization_endpoint` | The identity provider's authorization endpoint |
+| `token_endpoint` | The identity provider's token endpoint. The code exchange goes through the provider egress |
+| `jwt_verification_strategy_id` | The JWT verification strategy that verifies the ID token. Its `expected_issuer` and `principal_claim` decide which callers are confirmed |
+| `id_token_principal_claim` | Optional. The ID-token claim that holds the caller's value, when it is not the strategy's `principal_claim` (see [Which claim names the caller](#which-claim-names-the-caller)) |
+
+Register `{redirect URI}/confirm` as the login client's redirect URI at the identity provider,
+where `{redirect URI}` is the provider's own
+([Redirect URI and issuer of an authorization code provider](#redirect-uri-and-issuer-of-an-authorization-code-provider)).
+
+On create and update, a provider with the setting is refused with `400` and this `error`:
+
+| Refused when | `error` |
+| --- | --- |
+| The provider is not legacy consent | `consent_confirmation is allowed only on an oauth2_authorization_code provider without issuer` |
+| `AG_IDENTITY_HASH_PEPPER` is not set | `consent_confirmation needs AG_IDENTITY_HASH_PEPPER to be set` |
+| A required field is blank | `consent_confirmation needs client_id, client_secret_secret_ref and jwt_verification_strategy_id` |
+| `client_id` is too long or has whitespace | `consent_confirmation.client_id must be at most 2048 characters, without whitespace` |
+| `id_token_principal_claim` names no caller | `consent_confirmation.id_token_principal_claim: …` |
+| `authorization_endpoint` is not an `https` URL with a host and no query or fragment | `consent_confirmation.authorization_endpoint: …`, or `consent_confirmation.authorization_endpoint must be an https URL with a host and no query or fragment` |
+| `token_endpoint` breaks the [token endpoint rules](#https-token-endpoints) | `consent_confirmation.token_endpoint: …`, or `consent_confirmation.token_endpoint must be an https URL` |
+| The strategy does not exist, the provider's tenant or the token's scope cannot reference it, or its `principal_claim` names no caller | `Consent confirmation strategy is invalid or not accessible` |
+| The strategy expects this gateway's own `sts.mcp_issuer` | `consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else` |
+| An Entra caller is named by `sub` | `consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid` |
+| A caller is named by `email` | `consent_confirmation cannot name a caller by email, which the sign-in does not ask for` |
+| The ID-token claim is one a person can change ([Which claim names the caller](#which-claim-names-the-caller)) | `consent_confirmation cannot name a caller by a claim the person can change at their identity provider: use an immutable claim the identity provider assigns, such as sub or oid` |
+
+On update, an absent `consent_confirmation` keeps the stored setting, `null` clears it, and a
+value replaces it. Every update checks the setting it keeps. Once `AG_IDENTITY_HASH_PEPPER` is
+unset or the strategy is deleted, every edit of the provider is therefore refused until the
+update sends `consent_confirmation: null`.
+
+#### Who is confirmed
+
+A consent link confirms its caller when all of these hold:
+
+- the request reached the surface's Access Point;
+- the setting and its strategy still pass the save rules above;
+- the caller is a `jwt_bearer` caller whose `iss` is the strategy's `expected_issuer` and whose
+  principal claim is the strategy's `principal_claim`;
+- the caller's identity hash is the one the strategy gives that caller.
+
+Which strategy verified the caller does not matter. Another strategy with the same issuer and
+claim gives the same identity hash, so its callers are confirmed too.
+
+Any other caller is minted a link as if the provider had no setting, and its start page leads
+straight to the vendor. The gateway logs this at `DEBUG`, once per provider, surface and
+reason, as `Consent link minted without confirming its caller at their identity provider`,
+with no detail of the caller. The link fails instead only when the strategy cannot be read.
+
+| `reason` | The link does not confirm its caller because |
+| --- | --- |
+| `PathNotCovered` | The request came through a Transit Point or over Fabric |
+| `NotLegacyConsent` | The provider is no longer legacy consent |
+| `PepperUnset` | `AG_IDENTITY_HASH_PEPPER` is not set |
+| `NotJwtCaller` | The caller is not a `jwt_bearer` caller, or there is none |
+| `StrategyUnavailable` | The strategy is gone, the provider's tenant cannot reference it, or its `principal_claim` names no caller |
+| `GatewayIssuer` | The strategy expects this gateway's own `sts.mcp_issuer` |
+| `EntraCallerNamedBySub` | The strategy or `id_token_principal_claim` names an Entra caller by `sub` |
+| `IdTokenClaimInvalid` | `id_token_principal_claim` names no caller |
+| `EditableClaim` | The strategy or the ID token names the caller by `email`, or the ID token by another claim a person can change |
+| `OtherIssuer`, `OtherPrincipalClaim`, `OtherIdentityHash` | The caller's issuer, principal claim or identity hash is not the strategy's |
+
+Consent confirmation therefore does not cover:
+
+- API key, mTLS and DID callers;
+- consent through a Transit Point or over Fabric, which is not confirmed;
+- callers holding this gateway's own STS tokens, who sign in at no other identity provider;
+- a person who signs in as themselves on a link minted for them. They are confirmed, whoever
+  sent them the link;
+- an identity provider with pairwise `sub` and no claim that is the same in both clients (see
+  below).
+
+#### The flow
+
+1. The start page says the person signs in to their identity provider first, and its button
+   reads "Sign in, then continue to {provider}".
+2. The start POST checks the setting again. The setting must still name the sealed strategy,
+   the strategy must exist with the provider's tenant able to reference it, and its issuer,
+   JWKS source and principal claim must be unchanged. The `authorization_endpoint` must pass
+   the save rules, without its host being resolved. The POST then answers `302` to the
+   `authorization_endpoint` with `response_type=code`, the login `client_id`,
+   `redirect_uri={redirect URI}/confirm`, `scope`, a confirmation `state`, a random `nonce`
+   sealed in that state, a PKCE `S256` challenge and `response_mode=query`. The scope is
+   `openid` when the ID-token claim is `sub`, and `openid profile` otherwise. The binding
+   cookie is set as for the vendor. A POST refused here leaves the start state unused.
+3. `GET {callback_path}/confirm` checks, in order:
+   - the `state` is a confirmation state this gateway sealed;
+   - the browser presents its binding cookie;
+   - the state has not been used. It is claimed now, so every later refusal, an identity
+     provider `error` included, uses it up;
+   - the provider is unchanged, and its setting still names the sealed strategy;
+   - the identity provider sent no `error`, and sent a `code`;
+   - the strategy still exists, the provider's tenant can reference it, its issuer, JWKS
+     source and principal claim are unchanged, and the setting still passes the save rules;
+   - an `iss` (RFC 9207), when sent, is the strategy's `expected_issuer`. A response without
+     `iss` is accepted, since no identity provider metadata is fetched;
+   - the code exchange at `token_endpoint`, with the login client's id and secret and the PKCE
+     verifier, through the pinned provider egress within its timeout, answers an `id_token`.
+     A failed exchange is logged as a `WARN` with its cause, or with the HTTP status and the
+     OAuth `error` code the token endpoint answered;
+   - the strategy verifies the ID token: its signature, `typ` `JWT` when set, `iss`, an `aud`
+     naming the login client (and `azp` naming it when set or when there are several
+     audiences), `exp`, an `iat` no earlier than the sign-in began less clock skew, and the
+     sealed `nonce`;
+   - the identity hash recomputed from the ID token is the sealed one. The value is the
+     ID-token claim's, and it is hashed under the strategy's claim name, as the caller's access
+     token was.
+
+   The gateway then answers `302` to the vendor with a new vendor state on the same browser
+   binding, so the cookie stays as it is, with a fresh nonce and PKCE verifier. It expires
+   with the start state or ten minutes from now, whichever is sooner, so the sign-in and the
+   vendor's consent both fit in the start link's lifetime. The gateway reads only the
+   `id_token` from the exchange and drops it after the check. It logs and audits nothing of
+   it, and creates no session.
+
+The vendor callback accepts that vendor state, or a callback state of a link minted without
+confirmation. It refuses any other state with `400` `consent_state_invalid`: a start state, a
+confirmation state, and a state in the format of links without confirmation that carries a
+confirmation stage. It stores nothing and leaves the binding cookie, which expires with its
+state. Such a state is not one sealed for the callback, so the refusal is logged but not
+audited.
+
+Refusals at `/confirm` show the fixed refusal page, clear the binding cookie when the state
+names it, store nothing,
+and use the reasons in the table under [The callback](#the-callback). `consent_identity_mismatch`,
+`consent_identity_missing` and `browser_binding_mismatch` answer `403`. The others, which are
+about the state, the strategy or the setting, answer `400`.
+
+#### Which claim names the caller
+
+The strategy's `principal_claim` names the caller in the access token, and the ID token must
+name the same person by the same value.
+
+| Identity provider | `principal_claim` |
+| --- | --- |
+| Google, Okta, Auth0, Keycloak | `sub` |
+| Microsoft Entra | `oid`. `sub` is refused, since Entra issues it per application. This holds on every Entra host: `login.microsoftonline.com`, `sts.windows.net`, `login.microsoftonline.us`, `login.chinacloudapi.cn`, `login.partner.microsoftonline.cn` and the subdomains of `ciamlogin.com`. Use v2 tokens, so the access token and the ID token carry the same `iss` ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)) |
+| Any | `email` is refused, as the strategy's claim or as `id_token_principal_claim` |
+
+The ID-token claim must be immutable and assigned by the identity provider. A claim a person
+can change is refused as the ID-token claim: `preferred_username`, `nickname`, `name`,
+`given_name`, `family_name`, `upn`, `unique_name`, `email` and `phone_number`.
+
+`id_token_principal_claim` only chooses which ID-token claim supplies the value. The value is
+always hashed under the strategy's claim name. Use it for an identity provider whose ID token
+names the person under another claim than its access token. For example, an access token
+names the person by `sub` and the ID token by `uid`: the strategy keeps `sub`, and
+`id_token_principal_claim` is `uid`.
+
+An identity provider with pairwise `sub` gives the login client a different `sub` from the one
+in the caller's access token. Name callers by a claim that is the same for both clients.
+Otherwise every confirmation is refused with `consent_identity_mismatch`.
+
+#### Turning it on
+
+- Enable the setting only after every gateway instance runs a release that supports it. An
+  older instance cannot open the states a confirming link uses, and refuses them.
+- Links minted before the setting was turned on do not confirm their caller. They stay usable
+  for the rest of their ten-minute lifetime.
+- A strategy's `principal_claim` is fixed when it is created
+  ([Which claim names a JWT caller](SOURCE_AUTH.md#which-claim-names-a-jwt-caller)), so changing
+  it means a new strategy. Every caller's identity hash then changes, and every caller consents
+  again (see
+  [Removing grants keyed by the old identity hash](#removing-grants-keyed-by-the-old-identity-hash)).
+  On Entra, use `oid` from the start.
 
 ### State
 
@@ -1963,15 +2149,16 @@ provider nor anyone else who sees a URL can read it (the PKCE code verifier incl
 one naming a different agent or user. When encryption at rest is enabled, its key seals the
 state; otherwise a key derived from `AG_IDENTITY_HASH_PEPPER` does, so gateways that share the
 pepper can open each other's states
-([`encode_oauth_state`, `decode_start_state`, `decode_callback_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
+([`encode_oauth_state`, `decode_start_state`, `decode_confirmation_state`, `decode_callback_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
 
 The code exchange, the legacy and `2026-07-28` refresh, and the `2026-07-28` consent exchange
 use the same pinned client as service tokens (see _Service tokens_): redirects are not
 followed, and a token endpoint resolving to a blocked address is refused before any request.
 
 The start page and the callback live under `/v1/identity/oauth/callback` unless `gateway.json`
-sets `oauth_callback_route`; a reverse proxy in front of the gateway must forward both
-`{route}/{segment}` and `{route}/{segment}/start`, where `{segment}` is the provider's id for a
+sets `oauth_callback_route`; a reverse proxy in front of the gateway must forward
+`{route}/{segment}`, `{route}/{segment}/start` and, for [consent confirmation](#consent-confirmation),
+`{route}/{segment}/confirm`, where `{segment}` is the provider's id for a
 new provider and its `provider_id` for one stored before. On success the gateway stores the
 token and issues a `DelegationCredential`, a verifiable credential recording the
 delegation chain, kept with the token as `delegation_vc`.
