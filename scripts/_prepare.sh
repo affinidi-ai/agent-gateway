@@ -155,11 +155,10 @@ spa_reserved_routes() {
   ' "$1"
 }
 
-# Warns when a prefix in <gateway_json> shadows a dashboard page. The gateway
-# starts anyway but does not serve that prefix, and logs it (see
-# spa_collision_warning in src/proxy/paths.rs); warning while the env is
-# prepared says so before the first request goes missing. Nothing is rewritten:
-# the developer renames the prefix.
+# Fails when a prefix in <gateway_json> shadows a dashboard page, which the
+# gateway does not serve (see spa_collision_warning in src/proxy/paths.rs).
+# Catching it while the env is prepared says so before the first request goes
+# missing. Nothing is rewritten: the developer renames the prefix.
 #
 # The comparison matches the runtime's: the first path segment of the prefix,
 # lowercased, against the reserved list — so /svc/payments is fine and
@@ -222,14 +221,14 @@ check_reserved_dashboard_routes() {
   done <<< "${prefixes}"
 
   if [[ -n "${collisions}" ]]; then
-    echo "⚠️  Reserved dashboard routes are shadowed by ${gateway_json}:"
+    echo "❌ Reserved dashboard routes are shadowed by ${gateway_json}:"
     printf '%s' "${collisions}"
-    echo "   The gateway starts, but does not serve these prefixes, since they would"
-    echo "   answer those dashboard pages instead of the dashboard."
+    echo "   The gateway does not serve these prefixes, since they would answer"
+    echo "   those dashboard pages instead of the dashboard."
     echo "   Fix: rename each prefix (of a channel, an MCP proxy, or a proxy or redirect"
     echo "   route, in that gateway.json) to one that is not a dashboard page,"
     echo "   e.g. '/svc/<name>'. Clients calling it must use the new prefix."
-    return 0
+    exit 1
   fi
 
   echo "✅ No prefix in gateway.json shadows a reserved dashboard route"
