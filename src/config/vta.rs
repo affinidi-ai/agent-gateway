@@ -26,31 +26,6 @@ pub enum VtaTransport {
     Tsp,
 }
 
-/// Deployment shape of the VTA the gateway signs with.
-///
-/// This is **not** a custody tier and must never be presented as one. A
-/// bundled sidecar shares a host and a blast radius with the gateway, so the
-/// gateway holding super-admin over it changes nothing about who could reach
-/// the keys — which is precisely why no custody claim attaches to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum VtaMode {
-    /// A separately-operated VTA the gateway is a least-privilege client of.
-    #[default]
-    Appliance,
-    /// `vta-service` shipped inside the gateway's own deployment unit — a
-    /// sidecar container, a second process in the Pod, a systemd bundle —
-    /// reached over loopback or a unix socket.
-    ///
-    /// Spelled `embedded` on the wire for compatibility with config written
-    /// before the shape was named; the semantics are **bundled packaging**,
-    /// never an in-process library. Linking is blocked by a dependency
-    /// conflict (see VTA-02/VTA-21), and the gateway code path here is
-    /// identical to a remote VTA — only the endpoint differs.
-    #[serde(rename = "embedded", alias = "bundled")]
-    Bundled,
-}
-
 /// How the gateway names itself when it authenticates to its trust agent.
 ///
 /// `did:key` is the key itself: nothing to host, nothing for the agent to
@@ -73,47 +48,8 @@ impl ControlDidMethod {
     }
 }
 
-impl VtaMode {
-    /// Operator-facing tier label, surfaced by the management API and the
-    /// dashboard.
-    pub fn tier(self) -> &'static str {
-        match self {
-            Self::Appliance => "self-hosted",
-            Self::Bundled => "bundled",
-        }
-    }
-
-    /// Whether this deployment supports a key-custody claim.
-    ///
-    /// A bundled sidecar never does: it shares a host, a disk and an operator
-    /// with the gateway, so "the keys are held by a separate agent" is not a
-    /// property the deployment actually has. Saying otherwise in product copy
-    /// would be the single most damaging thing this integration could do.
-    pub fn supports_custody_claim(self) -> bool {
-        matches!(self, Self::Appliance)
-    }
-
-    /// Whether the gateway may hold super-admin over this VTA, and therefore
-    /// auto-provision contexts and self-grant.
-    ///
-    /// Only on the bundled tier, where it grants no authority the gateway's own
-    /// host does not already have. On any separately-operated VTA the grant is
-    /// the customer's to give, and must stay least-privilege.
-    pub fn allows_self_administration(self) -> bool {
-        matches!(self, Self::Bundled)
-    }
-}
-
-fn default_bootstrap_dir() -> String {
-    "/bootstrap".to_string()
-}
-
-fn default_bootstrap_wait_secs() -> u64 {
-    90
-}
-
 fn default_control_key_rotation_days() -> u32 {
-    90
+    0
 }
 
 fn default_connection_key_switch_timeout_secs() -> u64 {
@@ -122,10 +58,6 @@ fn default_connection_key_switch_timeout_secs() -> u64 {
 
 /// The longest interval between automatic control-key rotations: ten years.
 pub const MAX_CONTROL_KEY_ROTATION_DAYS: u32 = 3650;
-
-/// The context a bundled gateway is enrolled in. Fixed by the sidecar's
-/// entrypoint, so the gateway never chooses it.
-pub const BUNDLED_CONTEXT_ID: &str = "gateway";
 
 fn default_timeout_ms() -> u64 {
     5_000
@@ -288,10 +220,6 @@ pub struct VtaConfig {
     #[serde(default)]
     pub transport: VtaTransport,
 
-    /// Deployment shape. Defaults to `appliance`.
-    #[serde(default)]
-    pub mode: VtaMode,
-
     /// How the gateway's auth/control key (the Ed25519 `did:key` the gateway
     /// authenticates to the VTA with) is sourced: e.g. `env://VAR` or
     /// `file://path`. Optional in the PoC — when absent the connector uses an
@@ -317,31 +245,10 @@ pub struct VtaConfig {
     #[serde(default)]
     pub auth_did: Option<String>,
 
-    /// Connect to the bundled sidecar with no operator action: write the
-    /// gateway's control DID for the sidecar to enrol, wait for the sidecar's
-    /// own DID and pin it, authenticate, check the grant, and create the
-    /// signing key.
-    ///
-    /// Only for `mode = "embedded"` over loopback. With this on, `vta_did`,
-    /// `context_id` and `signing_key_id` come from the bootstrap and need not
-    /// be set; one that is set acts as an extra check.
-    #[serde(default)]
-    pub auto_bootstrap: bool,
-
-    /// The folder shared with the sidecar. The gateway writes
-    /// `gateway-enrolment.env` there and reads `vta-identity.env`. Public
-    /// data only: nothing secret is ever written here.
-    #[serde(default = "default_bootstrap_dir")]
-    pub bootstrap_dir: String,
-
-    /// How long startup waits for the sidecar to publish its identity and
-    /// answer, before reporting `waiting_for_vta`.
-    #[serde(default = "default_bootstrap_wait_secs")]
-    pub bootstrap_wait_secs: u64,
-
     /// Days between automatic rotations of the control key the gateway
-    /// authenticates to its bundled trust agent with. `0` turns automatic
-    /// rotation off. Only the bundled tier rotates; read at startup.
+    /// authenticates to its trust agent with, through `acl/swap-key`. `0`
+    /// (the default) turns automatic rotation off. Applies only to a
+    /// `did:key` control key the gateway holds itself; read at startup.
     #[serde(default = "default_control_key_rotation_days")]
     pub control_key_rotation_days: u32,
 
@@ -446,12 +353,8 @@ impl Default for VtaConfig {
             context_id: None,
             signing_key_id: None,
             transport: VtaTransport::default(),
-            mode: VtaMode::default(),
             auth_key_source: None,
             auth_did: None,
-            auto_bootstrap: false,
-            bootstrap_dir: default_bootstrap_dir(),
-            bootstrap_wait_secs: default_bootstrap_wait_secs(),
             control_key_rotation_days: default_control_key_rotation_days(),
             connection_key_switch_timeout_secs: default_connection_key_switch_timeout_secs(),
             control_did_method: None,
@@ -488,11 +391,6 @@ impl VtaConfig {
         if self.transport != VtaTransport::Rest {
             return Err(format!("[vta] transport = {:?} is not yet supported; only `rest` is wired", self.transport));
         }
-        // Both modes are wired: `appliance` talks to a separately-operated VTA,
-        // `embedded` (bundled) to one shipped in the gateway's own deployment
-        // unit. The gateway code path is identical — only the endpoint differs
-        // — which is exactly what makes switching between them a configuration
-        // change (VTA-21).
         let require = |field: &str, value: &Option<String>| -> Result<(), String> {
             match value {
                 Some(v) if !v.trim().is_empty() => Ok(()),
@@ -500,12 +398,8 @@ impl VtaConfig {
             }
         };
         require("base_url", &self.base_url)?;
-        if self.auto_bootstrap {
-            self.validate_auto_bootstrap()?;
-        } else {
-            require("vta_did", &self.vta_did)?;
-            require("context_id", &self.context_id)?;
-        }
+        require("vta_did", &self.vta_did)?;
+        require("context_id", &self.context_id)?;
         if let (Some(method), Some(publish)) = (self.control_did_method, self.publish_auth_did) {
             let publishes = method == ControlDidMethod::DidWebvh;
             if publishes != publish {
@@ -525,8 +419,14 @@ impl VtaConfig {
         // Pinned signing key last: an enabled connector that cannot sign is a
         // misconfiguration, so fail closed at startup rather than at the first
         // signing call.
-        if !self.auto_bootstrap {
-            require("signing_key_id", &self.signing_key_id)?;
+        require("signing_key_id", &self.signing_key_id)?;
+        if !(10..=3600).contains(&self.connection_key_switch_timeout_secs) {
+            return Err("[vta] connection_key_switch_timeout_secs must be between 10 and 3600".to_string());
+        }
+        if self.control_key_rotation_days > MAX_CONTROL_KEY_ROTATION_DAYS {
+            return Err(format!(
+                "[vta] control_key_rotation_days must be at most {MAX_CONTROL_KEY_ROTATION_DAYS} (0 turns rotation off)"
+            ));
         }
         // A quota window of zero would make the limit meaningless (every call
         // starts a fresh window), so reject it rather than silently disabling
@@ -588,68 +488,11 @@ impl VtaConfig {
         Ok(())
     }
 
-    /// What `auto_bootstrap` needs to be true. It connects to a sidecar this
-    /// deployment ships, so it is refused for anything else: a sidecar that is
-    /// reached over a network, or enrolled with a DID it cannot resolve.
-    fn validate_auto_bootstrap(&self) -> Result<(), String> {
-        if self.mode != VtaMode::Bundled {
-            return Err("[vta] auto_bootstrap is only for the bundled sidecar (`mode = \"embedded\"`)".to_string());
-        }
-        let base_url = self
-            .base_url
-            .as_deref()
-            .unwrap_or_default();
-        if !is_loopback_url(base_url) {
-            return Err(format!(
-                "[vta] auto_bootstrap needs a loopback `base_url` (127.0.0.1, localhost or [::1]); got `{base_url}`"
-            ));
-        }
-        if self.auth_did.is_some() {
-            return Err(
-                "[vta] auto_bootstrap enrols the gateway's own did:key, so `auth_did` must not be set".to_string()
-            );
-        }
-        if self.effective_control_did_method() != ControlDidMethod::DidKey {
-            return Err(
-                "[vta] auto_bootstrap enrols a did:key; set `control_did_method = \"did_key\"` or leave it unset"
-                    .to_string(),
-            );
-        }
-        if let Some(context) = self.context_id.as_deref()
-            && context != BUNDLED_CONTEXT_ID
-        {
-            return Err(format!(
-                "[vta] auto_bootstrap enrols the gateway in context `{BUNDLED_CONTEXT_ID}`; `context_id` must be that or unset"
-            ));
-        }
-        if self
-            .bootstrap_dir
-            .trim()
-            .is_empty()
-        {
-            return Err("[vta] bootstrap_dir must not be empty".to_string());
-        }
-        if self.bootstrap_wait_secs == 0 {
-            return Err("[vta] bootstrap_wait_secs must be greater than zero".to_string());
-        }
-        if !(10..=3600).contains(&self.connection_key_switch_timeout_secs) {
-            return Err("[vta] connection_key_switch_timeout_secs must be between 10 and 3600".to_string());
-        }
-        if self.control_key_rotation_days > MAX_CONTROL_KEY_ROTATION_DAYS {
-            return Err(format!(
-                "[vta] control_key_rotation_days must be at most {MAX_CONTROL_KEY_ROTATION_DAYS} (0 turns rotation off)"
-            ));
-        }
-        Ok(())
-    }
-
     /// The DID method the gateway authenticates as, decided in this order:
     ///
     /// 1. `auth_did` set: the operator hosts their own identity.
     /// 2. `control_did_method` set: that.
-    /// 3. a bundled sidecar: `did_key`, because it is reached over loopback and
-    ///    cannot resolve the gateway's public address.
-    /// 4. `publish_auth_did`, where `false` means `did_key`; otherwise
+    /// 3. `publish_auth_did`, where `false` means `did_key`; otherwise
     ///    `did_webvh`.
     pub fn effective_control_did_method(&self) -> ControlDidMethod {
         if let Some(auth_did) = self.auth_did.as_deref() {
@@ -662,9 +505,6 @@ impl VtaConfig {
         if let Some(method) = self.control_did_method {
             return method;
         }
-        if self.mode == VtaMode::Bundled {
-            return ControlDidMethod::DidKey;
-        }
         match self.publish_auth_did {
             Some(false) => ControlDidMethod::DidKey,
             _ => ControlDidMethod::DidWebvh,
@@ -675,37 +515,19 @@ impl VtaConfig {
     /// dashboard. Reported even when the block is disabled, so the UI can say
     /// "local key" rather than guessing.
     pub fn tier(&self) -> &'static str {
-        if !self.enabled {
-            "local"
+        if self.enabled {
+            "self-hosted"
         } else {
-            self.mode.tier()
+            "local"
         }
     }
 
-    /// Whether this deployment supports a key-custody claim.
-    ///
-    /// Disabled (local signing) and bundled both answer `false`: in neither
-    /// case are the keys held by anything the gateway's own host does not
-    /// already control. Nothing in product copy or the dashboard may claim
-    /// custody when this is `false`.
+    /// Whether this deployment supports a key-custody claim: only when the
+    /// gateway signs through a separately operated trust agent. Local signing
+    /// keeps the keys on the gateway's own host, so nothing in product copy or
+    /// the dashboard may claim custody then.
     pub fn supports_custody_claim(&self) -> bool {
         self.enabled
-            && self
-                .mode
-                .supports_custody_claim()
-    }
-}
-
-/// Whether `url` names this host alone.
-fn is_loopback_url(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else {
-        return false;
-    };
-    match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
-        None => false,
     }
 }
 
@@ -728,46 +550,30 @@ mod tests {
     }
 
     #[test]
-    fn a_bundled_block_authenticates_as_did_key_by_default() {
-        let cfg = block(r#"mode = "embedded""#);
-        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidKey);
-        cfg.validate().expect("valid");
-    }
-
-    #[test]
-    fn a_bundled_block_can_opt_in_to_did_webvh() {
-        let cfg = block("mode = \"embedded\"\ncontrol_did_method = \"did_webvh\"");
-        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
-        cfg.validate().expect("valid");
-    }
-
-    #[test]
-    fn an_appliance_block_keeps_did_webvh_by_default() {
+    fn a_block_authenticates_as_did_webvh_by_default() {
         let cfg = block("");
         assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
+        cfg.validate().expect("valid");
     }
 
     #[test]
-    fn publish_auth_did_false_still_means_did_key_on_an_appliance() {
+    fn a_block_can_opt_in_to_did_key() {
+        let cfg = block("control_did_method = \"did_key\"");
+        assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidKey);
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn publish_auth_did_false_still_means_did_key() {
         let cfg = block("publish_auth_did = false");
         assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidKey);
-    }
-
-    #[test]
-    fn publish_auth_did_does_not_override_a_bundled_default() {
-        let cfg = block("mode = \"embedded\"\npublish_auth_did = true");
-        assert_eq!(
-            cfg.effective_control_did_method(),
-            ControlDidMethod::DidKey,
-            "a bundled sidecar cannot resolve the gateway's public address"
-        );
     }
 
     #[test]
     fn an_explicit_auth_did_wins_over_every_setting() {
         let cfg = block("auth_did = \"did:webvh:Qm:host.example:gw\"\ncontrol_did_method = \"did_key\"");
         assert_eq!(cfg.effective_control_did_method(), ControlDidMethod::DidWebvh);
-        let key = block("mode = \"embedded\"\nauth_did = \"did:key:z6MkGw\"");
+        let key = block("auth_did = \"did:key:z6MkGw\"");
         assert_eq!(key.effective_control_did_method(), ControlDidMethod::DidKey);
     }
 
@@ -789,27 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_bootstrap_needs_no_vta_coordinates_on_a_bundled_loopback_block() {
-        let cfg: VtaConfig = toml::from_str(
-            r#"
-            enabled = true
-            mode = "embedded"
-            auto_bootstrap = true
-            base_url = "http://127.0.0.1:8100"
-            "#,
-        )
-        .expect("parse");
-        cfg.validate()
-            .expect("the bootstrap supplies vta_did, context and key");
-        assert_eq!(cfg.bootstrap_dir, "/bootstrap");
-        assert_eq!(cfg.bootstrap_wait_secs, 90);
-    }
-
-    #[test]
-    fn rotation_days_default_to_ninety() {
+    fn automatic_rotation_is_off_by_default() {
         let cfg: VtaConfig = toml::from_str("enabled = false").expect("parse");
-        assert_eq!(cfg.control_key_rotation_days, 90);
-        assert_eq!(VtaConfig::default().control_key_rotation_days, 90);
+        assert_eq!(cfg.control_key_rotation_days, 0);
+        assert_eq!(VtaConfig::default().control_key_rotation_days, 0);
     }
 
     #[test]
@@ -817,7 +606,7 @@ mod tests {
         assert_eq!(VtaConfig::default().connection_key_switch_timeout_secs, 330);
         let block = |secs: u64| -> VtaConfig {
             toml::from_str(&format!(
-                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\nconnection_key_switch_timeout_secs = {secs}"
+                "enabled = true\nbase_url = \"http://127.0.0.1:8100\"\nvta_did = \"did:key:z6MkVta\"\ncontext_id = \"gateway\"\nsigning_key_id = \"k\"\nconnection_key_switch_timeout_secs = {secs}"
             ))
             .expect("parse")
         };
@@ -844,7 +633,7 @@ mod tests {
     fn rotation_days_above_ten_years_are_refused_and_zero_is_allowed() {
         let block = |days: u32| -> VtaConfig {
             toml::from_str(&format!(
-                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\ncontrol_key_rotation_days = {days}"
+                "enabled = true\nbase_url = \"http://127.0.0.1:8100\"\nvta_did = \"did:key:z6MkVta\"\ncontext_id = \"gateway\"\nsigning_key_id = \"k\"\ncontrol_key_rotation_days = {days}"
             ))
             .expect("parse")
         };
@@ -861,86 +650,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_bootstrap_is_refused_off_the_bundled_tier_or_off_loopback() {
-        let appliance: VtaConfig =
-            toml::from_str("enabled = true\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"")
-                .expect("parse");
-        assert!(
-            appliance
-                .validate()
-                .expect_err("appliance")
-                .contains("bundled")
-        );
-
-        for url in
-            ["http://vta:8100", "https://vta.example.com", "http://10.0.0.5:8100", "http://127.0.0.1.evil.example:8100"]
-        {
-            let cfg: VtaConfig = toml::from_str(&format!(
-                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{url}\""
-            ))
-            .expect("parse");
-            assert!(
-                cfg.validate()
-                    .expect_err(url)
-                    .contains("loopback"),
-                "{url}"
-            );
-        }
-        for url in ["http://localhost:8100", "http://[::1]:8100", "http://127.0.0.1:8100"] {
-            let cfg: VtaConfig = toml::from_str(&format!(
-                "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{url}\""
-            ))
-            .expect("parse");
-            cfg.validate()
-                .unwrap_or_else(|e| panic!("{url}: {e}"));
-        }
-    }
-
-    #[test]
-    fn auto_bootstrap_enrols_a_did_key_in_the_fixed_context_only() {
-        let base = "enabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"http://127.0.0.1:8100\"\n";
-        let webvh: VtaConfig = toml::from_str(&format!("{base}control_did_method = \"did_webvh\"")).expect("parse");
-        assert!(
-            webvh
-                .validate()
-                .expect_err("webvh")
-                .contains("did:key")
-        );
-        let own: VtaConfig = toml::from_str(&format!("{base}auth_did = \"did:key:z6MkGw\"")).expect("parse");
-        assert!(
-            own.validate()
-                .expect_err("auth_did")
-                .contains("auth_did")
-        );
-        let other: VtaConfig = toml::from_str(&format!("{base}context_id = \"mine\"")).expect("parse");
-        assert!(
-            other
-                .validate()
-                .expect_err("context")
-                .contains("gateway")
-        );
-        let same: VtaConfig = toml::from_str(&format!("{base}context_id = \"gateway\"")).expect("parse");
-        same.validate()
-            .expect("the fixed context is fine");
-    }
-
-    #[test]
-    fn a_block_without_auto_bootstrap_still_requires_its_coordinates() {
-        let cfg: VtaConfig =
-            toml::from_str("enabled = true\nmode = \"embedded\"\nbase_url = \"http://127.0.0.1:8100\"").expect("parse");
-        assert!(
-            cfg.validate()
-                .expect_err("vta_did")
-                .contains("vta_did")
-        );
-    }
-
-    #[test]
     fn default_is_disabled_and_valid() {
         let cfg = VtaConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.transport, VtaTransport::Rest);
-        assert_eq!(cfg.mode, VtaMode::Appliance);
         assert_eq!(cfg.timeout_ms, 5_000);
         assert_eq!(cfg.max_concurrent, 16);
         cfg.validate()
@@ -1190,58 +903,10 @@ mod tests {
         assert!(err.contains("max_contexts"), "explains the quota: {err}");
     }
 
-    // ── Deployment tier (VTA-21) ─────────────────────────────────────────
-
-    fn bundled() -> VtaConfig {
-        toml::from_str(
-            r#"
-            enabled = true
-            mode = "embedded"
-            base_url = "http://127.0.0.1:3000"
-            vta_did = "did:webvh:localhost"
-            context_id = "ctx-gateway"
-            signing_key_id = "key-gateway-jwt"
-            "#,
-        )
-        .expect("parse")
-    }
+    // ── Deployment tier ──────────────────────────────────────────────────
 
     #[test]
-    fn the_bundled_mode_is_wired_and_keeps_its_legacy_wire_name() {
-        let cfg = bundled();
-        assert_eq!(cfg.mode, VtaMode::Bundled);
-        cfg.validate()
-            .expect("the bundled deployment is supported");
-        // `bundled` is accepted as an alias so new config reads naturally.
-        let aliased: VtaConfig = toml::from_str(
-            r#"
-            enabled = true
-            mode = "bundled"
-            base_url = "http://127.0.0.1:3000"
-            vta_did = "did:webvh:localhost"
-            context_id = "ctx-gateway"
-            signing_key_id = "key-gateway-jwt"
-            "#,
-        )
-        .expect("parse");
-        assert_eq!(aliased.mode, VtaMode::Bundled);
-        // …and the legacy spelling is what is written back, so existing
-        // deployments round-trip unchanged.
-        assert!(
-            serde_json::to_string(&cfg)
-                .unwrap()
-                .contains("\"embedded\"")
-        );
-    }
-
-    /// The single most damaging thing this integration could do is claim key
-    /// custody it does not have. A bundled sidecar shares a host, a disk and
-    /// an operator with the gateway, so it is not a custody tier.
-    #[test]
-    fn no_custody_claim_attaches_to_the_bundled_or_local_tier() {
-        assert_eq!(bundled().tier(), "bundled");
-        assert!(!bundled().supports_custody_claim());
-
+    fn a_connected_trust_agent_is_self_hosted_and_local_signing_claims_no_custody() {
         let local = VtaConfig::default();
         assert_eq!(local.tier(), "local");
         assert!(!local.supports_custody_claim());
@@ -1260,25 +925,9 @@ mod tests {
         assert!(appliance.supports_custody_claim());
     }
 
-    /// `allows_self_administration` still distinguishes the tiers — it gates
-    /// what the dashboard claims about custody — but it must **not** gate
-    /// context auto-provisioning.
-    ///
-    /// Creating a *sub*-context needs only the narrow `context-create`
-    /// capability scoped to its parent, which is exactly what the pairing
-    /// wizard asks the operator to grant. Only a *top-level* context needs
-    /// super-admin, and the agent enforces that itself. Refusing at config
-    /// time blocked operators who had deliberately granted the capability,
-    /// and the agent is the authority on its own grants.
     #[test]
-    fn auto_provisioning_does_not_depend_on_the_deployment_tier() {
-        assert!(VtaMode::Bundled.allows_self_administration(), "the gateway may administer a VTA on its own host");
-        assert!(
-            !VtaMode::Appliance.allows_self_administration(),
-            "a VTA somebody else operates is theirs to administer"
-        );
-
-        let mut cfg: VtaConfig = toml::from_str(
+    fn auto_provisioning_is_decided_by_the_agents_grant_not_by_this_check() {
+        let cfg: VtaConfig = toml::from_str(
             r#"
             enabled = true
             base_url = "https://vta.internal:8443"
@@ -1291,25 +940,21 @@ mod tests {
         .expect("parse");
         cfg.validate()
             .expect("a self-hosted agent may grant context-create; the agent decides, not this check");
-
-        cfg.mode = VtaMode::Bundled;
-        cfg.validate()
-            .expect("auto-provisioning is fine on a bundled sidecar");
     }
 
-    /// Switching bundled → remote must be a configuration change only: the
-    /// same fields, the same validation, no code path difference.
     #[test]
-    fn switching_between_tiers_is_a_configuration_change_only() {
-        let mut cfg = bundled();
-        cfg.validate()
-            .expect("bundled is valid");
-
-        cfg.mode = VtaMode::Appliance;
-        cfg.base_url = Some("https://vta.customer.example".to_string());
-        cfg.vta_did = Some("did:webvh:vta.customer.example".to_string());
-        cfg.validate()
-            .expect("the same block, re-pointed, is valid as a remote appliance");
-        assert_eq!(cfg.tier(), "self-hosted");
+    fn a_block_that_still_names_a_deployment_mode_parses() {
+        let cfg: VtaConfig = toml::from_str(
+            r#"
+            enabled = true
+            mode = "appliance"
+            base_url = "https://vta.internal:8443"
+            vta_did = "did:webvh:vta.internal:agent"
+            context_id = "ctx-gateway"
+            signing_key_id = "key-gateway-jwt"
+            "#,
+        )
+        .expect("an older block with a mode still parses");
+        cfg.validate().expect("valid");
     }
 }

@@ -33,90 +33,52 @@ changes:
         setting, `[vta] connection_key_switch_timeout_secs`, sets how long it
         retries.
     - timestamp: '2026-11-10T11:00:00Z'
-      title: Show when the bundled control key was rotated, with a Rotate button
+      title: Show when the control key was rotated, with a Rotate button
       description: >-
         The Trust Agent page has a card for the key the gateway authenticates to
-        its bundled trust agent with: the control DID, when it was last rotated,
-        when it is next due, and a Rotate control key button for users who can
-        edit key management. The button asks for confirmation, rotates through
-        the new API, and says how long to wait when a rotation was just done.
+        its trust agent with: the control DID, when it was last rotated, when it
+        is next due, and a Rotate control key button for users who can edit key
+        management. The button asks for confirmation, rotates through the API,
+        and says how long to wait when a rotation was just done. It shows only
+        while the gateway holds a did:key control key it can rotate.
     - timestamp: '2026-11-10T10:30:00Z'
-      title: Rotate the bundled trust agent's control key from the API
+      title: Rotate the gateway's trust agent control key from the API
       description: >-
         POST /v1/vta/control-key/rotate moves the gateway's access entry on its
-        bundled trust agent to a new control key now. It needs key management
-        edit rights, is refused with 429 and a Retry-After for ten minutes after
-        the last rotation, with 409 while the agent is not connected, and answers
-        502 when the agent refuses, leaving the current key in use. The new
-        --vta-print-control-did command prints the stored key's DID for granting
-        it again after a backup restore.
+        trust agent to a new control did:key now, with acl/swap-key. It needs key
+        management edit rights, is refused with 429 and a Retry-After for ten
+        minutes after the last rotation, with 404 when the gateway holds no
+        did:key control key it can rotate, and answers 502 when the agent
+        refuses, leaving the current key in use. The new --vta-print-control-did
+        command prints the stored key's DID for granting it again after a backup
+        restore.
     - timestamp: '2026-11-10T10:00:00Z'
-      title: ⭐ Rotate the bundled trust agent's control key every 90 days
+      title: Rotate the gateway's trust agent control key on a schedule
       description: >-
-        The gateway now rotates the control key it authenticates to its bundled
-        trust agent with every 90 days by default, while it runs. The active
-        gateway does it, only while the agent is connected, with a random delay
+        Setting `[vta] control_key_rotation_days` makes the gateway rotate the
+        control did:key it authenticates to its trust agent with at that
+        interval while it runs. The active gateway does it, with a random delay
         of up to six hours; a failure keeps the current key, retries with a
-        growing wait and logs an error after three in a row. Set
-        `[vta] control_key_rotation_days` to change the interval, or 0 to turn it
-        off. The status API reports the days, when the key last rotated and when
-        it is next due.
+        growing wait and logs an error after three in a row. It is off by
+        default. The status API reports the days, when the key last rotated and
+        when it is next due. An interrupted rotation is finished at the next
+        start.
     - timestamp: '2026-11-10T09:00:00Z'
-      title: Rotate the bundled trust agent's control key without a restart
+      title: Rotate the gateway's trust agent control key without a restart
       description: >-
-        The gateway's control key for its bundled trust agent can now be moved to
-        a new key while the gateway runs, through the connection it already has,
-        so requests in flight keep working. The rotation is recorded in the
-        bundled state with its time, and the signing keys and issuer do not
-        change. Until now the rotation needed the gateway stopped.
+        The gateway's did:key control key for its trust agent can be moved to a
+        new key while the gateway runs, through the connection it already has,
+        so requests in flight keep working. The signing keys and issuer do not
+        change.
     - timestamp: '2026-11-09T16:00:00Z'
-      title: Let a surface sign through the bundled trust agent by name
+      title: Let a surface sign through the trust agent configured in [vta] by name
       description: >-
-        A surface could not name the bundled trust agent: its record was treated
-        as having no control key, so the surface fell back to local signing, and
-        the Surface Builder greyed it out as "not ready". The record now
-        validates without a secrets-store control key, shows the bundled signing
-        key once connected, and the Signing key list offers "Bundled trust
-        agent". A surface can be pinned to the sidecar while the appliance
-        default is another trust agent.
-    - timestamp: '2026-11-08T23:45:00Z'
-      title: Show the bundled trust agent's bootstrap state on the Trust Agent page
-      description: >-
-        GET /v1/vta/status now reports how the bundled trust agent's first-start
-        bootstrap went (connected, waiting, refused, replaced, lost, revoked or
-        misconfigured), what to do about it, and who owns the trust agent
-        (unclaimed until a person claims it). The Trust Agent page's banner
-        shows it, and still never implies key custody for a bundled deployment.
-    - timestamp: '2026-11-08T23:00:00Z'
-      title: Rotate the gateway's trust agent control key without a new grant
-      description: >-
-        agent-gateway --vta-rotate-control-key --yes moves the gateway's
-        access entry on the bundled trust agent to a new control did:key with
-        acl/swap-key. The trust agent copies the entry exactly, so the grant
-        cannot widen, and the new key is stored as pending first, so a crash
-        part-way is finished at the next start. Run it with the gateway
-        stopped. It is hygiene, not recovery from a leak: whoever holds the
-        current key can rotate it away, and recovery is an operator re-grant.
-    - timestamp: '2026-11-08T22:30:00Z'
-      title: Recover from a replaced bundled trust agent with --vta-rebootstrap
-      description: >-
-        agent-gateway --vta-rebootstrap forgets the pinned bundled trust agent
-        and retires its signing key, which stays published so tokens it signed
-        still verify; the next start bootstraps again under a new key id.
-        Without --yes it only shows what it would do. It is never run
-        automatically: a new trust agent means new keys and DIDs.
-    - timestamp: '2026-11-08T22:00:00Z'
-      title: ⭐ Connect the bundled trust agent automatically on first start
-      description: >-
-        With [vta] mode = "embedded" and auto_bootstrap = true the gateway
-        writes its own did:key for the sidecar to enrol, waits for the
-        sidecar to publish its DID and pins it, authenticates, checks it holds
-        exactly the expected grant, and creates a non-exportable signing key,
-        with no operator action and no manual grant. A restart keeps the same
-        identity. A replaced, emptied or revoking sidecar is reported on
-        GET /v1/vta/status and never re-enrolled automatically; a gateway that
-        had been connected refuses to sign rather than switch issuer key, and
-        one that never connected signs locally.
+        A surface could not name the trust agent configured in the [vta] block:
+        its record was treated as having no control key, so the surface fell
+        back to local signing, and the Surface Builder greyed it out as "not
+        ready". The record now validates without a secrets-store control key and
+        shows its signing key once connected, so a surface can be pinned to it
+        while the appliance default is another trust agent.
   changed:
     - timestamp: '2026-11-08T21:30:00Z'
       title: Stop granting raw sign to the gateway on a trust agent
@@ -124,19 +86,14 @@ changes:
         The grant command the gateway prints for a trust agent no longer names
         the raw sign capability, because no gateway code path calls keys/sign;
         it signs through sign-jws and sign-document. Existing grants that
-        still carry sign keep working. The gateway can now ask the agent
-        which capabilities it holds (auth/whoami) and refuse a bundled
-        grant that is wider than the one it was enrolled with.
+        still carry sign keep working.
     - timestamp: '2026-11-08T21:00:00Z'
-      title: Authenticate to a bundled trust agent as a did:key by default
+      title: Let the gateway authenticate to a trust agent as a did:key
       description: >-
-        A bundled trust agent is reached over loopback and cannot resolve the
-        gateway's public address, so the gateway no longer publishes a
-        did:webvh to authenticate to it. A new [vta] control_did_method
-        setting (did_key or did_webvh) chooses the DID explicitly; absent, a
-        bundled sidecar uses did_key and a separately-operated agent keeps
-        did_webvh. publish_auth_did is still read, and must agree with
-        control_did_method when both are set.
+        A new [vta] control_did_method setting (did_key or did_webvh) chooses the
+        DID the gateway authenticates as. A did:key needs no hosting and no
+        resolution by the trust agent. publish_auth_did is still read, and must
+        agree with control_did_method when both are set.
     - timestamp: '2026-11-08T18:30:00Z'
       title: Authenticate to a trust agent as a did:webvh by default
       description: >-
@@ -160,15 +117,6 @@ changes:
         Rotating the signing key now changes the issuer; the gateway still
         accepts its own tokens from a retired or per-surface key. Verifiers
         that pin the old issuer must be updated.
-    - timestamp: '2026-11-08T12:05:00Z'
-      title: Keep the local signing key by default; make the bundled trust agent opt-in
-      description: >-
-        The default signing backend is now the gateway's own key on every
-        install, new or existing. Choosing the bundled trust agent takes
-        default_backend = "bundled". Defaulting new installs to it put a second
-        service in every deployment, and inferring the choice from whether a
-        local key was on disk meant a rebuilt volume or a sidecar that was down
-        at startup could silently change which backend signed.
     - timestamp: '2026-11-08T12:10:00Z'
       title: Ask before disconnecting a trust agent that holds agent keys
       description: >-
@@ -221,7 +169,7 @@ changes:
     - timestamp: '2026-11-10T09:30:00Z'
       title: Keep signing after the control key was rotated by another process
       description: >-
-        When the bundled trust agent refuses the gateway's control key, the
+        When the trust agent refuses the gateway's control key, the
         gateway now looks for the key stored for it, finishing an interrupted
         rotation first, and signs in once more if that is a different key. It
         never retries with the same key and never falls back to local signing.
@@ -234,75 +182,15 @@ changes:
         check answered 200, though the answer said "authenticated: false", and the
         app sent the browser straight back. The page now redirects only for a real
         session, and otherwise forgets the stale token and shows the sign-in form.
-    - timestamp: '2026-11-09T14:30:00Z'
-      title: Stop listing the bundled trust agent as "not ready" on a surface
-      description: >-
-        The Surface Builder's Signing key list showed the bundled trust agent as
-        "Bootstrap VTA — not ready: connect it and provision a key first", as if
-        it were waiting to be set up, when it is connected and used through
-        "Inherit the appliance default". A surface cannot name it, so it is no
-        longer offered; a surface that already saved it keeps it listed with an
-        explanation.
     - timestamp: '2026-11-09T13:45:00Z'
-      title: Say what the appliance signs with in Settings, and why a sidecar failed
+      title: Say what the appliance signs with in Settings, and why
       description: >-
         The Key management card in Settings preselected "This gateway's own key
-        (local)" while the appliance signed through the bundled sidecar, listed
-        the sidecar's own record as "not ready", kept saying "bundled" after a
-        default was chosen, and lost its confirmation message after a save. Its
-        first option now names what the configuration resolves to, the card shows
-        the chosen default, and the confirmation stays. The reason line also no
-        longer cuts off ("its bundled trust agent") or prints an internal state
-        name, the key inventory shows the bundled connection as paired and
-        usable, and the Trust Agent page tells the operator why the gateway is
-        signing locally when the sidecar never came up.
-    - timestamp: '2026-11-09T12:45:00Z'
-      title: Keep the bundled trust agent as default when connecting another agent
-      description: >-
-        The Trust Agent connect wizard pre-checked "Use this agent for all
-        signing" while the bundled sidecar was the appliance default, because
-        it only looked for a stored default. Finishing it would have silently
-        moved all signing off the sidecar. The wizard now treats the bundled
-        trust agent as an existing default and leaves the box unchecked.
-    - timestamp: '2026-11-09T11:30:00Z'
-      title: Let surfaces on the bundled trust agent issue identity credentials
-      description: >-
-        A request through a surface that signs with the bundled sidecar logged
-        "context gateway has no DID" and carried no identity credential, because
-        the sidecar's gateway context was never given the signing identity a
-        credential is issued as. The bootstrap now gives it one when it connects,
-        once, and a restart leaves it alone.
-    - timestamp: '2026-11-09T09:30:00Z'
-      title: Show the bundled trust agent's connection as connected, not unpaired
-      description: >-
-        The Trust Agent page listed the bundled sidecar's connection as "Not
-        paired" next to a banner that said it was connected, because the record
-        is created as a draft and the automatic bootstrap never pairs it. The
-        connection API now reports that record's state from the bootstrap
-        itself, including why it is not connected, and the page no longer
-        offers Revoke or Verify buttons the server always refuses. Verifying
-        that record used to answer 502 and write an error into it.
-    - timestamp: '2026-11-09T06:00:00Z'
-      title: Make the bundled sidecar compose example start with real containers
-      description: >-
-        Running the compose example with real images showed three faults, now
-        fixed. The gateway never received its mandatory backup encryption key
-        or the certificates it needs. The shared bootstrap folder was owned by
-        root while the gateway and the sidecar run as different users, so
-        neither could write it; a one-shot init service now makes it sticky and
-        world-writable. And the sidecar must be restarted after the gateway,
-        because it joins the gateway's network namespace; the supported
-        procedure is documented.
-    - timestamp: '2026-11-08T23:30:00Z'
-      title: Correct the bundled trust agent compose example and add a Kubernetes one
-      description: >-
-        The compose example used settings the trust agent does not have
-        (VTA_LISTEN, VTA_DATA_DIR, port 3000, a health command) and put the
-        agent on a network where anything could reach it. It now shares the
-        gateway's network namespace so the agent listens on loopback only, uses
-        the agent's own port and health check, carries the shared bootstrap
-        volume and an encrypted seed secret, and needs no hand-made control key
-        or DID. A one-Pod Kubernetes example is added.
+        (local)" while the appliance signed through a trust agent, kept saying
+        the old default after one was chosen, and lost its confirmation message
+        after a save. Its first option now names what the configuration resolves
+        to, the card shows the chosen default, and the confirmation stays. The
+        reason line also no longer cuts off or prints an internal state name.
     - timestamp: '2026-11-08T10:20:00Z'
       title: Verify a trust-agent presentation bound to a challenge or domain
       description: >-

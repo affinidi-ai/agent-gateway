@@ -38,7 +38,7 @@ export interface SurfaceMapping {
 
 export interface KeyInventory {
   tier: string;
-  /** False for both local signing and a bundled sidecar. Computed server-side. */
+  /** False for local signing. Computed server-side. */
   custody_claim: boolean;
   connections: ConnectionInventory[];
   mappings: SurfaceMapping[];

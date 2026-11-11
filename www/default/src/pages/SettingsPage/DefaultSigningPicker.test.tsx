@@ -130,22 +130,22 @@ describe('DefaultSigningPicker', () => {
 
   /**
    * The sentinel option clears the override, which hands the choice back to the
-   * configuration. When that is the bundled trust agent, calling it the
+   * configuration. When that is the `[vta]` block's agent, calling it the
    * gateway's own key tells the operator the opposite of what happens.
    */
-  it('names the configured default honestly, and does not list the bundled record twice', async () => {
+  it('names the configured default honestly, and does not list the [vta] record twice', async () => {
     respondWith([
-      connection({ id: 'vta-bootstrap', name: 'Bootstrap VTA', keys: {} }),
+      connection({ id: 'vta-bootstrap', name: 'Configured VTA', keys: {} }),
       connection(),
     ]);
-    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="bundled" />);
+    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="vta" />);
 
     await screen.findByRole('option', { name: /Production agent/ });
     expect(
-      screen.getByRole('option', { name: 'The bundled trust agent (default)' })
+      screen.getByRole('option', { name: 'The configured agent (from the [vta] block)' })
     ).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /own key/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('option', { name: /Bootstrap VTA/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Configured VTA/ })).not.toBeInTheDocument();
   });
 
   it('still calls the local default the gateway’s own key', async () => {
@@ -157,18 +157,20 @@ describe('DefaultSigningPicker', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows the bundled agent as chosen when the stored default names its record', async () => {
-    // Naming the bundled record as the default is the same as handing the choice
+  it('shows the [vta] block agent as chosen when the stored default names its record', async () => {
+    // Naming the [vta] record as the default is the same as handing the choice
     // back to the configuration, so the select must not go blank.
-    respondWith([connection({ id: 'vta-bootstrap', name: 'Bootstrap VTA' }), connection()], {
+    respondWith([connection({ id: 'vta-bootstrap', name: 'Configured VTA' }), connection()], {
       default_signing: { connection_id: 'vta-bootstrap' },
     });
-    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="bundled" />);
+    render(<DefaultSigningPicker onChanged={jest.fn()} configuredDefault="vta" />);
 
     await screen.findByRole('option', { name: /Production agent/ });
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     await waitFor(() =>
-      expect(select.options[select.selectedIndex].text).toBe('The bundled trust agent (default)')
+      expect(select.options[select.selectedIndex].text).toBe(
+        'The configured agent (from the [vta] block)'
+      )
     );
   });
 });

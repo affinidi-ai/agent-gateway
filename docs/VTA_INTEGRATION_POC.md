@@ -170,89 +170,7 @@ That is correct VTA behaviour, and it is exactly why a connection mints its
 
 Run live tests with `--test-threads=1`, or give each its own control key.
 
-## Bundled sidecar runbook (VTA-21)
-Example deployment: [`config/examples/vta-bundled/`](../config/examples/vta-bundled/)
-(compose file, Kubernetes pod, the `[vta]` block, the sidecar's setup file and
-entrypoint).
-
-**This is not a key-custody tier.** The sidecar shares a host, a disk and an
-operator with the gateway, so "the keys are held by a separate agent" is not a
-property this shape has. `GET /v1/vta/status` reports `tier: "bundled"` and
-`custody_claim: false`; nothing in the product may claim otherwise. The
-separately-operated (`appliance`) tier is the one that supports the claim.
-
-**Why packaging and not a library.** Linking `vta-sdk` forces
-`affinidi-did-resolver-cache-sdk` 0.8.22 → 0.8.41 through cargo's whole-graph
-version unification, which needs a newer `affinidi-did-web` than the gateway
-stack carries and breaks the default build (confirmed and reverted during
-VTA-02). An in-process build would need *more* of the VTA workspace, so the
-coupling is strictly worse. The gateway therefore speaks the same Trust Task
-REST surface to a sidecar as to a remote VTA — one code path, zero dependency
-coupling.
-
-### First start: no operator action
-
-With `[vta] mode = "embedded"` and `auto_bootstrap = true`:
-
-1. The gateway generates its control key (kept encrypted in its own storage; it
-   never leaves the gateway) and writes its `did:key` to
-   `gateway-enrolment.env` in the shared `bootstrap_dir`. Public data only.
-2. The sidecar's entrypoint sets the VTA up **once, with no admin**, then
-   enrols that DID **offline, before the daemon listens**, as role `initiator`
-   in context `gateway` with exactly `context-create, key-mint, sign-jws,
-   sign-document`. The role, context and capabilities are fixed in the script,
-   never taken from the gateway's file. It then writes the VTA's own `did:key`
-   to `vta-identity.env`.
-3. The gateway **pins** that DID (the first one it sees; a different one later
-   is refused), authenticates, asks the VTA what it holds (`auth/whoami`) and
-   requires **exactly** the grant above — more is a failure, not a bonus —
-   and creates a non-exportable signing key `gateway-jwt-1`, capturing its
-   public half (the VTA will not return an internal key's record again).
-4. The record is persisted encrypted (`vta_bundled_state.json`), the `[vta]`
-   block is completed from it, and signing goes through the VTA.
-
-Both DIDs are `did:key`. The gateway's, because the sidecar listens on loopback
-only and cannot resolve a published `did:webvh` of the gateway's; the VTA's,
-because it is an internal service nobody resolves, its keys are non-exportable
-whatever its DID method, and a `did:webvh` would need a recovery-key custodian
-outside the deployment (spec KEY-116/119) that a fresh install has not got.
-`control_did_method = "did_webvh"` is refused with `auto_bootstrap`.
-
-**The gateway is not super-admin of its sidecar.** It holds one context-scoped
-entry. The super-admin slot stays empty (`owner: unclaimed`) until a person
-claims the trust agent; until then admin work is the VTA's offline CLI on the
-host. A compromised gateway can sign within its grant, bounded by the quota and
-audited, but cannot export the seed or an internal key, grant itself more, or
-create a context outside `gateway/*`.
-
-### States, and what to do
-
-`GET /v1/vta/status` reports `bootstrap.state`. Nothing below is ever fixed
-automatically.
-`GET /v1/vta/connections` shows the sidecar's `vta-bootstrap` record from the same state
-(`connected`, `awaiting_grant` for `waiting_for_vta`, `revoked`, `degraded` for the rest, with
-the advice as `last_error`), computed on each read and never stored.
-
-| State | Meaning | Signing | Operator action |
-|---|---|---|---|
-| `connected` | Authenticated, exact grant, key present | the VTA | none |
-| `waiting_for_vta` | The sidecar published no identity or did not answer in `bootstrap_wait_secs` | local if it never connected, otherwise **refused** | start the sidecar, restart the gateway |
-| `enrolment_refused` | The sidecar refused the gateway or granted something other than the bundled grant | local if it never connected | read the sidecar's entrypoint log |
-| `revoked` | Was connected; the sidecar now refuses it | **refused** | re-grant offline (`vta acl create`), restart |
-| `vta_replaced` | A different trust agent answers at the pinned address | **refused** | investigate, then `--vta-rebootstrap` |
-| `vta_lost` | The pinned agent no longer holds the signing key | **refused** | `--vta-rebootstrap` |
-| `misconfigured` | The control key, the shared folder or the identity file is wrong | local if it never connected | fix the named problem |
-
-"Refused" rather than "local" once the sidecar has signed anything: tokens
-already issued carry its key, and switching to the gateway's own key would
-change the issuer under callers.
-
-`agent-gateway --vta-rebootstrap` (without `--yes` it only shows what it would
-do) forgets the pinned trust agent and **retires** the current signing key,
-which stays published as a retiring key so tokens it signed still verify. The
-next start bootstraps again under a new key id (`gateway-jwt-2`, …); a retired
-key id is never reused. It is never run automatically: a new trust agent means
-new keys and DIDs.
+## Control keys and the trust agent's origin
 
 ### Rotating the control key of a connection you added
 
@@ -275,183 +193,81 @@ restart resumes the rotation instead of repeating it:
    deleted.
 
 If the trust agent refuses the new key, the gateway retries (10 s, doubling to 60 s) until
-`[vta] connection_key_switch_timeout_secs` (default 330) has passed, then rolls back: the old
-key is the only one published again and the new seed is deleted, so signing never stopped. A
-trust agent that cannot be reached leaves the rotation under way (`202`, with the last error on
-the connection); **Cancel** (`POST …/control-key/rotate/cancel`) puts the old key back until the
-switch has happened. The request answers `200` when the rotation finished within 15 seconds,
-`202` while it carries on, `502` when it was rolled back.
+`[vta] connection_key_switch_timeout_secs` (10 to 3600, default 330, validated on every enabled
+block) has passed, then rolls back: the old key is the only one published again and the new seed
+is deleted, so signing never stopped. A trust agent that cannot be reached leaves the rotation
+under way (`202`, with the last error on the connection); **Cancel**
+(`POST …/control-key/rotate/cancel`) puts the old key back until the switch has happened. The
+request answers `200` when the rotation finished within 15 seconds, `202` while it carries on,
+`502` when it was rolled back.
 
-Refused with `409`: the bundled record (it rotates through `POST /v1/vta/control-key/rotate`), a
-connection that authenticates as a `did:key` (its identifier is its key; rotating it needs a new
-grant), one that is disabled or not connected, and one already rotating. Checked against a real
-trust agent: the new key is accepted at once, and the old one stops working after the trust
-agent's DID cache time (its `[did_cache] ttl_secs`, 60 seconds by default, 300 at most), plus up
-to 15 minutes for a session it already opened. Like the bundled rotation this is hygiene, not
-recovery from a leak: whoever holds the current key can rotate the document too, and the
+Refused with `409`: a connection that authenticates as a `did:key` (its identifier is its key;
+rotating it needs a new grant), one that is disabled or not connected, and one already rotating.
+Checked against a real trust agent: the new key is accepted at once, and the old one stops
+working after the trust agent's DID cache time (its `[did_cache] ttl_secs`, 60 seconds by
+default, 300 at most), plus up to 15 minutes for a session it already opened. This is hygiene,
+not recovery from a leak: whoever holds the current key can rotate the document too, and the
 recovery is to revoke and grant again.
 
-### Rotating the control key
+### Rotating the `[vta]` block's control key
 
 In plain terms, with the setting and the security measures: [how the control key rotates](vta-auth-key-rotation/how-it-works.md).
 
-The control key moves while the gateway runs. It rotates **every 90 days by
-default** (`[vta] control_key_rotation_days`, `0` turns it off), on demand from
-the **Rotate control key** button on the Trust Agent page or
-`POST /v1/vta/control-key/rotate` (key management edit rights; refused with
-`429` and a `Retry-After` for ten minutes after the last rotation), and offline
-with `agent-gateway --vta-rotate-control-key --yes` while the gateway is
-stopped. `GET /v1/vta/status` reports `bootstrap.control_key_rotated_at`,
-`control_key_next_rotation_at` and `control_key_rotation_days`.
+When the `[vta]` block authenticates as a `did:key` held in a file
+(`control_did_method = "did_key"`, `auth_key_source = "file://<path>"`, no `auth_did`), the
+gateway can move that key while it runs, with `acl/swap-key`:
 
-It moves the gateway's access entry to a new `did:key` with `acl/swap-key`: the
-new key signs a short proof that it agrees to take the entry over, and the
-agent copies the entry exactly, so the grant cannot widen. Only the access entry
-moves; the signing keys, the issuer and the agents' keys are untouched. The
-swap is sent through the connection the gateway already has, so the old DID
-never signs in a second time and nothing in flight is superseded. The new key
-is stored as pending before the swap is sent, so a crash part-way is finished
-or abandoned by asking the agent which key is live, at the next start or on the
-next refused sign-in. A refusal from the agent leaves the current key in use;
-a rotation never makes the gateway sign locally.
+- **On demand**: the **Rotate control key** button on the Trust Agent page or
+  `POST /v1/vta/control-key/rotate` (key management edit rights). It answers `404` when the
+  gateway holds no such key, `409` while a rotation is running, `429` with a `Retry-After` within
+  ten minutes of the last rotation, `503` on a standby gateway and `502` when the trust agent
+  refuses the swap.
+- **On a schedule**, only when `[vta] control_key_rotation_days` is above `0` (default `0`,
+  which is off; at most `3650`). It runs on the active gateway only, with a random delay of up to
+  six hours so gateways installed together do not rotate at once. A failure keeps the current key
+  and retries after an hour, doubling up to a day, and logs an error after three failures in a
+  row.
 
-The schedule runs on the active gateway only, while the bundled agent is
-connected, with a random delay of up to six hours so gateways installed
-together do not rotate at once. A failure keeps the current key and retries
-after an hour, doubling up to a day, and logs an error after three failures in
-a row. Each rotation logs `vta_control_key_rotated` (old and new DID, what
+The swap moves the gateway's access entry to a new `did:key`: the new key signs a short proof
+that it agrees to take the entry over, and the trust agent copies the entry exactly, so the
+grant cannot widen. Only the access entry moves; the signing keys, the issuer and the agents'
+keys are untouched. The swap is sent through the connection the gateway already has, so the old
+DID never signs in a second time and nothing in flight is superseded. The new key is stored as
+pending before the swap is sent, so an interrupted rotation is settled at the next start, or on
+the next refused sign-in, by asking the trust agent which key is live. A refusal from the trust
+agent leaves the current key in use.
+
+A record, `vta_control_key_rotation.json`, is kept beside the key file: when the gateway began
+holding the key and when it last rotated. `GET /v1/vta/status` reports it as
+`control_key: {control_did, rotated_at?, next_rotation_at?, rotation_days}`, or `null` when the
+gateway holds no such key. Each rotation logs `vta_control_key_rotated` (old and new DID, what
 triggered it) on the `vta_audit` target.
 
-After restoring a backup taken before the last rotation the stored key is one
-the agent no longer accepts. Print its DID with
-`agent-gateway --vta-print-control-did`, grant it again on the sidecar with the
-same `vta acl create` flags `vta-entrypoint.sh` uses, and start the gateway.
-Do not use `--vta-rebootstrap` for this: it creates new signing keys.
+After restoring a backup taken before the last rotation the stored key is one the trust agent
+no longer accepts. Print its DID with `agent-gateway --vta-print-control-did`, grant that DID on
+the trust agent again, and start the gateway.
 
-This is hygiene, not recovery from a leak: whoever holds the current key can
-rotate it to one of their own, exactly as with a `did:webvh` control key.
-Recovery is an operator re-granting the gateway, and the agent audits every
-swap. **After a swap the old key's already-issued access token can keep
-signing until it expires (up to 15 minutes)**: the agent's signing gates fall
-back to the role in the token when the access entry is missing. Rotate during a
-quiet period, and treat a suspected leak as "revoke and wait out the token".
+This is hygiene, not recovery from a leak: whoever holds the current key can rotate it to one of
+their own, exactly as with a `did:webvh` control key. Recovery is an operator re-granting the
+gateway, and the trust agent audits every swap. **After a swap the old key's already-issued
+access token can keep signing until it expires (up to 15 minutes)**: the trust agent's signing
+gates fall back to the role in the token when the access entry is missing. Rotate during a quiet
+period, and treat a suspected leak as "revoke and wait out the token".
 
-### Isolation and encryption
+### Isolation
 
-The sidecar shares the gateway's network namespace (a Kubernetes Pod, or
-Compose `network_mode: "service:gateway"`) and listens on `127.0.0.1:8100`
-only; it has no TLS and no unix socket, so loopback in a private namespace is
-what keeps it off every network. The gateway additionally **reserves** every
-VTA address it knows (`src/vta/isolation.rs`) and refuses it on both pinned
-egress paths, so a surface, MCP proxy or A2A proxy pointed at the sidecar is
-blocked even where the network allowed it. `GET /v1/vta/status` lists the
-reserved origins.
+The gateway **reserves** every VTA address it knows (`src/vta/isolation.rs`) and refuses it on
+both pinned egress paths, so a surface, MCP proxy or A2A proxy pointed at a trust agent is
+blocked even where the network allowed it. This applies to every connection. `GET /v1/vta/status`
+lists the reserved origins.
 
-**Encryption at rest is mandatory here** and enforced at startup: the sidecar's
-key material is on this host's disk, so it is the only thing between a disk
-image and the signing keys. A bundled deployment without it fails closed. The
-sidecar's own seed is `encrypted_file` with `[hardened] enabled = true`, its
-passphrase supplied as a mounted secret and never read from config or the
-environment.
+### A custom trust agent for one surface
 
-### Restarting under Compose
-
-The sidecar joins the gateway's network namespace (`network_mode: "service:gateway"`),
-so restart the **gateway first and the sidecar second**:
-`docker compose restart gateway && docker compose restart vta`, or recreate both with
-`docker compose up -d --force-recreate`. A plain `docker compose restart` fails the
-sidecar with "cannot join network of a non running container", and Docker's restart
-policy does not bring it back. A one-shot `bootstrap-init` service makes the shared
-`/bootstrap` volume sticky and world-writable, because the gateway image's user and the
-VTA image's uid 1000 differ and a fresh named volume is root-owned. In the Kubernetes pod
-the containers share the pod's namespace, so either can restart on its own.
-
-### Image, upgrade, backup and loss
-
-**Build the VTA image from `verifiable-trust-infrastructure` branch
-`gateway-integration`** until `Capability::ContextCreate` is released; a stock
-image refuses the sidecar's grant with "unknown capability". Pin both images by
-digest; an unpinned sidecar is a supply-chain hole in the component holding the
-keys.
-
-**Upgrade.** Upgrade the VTA first, confirm `bootstrap.state` is still
-`connected`, then the gateway. The signing keys live in the `vta-data` volume
-and survive the container.
-
-**Backup and loss.** Back up `vta-data` and the seed passphrase **separately**
-(spec VTA-050), alongside the gateway's `_storage`; they are one unit. Internal
-keys are never in any backup, and `pnm backup` needs DIDComm or TSP, which this
-sidecar does not run. Losing `vta-data` loses every key the VTA held. The
-recovery is **rotate, not restore**: see `vta_lost` / `vta_replaced` above. The
-retired key's public half is recorded, so tokens it signed still verify.
-
-**Switching bundled → remote** is a configuration change: drop `auto_bootstrap`
-and set `mode`, `base_url` and `vta_did` (and, for a remote agent, grant the
-gateway on it yourself). No code path differs.
-
-### Trying it by hand
-
-`scripts/vta-bundled-manual.sh` brings up the shipped Compose example with real containers and
-leaves it running (`GATEWAY_IMAGE=… VTA_IMAGE=… ./scripts/vta-bundled-manual.sh up`; needs port
-8443 free and `make config-debug` once). `login` explains the dashboard login: open
-`https://localhost:8443/dashboard`, accept the certificate warning, register a passkey (the
-first one becomes the administrator, and the page then asks you to sign in with it), and open
-**Trust Agent**. The banner reads "Bundled trust agent: Connected. Owner: unclaimed". With a
-token copied from the browser console (`copy(sessionStorage.getItem('session_token'))`),
-`AG_TOKEN=… status` prints `GET /v1/vta/status` and `AG_TOKEN=… sign` issues a credential and
-shows its `kid` (`gateway-jwt-N`) and subject; `logs` shows the sidecar's `payload signed` line
-for that key and the gateway's `token_signed` audit record. `down` removes everything. To see
-the failure states, stop the sidecar before the first start, or run the VTA's offline
-`acl delete` against the `vta-data` volume.
-
-### A custom trust agent beside the bundled one
-
-The bundled sidecar is the appliance default. An operator can still connect a trust agent of
-their own and name it on a surface (`signing.connection_id`, with its `context_id` and
-`key_id`). That surface's identity credential is issued and signed by the custom trust agent,
-under the DID of the context it names; every other surface keeps the sidecar. Each agent's own
-key, and the presentation it makes, stay in the appliance default, so a request through a custom
-surface touches both trust agents.
-
-`scripts/vta-custom-e2e.sh` runs this with the real `vta` and `agent-gateway` binaries and the
-local A2A agent (`VTA_BIN=… A2A_AGENT_DIR=… ./scripts/vta-custom-e2e.sh`; not part of CI). It
-starts the gateway with its bundled sidecar, sets up a second VTA from nothing, pairs it
-through the management API, grants it offline, creates two surfaces (one default, one on the
-custom connection) and sends a message through each. It then checks, from the body the agent
-received, that each message carries an identity credential whose signature verifies under its
-issuer and a presentation that verifies under the agent, that the two issuers differ, that each
-issuer is a context DID set by its own trust agent, and, from each trust agent's log, that
-the default message's credential was signed by the sidecar and the custom message's by the
-custom trust agent.
-
-### What was verified, and how
-
-Three layers, from the outside in:
-
-- **Real containers.** `scripts/vta-bundled-compose-e2e.sh` runs the shipped Compose example
-  with real images (`GATEWAY_IMAGE=… VTA_IMAGE=… ./scripts/vta-bundled-compose-e2e.sh`; not
-  part of CI). It checks first start with no manual grant, the shared loopback and the
-  shared-volume permissions, that nothing else on the network reaches the trust agent, a
-  restart that keeps the same identity, a revoked gateway that is reported and never
-  re-enrolled, an offline re-grant, and a control-key rotation run in a one-off gateway
-  container beside the sidecar (20 checks). Each check reads only the logs written since its
-  own restart. It found three faults the other layers could not: the
-  gateway never received its mandatory backup key or certificates, the shared `/bootstrap`
-  volume was unwritable by both users, and a plain `docker compose restart` fails the sidecar.
-- **Real binaries.** `scripts/vta-bundled-e2e.sh` runs the real `vta` and `agent-gateway`
-  binaries from zero in temporary directories (`VTA_BIN=… ./scripts/vta-bundled-e2e.sh`; needs a
-  built VTA and `make config-debug` once; not part of CI). It covers: first start with no
-  manual step; restart keeping the same identity and creating no second key; a revoked gateway
-  reported and **not** re-enrolled by the entrypoint; re-grant and restart; and a real
-  `acl/swap-key` rotation. Also checked by hand: a wiped sidecar reported as `vta_replaced`
-  and recovered with `--vta-rebootstrap --yes`, and a rotation interrupted after the swap
-  finished at the next start.
-- **Behaviour scenarios and unit tests.** `tests/features/surface/trust_agent_bootstrap.feature`
-  (a connected, a waiting, a refused and an over-granted trust agent, through the real gateway
-  binary and a mock trust agent) and `trust_agent_signing.feature` (the tenant check), plus
-  unit tests against a mock trust agent for every state and recovery.
-
-The Kubernetes pod was validated for syntax only; no cluster was available.
+An operator can connect a trust agent of their own and name it on a surface
+(`signing.connection_id`, with its `context_id` and `key_id`). That surface's identity
+credential is issued and signed by that trust agent, under the DID of the context it names;
+every other surface keeps the default signing. Each agent's own key, and the presentation it
+makes, stay in the default, so a request through such a surface can touch two signers.
 
 ## Bring up a local VTA (for the live e2e)
 
@@ -599,18 +415,13 @@ keys. See *Manual walkthrough* below for that path end to end.
 The steps here are the **config-file** route, for fleet or IaC installs that
 cannot use a dashboard.
 
-1. **Start the gateway with `[vta]` enabled.** For a separately-operated
-   trust agent (`mode = "appliance"`) it publishes a `did:webvh` to
-   authenticate with on first boot and logs it, along with the URL that
-   document is served at. For a bundled sidecar (`mode = "embedded"`) it
-   authenticates as the plain `did:key` and publishes nothing, because the
-   sidecar is reached over loopback and cannot resolve the gateway's public
-   address.
+1. **Start the gateway with `[vta]` enabled** (`base_url`, `vta_did`, `context_id` and
+   `signing_key_id` are required). Unless it is told otherwise it publishes a `did:webvh` to
+   authenticate with on first boot and logs it, along with the URL that document is served at.
 
    `control_did_method = "did_key" | "did_webvh"` chooses explicitly. Absent,
    the gateway decides in this order: a configured `auth_did` (a DID you host
-   yourself) wins; then `control_did_method`; then `did_key` for a bundled
-   sidecar; then the older `publish_auth_did` (`false` means `did_key`);
+   yourself) wins; then `control_did_method`; then the older `publish_auth_did` (`false` means `did_key`);
    otherwise `did_webvh`. `control_did_method` and `publish_auth_did` must
    agree when both are set.
 

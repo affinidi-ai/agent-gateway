@@ -21,7 +21,7 @@ interface VtaStatus {
 }
 
 const configuredDefault = (backend?: string): ConfiguredDefault =>
-  backend === 'bundled' ? 'bundled' : backend === 'local' || !backend ? 'local' : 'vta';
+  backend === 'local' || !backend ? 'local' : 'vta';
 
 /**
  * Key management, collapsed out of the default path (VTA-26).

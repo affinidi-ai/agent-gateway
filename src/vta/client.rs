@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 pub(crate) const TRUST_TASKS_PATH: &str = "/trust-tasks";
 const TASK_AUTH_CHALLENGE: &str = "https://trusttasks.org/spec/auth/challenge/0.1";
 const TASK_AUTH_AUTHENTICATE: &str = "https://trusttasks.org/spec/auth/authenticate/0.3";
+#[cfg(test)]
 const TASK_AUTH_WHOAMI: &str = "https://trusttasks.org/spec/auth/whoami/0.1";
 
 /// A cached, memory-only session. Tokens never touch disk, are **zeroized** when
@@ -326,6 +327,7 @@ impl VtaRestClient {
     ///
     /// The task's specification declares its request proof mandatory, so this
     /// is dispatched signed; a bearer-only call is refused `proofRequired`.
+    #[cfg(test)]
     pub async fn whoami(&self) -> Result<super::onboarding::Whoami, VtaError> {
         self.dispatch_signed(TASK_AUTH_WHOAMI, json!({}))
             .await
@@ -811,12 +813,12 @@ mod tests {
 
         assert_eq!(who.roles, ["initiator"]);
         assert_eq!(who.scopes, ["ctx:gateway"]);
-        who.assert_bundled_grant("gateway")
-            .expect("the mock holds exactly the bundled grant");
         assert!(
-            who.assert_bundled_grant("other")
-                .is_err(),
-            "a different context is not the grant"
+            who.capabilities
+                .iter()
+                .any(|c| c == "sign-jws"),
+            "{:?}",
+            who.capabilities
         );
     }
 
@@ -912,29 +914,6 @@ mod tests {
             .expect("authenticate against the live VTA");
         eprintln!("LIVE_OK: received a session token of length {}", token.len());
         assert!(!token.is_empty());
-    }
-
-    /// Live check that a gateway enrolled by the bundled entrypoint holds
-    /// exactly the bundled grant, as the VTA itself reports it.
-    ///
-    /// Enrol the DID printed by [`live_authenticate_against_real_vta`] with
-    /// `vta-entrypoint.sh`, start the VTA, then run with `VTA_LIVE_URL` and
-    /// `VTA_LIVE_DID` set to its address and `did:key`.
-    #[tokio::test]
-    #[ignore = "requires a running vta-service enrolled by vta-entrypoint.sh; run manually"]
-    async fn live_whoami_reports_the_bundled_grant() {
-        let key = Arc::new(ControlKey::from_seed([42u8; 32]));
-        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:8100".to_string());
-        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID to the bundled VTA did:key");
-
-        let client = VtaRestClient::new(&url, &vta_did, key, Duration::from_secs(15), 8, None).expect("build client");
-        let who = client
-            .whoami()
-            .await
-            .expect("whoami against the live VTA");
-        eprintln!("LIVE_WHOAMI: {who:?}");
-        who.assert_bundled_grant("gateway")
-            .expect("the entrypoint enrols exactly the bundled grant");
     }
 
     /// Live check of how a trust agent refuses a control key it has no access

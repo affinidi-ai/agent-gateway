@@ -561,16 +561,6 @@ pub async fn run_axum_proxy(
     bootstrap_config
         .pin_external_consent_issuers()
         .context("Configuration validation failed")?;
-    // A bundled trust agent connects itself before anything reads `[vta]`, so
-    // every later consumer sees the pinned DID and the signing key it made.
-    {
-        let issuer_storage = PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .vc_keys,
-        );
-        crate::vta::bundled::bootstrap(&mut bootstrap_config.vta, &issuer_storage).await;
-    }
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
 

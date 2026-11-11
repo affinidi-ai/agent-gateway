@@ -102,51 +102,28 @@ export interface PairingPayload {
 /** `GET /v1/vta/status` — the appliance's signing-deployment tier. */
 export interface VtaDeploymentStatus {
   enabled: boolean;
+  /** `local` when signing is in-process, `self-hosted` when a trust agent signs. */
   tier: string;
   /**
-   * Whether this deployment supports a key-custody claim. False for both
-   * bundled and local signing — the UI must never imply custody when this is
-   * false.
+   * Whether this deployment supports a key-custody claim. False for local
+   * signing — the UI must never imply custody when this is false.
    */
   custody_claim: boolean;
-  self_administered: boolean;
   auto_provision_contexts: boolean;
   reserved_origins: string[];
   /** The DID method the gateway authenticates to the agent as. */
   control_did_method?: 'did_key' | 'did_webvh';
-  /** How the bundled sidecar's first-start bootstrap went. Absent unless one runs. */
-  bootstrap?: VtaBootstrapStatus | null;
+  /** The `did:key` control key the gateway holds and can rotate. Absent or null when it holds none. */
+  control_key?: VtaControlKeyStatus | null;
 }
 
-export type VtaBootstrapState =
-  | 'connected'
-  | 'waiting_for_vta'
-  | 'enrolment_refused'
-  | 'vta_replaced'
-  | 'vta_lost'
-  | 'revoked'
-  | 'misconfigured';
-
-/** The bundled trust agent's bootstrap, from `GET /v1/vta/status`. */
-export interface VtaBootstrapStatus {
-  state: VtaBootstrapState;
-  /** What an operator should do about it, written by the backend. */
-  advice: string;
-  detail?: string;
-  vta_did?: string;
-  control_did?: string;
-  context_id: string;
-  bootstrapped_at?: string;
+/** The control key the gateway signs in to its trust agent with, from `GET /v1/vta/status`. */
+export interface VtaControlKeyStatus {
+  control_did: string;
   /** When the control key last moved to a new one; absent until it has. */
-  control_key_rotated_at?: string;
+  rotated_at?: string;
   /** When it is next due; absent when automatic rotation is off. */
-  control_key_next_rotation_at?: string;
+  next_rotation_at?: string;
   /** Days between automatic rotations; 0 is off. */
-  control_key_rotation_days: number;
-  /** A completed bootstrap was recorded before this start. */
-  previously_connected: boolean;
-  /** `unclaimed` until a person claims the trust agent. */
-  owner: string;
+  rotation_days: number;
 }
-
-export type WizardBackend = 'bundled' | 'own';

@@ -418,16 +418,6 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     {
         gateway_env.insert("AG_ALLOW_LOCAL_A2A_PROXY".to_string(), "true".to_string());
     }
-    if world
-        .surface_config
-        .bundled_trust_agent
-        .is_some()
-    {
-        gateway_env.insert(
-            crate::bdd_support::config::single_surface_fixture::BUNDLED_MASTER_KEY_ENV.to_string(),
-            crate::bdd_support::config::single_surface_fixture::BUNDLED_MASTER_KEY.to_string(),
-        );
-    }
     let mut gateway = if world
         .surface_config
         .keeps_gateway_log

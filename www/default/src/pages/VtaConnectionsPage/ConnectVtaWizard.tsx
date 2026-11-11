@@ -3,21 +3,14 @@ import { apiClient } from '../../api';
 import { AppButton } from '../../components/shared/AppButton';
 import { showToast } from '../../utils/toaster';
 import { applianceSigningPayload } from './vtaConnectionHelpers';
-import { BackendStep, TransportStep } from './WizardChoiceSteps';
+import { TransportStep } from './WizardChoiceSteps';
 import { PairStep, VerifyStep } from './WizardPairSteps';
 import { WizardFinishStep } from './WizardFinishStep';
 import { WIZARD_STEPS } from './wizardSteps';
-import type {
-  PairingPayload,
-  VtaConnection,
-  VtaDeploymentStatus,
-  VtaTransport,
-  WizardBackend,
-} from './types';
+import type { PairingPayload, VtaConnection, VtaTransport } from './types';
 
 interface ConnectVtaWizardProps {
   connection: VtaConnection;
-  deployment: VtaDeploymentStatus | null;
   onPair: (connection: VtaConnection) => Promise<PairingPayload>;
   onVerify: (connection: VtaConnection) => Promise<VtaConnection>;
   onProvisionKey: (connection: VtaConnection) => Promise<VtaConnection>;
@@ -25,7 +18,7 @@ interface ConnectVtaWizardProps {
 }
 
 /**
- * The operator-facing half of pairing (VTA-24): choose a backend, choose a
+ * The operator-facing half of pairing (VTA-24): choose a
  * transport, approve exactly one grant on your own agent, watch it verify.
  *
  * The gateway never performs the grant itself — that is the whole point, and
@@ -38,16 +31,12 @@ interface ConnectVtaWizardProps {
  */
 export const ConnectVtaWizard: React.FC<ConnectVtaWizardProps> = ({
   connection,
-  deployment,
   onPair,
   onVerify,
   onProvisionKey,
   onClose,
 }) => {
   const [stepIndex, setStepIndex] = useState(0);
-  const [backend, setBackend] = useState<WizardBackend>(
-    deployment?.self_administered ? 'bundled' : 'own'
-  );
   const [transport, setTransport] = useState<VtaTransport>(connection.transport);
   const [payload, setPayload] = useState<PairingPayload | null>(null);
   const [pairError, setPairError] = useState<string | null>(null);
@@ -161,13 +150,6 @@ export const ConnectVtaWizard: React.FC<ConnectVtaWizardProps> = ({
           ))}
         </ol>
 
-        {step === 'Backend' && (
-          <BackendStep
-            value={backend}
-            bundledAvailable={Boolean(deployment?.self_administered)}
-            onChange={setBackend}
-          />
-        )}
         {step === 'Transport' && <TransportStep value={transport} onChange={setTransport} />}
         {step === 'Pair' && (
           <PairStep payload={payload} error={pairError} onReissue={issuePayload} />

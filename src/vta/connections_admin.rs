@@ -422,8 +422,7 @@ pub async fn create_connection(
     }
 }
 
-/// A stored connection as the API shows it: the bootstrap record reports the
-/// bundled sidecar's own state when this gateway runs one.
+/// A stored connection as the API shows it.
 fn present(mut connection: VtaConnection) -> VtaConnection {
     // A rotation under way names the secrets-store entries of both keys; what
     // the page needs is the phase and the times.
@@ -437,10 +436,7 @@ fn present(mut connection: VtaConnection) -> VtaConnection {
             .previous_key_ref
             .clear();
     }
-    match crate::vta::bundled::status() {
-        Some(status) => connection.presented_with_bundled(&status),
-        None => connection,
-    }
+    connection
 }
 
 /// `GET /v1/vta/connections` — list connections.
@@ -1138,11 +1134,10 @@ async fn bootstrap_control_did(
 /// `GET /v1/vta/status` — the appliance's signing-deployment tier.
 ///
 /// The dashboard renders this verbatim. `custody_claim` is deliberately part
-/// of the payload rather than inferred client-side: a bundled sidecar shares a
-/// host, a disk and an operator with the gateway, so "the keys are held by a
-/// separate agent" is not a property that deployment has, and the backend —
-/// which is the only thing that knows the mode — says so explicitly rather
-/// than leaving the UI to guess.
+/// of the payload rather than inferred client-side: local signing keeps the
+/// keys on the gateway's own host, so "the keys are held by a separate agent"
+/// is not a property that deployment has, and the backend says so explicitly
+/// rather than leaving the UI to guess.
 pub async fn vta_status(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
@@ -1176,16 +1171,15 @@ pub async fn vta_status(
         Json(serde_json::json!({
             "enabled": config.enabled,
             "tier": config.tier(),
-            // False for both local signing and a bundled sidecar. Nothing in
-            // product copy may claim custody when this is false.
+            // False for local signing. Nothing in product copy may claim
+            // custody when this is false.
             "custody_claim": config.supports_custody_claim(),
-            "self_administered": config.mode.allows_self_administration(),
             "auto_provision_contexts": config.auto_provision_contexts,
             "control_did": control_did,
             "control_did_method": config.effective_control_did_method().as_str(),
-            // How the bundled sidecar's first-start bootstrap went, and who
-            // owns it. Absent unless this gateway runs one.
-            "bootstrap": crate::vta::bundled::status(),
+            // The control key this gateway rotates with `acl/swap-key`: absent
+            // unless it holds a `did:key` control key in a file.
+            "control_key": crate::vta::control_key_live::status(),
             // What this appliance signs with when nobody has said, and why
             // (VTA-26). Reported so "why is it signing with this?" never
             // requires reading config or code.
@@ -1203,16 +1197,9 @@ pub async fn vta_status(
 fn rotation_refusal(error: &crate::vta::control_key_live::RotateNowError) -> (StatusCode, Option<u64>, String) {
     use crate::vta::control_key_live::RotateNowError as E;
     match error {
-        E::NotBundled => (
-            StatusCode::NOT_FOUND,
-            None,
-            "this gateway runs no bundled trust agent, so there is no key to rotate".to_string(),
-        ),
-        E::NotConnected(state) => (
-            StatusCode::CONFLICT,
-            None,
-            format!("the bundled trust agent is {state}; the control key can be rotated once it is connected"),
-        ),
+        E::NotConfigured => {
+            (StatusCode::NOT_FOUND, None, "this gateway holds no did:key control key it can rotate".to_string())
+        }
         E::InProgress => (StatusCode::CONFLICT, None, "a rotation is already running".to_string()),
         E::Standby => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1233,7 +1220,7 @@ fn rotation_refusal(error: &crate::vta::control_key_live::RotateNowError) -> (St
 }
 
 /// `POST /v1/vta/control-key/rotate` — move the gateway's access entry on its
-/// bundled trust agent to a new control key, now.
+/// trust agent to a new control `did:key`, now.
 ///
 /// Signing keys and issuer identities are untouched; only the key the gateway
 /// authenticates with changes. Needs key management edit rights.
@@ -1289,9 +1276,10 @@ fn rotation_start_refusal(error: crate::vta::connection_key_rotation::StartError
     use crate::vta::connection_key_rotation::StartError as E;
     let (status, message) = match error {
         E::NotFound => return not_found().into_response(),
-        E::Bundled => (
+        E::ConfiguredBlock => (
             StatusCode::CONFLICT,
-            "the bundled trust agent's control key rotates through POST /v1/vta/control-key/rotate".to_string(),
+            "the connection configured in [vta] rotates its control key through POST /v1/vta/control-key/rotate"
+                .to_string(),
         ),
         E::NotUsable(reason) => (StatusCode::CONFLICT, format!("{reason}; connect it before rotating its key")),
         E::NotWebvh => (
@@ -1889,11 +1877,9 @@ mod tests {
 
     #[test]
     fn every_refused_rotation_is_answered_with_its_own_status_and_no_agent_internals() {
-        use crate::vta::bundled::BootstrapState;
         use crate::vta::control_key_live::RotateNowError as E;
         let cases = [
-            (E::NotBundled, StatusCode::NOT_FOUND, None),
-            (E::NotConnected(BootstrapState::WaitingForVta.label()), StatusCode::CONFLICT, None),
+            (E::NotConfigured, StatusCode::NOT_FOUND, None),
             (E::InProgress, StatusCode::CONFLICT, None),
             (E::Standby, StatusCode::SERVICE_UNAVAILABLE, None),
             (E::TooSoon(420), StatusCode::TOO_MANY_REQUESTS, Some(420)),
@@ -1912,8 +1898,8 @@ mod tests {
             assert_eq!(got_retry, retry, "{error:?}");
             assert!(!message.contains("secret-internal-detail"), "{message}");
         }
-        let (_, _, message) = rotation_refusal(&E::NotConnected(BootstrapState::WaitingForVta.label()));
-        assert!(message.contains("waiting for the trust agent"), "{message}");
+        let (_, _, message) = rotation_refusal(&E::NotConfigured);
+        assert!(message.contains("did:key control key"), "{message}");
     }
 
     #[tokio::test]

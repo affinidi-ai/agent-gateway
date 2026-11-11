@@ -2,114 +2,45 @@ import React from 'react';
 import { render, screen } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { VtaTierBanner } from './VtaTierBanner';
-import type { VtaBootstrapStatus, VtaDeploymentStatus } from './types';
-
-const bootstrap = (overrides: Partial<VtaBootstrapStatus> = {}): VtaBootstrapStatus => ({
-  state: 'connected',
-  advice: 'nothing to do',
-  context_id: 'gateway',
-  previously_connected: true,
-  owner: 'unclaimed',
-  control_key_rotation_days: 90,
-  ...overrides,
-});
+import type { VtaDeploymentStatus } from './types';
 
 const deployment = (extra: Partial<VtaDeploymentStatus> = {}): VtaDeploymentStatus => ({
   enabled: true,
-  tier: 'bundled',
+  tier: 'self-hosted',
   custody_claim: false,
-  self_administered: true,
   auto_provision_contexts: true,
   reserved_origins: [],
   ...extra,
 });
 
-describe('VtaTierBanner bundled bootstrap', () => {
-  it('shows no bootstrap line when this gateway runs none', () => {
-    render(<VtaTierBanner deployment={deployment()} />);
-    expect(screen.queryByTestId('vta-bootstrap-status')).not.toBeInTheDocument();
-  });
-
-  it('says the trust agent is connected and unowned', () => {
-    render(<VtaTierBanner deployment={deployment({ bootstrap: bootstrap() })} />);
-    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent('Connected');
-    expect(screen.getByTestId('vta-bootstrap-owner')).toHaveTextContent('unclaimed');
-    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent(
-      'no person owns this trust agent yet'
-    );
-    expect(screen.queryByTestId('vta-bootstrap-advice')).not.toBeInTheDocument();
-  });
-
-  it('never implies custody for a bundled trust agent, whatever its state', () => {
-    render(<VtaTierBanner deployment={deployment({ bootstrap: bootstrap() })} />);
-    expect(screen.getByText(/not/, { selector: 'strong' })).toBeInTheDocument();
-    expect(screen.queryByText(/support a key custody claim/)).not.toBeInTheDocument();
-  });
-
-  it('shows the advice and the detail when the trust agent was replaced', () => {
-    render(
-      <VtaTierBanner
-        deployment={deployment({
-          bootstrap: bootstrap({
-            state: 'vta_replaced',
-            advice: 'investigate before re-bootstrapping',
-            detail: 'the sidecar now publishes a different DID',
-          }),
-        })}
-      />
-    );
-    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent('Trust agent replaced');
-    expect(screen.getByTestId('vta-bootstrap-advice')).toHaveTextContent(
-      'investigate before re-bootstrapping'
-    );
-    expect(screen.getByTestId('vta-bootstrap-detail')).toHaveTextContent('different DID');
-    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent('Signing is refused');
-  });
-
-  it('does not say signing is refused for a gateway that never connected', () => {
-    render(
-      <VtaTierBanner
-        deployment={deployment({
-          bootstrap: bootstrap({
-            state: 'waiting_for_vta',
-            advice: 'start the bundled trust agent, then restart the gateway',
-            previously_connected: false,
-          }),
-        })}
-      />
-    );
-    expect(screen.getByTestId('vta-bootstrap-advice')).toHaveTextContent('start the bundled');
-    expect(screen.getByTestId('vta-bootstrap-status')).not.toHaveTextContent('Signing is refused');
-  });
-
-  it('says why the gateway signs locally when the bundled trust agent never came up', () => {
-    // The status reports the deployment as not enabled in that case, but the
-    // operator still has to be told the sidecar is the reason.
-    render(
-      <VtaTierBanner
-        deployment={deployment({
-          enabled: false,
-          tier: 'local',
-          bootstrap: bootstrap({
-            state: 'waiting_for_vta',
-            previously_connected: false,
-            advice: 'start the bundled trust agent, then restart the gateway',
-          }),
-        })}
-      />
-    );
-    expect(screen.getByText(/Signing locally/)).toBeInTheDocument();
-    expect(screen.getByTestId('vta-bootstrap-status')).toHaveTextContent(
-      'Waiting for the trust agent'
-    );
-    expect(screen.getByTestId('vta-bootstrap-advice')).toHaveTextContent(
-      'start the bundled trust agent, then restart the gateway'
-    );
-  });
-
-  it('shows nothing extra when signing locally with no bundled trust agent', () => {
+describe('VtaTierBanner', () => {
+  it('says the gateway signs with its own keys when no trust agent is enabled', () => {
     render(<VtaTierBanner deployment={deployment({ enabled: false, tier: 'local' })} />);
     expect(screen.getByText(/Signing locally/)).toBeInTheDocument();
-    expect(screen.queryByTestId('vta-bootstrap-status')).not.toBeInTheDocument();
+    expect(screen.getByText(/own keys/)).toBeInTheDocument();
+  });
+
+  it('never implies custody when the deployment makes no custody claim', () => {
+    render(<VtaTierBanner deployment={deployment()} />);
+    expect(screen.getByText(/Deployment: self-hosted/)).toBeInTheDocument();
+    expect(screen.getByText(/not/, { selector: 'strong' })).toBeInTheDocument();
+    expect(screen.queryByText(/held by a separately-operated agent/)).not.toBeInTheDocument();
+  });
+
+  it('states a custody claim only when the backend makes one', () => {
+    render(<VtaTierBanner deployment={deployment({ custody_claim: true })} />);
+    expect(screen.getByText(/held by a separately-operated agent/)).toBeInTheDocument();
+  });
+
+  it('lists reserved control-plane origins', () => {
+    render(
+      <VtaTierBanner deployment={deployment({ reserved_origins: ['http://127.0.0.1:8100'] })} />
+    );
+    expect(screen.getByText('http://127.0.0.1:8100')).toBeInTheDocument();
+  });
+
+  it('renders nothing before the status is known', () => {
+    const { container } = render(<VtaTierBanner deployment={null} />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

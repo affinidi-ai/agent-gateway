@@ -48,7 +48,7 @@ const webvh = (overrides: Partial<VtaConnection> = {}): VtaConnection => ({
 });
 
 describe('VtaConnectionsList', () => {
-  it('shows the bundled agent as connected, not as waiting to be paired', () => {
+  it('shows the [vta] block agent as connected, not as waiting to be paired', () => {
     renderList([connection('vta-bootstrap', 'connected')]);
     expect(screen.getByText('Connected')).toBeInTheDocument();
     expect(screen.queryByText(/Not paired/)).not.toBeInTheDocument();
@@ -75,7 +75,7 @@ describe('VtaConnectionsList', () => {
       );
     });
 
-    it('offers nothing for a did:key connection, the bundled record or a user without the right', () => {
+    it('offers nothing for a did:key connection, the [vta] record or a user without the right', () => {
       renderList([
         connection('customer-1', 'connected'),
         webvh({ id: 'vta-bootstrap', name: 'Bootstrap VTA' }),

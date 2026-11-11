@@ -9,49 +9,29 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
   live but, when it is missing, fall back to the role in the caller's access token. A revoked or
   swapped-away DID can keep signing until its access token expires (up to 15 minutes). Until a
   missing entry denies, treat a suspected leak as "revoke, then wait out the token".
-- **`Capability::ContextCreate` is not in a released trust agent.** The bundled sidecar's grant
-  names it, so the sidecar image must be built from the `gateway-integration` branch until it
-  is released with its specification change.
-- **The offline CLI's audit rows** are written by the `gateway-integration` branch; a trust
-  agent built without that change enrols the gateway with no audit record.
-
-## Custom trust agents beside the bundled default
-
-- **An agent's own key stays in the appliance default.** A surface that signs through a custom
-  connection has its identity credential issued by that trust agent, but each agent's own key,
-  and so the presentation it holds, is created in and signed by the appliance default (the
-  bundled sidecar), because an onboarded agent keeps its key where it was created. Only the
-  issuer's signature moves to the custom trust agent.
-- **A custom connection's `did:webvh` control identity needs the trust agent to reach the
-  gateway over the address it was published at.** A local development gateway names its TLS
-  port, which a trust agent resolving a `localhost` DID over plain `http` cannot reach, so the
-  live check connects its custom trust agent with `control_identity: "did_key"`.
-- **Surface signing cannot name the bundled connection.** A surface's `signing.connection_id`
-  of `vta-bootstrap` is refused as unusable (the record has no control key of its own); the
-  bundled sidecar is reached through the appliance default only.
-
-## On the bundled sidecar
-
-- **No person owns it.** The super-admin slot stays empty (`owner: unclaimed`). A claim flow
-  (a one-time code with a claim check shown on both sides) would let a person become the owner
-  and see or revoke the gateway's access.
-- **Its own DID is a `did:key`.** A `did:webvh` needs a recovery-key custodian outside the
-  deployment, which a claim would provide.
-- **A sidecar that starts after the gateway is only picked up at the next start.** There is no
-  hot adoption.
+- **`Capability::ContextCreate` is not in a released trust agent.** A grant that names it needs
+  a trust agent built from the `verifiable-trust-infrastructure` branch `gateway-integration`,
+  until it is released with its specification change.
 - **A rotated control key's old session lives on for up to 15 minutes.** After a swap the
   trust agent's signing gates fall back to the role in an already-issued access token, so a
   copy of the old key that holds a token keeps signing until it expires. Rotation protects
   against old copies of the key (backups, snapshots), not against a session already open.
   The trust agent ending the old DID's sessions on a swap would close this.
-- **The Kubernetes pod was validated for syntax only.** The Compose example is run with real
-  containers by `scripts/vta-bundled-compose-e2e.sh`; no cluster was available for the pod.
-- **Compose restarts must be ordered.** The sidecar joins the gateway's network namespace, so
-  restart the gateway first and the sidecar second. A plain `docker compose restart` fails
-  the sidecar and Docker's restart policy does not bring it back.
-- **The images need more than 8 GB to build.** `vti-specs-core` and the `agent-gateway` crate
-  are killed by the out-of-memory killer in an 8 GB Docker VM; 16 GB builds both.
 
+## Custom trust agents for one surface
+
+- **An agent's own key stays in the default signing.** A surface that signs through a custom
+  connection has its identity credential issued by that trust agent, but each agent's own key,
+  and so the presentation it holds, is created in and signed by the appliance default, because
+  an onboarded agent keeps its key where it was created. Only the issuer's signature moves to
+  the custom trust agent.
+- **A custom connection's `did:webvh` control identity needs the trust agent to reach the
+  gateway over the address it was published at.** A local development gateway names its TLS
+  port, which a trust agent resolving a `localhost` DID over plain `http` cannot reach, so the
+  live check connects its custom trust agent with `control_identity: "did_key"`.
+- **Surface signing cannot name the `vta-bootstrap` connection.** A surface's
+  `signing.connection_id` of `vta-bootstrap` is refused as unusable (the record has no control
+  key of its own); the `[vta]` block is reached through the appliance default only.
 - **A custom connection's control key can only be rotated by hand, and only as a `did:webvh`.**
   There is no schedule for it, and a connection that authenticates as a `did:key` cannot be
   rotated without a new grant. After a rotation the trust agent keeps accepting the old key for

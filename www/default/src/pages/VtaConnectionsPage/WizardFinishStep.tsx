@@ -67,20 +67,13 @@ export const WizardFinishStep: React.FC<Props> = ({
 
   // Pre-check only when the appliance has no agent default yet. Connecting a
   // second agent must never silently repoint signing for everything already
-  // running against the first. A bundled trust agent is a default too, though it
-  // is not stored in the settings: the status says so.
+  // running against the first.
   useEffect(() => {
     void (async () => {
       try {
-        const [response, status] = await Promise.all([
-          apiClient.fetch('/api/v1/settings'),
-          apiClient.fetch('/api/v1/vta/status').catch(() => null),
-        ]);
+        const response = await apiClient.fetch('/api/v1/settings');
         const settings = response.ok ? await response.json() : null;
-        const resolution = status?.ok ? (await status.json())?.default_resolution : null;
-        const existing =
-          settings?.default_signing?.connection_id ??
-          (resolution?.backend === 'bundled' ? 'the bundled trust agent' : null);
+        const existing = settings?.default_signing?.connection_id ?? null;
         setExistingDefault(existing);
         const preCheck = canSetDefault && !existing;
         setMakeDefault(preCheck);

@@ -61,15 +61,13 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
     connection.pairing.state === 'connected' &&
     Boolean(connection.keys?.active?.key_id);
 
-  // The `[vta]` block's own record is the bundled trust agent. It is offered once it
-  // is connected, under a name that says what it is. While it is not, offering it
-  // greyed out as "not ready" would suggest there is something to set up, so it is
-  // left out, unless this surface already saved it, so the select is never blank.
-  const bundled = (connection: VtaConnection) => connection.id === BOOTSTRAP_CONNECTION_ID;
+  // The `[vta]` block's own record is offered once it is connected. While it is not,
+  // offering it greyed out as "not ready" would suggest there is something to set up,
+  // so it is left out, unless this surface already saved it, so the select is never blank.
   const listed = (connection: VtaConnection) =>
-    !bundled(connection) || ready(connection) || signing?.connection_id === connection.id;
-  const label = (connection: VtaConnection) =>
-    bundled(connection) ? 'Bundled trust agent' : connection.name;
+    connection.id !== BOOTSTRAP_CONNECTION_ID ||
+    ready(connection) ||
+    signing?.connection_id === connection.id;
 
   const choose = (value: string) => {
     if (value === INHERIT) {
@@ -110,12 +108,8 @@ export const SurfaceSigningSection: React.FC<Props> = ({ signing, setSigning, di
         <option value={LOCAL}>This gateway&apos;s own key (local)</option>
         {connections.filter(listed).map(connection => (
           <option key={connection.id} value={connection.id} disabled={!ready(connection)}>
-            {label(connection)}
-            {ready(connection)
-              ? ''
-              : bundled(connection)
-                ? ' — not ready: the bundled trust agent is not connected'
-                : ' — not ready: connect it and provision a key first'}
+            {connection.name}
+            {ready(connection) ? '' : ' — not ready: connect it and provision a key first'}
           </option>
         ))}
       </Form.Select>

@@ -86,23 +86,21 @@ pub struct SurfaceConfigBuilder {
     pub keeps_gateway_log: bool,
     /// The gateway writes its log files to `_storage/logs`, the directory the log routes act on.
     pub writes_log_directory: bool,
-    /// The gateway starts with `[vta] auto_bootstrap` against a mock bundled trust agent.
-    pub bundled_trust_agent: Option<BundledTrustAgentSetup>,
+    /// The gateway starts with a `[vta]` block that points at a mock trust agent.
+    pub control_key_trust_agent: Option<ControlKeyTrustAgentSetup>,
+    /// `[vta] control_key_rotation_days` of that block.
+    pub control_key_rotation_days: Option<u32>,
     /// `[vta] connection_key_switch_timeout_secs`, so a rotation the trust agent refuses rolls back quickly.
     pub connection_key_switch_timeout_secs: Option<u64>,
 }
 
-/// Where a bundled gateway finds its trust agent and the folder they share.
+/// The trust agent a gateway is configured against, and where it keeps its control key.
 #[derive(Debug, Clone)]
-pub struct BundledTrustAgentSetup {
+pub struct ControlKeyTrustAgentSetup {
     pub base_url: String,
-    pub bootstrap_dir: std::path::PathBuf,
+    pub key_path: std::path::PathBuf,
+    pub control_did_method: &'static str,
 }
-
-/// The master key the bundled scenarios give the gateway, because a bundled
-/// trust agent requires encryption at rest.
-pub const BUNDLED_MASTER_KEY_ENV: &str = "BDD_BUNDLED_MASTER_KEY";
-pub const BUNDLED_MASTER_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
 
 impl Default for SurfaceConfigBuilder {
     fn default() -> Self {
@@ -163,7 +161,8 @@ impl Default for SurfaceConfigBuilder {
             token_request_timeout_secs: None,
             keeps_gateway_log: false,
             writes_log_directory: false,
-            bundled_trust_agent: None,
+            control_key_trust_agent: None,
+            control_key_rotation_days: None,
             connection_key_switch_timeout_secs: None,
         }
     }

@@ -15,24 +15,24 @@ jest.mock('../../context/PermissionsContext', () => ({
 
 const mockFetch = apiClient.fetch as jest.Mock;
 
-const bundledStatus = {
+const vtaStatus = {
   enabled: true,
-  tier: 'bundled',
+  tier: 'self-hosted',
   custody_claim: false,
   default_resolution: {
-    backend: 'bundled',
-    reason: 'the [vta] block is enabled, so this appliance signs through its bundled trust agent',
+    backend: 'vta',
+    reason: 'the [vta] block is enabled, so this appliance signs through its trust agent',
     explicit: true,
   },
 };
 
-const bootstrap = {
+const blockConnection = {
   id: 'vta-bootstrap',
-  name: 'Bootstrap VTA',
+  name: 'Configured VTA',
   enabled: true,
   transport: 'https',
   endpoint: 'http://127.0.0.1:8100',
-  vta_did: 'did:key:z6MkBundled',
+  vta_did: 'did:key:z6MkBlock',
   default_context_id: 'gateway',
   status: 'connected',
   pairing: { state: 'connected' },
@@ -40,7 +40,7 @@ const bootstrap = {
 };
 
 const custom = {
-  ...bootstrap,
+  ...blockConnection,
   id: 'vta-custom',
   name: 'Custom VTA',
   endpoint: 'http://127.0.0.1:3000',
@@ -53,10 +53,10 @@ let settings: Record<string, unknown> = {};
 const respond = () => {
   mockFetch.mockImplementation((url: string, init?: { method?: string; body?: string }) => {
     if (url.includes('/vta/status')) {
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(bundledStatus) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(vtaStatus) });
     }
     if (url.includes('/vta/connections')) {
-      return Promise.resolve({ ok: true, json: () => Promise.resolve([bootstrap, custom]) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([blockConnection, custom]) });
     }
     if (url.includes('/settings')) {
       if (init?.method === 'POST') {
@@ -90,21 +90,21 @@ beforeEach(() => {
   respond();
 });
 
-describe('KeyManagementSettingsSection with the bundled trust agent', () => {
-  it('shows the bundled agent as the current choice, not the gateway’s own key', async () => {
+describe('KeyManagementSettingsSection with the [vta] block trust agent', () => {
+  it('shows the configured agent as the current choice, not the gateway’s own key', async () => {
     const picker = await open();
     await screen.findByRole('option', { name: /Custom VTA/ });
 
     const options = within(picker)
       .getAllByRole('option')
       .map(o => o.textContent);
-    expect(options).toContain('The bundled trust agent (default)');
+    expect(options).toContain('The configured agent (from the [vta] block)');
     expect(options.join('|')).not.toMatch(/own key/);
-    expect(options.join('|')).not.toMatch(/Bootstrap VTA/);
+    expect(options.join('|')).not.toMatch(/Configured VTA/);
     expect(picker).toHaveValue('__local__');
     expect(
       (picker as HTMLSelectElement).options[(picker as HTMLSelectElement).selectedIndex].text
-    ).toBe('The bundled trust agent (default)');
+    ).toBe('The configured agent (from the [vta] block)');
   });
 
   it('says what changed after saving another default, and keeps saying it', async () => {

@@ -9,15 +9,14 @@ import type { VtaConnection } from '../VtaConnectionsPage/types';
 const LOCAL = '__local__';
 
 /** What the configuration resolves to when no default is stored: the sentinel option. */
-export type ConfiguredDefault = 'local' | 'bundled' | 'vta';
+export type ConfiguredDefault = 'local' | 'vta';
 
 const CONFIGURED_LABELS: Record<ConfiguredDefault, string> = {
   local: "This gateway's own key (local)",
-  bundled: 'The bundled trust agent (default)',
   vta: 'The configured agent (from the [vta] block)',
 };
 
-/** The bundled sidecar's own record: the sentinel option already stands for it. */
+/** The `[vta]` block's own record: the sentinel option already stands for it. */
 const BOOTSTRAP_CONNECTION_ID = 'vta-bootstrap';
 
 interface Props {

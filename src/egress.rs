@@ -333,7 +333,7 @@ fn pin_and_build(
 /// Same policy as the forwarding-layer static check
 /// ([`validate_resolved_cloud_metadata_url`]): blocks only cloud metadata,
 /// allows loopback and RFC 1918 so an operator-configured surface can forward to
-/// a localhost sidecar or same-VPC upstream. Pins the connection to the vetted
+/// a localhost service or same-VPC upstream. Pins the connection to the vetted
 /// address so DNS cannot be re-resolved to an internal address between vetting
 /// and connect (rebinding TOCTOU), and disables redirects so an upstream 3xx is
 /// returned to the caller rather than followed to an unvetted `Location`. A host
@@ -344,7 +344,7 @@ pub(crate) fn pinned_forward_client(
     raw_url: &str,
     timeout: Duration,
 ) -> Result<(Client, PinnedTarget), EgressError> {
-    // A bundled VTA sits on loopback or a private network — addresses this
+    // A trust agent can sit on loopback or a private network — addresses this
     // policy deliberately allows — so without this check an operator-configured
     // surface could forward to the agent holding this gateway's signing keys
     // (VTA-21). The VTA is a control-plane dependency; it is never a proxy
@@ -1140,7 +1140,7 @@ mod tests {
         );
     }
 
-    /// A bundled VTA sits on exactly the addresses the forward leg allows, so
+    /// A trust agent can sit on exactly the addresses the forward leg allows, so
     /// without an explicit reservation a surface could proxy a caller straight
     /// to the agent holding this gateway's signing keys (VTA-21).
     #[test]
@@ -1162,7 +1162,7 @@ mod tests {
             assert!(matches!(result, Err(EgressError::Blocked(_))), "strict reached the VTA at {raw}: {result:?}");
         }
 
-        // An unrelated loopback sidecar on a different port still forwards, so
+        // An unrelated loopback service on a different port still forwards, so
         // the block is the VTA's address and not the whole range.
         crate::vta::isolation::clear_reservations();
         pinned_forward_client("http://127.0.0.1:9/ok", Duration::from_secs(5))

@@ -1,8 +1,8 @@
 //! Keeping the VTA off the data plane.
 //!
-//! A bundled VTA sidecar sits on loopback or a private compose network — the
-//! same address space a surface is legitimately allowed to forward to. That
-//! makes it reachable, in principle, as an ordinary MCP/A2A/surface upstream,
+//! A trust agent can sit on loopback or a private network — the same address
+//! space a surface is legitimately allowed to forward to. That makes it
+//! reachable, in principle, as an ordinary MCP/A2A/surface upstream,
 //! which would let a caller drive the agent that holds this gateway's signing
 //! keys through the proxy pipeline. The VTA is a **control-plane** dependency
 //! and must never be addressable from the data plane.
@@ -11,14 +11,14 @@
 //! [`crate::egress::EgressPolicy::Strict`], which blocks loopback and RFC 1918.
 //! The gap this module closes is the **forward leg**, which deliberately allows
 //! those ranges so an operator-configured surface can reach a localhost
-//! sidecar — exactly the shape a bundled VTA has.
+//! service — exactly the shape a co-located VTA has.
 //!
 //! ## Why origin-level, and why a reservation rather than a range
 //!
 //! Matching is on `(host, port)`: path and scheme are ignored, because
 //! `/trust-tasks` and `/` are the same service and an http/https downgrade is
 //! not a different agent. Blocking by *range* instead would also block every
-//! legitimate localhost sidecar an operator runs, so only the endpoints the
+//! legitimate localhost service an operator runs, so only the endpoints the
 //! gateway itself was configured with are reserved.
 
 use std::collections::BTreeSet;
@@ -75,7 +75,7 @@ pub fn is_reserved(raw: &str) -> bool {
 }
 
 /// Refuse `raw` if it names a VTA. The message is deliberately explicit about
-/// *why*, because an operator who typed the sidecar address into a surface
+/// *why*, because an operator who typed the trust agent address into a surface
 /// needs to understand it is not a configuration mistake they can work around.
 pub fn assert_not_vta(raw: &str) -> Result<(), String> {
     if is_reserved(raw) {
@@ -119,7 +119,7 @@ mod tests {
     use super::TEST_LOCK as LOCK;
 
     #[test]
-    fn a_reserved_sidecar_cannot_be_named_as_a_proxy_target() {
+    fn a_reserved_trust_agent_cannot_be_named_as_a_proxy_target() {
         let _guard = LOCK.lock().unwrap();
         clear_reservations();
         reserve("http://127.0.0.1:3000");
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unrelated_localhost_sidecar_is_untouched() {
+    fn an_unrelated_localhost_service_is_untouched() {
         let _guard = LOCK.lock().unwrap();
         clear_reservations();
         reserve("http://127.0.0.1:3000");

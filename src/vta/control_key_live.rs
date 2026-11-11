@@ -1,5 +1,5 @@
-//! Rotating the bundled trust agent's control key while the gateway runs, on a
-//! schedule or on request.
+//! Rotating the control key the gateway holds for its `[vta]` trust agent while
+//! it runs, on a schedule or on request.
 //!
 //! The running gateway registers its shared trust agent client here once the
 //! signing backend is built. Everything that rotates (the schedule, the admin
@@ -7,20 +7,100 @@
 //! events cannot differ between them.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once, RwLock};
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
-use super::bundled::BootstrapState;
 use super::client::VtaRestClient;
 use super::control_key_schedule::{self, Decision, Schedule};
 use super::control_rotation::{self, RotateLiveError};
 use super::error::VtaError;
 use crate::config::vta::VtaConfig;
 
-/// What the gateway needs to rotate: the running client, the `[vta]` block as
-/// it stands after the bootstrap, and where the key material is kept.
+/// Where the rotation record is kept, beside the control key.
+pub const RECORD_FILE: &str = "vta_control_key_rotation.json";
+
+/// When the gateway began holding its control key and when it last moved to a
+/// new one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Record {
+    since: DateTime<Utc>,
+    #[serde(default)]
+    rotated_at: Option<DateTime<Utc>>,
+}
+
+fn record_path(storage: &Path) -> PathBuf {
+    storage.join(RECORD_FILE)
+}
+
+async fn load_record(storage: &Path) -> Option<Record> {
+    let text = crate::encryption::secret_file::read_secret_file(&record_path(storage))
+        .await
+        .ok()??;
+    serde_json::from_str(&text).ok()
+}
+
+async fn save_record(
+    storage: &Path,
+    record: &Record,
+) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(record).map_err(|e| format!("could not encode the rotation record: {e}"))?;
+    crate::encryption::secret_file::write_secret_file(&record_path(storage), &text)
+        .await
+        .map_err(|e| format!("could not persist the rotation record: {e}"))
+}
+
+/// What the status API reports about the control key the gateway rotates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControlKeyStatus {
+    pub control_did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<DateTime<Utc>>,
+    /// Absent when automatic rotation is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_rotation_at: Option<DateTime<Utc>>,
+    /// Days between automatic rotations; `0` is off.
+    pub rotation_days: u32,
+}
+
+fn status_for(
+    record: &Record,
+    config: &VtaConfig,
+    control_did: String,
+) -> ControlKeyStatus {
+    ControlKeyStatus {
+        control_did,
+        rotated_at: record.rotated_at,
+        next_rotation_at: control_key_schedule::next_due(
+            record.rotated_at,
+            record.since,
+            config.control_key_rotation_days,
+        ),
+        rotation_days: config.control_key_rotation_days,
+    }
+}
+
+static STATUS: RwLock<Option<ControlKeyStatus>> = RwLock::new(None);
+
+/// The control key's status, when this gateway holds one it can rotate.
+pub fn status() -> Option<ControlKeyStatus> {
+    STATUS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn set_status(status: Option<ControlKeyStatus>) {
+    *STATUS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+}
+
+/// What the gateway needs to rotate: the running client, the `[vta]` block, and
+/// where the key material is kept.
 pub struct Live {
     client: Arc<VtaRestClient>,
     config: VtaConfig,
@@ -35,14 +115,28 @@ fn live() -> Option<Arc<Live>> {
         .clone()
 }
 
-/// Remember the bundled client for later rotations, replacing an earlier one
-/// (a process that builds more than one gateway, as the tests do, rotates the
-/// latest).
-pub fn register(
+/// Remember the client for later rotations, replacing an earlier one (a process
+/// that builds more than one gateway, as the tests do, rotates the latest), and
+/// publish the control key's status.
+pub async fn register(
     client: Arc<VtaRestClient>,
     config: VtaConfig,
     storage: PathBuf,
 ) {
+    let record = match load_record(&storage).await {
+        Some(record) => record,
+        None => {
+            let record = Record {
+                since: Utc::now(),
+                rotated_at: None,
+            };
+            if let Err(e) = save_record(&storage, &record).await {
+                tracing::warn!(target: "vta_audit", "{e}");
+            }
+            record
+        }
+    };
+    set_status(Some(status_for(&record, &config, client.control_did())));
     *LIVE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(Live { client, config, storage }));
@@ -83,10 +177,8 @@ impl Trigger {
 /// Why a rotation was not done.
 #[derive(Debug)]
 pub enum RotateNowError {
-    /// This gateway runs no bundled trust agent.
-    NotBundled,
-    /// The bundled agent is not connected; carries what it is doing instead.
-    NotConnected(&'static str),
+    /// This gateway holds no control key it can rotate.
+    NotConfigured,
     /// A standby gateway never rotates: the active one owns the key.
     Standby,
     /// Another rotation is running.
@@ -108,16 +200,48 @@ pub struct Report {
 /// Whether a rotation may start now.
 pub fn precondition(
     standby: bool,
-    state: Option<BootstrapState>,
+    configured: bool,
 ) -> Result<(), RotateNowError> {
-    let state = state.ok_or(RotateNowError::NotBundled)?;
+    if !configured {
+        return Err(RotateNowError::NotConfigured);
+    }
     if standby {
         return Err(RotateNowError::Standby);
     }
-    if state != BootstrapState::Connected {
-        return Err(RotateNowError::NotConnected(state.label()));
-    }
     Ok(())
+}
+
+/// Record a finished rotation: the rotation record, the onboarding record and
+/// the published status.
+///
+/// Only the gateway's access entry moved; the signing key and everything else
+/// the trust agent holds are untouched.
+async fn record_rotation(
+    storage: &Path,
+    config: &VtaConfig,
+    rotated: &control_rotation::Rotated,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let mut record = load_record(storage)
+        .await
+        .unwrap_or(Record { since: now, rotated_at: None });
+    record.rotated_at = Some(now);
+    set_status(Some(status_for(&record, config, rotated.new_did.clone())));
+
+    // Written before the client signs in as the new DID, so the onboarding check
+    // finds the record already current instead of flagging an off-schedule change.
+    let onboarding_path = storage.join(super::onboarding::ONBOARDING_RECORD_FILE);
+    if let Ok(Some(mut onboarding)) = super::onboarding::OnboardingRecord::load(&onboarding_path).await {
+        onboarding.control_did = rotated.new_did.clone();
+        onboarding.granted_at = now;
+        if let Err(e) = onboarding
+            .save(&onboarding_path)
+            .await
+        {
+            tracing::warn!(target: "vta_audit", "could not update the onboarding record: {}", e.log_detail());
+        }
+    }
+    save_record(storage, &record).await
 }
 
 async fn perform(
@@ -129,8 +253,8 @@ async fn perform(
         .config
         .vta_did
         .as_deref()
-        .ok_or(RotateNowError::NotBundled)?;
-    let key_path = super::appliance_control_key_path(&live.storage);
+        .ok_or(RotateNowError::NotConfigured)?;
+    let key_path = super::rotatable_control_key_path(&live.config).ok_or(RotateNowError::NotConfigured)?;
     let rotated = control_rotation::rotate_live(&live.client, &live.config, vta_did, &key_path)
         .await
         .map_err(|e| match e {
@@ -138,10 +262,7 @@ async fn perform(
             RotateLiveError::Failed(e) => RotateNowError::Failed(e),
         })?;
     let now = Utc::now();
-    if let Err(e) =
-        super::bundled::record_rotation(&live.storage, std::path::Path::new(&live.config.bootstrap_dir), &rotated, now)
-            .await
-    {
+    if let Err(e) = record_rotation(&live.storage, &live.config, &rotated, now).await {
         tracing::error!(
             target: "vta_audit",
             event = "vta_control_key_record_failed",
@@ -156,9 +277,9 @@ async fn perform(
         control_did = %rotated.new_did,
         trigger = trigger.as_str(),
         user_id = user.unwrap_or(""),
-        "the gateway's control key on the bundled trust agent was rotated",
+        "the gateway's control key on its trust agent was rotated",
     );
-    let next = super::bundled::status().and_then(|s| s.control_key_next_rotation_at);
+    let next = status().and_then(|s| s.next_rotation_at);
     Ok(Report {
         previous_control_did: rotated.previous_did,
         control_did: rotated.new_did,
@@ -172,11 +293,11 @@ pub async fn rotate_now(
     trigger: Trigger,
     user: Option<&str>,
 ) -> Result<Report, RotateNowError> {
-    precondition(crate::server::mode::is_standby(), super::bundled::status().map(|s| s.state))?;
-    let live = live().ok_or(RotateNowError::NotBundled)?;
+    let live = live();
+    precondition(crate::server::mode::is_standby(), live.is_some())?;
+    let live = live.ok_or(RotateNowError::NotConfigured)?;
     if trigger == Trigger::Api
-        && let Some(seconds) =
-            seconds_until_allowed(super::bundled::status().and_then(|s| s.control_key_rotated_at), Utc::now())
+        && let Some(seconds) = seconds_until_allowed(status().and_then(|s| s.rotated_at), Utc::now())
     {
         return Err(RotateNowError::TooSoon(seconds));
     }
@@ -195,8 +316,7 @@ pub async fn rotate_now(
 
 fn describe(error: &RotateNowError) -> String {
     match error {
-        RotateNowError::NotBundled => "no bundled trust agent".to_string(),
-        RotateNowError::NotConnected(state) => format!("the bundled trust agent is {state}"),
+        RotateNowError::NotConfigured => "no control key this gateway can rotate".to_string(),
         RotateNowError::Standby => "this gateway is on standby".to_string(),
         RotateNowError::InProgress => "another rotation is running".to_string(),
         RotateNowError::TooSoon(seconds) => format!("the last rotation was too recent; retry in {seconds}s"),
@@ -242,7 +362,7 @@ where
 }
 
 /// Start the background schedule. Rotation runs only on the active gateway and
-/// only while the bundled agent is connected, an hour apart at most.
+/// only when `control_key_rotation_days` is set, checked an hour apart.
 pub fn spawn_schedule() {
     static STARTED: Once = Once::new();
     if live().is_none() {
@@ -263,17 +383,14 @@ async fn schedule_loop() {
             _ = modes.recv() => {}
         }
         wait = std::time::Duration::from_secs(3600);
-        let status = super::bundled::status();
-        let connected = status
+        let current = status();
+        let connected = current.is_some();
+        let due = current
             .as_ref()
-            .is_some_and(|s| s.state == BootstrapState::Connected);
-        let due = status
+            .and_then(|s| s.next_rotation_at);
+        let jitter = current
             .as_ref()
-            .and_then(|s| s.control_key_next_rotation_at);
-        let jitter = status
-            .as_ref()
-            .and_then(|s| s.control_did.as_deref())
-            .map(control_key_schedule::jitter)
+            .map(|s| control_key_schedule::jitter(&s.control_did))
             .unwrap_or_default();
         tick(&mut schedule, Utc::now(), due, jitter, crate::server::mode::is_standby(), connected, || {
             rotate_now(Trigger::Schedule, None)
@@ -308,25 +425,90 @@ mod tests {
         assert_eq!(seconds_until_allowed(None, at(5)), None, "never rotated is never too soon");
     }
 
+    fn config_with_days(days: u32) -> VtaConfig {
+        VtaConfig {
+            control_key_rotation_days: days,
+            ..VtaConfig::default()
+        }
+    }
+
     #[test]
-    fn a_gateway_with_no_bundled_agent_cannot_rotate() {
-        assert!(matches!(precondition(false, None), Err(RotateNowError::NotBundled)));
+    fn the_status_counts_the_next_rotation_from_the_last_one_or_else_from_when_the_key_was_first_held() {
+        let never = Record { since: at(0), rotated_at: None };
+        let status = status_for(&never, &config_with_days(30), "did:key:z6MkA".to_string());
+        assert_eq!(status.control_did, "did:key:z6MkA");
+        assert_eq!(status.rotated_at, None);
+        assert_eq!(status.next_rotation_at, Some(at(30)));
+        assert_eq!(status.rotation_days, 30);
+
+        let rotated = Record {
+            since: at(0),
+            rotated_at: Some(at(10)),
+        };
+        assert_eq!(
+            status_for(&rotated, &config_with_days(30), "did:key:z6MkB".to_string()).next_rotation_at,
+            Some(at(40))
+        );
+    }
+
+    #[test]
+    fn with_automatic_rotation_off_the_status_names_no_next_rotation() {
+        let record = Record {
+            since: at(0),
+            rotated_at: Some(at(10)),
+        };
+        let status = status_for(&record, &config_with_days(0), "did:key:z6MkA".to_string());
+        assert_eq!(status.next_rotation_at, None);
+        assert_eq!(status.rotation_days, 0);
+        assert_eq!(status.rotated_at, Some(at(10)));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_rotation_is_kept_beside_the_key_and_keeps_when_the_key_was_first_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_record(dir.path(), &Record { since: at(1), rotated_at: None })
+            .await
+            .expect("save");
+        let rotated = control_rotation::Rotated {
+            previous_did: "did:key:z6MkOld".to_string(),
+            new_did: "did:key:z6MkNew".to_string(),
+        };
+
+        record_rotation(dir.path(), &config_with_days(30), &rotated, at(20))
+            .await
+            .expect("record");
+
+        let record = load_record(dir.path())
+            .await
+            .expect("a record");
+        assert_eq!(
+            record,
+            Record {
+                since: at(1),
+                rotated_at: Some(at(20))
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_record_reads_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(load_record(dir.path()).await, None);
+    }
+
+    #[test]
+    fn a_gateway_with_no_rotatable_control_key_cannot_rotate() {
+        assert!(matches!(precondition(false, false), Err(RotateNowError::NotConfigured)));
     }
 
     #[test]
     fn a_standby_gateway_cannot_rotate() {
-        assert!(matches!(precondition(true, Some(BootstrapState::Connected)), Err(RotateNowError::Standby)));
+        assert!(matches!(precondition(true, true), Err(RotateNowError::Standby)));
     }
 
     #[test]
-    fn an_agent_that_is_not_connected_names_what_it_is_doing() {
-        let err = precondition(false, Some(BootstrapState::WaitingForVta)).expect_err("not connected");
-        assert!(matches!(err, RotateNowError::NotConnected(state) if state == BootstrapState::WaitingForVta.label()));
-    }
-
-    #[test]
-    fn a_connected_active_gateway_may_rotate() {
-        assert!(precondition(false, Some(BootstrapState::Connected)).is_ok());
+    fn an_active_gateway_with_a_rotatable_control_key_may_rotate() {
+        assert!(precondition(false, true).is_ok());
     }
 
     #[tokio::test]

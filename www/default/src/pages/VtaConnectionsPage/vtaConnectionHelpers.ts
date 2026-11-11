@@ -51,7 +51,7 @@ export function presentPairing(state: PairingState): PairingPresentation {
  * Whether this connection can sign right now. Mirrors the backend's
  * `pairing::assert_usable`: both halves matter, and anything else fails closed.
  */
-/** The record the `[vta]` block, and so the bundled sidecar, is shown as. */
+/** The record the `[vta]` config block is shown as. */
 export const BOOTSTRAP_CONNECTION_ID = 'vta-bootstrap';
 
 /** The server refuses to revoke or verify it: the `[vta]` block is the only way to change it. */

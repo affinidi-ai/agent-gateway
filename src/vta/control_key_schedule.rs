@@ -1,4 +1,4 @@
-//! When the bundled control key is next due for rotation, and whether a given
+//! When the control key is next due for rotation, and whether a given
 //! moment is the one to do it.
 //!
 //! Everything here is a pure function of its inputs, so the timing rules can be
@@ -19,17 +19,18 @@ const BACKOFF_CAP: Duration = Duration::from_secs(24 * 3600);
 /// Failures in a row after which the log line becomes an error.
 pub const ESCALATE_AFTER_FAILURES: u32 = 3;
 
-/// When rotation is next due: `days` after the last rotation, or after the
-/// bootstrap when there has been none. `None` when `days` is zero.
+/// When rotation is next due: `days` after the last rotation, or after `since`
+/// (when the gateway began holding the key) when there has been none. `None`
+/// when `days` is zero.
 pub fn next_due(
     rotated_at: Option<DateTime<Utc>>,
-    bootstrapped_at: DateTime<Utc>,
+    since: DateTime<Utc>,
     days: u32,
 ) -> Option<DateTime<Utc>> {
     if days == 0 {
         return None;
     }
-    Some(rotated_at.unwrap_or(bootstrapped_at) + chrono::Duration::days(i64::from(days)))
+    Some(rotated_at.unwrap_or(since) + chrono::Duration::days(i64::from(days)))
 }
 
 /// A delay in `[0, JITTER_WINDOW)` that is the same every time for one DID.
@@ -130,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn next_due_counts_from_the_bootstrap_when_never_rotated() {
+    fn next_due_counts_from_when_the_key_was_first_held_when_never_rotated() {
         assert_eq!(next_due(None, at(10), 90), Some(at(100)));
     }
 

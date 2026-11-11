@@ -1,14 +1,11 @@
-//! A mock bundled trust agent, in the test process, for scenarios about the
-//! gateway's first-start bootstrap.
+//! A mock trust agent, in the test process, for scenarios about the control key
+//! the gateway holds for its configured `[vta]` trust agent.
 //!
-//! It answers what the gateway asks of a trust agent while connecting: a health
-//! check, the authentication handshake, `auth/whoami`, and the key listing and
-//! creation. It can behave as a sidecar that enrolled the gateway, one that
-//! refuses it, or one that granted something other than the bundled grant. The
-//! sidecar's published identity lives in a shared folder, as it does in a real
-//! deployment.
+//! It answers what the gateway asks of a trust agent while it connects and
+//! rotates: a health check, the authentication handshake, `auth/whoami`, the
+//! key listing and creation, and `acl/swap-key`. It can behave as a trust agent
+//! that moves the gateway's access entry to a new key, or one that refuses to.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -25,14 +22,11 @@ pub const TRUST_AGENT_DID: &str = "did:key:z6MkvnxZrB5vsAFb8AGaDVAqSYYNoz5y2Rgvh
 /// What the mock does when the gateway talks to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Behaviour {
-    /// Enrolled the gateway with exactly the bundled grant.
-    Enrolled,
-    /// Never enrolled the gateway: authentication is refused.
-    Refusing,
-    /// Enrolled the gateway as an administrator that may export keys.
-    OverPrivileged,
-    /// Enrolled the gateway with exactly the bundled grant, but refuses to move
-    /// its access entry to another key.
+    /// Knows the gateway by the first key it signs in with and moves that
+    /// access entry to a new key on request.
+    Accepting,
+    /// Knows the gateway the same way, but refuses to move its access entry to
+    /// another key.
     RefusingSwap,
 }
 
@@ -42,8 +36,8 @@ struct AgentState {
     keys: Vec<Value>,
     creates: usize,
     context_did: Option<String>,
-    /// The one DID the gateway is enrolled as. The first DID to authenticate is
-    /// taken to be the one the sidecar's start-up script enrolled.
+    /// The one DID the gateway is known as. The first DID to authenticate is
+    /// taken to be the one the operator granted.
     entry: Option<String>,
     swaps: Vec<(String, String)>,
     refused: usize,
@@ -52,7 +46,7 @@ struct AgentState {
 #[derive(Debug)]
 pub struct MockTrustAgent {
     pub url: String,
-    pub bootstrap_dir: tempfile::TempDir,
+    pub key_dir: tempfile::TempDir,
     state: Arc<Mutex<AgentState>>,
     server: JoinHandle<()>,
 }
@@ -88,9 +82,6 @@ async fn trust_tasks(
         return Json(json!({ "challenge": "c", "sessionId": "s" })).into_response();
     }
     if task.contains("auth/authenticate") {
-        if agent.behaviour == Behaviour::Refusing {
-            return (StatusCode::FORBIDDEN, Json(json!({ "payload": { "code": "permissionDenied" } }))).into_response();
-        }
         match &agent.entry {
             None => agent.entry = Some(issuer),
             Some(entry) if *entry != issuer => {
@@ -104,14 +95,9 @@ async fn trust_tasks(
             .into_response();
     }
     if task.contains("auth/whoami") {
-        let (role, capabilities) = match agent.behaviour {
-            Behaviour::OverPrivileged => {
-                ("admin", vec!["context-create", "key-mint", "sign-jws", "sign-document", "key-export"])
-            }
-            _ => ("initiator", vec!["context-create", "key-mint", "sign-jws", "sign-document"]),
-        };
         return Json(json!({ "payload": {
-            "roles": [role], "scopes": ["ctx:gateway"], "capabilities": capabilities,
+            "roles": ["initiator"], "scopes": ["ctx:gateway"],
+            "capabilities": ["context-create", "key-mint", "sign-jws", "sign-document"],
         } }))
         .into_response();
     }
@@ -256,35 +242,17 @@ impl MockTrustAgent {
         });
         Self {
             url,
-            bootstrap_dir: tempfile::tempdir().expect("a bootstrap folder"),
+            key_dir: tempfile::tempdir().expect("a folder for the control key"),
             state,
             server,
         }
     }
 
-    pub fn bootstrap_path(&self) -> PathBuf {
-        self.bootstrap_dir
+    /// Where the gateway keeps its control key.
+    pub fn control_key_path(&self) -> std::path::PathBuf {
+        self.key_dir
             .path()
-            .to_path_buf()
-    }
-
-    /// The sidecar publishes its own DID for the gateway to pin.
-    pub fn publish_identity(&self) {
-        let text = format!("FORMAT=1\nVTA_DID={TRUST_AGENT_DID}\nBASE_URL=http://127.0.0.1:8100\n");
-        std::fs::write(
-            self.bootstrap_path()
-                .join("vta-identity.env"),
-            text,
-        )
-        .expect("publish the identity");
-    }
-
-    pub fn context_identity(&self) -> Option<String> {
-        self.state
-            .lock()
-            .expect("mock trust agent state")
-            .context_did
-            .clone()
+            .join("vta_control_key")
     }
 
     pub fn signing_keys_created(&self) -> usize {

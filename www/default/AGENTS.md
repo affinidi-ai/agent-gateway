@@ -1149,33 +1149,27 @@ filter, and surface links in the `useIdentityRows` hook, the shared managed DID 
 gateway is on. The tier banner (`VtaTierBanner`) reads `GET /v1/vta/status` and never derives
 anything itself:
 
-- `custody_claim` is computed by the backend. It is false for the bundled sidecar and for
-  local signing, and the banner then says the deployment is **not** a key custody tier. Never
-  write copy that implies custody while it is false.
-- For a bundled sidecar that bootstraps itself (`bootstrap` present), the banner adds one line
-  (`data-testid="vta-bootstrap-status"`): the state, from the fixed set `connected`,
-  `waiting_for_vta`, `enrolment_refused`, `vta_replaced`, `vta_lost`, `revoked` and
-  `misconfigured`. A healthy state shows the owner (`vta-bootstrap-owner`, `unclaimed` until a
-  person claims the trust agent). Any other state shows the backend's `advice`
-  (`vta-bootstrap-advice`) and `detail` (`vta-bootstrap-detail`) in danger text, and says signing
-  is refused when `previously_connected` is true. The advice text is the backend's, so a new
-  state needs a label here and advice there.
-- Under the banner, while `bootstrap` is present, the **Bundled trust agent control key** card
-  (`BundledControlKeyCard`, `data-testid="bundled-control-key"`) shows the control DID the gateway
-  authenticates to the sidecar with (shortened, full value in the `title`, with a copy button:
-  `bundled-control-key-did`), when it was last rotated or "Never rotated"
-  (`bundled-control-key-rotated-at`), and when it is next due or "Automatic rotation is off"
-  (`bundled-control-key-next`), from `control_key_rotated_at`, `control_key_next_rotation_at` and
-  `control_key_rotation_days`. **Rotate control key** (`bundled-control-key-rotate`) is shown only
-  with `key_management.edit` and is disabled while the sidecar is not connected. It asks first
-  (an inline confirmation, `bundled-control-key-confirm` / `-cancel`) and then posts to
-  `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N minutes" from `Retry-After`,
-  any other refusal shows the gateway's message, and a success toasts the new DID and reloads the
-  page's status. The card says rotation changes no signing key; keep that true.
+- `custody_claim` is computed by the backend. It is false for local signing and for a trust
+  agent the operator runs, and the banner then does not claim custody. Local signing reads
+  "signed with this gateway's own keys"; an enabled (`self-hosted`) tier is a trust agent the
+  operator runs. Never write copy that implies custody while it is false.
+- Under the banner, while `control_key` of the status is present (the gateway holds a rotatable
+  `did:key` control key for a `[vta]` connection), the **Control key** card (`ControlKeyCard`,
+  `data-testid="vta-control-key"`) shows the key this gateway signs in to its trust agent with
+  (shortened, full value in the `title`, with a copy button: `vta-control-key-did`), when it was
+  last rotated or "Never rotated" (`vta-control-key-rotated-at`), and when it is next due or
+  "Automatic rotation is off" when `rotation_days` is 0 (`vta-control-key-next`), from
+  `control_key.rotated_at`, `next_rotation_at` and `rotation_days`. The card is not rendered
+  while `control_key` is absent. **Rotate control key** (`vta-control-key-rotate`) is shown only
+  with `key_management.edit`. It asks first (an inline confirmation, `vta-control-key-confirm` /
+  `-cancel`) and then posts to `POST /v1/vta/control-key/rotate`; a `429` reads "Try again in N
+  minutes" from `Retry-After`, any other refusal shows the gateway's message, and a success
+  toasts the new DID and reloads the page's status. The card says rotation changes no signing
+  key; keep that true.
 - A connection the operator added whose control identity is a `did:webvh` shows, under its
   agent DID, `Control key key-N · Rotated <date>` or `Never rotated`
   (`vta-row-control-key`, `vta-row-control-key-rotated-at`) and an action **Rotate control key**
-  (`vta-row-rotate-control-key`, `canRotateControlKey`: not the bundled record, enabled,
+  (`vta-row-rotate-control-key`, `canRotateControlKey`: not the `[vta]` block's record, enabled,
   connected, no rotation under way; only with `key_management.edit`). It asks first, in a row
   under the connection (`vta-row-rotate-confirm-row`, `-confirm-text`, `-confirm`, `-confirm-cancel`),
   and posts to `POST /v1/vta/connections/{id}/control-key/rotate`: `200` toasts that the key
@@ -1186,29 +1180,26 @@ anything itself:
   and the page reads the connections again every 10 seconds. A `did:key` connection shows
   none of this: its key cannot change without a new grant.
 - The connections table below it reads `GET /v1/vta/connections`. The `vta-bootstrap` record is
-  the bundled sidecar's; the backend reports its pairing state from the bootstrap (so it reads
-  Connected while the sidecar is, never "Not paired"), and the page offers no Revoke on it
-  (`canRevoke`) or Verify (`canVerify`), since the server refuses both.
+  the `[vta]` configuration block's; the backend reports its pairing state, and the page offers no
+  Revoke on it (`canRevoke`) or Verify (`canVerify`), since the server refuses both. It has no row
+  rotate button either: its control key is rotated from the Control key card.
 - The Surface Builder's **Signing key** select (`SurfaceSigningSection`) offers the `[vta]` block's
-  own record (`vta-bootstrap`) as **Bundled trust agent** once it is connected and shows its
-  signing key (`keys.active`, filled in by the API from the bootstrap), so a surface can be pinned
-  to the sidecar while the appliance default is another agent. While it is not connected it is
-  left out rather than shown as "not ready", unless the surface already saved it, so the select
-  is never blank. Other connections without an active key stay listed as "not ready".
-- While the gateway signs locally because a bundled trust agent never came up (`enabled` is
-  false), the banner still shows the bootstrap line, so the operator is told why.
+  own record (`vta-bootstrap`) once it is connected and shows its signing key (`keys.active`), so
+  a surface can be pinned to it while the appliance default is another agent. While it is not
+  connected it is left out rather than shown as "not ready", unless the surface already saved it,
+  so the select is never blank. Other connections without an active key stay listed as "not
+  ready".
 - **Settings → Key management** (`KeyManagementSettingsSection`, with `DefaultSigningPicker`)
   reports what is in force: a default chosen in the picker (stored in `default_signing`) wins over
   what the configuration resolves to (`default_resolution` of `GET /v1/vta/status`). The picker's
   first option clears the stored choice, which hands signing back to the configuration, so it is
-  named for what that resolves to: "The bundled trust agent (default)", "The configured agent",
-  or "This gateway's own key (local)". The bundled connection is not listed again, and the
+  named for what that resolves to: "The configured agent (from the [vta] block)" or "This
+  gateway's own key (local)". The `[vta]` connection is not listed again, and the
   confirmation stays visible after a save because the picker stays mounted.
 - The connect wizard's last step offers **Use this agent for all signing**, pre-checked only
-  when the appliance has no default yet. A default is either a stored one
-  (`default_signing.connection_id` in `GET /v1/settings`) or the bundled trust agent
-  (`default_resolution.backend` of `GET /v1/vta/status` is `bundled`): connecting a second agent
-  must never silently repoint signing away from either.
+  when the appliance has no stored default yet (`default_signing.connection_id` in
+  `GET /v1/settings`): connecting a second agent must never silently repoint signing away from
+  one. The wizard starts at the transport step; it only connects your own trust agent.
 
 ## Connections page
 

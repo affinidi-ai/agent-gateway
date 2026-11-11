@@ -309,6 +309,7 @@ impl super::control_key::ControlKeyReloader for StoredKeyReloader {
 
 /// Rotate the control key at `control_key_path` on the trust agent `vta_did`,
 /// with nothing else running (the offline command).
+#[cfg(test)]
 pub async fn rotate(
     config: &VtaConfig,
     vta_did: &str,

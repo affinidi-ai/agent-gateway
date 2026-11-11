@@ -25,9 +25,9 @@ const connection = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-const bundledNotReady = connection({
+const configNotReady = connection({
   id: 'vta-bootstrap',
-  name: 'Bootstrap VTA',
+  name: 'Configured VTA',
   endpoint: 'http://127.0.0.1:8100',
   default_context_id: 'gateway',
   status: 'unpaired',
@@ -35,9 +35,9 @@ const bundledNotReady = connection({
   keys: {},
 });
 
-const bundled = connection({
+const configBlock = connection({
   id: 'vta-bootstrap',
-  name: 'Bootstrap VTA',
+  name: 'Configured VTA',
   endpoint: 'http://127.0.0.1:8100',
   default_context_id: 'gateway',
   keys: { active: { key_id: 'gateway-jwt-1' } },
@@ -57,25 +57,25 @@ const renderWith = async (connections: unknown[], signing?: Record<string, strin
 beforeEach(() => mockFetch.mockReset());
 
 describe('SurfaceSigningSection', () => {
-  it('offers the bundled trust agent once it is connected, by a name that says what it is', async () => {
-    await renderWith([bundled, connection()]);
+  it('offers the [vta] block connection once it is connected', async () => {
+    await renderWith([configBlock, connection()]);
     await screen.findByRole('option', { name: 'Custom VTA' });
 
     expect(optionTexts()).toEqual([
       'Inherit the appliance default',
       "This gateway's own key (local)",
-      'Bundled trust agent',
+      'Configured VTA',
       'Custom VTA',
     ]);
-    const option = screen.getByRole('option', { name: 'Bundled trust agent' }) as HTMLOptionElement;
+    const option = screen.getByRole('option', { name: 'Configured VTA' }) as HTMLOptionElement;
     expect(option.disabled).toBe(false);
   });
 
-  it('saves the bundled trust agent with its context and key when chosen', async () => {
-    mockFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve([bundled]) });
+  it('saves the [vta] block connection with its context and key when chosen', async () => {
+    mockFetch.mockResolvedValue({ ok: true, json: () => Promise.resolve([configBlock]) });
     const setSigning = jest.fn();
     render(<SurfaceSigningSection setSigning={setSigning} />);
-    await screen.findByRole('option', { name: 'Bundled trust agent' });
+    await screen.findByRole('option', { name: 'Configured VTA' });
 
     await userEvent.selectOptions(screen.getByRole('combobox'), 'vta-bootstrap');
 
@@ -87,10 +87,10 @@ describe('SurfaceSigningSection', () => {
     });
   });
 
-  it('does not offer the bundled trust agent while it is not connected', async () => {
+  it('does not offer the [vta] block connection while it is not connected', async () => {
     // Offering it greyed out as "not ready" would suggest the operator has
     // something to set up.
-    await renderWith([bundledNotReady, connection()]);
+    await renderWith([configNotReady, connection()]);
     await screen.findByRole('option', { name: 'Custom VTA' });
 
     expect(optionTexts()).toEqual([
@@ -108,13 +108,13 @@ describe('SurfaceSigningSection', () => {
     expect(option.textContent).toMatch(/not ready/);
   });
 
-  it('keeps a saved choice of the bundled agent visible even when it is not ready', async () => {
-    await renderWith([bundledNotReady], { backend: 'vta', connection_id: 'vta-bootstrap' });
-    await screen.findByRole('option', { name: /Bundled trust agent/ });
+  it('keeps a saved choice of the [vta] block connection visible even when it is not ready', async () => {
+    await renderWith([configNotReady], { backend: 'vta', connection_id: 'vta-bootstrap' });
+    await screen.findByRole('option', { name: /Configured VTA/ });
 
     const select = screen.getByRole('combobox') as HTMLSelectElement;
     const shown = select.options[select.selectedIndex];
     expect(shown.value).toBe('vta-bootstrap');
-    expect(shown.textContent).toMatch(/Bundled trust agent.*not ready/);
+    expect(shown.textContent).toMatch(/Configured VTA.*not ready/);
   });
 });

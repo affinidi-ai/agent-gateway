@@ -34,18 +34,12 @@ const connection = (overrides: Record<string, unknown> = {}) =>
     ...overrides,
   }) as never;
 
-const settingsReturning = (defaultSigning: unknown, defaultResolution: unknown = null) => {
+const settingsReturning = (defaultSigning: unknown) => {
   mockFetch.mockImplementation((url: string) => {
     if (url.includes('/settings')) {
       return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({ default_signing: defaultSigning }),
-      });
-    }
-    if (url.includes('/vta/status')) {
-      return Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve({ default_resolution: defaultResolution }),
       });
     }
     return Promise.resolve({ ok: false, statusText: 'unexpected' });
@@ -120,27 +114,6 @@ describe('WizardFinishStep', () => {
     // Connecting a second agent must never silently repoint signing for
     // everything already running against the first.
     settingsReturning({ connection_id: 'vta-other' });
-    const onDefaultChoice = jest.fn();
-
-    render(
-      <WizardFinishStep
-        connection={connection({ keys: { active: { key_id: 'k' } } })}
-        onProvisionKey={jest.fn()}
-        onSettled={noop}
-        onDefaultChoice={onDefaultChoice}
-      />
-    );
-
-    const checkbox = await screen.findByLabelText(/Use this agent for all signing/);
-    await waitFor(() => expect(onDefaultChoice).toHaveBeenCalledWith(false));
-    expect(checkbox).not.toBeChecked();
-    expect(await screen.findByText(/already the appliance default/)).toBeInTheDocument();
-  });
-
-  it('leaves the default unchecked when the bundled trust agent already is the default', async () => {
-    // The bundled sidecar is the default without a stored setting, so reading
-    // the settings alone would offer to replace it as if there were none.
-    settingsReturning(null, { backend: 'bundled', explicit: true });
     const onDefaultChoice = jest.fn();
 
     render(

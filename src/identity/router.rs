@@ -176,12 +176,10 @@ async fn connection_did_publisher(
 /// Give `[vta]` a stable `did:webvh` to authenticate with, creating it on
 /// first boot, when the effective control DID method calls for one.
 ///
-/// The method comes from [`VtaConfig::effective_control_did_method`]: a bundled
-/// sidecar defaults to `did:key`, because it is reached over loopback and
-/// cannot resolve the gateway's public address, so nothing is published for
-/// it unless the operator sets `control_did_method = "did_webvh"`. For a
+/// The method comes from [`VtaConfig::effective_control_did_method`]. For a
 /// `did:webvh` the agent resolves the published document on **every**
-/// authentication, so a gateway it cannot reach stops authenticating.
+/// authentication, so a gateway it cannot reach stops authenticating; a
+/// `did:key` publishes nothing.
 ///
 /// An explicitly configured `auth_did` always wins: the operator may already
 /// host one, and silently replacing it would invalidate the grant they made
@@ -2430,20 +2428,18 @@ pub async fn create_identity_api_router(
     let agent_provisioner = key_directory.agent_provisioner();
     let vta_client_for_holder = key_directory.client();
     if let Some(client) = &vta_client_for_holder
-        && sts_vta_config.auto_bootstrap
-        && crate::vta::bundled::status().is_some()
-        && let Some(key_path) = sts_vta_config
-            .auth_key_source
-            .as_deref()
-            .and_then(|source| source.strip_prefix("file://"))
-        && let Some(storage) = std::path::Path::new(key_path).parent()
+        && let Some(key_path) = crate::vta::rotatable_control_key_path(&sts_vta_config)
+        && let Some(storage) = key_path.parent()
     {
         crate::vta::control_key_live::register(
             std::sync::Arc::clone(client),
             sts_vta_config.clone(),
             storage.to_path_buf(),
-        );
-        crate::vta::control_key_live::spawn_schedule();
+        )
+        .await;
+        if sts_vta_config.control_key_rotation_days > 0 {
+            crate::vta::control_key_live::spawn_schedule();
+        }
     }
 
     let appliance_key = key_directory
@@ -2529,17 +2525,8 @@ pub async fn create_identity_api_router(
     }
     let key_directory = std::sync::Arc::new(key_directory);
 
-    // What this appliance signs with when nobody has said (VTA-26). `auto`
-    // keeps the local issuer key; the bundled agent is an explicit opt-in.
-    let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::with_bundled_bootstrap(
-        crate::vta::onboarding_default::with_availability(
-            crate::vta::onboarding_default::resolve(&sts_vta_config),
-            // The bundled agent is "available" exactly when the connector it
-            // needs actually built; a failure here must report, not block.
-            sts_vta_config.enabled,
-        ),
-        crate::vta::bundled::status().as_ref(),
-    ));
+    // What this appliance signs with when nobody has said.
+    let default_resolution = std::sync::Arc::new(crate::vta::onboarding_default::resolve(&sts_vta_config));
     info!(
         target: "vta_audit",
         backend = %default_resolution.backend,

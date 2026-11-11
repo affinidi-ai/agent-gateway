@@ -125,26 +125,11 @@ struct Args {
     #[arg(long, value_name = "INPUT_FILE")]
     decrypt_export: Option<PathBuf>,
 
-    /// Forget the pinned bundled trust agent and retire its signing key, so the
-    /// next start bootstraps against whatever answers now. The recovery for a
-    /// replaced or emptied sidecar; shows what it would do unless --yes is given.
-    #[arg(long)]
-    vta_rebootstrap: bool,
-
-    /// Move this gateway's access entry on the bundled trust agent to a new
-    /// control did:key (acl/swap-key), with the same grant. Run with the gateway
-    /// stopped; shows what it would do unless --yes is given.
-    #[arg(long)]
-    vta_rotate_control_key: bool,
-
-    /// Print the did:key of the control key stored for the bundled trust agent,
-    /// for granting it again after a backup restore. Prints public data only.
+    /// Print the did:key of the control key stored for the trust agent
+    /// connection configured in `[vta]`, for granting it on the trust agent or
+    /// again after a backup restore. Prints public data only.
     #[arg(long)]
     vta_print_control_did: bool,
-
-    /// Confirm --vta-rebootstrap or --vta-rotate-control-key.
-    #[arg(long)]
-    yes: bool,
 
     /// Output path (used with --decrypt-export, defaults to export.zip)
     #[arg(long, value_name = "OUTPUT_FILE", default_value = "export.zip")]
@@ -330,44 +315,15 @@ async fn async_main() -> Result<()> {
         .context("Failed to initialize storage encryption")?;
 
     if args.vta_print_control_did {
-        let issuer_storage = std::path::PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .vc_keys,
-        );
-        match vta::control_rotation::stored_control_did(&vta::appliance_control_key_path(&issuer_storage))
+        let key_path = vta::rotatable_control_key_path(&bootstrap_config.vta)
+            .ok_or_else(|| anyhow::anyhow!("[vta] holds no did:key control key in a file"))?;
+        match vta::control_rotation::stored_control_did(&key_path)
             .await
             .map_err(|e| anyhow::anyhow!(e.log_detail().to_string()))?
         {
             Some(did) => println!("{did}"),
-            None => anyhow::bail!("no control key is stored for the bundled trust agent"),
+            None => anyhow::bail!("no control key is stored at {}", key_path.display()),
         }
-        return Ok(());
-    }
-
-    if args.vta_rotate_control_key {
-        let issuer_storage = std::path::PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .vc_keys,
-        );
-        let report = vta::bundled::rotate_control_key(&bootstrap_config.vta, &issuer_storage, args.yes)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        println!("{report}");
-        return Ok(());
-    }
-
-    if args.vta_rebootstrap {
-        let issuer_storage = std::path::PathBuf::from(
-            &bootstrap_config
-                .storage_paths
-                .vc_keys,
-        );
-        let report = vta::bundled::rebootstrap(&issuer_storage, args.yes)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-        println!("{report}");
         return Ok(());
     }
 

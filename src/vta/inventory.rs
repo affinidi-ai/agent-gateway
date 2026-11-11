@@ -76,7 +76,7 @@ pub struct SurfaceMapping {
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyInventory {
     pub tier: String,
-    /// False for both local signing and a bundled sidecar. Computed here so no
+    /// False for local signing. Computed here so no
     /// client can imply custody the deployment does not have.
     pub custody_claim: bool,
     pub connections: Vec<ConnectionInventory>,
@@ -379,13 +379,8 @@ mod tests {
 
     #[test]
     fn the_custody_claim_is_computed_here_and_follows_the_tier() {
-        let mut config = vta_config();
+        let config = vta_config();
         assert!(build(&config, &[], &[], &[]).custody_claim, "a separately-operated VTA supports the claim");
-
-        config.mode = crate::config::vta::VtaMode::Bundled;
-        let bundled = build(&config, &[], &[], &[]);
-        assert_eq!(bundled.tier, "bundled");
-        assert!(!bundled.custody_claim, "a bundled sidecar is not a custody tier");
 
         let local = build(&VtaConfig::default(), &[], &[], &[]);
         assert_eq!(local.tier, "local");

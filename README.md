@@ -134,7 +134,7 @@ troubleshooting.
 
 One Rust binary, `agent-gateway`, built from [`src/`](src/), plus a React dashboard served
 from the same process and built from [`www/default/`](www/default/). About 270,000 lines
-of Rust across 54 top-level modules. No database, and no sidecar unless you add the optional [trust agent](docs/DEPLOYMENT_REQUIREMENTS.md#bundled-trust-agent-optional): state lives in an in-memory cache
+of Rust across 54 top-level modules. No database, and no sidecar: state lives in an in-memory cache
 backed by JSON files on disk.
 
 [`ARCHITECTURE.md`](ARCHITECTURE.md) maps the system to the source tree.

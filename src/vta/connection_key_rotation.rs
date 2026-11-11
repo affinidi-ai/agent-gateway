@@ -114,8 +114,8 @@ pub fn view_of(connection: &VtaConnection) -> RotationView {
 #[derive(Debug)]
 pub enum StartError {
     NotFound,
-    /// The bundled record rotates through `POST /v1/vta/control-key/rotate`.
-    Bundled,
+    /// The `[vta]` block's record rotates through `POST /v1/vta/control-key/rotate`.
+    ConfiguredBlock,
     /// Disabled, or not paired: nothing to rotate yet.
     NotUsable(String),
     /// The connection authenticates as a `did:key`, whose identifier is its key.
@@ -327,7 +327,7 @@ impl ConnectionKeyRotator {
             .map_err(StartError::Failed)?
             .ok_or(StartError::NotFound)?;
         if connection.is_bootstrap() {
-            return Err(StartError::Bundled);
+            return Err(StartError::ConfiguredBlock);
         }
         if let Some(rotation) = &connection
             .control_key_state
@@ -1570,17 +1570,17 @@ mod tests {
             Err(StartError::NotFound)
         ));
 
-        let mut bundled = record.clone();
-        bundled.id = crate::vta::connections::BOOTSTRAP_CONNECTION_ID.to_string();
+        let mut configured = record.clone();
+        configured.id = crate::vta::connections::BOOTSTRAP_CONNECTION_ID.to_string();
         f.store
-            .create(bundled)
+            .create(configured)
             .await
             .unwrap();
         assert!(matches!(
             f.rotator
                 .start(crate::vta::connections::BOOTSTRAP_CONNECTION_ID, None)
                 .await,
-            Err(StartError::Bundled)
+            Err(StartError::ConfiguredBlock)
         ));
     }
 

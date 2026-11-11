@@ -25,7 +25,6 @@ pub mod appliance_di;
 pub mod audit;
 pub mod auth_did;
 pub mod authority;
-pub mod bundled;
 pub mod client;
 pub mod connection_key_rotation;
 pub mod connections;
@@ -130,27 +129,11 @@ pub async fn select_signing_backends(
         .ok_or_else(|| VtaError::Config("[vta] base_url is required when enabled".to_string()))?;
 
     // Take the VTA's address off the data plane before anything can forward to
-    // it (VTA-21). A bundled sidecar lives on loopback or a private network —
-    // addresses a surface is otherwise allowed to reach — so without this a
-    // caller could drive the agent holding this gateway's signing keys through
-    // the proxy pipeline.
+    // it. A trust agent can live on loopback or a private network — addresses a
+    // surface is otherwise allowed to reach — so without this a caller could
+    // drive the agent holding this gateway's signing keys through the proxy
+    // pipeline.
     isolation::reserve(base_url);
-
-    // A bundled sidecar keeps its key material on the gateway's own disk, so
-    // encryption at rest is the only thing standing between a disk image and
-    // the signing keys. Fail closed rather than starting a deployment whose
-    // security story quietly does not hold.
-    if config
-        .mode
-        .allows_self_administration()
-        && !crate::encryption::global::is_field_encryption_configured()
-    {
-        return Err(VtaError::Config(
-            "[vta] the bundled deployment keeps VTA key material on this host, so encryption at rest must be \
-             configured; enable it or switch to `mode = \"appliance\"`"
-                .to_string(),
-        ));
-    }
 
     let vta_did = config
         .vta_did
@@ -167,6 +150,12 @@ pub async fn select_signing_backends(
         .ok_or_else(|| VtaError::Config("[vta] signing_key_id is required when enabled".to_string()))?
         .to_string();
 
+    let rotatable_key_path = rotatable_control_key_path(config);
+    if let Some(path) = &rotatable_key_path
+        && let Err(e) = control_rotation::settle_pending(config, vta_did, path).await
+    {
+        tracing::warn!(target: "vta_audit", "could not settle a pending control key: {}", e.log_detail());
+    }
     let control_key = build_control_key(config).await?;
     // Customer-sovereign onboarding (VTA-05): print the exact one-consent-step
     // grant command the customer runs on their VTA, and set up the post-auth
@@ -197,16 +186,11 @@ pub async fn select_signing_backends(
         config.max_concurrent,
         Some(onboarding),
     )?;
-    if config.auto_bootstrap
-        && let Some(path) = config
-            .auth_key_source
-            .as_deref()
-            .and_then(|source| source.strip_prefix("file://"))
-    {
+    if let Some(path) = rotatable_key_path {
         client = client.with_key_reloader(Arc::new(control_rotation::StoredKeyReloader::new(
             config.clone(),
             vta_did.to_string(),
-            std::path::PathBuf::from(path),
+            path,
         )));
     }
     let client = Arc::new(client);
@@ -294,6 +278,23 @@ pub async fn select_signing_backends(
 /// Minimum interval between control-DID changes before a rotation is flagged
 /// off-schedule (24h).
 const ROTATION_MIN_INTERVAL_SECS: u64 = 86_400;
+
+/// The stored `did:key` control key the gateway can move to a new key with
+/// `acl/swap-key`: one it holds in a `file://` seed. A `did:webvh` control
+/// identity rotates by updating its published DID instead, and an `env://` or
+/// ephemeral key has nowhere to keep a new one.
+pub fn rotatable_control_key_path(config: &VtaConfig) -> Option<std::path::PathBuf> {
+    if config.effective_control_did_method() != crate::config::vta::ControlDidMethod::DidKey
+        || config.auth_did.is_some()
+    {
+        return None;
+    }
+    config
+        .auth_key_source
+        .as_deref()
+        .and_then(|source| source.strip_prefix("file://"))
+        .map(std::path::PathBuf::from)
+}
 
 /// Where to persist the onboarding record, encrypted at rest: alongside a
 /// `file://` control key (so key + grant travel together). `None` for
@@ -511,6 +512,35 @@ mod tests {
     async fn local_authority() -> (Arc<dyn CredentialAuthority>, tempfile::TempDir) {
         let (issuer, tmp) = crate::identity::test_helpers::test_vc_issuer().await;
         (Arc::new(LocalCredentialAuthority::new(Arc::new(issuer))), tmp)
+    }
+
+    fn did_key_block(extra: &str) -> VtaConfig {
+        toml::from_str(&format!(
+            "enabled = true\nbase_url = \"http://127.0.0.1:8100\"\nvta_did = \"did:key:z6MkVta\"\n\
+             context_id = \"gateway\"\nsigning_key_id = \"k\"\n{extra}"
+        ))
+        .expect("parse")
+    }
+
+    #[test]
+    fn a_did_key_control_key_in_a_file_is_rotatable() {
+        let config = did_key_block("control_did_method = \"did_key\"\nauth_key_source = \"file:///keys/control\"");
+        assert_eq!(rotatable_control_key_path(&config), Some(std::path::PathBuf::from("/keys/control")));
+    }
+
+    #[test]
+    fn a_control_key_that_is_not_a_stored_did_key_is_not_rotatable() {
+        let webvh = did_key_block("auth_key_source = \"file:///keys/control\"");
+        assert_eq!(rotatable_control_key_path(&webvh), None, "did:webvh is the default method");
+
+        let from_env = did_key_block("control_did_method = \"did_key\"\nauth_key_source = \"env://CONTROL_SEED\"");
+        assert_eq!(rotatable_control_key_path(&from_env), None, "an environment seed has nowhere to keep a new key");
+
+        let ephemeral = did_key_block("control_did_method = \"did_key\"");
+        assert_eq!(rotatable_control_key_path(&ephemeral), None);
+
+        let own_did = did_key_block("auth_did = \"did:key:z6MkGw\"\nauth_key_source = \"file:///keys/control\"");
+        assert_eq!(rotatable_control_key_path(&own_did), None, "a named auth DID keeps its own identifier");
     }
 
     #[tokio::test]

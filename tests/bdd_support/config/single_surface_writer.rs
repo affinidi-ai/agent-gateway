@@ -582,8 +582,8 @@ fn write_single_surface_config_inner(
         &surface_config.enforced_credential_rules,
         surface_config.token_request_timeout_secs,
     );
-    if let Some(setup) = &surface_config.bundled_trust_agent {
-        write_bundled_trust_agent(base_dir, setup);
+    if let Some(setup) = &surface_config.control_key_trust_agent {
+        write_trust_agent_block(base_dir, setup, surface_config.control_key_rotation_days);
     }
     if let Some(secs) = surface_config.connection_key_switch_timeout_secs {
         let path = base_dir.join("config.toml");
@@ -601,23 +601,26 @@ fn write_single_surface_config_inner(
     }
 }
 
-/// Appends the `[encryption]` and `[vta]` tables of a bundled gateway that bootstraps itself
-/// against `setup.base_url`. A bundled trust agent keeps its keys on the gateway's disk, so
-/// startup refuses it without encryption at rest.
-fn write_bundled_trust_agent(
+/// Appends the `[vta]` table of a gateway configured against `setup.base_url`, with its
+/// control key in a file.
+fn write_trust_agent_block(
     base_dir: &Path,
-    setup: &super::single_surface_fixture::BundledTrustAgentSetup,
+    setup: &super::single_surface_fixture::ControlKeyTrustAgentSetup,
+    rotation_days: Option<u32>,
 ) {
     let path = base_dir.join("config.toml");
     let mut config = std::fs::read_to_string(&path).unwrap();
     config.push_str(&format!(
-        "\n[encryption]\nenabled = true\nkey_source = \"local\"\nkey_env_var = \"{}\"\n\n\
-         [vta]\nenabled = true\nmode = \"embedded\"\nauto_bootstrap = true\nbase_url = \"{}\"\n\
-         bootstrap_dir = \"{}\"\nbootstrap_wait_secs = 2\n",
-        super::single_surface_fixture::BUNDLED_MASTER_KEY_ENV,
+        "\n[vta]\nenabled = true\nbase_url = \"{}\"\nvta_did = \"{}\"\ncontext_id = \"gateway\"\n\
+         signing_key_id = \"gateway-jwt-1\"\ncontrol_did_method = \"{}\"\nauth_key_source = \"file://{}\"\n",
         setup.base_url,
-        setup.bootstrap_dir.display(),
+        crate::bdd_support::trust_agent::TRUST_AGENT_DID,
+        setup.control_did_method,
+        setup.key_path.display(),
     ));
+    if let Some(days) = rotation_days {
+        config.push_str(&format!("control_key_rotation_days = {days}\n"));
+    }
     std::fs::write(&path, config).unwrap();
 }
 
