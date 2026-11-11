@@ -349,10 +349,7 @@ pub async fn empty_secret_files(path: &Path) -> Option<Vec<EmptySecretFile>> {
 /// [`EmptySecretFile::remove_if_still_empty`].
 pub async fn remove_unchanged_empty_secret_files(empty: &[EmptySecretFile]) -> bool {
     for form in empty {
-        if !form
-            .is_unchanged()
-            .await
-        {
+        if !form.is_unchanged().await {
             return false;
         }
     }
@@ -522,9 +519,7 @@ async fn fill_created_secret_file(
         .write_all(bytes)
         .await?;
     created.flush().await?;
-    created
-        .sync_all()
-        .await
+    created.sync_all().await
 }
 
 /// Make a just-created secret file durable, and give it up again when the other
@@ -1154,11 +1149,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "the stalled creator's secret");
         let left_behind: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
-            .map(|entry| {
-                entry
-                    .unwrap()
-                    .file_name()
-            })
+            .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left_behind, vec![std::ffi::OsString::from("key.json")], "nothing may be left renamed aside");
     }
