@@ -1822,6 +1822,13 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .is_fresh()
 }
 
+/// `state` sealed under the legacy label whatever its stage, as a gateway
+/// that predates consent stages would seal it.
+#[cfg(test)]
+pub(crate) fn seal_under_legacy_label(state: &OAuthState) -> String {
+    tests::seal_under(state, OAUTH_STATE_KEY_LABEL)
+}
+
 /// Whether `state`'s nonce was already claimed on this process.
 #[cfg(test)]
 pub(crate) async fn is_claimed(state: &OAuthState) -> bool {
@@ -2210,7 +2217,7 @@ mod tests {
         }
     }
 
-    fn seal_under(
+    pub(super) fn seal_under(
         state: &OAuthState,
         label: &[u8],
     ) -> String {

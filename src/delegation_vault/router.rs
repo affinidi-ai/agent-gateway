@@ -865,6 +865,43 @@ mod tests {
         assert_eq!(fixture.vault_records(), 0);
     }
 
+    /// The vendor callback takes only a vendor state: a confirm start state,
+    /// whose caller was never confirmed, and a staged state sealed under the
+    /// legacy label, as a gateway that predates consent stages would seal it,
+    /// are refused although the browser holds the cookie, so no code is
+    /// exchanged and nothing is stored.
+    #[tokio::test]
+    async fn the_vendor_callback_refuses_an_unconfirmed_or_an_old_label_staged_state() {
+        use crate::delegation_vault::ConsentStage;
+        use crate::delegation_vault::oauth::{decode_callback_state, seal_under_legacy_label};
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture.confirming(None).await;
+        let confirm_start = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let (callback_state, cookie) = fixture.begin().await;
+        let old_label = seal_under_legacy_label(&crate::delegation_vault::OAuthState {
+            stage: Some(ConsentStage::Vendor(consent::confirm_binding(&strategy))),
+            ..decode_callback_state(&callback_state).unwrap()
+        });
+        let (results, events) = capture(async {
+            let mut results = Vec::new();
+            for state in [&confirm_start, &old_label] {
+                results.push(
+                    fixture
+                        .callback("github", &format!("code=c&state={state}"), Some(&cookie))
+                        .await,
+                );
+            }
+            results
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, None);
+        }
+        assert!(events.is_empty(), "a state of another stage is not audited: {events:?}");
+        assert_eq!(fixture.token_calls(), 0);
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// A start state that confirms its caller sends the browser to the
     /// caller's identity provider, never the vendor: the login client, the
     /// confirmation redirect URI, `openid`, `response_mode=query`, PKCE S256
