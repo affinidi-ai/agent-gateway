@@ -670,6 +670,39 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   "N Transit Points need Trust Check review" ("1 Transit Point needs …" for one), counting each
   Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
   snapshot (it says how many are in other variants), hidden at zero.
+- **Authority source.** A Trust Check query and a Trust Recorder entry carry `authority_source`
+  (`AuthoritySource` in `types.ts`: `authority` or `issuer`) beside a literal anchor DID found in
+  that register, and none beside a template or a DID in neither. `queriesFromWire`, `readQueries`
+  and `buildEntry` (Trust Check) and `readEntries` (Trust Recorder) keep it through every load and
+  save, on the caller, Managed Agent and Transit Point lists and in variants. The gateway
+  recomputes it on every save from the registers and never drops `authority`, so a link to a
+  deleted Authority stays one;
+  `authoritySourceFor` (`_shared/authorityReference.ts`) drops it beside an empty value or a
+  template. The Authority picker writes `issuer` for an Issuer and `authority` for an Authority,
+  and removes it for a caller-leg template; a preset (`applyPresetToQuery`) removes it; a stored
+  custom DID or legacy template left untouched keeps what is stored.
+- **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
+  Authorities register no longer has is `missing-authority` (`classifyTargetAuthoritySelection`,
+  checked against the Authorities only, even when an Issuer has the DID); the gateway fails it
+  with `AUTHORITY_NOT_FOUND`. The register is `authorityDids` in `SurfaceMetaContext`, from
+  `useAuthorityDids` (`hooks/useAuthorityDids.ts`), which both surface pages call: read when the
+  page opens and when the tab becomes visible again, and updated by every
+  `getAuthorities({ refresh: true })` through `subscribeAuthorities`, so an Authority added in
+  another tab clears the problem. Nothing is flagged while it loads or after it failed; the
+  fullscreen editors flag only once their own read loaded (`authoritiesLoaded`). It follows the
+  blocking API key pattern: the node gets the red `unconfigured-ring` with "Authority deleted"
+  under its label; the sidebar panel, and the picker in the fullscreen editor, show the shared
+  `MissingAuthorityWarning` (`_shared/MissingAuthorityWarning.tsx`, a non-collapsible `danger`
+  `InfoBanner` titled "Configuration required", `role="alert"`) saying the check fails with
+  `AUTHORITY_NOT_FOUND` until it is fixed, the fixes (pick another Authority, add an Authority
+  with the same DID through `deepLinks.authority`, or remove the Trust Check) and the stored DID
+  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a locked
+  "Deleted Authority" option marked invalid. Save is blocked on both surface pages, in the base
+  and every variant, with the full warning and **Show me** (`firstMissingAuthorityNode` in
+  `elements/missingAuthority.ts`). It is not part of `configured` or `getIncompleteReason`. The
+  panel copy says the DID is stored directly and that, for an Authority, the gateway fails the
+  check once that Authority is deleted. The Audit Log words `AUTHORITY_NOT_FOUND` as "the
+  Authority this Trust Check uses no longer exists" (`TRUST_ERROR_LABEL`).
 
 | Element                          | Test id                                                                                            |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -681,6 +714,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
 | Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
+| Deleted Authority warning        | `trust-check-panel-authority-missing`, `trust-check-query-<n>-authority-missing`, each with `-dids` and `-add-authority-link` |
 
 ## Trust Recorder
 
@@ -700,11 +734,20 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   Never describe it as signing records or setting the Authority.
 - The fullscreen editor opens with a collapsed `InfoBanner` explaining Authority, Entity, the
   entry Issuer and the surface Issuer, linked to the Trust elements guide.
+- The entry's explicit Authority select writes `authority_source: 'authority'` for a DID of the
+  Authorities register and `'issuer'` for an Issuer; **Use surface Issuer** and **Explicit DID**
+  remove it (see _Authority source_ under Trust Check). An entry whose Authority was deleted gets
+  the same ring, "Authority deleted" reason, `MissingAuthorityWarning` (the entry writes no records
+  until it is fixed; "Entry <n>: <did>" in the sidebar when there are several), locked "Deleted
+  Authority" option and Save block as a Trust Check. The recorder then reports `skipped` with
+  reason `authority_not_found`, worded "Authority not found" by `utils/trustRecorderStatus.ts` in
+  the Last outcome row and the Identities page chip.
 
 | Element                            | Test id                                                                                                                           |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Panel warning                      | `trust-recorder-panel-no-surface-issuer-warning`                                                                                  |
 | Entry warning                      | `trust-recorder-entry-<index>-no-surface-issuer-warning`                                                                          |
+| Deleted Authority warning          | `trust-recorder-panel-authority-missing`, `trust-recorder-entry-<index>-authority-missing`, each with `-dids` and `-add-authority-link` |
 | Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
 | Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
 
@@ -1100,9 +1143,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 
 The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
 (**Delete**) share `useApiKeyAction('delete', …)` (`src/components/api-keys/ApiKeyActionDialog.tsx`). The
-delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
-like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
-a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built on
+the shared `components/shared/WarningDialog.tsx` (`modal fade show` with `display: block`,
+`modal-dialog-centered`, a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`, named
+by its title). Its title "Delete API key"
 carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
 client id and key id and says, in plain words, that callers using the key will be refused,
 surfaces that use it will stop working until another key is picked, and the delete can't be
@@ -1127,6 +1171,26 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Authority delete
+
+The Authorities list (`pages/AuthoritiesPage.tsx`, `authorities-delete-button-<id>`) and the
+Authority editor (`pages/EditAuthorityPage.tsx`, `authority-editor-delete-button`) delete through
+`apiClient.deleteAuthority` after the two-step `DeleteButton`. While Trust Checks or Trust Recorder
+entries use the Authority, the gateway answers `409` with `references` and `hidden_references`;
+`authorityInUse` (`components/authorities/authorityInUse.ts`) reads them from `ApiError.body`, the
+raw error body the API client keeps, and `AuthorityInUseDialog` (`authority-in-use-dialog`, a
+`WarningDialog` titled "Authority in use") opens in place of the error. It says the Authority is
+used by Trust Checks or Trust Recorder entries and to point them at another Authority or remove
+them, then delete it, and lists each surface, linked to `/surfaces/<id>` in a new tab
+(`authority-in-use-dialog-surface-<id>`, `-surface-link-<id>`), and STS client, not linked
+(`authority-in-use-dialog-sts-client-<id>`), each with one line per use from
+`describeAuthorityUse`: "Trust Check “<name>” on the Access Point", "… on the Managed Agent's
+target", "… on Transit Point <alias>", "Trust Recorder entry for <trust registry name or id>",
+with "in variant <alias>" for a variant. "N more you can't view." (`authority-in-use-dialog-hidden`)
+follows while `hidden_references` is above zero. Its only action is **Close**
+(`authority-in-use-dialog-close`): the dashboard never sends `force=true`. Any other failure keeps
+the list page's error alert and the editor's error toast. Every value is rendered as React text.
 
 ## Policy definition editor
 

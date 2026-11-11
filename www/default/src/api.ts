@@ -55,7 +55,9 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public readonly status: number,
-    public readonly code?: string
+    public readonly code?: string,
+    /** The raw response body, for a caller that reads more than the message from it. */
+    public readonly body?: string | null
   ) {
     super(message);
   }
@@ -212,7 +214,8 @@ class APIClient {
         throw new ApiError(
           formatApiError(response.status, errorBody, response.statusText),
           response.status,
-          extractErrorCode(errorBody)
+          extractErrorCode(errorBody),
+          errorBody
         );
       }
 

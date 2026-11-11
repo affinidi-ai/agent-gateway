@@ -2,7 +2,7 @@ use cucumber::{given, then, when};
 use reqwest::Method;
 use serde_json::{Value, json};
 
-use crate::bdd_support::admin_client::recorded_response;
+use crate::bdd_support::admin_client::{RecordedResponse, recorded_response};
 use crate::steps::credential_save::{create_provider, send, surface_id};
 use crate::steps::when::build_primary_target_surface_payload;
 use crate::world::SurfaceWorld;
@@ -55,7 +55,7 @@ fn refusal(world: &SurfaceWorld) -> &Value {
         .body
 }
 
-fn references(world: &SurfaceWorld) -> Vec<(String, String)> {
+pub(crate) fn references(world: &SurfaceWorld) -> Vec<(String, String)> {
     refusal(world)["references"]
         .as_array()
         .unwrap_or_else(|| panic!("the refusal lists no references: {}", refusal(world)))
@@ -145,8 +145,18 @@ async fn restricted_token_deletes_secret(
     secret_id: String,
 ) {
     let id = secret_record_id(world, &secret_id).await;
-    let scopes = json!({"name": "secret cleanup token", "scopes": ["secrets.view", "secrets.delete", "surfaces.view"]});
-    let created = send(world, Method::POST, "/v1/access-tokens", Some(&scopes)).await;
+    let scopes = ["secrets.view", "secrets.delete", "surfaces.view"];
+    world.admin_response = Some(delete_with_scoped_token(world, &scopes, &format!("/api/v1/secrets/{id}")).await);
+}
+
+/// Deletes `path` (under `/api`) with a new access token holding only `scopes`.
+pub(crate) async fn delete_with_scoped_token(
+    world: &mut SurfaceWorld,
+    scopes: &[&str],
+    path: &str,
+) -> RecordedResponse {
+    let request = json!({"name": "scoped cleanup token", "scopes": scopes});
+    let created = send(world, Method::POST, "/v1/access-tokens", Some(&request)).await;
     assert!(matches!(created.status, 200 | 201), "creating the access token: {}", created.body);
     let token = created.body["token"]
         .as_str()
@@ -161,16 +171,14 @@ async fn restricted_token_deletes_secret(
         .no_proxy()
         .build()
         .expect("an HTTP client")
-        .delete(format!("http://127.0.0.1:{port}/api/v1/secrets/{id}"))
+        .delete(format!("http://127.0.0.1:{port}{path}"))
         .bearer_auth(token)
         .send()
         .await
-        .expect("deleting the secret with the access token");
-    world.admin_response = Some(
-        recorded_response(response)
-            .await
-            .expect("reading the delete answer"),
-    );
+        .expect("deleting with the access token");
+    recorded_response(response)
+        .await
+        .expect("reading the delete answer")
 }
 
 #[when(expr = "the operator deletes the credential provider {string}")]

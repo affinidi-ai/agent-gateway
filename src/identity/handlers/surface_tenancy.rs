@@ -74,6 +74,42 @@ pub async fn validate_surface_references(
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
 }
 
+/// Classifies each literal authority DID of `surface` by the register it is in, then refuses a
+/// source set on a template and a link to an Authority that does not exist or belongs to
+/// another tenant. A DID that `stored` (the surface as stored, if any) linked to an Authority
+/// stays linked, so a save cannot turn a deleted Authority into a plain DID. Without an
+/// Authority store nothing is classified or refused.
+pub async fn validate_authority_sources(
+    state: &IdentityApiState,
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    use crate::trust_registry_verification::authority_source::{AuthorityRegisters, surface_references};
+
+    let Some(authorities) = state
+        .authority_store
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if surface_references(surface).is_empty() {
+        return Ok(());
+    }
+    let registers = AuthorityRegisters::load(
+        authorities,
+        state
+            .issuer_store
+            .as_deref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .map_err(|error| internal("Authority", error))?;
+    registers.classify_surface(surface, stored);
+    registers
+        .check(&surface_references(surface), surface.tenant_id.as_deref())
+        .map_err(SurfaceApiError::BadRequest)
+}
+
 pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
     "Target authentication cannot use an oauth2_authorization_code credential provider: it needs a user's consent";
 
@@ -4121,6 +4157,7 @@ mod tests {
                 trust_registry_id: "tr-base-recorder".into(),
                 issuer_did: "did:example:issuer".into(),
                 authority_did: "did:example:authority".into(),
+                authority_source: None,
                 include_owned_agent: true,
                 custom_resources: Vec::new(),
             }],
@@ -4139,6 +4176,7 @@ mod tests {
                             trust_registry_id: "tr-variant-recorder".into(),
                             issuer_did: "did:example:variant-issuer".into(),
                             authority_did: "did:example:variant-authority".into(),
+                            authority_source: None,
                             include_owned_agent: true,
                             custom_resources: Vec::new(),
                         }],

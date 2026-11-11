@@ -3379,6 +3379,7 @@ mod tests {
                     trust_registry_id: "tr-1".into(),
                     issuer_did: "did:example:issuer".into(),
                     authority_did: "did:example:authority".into(),
+                    authority_source: None,
                     include_owned_agent: true,
                     custom_resources: vec![],
                 }],

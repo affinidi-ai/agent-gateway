@@ -269,6 +269,60 @@ surface id, the request's trace id and the authenticated caller (on the Access P
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
 
+### The authority of a Trust Check
+
+`query.authority_id` is stored as text: a literal DID, or a template resolved per request.
+`authority_source` beside it records the register a literal DID was found in
+([`authority_source.rs`](../src/trust_registry_verification/authority_source.rs)):
+
+| `authority_source` | Meaning |
+| --- | --- |
+| `authority` | Linked to the Authority with that DID. The Authority must still exist. |
+| `issuer` | An Issuer has that DID. |
+| absent | A template, or a DID in neither register. |
+
+Every save of a surface or STS client sets it for each literal DID: `authority` when the write
+sends `authority`, when the stored record already had the DID as `authority`, or when an
+Authority the record's tenant may use has the DID; else `issuer` when such an Issuer has it;
+else none. A link to an Authority is never dropped, so a client that leaves the field out or
+sends another value cannot turn a deleted Authority into a plain DID. A save is refused with
+`400` when a source is set on a template, or when a link names an Authority that does not exist
+or belongs to another tenant; both answer alike. Without an Authority store nothing is set or
+refused. Stored surfaces are classified the same way on each load (an active node saves the
+ones that changed; a standby node keeps them in memory), and stored STS clients at startup on
+an active node.
+
+A link from a surface or STS client to an Authority is an ownership reference: moving the
+Authority, the surface or the STS client to a tenant that would make it cross-tenant is refused
+with `409`, like any other cross-tenant reference.
+
+`DELETE /v1/authorities/{id}` is refused with `409` while a Trust Check or a Trust Recorder
+entry on any surface (base or variant) or STS client names the Authority's DID, counting only
+records whose tenant may use the Authority: a record of another tenant that names the same DID
+neither holds the Authority nor learns of it. The answer lists
+the surfaces and STS clients the caller may view, each with `uses`: the Trust Checks
+(`element: trust_check`, `id`, `name`, `placement` (`access_point`, `target` or
+`transit_point`), `transit_point`, `variant`) and Trust Recorder entries
+(`element: trust_recorder`, `trust_registry_id`, `variant`) that name it, and
+`hidden_references` counts the rest. `?force=true` deletes it anyway, but only when the caller
+may view every record that names it, and records an `authority_force_deleted` event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). The records keep their configuration. A delete and a
+surface save never interleave: the save re-checks its new links under the lock the delete
+holds.
+
+A Trust Check linked to an Authority that no longer exists fails with `AUTHORITY_NOT_FOUND`
+without querying its trust registry, whether the Authority was deleted with force, removed from
+`_storage/`, or never existed; so does one whose Authority store is missing or unreadable. The
+result keeps the configured `authority_id`, so policy and the audit trail can see which DID was
+refused. The check looks the DID up among all Authorities, whose DIDs are unique; whether the
+record's tenant may use it is checked on save and on tenant moves. A DID with no source is not
+checked, so a forced delete leaves a record that a node has not classified yet, such as an STS
+client stored while the node was in standby, querying the DID until its next save or startup.
+Likewise a record naming an Authority that was deleted before this check existed has no source
+on its first load, because no register has the DID any more, and its Trust Check keeps running.
+Each load logs, per surface and STS client, the literal DIDs it names that are in neither
+register, so such a record can be found and pointed at an Authority or removed.
+
 ## Failed caller authentication
 
 A closed Access Point (`access_point.public: false`, which the admin API sets on every surface

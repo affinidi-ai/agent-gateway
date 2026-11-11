@@ -1,4 +1,4 @@
-import type { PredefinedTrustCheckQuery } from '../../../../types';
+import type { AuthoritySource, PredefinedTrustCheckQuery } from '../../../../types';
 import {
   isTransitPointType,
   managedAgentTargetLegTrustCheckAllowed,
@@ -11,6 +11,12 @@ import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } fro
 import TrustCheckPanel from './TrustCheckPanel';
 import TrustCheckFullscreenPanel from './TrustCheckFullscreenPanel';
 import { DOCS_URL } from '../../../../config/docs';
+import {
+  authoritySourceFor,
+  missingAuthorityDid,
+  type AuthorityDids,
+  type MissingAuthority,
+} from '../_shared/authorityReference';
 
 export type { PredefinedQueryOrigin, PredefinedTrustCheckQuery } from '../../../../types';
 
@@ -112,21 +118,32 @@ export function defaultAuthorityIdTemplate(edge: 'ap-ma' | 'ma-tp'): string {
  * (or via the JSON API) that still references a `{{ … }}` template, so
  * the operator can see it and replace it. `custom-did` is a literal DID
  * that isn't in either register (JSON-API-authored). Issuers take
- * precedence over Authorities on a DID collision.
+ * precedence over Authorities on a DID collision, except for a value
+ * whose `authority_source` is `authority`: that one is looked up among
+ * the Authorities only, and is `missing-authority` once the loaded
+ * register no longer has it, since the gateway then fails the check.
  */
 export type TargetAuthoritySelection =
   | { kind: 'unset' }
   | { kind: 'issuer'; name: string; did: string }
   | { kind: 'authority'; name: string; did: string }
+  | { kind: 'missing-authority'; did: string }
   | { kind: 'legacy-template'; template: string }
   | { kind: 'custom-did'; did: string };
 
 export function classifyTargetAuthoritySelection(
   storedValue: string,
   issuers: ReadonlyArray<{ did: string; name: string }>,
-  authorities: ReadonlyArray<{ did: string; name: string }>
+  authorities: ReadonlyArray<{ did: string; name: string }>,
+  source?: AuthoritySource,
+  authoritiesLoaded = true
 ): TargetAuthoritySelection {
   if (!storedValue) return { kind: 'unset' };
+  if (authoritySourceFor(storedValue, source) === 'authority') {
+    const picked = authorities.find(a => a.did === storedValue);
+    if (picked) return { kind: 'authority', name: picked.name, did: storedValue };
+    if (authoritiesLoaded) return { kind: 'missing-authority', did: storedValue };
+  }
   const issuer = issuers.find(i => i.did === storedValue);
   if (issuer) return { kind: 'issuer', name: issuer.name, did: storedValue };
   const authority = authorities.find(a => a.did === storedValue);
@@ -398,8 +415,10 @@ export function applyPresetToQuery(
   if (typeof preset.query.resource === 'string' && preset.query.resource) {
     query.resource = preset.query.resource;
   }
+  const { authority_source: _dropped, ...rest } = draft;
+  void _dropped;
   return {
-    ...draft,
+    ...rest,
     query_type: preset.query_type,
     query,
   };
@@ -465,6 +484,8 @@ export interface TrustCheckQueryConfig {
   // field the first time it is saved from the dashboard (backend uses it in
   // probe results + audit events, per AGENTS.md).
   name?: string;
+  /** Where the literal `query.authority_id` came from; absent for a template. */
+  authority_source?: AuthoritySource;
   query?: {
     authority_id?: string;
     action?: string;
@@ -492,32 +513,40 @@ export function readQueries(config: any): TrustCheckQueryConfig[] {
       config.query_type !== undefined ||
       config.query !== undefined)
   ) {
-    return [
-      {
-        id: typeof config.id === 'string' ? config.id : undefined,
-        trust_registry_id:
-          typeof config.trust_registry_id === 'string' ? config.trust_registry_id : '',
-        query_type: config.query_type === 'recognition' ? 'recognition' : 'authorization',
-        name: typeof config.name === 'string' ? config.name : undefined,
-        query: config.query || {},
-      },
-    ];
+    return [queryFromElement(config)];
   }
   return [];
+}
+
+function queryFromElement(e: any): TrustCheckQueryConfig {
+  const query = e.query || {};
+  const source = authoritySourceFor(query.authority_id, e.authority_source);
+  return {
+    id: typeof e.id === 'string' ? e.id : undefined,
+    trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
+    query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
+    name: typeof e.name === 'string' ? e.name : undefined,
+    ...(source ? { authority_source: source } : {}),
+    query,
+  };
 }
 
 /** Read a wire `trust_check_list` into the node's `queries[]` shape. */
 export function queriesFromWire(raw: unknown): TrustCheckQueryConfig[] {
   if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((e: any) => e && typeof e === 'object')
-    .map((e: any) => ({
-      id: typeof e.id === 'string' ? e.id : undefined,
-      trust_registry_id: typeof e.trust_registry_id === 'string' ? e.trust_registry_id : '',
-      query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
-      name: typeof e.name === 'string' ? e.name : undefined,
-      query: e.query || {},
-    }));
+  return raw.filter((e: any) => e && typeof e === 'object').map(queryFromElement);
+}
+
+/** The queries of a Trust Check node whose Authority the loaded register no longer has. */
+export function missingTrustCheckAuthorities(
+  config: any,
+  authorityDids: AuthorityDids
+): MissingAuthority[] {
+  if (!authorityDids) return [];
+  return readQueries(config).flatMap((q, index) => {
+    const did = missingAuthorityDid(q.query?.authority_id, q.authority_source, authorityDids);
+    return did ? [{ index, did }] : [];
+  });
 }
 
 /**
@@ -685,6 +714,8 @@ function buildEntry(
     query,
   };
   if (typeof q.name === 'string' && q.name.length > 0) entry.name = q.name;
+  const source = authoritySourceFor(query.authority_id, q.authority_source);
+  if (source) entry.authority_source = source;
   return entry;
 }
 

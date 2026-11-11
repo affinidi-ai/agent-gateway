@@ -2588,6 +2588,10 @@ pub struct TrustRecorderEntry {
     /// without a distinct authority the recorder degenerates to
     /// self-assertion, which some trust registries reject.
     pub authority_did: String,
+    /// The register `authority_did` was picked from. Absent on the
+    /// `{{ surface.issuer_did }}` template and on an entry not yet classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_source: Option<crate::trust_registry_verification::authority_source::AuthoritySource>,
     /// authority=<authority_did>, entity=<agent DID>, action="is", resource="ownedAgent"
     #[serde(default = "default_false")]
     pub include_owned_agent: bool,

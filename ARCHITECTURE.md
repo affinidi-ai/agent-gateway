@@ -400,7 +400,7 @@ from.
 | [`certificates/`](src/certificates/) | TLS and mTLS certificate records | [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#mtls) |
 | [`vault_identity/`](src/vault_identity/) | Identity material for API keys and certificates | Source only: [`src/vault_identity/mod.rs`](src/vault_identity/mod.rs) |
 | [`issuers/`](src/issuers/) | Issuer records with generated `did:web` / `did:webvh` DIDs | Source only: [`src/issuers/mod.rs`](src/issuers/mod.rs) |
-| [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors | Source only: [`src/authorities/mod.rs`](src/authorities/mod.rs) |
+| [`authorities/`](src/authorities/) | Local record of external authority DIDs used as trust anchors; a delete is refused while a Trust Check or Trust Recorder entry uses one | [`POLICY.md`](docs/POLICY.md#the-authority-of-a-trust-check) |
 | [`trust_registries/`](src/trust_registries/) | Trust registry connection records, display-name reference fields | [`POLICY.md`](docs/POLICY.md#trust-check) for Trust Check. Records: [`src/trust_registries/mod.rs`](src/trust_registries/mod.rs) |
 | [`trust_registry_verification/`](src/trust_registry_verification/) | TRQP queries, Trust Check, the Trust Recorder and its last-outcome status | [`POLICY.md`](docs/POLICY.md), [`SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#recorder-status) |
 | [`sts/`](src/sts/) | RFC 8693 token exchange, and ID-JAG issuance and redemption | [`STS.md`](docs/STS.md) |

@@ -219,3 +219,49 @@ describe('TrustRecorderPanel — surface Issuer warning', () => {
     expect(getIssuersMock).not.toHaveBeenCalled();
   });
 });
+
+describe('TrustRecorderPanel — deleted Authority', () => {
+  const GONE = 'did:web:deleted-authority.example';
+  const entry = (authority_did: string, authority_source?: string) => ({
+    trust_registry_id: 'tr-1',
+    issuer_did: 'did:web:issuer.example',
+    authority_did,
+    ...(authority_source ? { authority_source } : {}),
+    include_owned_agent: true,
+    custom_resources: [],
+  });
+
+  function renderWithRegister(
+    config: Record<string, unknown>,
+    authorityDids: ReadonlySet<string> | null
+  ) {
+    getIssuersMock.mockResolvedValue([]);
+    const meta = { issuerId: '', authorityDids } as unknown as SurfaceMetaValue;
+    return render(
+      <SurfaceMetaProvider value={meta}>
+        <TrustRecorderPanel {...(baseProps(config) as any)} />
+      </SurfaceMetaProvider>
+    );
+  }
+
+  it('shows Configuration required naming the entry whose Authority was deleted', () => {
+    renderWithRegister(
+      { entries: [entry('did:web:auth.example', 'authority'), entry(GONE, 'authority')] },
+      new Set(['did:web:auth.example'])
+    );
+    const warning = screen.getByTestId('trust-recorder-panel-authority-missing');
+    expect(warning).toHaveTextContent('Configuration required');
+    expect(warning).toHaveTextContent('writes no records');
+    expect(screen.getByTestId('trust-recorder-panel-authority-missing-dids')).toHaveTextContent(
+      `Entry 2: ${GONE}`
+    );
+  });
+
+  it('says nothing while the register has not loaded or for an Issuer DID', () => {
+    const { unmount } = renderWithRegister({ entries: [entry(GONE, 'authority')] }, null);
+    expect(screen.queryByTestId('trust-recorder-panel-authority-missing')).toBeNull();
+    unmount();
+    renderWithRegister({ entries: [entry(GONE, 'issuer')] }, new Set());
+    expect(screen.queryByTestId('trust-recorder-panel-authority-missing')).toBeNull();
+  });
+});

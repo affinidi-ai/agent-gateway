@@ -171,6 +171,8 @@ export interface SurfaceFormShellProps {
   legacyAccessPoint?: boolean;
   /** Status of each API key the stored surface names, by key id. */
   apiKeyStatuses?: ApiKeyStatuses;
+  /** DIDs of the Authorities register; `null` while it loads or when it could not be loaded. */
+  authorityDids?: ReadonlySet<string> | null;
 }
 
 /** True when `variantId` is the default variant in the canvas's variant catalog. */
@@ -332,6 +334,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
   accessPointNotice,
   legacyAccessPoint,
   apiKeyStatuses,
+  authorityDids,
 }) => {
   const surfacePolicyIds =
     surfacePolicyLoadState.status === 'loaded' ? surfacePolicyLoadState.ids : null;
@@ -858,6 +861,7 @@ const SurfaceFormShell: React.FC<SurfaceFormShellProps> = ({
         accessPointNotice,
         legacyAccessPoint,
         apiKeyStatuses,
+        authorityDids,
         onConfigureAuthentication: handleConfigureAuthentication,
         setName: setMeta.setName,
         setDescription: setMeta.setDescription,

@@ -46,6 +46,7 @@ pub enum RecorderReason {
     RegistryNotFound,
     RegistryNotConnected,
     NoSurfaceIssuer,
+    AuthorityNotFound,
     NoResponse,
     Rejected,
     Error,
