@@ -1426,6 +1426,19 @@ mod tests {
                 resource_origins: Default::default(),
                 issuers: Default::default(),
                 mcp_proxy_store: None,
+                identity_strategies: Arc::new(
+                    crate::jwt_bearer::storage::FileSystemJwtVerificationStrategyStore::new(
+                        directory
+                            .path()
+                            .join("strategies"),
+                    )
+                    .await
+                    .unwrap(),
+                ),
+                verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                    crate::jwt_bearer::JwksClient::new(),
+                ))),
+                provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
             };
             Self {
                 _directory: directory,

@@ -514,6 +514,11 @@ impl Receiver {
             resource_origins: Arc::new(HashMap::new()),
             issuers: Default::default(),
             mcp_proxy_store: None,
+            identity_strategies: self.strategies.clone(),
+            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                crate::jwt_bearer::JwksClient::new(),
+            ))),
+            provider_egress: self.egress(),
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));

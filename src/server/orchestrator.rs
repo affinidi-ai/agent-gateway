@@ -3728,6 +3728,9 @@ pub async fn run_axum_proxy(
                 mcp_proxy_store: identity_state
                     .mcp_proxy_store
                     .clone(),
+                identity_strategies: source_auth_middleware.provider_store(),
+                verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(source_auth_middleware.jwks_client())),
+                provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");
@@ -3759,14 +3762,16 @@ pub async fn run_axum_proxy(
             {
                 dv_oauth_router = dv_oauth_router.merge(crate::delegation_vault::modern_consent::router(
                     crate::delegation_vault::modern_consent::ModernConsentState {
-                        vault: dv_state,
                         network: Arc::new(network_config.clone()),
-                        identity_strategies: source_auth_middleware.provider_store(),
-                        verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(
-                            source_auth_middleware.jwks_client(),
-                        )),
+                        identity_strategies: dv_state
+                            .identity_strategies
+                            .clone(),
+                        verifier: dv_state.verifier.clone(),
                         continuations: runtime.service.clone(),
-                        provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                        provider_egress: dv_state
+                            .provider_egress
+                            .clone(),
+                        vault: dv_state,
                     },
                 ));
             }

@@ -886,6 +886,8 @@ mod tests {
             .unwrap(),
             Arc::new(EmbeddedContinuations::new(32).unwrap()),
         ));
+        let verifier =
+            Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(crate::jwt_bearer::JwksClient::new())));
         let app = router(ModernConsentState {
             vault: super::super::handlers::DelegationVaultState {
                 vault_store: vault.clone(),
@@ -901,12 +903,13 @@ mod tests {
                 resource_origins: Default::default(),
                 issuers: Default::default(),
                 mcp_proxy_store: None,
+                identity_strategies: strategies.clone(),
+                verifier: verifier.clone(),
+                provider_egress: provider_egress.clone(),
             },
             network: Arc::new(network),
             identity_strategies: strategies,
-            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
-                crate::jwt_bearer::JwksClient::new(),
-            ))),
+            verifier,
             continuations: service.clone(),
             provider_egress,
         });

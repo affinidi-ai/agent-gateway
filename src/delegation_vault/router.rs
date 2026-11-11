@@ -98,6 +98,7 @@ mod tests {
     use crate::delegation_vault::storage::DelegationVaultStorage;
     use crate::delegation_vault::test_support::{InMemoryProviders, audit_log_of_two_tenants};
     use crate::delegation_vault::{DelegationToken, VaultLookupResult};
+    use crate::jwt_bearer::models::JwtVerificationStrategy;
     use crate::rbac::RbacConfig;
     use crate::secrets::{CreateSecretRequest, Secret, SecretListItem, SecretsStore, UpdateSecretRequest};
     use crate::tenancy::PatTenantContext;
@@ -208,6 +209,39 @@ mod tests {
             _id: &str,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+    }
+
+    struct StubStrategyStore;
+
+    #[async_trait::async_trait]
+    impl crate::jwt_bearer::JwtVerificationStrategyStorage for StubStrategyStore {
+        async fn create(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            unimplemented!("strategy store not used by delegation-vault management routes")
+        }
+        async fn get(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<JwtVerificationStrategy>> {
+            unimplemented!()
+        }
+        async fn list(&self) -> anyhow::Result<Vec<JwtVerificationStrategy>> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _strategy: JwtVerificationStrategy,
+        ) -> anyhow::Result<JwtVerificationStrategy> {
+            unimplemented!()
+        }
+        async fn delete(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
         }
     }
 
@@ -322,6 +356,11 @@ mod tests {
             resource_origins: Default::default(),
             issuers: Default::default(),
             mcp_proxy_store: None,
+            identity_strategies: Arc::new(StubStrategyStore),
+            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                crate::jwt_bearer::JwksClient::new(),
+            ))),
+            provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
         }
     }
 

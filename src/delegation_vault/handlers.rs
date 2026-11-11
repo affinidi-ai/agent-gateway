@@ -64,6 +64,9 @@ pub struct DelegationVaultState {
     /// The MCP Proxies a `proxy://` Transit Point's binding sends its grants
     /// through.
     pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
+    pub identity_strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+    pub verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
+    pub provider_egress: oauth::TokenEgress,
 }
 
 /// A read refused because the credential providers could not be read. It
