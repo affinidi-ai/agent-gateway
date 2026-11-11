@@ -630,6 +630,67 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Live check of `acl/swap-key` against a real trust agent: the access entry
+    /// of the control key moves to a new key, the running client signs in as the
+    /// new key, and the old key is refused afterwards.
+    ///
+    /// Needs a running vta-service whose access list holds the fixed test
+    /// control `did:key` (seed `[42u8; 32]`) as an admin:
+    /// `vta import-did --did did:key:z6MkgAnvkP45uNxwCKeNdt6wrYkEjpYX4f7Nrd8MQqFL8Fbn --role admin`.
+    /// The swap moves that entry away, so grant it again before the next run.
+    #[tokio::test]
+    #[ignore = "requires a running vta-service with the test control did:key granted; run manually"]
+    async fn live_swap_key_moves_the_access_entry_and_the_new_key_signs_in() {
+        let url = std::env::var("VTA_LIVE_URL").unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let vta_did = std::env::var("VTA_LIVE_DID").expect("set VTA_LIVE_DID to the VTA did");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control_key");
+        let old = ControlKey::from_seed([42u8; 32]);
+        write_seed(&path, &old)
+            .await
+            .expect("seed");
+        let client = client_for(&config(&url), &vta_did, ControlKey::from_seed([42u8; 32])).expect("client");
+        client
+            .authenticate()
+            .await
+            .expect("the granted key signs in before the swap");
+
+        let rotated = rotate_live(&client, &config(&url), &vta_did, &path)
+            .await
+            .expect("the trust agent accepts the swap");
+
+        assert_eq!(rotated.previous_did, old.did());
+        assert_ne!(rotated.new_did, old.did());
+        assert_eq!(client.control_did(), rotated.new_did, "the running client signs in as the new key");
+        client
+            .whoami()
+            .await
+            .expect("the new key's session works");
+        assert_eq!(
+            stored_control_did(&path)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some(rotated.new_did.as_str()),
+            "the stored key is the new one"
+        );
+        assert!(
+            settle_pending(&config(&url), &vta_did, &path)
+                .await
+                .expect("settle")
+                .is_none()
+        );
+        let refused = client_for(&config(&url), &vta_did, ControlKey::from_seed([42u8; 32]))
+            .expect("client")
+            .authenticate()
+            .await;
+        assert!(
+            matches!(refused, Err(VtaError::Http { status: 401 | 403, .. })),
+            "the old key is refused: {refused:?}"
+        );
+        eprintln!("LIVE_OK: swapped {} -> {}", rotated.previous_did, rotated.new_did);
+    }
+
     fn config(base_url: &str) -> VtaConfig {
         VtaConfig {
             base_url: Some(base_url.to_string()),
