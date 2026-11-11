@@ -80,6 +80,26 @@ async fn managed_agent_serves_card_naming_its_address(
         .await;
 }
 
+#[given(expr = "managed agent {string} serves an Agent Card that declares the identity extension without its payload")]
+async fn managed_agent_serves_card_with_identity_extension_without_payload(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    ensure_gateway_running(world).await;
+    let mock = world.mock_for_target(&agent_name);
+    let address = format!("{}/a2a", mock.url());
+    mock.set_response(MockResponse::json(json!({
+        "name": "Orders agent",
+        "url": address,
+        "skills": [],
+        "capabilities": {"extensions": [{"uri": "https://fabric.affinidi.io/extensions/agent-identity/v1"}]}
+    })))
+    .await;
+}
+
 #[when("the operator reads the agent card preview of the surface")]
 async fn operator_reads_preview(world: &mut SurfaceWorld) {
     ask(world, caller_of(None, false), false).await;

@@ -28,6 +28,15 @@ export const CARD_FETCH_CAUSES = [
 ] as const;
 export type CardFetchCause = (typeof CARD_FETCH_CAUSES)[number];
 
+export const CARD_IDENTITY_ERRORS = [
+  'identity_extension_missing',
+  'identity_validation_failed',
+  'identity_invalid_response',
+  'identity_did_failed',
+  'credential_injection_failed',
+] as const;
+export type CardIdentityError = (typeof CARD_IDENTITY_ERRORS)[number];
+
 export const CARD_AUTH_KINDS = [
   'none',
   'static_secret',
@@ -60,6 +69,7 @@ export interface CardFetch {
   cause: CardFetchCause | null;
   http_status: number | null;
   duration_ms: number;
+  identity_error: CardIdentityError | null;
 }
 
 export interface CardAuthReport {
@@ -127,11 +137,20 @@ function parseFetch(raw: unknown): CardFetch | null {
     raw.cause === null || raw.cause === undefined ? null : oneOf(CARD_FETCH_CAUSES, raw.cause);
   if (raw.cause !== null && raw.cause !== undefined && !cause) return null;
   if ((status === 'ok') !== (cause === null)) return null;
+  const identity_error =
+    raw.identity_error === null || raw.identity_error === undefined
+      ? null
+      : oneOf(CARD_IDENTITY_ERRORS, raw.identity_error);
+  if (raw.identity_error !== null && raw.identity_error !== undefined && !identity_error) {
+    return null;
+  }
+  if (identity_error !== null && cause !== 'identity_failed') return null;
   return {
     status,
     cause,
     http_status: asNumber(raw.http_status),
     duration_ms: asNumber(raw.duration_ms) ?? 0,
+    identity_error,
   };
 }
 
@@ -272,6 +291,19 @@ export const CARD_FETCH_CAUSE_TEXT: Record<CardFetchCause, string> = {
     "The managed agent's card has no identity extension, so the gateway serves it without an identity credential.",
 };
 
+export const CARD_IDENTITY_ERROR_TEXT: Record<CardIdentityError, string> = {
+  identity_extension_missing:
+    "The managed agent's card has no identity extension the gateway can use. Publish the agent-identity extension on the managed agent's card, then Refresh.",
+  identity_validation_failed:
+    "The managed agent's identity extension is invalid or does not match the surface's identity schema or rules. Fix the managed agent's identity extension, then Refresh.",
+  identity_invalid_response:
+    "The gateway could not read the managed agent's card for its managed identity. Check the agent card, then Refresh.",
+  identity_did_failed:
+    'The gateway could not issue a DID for the managed agent. Check the gateway logs and the identity issuer, then Refresh.',
+  credential_injection_failed:
+    'The gateway could not sign or attach its identity credential to the card. Check the gateway logs, then Refresh.',
+};
+
 export const AUTH_FAILED_ACTION_TEXT = 'Check Target Authentication on the Managed Agent.';
 
 export const CARD_REJECTED_CREDENTIAL_TEXT =
@@ -314,6 +346,9 @@ export function describeFetchCause(fetch: CardFetch, auth: CardAuthReport): stri
     return [CARD_FETCH_CAUSE_TEXT.auth_failed, reason, AUTH_FAILED_ACTION_TEXT]
       .filter(Boolean)
       .join(' ');
+  }
+  if (cause === 'identity_failed' && fetch.identity_error) {
+    return CARD_IDENTITY_ERROR_TEXT[fetch.identity_error];
   }
   const text = CARD_FETCH_CAUSE_TEXT[cause];
   if (!text.includes('{s}')) return text;

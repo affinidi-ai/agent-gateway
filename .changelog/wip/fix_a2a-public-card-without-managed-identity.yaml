@@ -1,4 +1,4 @@
-branch: fix/a2a-invalid-managed-identity-code
+branch: fix/a2a-public-card-without-managed-identity
 changes:
   added: []
   changed: []
@@ -34,6 +34,13 @@ changes:
         agent's card has no identity extension, and the Managed Agent panel's fetch line shows the
         same status in the warning tone, so operators see why the card carries no identity
         credential instead of a failure.
+    - timestamp: '2026-11-11T18:00:00Z'
+      title: Name why the gateway will not attach the managed identity to the agent card
+      description: >-
+        The agent card preview adds fetch.identity_error beside the identity_failed cause: the
+        identity error code the card route answers with, or credential_injection_failed when the
+        gateway could not sign or attach its own credential. The Agent Cards view names that cause
+        and what to do instead of only asking the operator to check the gateway logs.
   removed: []
   security: []
   breaking: []

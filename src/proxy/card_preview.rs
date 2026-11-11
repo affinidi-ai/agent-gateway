@@ -212,12 +212,41 @@ impl CardAuthReport {
     }
 }
 
+/// Why the gateway would not attach the agent's identity to the card: the code of the
+/// identity error the card route answers with, or the gateway's own failure to sign
+/// and attach its credential. Fixed strings only.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CardIdentityError {
+    IdentityExtensionMissing,
+    IdentityValidationFailed,
+    IdentityInvalidResponse,
+    IdentityDidFailed,
+    CredentialInjectionFailed,
+}
+
+impl CardIdentityError {
+    pub(crate) fn of(error: &crate::proxy::backend_identity::IdentityResolutionError) -> Self {
+        use crate::proxy::backend_identity::IdentityResolutionError;
+        match error {
+            IdentityResolutionError::IdentityExtensionMissing(_) => Self::IdentityExtensionMissing,
+            IdentityResolutionError::ValidationFailed(_) => Self::IdentityValidationFailed,
+            IdentityResolutionError::InvalidResponseJson => Self::IdentityInvalidResponse,
+            IdentityResolutionError::DidCreationFailed(_) | IdentityResolutionError::IdentityBackendUnavailable(_) => {
+                Self::IdentityDidFailed
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct CardFetchReport {
     pub status: CardFetchStatus,
     pub cause: Option<CardFetchCause>,
     pub http_status: Option<u16>,
     pub duration_ms: u64,
+    /// Set only when `cause` is `identity_failed`.
+    pub identity_error: Option<CardIdentityError>,
 }
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +367,7 @@ fn classify_fault(
         FetchFault::Status { status, credential_sent } => (classify_status(status, credential_sent), Some(status)),
         FetchFault::TooLarge => (CardFetchCause::TooLarge, None),
         FetchFault::InvalidCard => (CardFetchCause::InvalidCard, None),
-        FetchFault::IdentityFailed => (CardFetchCause::IdentityFailed, None),
+        FetchFault::IdentityFailed(_) => (CardFetchCause::IdentityFailed, None),
         FetchFault::RewriteFailed => (CardFetchCause::RewriteFailed, None),
     }
 }
@@ -634,6 +663,13 @@ async fn fetch_preview(
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut auth = CardAuthReport::for_surface(surface);
+    let identity_error = match &built {
+        Some(Err(failure)) => match failure.fault {
+            FetchFault::IdentityFailed(error) => Some(error),
+            _ => None,
+        },
+        _ => None,
+    };
     let (reported, upstream, served) = match built {
         Some(Ok(card)) => {
             auth.sent(card.credential_sent);
@@ -657,6 +693,7 @@ async fn fetch_preview(
         cause: reported.map(|(cause, _)| cause),
         http_status: reported.and_then(|(_, http_status)| http_status),
         duration_ms,
+        identity_error,
     };
     let generated = surface.is_a2a_proxy_target();
     let (source_url, source_url_query_hidden) = if generated {
@@ -1137,9 +1174,8 @@ mod tests {
         assert_ne!(surface_digest(&surface("https://a.example")), surface_digest(&surface("https://b.example")));
     }
 
-    #[tokio::test]
-    async fn a_card_without_an_identity_previews_as_served_without_identity() {
-        let target = MockServer::start_with_response(agent_card().to_string()).await;
+    async fn managed_identity_state(card: &serde_json::Value) -> (MockServer, ProxyState) {
+        let target = MockServer::start_with_response(card.to_string()).await;
         let mut surface = surface_with("orders", json!({"endpoint": target.url()}));
         surface
             .identity_slots
@@ -1150,6 +1186,50 @@ mod tests {
             },
         ));
         let state = running(surface).await;
+        (target, state)
+    }
+
+    #[tokio::test]
+    async fn a_card_with_an_invalid_identity_previews_its_identity_error() {
+        let mut card = agent_card();
+        card["capabilities"] = json!({"extensions": [{"uri": crate::config::AFFINIDI_AGENT_IDENTITY_EXTENSION}]});
+        let (_target, state) = managed_identity_state(&card).await;
+
+        let preview = PreviewMemory::new(FETCHES_PER_MINUTE)
+            .preview(&state, &caller("u-invalid-identity"), PreviewRequest::Read)
+            .await
+            .unwrap();
+
+        assert_eq!(fetch_of(&preview), (CardFetchStatus::NotServed, Some(CardFetchCause::IdentityFailed), None));
+        assert_eq!(
+            preview
+                .fetch
+                .as_ref()
+                .and_then(|fetch| fetch.identity_error),
+            Some(CardIdentityError::IdentityValidationFailed)
+        );
+        assert_eq!(preview.before, Some(card));
+    }
+
+    #[test]
+    fn an_identity_error_reports_the_code_the_card_route_answers_with() {
+        use crate::proxy::backend_identity::{IdentityResolutionError, IdentitySource};
+        let cases = [
+            IdentityResolutionError::IdentityExtensionMissing(IdentitySource::AgentCard),
+            IdentityResolutionError::ValidationFailed("bad".into()),
+            IdentityResolutionError::InvalidResponseJson,
+            IdentityResolutionError::DidCreationFailed("no issuer".into()),
+            IdentityResolutionError::IdentityBackendUnavailable("down".into()),
+        ];
+        for error in cases {
+            assert_eq!(json!(CardIdentityError::of(&error)), json!(error.code()), "{error}");
+        }
+        assert_eq!(json!(CardIdentityError::CredentialInjectionFailed), json!("credential_injection_failed"));
+    }
+
+    #[tokio::test]
+    async fn a_card_without_an_identity_previews_as_served_without_identity() {
+        let (_target, state) = managed_identity_state(&agent_card()).await;
 
         let memory = PreviewMemory::new(FETCHES_PER_MINUTE);
         let preview = memory
@@ -1160,6 +1240,13 @@ mod tests {
         assert_eq!(
             fetch_of(&preview),
             (CardFetchStatus::ServedWithoutIdentity, Some(CardFetchCause::IdentityMissing), None)
+        );
+        assert_eq!(
+            preview
+                .fetch
+                .as_ref()
+                .and_then(|fetch| fetch.identity_error),
+            None
         );
         assert_eq!(preview.before, Some(agent_card()));
         let served = preview

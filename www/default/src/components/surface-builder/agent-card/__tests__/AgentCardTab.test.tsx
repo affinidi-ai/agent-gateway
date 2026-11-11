@@ -280,6 +280,26 @@ describe('AgentCardTab, failed fetches', () => {
     expect(screen.queryByTestId('agent-card-row-signin')).not.toBeInTheDocument();
   });
 
+  it('names the identity error when the gateway will not attach the identity', async () => {
+    await showBody(
+      previewBody({
+        fetch: {
+          status: 'not_served',
+          cause: 'identity_failed',
+          http_status: null,
+          duration_ms: 5,
+          identity_error: 'identity_validation_failed',
+        },
+        after: null,
+        after_bytes: null,
+      })
+    );
+    expect(screen.getByTestId('agent-card-failed-cause')).toHaveTextContent(
+      "The managed agent's identity extension is invalid or does not match the surface's identity schema or rules. Fix the managed agent's identity extension, then Refresh."
+    );
+    expect(screen.getByTestId('agent-card-fetch-cause')).toHaveTextContent('Identity failed');
+  });
+
   it('warns that a card served without a managed identity has no identity credential', async () => {
     await showBody(
       previewBody({

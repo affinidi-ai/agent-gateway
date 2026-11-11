@@ -106,7 +106,7 @@ Every fetch result is a `200` with these fields, each always present:
 | `served_url` | The card URL callers use: the first external URL of the Access Point's listener, the route and `/.well-known/agent-card.json`. |
 | `source_url`, `source_url_query_hidden` | The card URL fetched from the Target, without user info, query or fragment; the flag says a query or user info was removed. |
 | `fetched_at`, `cached` | When the fetch started; `cached` is `true` when the answer is the last preview instead of a new fetch. |
-| `fetch` | `status` (`ok`, `failed`, `not_served`, `served_without_identity`), `cause`, `http_status`, `duration_ms`. |
+| `fetch` | `status` (`ok`, `failed`, `not_served`, `served_without_identity`), `cause`, `http_status`, `duration_ms`, `identity_error`. |
 | `auth` | `kind` (`none`, `static_secret`, `credential_provider`, `credential_lookup`, `remote_gateway`), `result` (`not_configured`, `sent`, `not_sent`, `failed`) and `failure`; `provider_name` and `token_expires_at` are `null`. |
 | `before`, `before_bytes` | The agent's own card as fetched, and its size. |
 | `after`, `after_bytes` | The card the gateway serves, and its size. |
@@ -122,7 +122,11 @@ could not obtain), `forbidden` (403), `not_found` (404 or 410), `redirected` (3x
 `identity_missing`: the surface reads the managed identity from the card, the agent's card
 carries none, and the gateway serves it without an identity credential (see
 [Generated agent cards](#generated-agent-cards)); `after` is then the served card and counts as
-the last good card. An `auth.failure` is `secret_unavailable`,
+the last good card. `identity_error` is `null` unless the cause is `identity_failed`, and then names
+why: the code of the identity error the card route answers with (`identity_extension_missing`,
+`identity_validation_failed`, `identity_invalid_response` or `identity_did_failed`), or
+`credential_injection_failed` when the gateway could not sign or attach its own identity
+credential. An `auth.failure` is `secret_unavailable`,
 `provider_not_found` (a secret or provider of another tenant reports as missing too),
 `token_unavailable`, `unsupported`, `forbidden` (a `[credential_policy]` rule in `enforce`
 withholds the credential), or `invalid_header` (a stored Target authentication whose header

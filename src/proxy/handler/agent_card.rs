@@ -87,7 +87,7 @@ pub(crate) enum FetchFault {
     Status { status: u16, credential_sent: bool },
     TooLarge,
     InvalidCard,
-    IdentityFailed,
+    IdentityFailed(crate::proxy::card_preview::CardIdentityError),
     RewriteFailed,
 }
 
@@ -261,7 +261,7 @@ async fn resolve_card_identity(
             "Protected agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::of(&e)),
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -309,7 +309,7 @@ async fn resolve_external_card_identity(
             "External agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::of(&e)),
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -373,7 +373,7 @@ async fn inject_identity_credential(
         .map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
             CardFailure::new(
-                FetchFault::IdentityFailed,
+                FetchFault::IdentityFailed(crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed),
                 create_error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("Agent card identity credential injection failed: {}", e),

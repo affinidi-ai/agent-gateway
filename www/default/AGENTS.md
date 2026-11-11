@@ -848,7 +848,12 @@ surface, never the unsaved form.
   No managed identity" in the warning tone (`agent-card-fetch-warning`, icon
   `fa-circle-exclamation`), and the card counts as the last served card (`lastServed`).
 - A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
-  `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
+  `agent-card-failed-cause`) and opens both raw panels. For `identity_failed` the alert names
+  `fetch.identity_error` with its own text (`CARD_IDENTITY_ERROR_TEXT`: an identity extension the
+  gateway can use is missing, the extension is invalid, the card could not be read for its
+  identity, a DID could not be issued, or the gateway could not attach its credential), and keeps
+  the generic "Check the gateway logs, then Refresh." only when the gateway names none. The parser
+  rejects an `identity_error` beside any other cause. The managed panel reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
   fetched it but will not serve it. The served panel shows, in this order: the card the gateway
   returns in `after` whatever the fetch status, with "The card the gateway last served for this

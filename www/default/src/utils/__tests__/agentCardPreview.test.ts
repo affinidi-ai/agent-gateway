@@ -5,6 +5,8 @@ import {
   CARD_FETCH_CAUSE_LABEL,
   CARD_FETCH_CAUSE_TEXT,
   CARD_FETCH_STATUS_LABEL,
+  CARD_IDENTITY_ERRORS,
+  CARD_IDENTITY_ERROR_TEXT,
   CARD_PEER_REFUSED_TEXT,
   CARD_REJECTED_CREDENTIAL_TEXT,
   describeCardAuth,
@@ -48,13 +50,20 @@ const failed = (cause: CardFetch['cause'], http_status: number | null = null): C
   cause,
   http_status,
   duration_ms: 1,
+  identity_error: null,
 });
 
 describe('parseAgentCardPreview', () => {
   it('parses a ready preview', () => {
     const p = supported(previewBody());
     expect(p.surface_id).toBe('s-123');
-    expect(p.fetch).toEqual({ status: 'ok', cause: null, http_status: null, duration_ms: 182 });
+    expect(p.fetch).toEqual({
+      status: 'ok',
+      cause: null,
+      http_status: null,
+      duration_ms: 182,
+      identity_error: null,
+    });
     expect(p.auth.provider_name).toBe('oidc-e2e jwt bearer');
     expect(p.before).toEqual(BEFORE_CARD);
     expect(p.after).toEqual(AFTER_CARD);
@@ -305,6 +314,7 @@ describe('describeFetchCause', () => {
       cause: 'identity_missing' as const,
       http_status: null,
       duration_ms: 1,
+      identity_error: null,
     };
     expect(CARD_FETCH_STATUS_LABEL.served_without_identity).toBe('Served – No managed identity');
     expect(describeFetchCause(fetch, auth())).toBe(
@@ -323,9 +333,44 @@ describe('describeFetchCause', () => {
     expect(parseAgentCardPreview(body)).toBeNull();
   });
 
+  it.each(CARD_IDENTITY_ERRORS)('names the identity error %s in the not-served alert', error => {
+    const fetch: CardFetch = {
+      status: 'not_served',
+      cause: 'identity_failed',
+      http_status: null,
+      duration_ms: 1,
+      identity_error: error,
+    };
+    expect(describeFetchCause(fetch, auth())).toBe(CARD_IDENTITY_ERROR_TEXT[error]);
+    expect(CARD_IDENTITY_ERROR_TEXT[error]).not.toBe(CARD_FETCH_CAUSE_TEXT.identity_failed);
+  });
+
+  it('keeps the generic identity text when the gateway names no identity error', () => {
+    expect(describeFetchCause({ ...failed('identity_failed'), status: 'not_served' }, auth())).toBe(
+      CARD_FETCH_CAUSE_TEXT.identity_failed
+    );
+  });
+
+  it('parses an identity error only beside an identity failure', () => {
+    const fetch = (cause: string, identity_error: unknown) =>
+      previewBody({
+        fetch: { status: 'not_served', cause, http_status: null, duration_ms: 1, identity_error },
+      });
+    expect(supported(fetch('identity_failed', 'identity_did_failed')).fetch.identity_error).toBe(
+      'identity_did_failed'
+    );
+    expect(supported(fetch('identity_failed', null)).fetch.identity_error).toBeNull();
+    expect(supported(previewBody()).fetch.identity_error).toBeNull();
+    expect(parseAgentCardPreview(fetch('rewrite_failed', 'identity_did_failed'))).toBeNull();
+    expect(parseAgentCardPreview(fetch('identity_failed', 'something_else'))).toBeNull();
+  });
+
   it('returns nothing for a fetch that worked', () => {
     expect(
-      describeFetchCause({ status: 'ok', cause: null, http_status: null, duration_ms: 1 }, auth())
+      describeFetchCause(
+        { status: 'ok', cause: null, http_status: null, duration_ms: 1, identity_error: null },
+        auth()
+      )
     ).toBe('');
   });
 });
