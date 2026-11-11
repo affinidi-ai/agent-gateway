@@ -550,11 +550,11 @@ applied and no Trust Recorder write. The gateway logs a `WARN` naming the surfac
 built without an identity, and again only after that card carried one or after a restart. This
 holds on the card route, the agent card preview, a well-known card answered through ordinary
 forwarding, a public card this gateway reads over Fabric, and a public card it serves to a peer
-over Fabric. An invalid identity on a public card, and a missing one on an extended card, a
-message, a stream or the external slot, are still refused on the first four of those paths. A
-public card this gateway serves to a peer over Fabric is never refused for its identity: any
-identity error on it, an invalid identity included, serves the card without an identity
-credential, and the gateway logs the error.
+over Fabric. An invalid identity on a public card is still refused on the first four of those
+paths. A missing identity on an extended card, a message, a stream or the external slot is still
+refused. A public card this gateway serves to a peer over Fabric is never refused for its
+identity: any identity error on it, an invalid identity included, serves the card without an
+identity credential, and the gateway logs the error.
 
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
