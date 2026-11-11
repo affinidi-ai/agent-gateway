@@ -1,0 +1,34 @@
+branch: feat/id-version-ff-up-2
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T08:00:00Z'
+      title: Keep identity rotation history after a rollback or an interrupted write
+      description: >-
+        An identity record saved by a release that does not track rotation_count, as after a
+        rollback to 1.0.6, no longer has a readable rotation history overwritten by its next
+        rotation: that rotation keeps the history on file and adds to it, without recording the
+        same rotation twice unless the credential rotated again before a failed save was
+        retried, which leaves one extra version, and fails instead when the history cannot be loaded because of a
+        disk or key service failure. Such an identity's history shows again only after that
+        rotation. The history is now written through a temporary file, so a write interrupted
+        from now on leaves the earlier history instead of a torn file that fails every later
+        rotation of that identity. A history file torn before this change still needs restoring
+        or removing; on a record saved by 1.0.6, its next rotation replaces it. See
+        docs/SOURCE_AUTH.md.
+    - timestamp: '2026-11-11T08:00:00Z'
+      title: Show the right changes in Version History while it reloads rotations
+      description: >-
+        When a credential rotated while Version History was open, the Identities page compared
+        the earlier rotation list with the updated row until the new list arrived, showing the
+        newest change against the wrong rotation. It now shows the loading state until then.
+    - timestamp: '2026-11-11T08:00:00Z'
+      title: Stop loading rotation pages when Version History closes
+      description: >-
+        Closing Version History or collapsing its row while the rotations load now aborts the
+        remaining page requests instead of fetching every page and discarding the result. When
+        one identity's rotations fail to load, the other identities' page requests now stop too.
+  removed: []
+  security: []
+  breaking: []
