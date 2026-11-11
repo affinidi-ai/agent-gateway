@@ -3623,6 +3623,23 @@ fn managed_agent_publishes_agent_card_with_identity(
     set_primary_target_response(world, agent_card);
 }
 
+#[given(expr = "managed agent {string} publishes an agent card without the agent-identity extension")]
+fn managed_agent_publishes_agent_card_without_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {"streaming": false}
+    });
+    set_primary_target_response(world, agent_card);
+}
+
 #[given(
     expr = "managed agent {string} publishes an agent card whose identity credential names a different DID than its presentation"
 )]

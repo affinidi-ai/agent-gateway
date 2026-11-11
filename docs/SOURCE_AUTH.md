@@ -1232,6 +1232,18 @@ identity presentation reports `vp` or `vp_unanchored` regardless of the configur
 on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
 
+### A missing identity on the public agent card
+
+On the protected slot, `payload_extraction` refuses a response that carries no identity with
+`422 identity_extension_missing`, and one whose identity is present but invalid with `422
+identity_validation_failed`. The public agent card of an A2A or AP2 surface is the exception for
+a missing identity: a card
+with neither `agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no
+identity credential and no Trust Recorder write, and the gateway logs a `WARN` once per surface.
+An agent that publishes no identity, such as a Microsoft Foundry agent, stays discoverable. Its
+messages are still refused while the slot reads the identity from the response. See
+[`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for the codes.
+
 ### `from_api_key` on the inbound slot
 
 The inbound slot stores no key. Each request's caller DID comes from the API key that request

@@ -42,6 +42,14 @@ Feature: A2A HTTP surface forwarding and identity
     And the agent card does not contain the raw identity extension
     And the agent card contains a valid Verifiable Presentation
 
+  Scenario: A2A agent card without the identity extension is served without an identity credential
+    Given the surface has managed identity enabled
+    And managed agent "bravo" publishes an agent card without the agent-identity extension
+    When the caller fetches the agent card
+    Then the response status is 200
+    And the agent card url points to the gateway listen address
+    And the agent card does not contain the credential extension
+
   Scenario: A2A agent card whose identity credential names a different DID than its presentation is refused
     Given the surface has managed identity enabled
     And managed agent "bravo" publishes an agent card whose identity credential names a different DID than its presentation

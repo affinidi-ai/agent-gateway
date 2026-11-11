@@ -1082,7 +1082,14 @@ mod tests {
         target: JsonValue,
         metrics: &Arc<crate::metrics::MetricsStore>,
     ) -> ProxyState {
-        let state = super::super::variant_routing_tests::router(surface(target))
+        state_of(surface(target), metrics).await
+    }
+
+    async fn state_of(
+        surface: crate::config::agent_surface::AgentSurface,
+        metrics: &Arc<crate::metrics::MetricsStore>,
+    ) -> ProxyState {
+        let state = super::super::variant_routing_tests::router(surface)
             .base_proxy_state("orders")
             .await
             .unwrap();
@@ -1158,6 +1165,41 @@ mod tests {
         assert_eq!(preview.served, served.served);
         assert_ne!(served.served["url"], "http://agent.internal/a2a", "the card points at the Access Point");
         assert_eq!(recorded(&metrics, 1).await, vec![crate::metrics::ConnectionStatus::Success]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_without_an_identity_extension_is_served_without_an_identity_credential() {
+        let card = json!({"name": "Orders agent", "url": "http://agent.internal/a2a", "skills": []});
+        let target = MockServer::start_with_response(card.to_string()).await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut managed = surface(json!({"endpoint": target.url()}));
+        managed
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        let state = state_of(managed, &metrics).await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let built = build(&state, mode)
+                .await
+                .unwrap_or_else(|failure| panic!("{mode:?}: {:?}", failure.fault));
+            assert_eq!(built.upstream, Some(card.clone()), "{mode:?}");
+            assert_ne!(
+                built.served["url"], "http://agent.internal/a2a",
+                "{mode:?}: the card points at the Access Point"
+            );
+            assert_eq!(
+                built
+                    .served
+                    .pointer("/capabilities/extensions"),
+                None,
+                "{mode:?}: no identity credential"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

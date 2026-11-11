@@ -1760,6 +1760,26 @@ fn agent_card_contains_credential(world: &mut SurfaceWorld) {
     );
 }
 
+#[then("the agent card does not contain the credential extension")]
+fn agent_card_does_not_contain_credential(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    let uris: Vec<&str> = body
+        .pointer("/capabilities/extensions")
+        .and_then(|extensions| extensions.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|ext| {
+            ext.get("uri")
+                .and_then(|u| u.as_str())
+        })
+        .collect();
+    assert!(
+        !uris.contains(&AGENT_IDENTITY_CREDENTIAL_URI),
+        "agent card extensions should NOT contain credential URI, got: {:?}",
+        uris
+    );
+}
+
 #[then("the agent card does not contain the raw identity extension")]
 fn agent_card_does_not_contain_raw(world: &mut SurfaceWorld) {
     let body = get_response_body_value(world);

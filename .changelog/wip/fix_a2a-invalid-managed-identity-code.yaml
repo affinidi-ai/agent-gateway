@@ -14,6 +14,17 @@ changes:
         whose presentation is missing or malformed. identity_extension_missing is kept for an
         identity that was not sent, so callers and operators can tell a missing identity from a
         bad one.
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: ⭐ Serve the public agent card when the managed agent publishes no identity
+      description: >-
+        A surface with managed identity refused its public agent card with 422
+        identity_extension_missing when the managed agent's card had no identity extension, as a
+        Microsoft Foundry agent's has not, so the agent could not be discovered. The gateway now
+        serves that card without an identity credential, with every other change applied, and logs
+        a warning once per surface. This applies to A2A and AP2 surfaces. A card whose identity is
+        present but invalid, or that carries only an identity credential the gateway cannot use, is
+        still refused, and messages, streams and extended cards without an identity are still
+        refused.
   removed: []
   security: []
   breaking: []

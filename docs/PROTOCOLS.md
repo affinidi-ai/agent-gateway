@@ -533,6 +533,16 @@ holder and the subject of its presentation, or whose presentation is missing or 
 extended card such a credential is ignored, so a card that carries only it is
 `identity_extension_missing`.
 
+A public card of an A2A or AP2 surface is the exception for a missing identity on the protected
+slot: when it carries neither `agent-identity/v1` nor `agent-identity-credential/v1`, it is served
+without an identity credential, with its other changes (URL rewrite, `agentDid` and `agentDNA`)
+applied and no Trust Recorder write. The gateway logs a `WARN` naming the surface, the
+`protected_identity` slot and `identity_extension_missing` the first time a surface's card is
+built without an identity, and again only after that card carried one or after a restart. This
+holds on the card route, the agent card preview, a well-known card answered through ordinary
+forwarding and a public card read or served over Fabric. An invalid identity on a public card, and
+a missing one on an extended card, a message, a stream or the external slot, are still refused.
+
 For the JSON-RPC binding, error responses and empty bodies are forwarded unchanged; a JSON-RPC error
 is an object `error` with no `result`, and a `null` member counts as absent, so `"error": null` next
 to a card still has the card rewritten. A card `result` is rewritten whatever the HTTP status. The
