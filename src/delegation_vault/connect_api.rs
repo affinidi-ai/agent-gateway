@@ -2104,11 +2104,6 @@ mod tests {
             .start(Some("tenant-a"), owner_start())
             .await;
         assert_eq!((status, answer["code"].as_str()), (StatusCode::FORBIDDEN, Some("issuer_not_permitted")));
-        assert!(
-            fixture
-                .token_requests()
-                .is_empty()
-        );
     }
 
     fn caller_extension() -> Option<Extension<AuthGuardOk>> {

@@ -782,7 +782,8 @@ pub fn resource_permitted(
 /// `external_consent_issuer_patterns`, always read together, so no check can
 /// consult one and miss the other. With neither set every issuer is
 /// permitted; with either set, only what one of them permits.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(test, derive(Default))]
 pub struct IssuerRules<'a> {
     listed: Option<&'a std::collections::HashMap<String, Vec<String>>>,
     patterns: Option<&'a [IssuerPattern]>,
@@ -818,7 +819,8 @@ impl<'a> IssuerRules<'a> {
 /// gateway.json's `external_consent_issuers` and
 /// `external_consent_issuer_patterns` as a handler's state keeps them, read
 /// through [`Self::rules`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct PermittedIssuers {
     listed: Option<std::collections::HashMap<String, Vec<String>>>,
     patterns: Option<Vec<IssuerPattern>>,

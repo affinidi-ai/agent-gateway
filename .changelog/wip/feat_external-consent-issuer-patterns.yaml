@@ -14,8 +14,9 @@ changes:
         use. Provider create, surface save, the connect API and every grant release and refresh
         check patterns beside the exact list, and a pattern list that is set, even empty, counts
         as the operator's list for a tenant's provider. A pattern that is not valid permits
-        nothing and is named at startup, and while patterns are set the startup credential
-        policy report warns about each stored external consent provider neither list permits.
+        nothing and is named at startup, and while patterns are set the credential policy
+        report, at startup and on every reload, warns about each stored external consent provider
+        neither list permits.
         A host label pattern's fixed host must be one under which only the vendor creates
         labels, never a shared hosting or public suffix. It is read once, at startup, and a
         configuration reload keeps it. Without the setting nothing changes.
