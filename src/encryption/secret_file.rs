@@ -203,9 +203,10 @@ pub async fn create_secret_file(
 /// is removed later: on unix by its device and inode, so a form another creator
 /// removed and created again is usually not mistaken for it, though a filesystem
 /// that reuses the inode can hide the difference. Elsewhere only its path and
-/// emptiness are compared, which is as much as the platform offers. Neither rules
-/// out a file created between the check and the removal; the creator's own
-/// read-back catches that instead.
+/// emptiness are compared, which is as much as the platform offers. The removal
+/// renames the file aside before it unlinks it, so a creator that finishes
+/// filling the captured file after this check cannot have its finished work
+/// deleted; see [`EmptySecretFile::remove_if_still_empty`].
 pub struct EmptySecretFile {
     path: PathBuf,
     #[cfg(unix)]
@@ -262,6 +263,59 @@ impl EmptySecretFile {
     ) -> bool {
         true
     }
+
+    /// Rename this file aside, confirm it is still the empty file that was
+    /// captured, and unlink it. Returns whether the path was freed.
+    ///
+    /// The rename is what makes this safe against a creator that is still
+    /// filling the captured file. It moves the inode that creator holds open out
+    /// of the path, so the creator's own read-back finds a path that no longer
+    /// holds its bytes and it gives up its creation. A file that turns out to
+    /// have gained content is put straight back and `false` returned: that
+    /// creator finished first and owns it. Checking the file without renaming it
+    /// could not give this, because the creator could finish in the moment
+    /// between the check and the unlink and still pass its own read-back.
+    async fn remove_if_still_empty(&self) -> bool {
+        let mut aside = self
+            .path
+            .as_os_str()
+            .to_os_string();
+        aside.push(format!(".{}.removed", uuid::Uuid::new_v4()));
+        let aside = PathBuf::from(aside);
+        if let Err(error) = tokio::fs::rename(&self.path, &aside).await {
+            warn!(
+                "Not removing the empty secret file {}: it could not be renamed aside ({})",
+                self.path.display(),
+                error
+            );
+            return false;
+        }
+        match tokio::fs::metadata(&aside).await {
+            Ok(metadata) if metadata.len() == 0 && self.is_same_file(&metadata) => {}
+            _ => {
+                if let Err(error) = tokio::fs::rename(&aside, &self.path).await {
+                    error!(
+                        "Failed to put the secret file {} back after it gained content while it was removed: {}",
+                        self.path.display(),
+                        error
+                    );
+                }
+                return false;
+            }
+        }
+        warn!(
+            "Secret file {} stayed empty, as a creation interrupted while filling it leaves it: removing it and \
+             creating the secret again",
+            self.path.display()
+        );
+        if let Err(error) = tokio::fs::remove_file(&aside).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            // The path is free either way, which is what the caller needs.
+            error!("Failed to remove the empty secret file {}: {}", aside.display(), error);
+        }
+        true
+    }
 }
 
 /// The forms of the secret in `path` when every one that exists is empty, as a
@@ -285,37 +339,32 @@ pub async fn empty_secret_files(path: &Path) -> Option<Vec<EmptySecretFile>> {
 }
 
 /// Remove the empty files [`empty_secret_files`] captured, but only while every
-/// one of them is still the same empty file, so a creator that has since made its
-/// own file and is filling it does not lose it. Returns whether anything was
-/// removed; a failure is logged and leaves the file in place, where the creation
-/// that follows refuses it as an existing file.
+/// one of them is still that same empty file, so a creator that has since made
+/// its own file, or finished filling this one, does not lose it. Returns whether
+/// the paths were freed; a refusal is logged and leaves the file where it was,
+/// so the creation that follows refuses it as an existing file.
 ///
-/// The check and the removal are not one operation, so a creator that creates its
-/// file in the moment between them still loses it. That creator reads its own
-/// file back once it is filled, finds the winner's content, and gives up its
-/// creation, so the two converge on one secret (see
-/// [`created_secret_file_is_still_ours`]).
+/// Each file is renamed aside before it is unlinked, which is what closes the
+/// race against a creator that completes inside this call; see
+/// [`EmptySecretFile::remove_if_still_empty`].
 pub async fn remove_unchanged_empty_secret_files(empty: &[EmptySecretFile]) -> bool {
     for form in empty {
-        if !form.is_unchanged().await {
+        if !form
+            .is_unchanged()
+            .await
+        {
             return false;
         }
     }
     let mut removed = false;
     for form in empty {
-        warn!(
-            "Secret file {} stayed empty, as a creation interrupted while filling it leaves it: removing it and \
-             creating the secret again",
-            form.path.display()
-        );
-        match tokio::fs::remove_file(&form.path).await {
-            Ok(()) => removed = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                error!("Failed to remove the empty secret file {}: {}", form.path.display(), error);
-                return false;
-            }
+        if !form
+            .remove_if_still_empty()
+            .await
+        {
+            return false;
         }
+        removed = true;
     }
     removed
 }
@@ -380,16 +429,26 @@ async fn create_secret_file_in_place(
         .create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let created = match options.open(target).await {
+    let mut created = match options.open(target).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(error) => {
             return Err(error).with_context(|| format!("Failed to create secret file {}", target.display()));
         }
     };
-    if let Err(error) = fill_created_secret_file(created, bytes).await {
-        if let Err(error) = tokio::fs::remove_file(target).await {
-            error!("Failed to remove the unwritten secret file {}: {}", target.display(), error);
+    if let Err(error) = fill_created_secret_file(&mut created, bytes).await {
+        if created_file_is_still_at(&created, target).await {
+            if let Err(error) = tokio::fs::remove_file(target).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                error!("Failed to remove the unwritten secret file {}: {}", target.display(), error);
+            }
+        } else {
+            warn!(
+                "Not removing the secret file {} this creation could not fill: the path holds another creator's \
+                 file now, which this one must not delete",
+                target.display()
+            );
         }
         return Err(error).with_context(|| format!("Failed to write secret file {}", target.display()));
     }
@@ -404,11 +463,39 @@ async fn create_secret_file_in_place(
     settle_created_secret_file(target, other_form).await
 }
 
+/// Whether `target` still names the file this creator opened, so a creation that
+/// could not fill its file removes only its own. A creator stalled long enough
+/// for a reader to take the path, and for another creator to fill it, would
+/// otherwise delete a complete secret here. Only the inode decides: on a platform
+/// that cannot compare inodes this keeps the older behaviour and removes by path.
+#[cfg(unix)]
+async fn created_file_is_still_at(
+    opened: &tokio::fs::File,
+    target: &Path,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let (Ok(opened), Ok(current)) = (opened.metadata().await, tokio::fs::metadata(target).await) else {
+        return false;
+    };
+    opened.dev() == current.dev() && opened.ino() == current.ino()
+}
+
+#[cfg(not(unix))]
+async fn created_file_is_still_at(
+    _opened: &tokio::fs::File,
+    _target: &Path,
+) -> bool {
+    true
+}
+
 /// Whether the file just filled still holds what this creator wrote. Another
 /// creator can remove it as an empty leftover and create its own between the
 /// exclusive create and the fill, so the content on disk decides who won: a
 /// creator that finds anything else, or nothing, lost its file and must adopt
-/// the secret now in place.
+/// the secret now in place. A removal renames the file aside before unlinking
+/// it, so a creator whose file is taken while it fills it always reads back a
+/// path that no longer holds its bytes, even if it finishes in that moment.
 async fn created_secret_file_is_still_ours(
     target: &Path,
     bytes: &[u8],
@@ -422,9 +509,11 @@ async fn created_secret_file_is_still_ours(
     }
 }
 
-/// Write `bytes` to a just-created secret file and make them durable.
+/// Write `bytes` to a just-created secret file and make them durable. The handle
+/// stays with the caller, which needs it to tell whether the path still names
+/// the file it created before it removes anything.
 async fn fill_created_secret_file(
-    mut created: tokio::fs::File,
+    created: &mut tokio::fs::File,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -433,7 +522,9 @@ async fn fill_created_secret_file(
         .write_all(bytes)
         .await?;
     created.flush().await?;
-    created.sync_all().await
+    created
+        .sync_all()
+        .await
 }
 
 /// Make a just-created secret file durable, and give it up again when the other
@@ -1033,6 +1124,43 @@ mod tests {
 
         assert!(!remove_unchanged_empty_secret_files(&empty).await, "a file that gained content must be kept");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "another creator's secret");
+    }
+
+    /// The check and the removal are not one operation, so a creator can finish
+    /// filling the captured file between them and pass its own read-back. The
+    /// removal renames the file aside first and puts it back when it finds
+    /// content, so that creator keeps its secret. Calling the removal directly
+    /// is what puts the content there after the check, as a stalled creator
+    /// does.
+    #[tokio::test]
+    async fn a_leftover_filled_after_the_check_is_put_back_rather_than_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.json");
+        std::fs::write(&path, "").unwrap();
+        let empty = empty_secret_files(&path)
+            .await
+            .expect("an empty file must be captured");
+        let form = &empty[0];
+        assert!(form.is_unchanged().await, "the check passes while the file is still empty");
+
+        std::fs::write(&path, "the stalled creator's secret").unwrap();
+
+        assert!(
+            !form
+                .remove_if_still_empty()
+                .await,
+            "a file filled after the check must not be removed"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the stalled creator's secret");
+        let left_behind: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+            })
+            .collect();
+        assert_eq!(left_behind, vec![std::ffi::OsString::from("key.json")], "nothing may be left renamed aside");
     }
 
     /// A file another instance is still filling in place is empty. Reading it

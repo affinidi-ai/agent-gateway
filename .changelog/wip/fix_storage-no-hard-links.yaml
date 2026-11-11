@@ -27,9 +27,12 @@ changes:
         removed while it fills it reads the file back, finds the key that replaced it and
         uses that one, so the instances still share a key. Only an instance that found the
         file unchanged across those 5 seconds removes it, and an instance creating the key
-        removes nothing, so a file another instance is filling is left alone; an instance
-        that finds the key gone between reading and creating it tries both again rather
-        than stopping.
+        removes nothing, so a file another instance is filling is left alone. The removal
+        renames the file aside before deleting it and puts it back if it turns out to hold
+        a key, so a creator that was merely slow keeps its own file, and a creation that
+        cannot fill its file deletes only the file it created. Instances recovering the
+        same empty file together end on one key, and one that finds the key gone while it
+        is creating it reads it again rather than stopping.
     - timestamp: '2026-11-11T12:01:00Z'
       title: Wait out a transit token key file that cannot be read yet
       description: >-

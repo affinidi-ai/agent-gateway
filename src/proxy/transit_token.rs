@@ -77,12 +77,14 @@ impl TransitTokenKey {
     /// created. Only the reader that watched it stay the same empty file for that long removes
     /// it, so a file another instance is filling right now is never taken, and a creator whose
     /// own file is removed in the moment before it fills it adopts the key that replaced it.
-    /// Reading and creating are retried for the same window, so an instance that finds the key
-    /// gone between the two does not fail its start.
+    /// Reading and creating are retried for [`UNREADABLE_KEY_FILE_WAIT`] from the first creation
+    /// that loses, so an instance that finds the key gone between the two does not fail its
+    /// start. That window starts there rather than on entry, because reading an empty leftover
+    /// spends a whole window of its own first and would otherwise leave none for the retry.
     /// An existing key file, such as one a restore wrote, is restricted to its owner.
     pub async fn load_or_create(directory: &Path) -> Result<Self> {
         let path = directory.join(KEY_FILE_NAME);
-        let give_up_at = Instant::now() + UNREADABLE_KEY_FILE_WAIT;
+        let mut give_up_at = None;
         loop {
             if let Some(key) = Self::read_existing(&path).await? {
                 return Ok(key);
@@ -91,6 +93,7 @@ impl TransitTokenKey {
             if crate::encryption::secret_file::create_secret_file(&path, &generated.to_stored()?).await? {
                 return Ok(generated);
             }
+            let give_up_at = *give_up_at.get_or_insert_with(|| Instant::now() + UNREADABLE_KEY_FILE_WAIT);
             if Instant::now() >= give_up_at {
                 anyhow::bail!(
                     "Transit token signing key {} disappeared or stayed empty as it was created",
@@ -113,7 +116,10 @@ impl TransitTokenKey {
     /// still the same empty file when it runs out is removed, and `None` returned
     /// so the caller creates the key again; one that changed in the meantime, or
     /// that only fell empty along the way, is left alone, because another
-    /// instance is filling it.
+    /// instance owns it. `None` is returned in that case too: a captured file
+    /// that another instance has already recovered means the key is being
+    /// created, not that it is damaged, so the caller reads it again rather than
+    /// stopping. Only content that is there and will not parse is an error.
     async fn read_existing(path: &Path) -> Result<Option<Self>> {
         // Captured before the wait starts, so a file that is removed only once the
         // wait runs out is one that held no content for the whole of it, never one
@@ -132,15 +138,21 @@ impl TransitTokenKey {
             match read {
                 Ok(key) => return Ok(Some(key)),
                 Err(error) if Instant::now() >= give_up_at => {
-                    if let Some(empty) = &empty_when_first_read
-                        && crate::encryption::secret_file::remove_unchanged_empty_secret_files(empty).await
-                    {
-                        warn!(
-                            "Transit token signing key {} held no content for {} seconds, as a first start \
-                             interrupted while filling it leaves it: creating a new key in its place",
-                            path.display(),
-                            UNREADABLE_KEY_FILE_WAIT.as_secs()
-                        );
+                    if let Some(empty) = &empty_when_first_read {
+                        if crate::encryption::secret_file::remove_unchanged_empty_secret_files(empty).await {
+                            warn!(
+                                "Transit token signing key {} held no content for {} seconds, as a first start \
+                                 interrupted while filling it leaves it: creating a new key in its place",
+                                path.display(),
+                                UNREADABLE_KEY_FILE_WAIT.as_secs()
+                            );
+                        } else {
+                            warn!(
+                                "Transit token signing key {} is no longer the empty file this instance waited on: \
+                                 another instance is creating the key, reading it again",
+                                path.display()
+                            );
+                        }
                         return Ok(None);
                     }
                     return Err(error)
@@ -976,6 +988,26 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.kid, created.kid);
         assert_eq!(reloaded.secret.as_ref(), created.secret.as_ref());
+    }
+
+    /// Two instances recovering the same empty leftover must end on one key. The
+    /// one that loses the re-creation reads the winner's key instead of stopping,
+    /// which it can only do because the read-then-create retry has a window of
+    /// its own: waiting the leftover out spends a whole window first.
+    #[tokio::test(start_paused = true)]
+    async fn instances_recovering_the_same_empty_key_file_share_one_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(KEY_FILE_NAME);
+        std::fs::write(&path, "").unwrap();
+
+        let (first, second) =
+            tokio::join!(TransitTokenKey::load_or_create(dir.path()), TransitTokenKey::load_or_create(dir.path()));
+        let (first, second) = (first.unwrap(), second.unwrap());
+
+        assert_eq!(first.kid, second.kid, "both instances must end on one key");
+        assert_eq!(first.secret.as_ref(), second.secret.as_ref());
+        let stored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored["kid"].as_str(), Some(first.kid.as_str()), "the shared key is the one on disk");
     }
 
     /// The clock is paused so the retries of each damaged file pass instantly

@@ -1048,20 +1048,17 @@ instance still wins the creation, and an instance reading the file while another
 waits up to 5 seconds for it to be complete. Filling it takes milliseconds, so the wait
 covers a storage backend that stalls; an instance that still cannot read a file with content
 in it by then stops with an error and reads the complete file when it is restarted, so such
-a stall costs one restart and never a second key. A directory the file cannot be made in at
-all still stops the start. A key file that cannot be read stops the gateway from starting
-and is never replaced, with one exception: a key file that holds no content at all, which a
-first start killed between creating the file and filling it leaves behind, is removed and a
-new key created in its place, so an interrupted first start does not stop every later one.
-Only an instance that read the file empty and found it unchanged 5 seconds later removes it,
-and an instance creating the key removes nothing, so a file another instance is filling at
-that moment is left alone. A file with any content in it, even damaged, is kept and named in
-the error instead. Should an instance lose its file in the moment between that check and the
-removal, it reads its own file back once it has filled it, finds the other key there, and
-uses that key rather than the one it generated, so the two still share one key; and an
-instance that finds the key gone between reading and creating it tries both again for the
-same 5 seconds rather than stopping. Every token names the key in its `kid`
-header, and a token that names another key, or none, is refused.
+a stall costs one restart. A directory the file cannot be made in at all still stops the
+start. A key file that cannot be read stops the gateway from starting and is never replaced,
+with one exception: a key file that holds no content at all, which a first start killed
+between creating the file and filling it leaves behind, is removed and a new key created in
+its place, so an interrupted first start does not stop every later one. Only an instance
+that read the file empty and found it unchanged 5 seconds later removes it, and an instance
+creating the key removes nothing, so a file another instance is filling is left alone. A
+file with any content in it, even damaged, is kept and named in the error instead. Instances
+that recover the same empty file together still end on one key, and one that finds the key
+gone while it is creating it reads it again rather than stopping. Every token names the key
+in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
 accepts the tokens the Active instance issued; instances that do not share it refuse each
 other's tokens, so every instance that serves a managed agent's Transit Point calls must share
