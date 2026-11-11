@@ -2226,7 +2226,14 @@ server to server only, under a management session or access token, and never ret
 The gateway keeps a pending connect in the vault, encrypted at rest and under the vault's lock,
 holding a fresh verifier (32 random bytes) for ten minutes, and answers `201` with only its
 challenge: `{connect_id, code_challenge, code_challenge_method: "S256", expires_at}`. The other
-system builds the authorization request with that challenge and its own `state`.
+system builds the authorization request with that challenge and its own `state`. It names the
+provider's `resource` there (RFC 8707) unless the provider's `send_resource` is `false`, whose
+token endpoint refuses the parameter, as Entra v2.0's authorization endpoint does too. For a
+provider with `token_refresh_enabled` it also asks for a refresh token the way the vendor wants
+it, such as the `offline_access` scope at Entra and other OpenID Connect servers or
+`access_type=offline` at Google; otherwise the vendor issues none and the connect is refused
+`no_refresh_token`. An `offline_access` the vendor reports back is not taken for a wider grant
+under `scope_comparison` `oidc` or `microsoft` ([Granted scopes](#granted-scopes)).
 
 `POST /api/v1/delegation-vault/connects/{connect_id}/complete` with `{code, iss}` completes it.
 The code's shape, the provider (still an external consent provider of the connect's tenant, and
@@ -2246,10 +2253,13 @@ only decides, by the file names, which claim came first. Then:
 3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
    for, as the provider compares them ([Granted scopes](#granted-scopes)).
 4. For a provider with `token_refresh_enabled` (the default), an answer whose access token
-   expires (`expires_in`) must carry a refresh token: a grant that could never be refreshed
-   would ask the person to connect again once its token expired. An answer without
-   `expires_in` needs none, since such a grant is never refreshed, and neither does any answer
-   for a provider with `token_refresh_enabled: false`. An empty refresh token makes the whole
+   expires (`expires_in`) must carry a refresh token: without one the grant could never be
+   refreshed, and the person would be asked to connect again once its token expired. An answer
+   without `expires_in` is kept without one: its grant is never refreshed on a schedule, only
+   when the vendor refuses its token ([External consent on a Transit
+   Point](#external-consent-on-a-transit-point)), which a grant with a refresh token survives
+   and one without answers with `connect_required`. A provider with `token_refresh_enabled:
+   false` keeps an answer without a refresh token too. An empty refresh token makes the whole
    answer unusable (`invalid_token_response`).
 5. The grant is kept only while the surface still serves its binding, and the scopes asked for
    still lie within the binding's (or the provider's default scopes when it names none), checked

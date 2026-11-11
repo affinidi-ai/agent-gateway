@@ -2261,48 +2261,104 @@ mod tests {
 
     /// A provider that refreshes its grants keeps none that will expire with
     /// no refresh token: the connect answers `no_refresh_token`, stores
-    /// nothing, and the access token is revoked; the log names the reason,
-    /// never the token. An empty refresh token is no token answer at all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refreshing_provider_keeps_no_expiring_grant_without_a_refresh_token() {
-        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
-        let fixture = Fixture::new(vec![
-            Answer::json(
-                200,
-                json!({"access_token": "empty-refresh-access", "token_type": "Bearer", "expires_in": 3600,
-                    "refresh_token": "", "scope": "read"}),
-            ),
-            Answer::json(
-                200,
-                json!({"access_token": "no-refresh-access", "token_type": "Bearer", "expires_in": 3600, "scope": "read"}),
-            ),
-            Answer::status(200),
-        ])
-        .await;
-        let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
-        let logs = FormattedLogs::capture();
-        for expected in [
-            json!({"status": "failed", "reason": "invalid_token_response"}),
-            json!({"status": "failed", "reason": "no_refresh_token"}),
-        ] {
-            assert_eq!(connect_owner(&fixture).await, (StatusCode::BAD_GATEWAY, expected.clone()));
-            assert!(
-                fixture
-                    .state
-                    .vault_store
-                    .grant(&key)
-                    .await
+    /// nothing, and the access token is revoked; the log lines of the connect
+    /// and of the revocation, which runs on a task of its own, name the
+    /// reason, never the token. An empty refresh token is no token answer at
+    /// all. Every thread of the runtime writes its log lines to one capture,
+    /// so the revocation task's are read too.
+    #[test]
+    fn a_refreshing_provider_keeps_no_expiring_grant_without_a_refresh_token() {
+        use crate::component_tests::helpers::thread_subscriber::set_thread_default;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Lines {
+            fn write(
+                &mut self,
+                bytes: &[u8],
+            ) -> std::io::Result<usize> {
+                self.0
+                    .lock()
                     .unwrap()
-                    .is_none(),
-                "{expected}"
-            );
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        let text = logs.text();
+
+        let lines = Lines::default();
+        let subscriber = {
+            let lines = lines.clone();
+            move || {
+                let lines = lines.clone();
+                tracing_subscriber::fmt()
+                    .with_writer(move || lines.clone())
+                    .with_ansi(false)
+                    .finish()
+            }
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start({
+                let subscriber = subscriber.clone();
+                move || std::mem::forget(set_thread_default(subscriber()))
+            })
+            .build()
+            .unwrap();
+        let _main_thread = set_thread_default(subscriber());
+        let text = || String::from_utf8_lossy(&lines.0.lock().unwrap()).into_owned();
+        runtime.block_on(async {
+            let fixture = Fixture::new(vec![
+                Answer::json(
+                    200,
+                    json!({"access_token": "empty-refresh-access", "token_type": "Bearer", "expires_in": 3600,
+                        "refresh_token": "", "scope": "read"}),
+                ),
+                Answer::json(
+                    200,
+                    json!({"access_token": "no-refresh-access", "token_type": "Bearer", "expires_in": 3600,
+                        "scope": "read"}),
+                ),
+                Answer::status(200),
+            ])
+            .await;
+            let key = GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor");
+            for expected in [
+                json!({"status": "failed", "reason": "invalid_token_response"}),
+                json!({"status": "failed", "reason": "no_refresh_token"}),
+            ] {
+                assert_eq!(connect_owner(&fixture).await, (StatusCode::BAD_GATEWAY, expected.clone()));
+                assert!(
+                    fixture
+                        .state
+                        .vault_store
+                        .grant(&key)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{expected}"
+                );
+            }
+            fixture
+                .revoked_eventually("no-refresh-access")
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !text().contains("Revoked a delegated grant at its authorization server") {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the revocation is logged: {}", text()));
+        });
+        let text = text();
         assert!(text.contains("no_refresh_token"), "{text}");
         assert!(!text.contains("no-refresh-access"), "{text}");
-        fixture
-            .revoked_eventually("no-refresh-access")
-            .await;
+        assert!(!text.contains("empty-refresh-access"), "{text}");
     }
 
     /// A grant without a refresh token is kept where it never needs one: at a

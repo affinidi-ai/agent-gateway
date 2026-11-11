@@ -1,18 +1,21 @@
 branch: feat/external-consent-refresh-token-required
 changes:
   added: []
-  changed:
-    - timestamp: '2026-11-11T14:00:00Z'
-      title: Refuse an external consent connect that brings no refresh token
-      description: >-
-        For a provider with `token_refresh_enabled`, completing a connect whose token answer has
-        an access token that expires but no refresh token now fails with the reason
-        `no_refresh_token`. Nothing is stored and the access token is revoked at the vendor when
-        the provider has a revocation endpoint. Such a grant could never be refreshed, so the
-        person would have been asked to connect again as soon as it expired. An access token
-        without an expiry, and every answer for a provider with `token_refresh_enabled` set to
-        false, are kept as before.
+  changed: []
   fixed: []
   removed: []
   security: []
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-11T14:00:00Z'
+      title: Refuse an external consent connect that brings no refresh token
+      description: >-
+        If a vendor issues access tokens that expire without a refresh token, set the
+        provider's `token_refresh_enabled` to false, or ask the vendor for offline access in the
+        authorization request (`offline_access` at Entra, `access_type=offline` at Google):
+        otherwise its connects now fail. For a provider with `token_refresh_enabled`,
+        completing a connect whose token answer has an access token that expires but no refresh
+        token fails with the reason `no_refresh_token`, nothing is stored, and the access token
+        is revoked at the vendor when the provider has a revocation endpoint. Such a grant could
+        never be refreshed, so the person would have been asked to connect again as soon as it
+        expired. An access token without an expiry, and every answer for a provider with
+        `token_refresh_enabled` set to false, are kept as before.
