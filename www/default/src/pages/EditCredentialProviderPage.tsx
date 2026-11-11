@@ -11,7 +11,7 @@ import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
-import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
+import { SecretOption as Secret, SecretOptions } from '../components/shared/SecretOptions';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import {
   CredentialProviderType,

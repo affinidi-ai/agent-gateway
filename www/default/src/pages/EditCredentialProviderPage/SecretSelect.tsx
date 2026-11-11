@@ -5,9 +5,6 @@ import { deepLinks } from '../../utils/deepLinks';
 import { splitByTenant, type OwnerTenant } from '../../utils/tenantScope';
 import { SecretOptions, type SecretOption } from '../../components/shared/SecretOptions';
 
-export { SecretOptions };
-export type { SecretOption };
-
 interface SecretSelectProps {
   id: string;
   label: string;
