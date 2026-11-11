@@ -91,6 +91,7 @@ fn configure_header_metadata_inbound_identity_surface(
             protected_resource: None,
             on_failure: crate::config::agent_surface::OnFailure::Continue,
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
                 },
@@ -2352,6 +2353,7 @@ fn inbound_api_key_identity_surface(policy_id: &str) -> crate::config::agent_sur
         .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
         protected_resource: None,
         methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            id: None,
             extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
             secret_id: INBOUND_CALLER_KEY_SECRET.to_string(),
         })],

@@ -4,7 +4,7 @@ import { findSlotById } from '../edges/archetypes';
 import { registry } from '../registry';
 import IdentityPanel from './IdentityPanel';
 import IdentityPayloadFullscreenPanel from './IdentityPayloadFullscreenPanel';
-import { isInboundIdentity } from './placement';
+import { isInboundIdentity, SOURCE_METHOD_TYPES } from './placement';
 import { DOCS_URL } from '../../../../config/docs';
 import { readMethods } from '../caller-auth/methods';
 
@@ -12,6 +12,36 @@ export const INBOUND_API_KEY_NEEDS_API_KEY_CALLER =
   "Identity 'From API Key' needs every Caller Context method to be API Key or API Key Provider";
 
 const INBOUND_API_KEY_CALLER_METHODS = new Set<unknown>(['api_key', 'api_key_provider']);
+
+const REMOVED_SOURCE_METHOD =
+  'The Caller Context method this Identity reads was removed. Select another method.';
+
+const callerAuthMethods = (allNodes: DependencyNode[]) => {
+  const callerAuth = allNodes.find(n => n.type === 'caller-auth');
+  return callerAuth ? readMethods(callerAuth.config) : [];
+};
+
+const selectedMethod = (c: Record<string, any>, allNodes: DependencyNode[]) =>
+  callerAuthMethods(allNodes).find(method => method.id === c.source_method);
+
+const readsSelectedMethod = (c: Record<string, any>, node?: DependencyNode) =>
+  !!c.source_method && SOURCE_METHOD_TYPES.has(c.type) && isInboundIdentity(node);
+
+function identityConfigFromSlice(slice: any) {
+  if (!slice || typeof slice !== 'object') return slice;
+  if (slice.type === 'payload_extraction') {
+    const mapped: Record<string, any> = { ...slice, type: 'from_payload' };
+    if (slice.strip_raw_meta) mapped.strip_raw_meta = true;
+    return mapped;
+  }
+  if (slice.type === 'static') {
+    // The backend `ManagedIdentityConfig::Static` serialises the DID
+    // under `did`; the panel edits it as `static_did`.
+    const { did, ...rest } = slice;
+    return { ...rest, static_did: rest.static_did ?? did };
+  }
+  return slice;
+}
 
 export const identityDefinition: NodeDefinition = {
   type: 'identity',
@@ -113,7 +143,7 @@ export const identityDefinition: NodeDefinition = {
     {
       description:
         'from_jwt_claim derives the DID from a validated JWT, so the surface must authenticate every caller with JWT Bearer',
-      condition: c => c.type === 'from_jwt_claim',
+      condition: (c, _ctx, node) => c.type === 'from_jwt_claim' && !readsSelectedMethod(c, node),
       check: (_c, ctx) =>
         ctx.allNodes.some(n => {
           const methods = n.type === 'caller-auth' ? readMethods(n.config) : [];
@@ -125,8 +155,39 @@ export const identityDefinition: NodeDefinition = {
     },
     {
       description:
+        'An inbound Identity that names a Caller Context method needs that method to exist',
+      condition: (c, _ctx, node) => readsSelectedMethod(c, node),
+      check: (c, ctx) => !!selectedMethod(c, ctx.allNodes),
+      severity: 'error',
+      message: REMOVED_SOURCE_METHOD,
+    },
+    {
+      description: 'From JWT Claims reads a JWT Bearer method',
+      condition: (c, ctx, node) =>
+        c.type === 'from_jwt_claim' &&
+        readsSelectedMethod(c, node) &&
+        !!selectedMethod(c, ctx.allNodes),
+      check: (c, ctx) => selectedMethod(c, ctx.allNodes)?.method_type === 'jwt_bearer',
+      severity: 'error',
+      message: 'From JWT Claims reads a JWT Bearer method. Select a JWT Bearer method.',
+    },
+    {
+      description: 'Inbound From API Key reads an API Key or API Key Provider method',
+      condition: (c, ctx, node) =>
+        c.type === 'from_api_key' &&
+        readsSelectedMethod(c, node) &&
+        !!selectedMethod(c, ctx.allNodes),
+      check: (c, ctx) =>
+        INBOUND_API_KEY_CALLER_METHODS.has(selectedMethod(c, ctx.allNodes)?.method_type),
+      severity: 'error',
+      message:
+        'From API Key reads an API Key or API Key Provider method. Select an API Key or API Key Provider method.',
+    },
+    {
+      description:
         'Inbound from_api_key identifies each caller by the key it presents, so every Caller Context method must be API Key or API Key Provider',
-      condition: (c, _ctx, node) => c.type === 'from_api_key' && isInboundIdentity(node),
+      condition: (c, _ctx, node) =>
+        c.type === 'from_api_key' && isInboundIdentity(node) && !readsSelectedMethod(c, node),
       check: (_c, ctx) => {
         const callerAuth = ctx.allNodes.find(n => n.type === 'caller-auth');
         const methods = callerAuth ? readMethods(callerAuth.config) : [];
@@ -154,20 +215,18 @@ export const identityDefinition: NodeDefinition = {
   // slice round-trips as a `type` the dropdown can't render, so the
   // panel reports "Pick an identity extraction type" even though the
   // identity is fully configured.
-  configFromPayload: (slice: any) => {
-    if (!slice || typeof slice !== 'object') return slice;
-    if (slice.type === 'payload_extraction') {
-      const mapped: Record<string, any> = { ...slice, type: 'from_payload' };
-      if (slice.strip_raw_meta) mapped.strip_raw_meta = true;
-      return mapped;
+  configFromPayload: (slice: any, payload?: any) => {
+    const config = identityConfigFromSlice(slice);
+    const selected = payload?.identity_slots?.inbound_source_method;
+    if (
+      config &&
+      typeof selected === 'string' &&
+      selected &&
+      payload.identity_slots.inbound === slice
+    ) {
+      return { ...config, source_method: selected };
     }
-    if (slice.type === 'static') {
-      // The backend `ManagedIdentityConfig::Static` serialises the DID
-      // under `did`; the panel edits it as `static_did`.
-      const { did, ...rest } = slice;
-      return { ...rest, static_did: rest.static_did ?? did };
-    }
-    return slice;
+    return config;
   },
   buildPayload: ctx => {
     const nodes = ctx.nodesOfType('identity');
@@ -207,6 +266,14 @@ export const identityDefinition: NodeDefinition = {
       if (!value) continue;
       if (path === 'identity_slots.inbound') delete value.api_key_id;
       slices.push({ path, value });
+      if (
+        path === 'identity_slots.inbound' &&
+        SOURCE_METHOD_TYPES.has(ic.type) &&
+        typeof ic.source_method === 'string' &&
+        ic.source_method
+      ) {
+        slices.push({ path: 'identity_slots.inbound_source_method', value: ic.source_method });
+      }
     }
     return slices.length > 0 ? slices : undefined;
   },

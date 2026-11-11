@@ -481,6 +481,7 @@ async fn direct_tls_pinned_accepts_matching_client_cert() {
     drop(middleware_base);
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Pinned {
             certificate_ids: vec![client_cert_id],
         },
@@ -531,6 +532,7 @@ async fn direct_tls_ca_chain_subject_cn_binding() {
     ));
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Ca {
             ca_certificate_ids: vec![ca_id],
             require_client_auth_eku: true,
@@ -588,6 +590,7 @@ async fn direct_tls_rejects_when_client_omits_cert() {
     ));
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Ca {
             ca_certificate_ids: vec![ca_id],
             require_client_auth_eku: true,
@@ -648,6 +651,7 @@ async fn direct_tls_rejects_untrusted_ca_at_handshake() {
     ));
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Ca {
             ca_certificate_ids: vec![ca_id],
             require_client_auth_eku: true,
@@ -704,6 +708,7 @@ async fn xfcc_happy_path_from_trusted_proxy() {
     ));
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Pinned {
             certificate_ids: vec![client_id],
         },
@@ -768,6 +773,7 @@ async fn xfcc_rejected_when_proxy_not_trusted() {
     ));
 
     let mtls = MtlsAuthConfig {
+        id: None,
         trust: MtlsTrust::Pinned {
             certificate_ids: vec![client_id],
         },
