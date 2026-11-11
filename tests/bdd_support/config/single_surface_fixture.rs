@@ -158,11 +158,13 @@ impl SurfaceConfigBuilder {
         let own = self
             .credential_delegation
             .as_ref()
-            .is_some_and(|delegation| delegation.provider_id == provider_id);
-        if own && self.oauth_callback_path_ends_in_record_id {
-            format!("0b6e4c2a-{provider_id}-record")
-        } else {
-            provider_id.to_string()
+            .filter(|delegation| delegation.provider_id == provider_id);
+        match own {
+            Some(_) if self.oauth_callback_path_ends_in_record_id => format!("0b6e4c2a-{provider_id}-record"),
+            Some(delegation) => delegation
+                .record_id()
+                .to_string(),
+            None => provider_id.to_string(),
         }
     }
 }
@@ -654,11 +656,25 @@ pub struct SurfaceCustomMetadataConfig {
 
 #[derive(Debug, Clone)]
 pub struct SurfaceCredentialDelegationConfig {
+    /// The provider's `provider_id` slug, also its name.
     pub provider_id: String,
+    /// The provider's record id, when it is not its slug.
+    pub record_id: Option<String>,
+    /// The tenant that owns the provider; appliance-wide when `None`.
+    pub tenant_id: Option<String>,
     pub provider_kind: CredentialProviderKind,
     pub required_tool: Option<String>,
     pub inject_as: DelegatedCredentialInjection,
     pub scopes: Vec<String>,
+}
+
+impl SurfaceCredentialDelegationConfig {
+    /// The record id the surface binds the provider by.
+    pub fn record_id(&self) -> &str {
+        self.record_id
+            .as_deref()
+            .unwrap_or(&self.provider_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

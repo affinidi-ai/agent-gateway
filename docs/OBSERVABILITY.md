@@ -405,7 +405,12 @@ Governance audit records go to **sinks**: the VP Audit Log (`delegation-audit.js
 events (see [`INTEGRATIONS.md`](INTEGRATIONS.md)). Every sink selects the audit events it wants,
 and the selections are independent: an integration can receive an event the VP Audit Log does
 not keep, and the reverse. Nothing is selected on a fresh install, and a record nobody selects
-is never built.
+is never built. `/v1/audit` shows a tenant's access token only the records of its own tenant's
+credential providers, so no policy decision or other record without a provider; see
+[`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records). While the credential provider
+store cannot be read, `/v1/audit` answers a tenant's access token an empty page (`200`) marked
+`truncated`, and `/api/v1/delegation-audit` answers it `500`; sessions and appliance-wide access
+tokens never read that store and read the log as usual.
 
 **Selection.** The VP Audit Log keeps the events in the settings field `audit_events` while
 `audit_enabled` is on (Settings › VP Audit); turning it off pauses the log without losing the
@@ -445,10 +450,11 @@ it the disk, because an audit log that fills the disk stops being written — an
 Because nothing is deleted by default, an audit response carries the size of the history on disk
 (`history_bytes`, the live log plus every rotated file) and the advisory
 `[audit] vp_audit_log_soft_cap_bytes` (`soft_cap_bytes`, 1 GiB by default, `0` for none). The
-Audit page shows the one against the other. The soft cap enforces nothing: no record is deleted,
-no write is refused and no rotation happens at it, and the history keeps growing past it. It is
-there so an operator sees the growth and decides what to do — forward to a Governance Audit
-integration, or bound the history below.
+Audit page shows the one against the other. Both describe every tenant's records, so only a session
+or an appliance-wide access token is told them; every other caller reads `0` for both. The soft cap
+enforces nothing: no record is deleted, no write is refused and no rotation happens at it, and the
+history keeps growing past it. It is there so an operator sees the growth and decides what to do —
+forward to a Governance Audit integration, or bound the history below.
 
 The size is measured once, by listing the directory, when the gateway opens the log; from then on
 the writer keeps it as it appends and as retention deletes, so reporting it costs a page load
@@ -574,7 +580,9 @@ than that buffer and the two 64 KiB chunks it is measured across, however it was
 edited, and a rotated name that is not a regular file is passed over rather than opened — only
 the rotated names, the live log's own being the case above. A line
 the walk skipped, and a line that does not parse as a record, are counted in `dropped_records`:
-a page never counts a record it could not read as absent.
+a page never counts a record it could not read as absent. A line that does not parse names no
+credential provider, so only a page an appliance-wide caller reads counts it; a tenant's token is
+not told of it (see [`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)).
 
 A read that fails is answered with `500` by both audit endpoints, with the JSON body
 `{"error": "Failed to read the audit log"}`; what failed stays in the gateway's own log. Neither

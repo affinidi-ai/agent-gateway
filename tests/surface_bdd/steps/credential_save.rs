@@ -25,7 +25,7 @@ pub(crate) async fn send(
 
 pub(crate) const SECRET_VALUE: &str = "bdd-secret-value";
 
-async fn create_secret(
+pub(crate) async fn create_secret(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,

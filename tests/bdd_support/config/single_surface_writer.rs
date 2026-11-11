@@ -1013,6 +1013,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
     let client_credentials = provider.grant == TargetAuthProviderGrant::ClientCredentials;
     CredentialProviderFixture {
         id: TARGET_AUTH_PROVIDER_ID.to_string(),
+        tenant_id: None,
         name: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_id: TARGET_AUTH_PROVIDER_ID.to_string(),
         provider_type: if client_credentials {
@@ -1082,7 +1083,8 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             providers
         }
         CredentialProviderKind::ApiKey { secret_id, .. } => vec![CredentialProviderFixture {
-            id: provider_id.clone(),
+            id: surface_config.provider_record_id(&provider_id),
+            tenant_id: delegation.tenant_id.clone(),
             name: provider_id.clone(),
             provider_id: provider_id.clone(),
             provider_type: "api_key".to_string(),
@@ -1115,8 +1117,14 @@ fn oauth_provider_fixture(
         .as_ref()
         .expect("OAuth provider base URL must be configured before writing credential provider fixture");
     let record_id = surface_config.provider_record_id(provider_id);
+    let tenant_id = surface_config
+        .credential_delegation
+        .as_ref()
+        .filter(|delegation| delegation.provider_id == provider_id)
+        .and_then(|delegation| delegation.tenant_id.clone());
     CredentialProviderFixture {
         id: record_id.clone(),
+        tenant_id,
         name: provider_id.to_string(),
         provider_id: provider_id.to_string(),
         provider_type: "oauth2_authorization_code".to_string(),

@@ -17,6 +17,7 @@ pub mod surface_routes;
 pub mod target_auth_audit;
 pub mod target_auth_save;
 pub mod target_credential;
+pub mod tenant_records;
 pub mod terms;
 pub mod then;
 pub mod when;

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+use super::read_scope::VaultReadScope;
 use crate::audit::log_files;
 use crate::audit::pipeline::PipelineControl;
 use crate::metrics::backends::prometheus::set_audit_pipeline_started;
@@ -30,6 +31,43 @@ use crate::server::mode::ServerMode;
 
 /// Global audit file path — for reading the log
 static AUDIT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUDIT_PATH_OVERRIDE: Option<PathBuf>;
+}
+
+/// Runs `future` reading the VP Audit Log from `path` instead of the one set
+/// up at startup.
+#[cfg(test)]
+pub async fn reading_audit_log_from<F: std::future::Future>(
+    path: PathBuf,
+    future: F,
+) -> F::Output {
+    AUDIT_PATH_OVERRIDE
+        .scope(Some(path), future)
+        .await
+}
+
+/// Runs `future` as if no VP Audit Log were set up, so reading it fails.
+#[cfg(test)]
+pub async fn without_an_audit_log<F: std::future::Future>(future: F) -> F::Output {
+    AUDIT_PATH_OVERRIDE
+        .scope(None, future)
+        .await
+}
+
+#[cfg(not(test))]
+fn audit_log_path() -> Option<PathBuf> {
+    AUDIT_PATH.get().cloned()
+}
+
+#[cfg(test)]
+fn audit_log_path() -> Option<PathBuf> {
+    AUDIT_PATH_OVERRIDE
+        .try_with(Option::clone)
+        .unwrap_or_else(|_| AUDIT_PATH.get().cloned())
+}
 
 /// Bytes of the history one read examines, from the rotation `[audit]`
 /// configured at startup. Set beside [`AUDIT_PATH`], which the same reads use,
@@ -149,7 +187,11 @@ pub struct DelegationAuditEvent {
     /// SHA-256 hash of the user's identity
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_identity_hash: Option<String>,
-    /// Credential provider ID (machine-readable)
+    /// The id of the credential provider involved. A tenant's access token
+    /// reads the record only when that provider is its tenant's. A
+    /// `consent_granted` the OAuth callback wrote in earlier releases holds
+    /// the provider's `provider_id` slug instead, so only appliance-wide
+    /// callers read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     /// Human-readable provider name
@@ -1659,10 +1701,11 @@ pub struct AuditLogPage {
     /// did reach the end of the history.
     pub dropped_records: usize,
     /// Bytes the audit history takes on disk: the live log and every rotated
-    /// file beside it.
+    /// file beside it. `0` unless an appliance-wide caller reads the page.
     pub history_bytes: u64,
     /// The size an operator asked to be told about
-    /// (`[audit] vp_audit_log_soft_cap_bytes`), or `0` when none is set.
+    /// (`[audit] vp_audit_log_soft_cap_bytes`), or `0` when none is set or
+    /// the caller is not appliance-wide.
     /// Advisory: nothing happens when the history passes it.
     pub soft_cap_bytes: u64,
 }
@@ -1764,6 +1807,9 @@ impl From<AuditLogFilter<'_>> for OwnedAuditLogFilter {
 /// The filters one read applies to each record as it walks the history,
 /// prepared once for the whole walk.
 struct PreparedFilter<'a> {
+    /// The records the caller may read: a tenant's token keeps only those of
+    /// its own tenant's credential providers.
+    reader: &'a VaultReadScope,
     text: Option<String>,
     categories: std::collections::HashSet<&'a str>,
     flow: Option<&'a str>,
@@ -1793,13 +1839,17 @@ enum Tallied {
 }
 
 impl<'a> PreparedFilter<'a> {
-    fn new(filter: &'a OwnedAuditLogFilter) -> Self {
+    fn new(
+        filter: &'a OwnedAuditLogFilter,
+        reader: &'a VaultReadScope,
+    ) -> Self {
         let refinement = |value: &'a Option<String>| {
             value
                 .as_deref()
                 .filter(|value| !value.is_empty())
         };
         Self {
+            reader,
             text: filter
                 .text
                 .as_ref()
@@ -1822,9 +1872,10 @@ impl<'a> PreparedFilter<'a> {
         }
     }
 
-    /// The record this stored line holds, unless one of the filters applied
-    /// before the category tally drops it. The text filter matches the line as
-    /// it is stored, so a record no view keeps costs no parse.
+    /// The record this stored line holds, unless the caller may not read it or
+    /// one of the filters applied before the category tally drops it. The text
+    /// filter matches the line as it is stored, so a record no view keeps costs
+    /// no parse.
     fn tallied(
         &self,
         line: &str,
@@ -1849,10 +1900,24 @@ impl<'a> PreparedFilter<'a> {
         }
         // A line left half-written by a crash is not a record and is not
         // counted as one; the page says so rather than passing silently over
-        // evidence it could not read.
+        // evidence it could not read. It names no provider a tenant's scope
+        // can be checked against, so only an appliance-wide caller is told.
         let Ok(event) = serde_json::from_str::<DelegationAuditEvent>(line) else {
-            return Tallied::Unreadable;
+            return if *self.reader == VaultReadScope::Appliance {
+                Tallied::Unreadable
+            } else {
+                Tallied::Filtered
+            };
         };
+        // A record the caller may not read is dropped before anything below
+        // counts it, so `total`, `total_pages` and `category_counts` describe
+        // only the caller's records, and the text filter cannot probe others.
+        if !self
+            .reader
+            .reads(event.provider_id.as_deref())
+        {
+            return Tallied::Filtered;
+        }
         if self.exclude_vp_audit && event.event.is_vp_audit() {
             return Tallied::Filtered;
         }
@@ -1947,9 +2012,11 @@ fn history_bytes_of(path: &Path) -> u64 {
     }
 }
 
-/// Read the audit log with pagination (newest first). Every [`AuditLogFilter`]
-/// is applied **before** pagination and the category tally so `total`,
-/// `total_pages`, and `category_counts` stay consistent with the returned page.
+/// Read the audit log with pagination (newest first). Only the records `reader`
+/// may read are kept, and every [`AuditLogFilter`] is applied to them **before**
+/// pagination and the category tally, so `total`, `total_pages`, and
+/// `category_counts` stay consistent with the returned page and count no other
+/// record.
 ///
 /// A read walks back from the live log through the rotated files, holding only
 /// the page it returns, so it costs the same memory whatever the history has
@@ -1961,16 +2028,15 @@ pub async fn read_audit_log(
     page: usize,
     page_size: usize,
     opts: AuditLogFilter<'_>,
+    reader: VaultReadScope,
 ) -> anyhow::Result<AuditLogPage> {
-    let path = AUDIT_PATH
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?
-        .clone();
+    let path = audit_log_path().ok_or_else(|| anyhow::anyhow!("Audit logger not initialized"))?;
     let filter = OwnedAuditLogFilter::from(opts);
 
     under_read_permit(&AUDIT_READS, move || {
         let history_bytes = history_bytes_of(&path);
-        read_audit_window(&path, page, page_size, &filter, scan_bytes(), soft_cap_bytes(), history_bytes)
+        let prepared = PreparedFilter::new(&filter, &reader);
+        read_audit_window(&path, page, page_size, &prepared, scan_bytes(), soft_cap_bytes(), history_bytes)
     })
     .await?
 }
@@ -1993,14 +2059,13 @@ fn read_audit_window(
     path: &Path,
     page: usize,
     page_size: usize,
-    filter: &OwnedAuditLogFilter,
+    prepared: &PreparedFilter<'_>,
     scan_bytes: u64,
     soft_cap_bytes: u64,
     history_bytes: u64,
 ) -> anyhow::Result<AuditLogPage> {
     let page = page.max(1);
     let page_size = page_size.max(1);
-    let prepared = PreparedFilter::new(filter);
     let start = page
         .saturating_sub(1)
         .saturating_mul(page_size);
@@ -2077,6 +2142,15 @@ fn read_audit_window(
 
     enrich_page_from_signed_vps(path, &mut events, scan_bytes)?;
 
+    // The size of the history describes every tenant's records, so only an
+    // appliance-wide caller is told it, and the cap it is shown against.
+    let told = |bytes: u64| {
+        if *prepared.reader == VaultReadScope::Appliance {
+            bytes
+        } else {
+            0
+        }
+    };
     Ok(AuditLogPage {
         events,
         total,
@@ -2086,8 +2160,8 @@ fn read_audit_window(
         category_counts,
         truncated,
         dropped_records,
-        history_bytes,
-        soft_cap_bytes,
+        history_bytes: told(history_bytes),
+        soft_cap_bytes: told(soft_cap_bytes),
     })
 }
 
@@ -2591,7 +2665,7 @@ mod tests {
             path,
             page,
             page_size,
-            filter,
+            &PreparedFilter::new(filter, &VaultReadScope::Appliance),
             scan_bytes,
             log_files::HISTORY_SOFT_CAP_BYTES,
             log_files::history_bytes(path),
@@ -2766,6 +2840,122 @@ mod tests {
         assert!(!page.truncated);
     }
 
+    /// A read as the caller `scope` describes, over the whole history.
+    fn scoped_read(
+        path: &Path,
+        filter: &OwnedAuditLogFilter,
+        scope: &VaultReadScope,
+    ) -> AuditLogPage {
+        super::read_audit_window(
+            path,
+            1,
+            10,
+            &PreparedFilter::new(filter, scope),
+            whole_history(),
+            log_files::HISTORY_SOFT_CAP_BYTES,
+            log_files::history_bytes(path),
+        )
+        .unwrap()
+    }
+
+    /// The scope of a token of the tenant that owns the provider `cp-a`.
+    fn tenant_a() -> VaultReadScope {
+        VaultReadScope::Tenant(std::collections::HashSet::from(["cp-a".to_string()]))
+    }
+
+    fn text_filter(text: &str) -> OwnedAuditLogFilter {
+        OwnedAuditLogFilter {
+            text: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A tenant reads its own providers' records from the rotated files as
+    /// from the live log, and neither the counts nor the text filter see any
+    /// other record.
+    #[test]
+    fn a_tenant_reads_only_its_own_records_in_the_live_log_and_the_rotated_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), audit_line("cp-b")));
+        std::fs::write(
+            PathBuf::from(format!("{}.1", path.display())),
+            format!("{}{}", audit_line("cp-b"), audit_line("cp-a")),
+        )
+        .unwrap();
+
+        let page = scoped_read(&path, &OwnedAuditLogFilter::default(), &tenant_a());
+        let providers: Vec<Option<&str>> = page
+            .events
+            .iter()
+            .map(|event| event.provider_id.as_deref())
+            .collect();
+        assert_eq!(providers, [Some("cp-a"), Some("cp-a")], "one from the live log, one from the rotated file");
+        assert_eq!((page.total, page.total_pages), (2, 1));
+        assert_eq!(page.category_counts, std::collections::BTreeMap::from([("token_injected".to_string(), 2)]));
+
+        let probe = scoped_read(&path, &text_filter("cp-b"), &tenant_a());
+        assert_eq!((probe.total, probe.events.len()), (0, 0));
+        assert!(
+            probe
+                .category_counts
+                .is_empty()
+        );
+    }
+
+    /// A line the read cannot parse names no provider the caller can be
+    /// checked against, so only an appliance-wide caller is told of it; a
+    /// tenant's text filter cannot learn what another tenant's half-written
+    /// record holds.
+    #[test]
+    fn a_half_written_line_is_counted_only_for_an_appliance_wide_caller() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let crashed = audit_line("cp-b");
+        let cut = crashed
+            .find("cp-b")
+            .expect("the record names its provider")
+            + "cp-b\"".len();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), &crashed[..cut]));
+        let probe = text_filter("cp-b");
+
+        assert_eq!(scoped_read(&path, &probe, &tenant_a()).dropped_records, 0, "a tenant's filter learns nothing");
+        assert_eq!(
+            scoped_read(&path, &probe, &VaultReadScope::Appliance).dropped_records,
+            1,
+            "an appliance-wide caller is still told its counts are lower bounds"
+        );
+    }
+
+    /// The size of the history on disk describes every tenant's records, so
+    /// only an appliance-wide caller is told it, and the cap it is shown
+    /// against.
+    #[test]
+    fn only_an_appliance_wide_caller_is_told_the_size_of_the_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = written(&dir, &format!("{}{}", audit_line("cp-a"), audit_line("cp-b")));
+        let measured = log_files::history_bytes(&path);
+        let read = |scope: &VaultReadScope| {
+            super::read_audit_window(
+                &path,
+                1,
+                10,
+                &PreparedFilter::new(&OwnedAuditLogFilter::default(), scope),
+                whole_history(),
+                4096,
+                measured,
+            )
+            .unwrap()
+        };
+
+        let tenant = read(&tenant_a());
+        assert_eq!(
+            (tenant.total, tenant.history_bytes, tenant.soft_cap_bytes),
+            (1, 0, 0),
+            "a tenant reads its own record, not the size of every tenant's"
+        );
+        let appliance = read(&VaultReadScope::Appliance);
+        assert_eq!((appliance.total, appliance.history_bytes, appliance.soft_cap_bytes), (2, measured, 4096));
+    }
+
     #[test]
     fn a_page_reports_the_size_of_the_history_against_the_advisory_cap() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2775,9 +2965,16 @@ mod tests {
         std::fs::write(PathBuf::from(format!("{}.1", path.display())), &rotated).unwrap();
 
         let measured = log_files::history_bytes(&path);
-        let page =
-            super::read_audit_window(&path, 1, 10, &OwnedAuditLogFilter::default(), whole_history(), 4096, measured)
-                .unwrap();
+        let page = super::read_audit_window(
+            &path,
+            1,
+            10,
+            &PreparedFilter::new(&OwnedAuditLogFilter::default(), &VaultReadScope::Appliance),
+            whole_history(),
+            4096,
+            measured,
+        )
+        .unwrap();
 
         assert_eq!(measured, (live.len() + rotated.len()) as u64, "the size is the live log plus every rotated file");
         assert_eq!(page.history_bytes, measured, "and the page reports what it was given");
