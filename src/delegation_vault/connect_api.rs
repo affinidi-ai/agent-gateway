@@ -2296,6 +2296,7 @@ mod tests {
             move || {
                 let lines = lines.clone();
                 tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
                     .with_writer(move || lines.clone())
                     .with_ansi(false)
                     .finish()
