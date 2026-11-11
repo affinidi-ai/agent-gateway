@@ -3736,6 +3736,11 @@ pub async fn run_axum_proxy(
                 identity_strategies: source_auth_middleware.provider_store(),
                 verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(source_auth_middleware.jwks_client())),
                 provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                gateway_mcp_issuer: network_config
+                    .sts
+                    .mcp_issuer
+                    .as_ref()
+                    .map(|profile| profile.issuer.clone()),
             };
             if vault_rbac_guard.is_none() {
                 warn!(target: "credential_delegation", "Credential delegation audit route not registered because RBAC guard is unavailable");

@@ -71,15 +71,20 @@ pub fn create_delegation_vault_router(
     router.with_state(state)
 }
 
-/// Create the OAuth consent router: the consent start page and its POST, and
-/// the callback. These delegation-vault routes must remain public, because the
-/// person's browser opens the start page and the OAuth provider redirects it
-/// to the callback.
+/// Create the OAuth consent router: the consent start page and its POST, the
+/// consent confirmation callback and the vendor callback. These
+/// delegation-vault routes must remain public, because the person's browser
+/// opens the start page and the identity provider and the OAuth provider
+/// redirect it to the callbacks.
 pub fn create_delegation_vault_oauth_router(state: DelegationVaultState) -> Router {
     let callback_route = format!("{}/{{callback_segment}}", state.oauth_callback_route);
     Router::new()
         .route(&callback_route, get(handlers::oauth_callback))
         .route(&format!("{callback_route}/start"), get(handlers::consent_start_page).post(handlers::consent_start))
+        .route(
+            &format!("{callback_route}{}", crate::credential_providers::CONSENT_CONFIRMATION_PATH),
+            get(handlers::consent_confirmation_callback),
+        )
         .with_state(state)
 }
 
@@ -362,6 +367,7 @@ mod tests {
                 crate::jwt_bearer::JwksClient::new(),
             ))),
             provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+            gateway_mcp_issuer: None,
         }
     }
 
@@ -1975,6 +1981,453 @@ mod tests {
         assert!(events.is_empty(), "an expired state is not audited: {events:?}");
     }
 
+    /// A caller whose ID token names the person the link was minted for goes
+    /// on to the vendor with a vendor state on the confirmation's own browser
+    /// binding, a fresh nonce and PKCE verifier, and no new cookie; the code
+    /// was exchanged at the login client's token endpoint with the sign-in's
+    /// redirect URI and verifier, and the vendor callback then stores the
+    /// grant.
+    #[tokio::test]
+    async fn a_confirmed_caller_goes_on_to_the_vendor_on_the_same_browser_binding() {
+        use crate::delegation_vault::ConsentStage;
+        use crate::delegation_vault::oauth::{
+            browser_binding_matches, decode_callback_state, decode_confirmation_state,
+        };
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let sign_in = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        let (confirmed, events) = capture(fixture.confirm_code(&sign_in)).await;
+        assert_eq!(confirmed.status, StatusCode::FOUND, "{}", confirmed.body);
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(confirmed.header("set-cookie"), None, "the browser keeps its cookie");
+        assert_eq!(confirmed.header("cache-control"), Some("no-store"));
+        assert_eq!(confirmed.header("referrer-policy"), Some("no-referrer"));
+
+        let confirmation = decode_confirmation_state(&sign_in.state).unwrap();
+        let vendor = url::Url::parse(
+            confirmed
+                .header("location")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&vendor[..url::Position::AfterPath], "https://vendor.example/authorize");
+        assert_eq!(consent::query_value(&vendor, "client_id"), "github-client");
+        assert_eq!(consent::query_value(&vendor, "redirect_uri"), consent::REDIRECT_URI);
+        assert_eq!(consent::query_value(&vendor, "scope"), "repo read:user");
+        assert_eq!(consent::query_value(&vendor, "prompt"), "consent");
+        let callback = decode_callback_state(&consent::query_value(&vendor, "state")).unwrap();
+        assert_eq!(callback.stage, Some(ConsentStage::Vendor(consent::confirm_binding(&strategy))));
+        assert_eq!(callback.browser_binding, confirmation.browser_binding);
+        let cookie_value = sign_in
+            .cookie
+            .split_once('=')
+            .unwrap()
+            .1;
+        assert!(browser_binding_matches(&callback, Some(cookie_value)));
+        assert_ne!(callback.nonce, confirmation.nonce);
+        assert_ne!(
+            callback.code_verifier, confirmation.code_verifier,
+            "the identity provider's verifier is not reused"
+        );
+        assert_eq!(callback.expires_at, confirmation.expires_at, "the cookie's Max-Age still covers the vendor leg");
+        assert_eq!(callback.user_identity_hash, alice);
+
+        let forms = fixture.idp_forms();
+        assert_eq!(forms.len(), 1);
+        let expected: std::collections::HashMap<String, String> = [
+            ("grant_type", "authorization_code"),
+            ("code", "idp-code"),
+            ("redirect_uri", "https://198.51.100.7/v1/identity/oauth/callback/github/confirm"),
+            ("client_id", "login-client"),
+            ("client_secret", "secret"),
+            (
+                "code_verifier",
+                confirmation
+                    .code_verifier
+                    .as_deref()
+                    .unwrap(),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        assert_eq!(forms[0], expected);
+        assert_eq!(fixture.token_calls(), 0, "the vendor's token endpoint is not called before the vendor answers");
+
+        let stored = fixture
+            .callback(
+                "github",
+                &format!("code=vendor-code&state={}", consent::query_value(&vendor, "state")),
+                Some(&sign_in.cookie),
+            )
+            .await;
+        assert_eq!(stored.status, StatusCode::OK, "{}", stored.body);
+        assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// A person other than the one the link was minted for, signing in at
+    /// the identity provider, is refused with 403 before the vendor: the
+    /// cookie is cleared, nothing is stored and the audit names only the
+    /// reason.
+    #[tokio::test]
+    async fn another_person_signing_in_is_refused_with_consent_identity_mismatch() {
+        let logs = crate::component_tests::helpers::formatted_logs::FormattedLogs::capture();
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.idp_answers(
+            serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({"sub": "mallory"}))}),
+        );
+        let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&refused, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentIdentityMismatch]);
+        let audited = format!("{events:?}");
+        assert!(!audited.contains("mallory"), "{audited}");
+        let logged = logs.text();
+        assert!(!logged.contains("mallory"), "{logged}");
+        assert_eq!(fixture.vault_records(), 0);
+        assert_eq!(fixture.token_calls(), 0);
+    }
+
+    /// A sign-in whose token answer has no ID token, or one that fails
+    /// verification, confirms nobody: 403 `consent_identity_missing`.
+    #[tokio::test]
+    async fn a_sign_in_without_a_valid_id_token_is_refused_with_consent_identity_missing() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        type Answer = fn(&consent::Fixture, &str) -> serde_json::Value;
+        let answers: [(&str, Answer); 6] = [
+            ("no id_token", |_, _| serde_json::json!({"access_token": "a", "token_type": "Bearer"})),
+            ("an empty id_token", |_, _| serde_json::json!({"id_token": ""})),
+            ("not a JWT", |_, _| serde_json::json!({"id_token": "not-a-jwt"})),
+            (
+                "another audience",
+                |fixture, nonce| serde_json::json!({"id_token": fixture.id_token(nonce, serde_json::json!({"aud": "other-client"}))}),
+            ),
+            (
+                "another issuer",
+                |fixture, nonce| serde_json::json!({"id_token": fixture.id_token(nonce, serde_json::json!({"iss": "https://other.example"}))}),
+            ),
+            ("a forged signature", |fixture, nonce| {
+                let token = fixture.id_token(nonce, serde_json::json!({}));
+                serde_json::json!({"id_token": format!("{}.AAAA", token.rsplit_once('.').unwrap().0)})
+            }),
+        ];
+        for (case, answer) in answers {
+            let sign_in = fixture
+                .sign_in(&strategy, &alice)
+                .await;
+            fixture.idp_answers(answer(&fixture, &sign_in.nonce));
+            let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+            consent::assert_refused(&refused, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&sign_in.cookie)));
+            assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentIdentityMissing], "{case}");
+        }
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// An ID token carrying another sign-in's nonce, or none, confirms nobody.
+    #[tokio::test]
+    async fn an_id_token_with_another_nonce_is_refused() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let other = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        for nonce in [serde_json::json!(other.nonce), serde_json::Value::Null] {
+            let sign_in = fixture
+                .sign_in(&strategy, &alice)
+                .await;
+            fixture.idp_answers(
+                serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({"nonce": nonce}))}),
+            );
+            let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+            consent::assert_refused(&refused, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&sign_in.cookie)));
+            assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentIdentityMissing], "{nonce}");
+        }
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// A confirmation whose provider now confirms through another strategy,
+    /// or whose strategy now verifies with other keys, is refused before the
+    /// code is exchanged.
+    #[tokio::test]
+    async fn a_confirmation_whose_strategy_changed_is_refused_before_the_exchange() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+
+        let renamed = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        let mut provider = fixture
+            .providers
+            .get(consent::PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .jwt_verification_strategy_id = "another-strategy".to_string();
+        fixture
+            .providers
+            .update(provider.clone())
+            .await
+            .unwrap();
+        let (refused, events) = capture(fixture.confirm_code(&renamed)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&renamed.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .jwt_verification_strategy_id = strategy.id.clone();
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+        let rekeyed = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        let mut edited = strategy.clone();
+        edited.jwks_source = crate::jwt_bearer::models::JwksSource::Remote {
+            jwks_uri: "https://idp.example/jwks".to_string(),
+        };
+        fixture
+            .strategies
+            .update(edited)
+            .await
+            .unwrap();
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&rekeyed.nonce, serde_json::json!({}))}));
+        let (refused, events) = capture(fixture.confirm_code(&rekeyed)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&rekeyed.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// A provider edited after the sign-in began to name the caller by a
+    /// claim the save rules refuse is refused before the exchange.
+    #[tokio::test]
+    async fn a_confirmation_the_save_rules_now_refuse_is_refused_before_the_exchange() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        let mut provider = fixture
+            .providers
+            .get(consent::PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .id_token_principal_claim = Some("email".to_string());
+        fixture
+            .providers
+            .update(provider)
+            .await
+            .unwrap();
+        let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(fixture.idp_forms().is_empty());
+    }
+
+    /// A confirmation opened without the browser's binding cookie, or with
+    /// another browser's, is refused with 403 and leaves the state unused.
+    #[tokio::test]
+    async fn a_confirmation_without_the_browsers_cookie_is_refused_and_left_unused() {
+        use crate::delegation_vault::oauth::{decode_confirmation_state, is_claimed};
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let sign_in = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        let other = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        let name = consent::cookie_name(&sign_in.cookie);
+        let wrong = format!(
+            "{name}={}",
+            other
+                .cookie
+                .split_once('=')
+                .unwrap()
+                .1
+        );
+        let query = format!("code=idp-code&state={}", sign_in.state);
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .confirm(&query, None)
+                    .await,
+                fixture
+                    .confirm(&query, Some(&other.cookie))
+                    .await,
+                fixture
+                    .confirm(&query, Some(&wrong))
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::FORBIDDEN, Some(&name));
+        }
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::BrowserBindingMismatch; 3]);
+        assert!(!is_claimed(&decode_confirmation_state(&sign_in.state).unwrap()).await);
+        assert!(fixture.idp_forms().is_empty());
+    }
+
+    /// A confirmation state confirms once: the same redirect again is refused.
+    #[tokio::test]
+    async fn a_confirmation_state_is_used_once() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({}))}));
+        assert_eq!(
+            fixture
+                .confirm_code(&sign_in)
+                .await
+                .status,
+            StatusCode::FOUND
+        );
+        let (replayed, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&replayed, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateReused]);
+        assert_eq!(fixture.idp_forms().len(), 1);
+    }
+
+    /// An identity provider error ends the consent as denied: audited, the
+    /// cookie cleared and no code exchanged.
+    #[tokio::test]
+    async fn an_identity_provider_error_is_a_denied_consent() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        for (error, reason) in [
+            ("access_denied", DelegationFailureReason::ConsentDenied),
+            ("not%20a%20code", DelegationFailureReason::ConsentResponseInvalid),
+        ] {
+            let sign_in = fixture
+                .sign_in(&strategy, &alice)
+                .await;
+            let (refused, events) = capture(fixture.confirm(
+                &format!(
+                    "error={error}&state={}",
+                    url::form_urlencoded::byte_serialize(sign_in.state.as_bytes()).collect::<String>()
+                ),
+                Some(&sign_in.cookie),
+            ))
+            .await;
+            consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+            assert_eq!(consent::reasons(&events), [reason], "{error}");
+        }
+        assert!(fixture.idp_forms().is_empty());
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
+    /// An `iss` the identity provider sends must be the strategy's issuer
+    /// (RFC 9207); without one the sign-in still confirms.
+    #[tokio::test]
+    async fn an_iss_other_than_the_strategys_issuer_is_refused() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let alice = consent::caller_hash("sub", "alice");
+        let state_of = |sign_in: &consent::SignIn| {
+            url::form_urlencoded::byte_serialize(sign_in.state.as_bytes()).collect::<String>()
+        };
+        let mismatched = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        let (refused, events) = capture(fixture.confirm(
+            &format!("code=idp-code&iss=https%3A%2F%2Fother.example&state={}", state_of(&mismatched)),
+            Some(&mismatched.cookie),
+        ))
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&mismatched.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::IssMismatch]);
+        assert!(fixture.idp_forms().is_empty());
+
+        let matching = fixture
+            .sign_in(&strategy, &alice)
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(&matching.nonce, serde_json::json!({}))}));
+        let confirmed = fixture
+            .confirm(
+                &format!("code=idp-code&iss=https%3A%2F%2Fidp.example&state={}", state_of(&matching)),
+                Some(&matching.cookie),
+            )
+            .await;
+        assert_eq!(confirmed.status, StatusCode::FOUND, "{}", confirmed.body);
+    }
+
+    /// An identity provider that issues `sub` per application names the
+    /// caller by `oid` in both tokens: the sign-in confirms the caller whose
+    /// ID token has the same `oid` and another `sub`.
+    #[tokio::test]
+    async fn a_caller_named_by_oid_is_confirmed_whatever_their_pairwise_sub() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(Some("oid"), None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("oid", "person-1"))
+            .await;
+        fixture.idp_answers(serde_json::json!({"id_token": fixture.id_token(
+            &sign_in.nonce,
+            serde_json::json!({"sub": "pairwise-for-the-login-client", "oid": "person-1"}),
+        )}));
+        let confirmed = fixture
+            .confirm_code(&sign_in)
+            .await;
+        assert_eq!(confirmed.status, StatusCode::FOUND, "{}", confirmed.body);
+        assert!(
+            confirmed
+                .header("location")
+                .unwrap()
+                .starts_with("https://vendor.example/authorize?")
+        );
+    }
+
     mod consent {
         use super::*;
         use crate::credential_providers::storage::{CredentialProviderStorage, FileSystemCredentialProviderStore};
@@ -2039,7 +2492,39 @@ mod tests {
             forms: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
             egress: crate::delegation_vault::oauth::TokenEgress,
             token_endpoint: String,
+            idp_token_endpoint: String,
+            idp_answer: Arc<Mutex<serde_json::Value>>,
+            idp_forms: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
             _directory: tempfile::TempDir,
+        }
+
+        /// The issuer of the identity provider the confirmation tests sign in at.
+        pub const IDP_ISSUER: &str = "https://idp.example";
+        const IDP_KEY: [u8; 32] = [7; 32];
+
+        /// A sign-in begun at the identity provider: the confirmation state
+        /// and the browser's binding cookie pair, and the nonce the ID token
+        /// must carry.
+        pub struct SignIn {
+            pub state: String,
+            pub cookie: String,
+            pub nonce: String,
+        }
+
+        /// The vault key of a caller whose access token from [`IDP_ISSUER`]
+        /// names them `value` by `claim`, as the Access Point computes it.
+        pub fn caller_hash(
+            claim: &str,
+            value: &str,
+        ) -> String {
+            crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                subject: value.to_string(),
+                principal_claim: claim.to_string(),
+                claims: serde_json::json!({"iss": IDP_ISSUER, claim: value}),
+                strategy_id: None,
+            }
+            .principal_hash(None)
+            .unwrap()
         }
 
         pub struct Answer {
@@ -2136,7 +2621,25 @@ mod tests {
                 let counter = calls.clone();
                 let forms = Arc::new(Mutex::new(Vec::new()));
                 let recorded = forms.clone();
+                let idp_answer = Arc::new(Mutex::new(serde_json::json!({})));
+                let idp_forms = Arc::new(Mutex::new(Vec::new()));
+                let (answer, idp_recorded) = (idp_answer.clone(), idp_forms.clone());
                 let vendor = Router::new()
+                    .route(
+                        "/idp-token",
+                        post(move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
+                            let answer = answer.clone();
+                            let recorded = idp_recorded.clone();
+                            async move {
+                                recorded
+                                    .lock()
+                                    .unwrap()
+                                    .push(form);
+                                let body = answer.lock().unwrap().clone();
+                                axum::Json(body)
+                            }
+                        }),
+                    )
                     .route(
                         "/token",
                         post(move |axum::Form(form): axum::Form<std::collections::HashMap<String, String>>| {
@@ -2165,6 +2668,7 @@ mod tests {
                     .await
                     .unwrap();
                 let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+                let idp_token_endpoint = format!("http://{}/idp-token", listener.local_addr().unwrap());
                 tokio::spawn(async move {
                     axum::serve(listener, vendor)
                         .await
@@ -2245,10 +2749,13 @@ mod tests {
                     forms,
                     egress: crate::delegation_vault::oauth::TokenEgress {
                         timeout: std::time::Duration::from_secs(5),
-                        exact_allowlist: Some(token_endpoint.clone()),
+                        exact_allowlist: Some(format!("{token_endpoint},{idp_token_endpoint}")),
                         policy: Default::default(),
                     },
                     token_endpoint,
+                    idp_token_endpoint,
+                    idp_answer,
+                    idp_forms,
                     _directory: directory,
                 };
                 fixture
@@ -2263,6 +2770,7 @@ mod tests {
                 state.secrets_store = secrets;
                 state.agent_surface_store = Some(surfaces);
                 state.gateway_base_url = "https://198.51.100.7".to_string();
+                state.provider_egress = fixture.egress.clone();
                 fixture.app = create_delegation_vault_oauth_router(state)
                     .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
                 fixture
@@ -2351,6 +2859,162 @@ mod tests {
                     Some(crate::delegation_vault::ConsentStage::ConfirmStart(confirm_binding(strategy))),
                 )
                 .unwrap()
+            }
+
+            /// Stores a strategy for [`IDP_ISSUER`] with the identity
+            /// provider's signing key inline, naming callers by
+            /// `principal_claim`, and gives the provider a
+            /// `consent_confirmation` through it whose ID token names the caller
+            /// by `id_token_principal_claim`, exchanged at the fake identity
+            /// provider's token endpoint.
+            pub async fn confirming_at_idp(
+                &self,
+                principal_claim: Option<&str>,
+                id_token_principal_claim: Option<&str>,
+            ) -> JwtVerificationStrategy {
+                use base64::Engine as _;
+                let signing = ed25519_dalek::SigningKey::from_bytes(&IDP_KEY);
+                let strategy = self
+                    .strategies
+                    .create(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "", "name": "Callers", "expected_issuer": IDP_ISSUER,
+                            "jwks_source": {"type": "static", "jwks": [{"kty": "OKP", "crv": "Ed25519",
+                                "alg": "EdDSA", "kid": "idp-key",
+                                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                    .encode(signing.verifying_key().as_bytes())}]},
+                            "principal_claim": principal_claim,
+                            "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let mut provider = self.provider();
+                provider.consent_confirmation = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "client_id": "login-client", "client_secret_secret_ref": "github-client-secret",
+                        "authorization_endpoint": IDP_AUTHORIZE, "token_endpoint": self.idp_token_endpoint,
+                        "jwt_verification_strategy_id": strategy.id,
+                        "id_token_principal_claim": id_token_principal_claim
+                    }))
+                    .unwrap(),
+                );
+                provider
+                    .additional_params
+                    .insert("prompt".to_string(), "consent".to_string());
+                self.providers
+                    .update(provider)
+                    .await
+                    .unwrap();
+                strategy
+            }
+
+            /// Posts the start page of a link that confirms the caller whose
+            /// vault key is `user_identity_hash` through `strategy`.
+            pub async fn sign_in(
+                &self,
+                strategy: &JwtVerificationStrategy,
+                user_identity_hash: &str,
+            ) -> SignIn {
+                let start = crate::delegation_vault::oauth::build_authorization_url(
+                    &self.provider(),
+                    "did:web:agent.example",
+                    user_identity_hash,
+                    "surface",
+                    &["repo".to_string(), "read:user".to_string()],
+                    "https://198.51.100.7",
+                    Some(crate::delegation_vault::ConsentStage::ConfirmStart(confirm_binding(strategy))),
+                )
+                .unwrap();
+                let started = self
+                    .start_post(&start_state(&start), &[("origin", "https://198.51.100.7")])
+                    .await;
+                assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
+                let idp = url::Url::parse(
+                    started
+                        .header("location")
+                        .unwrap(),
+                )
+                .unwrap();
+                let (cookie, _, _) = set_cookie(&started);
+                SignIn {
+                    state: query_value(&idp, "state"),
+                    cookie,
+                    nonce: query_value(&idp, "nonce"),
+                }
+            }
+
+            /// An ID token for the login client, signed by the identity
+            /// provider, with `claims` added to or replacing its own.
+            pub fn id_token(
+                &self,
+                nonce: &str,
+                claims: serde_json::Value,
+            ) -> String {
+                use base64::Engine as _;
+                use ed25519_dalek::Signer as _;
+                let now = Utc::now().timestamp();
+                let mut token = serde_json::json!({"iss": IDP_ISSUER, "sub": "alice", "aud": "login-client",
+                    "exp": now + 300, "iat": now, "nonce": nonce});
+                for (name, value) in claims.as_object().unwrap() {
+                    token[name] = value.clone();
+                }
+                let encoding = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+                let input = format!(
+                    "{}.{}",
+                    encoding.encode(br#"{"alg":"EdDSA","typ":"JWT","kid":"idp-key"}"#),
+                    encoding.encode(serde_json::to_vec(&token).unwrap())
+                );
+                let signature = ed25519_dalek::SigningKey::from_bytes(&IDP_KEY).sign(input.as_bytes());
+                format!("{input}.{}", encoding.encode(signature.to_bytes()))
+            }
+
+            /// Makes the identity provider's token endpoint answer `body`.
+            pub fn idp_answers(
+                &self,
+                body: serde_json::Value,
+            ) {
+                *self
+                    .idp_answer
+                    .lock()
+                    .unwrap() = body;
+            }
+
+            /// The forms the identity provider's token endpoint received.
+            pub fn idp_forms(&self) -> Vec<std::collections::HashMap<String, String>> {
+                self.idp_forms
+                    .lock()
+                    .unwrap()
+                    .clone()
+            }
+
+            /// The identity provider's redirect back to the confirmation
+            /// route with `query`, from a browser sending `cookie`.
+            pub async fn confirm(
+                &self,
+                query: &str,
+                cookie: Option<&str>,
+            ) -> Answer {
+                let headers = cookie
+                    .map(|cookie| vec![("cookie", cookie)])
+                    .unwrap_or_default();
+                self.get(&format!("/v1/identity/oauth/callback/github/confirm?{query}"), &headers)
+                    .await
+            }
+
+            /// [`Self::confirm`] with `code` and the sign-in's own state and
+            /// cookie.
+            pub async fn confirm_code(
+                &self,
+                sign_in: &SignIn,
+            ) -> Answer {
+                let query = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("code", "idp-code")
+                    .append_pair("state", &sign_in.state)
+                    .finish();
+                self.confirm(&query, Some(&sign_in.cookie))
+                    .await
             }
 
             /// A callback state and the binding cookie of the browser that

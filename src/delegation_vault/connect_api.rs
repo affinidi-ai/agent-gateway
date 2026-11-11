@@ -1439,6 +1439,7 @@ mod tests {
                     crate::jwt_bearer::JwksClient::new(),
                 ))),
                 provider_egress: crate::delegation_vault::oauth::TokenEgress::from_environment(),
+                gateway_mcp_issuer: None,
             };
             Self {
                 _directory: directory,

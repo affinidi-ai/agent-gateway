@@ -327,6 +327,45 @@ impl ConsentConfirmation {
             && [strategy_claim, id_token_claim].contains(&crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM)
     }
 
+    /// The claims a confirmation through `strategy` names its caller by, when
+    /// the save rules accept them: `id_token_principal_claim` and the
+    /// strategy's principal claim name a caller, the strategy expects no issuer
+    /// of this gateway's own STS (`gateway_issuer`), names no Entra caller by
+    /// `sub`, no caller by `email`, and the ID token names the caller by no
+    /// [`EDITABLE_CLAIMS`] claim. Saving, minting and the confirmation route all
+    /// check through it.
+    pub fn claims_through<'a>(
+        &'a self,
+        strategy: &'a crate::jwt_bearer::models::JwtVerificationStrategy,
+        gateway_issuer: Option<&str>,
+    ) -> Result<ConfirmationClaims<'a>, ConfirmationStrategyRefusal> {
+        crate::jwt_bearer::models::normalize_principal_claim(
+            self.id_token_principal_claim
+                .as_deref(),
+        )
+        .map_err(ConfirmationStrategyRefusal::IdTokenClaim)?;
+        let strategy_claim = strategy
+            .principal_claim_name()
+            .map_err(|_| ConfirmationStrategyRefusal::StrategyClaim)?;
+        if is_gateway_issuer(&strategy.expected_issuer, gateway_issuer) {
+            return Err(ConfirmationStrategyRefusal::GatewayIssuer);
+        }
+        if self.names_entra_caller_by_sub(&strategy.expected_issuer, strategy_claim) {
+            return Err(ConfirmationStrategyRefusal::EntraCallerNamedBySub);
+        }
+        let id_token_claim = self
+            .id_token_principal_claim
+            .as_deref()
+            .unwrap_or(strategy_claim);
+        if [strategy_claim, id_token_claim].contains(&"email") {
+            return Err(ConfirmationStrategyRefusal::CallerNamedByEmail);
+        }
+        if EDITABLE_CLAIMS.contains(&id_token_claim) {
+            return Err(ConfirmationStrategyRefusal::EditableClaim);
+        }
+        Ok(ConfirmationClaims { strategy_claim, id_token_claim })
+    }
+
     /// The authorization endpoint parsed, when the save rules accept it: an
     /// OAuth endpoint URL that is https, with a host and no query or fragment.
     pub fn authorization_endpoint_url(&self) -> Result<url::Url, String> {
@@ -356,6 +395,45 @@ impl ConsentConfirmation {
         }
         Ok(url)
     }
+}
+
+/// The claims a consent confirmation names its caller by: the strategy's,
+/// the name the vault key hashes the value under, and the ID token's, the
+/// claim that supplies the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmationClaims<'a> {
+    pub strategy_claim: &'a str,
+    pub id_token_claim: &'a str,
+}
+
+/// The claims a person can change at common identity providers. The ID-token
+/// claim that confirms a caller must be one the identity provider assigns and
+/// nobody can edit.
+pub const EDITABLE_CLAIMS: [&str; 9] = [
+    "preferred_username",
+    "nickname",
+    "name",
+    "given_name",
+    "family_name",
+    "upn",
+    "unique_name",
+    "email",
+    "phone_number",
+];
+
+/// Why a `consent_confirmation` cannot confirm callers through a strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationStrategyRefusal {
+    /// `id_token_principal_claim` names no caller, for this reason.
+    IdTokenClaim(String),
+    /// The strategy's principal claim names no caller.
+    StrategyClaim,
+    /// The strategy expects this gateway's own STS issuer.
+    GatewayIssuer,
+    EntraCallerNamedBySub,
+    CallerNamedByEmail,
+    /// The ID token names the caller by one of [`EDITABLE_CLAIMS`].
+    EditableClaim,
 }
 
 /// Whether `expected_issuer` names `gateway_issuer`, this gateway's own STS
@@ -1294,6 +1372,53 @@ mod tests {
             "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
         }))
         .unwrap()
+    }
+
+    /// A caller is confirmed only by an ID-token claim the identity provider
+    /// assigns: one the person can edit is refused, whether
+    /// `id_token_principal_claim` names it or the strategy's claim stands in.
+    #[test]
+    fn a_claim_the_person_can_edit_never_confirms_a_caller() {
+        let strategy = |claim: Option<&str>| -> crate::jwt_bearer::models::JwtVerificationStrategy {
+            serde_json::from_value(serde_json::json!({
+                "id": "strategy", "name": "Callers", "expected_issuer": "https://idp.example",
+                "jwks_source": {"type": "remote", "jwks_uri": "https://idp.example/jwks"},
+                "principal_claim": claim,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let confirmation = |claim: Option<&str>| ConsentConfirmation {
+            id_token_principal_claim: claim.map(String::from),
+            ..confirming(consent_provider("a", "a", None))
+                .consent_confirmation
+                .unwrap()
+        };
+        for claim in EDITABLE_CLAIMS {
+            let expected = if claim == "email" {
+                ConfirmationStrategyRefusal::CallerNamedByEmail
+            } else {
+                ConfirmationStrategyRefusal::EditableClaim
+            };
+            assert_eq!(
+                confirmation(Some(claim)).claims_through(&strategy(None), None),
+                Err(expected.clone()),
+                "{claim}"
+            );
+            assert_eq!(confirmation(None).claims_through(&strategy(Some(claim)), None), Err(expected), "{claim}");
+        }
+        for (strategy_claim, id_token_claim) in [(None, None), (Some("oid"), None), (None, Some("oid"))] {
+            assert!(
+                confirmation(id_token_claim)
+                    .claims_through(&strategy(strategy_claim), None)
+                    .is_ok(),
+                "{strategy_claim:?}, {id_token_claim:?}"
+            );
+        }
+        assert!(matches!(
+            confirmation(Some("iss")).claims_through(&strategy(None), None),
+            Err(ConfirmationStrategyRefusal::IdTokenClaim(reason)) if reason.starts_with("principal_claim")
+        ));
     }
 
     fn confirming(mut provider: CredentialProvider) -> CredentialProvider {

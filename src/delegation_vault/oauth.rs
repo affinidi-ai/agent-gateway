@@ -161,6 +161,46 @@ pub async fn begin_consent(
     redirect_uri: &url::Url,
     secrets_store: &Arc<dyn SecretsStore>,
 ) -> Result<ConsentStart> {
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let (vendor_url, callback) =
+        vendor_leg(provider, start, browser_binding, start.stage.clone(), redirect_uri, secrets_store).await?;
+    consent_started(vendor_url, &callback, cookie_value)
+}
+
+/// The vendor's authorization URL for a caller the
+/// [`ConsentStage::Confirmation`] state `confirmation` has confirmed: a
+/// [`ConsentStage::Vendor`] state sealed with `binding` on the confirmation's
+/// own browser binding, so the browser keeps its cookie, with a fresh nonce
+/// and PKCE verifier. The URL is the one [`begin_consent`] builds, but for its
+/// state and PKCE challenge.
+pub(super) async fn continue_to_vendor(
+    provider: &CredentialProvider,
+    confirmation: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<url::Url> {
+    let browser_binding = confirmation
+        .browser_binding
+        .clone()
+        .ok_or_else(|| anyhow!("OAuth state has no browser binding"))?;
+    let stage = Some(ConsentStage::Vendor(binding.clone()));
+    vendor_leg(provider, confirmation, browser_binding, stage, redirect_uri, secrets_store)
+        .await
+        .map(|(vendor_url, _)| vendor_url)
+}
+
+/// The vendor callback state that follows `from`, sealed with `stage` and
+/// `browser_binding`, a fresh nonce and PKCE verifier, and the vendor's
+/// authorization URL that carries it.
+async fn vendor_leg(
+    provider: &CredentialProvider,
+    from: &OAuthState,
+    browser_binding: String,
+    stage: Option<ConsentStage>,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<(url::Url, OAuthState)> {
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -170,23 +210,23 @@ pub async fn begin_consent(
         .context("Failed to resolve client_id secret")?;
     let code_verifier = generate_pkce_verifier();
     let code_challenge = generate_pkce_challenge(&code_verifier);
-    let (cookie_value, browser_binding) = new_browser_binding();
     let callback = OAuthState {
         nonce: Uuid::new_v4().to_string(),
-        expires_at: next_state_expiry(start),
+        expires_at: next_state_expiry(from),
         code_verifier: Some(code_verifier),
         browser_binding: Some(browser_binding),
-        ..start.clone()
+        stage,
+        ..from.clone()
     };
     let vendor_url = vendor_authorization_url(
         provider,
         &client_id,
         redirect_uri.as_str(),
-        &start.scopes,
+        &from.scopes,
         &encode_oauth_state(&callback)?,
         &code_challenge,
     )?;
-    consent_started(vendor_url, &callback, cookie_value)
+    Ok((vendor_url, callback))
 }
 
 /// Begin confirming the caller of a confirm start state sealed with `binding`
@@ -235,11 +275,10 @@ pub(super) fn begin_confirmation(
     consent_started(url, &confirmation, cookie_value)
 }
 
-/// When the state a start POST seals expires: with its start state, and at
-/// most [`CONSENT_STATE_LIFETIME_MINUTES`] from now.
-fn next_state_expiry(start: &OAuthState) -> chrono::DateTime<Utc> {
-    start
-        .expires_at
+/// When the state that follows `from` expires: with `from`, and at most
+/// [`CONSENT_STATE_LIFETIME_MINUTES`] from now.
+fn next_state_expiry(from: &OAuthState) -> chrono::DateTime<Utc> {
+    from.expires_at
         .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES))
 }
 
@@ -303,13 +342,13 @@ pub fn decode_start_state(encoded: &str) -> Result<OAuthState> {
 
 /// Decode the state the identity provider redirects back with: a
 /// [`ConsentStage::Confirmation`] state.
-#[allow(dead_code)]
 pub fn decode_confirmation_state(encoded: &str) -> Result<OAuthState> {
     decode_consent_state(encoded, "confirmation", &[StageKind::Confirmation])
 }
 
-/// Decode a consent callback state: a [`ConsentStage::Vendor`] state, which
-/// only [`begin_consent`] seals.
+/// Decode a consent callback state: a legacy vendor callback state, which only
+/// [`begin_consent`] seals, or a [`ConsentStage::Vendor`] one, which only
+/// [`continue_to_vendor`] seals.
 pub fn decode_callback_state(encoded: &str) -> Result<OAuthState> {
     decode_consent_state(encoded, "callback", &[StageKind::Vendor])
 }

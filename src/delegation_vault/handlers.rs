@@ -67,6 +67,9 @@ pub struct DelegationVaultState {
     pub identity_strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
     pub verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
     pub provider_egress: oauth::TokenEgress,
+    /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
+    /// tokens, through which no consent confirmation confirms a caller.
+    pub gateway_mcp_issuer: Option<String>,
 }
 
 /// A read refused because the credential providers could not be read. It
@@ -857,6 +860,157 @@ async fn begin_confirmation(
     })
 }
 
+/// The reason a provider's `error` answer is refused with: a denied consent
+/// for an RFC 6749 error code, an invalid response otherwise; and the code
+/// the log may name.
+fn provider_error(error: &str) -> (DelegationFailureReason, &str) {
+    let valid = !error.is_empty()
+        && error.len() <= 128
+        && error
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid {
+        (DelegationFailureReason::ConsentDenied, error)
+    } else {
+        (DelegationFailureReason::ConsentResponseInvalid, oauth::UNRECOGNIZED_ERROR)
+    }
+}
+
+/// GET {callback_path}/confirm
+///
+/// The identity provider's redirect after a consent confirmation sign-in. The
+/// state must be a confirmation state of this gateway, held by the browser
+/// that posted its start page, and is used once; its provider must still
+/// confirm through the sealed strategy. An identity provider error is a denied
+/// consent. Once the caller is confirmed
+/// ([`confirm_caller`](super::consent_confirmation::confirm_caller)) the
+/// browser goes on to the vendor with a vendor state on the same browser
+/// binding, so its cookie stays as it is. A caller the sign-in does not
+/// confirm is refused with 403; every refusal clears the cookie and stores
+/// nothing.
+pub async fn consent_confirmation_callback(
+    State(state): State<DelegationVaultState>,
+    Path(provider_id): Path<String>,
+    cookies: Option<Extension<super::consent_cookie::ConsentCookies>>,
+    query: Result<Query<OAuthCallbackQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid),
+            &provider_id,
+            None,
+            None,
+        );
+    };
+    let sealed = query
+        .state
+        .as_deref()
+        .and_then(|encoded| oauth::decode_confirmation_state(encoded).ok());
+    let cookie_name = sealed
+        .as_ref()
+        .and_then(oauth::binding_cookie_name);
+    let audited = sealed
+        .as_ref()
+        .map(|sealed| refused_provider(&provider_id, sealed).to_string());
+    let refuse = |reason: DelegationFailureReason| {
+        let status = match reason {
+            DelegationFailureReason::ConsentIdentityMismatch
+            | DelegationFailureReason::ConsentIdentityMissing
+            | DelegationFailureReason::BrowserBindingMismatch => StatusCode::FORBIDDEN,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        consent_refused(ConsentRefusal { status, reason }, &provider_id, cookie_name.as_deref(), audited.as_deref())
+    };
+    let (Some(sealed), Some(cookie_name)) = (&sealed, cookie_name.as_deref()) else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    let Some(super::ConsentStage::Confirmation(sign_in)) = &sealed.stage else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    let presented = cookies
+        .as_ref()
+        .and_then(|Extension(cookies)| cookies.get(cookie_name));
+    if !oauth::browser_binding_matches(sealed, presented) {
+        return refuse(DelegationFailureReason::BrowserBindingMismatch);
+    }
+    if !oauth::claim_oauth_state(sealed).await {
+        return refuse(DelegationFailureReason::ConsentStateReused);
+    }
+    let provider = match consent_provider(&state, &provider_id, sealed).await {
+        Ok(provider) => provider,
+        Err(refusal) => return refuse(refusal.reason),
+    };
+    let Some(confirmation) = super::consent_confirmation::confirmation_for(&provider, &sign_in.binding) else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    if let Some(error) = &query.error {
+        let (reason, logged) = provider_error(error);
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            oauth_error = %logged,
+            "Identity provider returned an error to the consent confirmation"
+        );
+        return refuse(reason);
+    }
+    let Some(code) = query
+        .code
+        .as_deref()
+        .filter(|code| !code.is_empty())
+    else {
+        return refuse(DelegationFailureReason::ConsentResponseInvalid);
+    };
+    if let Err(reason) = super::consent_confirmation::confirm_caller(
+        &state,
+        &provider,
+        confirmation,
+        sealed,
+        sign_in,
+        code,
+        query.iss.as_deref(),
+    )
+    .await
+    {
+        return refuse(reason);
+    }
+    let Ok(redirect_uri) = provider.consent_redirect_uri(&state.gateway_base_url) else {
+        return refuse(DelegationFailureReason::RedirectUriInvalid);
+    };
+    let vendor_url =
+        match oauth::continue_to_vendor(&provider, sealed, &sign_in.binding, &redirect_uri, &state.secrets_store).await
+        {
+            Ok(vendor_url) => vendor_url,
+            Err(e) => {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    error = %e,
+                    "Could not continue a confirmed consent to the vendor"
+                );
+                return refuse(if e.is::<oauth::ProviderSecretError>() {
+                    DelegationFailureReason::CredentialsUnavailable
+                } else {
+                    DelegationFailureReason::AuthorizationUrlInvalid
+                });
+            }
+        };
+    let Ok(location) = HeaderValue::from_str(vendor_url.as_str()) else {
+        return refuse(DelegationFailureReason::AuthorizationUrlInvalid);
+    };
+    info!(
+        target: "credential_delegation",
+        provider_id = %provider.provider_id,
+        action = "consent_confirmed",
+        "Consent caller confirmed at their identity provider"
+    );
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, location);
+    consent_page_headers(&mut response, "no-referrer");
+    response
+}
+
 /// GET {callback_path}
 ///
 /// Handles the OAuth provider redirect after user consent. Every check runs
@@ -903,22 +1057,13 @@ pub async fn oauth_callback(
     );
 
     if let Some(error) = &query.error {
-        let valid = !error.is_empty()
-            && error.len() <= 128
-            && error
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        let (reason, logged) = provider_error(error);
         warn!(
             target: "credential_delegation",
             provider_id = plain_slug(named),
-            oauth_error = %if valid { error.as_str() } else { oauth::UNRECOGNIZED_ERROR },
+            oauth_error = %logged,
             "OAuth provider returned an error"
         );
-        let reason = if valid {
-            DelegationFailureReason::ConsentDenied
-        } else {
-            DelegationFailureReason::ConsentResponseInvalid
-        };
         return refuse(ConsentRefusal::bad_request(reason));
     }
 

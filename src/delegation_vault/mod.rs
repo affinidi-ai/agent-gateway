@@ -212,7 +212,6 @@ pub enum ConsentStage {
     /// The identity provider's redirect back to the gateway.
     Confirmation(ConfirmationSignIn),
     /// The vendor's redirect back to the gateway, for a confirmed caller.
-    #[allow(dead_code)]
     Vendor(ConsentConfirmBinding),
 }
 

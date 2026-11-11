@@ -285,13 +285,6 @@ async fn validate_consent_confirmation(
     {
         return invalid("consent_confirmation.client_id must be at most 2048 characters, without whitespace");
     }
-    if let Err(error) = crate::jwt_bearer::models::normalize_principal_claim(
-        confirmation
-            .id_token_principal_claim
-            .as_deref(),
-    ) {
-        return invalid(&format!("consent_confirmation.id_token_principal_claim: {error}"));
-    }
     confirmation
         .authorization_endpoint_url()
         .map_err(ProviderValidationError::InvalidConsentConfirmation)?;
@@ -304,32 +297,32 @@ async fn validate_consent_confirmation(
     let strategy = referenceable_strategy(state, provider, &confirmation.jwt_verification_strategy_id, context, scope)
         .await?
         .ok_or(ProviderValidationError::InvalidConfirmationStrategy)?;
-    let strategy_claim = strategy
-        .principal_claim_name()
-        .map_err(|_| ProviderValidationError::InvalidConfirmationStrategy)?;
-    if super::is_gateway_issuer(
-        &strategy.expected_issuer,
+    use super::ConfirmationStrategyRefusal as Refusal;
+    match confirmation.claims_through(
+        &strategy,
         state
             .gateway_mcp_issuer
             .as_deref(),
     ) {
-        return invalid(
+        Ok(_) => Ok(()),
+        Err(Refusal::StrategyClaim) => Err(ProviderValidationError::InvalidConfirmationStrategy),
+        Err(Refusal::IdTokenClaim(error)) => {
+            invalid(&format!("consent_confirmation.id_token_principal_claim: {error}"))
+        }
+        Err(Refusal::GatewayIssuer) => invalid(
             "consent_confirmation cannot confirm callers of this gateway's own MCP issuer, who sign in nowhere else",
-        );
-    }
-    if confirmation.names_entra_caller_by_sub(&strategy.expected_issuer, strategy_claim) {
-        return invalid(
+        ),
+        Err(Refusal::EntraCallerNamedBySub) => invalid(
             "consent_confirmation cannot name an Entra caller by sub, which Entra issues per application: use oid",
-        );
+        ),
+        Err(Refusal::CallerNamedByEmail) => {
+            invalid("consent_confirmation cannot name a caller by email, which the sign-in does not ask for")
+        }
+        Err(Refusal::EditableClaim) => invalid(
+            "consent_confirmation cannot name a caller by a claim the person can change at their identity provider: \
+             use an immutable claim the identity provider assigns, such as sub or oid",
+        ),
     }
-    let id_token_claim = confirmation
-        .id_token_principal_claim
-        .as_deref()
-        .unwrap_or(strategy_claim);
-    if [strategy_claim, id_token_claim].contains(&"email") {
-        return invalid("consent_confirmation cannot name a caller by email, which the sign-in does not ask for");
-    }
-    Ok(())
 }
 
 async fn stored_secret(

@@ -520,6 +520,7 @@ impl Receiver {
                 crate::jwt_bearer::JwksClient::new(),
             ))),
             provider_egress: self.egress(),
+            gateway_mcp_issuer: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));

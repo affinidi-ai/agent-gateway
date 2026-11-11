@@ -2,12 +2,17 @@
 //! provider before the vendor: only for a JWT caller of the provider's
 //! `consent_confirmation` strategy whose vault key the strategy recomputes.
 
+use chrono::Utc;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
-use super::ConsentConfirmBinding;
+use super::consent_id_token::{ConsentIdTokenExpectation, verify_consent_id_token};
+use super::handlers::DelegationVaultState;
+use super::{ConfirmationSignIn, ConsentConfirmBinding, OAuthState};
 use crate::audit::events::DelegationFailureReason;
-use crate::credential_providers::CredentialProvider;
+use crate::credential_providers::{
+    ConfirmationClaims, ConfirmationStrategyRefusal, ConsentConfirmation, CredentialProvider,
+};
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
 use crate::source_auth::AuthenticatedIdentity;
 
@@ -33,6 +38,11 @@ pub(crate) enum Unconfirmed {
     StrategyUnavailable,
     GatewayIssuer,
     EntraCallerNamedBySub,
+    /// `id_token_principal_claim` names no caller.
+    IdTokenClaimInvalid,
+    /// The strategy or the ID token names the caller by `email` or another
+    /// claim the person can change.
+    EditableClaim,
     OtherIssuer,
     OtherPrincipalClaim,
     OtherIdentityHash,
@@ -66,8 +76,8 @@ impl<'a> ConsentCaller<'a> {
 /// `surface_tenant_id` is `user_identity_hash`, is minted. A caller is
 /// confirmed when it reached the Access Point, the provider still uses legacy
 /// consent with a configured pepper, the strategy the setting names exists,
-/// the provider's tenant can reference it, it expects no issuer of this
-/// gateway's own STS and names no Entra caller by `sub`, and the caller's
+/// the provider's tenant can reference it, the save rules still accept
+/// confirming through it ([`ConsentConfirmation::claims_through`]), and the caller's
 /// `iss` and principal claim are the strategy's and give that vault key. A
 /// caller verified by another strategy with the same issuer and claim has the
 /// same vault key, so it is confirmed too. An error reading the strategy is an
@@ -112,16 +122,13 @@ pub(crate) async fn decide(
     else {
         return Ok(No(Unconfirmed::StrategyUnavailable));
     };
-    let (Ok(strategy_claim), Some(strategy_digest)) = (strategy.principal_claim_name(), strategy.verification_digest())
-    else {
+    let Some(strategy_digest) = strategy.verification_digest() else {
         return Ok(No(Unconfirmed::StrategyUnavailable));
     };
-    if crate::credential_providers::is_gateway_issuer(&strategy.expected_issuer, gateway_issuer) {
-        return Ok(No(Unconfirmed::GatewayIssuer));
-    }
-    if confirmation.names_entra_caller_by_sub(&strategy.expected_issuer, strategy_claim) {
-        return Ok(No(Unconfirmed::EntraCallerNamedBySub));
-    }
+    let strategy_claim = match confirmation.claims_through(&strategy, gateway_issuer) {
+        Ok(claims) => claims.strategy_claim,
+        Err(refusal) => return Ok(No(unconfirmed_by(refusal))),
+    };
     if claims
         .get("iss")
         .and_then(Value::as_str)
@@ -148,6 +155,20 @@ pub(crate) async fn decide(
         strategy_digest,
         tenant_id: surface_tenant_id.map(String::from),
     }))
+}
+
+/// Why the save rules refusing a confirmation through its strategy leave a
+/// caller unconfirmed.
+fn unconfirmed_by(refusal: ConfirmationStrategyRefusal) -> Unconfirmed {
+    match refusal {
+        ConfirmationStrategyRefusal::StrategyClaim => Unconfirmed::StrategyUnavailable,
+        ConfirmationStrategyRefusal::GatewayIssuer => Unconfirmed::GatewayIssuer,
+        ConfirmationStrategyRefusal::EntraCallerNamedBySub => Unconfirmed::EntraCallerNamedBySub,
+        ConfirmationStrategyRefusal::IdTokenClaim(_) => Unconfirmed::IdTokenClaimInvalid,
+        ConfirmationStrategyRefusal::CallerNamedByEmail | ConfirmationStrategyRefusal::EditableClaim => {
+            Unconfirmed::EditableClaim
+        }
+    }
 }
 
 /// Where the caller of a confirm start state signs in: the login client at
@@ -223,6 +244,216 @@ fn sign_in_scope(id_token_claim: &str) -> &'static str {
     } else {
         "openid profile"
     }
+}
+
+/// The provider's `consent_confirmation` when it still confirms through the
+/// strategy `binding` was sealed with.
+pub(crate) fn confirmation_for<'a>(
+    provider: &'a CredentialProvider,
+    binding: &ConsentConfirmBinding,
+) -> Option<&'a ConsentConfirmation> {
+    provider
+        .consent_confirmation
+        .as_ref()
+        .filter(|confirmation| confirmation.jwt_verification_strategy_id == binding.strategy_id)
+}
+
+/// Confirm the caller a confirmation state `sealed` was minted for, from the
+/// identity provider's `code` and `iss`. The sealed strategy is reloaded and
+/// must be one the provider's tenant can reference, with the sealed digest,
+/// that the save rules still accept
+/// ([`ConsentConfirmation::claims_through`]). The code is exchanged at the
+/// login client's token endpoint with PKCE, and the ID token is verified by
+/// that strategy for the login client, with the sealed nonce and issued no
+/// earlier than the sign-in began. The vault key recomputed from it, under
+/// the strategy's claim name, must be the sealed one. Nothing of the ID token
+/// is logged or audited.
+pub(crate) async fn confirm_caller(
+    vault: &DelegationVaultState,
+    provider: &CredentialProvider,
+    confirmation: &ConsentConfirmation,
+    sealed: &OAuthState,
+    sign_in: &ConfirmationSignIn,
+    code: &str,
+    iss: Option<&str>,
+) -> Result<(), DelegationFailureReason> {
+    let binding = &sign_in.binding;
+    let strategy = vault
+        .identity_strategies
+        .get(&binding.strategy_id)
+        .await
+        .map_err(|_| DelegationFailureReason::CredentialsUnavailable)?
+        .filter(|strategy| {
+            crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
+                && strategy
+                    .verification_digest()
+                    .as_deref()
+                    == Some(
+                        binding
+                            .strategy_digest
+                            .as_str(),
+                    )
+        })
+        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let claims = confirmation
+        .claims_through(
+            &strategy,
+            vault
+                .gateway_mcp_issuer
+                .as_deref(),
+        )
+        .map_err(|_| DelegationFailureReason::ConsentStateInvalid)?;
+    // RFC 9207: an `iss` sent must be the strategy's; none is accepted, since no metadata is fetched here.
+    if iss.is_some_and(|iss| iss != strategy.expected_issuer) {
+        return Err(DelegationFailureReason::IssMismatch);
+    }
+    let redirect_uri = url::Url::parse(&provider.consent_confirmation_redirect_uri(&vault.gateway_base_url))
+        .map_err(|_| DelegationFailureReason::RedirectUriInvalid)?;
+    let code_verifier = sealed
+        .code_verifier
+        .as_deref()
+        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let id_token = exchange_code(vault, provider, confirmation, code, code_verifier, &redirect_uri).await?;
+    let expected = ConsentIdTokenExpectation {
+        client_id: &confirmation.client_id,
+        principal_claim: claims.id_token_claim,
+        nonce: &sign_in.nonce,
+        issued_at: unix_seconds(sign_in.issued_at),
+    };
+    let verified = verify_consent_id_token(&vault.verifier, &strategy, &expected, &id_token, unix_seconds(Utc::now()))
+        .await
+        .map_err(|_| DelegationFailureReason::ConsentIdentityMissing)?;
+    let confirmed = confirmed_identity_hash(verified, claims, &strategy.id, binding.tenant_id.as_deref())
+        .ok_or(DelegationFailureReason::ConsentIdentityMissing)?;
+    if confirmed != sealed.user_identity_hash {
+        return Err(DelegationFailureReason::ConsentIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn unix_seconds(at: chrono::DateTime<Utc>) -> u64 {
+    u64::try_from(at.timestamp()).unwrap_or_default()
+}
+
+/// The vault key of the caller an ID token's `claims` name: the value of the
+/// ID token's claim hashed under the strategy's claim name, as the caller's
+/// access token is ([`AuthenticatedIdentity::principal_hash`]).
+fn confirmed_identity_hash(
+    mut claims: Value,
+    ConfirmationClaims { strategy_claim, id_token_claim }: ConfirmationClaims<'_>,
+    strategy_id: &str,
+    tenant_id: Option<&str>,
+) -> Option<String> {
+    let value = claims
+        .get(id_token_claim)?
+        .as_str()?
+        .to_string();
+    claims
+        .as_object_mut()?
+        .insert(strategy_claim.to_string(), Value::String(value.clone()));
+    AuthenticatedIdentity::JwtBearer {
+        subject: value,
+        principal_claim: strategy_claim.to_string(),
+        claims,
+        strategy_id: Some(strategy_id.to_string()),
+    }
+    .principal_hash(tenant_id)
+}
+
+/// The ID token the login client's token endpoint answers `code` with,
+/// exchanged through the provider egress with the login client's id and
+/// secret in the form and the PKCE verifier, the answer read up to
+/// [`MAX_TOKEN_RESPONSE_BYTES`](super::oauth::MAX_TOKEN_RESPONSE_BYTES)
+/// within the egress timeout.
+async fn exchange_code(
+    vault: &DelegationVaultState,
+    provider: &CredentialProvider,
+    confirmation: &ConsentConfirmation,
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &url::Url,
+) -> Result<zeroize::Zeroizing<String>, DelegationFailureReason> {
+    if code.len() > 4096
+        || code
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(DelegationFailureReason::ConsentResponseInvalid);
+    }
+    let egress = &vault.provider_egress;
+    let endpoint = confirmation
+        .token_endpoint
+        .as_str();
+    egress
+        .check_token_endpoint(&provider.provider_id, endpoint)
+        .map_err(|_| DelegationFailureReason::TokenExchangeFailed)?;
+    let client_secret = zeroize::Zeroizing::new(
+        super::oauth::resolve_secret(
+            provider,
+            &vault.secrets_store,
+            &confirmation.client_secret_secret_ref,
+            super::oauth::isolation_mode(),
+        )
+        .await
+        .map_err(|_| DelegationFailureReason::CredentialsUnavailable)?,
+    );
+    let exchange = async {
+        let (client, url) = egress
+            .pinned_client(endpoint)
+            .await
+            .map_err(|_| DelegationFailureReason::TokenExchangeFailed)?;
+        let answer = super::oauth::post_token_request(
+            &client,
+            url.as_str(),
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", redirect_uri.as_str()),
+                (
+                    "client_id",
+                    confirmation
+                        .client_id
+                        .as_str(),
+                ),
+                ("client_secret", client_secret.as_str()),
+                ("code_verifier", code_verifier),
+            ],
+            None,
+        )
+        .await
+        .map_err(|failure| {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                cause = %failure,
+                "Consent confirmation token request failed"
+            );
+            DelegationFailureReason::TokenExchangeFailed
+        })?;
+        if !answer.status.is_success() {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                status = %answer.status,
+                reason = %super::oauth::token_error_code(&String::from_utf8_lossy(&answer.body)),
+                "Consent confirmation token exchange failed"
+            );
+            return Err(DelegationFailureReason::TokenExchangeFailed);
+        }
+        #[derive(serde::Deserialize)]
+        struct IdTokenAnswer {
+            id_token: Option<String>,
+        }
+        serde_json::from_slice::<IdTokenAnswer>(&answer.body)
+            .ok()
+            .and_then(|answer| answer.id_token)
+            .filter(|id_token| !id_token.is_empty())
+            .map(zeroize::Zeroizing::new)
+            .ok_or(DelegationFailureReason::ConsentIdentityMissing)
+    };
+    tokio::time::timeout(egress.timeout, exchange)
+        .await
+        .map_err(|_| DelegationFailureReason::TokenExchangeFailed)?
 }
 
 /// Log at debug, once per provider, surface and reason, why a caller of a
@@ -697,6 +928,32 @@ mod tests {
         ));
     }
 
+    /// Mint refuses through the save rules too: a setting edited to name the
+    /// caller by a claim the save rules refuse confirms nobody.
+    #[tokio::test]
+    async fn a_setting_the_save_rules_now_refuse_confirms_nobody() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let alice = caller(ISSUER, "sub", Some("confirming"));
+        let strategies = stored(strategy(ISSUER, None));
+        for (claim, reason) in [
+            ("preferred_username", Unconfirmed::EditableClaim),
+            ("email", Unconfirmed::EditableClaim),
+            ("iss", Unconfirmed::IdTokenClaimInvalid),
+        ] {
+            let mut edited = provider(true);
+            edited
+                .consent_confirmation
+                .as_mut()
+                .unwrap()
+                .id_token_principal_claim = Some(claim.to_string());
+            assert_eq!(
+                decide_for(&edited, Some(&alice), Some(&strategies)).await,
+                ConfirmDecision::Unconfirmed(reason),
+                "{claim}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn without_a_configured_pepper_nobody_is_confirmed() {
         crate::identity::credential_identity::configure_pepper_for_tests(false);
@@ -717,6 +974,48 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The vault key recomputed from an ID token is the one the Access Point
+    /// computed from the same person's access token: the value comes from the
+    /// ID token's claim and is hashed under the strategy's claim name, whatever
+    /// else the ID token says.
+    #[test]
+    fn an_id_token_gives_the_vault_key_of_the_same_persons_access_token() {
+        let access_token = |claim: &str, value: &str| {
+            AuthenticatedIdentity::JwtBearer {
+                subject: value.to_string(),
+                principal_claim: claim.to_string(),
+                claims: json!({"iss": ISSUER, claim: value, "scp": "read"}),
+                strategy_id: Some("confirming".to_string()),
+            }
+            .principal_hash(TENANT)
+        };
+        let id_token = |claims: Value, strategy_claim: &str, id_token_claim: &str| {
+            confirmed_identity_hash(claims, ConfirmationClaims { strategy_claim, id_token_claim }, "confirming", TENANT)
+        };
+        assert_eq!(
+            id_token(json!({"iss": ISSUER, "sub": "alice", "nonce": "n"}), "sub", "sub"),
+            access_token("sub", "alice")
+        );
+        assert_eq!(
+            id_token(json!({"iss": ISSUER, "sub": "pairwise", "oid": "person-1"}), "oid", "oid"),
+            access_token("oid", "person-1"),
+            "an Entra caller named by oid, whose sub differs per application"
+        );
+        assert_eq!(
+            id_token(json!({"iss": ISSUER, "sub": "00u1", "uid": "alice"}), "sub", "uid"),
+            access_token("sub", "alice"),
+            "the ID token's uid hashed as the access token's sub"
+        );
+        assert_ne!(
+            id_token(json!({"iss": ISSUER, "sub": "00u1", "uid": "alice"}), "sub", "uid"),
+            access_token("uid", "alice"),
+            "the hash takes the strategy's claim name, not the ID token's"
+        );
+        assert_ne!(id_token(json!({"iss": ISSUER, "sub": "mallory"}), "sub", "sub"), access_token("sub", "alice"));
+        assert_eq!(id_token(json!({"iss": ISSUER, "sub": 7}), "sub", "sub"), None);
+        assert_eq!(id_token(json!({"sub": "alice"}), "sub", "sub"), None, "no issuer");
     }
 
     #[test]
