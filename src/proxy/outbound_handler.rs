@@ -17954,7 +17954,7 @@ mod tests {
         })
         .await;
 
-        assert!(matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)), "{sent:?}");
+        assert!(matches!(sent, Err(OutboundPipelineError::UpstreamResponseCompressed)), "{sent:?}");
         let calls = connector_calls(&events);
         assert_eq!(calls.len(), 1, "{events:?}");
         match &calls[0].event {
