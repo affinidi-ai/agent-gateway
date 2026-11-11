@@ -463,8 +463,10 @@ impl FilesystemIdentityStore {
     /// The rotation history of a record that counts none, kept when one exists: a release
     /// that does not track `rotation_count` drops it when it saves the record. The record's
     /// inline rotations already at the end of that history, saved there before a failed
-    /// record save, are dropped so they are not kept twice. A history that cannot be read
-    /// is replaced, as it was before such a history was kept, since nothing counts it.
+    /// record save, are dropped so they are not kept twice. A history that does not decrypt
+    /// or parse is replaced, as it was before such a history was kept, since nothing counts
+    /// it. Any other read failure, such as a disk or key service outage, fails the write, so
+    /// a history that may read again is never replaced.
     async fn uncounted_rotations(
         &self,
         record: &mut AgentIdentityRecord,
@@ -477,6 +479,7 @@ impl FilesystemIdentityStore {
             Ok(history) => history
                 .map(|history| history.rotations)
                 .unwrap_or_default(),
+            Err(e) if !e.is::<crate::storage::filesystem::UnreadableRecord>() => return Err(e),
             Err(e) => {
                 tracing::warn!(
                     identity_hash = %record.identity_hash,
@@ -1944,6 +1947,41 @@ mod tests {
             .map(|rotation| rotation.rotated_at)
             .collect();
         assert_eq!(rotated_at, vec![Some(at(60))]);
+    }
+
+    #[tokio::test]
+    async fn test_history_of_a_record_without_rotation_count_that_fails_to_load_is_not_replaced() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        let history_dir = temp_dir
+            .path()
+            .join(ROTATION_HISTORY_DIR);
+        std::fs::write(history_dir.join("h.json.enc"), b"encrypted history").unwrap();
+
+        let result = store
+            .apply_managed_source("h", &observed(60), &api_key_fields())
+            .await;
+
+        assert!(result.is_err(), "a read failure other than a torn file fails the rotation");
+        assert!(
+            !history_dir
+                .join("h.json")
+                .exists(),
+            "the history that may read again is not replaced"
+        );
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.rotation_count, 0);
+        assert_eq!(record.credential_updated_at, Some(at(0)));
     }
 
     #[tokio::test]

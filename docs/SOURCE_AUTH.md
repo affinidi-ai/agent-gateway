@@ -1686,11 +1686,14 @@ existed keeps its rotations inline in `rotations`; the next write of that record
 to the history.
 
 A record that counts no rotations beside an existing history file, as after the record was
-saved by a release that does not track `rotation_count`, lists no rotations until its next
-rotation. That rotation keeps the history on file and adds to it, or replaces it when the file
-cannot be read. A history file that cannot be read, such as one torn by an interrupted write
-before writes went through a temporary file, fails every rotation of a record that counts
-rotations, and its rotations request answers `500`, until the file is restored or removed.
+saved by a release that does not track `rotation_count`, lists only the rotations it holds
+inline, if any, until the history is next written: on its next rotation, or on its next write
+of any kind while it holds rotations inline. That write keeps the history on file and adds to
+it, or replaces it when the file does not decrypt or parse. Any other failure to read the file,
+such as a disk or key service outage, fails the write and leaves the file in place. A history
+file that cannot be read, such as one torn by an interrupted write before writes went through
+a temporary file, fails every rotation of a record that counts rotations, and its rotations
+request answers `500`, until the file is restored or removed.
 
 Identities rows and WebSocket identity updates carry `rotation_count`, not the rotations.
 `GET /api/v1/identities/by-hash/{identity_hash}/rotations` lists them, oldest first, under the
