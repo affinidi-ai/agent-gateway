@@ -460,6 +460,7 @@ mod tests {
 
     fn api_key_config() -> SourceAuthConfig {
         SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+            id: None,
             extraction: crate::source_auth::models::CredentialExtraction::HttpHeader { field: "x-api-key".to_string() },
             secret_id: "key".to_string(),
         })

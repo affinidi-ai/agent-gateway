@@ -625,6 +625,7 @@ mod tests {
         let pki = build_pki("alice", vec![], false, 3600);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Pinned {
                 certificate_ids: vec!["c1".into()],
             },
@@ -650,6 +651,7 @@ mod tests {
         let other = build_pki("eve", vec![], false, 3600);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Pinned {
                 certificate_ids: vec!["c1".into()],
             },
@@ -677,6 +679,7 @@ mod tests {
         );
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -705,6 +708,7 @@ mod tests {
         let other_ca = build_pki("eve", vec![], true, 3600);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -726,6 +730,7 @@ mod tests {
         let pki = build_pki("alice", vec![], false, 3600);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -747,6 +752,7 @@ mod tests {
         let pki = build_pki("alice", vec![], true, 3600);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -769,6 +775,7 @@ mod tests {
         let mut peer = peer_from_der(pki.client_der.clone());
         peer.source = PeerCertSource::Forwarded;
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -799,6 +806,7 @@ mod tests {
         );
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -832,6 +840,7 @@ mod tests {
         );
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -863,6 +872,7 @@ mod tests {
         let pki = build_pki("alice", vec![], true, 1);
         let peer = peer_from_der(pki.client_der.clone());
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca1".into()],
                 require_client_auth_eku: true,
@@ -947,6 +957,7 @@ mod tests {
         let peer = peer_with_intermediates(leaf_der, vec![int_der]);
 
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["root".into()],
                 require_client_auth_eku: true,
@@ -995,6 +1006,7 @@ mod tests {
         assert_ne!(old_pem, renewed_pem, "the renewed certificate is another certificate");
         let (other_pem, _, other_issuer) = ca_named("Org CA", None);
         let cfg = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: vec!["ca0".into()],
                 require_client_auth_eku: true,
@@ -1078,6 +1090,7 @@ mod tests {
     #[test]
     fn the_identity_hash_keys_an_mtls_caller_by_the_trust_anchor_that_verified_it() {
         let ca_trust = |cas: &[&[u8]]| MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Ca {
                 ca_certificate_ids: (0..cas.len())
                     .map(|i| format!("ca{i}"))
@@ -1122,6 +1135,7 @@ mod tests {
         assert_eq!(verify(&partner_alice, &both).principal_hash(None), by_partner.principal_hash(None));
 
         let pinned_trust = MtlsAuthConfig {
+            id: None,
             trust: MtlsTrust::Pinned {
                 certificate_ids: vec!["c1".into()],
             },

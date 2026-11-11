@@ -162,6 +162,11 @@ impl AudienceClaim {
 /// JWT Bearer-specific authentication configuration attached to a channel or pipe.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JwtBearerAuthConfig {
+    /// Stable identifier of this method within its `methods` list, assigned by
+    /// the dashboard and kept across edits and reordering. Names the method an
+    /// inbound identity is derived from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// UUID of the `JwtVerificationStrategy` to use for validation.
     pub jwt_verification_strategy_id: String,
 
@@ -203,6 +208,7 @@ fn default_token_scheme() -> String {
 impl Default for JwtBearerAuthConfig {
     fn default() -> Self {
         Self {
+            id: None,
             jwt_verification_strategy_id: String::new(),
             audiences: Vec::new(),
             audience_claim: AudienceClaim::Aud,

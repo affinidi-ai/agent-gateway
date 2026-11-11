@@ -144,6 +144,7 @@ fn verify_transfer_authorization(
     let doc_json =
         serde_json::to_value(&latest_entry.state).map_err(|e| format!("Failed to serialize DID document: {e}"))?;
     let config = DidAuthAuthConfig {
+        id: None,
         extraction: CredentialExtraction::HttpHeader {
             field: "Authorization".to_string(),
         },

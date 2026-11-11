@@ -145,9 +145,16 @@ _Surface Builder_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-bui
 
 The Surface Builder's inbound Identity **From API Key** shows no key picker, since each caller is
 identified by the API key it presents, and blocks Save unless every Caller Context method is API
-Key or API Key Provider; the protected and external Identities' key picker lists only the
+Key or API Key Provider or it names the API key method it reads; the protected and external Identities' key picker lists only the
 surface's own active keys; see _Surface Builder_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder).
+
+With several Caller Context methods, an inbound From JWT Claims or From API Key Identity shows an
+**Identity source method** select that writes `identity_slots.inbound_source_method` (the `id` of
+the method it reads); the gateway then refuses a caller authenticated by any other method; see
+_Method ids and the Identity source method_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#surface-builder) and
+[`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#naming-the-method-an-inbound-identity-reads).
 
 A protected, external or Transit Point Identity whose API key reference is `blocking`
 (`api_key_references`: a revoked or deleted key, or another surface's key that is revoked or

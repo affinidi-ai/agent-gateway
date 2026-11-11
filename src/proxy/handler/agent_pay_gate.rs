@@ -6526,6 +6526,7 @@ pub(crate) mod tests {
         paid.access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
             methods: vec![crate::source_auth::SourceAuthConfig::ApiKey(crate::source_auth::models::ApiKeyAuthConfig {
+                id: None,
                 extraction: crate::source_auth::models::CredentialExtraction::HttpHeader {
                     field: "x-api-key".to_string(),
                 },

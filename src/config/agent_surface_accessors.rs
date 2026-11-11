@@ -105,6 +105,40 @@ impl AgentSurface {
             )
     }
 
+    /// The `mode` label of the identity-resolution metric for the inbound slot.
+    pub fn inbound_identity_mode_label(&self) -> &'static str {
+        if self.inbound_identity_from_api_key() {
+            "from_api_key"
+        } else {
+            "from_jwt_claim"
+        }
+    }
+
+    /// Why a request verified by `method` gets no inbound identity: the
+    /// identity names, in `identity_slots.inbound_source_method`, another
+    /// method to derive it from. `None` when no method is named or `method`
+    /// is the one. The caller is refused, never given an identity from a
+    /// credential the identity does not read.
+    pub fn inbound_source_method_refusal(
+        &self,
+        method: &crate::source_auth::SourceAuthConfig,
+    ) -> Option<String> {
+        let selected = self
+            .identity_slots
+            .inbound_source_method
+            .as_deref()?;
+        if method.id() == Some(selected) {
+            return None;
+        }
+        Some(format!(
+            "inbound identity is derived from method '{selected}', but the caller authenticated with {} method {}",
+            method.method_tag(),
+            method
+                .id()
+                .map_or_else(|| "without an id".to_string(), |id| format!("'{id}'"))
+        ))
+    }
+
     #[inline]
     pub fn has_source_auth(&self) -> bool {
         !self
@@ -1919,6 +1953,41 @@ mod tests {
             shared_key.target_grant_agent_did(Some("did:web:planner.example")),
             "did:web:planner.example",
             "a view that cannot release grants to partners keeps them per agent"
+        );
+    }
+
+    fn two_method_surface(selected: Option<&str>) -> AgentSurface {
+        let mut surface = surface_with_methods(serde_json::json!([
+            {"type": "jwt_bearer", "id": "users-jwt", "jwt_verification_strategy_id": "st", "audiences": ["a"]},
+            {"type": "api_key", "id": "partner-key", "extraction": {"source": "http_header", "field": "X-API-Key"}, "secret_id": "keys"},
+            {"type": "api_key", "extraction": {"source": "http_header", "field": "X-Legacy"}, "secret_id": "old"}
+        ]));
+        surface
+            .identity_slots
+            .inbound_source_method = selected.map(str::to_string);
+        surface
+    }
+
+    #[test]
+    fn an_unset_source_method_refuses_no_authenticated_method() {
+        let surface = two_method_surface(None);
+        for method in surface.source_auth_methods() {
+            assert_eq!(surface.inbound_source_method_refusal(method), None);
+        }
+    }
+
+    #[test]
+    fn a_selected_source_method_admits_only_the_method_with_that_id() {
+        let surface = two_method_surface(Some("users-jwt"));
+        let methods = surface.source_auth_methods();
+        assert_eq!(surface.inbound_source_method_refusal(&methods[0]), None);
+        assert_eq!(
+            surface.inbound_source_method_refusal(&methods[1]),
+            Some("inbound identity is derived from method 'users-jwt', but the caller authenticated with api_key method 'partner-key'".to_string())
+        );
+        assert_eq!(
+            surface.inbound_source_method_refusal(&methods[2]),
+            Some("inbound identity is derived from method 'users-jwt', but the caller authenticated with api_key method without an id".to_string())
         );
     }
 }

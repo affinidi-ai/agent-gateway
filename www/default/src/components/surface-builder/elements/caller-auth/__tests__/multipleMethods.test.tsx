@@ -270,7 +270,13 @@ describe('Caller Context editor: the method list', () => {
 
     expect(latest.config.methods).toEqual([
       JWT_METHOD,
-      { method_type: 'api_key', extraction_source: 'http_header', extraction_field: 'X-API-Key' },
+      {
+        method_type: 'api_key',
+        extraction_source: 'http_header',
+        extraction_field: 'X-API-Key',
+        id: expect.stringMatching(/^method-[a-z0-9]+$/),
+        id_generated: true,
+      },
     ]);
     expect(screen.getByText('Method 2 settings')).toBeInTheDocument();
     expect(screen.queryByTestId('caller-auth-editor-add-method-menu')).toBeNull();
