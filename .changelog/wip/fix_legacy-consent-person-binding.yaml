@@ -28,9 +28,8 @@ changes:
         it changes expected_issuer to one that a credential provider naming the strategy would
         refuse at its own save: an issuer of this gateway's own STS or an Entra issuer while
         callers are named by sub for consent_confirmation, or an issuer that is not a canonical
-        https URL (no credentials, query or fragment, and written as parsed, so a bare host needs
-        its trailing slash) for consent_identity_strategy_id. Before, such an edit silently made consent confirmation
-        confirm nobody.
+        https URL for consent_identity_strategy_id. Before, such an edit silently made consent
+        confirmation confirm nobody, or stopped modern consent from finding the strategy.
   fixed: []
   removed: []
   security:

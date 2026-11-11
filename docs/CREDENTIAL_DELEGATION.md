@@ -59,7 +59,7 @@ them at another strategy before deleting one.
 | `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
 | `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity, caller key), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
 | `DELETE /api/v1/jwt-verification-strategies/{id}` | A credential provider's `consent_confirmation.jwt_verification_strategy_id` or `consent_identity_strategy_id` names the strategy. Surface methods are not checked | None: point the providers at another strategy first |
-| `PUT /api/v1/jwt-verification-strategies/{id}` that changes `expected_issuer` | A credential provider names the strategy and its own save would refuse the new issuer: for `consent_confirmation`, this gateway's own `sts.mcp_issuer` or an Entra issuer while a caller is named by `sub`; for `consent_identity_strategy_id`, an issuer that is not a canonical https URL: `https`, with a host, no credentials, query or fragment, and written as the URL parser writes it back, so `https://idp.example` is refused and `https://idp.example/` accepted | None: point the providers at another strategy first |
+| `PUT /api/v1/jwt-verification-strategies/{id}` that changes `expected_issuer` | A credential provider names the strategy and its own save would refuse the new issuer: for `consent_confirmation`, this gateway's own `sts.mcp_issuer` or an Entra issuer while a caller is named by `sub`; for `consent_identity_strategy_id`, an issuer that is not a canonical https URL: `https`, with a host, no credentials, query or fragment, and in no form the URL parser rewrites, such as a bare host with no path (`https://idp.example`), an upper-case host or an explicit `:443`. The issuer is also compared exactly with every token's `iss`, so an identity provider whose `iss` is a bare host cannot back `consent_identity_strategy_id`; adding a trailing slash its tokens don't carry refuses every caller of the strategy | None: point the providers at another strategy first |
 
 The other refusals answer a `409` body that keeps the `message` field current clients show:
 
@@ -2036,8 +2036,10 @@ links are minted unconfirmed`. `PathNotCovered` is logged at `WARN` as `Consent 
 unconfirmed for a Transit Point or Fabric caller: its grant can also be released to the
 surface's Access Point callers when the Transit Point has no managed identity of its own`.
 `OtherIssuer` and `OtherPrincipalClaim` are logged at `WARN` as `Consent link minted
-unconfirmed: the caller's issuer or principal claim is not the confirming strategy's`, since a
-strategy whose issuer or claim differs from every caller's confirms nobody. The other reasons
+unconfirmed: the caller's issuer or principal claim is not the confirming strategy's`. It is
+expected on a surface that also accepts callers of another strategy; on a surface whose
+callers all use the confirming strategy, it means the strategy's issuer or claim differs from
+theirs and confirms nobody. The other reasons
 concern one caller or request, and are logged at `DEBUG` as `Consent link minted without
 confirming its caller at their identity provider`.
 The link fails instead only when the strategy cannot be read.
