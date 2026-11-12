@@ -293,6 +293,20 @@ impl ConnectionPointStore for FileSystemConnectionPointStore {
             .delete(id)
             .await?;
         if let Some(hook) = self.event_hook.get() {
+            if let Ok(Some(record)) = &previous
+                && let Some(reserved) = &record.reserved_permanent
+                && matches!(
+                    self.storage
+                        .get(&reserved.cp_id)
+                        .await,
+                    Ok(None)
+                )
+            {
+                hook.emit(
+                    crate::event_hook::EventKind::CreationFailed,
+                    crate::event_hook::ConnectionPointPayload::reserved(record, reserved),
+                );
+            }
             match &previous {
                 Ok(Some(record)) if record.is_announced() => hook.emit(
                     crate::event_hook::EventKind::Deleted,
