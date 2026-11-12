@@ -19,6 +19,7 @@ Feature: Surface runtime updates and removal
     Given the operator has disabled the surface
     When the caller sends a request to the surface path "/example/foo"
     Then the response status is 404
+    And the response says only that no surface is served at "/example/foo"
     And managed agent "bravo" was not called
 
   Scenario: A disabled surface remains readable through the admin API
@@ -33,6 +34,7 @@ Feature: Surface runtime updates and removal
     Given the operator has deleted the surface
     When the caller sends a request to the surface path "/example/foo"
     Then the response status is 404
+    And the response says only that no surface is served at "/example/foo"
     And managed agent "bravo" was not called
 
   Scenario: A deleted surface is no longer readable through the admin API

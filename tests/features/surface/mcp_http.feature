@@ -182,3 +182,9 @@ Feature: HTTP MCP surface forwarding
     When the caller invokes MCP tool "delete_everything"
     Then the response status is 200
     And the MCP response is a JSON-RPC error with code -32000
+
+  Scenario: A legacy JSON-RPC batch is refused with the protocol-neutral batch refusal
+    When the caller sends a legacy batch of MCP tool catalog requests
+    Then the response status is 422
+    And the response says only that JSON-RPC batches are not supported
+    And MCP server "bravo" was not called

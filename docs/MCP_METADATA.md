@@ -262,7 +262,7 @@ or tool-scoped credentials:
 
 | Body | Legacy result | Modern result |
 | --- | --- | --- |
-| JSON-RPC batch (top-level array) | HTTP `422` problem details | HTTP `400`, `-32600` |
+| JSON-RPC batch (top-level array) | HTTP `422` problem details, type `about:blank`, `code` `batch_not_supported` | HTTP `400`, `-32600` |
 | Not valid JSON, such as a batch behind a UTF-8 BOM | HTTP `200`, `-32700` | HTTP `400`, `-32700` |
 | JSON that is not an object | HTTP `200`, `-32600` | HTTP `400`, `-32600` |
 | Two keys of one object, at any depth, that are equal or differ only in case | HTTP `200`, `-32600` | HTTP `400`, `-32600` |

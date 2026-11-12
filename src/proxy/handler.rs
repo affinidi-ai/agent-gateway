@@ -9999,10 +9999,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     404,
                     None,
                 );
-                return create_error_response(
-                    StatusCode::NOT_FOUND,
-                    &format!("No route configured for path: {}", path),
-                );
+                return no_route_response(&path);
             };
             crate::observability::policy_audit::set_request_variant(&recorded_variant);
 
@@ -10134,12 +10131,18 @@ async fn multi_channel_proxy_handler_in_request_scope(
                 404,
                 None,
             );
-            create_error_response(StatusCode::NOT_FOUND, &format!("No route configured for path: {}", path))
+            no_route_response(&path)
         }
     }
 }
 
 // Helper functions
+
+fn no_route_response(path: &str) -> Response {
+    crate::protocols::no_route_response(&format!(
+        "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+    ))
+}
 
 /// Format an error response body as a human-readable tail for the gateway log
 /// (e.g. ` | code=identity_did_failed | slot=protected_identity | channel=MCP Testkit 1 | detail=...`).
@@ -15388,7 +15391,7 @@ async fn handle_mcp_proxy_request_inner(
         })?
         .ok_or_else(|| {
             error!(channel = channel_name, proxy_id = proxy_id, "MCP proxy not found");
-            create_error_response(StatusCode::NOT_FOUND, &format!("MCP proxy '{}' not found", proxy_id))
+            crate::protocols::no_mcp_proxy_response()
         })?;
 
     if matches!(proxy.status, crate::mcp_proxies::types::McpProxyStatus::Disabled) {
@@ -16082,7 +16085,7 @@ async fn load_owned_proxy(
         .get(proxy_id)
         .await
         .map_err(|_| create_error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to load MCP proxy"))?
-        .ok_or_else(|| create_error_response(StatusCode::NOT_FOUND, "MCP proxy was not found"))
+        .ok_or_else(crate::protocols::no_mcp_proxy_response)
 }
 
 /// What a request gets when the Target's circuit breaker is open.
@@ -23520,37 +23523,256 @@ allow if {
         assert_eq!(values, ["gateway-key"]);
     }
 
-    #[tokio::test]
-    async fn a_connection_routed_with_a_disabled_surface_is_refused() {
-        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
-        let surface = mcp_surface("retired-surface", &target.url, None);
-        let mut router = direct_router_state(&bare_proxy_state(surface.clone(), None), surface.clone());
-        let cache = std::sync::Arc::new(crate::surfaces::ResolvedSurfaceCache::new());
-        cache
-            .upsert(&surface)
-            .unwrap();
-        router.resolved_surface_cache = cache.clone();
-        let send = || {
+    struct CachedSurface {
+        target: crate::component_tests::helpers::RecordingTarget,
+        surface: crate::config::agent_surface::AgentSurface,
+        cache: std::sync::Arc<crate::surfaces::ResolvedSurfaceCache>,
+        router: crate::state::MultiSurfaceProxyState,
+    }
+
+    impl CachedSurface {
+        async fn new() -> Self {
+            let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+            let surface = mcp_surface("retired-surface", &target.url, None);
+            let mut router = direct_router_state(&bare_proxy_state(surface.clone(), None), surface.clone());
+            let cache = std::sync::Arc::new(crate::surfaces::ResolvedSurfaceCache::new());
+            cache
+                .upsert(&surface)
+                .unwrap();
+            router.resolved_surface_cache = cache.clone();
+            Self { target, surface, cache, router }
+        }
+
+        fn retire(&self) {
+            self.cache
+                .remove(&self.surface.surface_id);
+        }
+
+        async fn send(
+            &self,
+            request: axum::http::Request<axum::body::Body>,
+        ) -> axum::response::Response {
             super::multi_channel_proxy_handler(
                 axum::extract::ConnectInfo(
                     "127.0.0.1:12345"
                         .parse()
                         .unwrap(),
                 ),
-                axum::extract::State(router.clone()),
-                legacy_mcp_request(
-                    "/retired-surface",
-                    &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
-                ),
+                axum::extract::State(self.router.clone()),
+                request,
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_routed_with_a_disabled_surface_is_refused() {
+        let served = CachedSurface::new().await;
+        let request = || {
+            legacy_mcp_request(
+                "/retired-surface",
+                &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
             )
         };
-        assert_eq!(send().await.status(), axum::http::StatusCode::OK);
-        assert_eq!(target.received().len(), 1);
+        assert_eq!(
+            served
+                .send(request())
+                .await
+                .status(),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(served.target.received().len(), 1);
 
-        cache.remove(&surface.surface_id);
+        served.retire();
 
-        assert_eq!(send().await.status(), axum::http::StatusCode::NOT_FOUND);
-        assert_eq!(target.received().len(), 1, "a retired surface must not reach its target");
+        assert_no_route_response(served.send(request()).await, "/retired-surface").await;
+        assert_eq!(served.target.received().len(), 1, "a retired surface must not reach its target");
+    }
+
+    fn a2a_shaped_request(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("a2a-version", "1.0")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "message/send",
+                    "params": {"message": {"role": "user", "parts": [{"text": "hello"}]}}
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    }
+
+    async fn assert_no_route_response(
+        response: axum::response::Response,
+        path: &str,
+    ) {
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "about:blank",
+                "title": "Not Found",
+                "status": 404,
+                "code": "no_route",
+                "detail": format!(
+                    "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+                ),
+            })
+        );
+    }
+
+    async fn send_to_retired_surface(request: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+        let served = CachedSurface::new().await;
+        served.retire();
+        served.send(request).await
+    }
+
+    async fn send_to_unknown_path(request: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+        let target = crate::component_tests::helpers::RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+        let surface = mcp_surface("known-surface", &target.url, None);
+        let state = bare_proxy_state(surface.clone(), None);
+        send_to_surface(&state, surface, request).await
+    }
+
+    #[tokio::test]
+    async fn an_mcp_request_on_an_unknown_path_gets_the_neutral_no_route_response() {
+        let request = legacy_mcp_request(
+            "/missing-surface",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        assert_no_route_response(send_to_unknown_path(request).await, "/missing-surface").await;
+    }
+
+    #[tokio::test]
+    async fn an_a2a_request_on_an_unknown_path_gets_the_neutral_no_route_response() {
+        assert_no_route_response(
+            send_to_unknown_path(a2a_shaped_request("/missing-surface")).await,
+            "/missing-surface",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_mcp_request_on_a_retired_surface_gets_the_neutral_no_route_response() {
+        let request = legacy_mcp_request(
+            "/retired-surface",
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        );
+        assert_no_route_response(send_to_retired_surface(request).await, "/retired-surface").await;
+    }
+
+    #[tokio::test]
+    async fn an_a2a_request_on_a_retired_surface_gets_the_neutral_no_route_response() {
+        assert_no_route_response(
+            send_to_retired_surface(a2a_shaped_request("/retired-surface")).await,
+            "/retired-surface",
+        )
+        .await;
+    }
+
+    async fn send_to_proxy_access_point(
+        proxy_exists: bool,
+        body: &serde_json::Value,
+    ) -> axum::response::Response {
+        use crate::mcp_proxies::filesystem::McpProxyStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(
+            crate::mcp_proxies::FileSystemMcpProxyStore::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let proxy = crate::mcp_proxies::types::McpProxy::new(
+            "Owned tools".into(),
+            String::new(),
+            "https://example.com".into(),
+            serde_json::json!({"openapi": "3.0.0", "info": {"title": "Tools", "version": "1.0"}, "paths": {}})
+                .to_string(),
+            "/mcp".into(),
+            "/owned-tools".into(),
+        );
+        if proxy_exists {
+            store
+                .create(&proxy)
+                .await
+                .unwrap();
+        }
+        let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "proxy-surface", "name": "Proxy surface",
+            "access_point": {"listen_address": "https://gateway.example", "route": "/proxy-surface", "protocol": "mcp"},
+            "target": {"endpoint": format!("proxy://{}", proxy.id)}
+        }))
+        .unwrap();
+        let state = crate::state::ProxyState {
+            mcp_proxy_store: Some(store),
+            ..bare_proxy_state(surface.clone(), None)
+        };
+        send_to_surface(&state, surface, legacy_mcp_request("/proxy-surface", body)).await
+    }
+
+    async fn problem_json(response: axum::response::Response) -> (axum::http::StatusCode, serde_json::Value) {
+        let status = response.status();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_batch_sent_to_an_mcp_proxy_access_point_is_refused_with_the_neutral_batch_body() {
+        let batch = serde_json::json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]);
+        let (status, body) = problem_json(send_to_proxy_access_point(true, &batch).await).await;
+        assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "about:blank",
+                "title": "Unprocessable Entity",
+                "status": 422,
+                "code": "batch_not_supported",
+                "detail": "JSON-RPC batches are not supported",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_access_point_whose_mcp_proxy_is_missing_gets_the_neutral_no_route_response() {
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let (status, body) = problem_json(send_to_proxy_access_point(false, &request).await).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "about:blank",
+                "title": "Not Found",
+                "status": 404,
+                "code": "no_route",
+                "detail": "No MCP Proxy is served at this entry point. Check that the MCP Proxy is saved and enabled.",
+            })
+        );
     }
 
     #[tokio::test]
