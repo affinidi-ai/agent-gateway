@@ -276,7 +276,8 @@ Feature: A2A HTTP surface forwarding and identity
     And managed agent "bravo" did not receive a POST request at path "/.well-known/agent-card.json"
 
   Scenario: A path whose case differs is not served as the agent card fetch
-    Given the surface requires "API Key" source authentication and forwards failed callers to policy
+    Given the surface requires "API Key" source authentication
+    And the surface is stored with a public Access Point
     And the gateway authenticates to the managed agent with secret "bdd-target-api-key" holding "bdd-target-secret" in header "x-target-api-key"
     When the caller sends a GET request to the surface route path "/.well-known/Agent-Card.json"
     Then the response status is 200

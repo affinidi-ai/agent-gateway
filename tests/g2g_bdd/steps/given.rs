@@ -689,18 +689,6 @@ fn surface_is_stored_as_a_legacy_surface(
     surface_spec_mut(world, &surface_name).legacy_access_point = true;
 }
 
-/// The fixture sets neither `access_point.public` nor `on_failure`, so the
-/// Access Point forwards a caller whose API key is missing or invalid to policy.
-#[given(
-    regex = r#"^surface "([^"]+)" requires "API Key" source authentication and forwards failed callers to policy$"#
-)]
-pub async fn surface_requires_api_key_and_forwards_failed_callers(
-    world: &mut G2gWorld,
-    surface_name: String,
-) {
-    surface_requires_api_key(world, surface_name).await;
-}
-
 #[given(expr = "surface {string} fetches its agent card from path {string}")]
 pub async fn surface_fetches_its_agent_card_from_path(
     world: &mut G2gWorld,

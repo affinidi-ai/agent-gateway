@@ -19,10 +19,11 @@ Feature: Protected agent card fetch over Fabric
     And managed agent "bravo" received a GET request at path "/.well-known/agent-card.json"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "x-target-api-key" with value "bdd-target-secret"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "accept-language" with value "en-GB"
+    And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" carried header "accept-encoding" with value "identity"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-forwarded-user"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-caller-note"
     And the GET request at path "/.well-known/agent-card.json" to managed agent "bravo" did not carry header "x-gateway-trace-id"
-    And the GET request at path "/.well-known/agent-card.json" that gateway 2 sent to managed agent "bravo" carried only headers "accept, accept-language, x-target-api-key"
+    And the GET request at path "/.well-known/agent-card.json" that gateway 2 sent to managed agent "bravo" carried only headers "accept, accept-encoding, accept-language, x-target-api-key"
 
   Scenario: gateway 2 refuses the agent card fetch when its Target credential cannot be resolved
     Given a fabric with 2 gateways
@@ -101,7 +102,8 @@ Feature: Protected agent card fetch over Fabric
   Scenario: gateway 2 fetches the configured card location with its Target credential for a caller without an API key
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
-    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" is stored with a public Access Point
     And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
@@ -218,7 +220,8 @@ Feature: Protected agent card fetch over Fabric
   Scenario: gateway 2 forwards an authenticated caller's POST to its configured card location with its body and Target credential
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
-    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" is stored with a public Access Point
     And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
@@ -232,7 +235,8 @@ Feature: Protected agent card fetch over Fabric
   Scenario: gateway 2 forwards a POST to its configured card location from a caller without an API key without its Target credential
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
-    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" is stored with a public Access Point
     And surface "alpha" fetches its agent card from path "/cards/me"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
@@ -245,7 +249,8 @@ Feature: Protected agent card fetch over Fabric
   Scenario: gateway 2 does not treat a card path whose case differs as its agent card fetch
     Given a fabric with 2 gateways
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
-    And surface "alpha" requires "API Key" source authentication and forwards failed callers to policy
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" is stored with a public Access Point
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
     When the caller sends a GET request to gateway 1 surface "charlie" path "/.well-known/Agent-Card.json"

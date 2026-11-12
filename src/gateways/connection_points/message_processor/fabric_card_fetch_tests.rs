@@ -123,6 +123,7 @@ fn protected_surface(
     card_location: Option<&str>,
 ) -> AgentSurface {
     let mut value = serde_json::to_value(surface("a2a", target, &[])).unwrap();
+    value["access_point"]["public"] = json!(true);
     value["target"]["auth"] =
         json!({ "method": { "static_secret": { "secret_id": secret_id, "header_name": TARGET_KEY_HEADER } } });
     if let Some(location) = card_location {
@@ -450,7 +451,8 @@ async fn a_passthrough_card_fetch_over_fabric_without_its_credential_returns_the
         .filter(|name| *name != "host")
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["accept", "accept-language", "user-agent"]);
+    assert_eq!(names, ["accept", "accept-encoding", "accept-language", "user-agent"]);
+    assert_eq!(header_values(&request.headers, "accept-encoding"), ["identity"]);
     assert_eq!(header_values(&request.headers, "accept"), ["application/json"]);
     assert_eq!(header_values(&request.headers, "accept-language"), ["en-GB"]);
     assert_eq!(header_values(&request.headers, "user-agent"), ["peer-agent"]);

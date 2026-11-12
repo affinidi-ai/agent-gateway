@@ -465,8 +465,9 @@ the [direct path](PROTOCOLS.md#agent-card-fetch)'s header, body and failure rule
 path is exactly `/.well-known/agent-card.json` or the surface's configured card location, the paths
 a sending gateway's card fetch asks for, is a card fetch
 ([`is_fabric_card_fetch`](../src/proxy/handler.rs)). That fetch is the gateway's own request: a `GET` with no body, sent to the card path under the Target endpoint (or
-the configured location on the Target's origin), carrying `target.auth` and only the peer's
-`Accept`, `Accept-Language` and `User-Agent`. The peer's `Authorization`, `Cookie`, other headers
+the configured location on the Target's origin), carrying `target.auth`, the gateway's own
+`Accept-Encoding: identity` and, from the peer, only `Accept`, `Accept-Language` and `User-Agent`.
+The peer's `Authorization`, `Cookie`, other headers
 and body are dropped, and the fetch carries no caller's material: no delegated credential from
 `outbound_credentials` (so it never answers `consent_required`), no transit token, even at a
 configured card location, and no `X-Gateway-Trace-Id`.
