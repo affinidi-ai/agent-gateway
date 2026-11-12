@@ -260,6 +260,22 @@ async fn operator_creates_surface_with_authority_list(
     create_surface_with_trust_check_query(world, &route, query).await;
 }
 
+#[given(
+    expr = "the operator has created the surface for route {string} with a caller-leg Trust Check listing authorities {string}"
+)]
+async fn operator_has_created_surface_with_authority_list(
+    world: &mut SurfaceWorld,
+    route: String,
+    authorities: String,
+) {
+    operator_creates_surface_with_authority_list(world, route.clone(), authorities).await;
+    let response = world
+        .admin_response
+        .take()
+        .expect("the surface create was answered");
+    assert_eq!(response.status, 201, "creating surface {route}: {}", response.body);
+}
+
 #[when(
     expr = "the operator creates the surface for route {string} with a caller-leg Trust Check against DID {string} that also lists authorities {string}"
 )]
@@ -439,6 +455,35 @@ async fn stored_trust_check_is_not_linked(
     assert!(
         check
             .get("authority_source")
+            .is_none(),
+        "{check}"
+    );
+}
+
+#[then(
+    expr = "the stored Trust Check {string} of the surface under test takes listed authority {string} from the Authorities register"
+)]
+async fn stored_trust_check_takes_listed_authority_from_register(
+    world: &mut SurfaceWorld,
+    check_id: String,
+    did: String,
+) {
+    let check = stored_trust_check(world, &check_id).await;
+    assert_eq!(check["authority_sources"][did.as_str()], "authority", "{check}");
+}
+
+#[then(
+    expr = "the stored Trust Check {string} of the surface under test does not link listed authority {string} to any register"
+)]
+async fn stored_trust_check_does_not_link_listed_authority(
+    world: &mut SurfaceWorld,
+    check_id: String,
+    did: String,
+) {
+    let check = stored_trust_check(world, &check_id).await;
+    assert!(
+        check["authority_sources"]
+            .get(did.as_str())
             .is_none(),
         "{check}"
     );

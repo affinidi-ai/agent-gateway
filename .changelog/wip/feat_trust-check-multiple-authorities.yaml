@@ -11,6 +11,14 @@ changes:
         one result per authority under the element's id, so a surface can accept callers that any
         participating organisation recognises. The dashboard keeps such a list when it saves a
         surface but cannot edit it yet.
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Link each authority a Trust Check lists to the Authorities register
+      description: >-
+        Saving a surface or managed connection records, per DID in query.authority_ids, whether
+        it was picked from the Authorities register (authority_sources), as it does for
+        authority_id. A listed Authority that no longer exists fails only its own result with
+        AUTHORITY_NOT_FOUND without querying its registry, while the other authorities are queried,
+        and deleting an Authority that a Trust Check lists is refused naming that Trust Check.
   changed: []
   fixed: []
   removed: []

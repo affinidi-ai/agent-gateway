@@ -999,33 +999,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_authority_checks_are_not_checked_against_the_authorities_register() {
+    async fn a_listed_authority_that_is_gone_fails_only_its_own_result() {
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
         let (store, _dir) = authority_store("did:web:present").await;
         let client = CountingClient(std::sync::Mutex::new(Vec::new()));
-        let mut element = multi_authority(&["did:web:gone", "did:web:present"]);
-        element
-            .authority_sources
-            .insert(
-                "did:web:gone".to_string(),
-                crate::trust_registry_verification::authority_source::AuthoritySource::Authority,
-            );
+        let mut element = multi_authority(&["did:web:gone", "did:web:present", "did:web:typed"]);
+        for did in ["did:web:gone", "did:web:present"] {
+            element
+                .authority_sources
+                .insert(did.to_string(), AuthoritySource::Authority);
+        }
 
-        let ctx = run_trust_check_stage_with(
+        let (ctx, records) = crate::audit::producer::capture(run_trust_check_stage_with(
             "surf".into(),
             TrustCheckLeg::Caller,
             &[element],
             &json!({}),
             &client,
             Some(&store),
-        )
-        .await
-        .expect("expected Some");
+        ))
+        .await;
+        let results = ctx
+            .expect("expected Some")
+            .caller;
 
-        assert!(
-            ctx.caller
-                .iter()
-                .all(|result| result.ok)
+        assert_eq!(
+            outcomes(&results),
+            [("did:web:gone", Some("AUTHORITY_NOT_FOUND")), ("did:web:present", None), ("did:web:typed", None)]
         );
-        assert_eq!(*client.0.lock().unwrap(), ["did:web:gone", "did:web:present"]);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.id == "fi-recognised")
+        );
+        assert_eq!(
+            *client.0.lock().unwrap(),
+            ["did:web:present", "did:web:typed"],
+            "the gone Authority is not queried"
+        );
+        assert_eq!(records.len(), 3, "every listed authority is audited");
     }
 }

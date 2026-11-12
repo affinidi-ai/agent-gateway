@@ -110,3 +110,14 @@ Feature: Trust Check on the Access Point request edge
     Then the response status is 403
     And managed agent "bravo" was not called
     And the caller Trust Check reported error code "AUTHORITY_NOT_FOUND"
+
+  Scenario: A Trust Check that lists several authorities fails the one whose Authority no longer exists and still asks about the others
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "did:web:example.com:agent"
+    And the caller-leg Trust Check lists authorities "did:web:fi-a, did:web:fi-b"
+    And the caller-leg Trust Check takes listed authority "did:web:fi-a" from an Authority that no longer exists
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And the caller Trust Check reported error code "AUTHORITY_NOT_FOUND" for authority "did:web:fi-a"
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:fi-b"

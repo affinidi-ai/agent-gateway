@@ -273,7 +273,8 @@ impl TrustCheckElement {
     }
 
     /// One single-authority element per listed authority, in configuration
-    /// order, each keeping this element's `id` and waiting
+    /// order, each keeping this element's `id`, taking its `authority_source`
+    /// from `authority_sources` and waiting
     /// [`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`]. A single-authority
     /// element is returned unchanged.
     pub fn per_authority(&self) -> Vec<TrustCheckElement> {
@@ -283,7 +284,10 @@ impl TrustCheckElement {
         authorities
             .iter()
             .map(|authority| TrustCheckElement {
-                authority_source: None,
+                authority_source: self
+                    .authority_sources
+                    .get(authority)
+                    .copied(),
                 authority_sources: BTreeMap::new(),
                 query: TrqpQueryParams {
                     authority_id: authority.clone(),
@@ -888,6 +892,21 @@ mod tests {
                     .is_none()
                 && e.timeout_secs == Some(TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS)
         }));
+    }
+
+    #[test]
+    fn per_authority_takes_each_source_from_the_authority_sources_map() {
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+        let mut elem = multi(&["did:web:fi-a", "did:web:fi-b"]);
+        elem.authority_sources
+            .insert("did:web:fi-a".to_string(), AuthoritySource::Authority);
+        let sources: Vec<_> = elem
+            .per_authority()
+            .into_iter()
+            .map(|e| (e.authority_source, e.authority_sources.is_empty()))
+            .collect();
+        assert_eq!(sources, [(Some(AuthoritySource::Authority), true), (None, true)]);
     }
 
     #[test]

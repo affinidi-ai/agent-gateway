@@ -749,6 +749,25 @@ fn caller_trust_check_uses_deleted_authority(world: &mut SurfaceWorld) {
     element["authority_source"] = serde_json::json!("authority");
 }
 
+#[given(expr = "the caller-leg Trust Check takes listed authority {string} from an Authority that no longer exists")]
+fn caller_trust_check_lists_deleted_authority(
+    world: &mut SurfaceWorld,
+    did: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    assert!(
+        element["query"]["authority_ids"]
+            .as_array()
+            .is_some_and(|listed| listed.contains(&serde_json::json!(did))),
+        "the caller-leg Trust Check does not list {did}: {element}"
+    );
+    element["authority_sources"][did.as_str()] = serde_json::json!("authority");
+}
+
 #[given(
     expr = "the Trust Recorder for trust registry {string} takes its authority from an Authority that no longer exists"
 )]

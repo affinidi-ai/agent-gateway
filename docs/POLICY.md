@@ -307,10 +307,13 @@ allow if {
 }
 ```
 
-A rule that addresses one result by `id` alone matches every authority of the element. Listed
-DIDs are not checked against the Authorities register: `authority_sources`, which maps a listed
-DID to the register it was picked from, is stored but does not yet raise `AUTHORITY_NOT_FOUND`.
-The Surface Builder keeps a stored list when it saves the surface but cannot edit it.
+A rule that addresses one result by `id` alone matches every authority of the element.
+`authority_sources` maps each listed literal DID to the register it was picked from, as
+`authority_source` does for `authority_id` (see
+[_The authority of a Trust Check_](#the-authority-of-a-trust-check)); a template or a DID in
+neither register has no entry. A listed Authority that no longer exists fails only its own
+result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usual. The Surface
+Builder keeps a stored list when it saves the surface but cannot edit it.
 
 ### The authority of a Trust Check
 
@@ -323,6 +326,9 @@ The Surface Builder keeps a stored list when it saves the surface but cannot edi
 | `authority` | Linked to the Authority with that DID. The Authority must still exist. |
 | `issuer` | An Issuer has that DID. |
 | absent | A template, or a DID in neither register. |
+
+For a query that lists authorities, `authority_sources` holds the same value per listed DID, and
+everything below applies to each listed DID on its own.
 
 Every save of a surface or STS client sets it for each literal DID: `authority` when the write
 sends `authority`, when the stored record already had the DID as `authority`, or when an

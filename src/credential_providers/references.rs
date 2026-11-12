@@ -576,6 +576,21 @@ mod tests {
             .save(&surface("billing", "did:web:other"))
             .await
             .unwrap();
+        let mut partners = surface("partners", "did:web:other");
+        partners
+            .access_point
+            .trust_check_list = vec![
+            serde_json::from_value(json!({
+                "id": "partners-check", "trust_registry_id": "tr-1", "query_type": "recognition",
+                "query": {"authority_ids": ["did:web:other", "did:web:acme"], "entity_id": "{{ input.agent.did }}"},
+                "authority_sources": {"did:web:acme": "authority"}
+            }))
+            .unwrap(),
+        ];
+        surfaces
+            .save(&partners)
+            .await
+            .unwrap();
         let client: crate::sts::store::StsClient = serde_json::from_value(json!({
             "id": "client-1", "client_id": "cli", "name": "CLI",
             "trust_check_list": [check("sts-check", "did:web:acme")],
@@ -616,6 +631,9 @@ mod tests {
                 {"kind": "surface", "id": "orders", "name": "orders name", "uses": [
                     {"element": "trust_check", "id": "orders-check", "placement": "access_point"},
                     {"element": "trust_recorder", "trust_registry_id": "tr-rec"}
+                ]},
+                {"kind": "surface", "id": "partners", "name": "partners name", "uses": [
+                    {"element": "trust_check", "id": "partners-check", "placement": "access_point"}
                 ]}
             ])
         );
