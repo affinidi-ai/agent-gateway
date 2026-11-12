@@ -1,8 +1,9 @@
 Feature: Caller key rules when saving a surface
-  The admin API refuses a caller key whose header is not a lower-case HTTP header
-  name, is one the gateway reserves, reads or sets itself, or is already used by
-  another setting of the surface, and one whose secret holds fewer than 32 bytes.
-  A save that leaves the caller key out, as a Surface Builder save does, keeps it.
+  The admin API refuses a caller key whose header is outside the caller key family
+  (x-caller-key, or x-caller-key- followed by lower-case words, at most 64
+  characters) or is already used by another setting of the surface, and one whose
+  secret holds fewer than 32 bytes. A save that leaves the caller key out, as a
+  Surface Builder save does, keeps it.
 
   Background:
     Given the operator can use the admin API and no surface is configured for route "/example"
@@ -13,23 +14,31 @@ Feature: Caller key rules when saving a surface
     Given a surface draft for route "/checked" whose Target receives secret "target-key" in header "X-Target-Key"
     And the draft's Target is an https URL
     And the draft's Access Point checks callers by the API key in secret "target-key"
-    And the draft derives caller keys in header "x-user-vault-key" from secret "caller-keys"
+    And the draft derives caller keys in header "x-caller-key-memory" from secret "caller-keys"
     When the operator creates the surface from the draft
     Then the admin API response status is 201
 
-  Scenario Outline: A caller key header the surface may not use is refused
+  Scenario Outline: A caller key header outside the caller key family is refused
     Given a surface draft for route "/refused" whose Target receives secret "target-key" in header "X-Target-Key"
     And the draft derives caller keys in header "<header>" from secret "caller-keys"
     When the operator creates the surface from the draft
     Then the admin API response status is 400
-    And the admin API error response mentions "<refusal>"
+    And the admin API error response mentions "caller_key.header must be x-caller-key, or x-caller-key- followed by lower-case letters and digits in words joined by single hyphens, at most 64 characters"
 
     Examples:
-      | header          | refusal                                                                             |
-      | X-Caller-Key    | caller_key.header must be lower case                                                |
-      | x-transit-token | caller_key.header must not be the reserved header X-Transit-Token                   |
-      | authorization   | caller_key.header must not be authorization, which the gateway reads or sets itself |
-      | x-target-key    | caller_key.header x-target-key is already used by a Target or delegated credential  |
+      | header                                                            |
+      | X-Caller-Key                                                      |
+      | x-user-vault-key                                                  |
+      | authorization                                                     |
+      | x-caller-key-                                                     |
+      | x-caller-key-memory-of-a-very-long-header-name-past-sixty-four-ch |
+
+  Scenario: A caller key header the Target credential uses is refused
+    Given a surface draft for route "/refused" whose Target receives secret "target-key" in header "X-Caller-Key-Vendor"
+    And the draft derives caller keys in header "x-caller-key-vendor" from secret "caller-keys"
+    When the operator creates the surface from the draft
+    Then the admin API response status is 400
+    And the admin API error response mentions "caller_key.header x-caller-key-vendor is already used by a Target or delegated credential"
 
   Scenario: A caller key header the Access Point reads its callers' API keys from is refused
     Given a surface draft for route "/refused" whose Target receives secret "target-key" in header "X-Target-Key"
@@ -50,8 +59,8 @@ Feature: Caller key rules when saving a surface
     Given a surface draft for route "/checked" whose Target receives secret "target-key" in header "X-Target-Key"
     And the draft's Target is an https URL
     And the draft's Access Point checks callers by the API key in secret "target-key"
-    And the draft derives caller keys in header "x-user-vault-key" from secret "caller-keys"
+    And the draft derives caller keys in header "x-caller-key-memory" from secret "caller-keys"
     And the operator has created the surface from the draft
     When the operator saves the surface without its caller key
     Then the admin API response status is 200
-    And the stored surface derives caller keys in header "x-user-vault-key" from secret "caller-keys"
+    And the stored surface derives caller keys in header "x-caller-key-memory" from secret "caller-keys"

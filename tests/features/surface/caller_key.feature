@@ -3,8 +3,10 @@ Feature: Caller keys
   the gateway verified on that request. The gateway derives it from a secret in
   its secrets store, the surface, and the caller's issuer and identity claim, so
   the key is the same on every request from that caller and the Target's own
-  operator cannot derive it. No other caller gets a key, and a caller key a
-  caller sends is never forwarded, whether or not the surface sets a caller key.
+  operator cannot derive it. No other caller gets a key, and no header of the
+  caller key family (x-caller-key, or a name starting x-caller-key-, in any
+  case and with _ for -) that a caller sends is forwarded, whether or not the
+  surface sets a caller key.
 
   Scenario: A JWT caller's key reaches the Target the same on every request
     Given an A2A surface targeting managed agent "bravo"
@@ -18,10 +20,10 @@ Feature: Caller keys
   Scenario: The Target receives the caller key in the header the surface names
     Given an A2A surface targeting managed agent "bravo"
     And the surface requires "JWT Bearer" source authentication
-    And the surface derives caller keys in header "x-user-vault-key" from secret "caller-keys"
+    And the surface derives caller keys in header "x-caller-key-memory" from secret "caller-keys"
     When the caller sends a request to the surface with a valid token
     Then the response status is 200
-    And managed agent "bravo" received the caller key of "test-user" in header "x-user-vault-key" on every request
+    And managed agent "bravo" received the caller key of "test-user" in header "x-caller-key-memory" on every request
     And managed agent "bravo" did not receive header "x-caller-key"
 
   Scenario Outline: A caller key the caller sends is replaced by the caller's own key
@@ -34,9 +36,10 @@ Feature: Caller keys
     And managed agent "bravo" did not receive header "x_caller_key"
 
     Examples:
-      | header       |
-      | x-caller-key |
-      | x_caller_key |
+      | header              |
+      | x-caller-key        |
+      | x_caller_key        |
+      | x-caller-key-memory |
 
   Scenario Outline: A surface without a caller key does not forward one the caller sends
     Given an A2A surface targeting managed agent "bravo"
@@ -46,9 +49,24 @@ Feature: Caller keys
     And managed agent "bravo" did not receive header "<header>"
 
     Examples:
-      | header       |
-      | x-caller-key |
-      | x_caller_key |
+      | header              |
+      | x-caller-key        |
+      | x_caller_key        |
+      | x-caller-key-memory |
+      | X_Caller_Key_Vault  |
+
+  Scenario Outline: A header outside the caller key family still reaches the Target
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface requires "JWT Bearer" source authentication
+    And the surface derives caller keys from secret "caller-keys"
+    When the caller sends a request to the surface with a valid token and header "<header>" set to "kept"
+    Then the response status is 200
+    And managed agent "bravo" received header "<header>" with value "kept"
+
+    Examples:
+      | header        |
+      | x-api-key     |
+      | x-caller-keys |
 
   Scenario: An API key caller gets no caller key
     Given an A2A surface targeting managed agent "bravo"
