@@ -957,7 +957,7 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
         if provider.stores_client_id() {
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_ID_SECRET, TARGET_AUTH_CLIENT_ID_VALUE));
         }
-        if provider.stores_client_secret() {
+        if provider.seeds_client_secret() {
             secrets.push(SecretFixture::new(TARGET_AUTH_CLIENT_SECRET_SECRET, TARGET_AUTH_CLIENT_SECRET_VALUE));
         }
     }

@@ -1096,8 +1096,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-token-endpoint-https-warning`, warning styling, field not marked invalid)
   saying new or changed http endpoints are refused unless listed by exact URL in the bootstrap
   `credential_policy.insecure_token_endpoints`, and that an unchanged stored one, on a provider
-  whose type is unchanged, is still accepted while `token_endpoint_https` is `warn`. It does not
-  block Save; the gateway decides on save.
+  whose type is unchanged, is still accepted while `token_endpoint_https` is `warn`, unless the
+  save starts sending a client secret (a client authentication that sends one, or a client
+  secret the provider did not have). It does not block Save; the gateway decides on save.
 - The Callback URL of an authorization code provider is, when editing, the stored `callback_url`
   unchanged (a reverse proxy prefix included) while the chosen listen address is still its origin
   and the stored URL is `https` and its path ends in the stored `callback_path`

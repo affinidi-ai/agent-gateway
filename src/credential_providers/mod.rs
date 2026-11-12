@@ -26,6 +26,11 @@ use std::collections::HashMap;
 
 use crate::storage::filesystem::StorableEntity;
 
+/// Whether a reference or setting is left out or holds only whitespace.
+pub(crate) fn is_blank(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim().is_empty())
+}
+
 /// The type of credential flow this provider supports
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CredentialProviderType {
@@ -223,11 +228,7 @@ impl JwtAssertionSettings {
         &self,
         provider_type: &CredentialProviderType,
     ) -> bool {
-        *provider_type == CredentialProviderType::OAuth2JwtBearer
-            && self
-                .jwt_subject
-                .as_deref()
-                .is_none_or(|subject| subject.trim().is_empty())
+        *provider_type == CredentialProviderType::OAuth2JwtBearer && is_blank(self.jwt_subject.as_deref())
     }
 
     /// The same settings with blank values removed and the rest trimmed, so a field
@@ -487,6 +488,26 @@ impl CredentialProvider {
         .into_iter()
         .flatten()
         .collect()
+    }
+
+    /// Whether a grant of this provider carries its client secret: it holds a client secret
+    /// reference and its type sends it. A client credentials or authorization code provider
+    /// always sends the one it holds, a JWT Bearer provider only when its client authentication
+    /// uses a secret, and an API key provider or a client authenticating with a JWT never does.
+    pub fn sends_client_secret(&self) -> bool {
+        let type_sends_it = match self.provider_type {
+            CredentialProviderType::OAuth2ClientCredentials | CredentialProviderType::OAuth2AuthorizationCode => true,
+            CredentialProviderType::OAuth2JwtBearer => self
+                .jwt
+                .client_authentication_method()
+                .is_some_and(|method| method.uses_secret()),
+            CredentialProviderType::ApiKey | CredentialProviderType::OAuth2ClientCredentialsJwtAuth => false,
+        };
+        type_sends_it
+            && !is_blank(
+                self.client_secret_secret_ref
+                    .as_deref(),
+            )
     }
 
     /// The secret reference of each field, in the order of [`Self::secret_refs`].
@@ -1357,6 +1378,43 @@ mod tests {
             none_kept,
             "dropping the client authentication is a change of what the provider sends too"
         );
+    }
+
+    #[test]
+    fn sends_client_secret_follows_the_provider_type_and_the_held_reference() {
+        let provider = |provider_type: &str, client_authentication: Option<&str>, client_secret: Option<&str>| {
+            serde_json::from_value::<CredentialProvider>(serde_json::json!({
+                "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
+                "client_authentication": client_authentication, "client_secret_secret_ref": client_secret,
+                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let cases = [
+            ("oauth2_client_credentials", None, Some("SECRET"), true),
+            ("oauth2_authorization_code", None, Some("SECRET"), true),
+            ("oauth2_client_credentials", None, None, false),
+            ("oauth2_authorization_code", None, None, false),
+            ("oauth2_client_credentials", Some("none"), Some("SECRET"), true),
+            ("oauth2_client_credentials", Some("client_secret_post"), None, false),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), Some("SECRET"), true),
+            ("oauth2_jwt_bearer", Some("client_secret_post"), Some("SECRET"), true),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), None, false),
+            ("oauth2_jwt_bearer", Some("none"), Some("SECRET"), false),
+            ("oauth2_jwt_bearer", None, Some("SECRET"), false),
+            ("oauth2_client_credentials_jwt_auth", None, Some("SECRET"), false),
+            ("api_key", None, Some("SECRET"), false),
+            ("oauth2_client_credentials", None, Some("  "), false),
+            ("oauth2_authorization_code", None, Some(""), false),
+            ("oauth2_jwt_bearer", Some("client_secret_basic"), Some("  "), false),
+        ];
+        for (provider_type, client_authentication, client_secret, sends) in cases {
+            assert_eq!(
+                provider(provider_type, client_authentication, client_secret).sends_client_secret(),
+                sends,
+                "{provider_type}, client authentication {client_authentication:?}, client secret {client_secret:?}"
+            );
+        }
     }
 
     #[test]

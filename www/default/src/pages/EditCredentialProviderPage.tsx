@@ -598,7 +598,9 @@ const EditCredentialProviderPage: React.FC = () => {
                           refused unless listed by exact URL in{' '}
                           <code>credential_policy.insecure_token_endpoints</code> in the gateway
                           bootstrap config. A stored endpoint that is unchanged, on a provider whose
-                          type is unchanged, is still accepted while token_endpoint_https is warn.
+                          type is unchanged, is still accepted while token_endpoint_https is warn,
+                          unless the save starts sending a client secret (a client authentication
+                          that sends one, or a client secret the provider did not have).
                         </div>
                       )}
                       <small className="form-text text-muted">

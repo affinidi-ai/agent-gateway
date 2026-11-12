@@ -2922,6 +2922,17 @@ fn target_credential_provider_stores_unused_client_references(world: &mut Surfac
     jwt_bearer_target_auth_provider(world).stores_unused_client_references = true;
 }
 
+#[given("the credential provider stores no client secret")]
+fn target_credential_provider_stores_no_client_secret(world: &mut SurfaceWorld) {
+    let provider = target_auth_provider(world);
+    assert_eq!(
+        provider.grant,
+        TargetAuthProviderGrant::ClientCredentials,
+        "this step applies only to a client credentials provider"
+    );
+    provider.omits_client_secret_reference = true;
+}
+
 #[given(expr = "the credential provider authenticates its client with {string}")]
 fn target_credential_provider_authenticates_its_client(
     world: &mut SurfaceWorld,

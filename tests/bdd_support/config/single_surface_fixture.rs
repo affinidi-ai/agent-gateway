@@ -502,6 +502,9 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// A JWT Bearer provider stores a client ID and a client secret although it sets no
     /// client authentication.
     pub stores_unused_client_references: bool,
+    /// A client credentials provider's stored record names no client secret, although the
+    /// secrets store holds one.
+    pub omits_client_secret_reference: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -559,6 +562,7 @@ impl SurfaceTargetAuthProviderConfig {
             jwt_subject: Some("bdd-subject@example.com".to_string()),
             client_authentication: None,
             stores_unused_client_references: false,
+            omits_client_secret_reference: false,
         }
     }
 
@@ -570,12 +574,19 @@ impl SurfaceTargetAuthProviderConfig {
                 .is_some()
     }
 
+    /// The secrets store holds the client secret: the provider's record names it, or omits
+    /// the reference to it.
+    pub fn seeds_client_secret(&self) -> bool {
+        self.stores_client_secret() || self.omits_client_secret_reference
+    }
+
     pub fn stores_client_secret(&self) -> bool {
-        self.grant == TargetAuthProviderGrant::ClientCredentials
-            || self.stores_unused_client_references
-            || self
-                .client_authentication
-                .is_some_and(TargetAuthClientAuthentication::sends_secret)
+        !self.omits_client_secret_reference
+            && (self.grant == TargetAuthProviderGrant::ClientCredentials
+                || self.stores_unused_client_references
+                || self
+                    .client_authentication
+                    .is_some_and(TargetAuthClientAuthentication::sends_secret))
     }
 }
 
