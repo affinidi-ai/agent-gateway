@@ -263,7 +263,7 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
-| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds 1 to `TRUST_CHECK_AUTHORITIES_MAX` (25) distinct, non-blank DIDs or templates. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds 1 to `TRUST_CHECK_AUTHORITIES_MAX` (25) distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`. |
 | `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is

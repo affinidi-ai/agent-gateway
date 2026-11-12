@@ -1076,6 +1076,25 @@ mod tests {
     }
 
     #[test]
+    fn check_refuses_a_kept_listed_authority_that_is_gone() {
+        let registers = registers(vec![authority(ACME, None)]);
+        let stored = surface(
+            vec![listed("authority-recognised", &[ACME, TYPED], json!({ ACME: "authority", TYPED: "authority" }))],
+            BILLING,
+        );
+        let mut saved = surface(vec![listed("authority-recognised", &[ACME, TYPED], json!({}))], BILLING);
+        registers.classify_surface(&mut saved, Some(&stored));
+
+        assert_eq!(
+            registers.check(&surface_references(&saved), None),
+            Err(format!(
+                "Trust Check 'authority-recognised' uses Authority {TYPED}, which does not exist or belongs to another tenant. Pick \
+                 another Authority or remove the Trust Check"
+            ))
+        );
+    }
+
+    #[test]
     fn the_source_round_trips_and_is_omitted_when_absent() {
         let linked = element(check("caller", ACME, Some("authority")));
         assert_eq!(linked.authority_source, Some(AuthoritySource::Authority));

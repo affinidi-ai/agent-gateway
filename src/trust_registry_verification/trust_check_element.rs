@@ -180,6 +180,8 @@ pub enum TrustCheckElementValidationError {
     AuthoritiesEntryBlank { index: usize },
     #[error("query.authority_ids[{index}] repeats an earlier entry")]
     AuthoritiesDuplicate { index: usize },
+    #[error("authority_sources cannot be set without query.authority_ids")]
+    AuthoritySourcesWithoutList,
     #[error("timeout_secs cannot be set when query.authority_ids is set")]
     AuthoritiesTimeoutSet,
     #[error("name exceeds {max} code points (got {got})")]
@@ -236,10 +238,12 @@ impl TrustCheckElement {
             .trim()
             .is_empty();
         let Some(authorities) = &self.query.authority_ids else {
-            return if single_set {
-                Ok(())
-            } else {
+            return if !single_set {
                 Err(TrustCheckElementValidationError::AuthorityBlank)
+            } else if !self.authority_sources.is_empty() {
+                Err(TrustCheckElementValidationError::AuthoritySourcesWithoutList)
+            } else {
+                Ok(())
             };
         };
         if single_set {
@@ -856,6 +860,16 @@ mod tests {
         let mut elem = elem_with_name("tc", None);
         elem.query.authority_id = String::new();
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthorityBlank));
+    }
+
+    #[test]
+    fn validate_rejects_authority_sources_without_authority_list() {
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+        let mut elem = elem_with_name("tc", None);
+        elem.authority_sources
+            .insert("did:a".to_string(), AuthoritySource::Authority);
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritySourcesWithoutList));
     }
 
     #[test]
