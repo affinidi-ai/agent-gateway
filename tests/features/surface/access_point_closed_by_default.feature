@@ -87,7 +87,7 @@ Feature: Access Points that are not public refuse failed callers
     And the surface requires "API Key" source authentication
     And the gateway keeps its log of warnings
     When the caller sends a request to the surface with a valid API key
-    Then the gateway log has a warning containing "refuses callers whose credential is missing or invalid with 401"
+    Then the gateway log has a warning containing "is configured for authenticated callers only"
 
   Scenario: The gateway does not warn at start about a public surface
     Given an A2A surface targeting managed agent "bravo"
@@ -95,7 +95,7 @@ Feature: Access Points that are not public refuse failed callers
     And the surface is stored with a public Access Point
     And the gateway keeps its log of warnings
     When the caller sends a request to the surface with a valid API key
-    Then the gateway log has no warning containing "refuses callers whose credential is missing or invalid"
+    Then the gateway log has no warning containing "is configured for authenticated callers only"
 
   Scenario: A legacy surface admits a caller with a valid API key
     Given an A2A surface targeting managed agent "bravo"

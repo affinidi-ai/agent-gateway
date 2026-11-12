@@ -543,9 +543,9 @@ pub const LEGACY_OPEN_ACCESS_POINT_WARNING: &str = "This Access Point is neither
 /// What the gateway logs at start for each legacy surface (no `public`) that
 /// refuses a caller whose credential is missing or invalid only because it is
 /// not public; see [`AgentSurface::legacy_access_point_notice`].
-pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is neither closed nor \
-     public, and it refuses callers whose credential is missing or invalid with 401, as a closed one does. Set \
-     access_point.public to true to hand them to policy, or to false to close it.";
+pub const LEGACY_ACCESS_POINT_REFUSES_FAILED_CALLERS_NOTICE: &str = "This Access Point is configured for \
+     authenticated callers only. Any request without valid credentials is denied with a 401 Unauthorized response. \
+     To allow requests from those callers, switch the Access Point to Public access.";
 
 /// What the Gateway needs to know about the caller.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
