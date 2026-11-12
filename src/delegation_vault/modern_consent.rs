@@ -847,6 +847,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: subject.clone(),
             claims: json!({"iss": profile.issuer, "sub": subject, "scope": "read", "exp": now + 300}),
+            verification: Default::default(),
         };
         let request = ValidatedModernMessage {
             protocol_version: crate::mcp::MCP_MODERN_VERSION.into(),

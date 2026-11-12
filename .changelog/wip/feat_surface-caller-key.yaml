@@ -8,11 +8,15 @@ changes:
         `secret_id`, with a `header` (`x-caller-key` by default) and ordered `identity_claims`
         (`["sub"]` by default). On each request whose caller presented a JWT the gateway verified
         on that request, the Target receives HKDF-SHA256 of the secret, salted with
-        `agent-gateway-caller-key-v1`, over the surface id, the token's `iss` and the first
-        identity claim the token carries as a string, as 32 bytes of base64url without padding,
-        so a Target that keeps data per caller can encrypt it with a key its own operator cannot
-        derive. API key, DID Auth, mTLS and anonymous callers, and callers whose credential
-        failed, get none. When the secret cannot be read the request is forwarded without the
+        `agent-gateway-caller-key-v2`, as 32 bytes of base64url without padding, so a Target that
+        keeps data per caller can encrypt it with a key its own operator cannot derive. The info
+        binds the key to the surface, to the key source that verified the token (the strategy's
+        JWKS URI as configured, or the SHA-256 of the canonical inline key set), to the audience
+        claim and the sorted accepted audiences, and to the token's `iss` and the first identity
+        claim it carries as a string, each field length-prefixed. So editing a strategy to trust
+        another key set, or adding an audience, yields keys no caller had rather than an existing
+        caller's key; it also changes every caller's key, by design. API key, DID Auth, mTLS and
+        anonymous callers, and callers whose credential failed, get none. When the secret cannot be read the request is forwarded without the
         header and a warning names the surface. A save refuses a header outside the caller key
         family (`x-caller-key`, or `x-caller-key-` followed by lower-case words, at most 64
         characters) or one the surface already uses, invalid claims, and a secret of fewer than

@@ -22931,6 +22931,7 @@ allow if {
                 principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
+                verification: Default::default(),
             };
 
             for identity in [Some(&jwt), None] {
@@ -24260,6 +24261,7 @@ mod fabric_send_tests {
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
+            verification: Default::default(),
         };
 
         let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(

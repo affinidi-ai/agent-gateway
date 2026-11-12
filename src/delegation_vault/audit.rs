@@ -1376,6 +1376,7 @@ pub fn build_caller_context(identity: &crate::source_auth::AuthenticatedIdentity
             subject,
             principal_claim,
             claims,
+            ..
         } => {
             let named_by_sub = principal_claim == crate::jwt_bearer::models::DEFAULT_PRINCIPAL_CLAIM;
             let (sub, principal) = if named_by_sub {
@@ -3307,6 +3308,7 @@ mod tests {
                 "email": "alice@example.com",
                 "name": "Alice Example"
             }),
+            verification: Default::default(),
         };
 
         let caller = build_caller_context(&identity);
@@ -3333,6 +3335,7 @@ mod tests {
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub", "oid": "person-1" }),
+            verification: Default::default(),
         };
         let caller = build_caller_context(&identity);
         assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
@@ -3341,12 +3344,14 @@ mod tests {
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
+            verification: Default::default(),
         };
         assert_eq!(build_caller_context(&without_sub).sub, None);
         let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
             principal_claim: "oid".to_string(),
             subject: "<none>".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
+            verification: Default::default(),
         };
         let caller = build_caller_context(&without_oid);
         assert_eq!(caller.principal, None, "a token without the claim has no principal, not the placeholder");
@@ -3362,6 +3367,7 @@ mod tests {
             subject: "alice".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
             principal_claim: "sub".to_string(),
+            verification: Default::default(),
         };
 
         let received = fabric_receive_caller_context(&identity, Some("did:web:partner.example"), "partner-record");
@@ -4186,6 +4192,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
+            verification: Default::default(),
         };
         let ((), events) = crate::audit::producer::capture(async {
             let decide = |caller| {
@@ -4439,6 +4446,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let event = vp_injected_event(injection(Some(build_caller_context(&identity))));
 
@@ -4470,6 +4478,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let event = crate::audit::context::with_caller(Some(build_caller_context(&identity)), async {
             vp_injected_event(injection(None))

@@ -50,6 +50,7 @@ fn verified_principal(identity: &AuthenticatedIdentity) -> Result<String, Contin
         subject,
         principal_claim,
         claims,
+        ..
     } = identity
     else {
         return Err(ContinuationError::BindingMismatch);
@@ -163,6 +164,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": "https://gateway.example/oauth2/mcp", "sub": "user", "scope": "write read", "act": {"sub": "client"}, "exp": 100}),
+            verification: Default::default(),
         };
         let authorization = McpResourceServerConfig {
             resource: "https://gateway.example/mcp".into(),

@@ -2,11 +2,12 @@
 //! caller's data with, derived from a secret the Target's own operator does not hold.
 //!
 //! On a surface with `caller_key`, a request whose caller presented a JWT verified on that
-//! request reaches the Target with the key in the configured header:
-//! HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v1` as the
-//! salt and `surface id, 0x00, iss, 0x00, claim name, 0x00, claim value` as the info, 32 bytes,
-//! base64url without padding. The claim is the first of `identity_claims` the token carries as
-//! a non-empty string. No other caller gets a key, and no header of the caller key family
+//! request reaches the Target with the key in the configured header: HKDF-SHA256 with the
+//! secret's bytes as the input key, `agent-gateway-caller-key-v2` as the salt and [`info`] as
+//! the info, 32 bytes, base64url without padding. The info binds the key to the surface, to
+//! where the keys that verified the token come from and the audiences it was accepted against
+//! ([`JwtVerification`]), and to the token's `iss` and the first of `identity_claims` it carries
+//! as a non-empty string. No other caller gets a key, and no header of the caller key family
 //! ([`crate::config::caller_key::is_caller_key_header`]) a caller sends is ever forwarded.
 
 use std::sync::Arc;
@@ -21,46 +22,103 @@ use zeroize::Zeroizing;
 use crate::config::agent_surface::AgentSurface;
 use crate::config::caller_key::{CallerKeyConfig, MIN_SECRET_BYTES};
 use crate::secrets::SecretsStore;
-use crate::source_auth::AuthenticatedIdentity;
+use crate::source_auth::{AuthenticatedIdentity, JwtVerification};
 
-const SALT: &[u8] = b"agent-gateway-caller-key-v1";
+const SALT: &[u8] = b"agent-gateway-caller-key-v2";
 
-/// What names a caller for its key: the token's issuer and the identity claim with its value.
+/// What names a caller for its key: how its token was verified, the token's issuer, and the
+/// identity claim with its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyedCaller<'a> {
+    pub verification: &'a JwtVerification,
     pub issuer: &'a str,
     pub claim: &'a str,
     pub value: &'a str,
 }
 
 impl<'a> KeyedCaller<'a> {
-    /// The caller a verified JWT `identity` names under `identity_claims`: its `iss` and the
-    /// first of those claims it carries as a usable string. `None` for any other identity, or a
-    /// token without a usable `iss` or any such claim.
+    /// The caller a verified JWT `identity` names under `identity_claims`: how it was verified,
+    /// its `iss` and the first of those claims it carries as a non-empty string. `None` for any
+    /// other identity, or a token whose key source is not known, without a non-empty string
+    /// `iss`, or without any such claim.
     pub(crate) fn of(
         identity: &'a AuthenticatedIdentity,
         identity_claims: &'a [String],
     ) -> Option<Self> {
+        let verification = identity
+            .jwt_verification()
+            .filter(|verification| {
+                !verification
+                    .key_source
+                    .is_empty()
+            })?;
         let claims = identity.jwt_claims()?;
-        let issuer = usable_string(claims.get("iss"))?;
+        let issuer = non_empty_string(claims.get("iss"))?;
         identity_claims
             .iter()
             .find_map(|claim| {
                 Some(Self {
+                    verification,
                     issuer,
                     claim,
-                    value: usable_string(claims.get(claim.as_str()))?,
+                    value: non_empty_string(claims.get(claim.as_str()))?,
                 })
             })
     }
 }
 
-/// A claim value that can name a caller: a string, not empty, which would name every caller
-/// without one, and without NUL, which separates the fields of the info.
-fn usable_string(value: Option<&Value>) -> Option<&str> {
+/// A claim value that can name a caller: a string, and not empty, which would name every
+/// caller without one.
+fn non_empty_string(value: Option<&Value>) -> Option<&str> {
     value?
         .as_str()
-        .filter(|text| !text.is_empty() && !text.contains('\0'))
+        .filter(|text| !text.is_empty())
+}
+
+/// The HKDF info of `caller` on surface `surface_id`: seven fields, each preceded by its length
+/// in bytes as a 4-byte big-endian integer, so no field can be read as part of another. They
+/// are the surface id, the key source, the audience claim, the audiences, the token's `iss`,
+/// the identity claim's name and its value. The audiences field is the audiences, sorted and
+/// without duplicates, each preceded by its own 4-byte length.
+fn info(
+    surface_id: &str,
+    caller: KeyedCaller<'_>,
+) -> Option<Vec<u8>> {
+    fn push(
+        into: &mut Vec<u8>,
+        field: &[u8],
+    ) -> Option<()> {
+        into.extend_from_slice(
+            &u32::try_from(field.len())
+                .ok()?
+                .to_be_bytes(),
+        );
+        into.extend_from_slice(field);
+        Some(())
+    }
+    let mut audiences = Vec::new();
+    for audience in &caller.verification.audiences {
+        push(&mut audiences, audience.as_bytes())?;
+    }
+    let mut info = Vec::new();
+    for field in [
+        surface_id.as_bytes(),
+        caller
+            .verification
+            .key_source
+            .as_bytes(),
+        caller
+            .verification
+            .audience_claim
+            .as_bytes(),
+        &audiences,
+        caller.issuer.as_bytes(),
+        caller.claim.as_bytes(),
+        caller.value.as_bytes(),
+    ] {
+        push(&mut info, field)?;
+    }
+    Some(info)
 }
 
 /// The caller key of `caller` on surface `surface_id` under `secret`.
@@ -69,10 +127,10 @@ pub(crate) fn derive(
     surface_id: &str,
     caller: KeyedCaller<'_>,
 ) -> Option<String> {
-    let info = [surface_id, caller.issuer, caller.claim, caller.value].join("\0");
+    let info = info(surface_id, caller)?;
     let mut key = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(SALT), secret)
-        .expand(info.as_bytes(), key.as_mut())
+        .expand(&info, key.as_mut())
         .ok()?;
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.as_ref()))
 }
@@ -157,8 +215,48 @@ mod tests {
     use crate::secrets::{CreateSecretRequest, FilesystemSecretsStore};
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
+    const JWKS_URI: &str = "https://idp.example/.well-known/jwks.json";
+    /// The key of `alice` on `surface-1` under [`SECRET`], verified by [`idp_verification`].
+    const ALICE_KEY: &str = "MHijA8kX963zxv0YWe5I42GRLQLyVJvNzGd4nWsw7QQ";
 
-    fn jwt(claims: Value) -> AuthenticatedIdentity {
+    fn strategy(jwks_source: Value) -> crate::jwt_bearer::models::JwtVerificationStrategy {
+        serde_json::from_value(serde_json::json!({
+            "id": "idp", "name": "IdP", "expected_issuer": "https://idp.example",
+            "jwks_source": jwks_source,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("strategy parses")
+    }
+
+    fn remote(jwks_uri: &str) -> crate::jwt_bearer::models::JwtVerificationStrategy {
+        strategy(serde_json::json!({ "type": "remote", "jwks_uri": jwks_uri }))
+    }
+
+    fn inline(x: &str) -> crate::jwt_bearer::models::JwtVerificationStrategy {
+        strategy(serde_json::json!({ "type": "static", "jwks": [
+            { "kty": "OKP", "crv": "Ed25519", "kid": "k1", "x": x }
+        ] }))
+    }
+
+    fn verified_by(
+        strategy: &crate::jwt_bearer::models::JwtVerificationStrategy,
+        audiences: &[&str],
+    ) -> JwtVerification {
+        let audiences: Vec<String> = audiences
+            .iter()
+            .map(|audience| audience.to_string())
+            .collect();
+        JwtVerification::of(strategy, &audiences, crate::jwt_bearer::models::AudienceClaim::Aud)
+    }
+
+    fn idp_verification() -> JwtVerification {
+        verified_by(&remote(JWKS_URI), &["https://agent.example", "api://memory"])
+    }
+
+    fn jwt_verified_by(
+        claims: Value,
+        verification: JwtVerification,
+    ) -> AuthenticatedIdentity {
         AuthenticatedIdentity::JwtBearer {
             subject: claims["sub"]
                 .as_str()
@@ -166,7 +264,12 @@ mod tests {
                 .to_string(),
             principal_claim: "sub".to_string(),
             claims,
+            verification,
         }
+    }
+
+    fn jwt(claims: Value) -> AuthenticatedIdentity {
+        jwt_verified_by(claims, idp_verification())
     }
 
     fn alice() -> AuthenticatedIdentity {
@@ -230,7 +333,7 @@ mod tests {
         info: &[u8],
     ) -> String {
         use hmac::{Hmac, Mac};
-        let mut extract = Hmac::<Sha256>::new_from_slice(b"agent-gateway-caller-key-v1").expect("any key length");
+        let mut extract = Hmac::<Sha256>::new_from_slice(b"agent-gateway-caller-key-v2").expect("any key length");
         extract.update(secret);
         let prk = extract
             .finalize()
@@ -242,25 +345,49 @@ mod tests {
     }
 
     /// Inputs: secret `0123456789abcdef0123456789abcdef` (32 ASCII bytes), surface id
-    /// `surface-1`, `iss` `https://idp.example`, claim `sub` = `alice`. Info is
-    /// `surface-1\0https://idp.example\0sub\0alice`.
+    /// `surface-1`, key source `jwks_uri:https://idp.example/.well-known/jwks.json`, audience
+    /// claim `aud`, audiences `https://agent.example` and `api://memory` (sorted:
+    /// `api://memory`, `https://agent.example`), `iss` `https://idp.example`, claim `sub` =
+    /// `alice`. The info is written out byte by byte below, each field after its 4-byte
+    /// big-endian length.
     #[test]
     fn a_caller_key_matches_hkdf_sha256_of_the_documented_inputs() {
+        let verification = idp_verification();
+        assert_eq!(verification.key_source, "jwks_uri:https://idp.example/.well-known/jwks.json");
+        assert_eq!(verification.audiences, ["api://memory", "https://agent.example"]);
         let caller = KeyedCaller {
+            verification: &verification,
             issuer: "https://idp.example",
             claim: "sub",
             value: "alice",
         };
+        let mut expected_info = Vec::new();
+        expected_info.extend_from_slice(b"\x00\x00\x00\x09surface-1");
+        expected_info.extend_from_slice(b"\x00\x00\x00\x32jwks_uri:https://idp.example/.well-known/jwks.json");
+        expected_info.extend_from_slice(b"\x00\x00\x00\x03aud");
+        expected_info
+            .extend_from_slice(b"\x00\x00\x00\x29\x00\x00\x00\x0capi://memory\x00\x00\x00\x15https://agent.example");
+        expected_info.extend_from_slice(b"\x00\x00\x00\x13https://idp.example");
+        expected_info.extend_from_slice(b"\x00\x00\x00\x03sub");
+        expected_info.extend_from_slice(b"\x00\x00\x00\x05alice");
+        assert_eq!(info("surface-1", caller), Some(expected_info.clone()));
         let derived = derive(SECRET.as_bytes(), "surface-1", caller).expect("32 bytes derive");
-        assert_eq!(derived, reference_key(SECRET.as_bytes(), b"surface-1\0https://idp.example\0sub\0alice"));
-        assert_eq!(derived, "_gfJk16BtniPoTKJ7mn5nYKby4Gmbw7sxgLohCnKI34");
+        assert_eq!(derived, reference_key(SECRET.as_bytes(), &expected_info));
+        assert_eq!(derived, ALICE_KEY);
         assert_eq!(derived.len(), 43, "32 bytes are 43 base64url characters without padding");
     }
 
     #[test]
     fn a_caller_key_is_stable_and_differs_by_caller_issuer_claim_surface_and_secret() {
+        let verification = idp_verification();
         let key = |secret: &str, surface_id: &str, issuer: &str, claim: &str, value: &str| {
-            derive(secret.as_bytes(), surface_id, KeyedCaller { issuer, claim, value }).expect("derives")
+            let caller = KeyedCaller {
+                verification: &verification,
+                issuer,
+                claim,
+                value,
+            };
+            derive(secret.as_bytes(), surface_id, caller).expect("derives")
         };
         let base = key(SECRET, "surface-1", "https://idp.example", "sub", "alice");
         assert_eq!(base, key(SECRET, "surface-1", "https://idp.example", "sub", "alice"));
@@ -274,6 +401,117 @@ mod tests {
         for other in &others {
             assert_ne!(&base, other);
         }
+    }
+
+    /// The key of `alice` from `https://idp.example` on `surface-1`, as `verification` verified
+    /// her token.
+    fn alice_key_verified_by(verification: &JwtVerification) -> String {
+        let caller = KeyedCaller {
+            verification,
+            issuer: "https://idp.example",
+            claim: "sub",
+            value: "alice",
+        };
+        derive(SECRET.as_bytes(), "surface-1", caller).expect("derives")
+    }
+
+    /// Whoever can edit the verification strategy can point it at a key set of their own and
+    /// sign a token claiming the real `iss` and any `sub`; the key that token gets is not the
+    /// victim's.
+    #[test]
+    fn the_same_issuer_and_subject_verified_by_another_key_source_get_another_key() {
+        let real = alice_key_verified_by(&idp_verification());
+        let substituted_uri = alice_key_verified_by(&verified_by(
+            &remote("https://attacker.example/.well-known/jwks.json"),
+            &["https://agent.example", "api://memory"],
+        ));
+        assert_ne!(real, substituted_uri);
+
+        let real_inline = verified_by(&inline("xMjCoPwAtNcNFrwDLMlggNGrTdN0LAd_kxjJGWg8jZU"), &["api://memory"]);
+        let other_inline = verified_by(&inline("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"), &["api://memory"]);
+        assert!(
+            real_inline
+                .key_source
+                .starts_with("inline_jwks:sha256:")
+        );
+        assert_ne!(real_inline.key_source, other_inline.key_source);
+        assert_ne!(alice_key_verified_by(&real_inline), alice_key_verified_by(&other_inline));
+        assert_eq!(
+            alice_key_verified_by(&real_inline),
+            alice_key_verified_by(&verified_by(
+                &inline("xMjCoPwAtNcNFrwDLMlggNGrTdN0LAd_kxjJGWg8jZU"),
+                &["api://memory"]
+            )),
+            "the same inline key set gives the same key"
+        );
+    }
+
+    #[test]
+    fn an_inline_key_source_is_the_sha256_of_the_canonical_key_set() {
+        use sha2::Digest;
+        let canonical =
+            br#"[{"crv":"Ed25519","kid":"k1","kty":"OKP","x":"xMjCoPwAtNcNFrwDLMlggNGrTdN0LAd_kxjJGWg8jZU"}]"#;
+        assert_eq!(
+            verified_by(&inline("xMjCoPwAtNcNFrwDLMlggNGrTdN0LAd_kxjJGWg8jZU"), &[]).key_source,
+            format!("inline_jwks:sha256:{}", hex::encode(Sha256::digest(canonical)))
+        );
+    }
+
+    #[test]
+    fn adding_an_audience_changes_the_key_and_reordering_them_does_not() {
+        let strategy = remote(JWKS_URI);
+        let base = alice_key_verified_by(&verified_by(&strategy, &["https://agent.example", "api://memory"]));
+        assert_eq!(base, ALICE_KEY);
+        assert_eq!(
+            base,
+            alice_key_verified_by(&verified_by(&strategy, &["api://memory", "https://agent.example", "api://memory"])),
+            "order and duplicates do not count"
+        );
+        assert_ne!(
+            base,
+            alice_key_verified_by(&verified_by(
+                &strategy,
+                &["https://agent.example", "api://memory", "api://other-app"]
+            ))
+        );
+        assert_ne!(base, alice_key_verified_by(&verified_by(&strategy, &["https://agent.example"])));
+        let mut by_client = verified_by(&strategy, &["https://agent.example", "api://memory"]);
+        by_client.audience_claim = "azp".to_string();
+        assert_ne!(base, alice_key_verified_by(&by_client), "another audience claim");
+    }
+
+    #[test]
+    fn a_field_never_reads_as_part_of_another() {
+        let verification = idp_verification();
+        let split = |issuer, value| {
+            info(
+                "surface-1",
+                KeyedCaller {
+                    verification: &verification,
+                    issuer,
+                    claim: "sub",
+                    value,
+                },
+            )
+        };
+        assert_ne!(split("https://idp.example\0\0\0\x03sub", "alice"), split("https://idp.example", "alice"));
+        let joined = |audiences: &[&str]| {
+            let mut verification = idp_verification();
+            verification.audiences = audiences
+                .iter()
+                .map(|audience| audience.to_string())
+                .collect();
+            alice_key_verified_by(&verification)
+        };
+        assert_ne!(joined(&["a\0b"]), joined(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_token_whose_key_source_is_not_known_names_no_caller() {
+        let sub = vec!["sub".to_string()];
+        let claims = serde_json::json!({ "iss": "https://idp.example", "sub": "alice" });
+        assert!(KeyedCaller::of(&jwt(claims.clone()), &sub).is_some());
+        assert_eq!(KeyedCaller::of(&jwt_verified_by(claims, JwtVerification::default()), &sub), None);
     }
 
     #[test]
@@ -291,7 +529,6 @@ mod tests {
             "uid": 42,
             "groups": ["a"],
             "email": "",
-            "nul": "a\u{0}b",
         }));
         let named = |order: &[&str]| {
             let order = claims(order);
@@ -300,10 +537,10 @@ mod tests {
         assert_eq!(named(&["oid", "sub"]), Some(("oid".to_string(), "o-1".to_string())));
         assert_eq!(named(&["sub", "oid"]), Some(("sub".to_string(), "alice".to_string())));
         assert_eq!(
-            named(&["uid", "groups", "email", "nul", "missing", "sub"]),
+            named(&["uid", "groups", "email", "missing", "sub"]),
             Some(("sub".to_string(), "alice".to_string()))
         );
-        assert_eq!(named(&["uid", "groups", "email", "nul", "missing"]), None);
+        assert_eq!(named(&["uid", "groups", "email", "missing"]), None);
     }
 
     #[test]
@@ -313,7 +550,6 @@ mod tests {
             serde_json::json!({ "sub": "alice" }),
             serde_json::json!({ "iss": "", "sub": "alice" }),
             serde_json::json!({ "iss": 7, "sub": "alice" }),
-            serde_json::json!({ "iss": "https://idp\u{0}.example", "sub": "alice" }),
         ] {
             assert_eq!(KeyedCaller::of(&jwt(claims.clone()), &sub), None, "{claims}");
         }
@@ -327,7 +563,7 @@ mod tests {
         let second = header_for(&configured, Some(&alice()), &secrets).await;
         assert_eq!(
             first,
-            Some(("x-caller-key".to_string(), "_gfJk16BtniPoTKJ7mn5nYKby4Gmbw7sxgLohCnKI34".to_string()))
+            Some(("x-caller-key".to_string(), "MHijA8kX963zxv0YWe5I42GRLQLyVJvNzGd4nWsw7QQ".to_string()))
         );
         assert_eq!(first, second, "one caller's key is stable across requests");
 
@@ -335,7 +571,7 @@ mod tests {
             surface("surface-1", serde_json::json!({ "secret_id": "caller-keys", "header": "x-caller-key-memory" }));
         assert_eq!(
             header_for(&renamed, Some(&alice()), &secrets).await,
-            Some(("x-caller-key-memory".to_string(), "_gfJk16BtniPoTKJ7mn5nYKby4Gmbw7sxgLohCnKI34".to_string()))
+            Some(("x-caller-key-memory".to_string(), "MHijA8kX963zxv0YWe5I42GRLQLyVJvNzGd4nWsw7QQ".to_string()))
         );
     }
 

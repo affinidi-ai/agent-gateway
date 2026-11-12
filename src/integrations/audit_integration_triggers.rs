@@ -254,6 +254,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
+            verification: Default::default(),
         })
     }
 
@@ -451,6 +452,7 @@ mod tests {
                 principal_claim: "oid".to_string(),
                 subject: "person-1".to_string(),
                 claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+                verification: Default::default(),
             },
         );
         assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");

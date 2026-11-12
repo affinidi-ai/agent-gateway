@@ -1876,6 +1876,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "caller".into(),
             claims: json!({"exp": 1}),
+            verification: Default::default(),
         };
         let expired = SubscriptionLifetime::new(std::time::Duration::from_secs(60), Some(&claims));
         assert!(expired.deadline <= tokio::time::Instant::now());

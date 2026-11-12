@@ -14869,6 +14869,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+            verification: Default::default(),
         };
         let alice_hash = alice
             .principal_hash(None)
@@ -14959,6 +14960,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+            verification: Default::default(),
         };
         let direct_client_hash = direct_client
             .principal_hash(None)
@@ -15107,6 +15109,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
+            verification: Default::default(),
         });
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
         let captured = capture_workload_binding_caller(&ctx, &config).expect("a verified JWT caller is captured");
@@ -15141,6 +15144,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
+            verification: Default::default(),
         });
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
         Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".to_string());
@@ -15166,6 +15170,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "<none>".to_string(),
             claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
+            verification: Default::default(),
         });
         assert_eq!(
             transit_client_json(&ctx),
@@ -15183,6 +15188,7 @@ mod tests {
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+                verification: Default::default(),
             },
         );
         assert_eq!(
@@ -15612,6 +15618,7 @@ mod tests {
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "sub": "alice", "tid": "tenant-1" }),
+                verification: Default::default(),
             },
         );
         assert!(decide(&mut resource_caller, only_tenant), "the verified client's claims reach the response policy");
@@ -17740,6 +17747,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: subject.to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": subject }),
+            verification: Default::default(),
         };
         state
             .delegation_vault_store
@@ -21405,6 +21413,7 @@ mod tests {
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
                 "oid": "00000000-0000-0000-0000-0000000000aa" }),
+            verification: Default::default(),
         }
         .principal_hash(None)
         .unwrap();
@@ -22184,6 +22193,7 @@ mod tests {
                 .unwrap_or("<none>")
                 .to_string(),
             claims,
+            verification: Default::default(),
         };
         let alice = jwt(json!({ "iss": "https://idp.example", "sub": "alice" }));
         let store_grant = |id: &'static str, user_identity_hash: String, access_token: &'static str| {
@@ -22302,6 +22312,7 @@ mod tests {
                     .to_string(),
                 principal_claim: principal_claim.to_string(),
                 claims,
+                verification: Default::default(),
             }
         };
         let by_oid = named_by("oid", "sub-in-the-first-app");
@@ -22354,6 +22365,7 @@ mod tests {
             subject: "<none>".to_string(),
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
+            verification: Default::default(),
         };
         assert!(
             step_inject_credentials(&state, &mut context(without_oid))
@@ -22391,6 +22403,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+            verification: Default::default(),
         });
         no_agent.authenticated_by = Some(SourceAuth);
         no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
@@ -23852,6 +23865,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+            verification: Default::default(),
         };
         for (provider, tenant) in [("tenant-own", "tenant-a"), ("tenant-foreign", "tenant-b")] {
             state
