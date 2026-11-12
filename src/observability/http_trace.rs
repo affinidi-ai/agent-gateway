@@ -576,6 +576,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "alice@example.com".to_string(),
             claims: serde_json::json!({"sub": "alice@example.com"}),
+            verification: Default::default(),
         };
         let f = caller_span_fields(&id);
         assert_eq!(field(&f, "caller.auth_method").as_deref(), Some("jwt_bearer"));
@@ -802,6 +803,7 @@ mod tests {
                         principal_claim: "sub".to_string(),
                         subject: "alice@example.com".to_string(),
                         claims: serde_json::json!({"sub": "alice@example.com"}),
+                        verification: Default::default(),
                     };
                     record_caller_identity_on_current_span(&identity);
                     "ok"
@@ -930,6 +932,7 @@ mod tests {
                         principal_claim: "sub".to_string(),
                         subject: "agent-oid-123".to_string(),
                         claims: serde_json::json!({"oid": "agent-oid-123"}),
+                        verification: Default::default(),
                     };
                     record_caller_identity_on_current_span(&identity);
                     // …then a DID is derived later in the pipeline (from_jwt_claim).

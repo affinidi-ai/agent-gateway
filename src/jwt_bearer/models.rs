@@ -111,19 +111,28 @@ pub fn normalize_principal_claim(claim: Option<&str>) -> Result<Option<String>, 
     let Some(claim) = claim else {
         return Ok(None);
     };
-    if claim.is_empty() || claim.len() > MAX_PRINCIPAL_CLAIM_LEN {
-        return Err(format!("principal_claim must be 1 to {MAX_PRINCIPAL_CLAIM_LEN} characters"));
+    if let Some(problem) = identifying_claim_problem(claim) {
+        return Err(format!("principal_claim {problem}"));
     }
-    if !claim
+    Ok((claim != DEFAULT_PRINCIPAL_CLAIM).then(|| claim.to_string()))
+}
+
+/// What keeps `claim` from naming a caller, worded to follow the setting's name: it must be
+/// 1 to 128 printable ASCII characters with no spaces, and not a claim that names the token,
+/// its issuer, audience, client, tenant, session or lifetime rather than a person.
+pub fn identifying_claim_problem(claim: &str) -> Option<String> {
+    if claim.is_empty() || claim.len() > MAX_PRINCIPAL_CLAIM_LEN {
+        Some(format!("must be 1 to {MAX_PRINCIPAL_CLAIM_LEN} characters"))
+    } else if !claim
         .bytes()
         .all(|byte| byte.is_ascii_graphic())
     {
-        return Err("principal_claim must be printable ASCII with no spaces".to_string());
+        Some("must be printable ASCII with no spaces".to_string())
+    } else if NON_IDENTIFYING_CLAIMS.contains(&claim) {
+        Some(format!("cannot be '{claim}': it does not identify a caller"))
+    } else {
+        None
     }
-    if NON_IDENTIFYING_CLAIMS.contains(&claim) {
-        return Err(format!("principal_claim cannot be '{claim}': it does not identify a caller"));
-    }
-    Ok((claim != DEFAULT_PRINCIPAL_CLAIM).then(|| claim.to_string()))
 }
 
 /// The claim a JWT Bearer method matches against its `audiences`.

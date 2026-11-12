@@ -329,7 +329,7 @@ The built-in rules, applied in this order:
 | Access and refresh tokens | The value of an `access_token`, `refresh_token` or `token` assignment |
 | Session identifiers | The value of a `session_id`, `sessionid`, `sid`, `jsessionid` or `connect.sid` assignment |
 | API key and secret assignments | The value after `api_key`, `api-key`, `apikey` or `secret` and an `=` or `:` |
-| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"` or `"cookie": "…"`, also with escaped quotes |
+| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"`, `"x-caller-key": "…"` or `"cookie": "…"`, also with escaped quotes |
 | Personal access tokens | `agpat_…` tokens |
 | Private key material (PEM) | PEM private key blocks |
 | Email addresses | Email addresses |
@@ -345,8 +345,9 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 `<redacted>` whatever its value, because a rule pattern cannot match a structured
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
-`api_key`, `apikey`, `private_key`, `credential` and `credentials`, alone or after a `.`,
-`_` or `-`: `http.request.header.authorization`, `x-api-key` and `mcp_session_id` match,
+`api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
+a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
+`mcp_session_id` match,
 `token_count` and `secret_id` do not. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
@@ -1002,6 +1003,52 @@ was deleted are dropped at startup, and their cases are `404`.
 - `target.mpp_auto_pay`, `target.mpp_auto_pay_max_amount` and
   `transit.points[*].payment_policy` are refused on save with the same code. A stored
   `mpp_auto_pay` is ignored: a `402` from a `fabric://` Target is passed back to the caller.
+
+## Surface caller keys
+
+A surface's optional `caller_key` gives its Target a stable key for each caller whose JWT the
+gateway verified on that request, so the Target can encrypt that caller's data with a key its
+own operator cannot derive. It is a surface field, not a configuration file, set through the
+admin API; a variant cannot override it.
+
+```json
+"caller_key": {
+  "secret_id": "agent-memory-keys",
+  "header": "x-caller-key",
+  "identity_claims": ["sub"]
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
+| `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
+| `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
+
+The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v2`
+as the salt, 32 bytes, base64url without padding. Its info is seven fields, each preceded by
+its length in bytes as a 4-byte big-endian integer, so no field can be read as part of
+another: the surface id; the key source, `jwks_uri:` and the JWT verification strategy's JWKS
+URI as configured, or `inline_jwks:sha256:` and the lowercase hex SHA-256 of the RFC 8785
+canonical JSON of a key set configured inline (the gateway's own signing keys for an MCP
+Resource Server token); the audience claim (`aud`, `azp` or `client_id`; `aud` for a Resource
+Server token); the audiences the token was accepted against (the method's `audiences`, or the
+resource for a Resource Server token), sorted, without duplicates, each preceded by its own
+4-byte length; the token's `iss`; the claim's name; and its value. Binding the key to the key
+source and the audiences means whoever edits the strategy to trust another key set, or adds an
+audience to accept another application's tokens, cannot obtain an existing caller's key with
+a token claiming that caller's `iss` and subject. By design, changing the secret, the claims,
+the surface, the strategy's JWKS URI or inline keys (an inline key rotation included), the
+audience claim or the audiences changes every caller's key; the issuer rotating the keys
+behind a JWKS URI does not. Only a caller whose JWT was verified on
+that request gets a key: no caller with an API key, DID Auth or mTLS, no caller without a
+credential or whose credential failed on a public Access Point, and no token without a string
+`iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
+starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
+gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
+used such a header for its own purposes can no longer send it through. A PUT that leaves
+`caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ## Remote gateway records
 

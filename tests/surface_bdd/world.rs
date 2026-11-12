@@ -25,10 +25,10 @@ pub struct StartedSignIn {
 }
 
 pub use crate::bdd_support::config::single_surface_fixture::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder, SurfaceCredentialDelegationConfig,
-    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder,
+    SurfaceCredentialDelegationConfig, SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig,
+    SurfaceTransitPointConfig, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
 };
 
 use tempfile::TempDir;

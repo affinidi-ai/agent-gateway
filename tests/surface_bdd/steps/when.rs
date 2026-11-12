@@ -2238,6 +2238,7 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
+#[given("the caller has sent a request to the surface with a valid token")]
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -2245,6 +2246,29 @@ async fn request_with_valid_token(world: &mut SurfaceWorld) {
     let audience = caller_token_audience(world);
     let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
     send_request_with_bearer_token(world, token).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid token and header {string} set to {string}")]
+async fn request_with_valid_token_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), (name, value)]).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and header {string} set to {string}")]
+async fn request_with_valid_api_key_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    let api_key = build_valid_api_key_source_auth_header(world);
+    send_request_and_record(world, vec![api_key, (name, value)]).await;
 }
 
 #[when(expr = "the caller sends a request to the surface with a token for audience {string}")]

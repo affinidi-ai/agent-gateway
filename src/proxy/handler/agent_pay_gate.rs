@@ -4636,6 +4636,7 @@ pub(crate) mod tests {
                 .unwrap_or_default()
                 .to_string(),
             claims,
+            verification: Default::default(),
         }
     }
 

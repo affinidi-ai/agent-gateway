@@ -6744,6 +6744,17 @@ async fn proxy_charged_request(
         }
     }
 
+    if !bound_target
+        && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+            &state.surface,
+            authenticated_identity.as_ref(),
+            state.secrets_store.as_ref(),
+        )
+        .await
+    {
+        upstream_req = replace_request_header(upstream_req, &header_name, &header_value);
+    }
+
     // ── The Target's grant by binding, in place of the caller's credentials ──
     let released_target_grant = match target_grant.as_ref() {
         Some(route) => match route
@@ -22187,6 +22198,28 @@ allow if {
         assert!(!should_forward_ap_request_header_with_mapping("X-Gateway-Fabric-Hops", &[], None, None));
     }
 
+    /// A caller key the caller sends never reaches the Target or a Fabric peer: any header of
+    /// the caller key family, in any spelling. A header outside the family still does.
+    #[test]
+    fn a_caller_key_the_caller_sends_is_stripped() {
+        for name in ["x-caller-key", "X-Caller-Key", "x_caller_key", "x-caller-key-memory", "X_Caller_Key_Memory"] {
+            assert!(!should_forward_ap_request_header_with_mapping(name, &[], None, None), "{name}");
+            assert!(!forwards_ap_caller_header(name, &[], None, None, &[]), "{name}");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("forged"),
+            );
+            let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &[]);
+            assert!(!buffered.contains_key(&name.to_uppercase()), "{name}");
+            assert!(streamed.get(name).is_none(), "{name}");
+        }
+        for name in ["x-api-key", "x-caller-keys", "x-caller-did-hint"] {
+            assert!(should_forward_ap_request_header_with_mapping(name, &[], None, None), "{name}");
+            assert!(forwards_ap_caller_header(name, &[], None, None, &[]), "{name}");
+        }
+    }
+
     #[test]
     fn every_configured_source_auth_header_is_stripped() {
         let headers = ["authorization", "X-API-Key"];
@@ -22898,6 +22931,7 @@ allow if {
                 principal_claim: "sub".to_string(),
                 subject: "user-1".into(),
                 claims: serde_json::json!({"sub": "user-1"}),
+                verification: Default::default(),
             };
 
             for identity in [Some(&jwt), None] {
@@ -24227,6 +24261,7 @@ mod fabric_send_tests {
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: json!({"iss": "https://idp.example.com", "email": "ada@example.com"}),
+            verification: Default::default(),
         };
 
         let (result, events) = crate::audit::producer::capture(Box::pin(super::handle_fabric_request(
