@@ -2928,6 +2928,36 @@ fn response_includes_header_with_value(
     assert_collaborator_header_value(get_response_headers_value(world), &header_name, &expected_value, "response");
 }
 
+#[then(expr = "the response carries no {string} header")]
+fn response_carries_no_header(
+    world: &mut SurfaceWorld,
+    header_name: String,
+) {
+    let headers = get_response_headers_value(world);
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&header_name)),
+        "response must not carry '{}'; headers: {:?}",
+        header_name,
+        headers
+    );
+}
+
+#[then(expr = "the created surface allows browser origins {string}")]
+fn created_surface_allows_browser_origins(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &get_admin_response(world).body;
+    let expected: Vec<&str> = expected.split(", ").collect();
+    assert_eq!(
+        body.pointer("/browser_origins"),
+        Some(&serde_json::json!(expected)),
+        "unexpected browser origins in {body}"
+    );
+}
+
 #[then(expr = "the response carries a non-empty {string} header")]
 fn response_carries_non_empty_header(
     world: &mut SurfaceWorld,
