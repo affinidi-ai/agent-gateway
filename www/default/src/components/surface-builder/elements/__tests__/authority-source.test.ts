@@ -9,6 +9,13 @@ import {
   classifyTargetAuthoritySelection,
   missingTrustCheckAuthorities,
   queriesFromWire,
+  addAuthorityRow,
+  authorityRows,
+  canAddAuthorityRow,
+  removeAuthorityRow,
+  setAuthorityRow,
+  TRUST_CHECK_AUTHORITIES_MAX,
+  type TrustCheckQueryConfig,
 } from '../trust-check/definition';
 import {
   missingTrustRecorderAuthorities,
@@ -143,7 +150,7 @@ describe('authority_source — wire round-trip', () => {
   it('keeps a stored authority list and its sources through hydration and save', () => {
     const payload = surface();
     const listed = {
-      id: 'fi-recognised',
+      id: 'authority-recognised',
       trust_registry_id: 'tr-1',
       query_type: 'recognition',
       authority_sources: { [AUTHORITY]: 'authority' },
@@ -205,6 +212,99 @@ describe('authority_source — wire round-trip', () => {
     );
     expect(next).not.toHaveProperty('authority_source');
     expect(next.id).toBe('q');
+  });
+});
+
+describe('several Authorities per query', () => {
+  const LISTED = ['did:web:authority-a', 'did:web:authority-b', 'did:web:authority-c'];
+  const single = (authority_id: string, authority_source?: 'authority' | 'issuer') =>
+    ({
+      id: 'q',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      ...(authority_source ? { authority_source } : {}),
+      query: { authority_id, entity_id: '{{ input.agent.did }}' },
+    }) as TrustCheckQueryConfig;
+
+  /** Pick each DID in a new row after the first, as the editor's Add Authority does. */
+  const listOf = (dids: string[], source: 'authority' | 'issuer' = 'authority') => {
+    let q = single(dids[0], source);
+    for (let i = 1; i < dids.length; i++) {
+      q = setAuthorityRow(addAuthorityRow(q), i, dids[i], source);
+    }
+    return q;
+  };
+
+  it('turns a picked Authority into the first of several when a row is added', () => {
+    const multi = addAuthorityRow(single(AUTHORITY, 'authority'));
+    expect(multi.query).toEqual({
+      authority_ids: [AUTHORITY, ''],
+      entity_id: '{{ input.agent.did }}',
+    });
+    expect(multi.authority_sources).toEqual({ [AUTHORITY]: 'authority' });
+    expect(multi).not.toHaveProperty('authority_source');
+  });
+
+  it('records an Issuer row as picked from the Issuers', () => {
+    const q = setAuthorityRow(addAuthorityRow(single(AUTHORITY, 'authority')), 1, ISSUER, 'issuer');
+    expect(q.query?.authority_ids).toEqual([AUTHORITY, ISSUER]);
+    expect(q.authority_sources).toEqual({ [AUTHORITY]: 'authority', [ISSUER]: 'issuer' });
+  });
+
+  it('adds no row beside a template, an empty row, or at the limit', () => {
+    expect(canAddAuthorityRow(single(AGENT_IDENTITY_ISSUER_DID_TEMPLATE))).toBe(false);
+    expect(canAddAuthorityRow(single(''))).toBe(false);
+    expect(canAddAuthorityRow(addAuthorityRow(single(AUTHORITY, 'authority')))).toBe(false);
+    const full = listOf(
+      Array.from({ length: TRUST_CHECK_AUTHORITIES_MAX }, (_, i) => `did:web:authority-${i}`)
+    );
+    expect(authorityRows(full)).toHaveLength(TRUST_CHECK_AUTHORITIES_MAX);
+    expect(canAddAuthorityRow(full)).toBe(false);
+    expect(addAuthorityRow(full)).toBe(full);
+  });
+
+  it('removes a row, and goes back to a single authority_id at one row', () => {
+    const q = removeAuthorityRow(listOf(LISTED), 0);
+    expect(q.query?.authority_ids).toEqual([LISTED[1], LISTED[2]]);
+    expect(q.authority_sources).toEqual({ [LISTED[1]]: 'authority', [LISTED[2]]: 'authority' });
+    const back = removeAuthorityRow(q, 1);
+    expect(back.query).toEqual({ authority_id: LISTED[1], entity_id: '{{ input.agent.did }}' });
+    expect(back.authority_source).toBe('authority');
+    expect(back).not.toHaveProperty('authority_sources');
+    expect(removeAuthorityRow(back, 0)).toBe(back);
+  });
+
+  it('saves the picked list and its sources, with no authority_id', () => {
+    const q = listOf(LISTED);
+    const nodes = [
+      {
+        id: 'tc',
+        type: 'trust-check',
+        slotId: 'request:trust-check-access_point_trust_check_list',
+        parentId: 'access-point',
+        config: { queries: [q] },
+      },
+    ] as unknown as CanvasNode[];
+    const [element] = rebuild(nodes).access_point.trust_check_list;
+    expect(element.query).toEqual({ authority_ids: LISTED, entity_id: '{{ input.agent.did }}' });
+    expect(element.authority_sources).toEqual(
+      Object.fromEntries(LISTED.map(d => [d, 'authority']))
+    );
+    expect(element).not.toHaveProperty('authority_source');
+  });
+
+  it('is incomplete while an added row is empty', () => {
+    const open = addAuthorityRow(single(AUTHORITY, 'authority'));
+    expect(registry.getIncompleteReason('trust-check', { queries: [open] })).toBe(
+      'Select an Issuer or Authority for every Authority row'
+    );
+  });
+
+  it('summarises the number of authorities', () => {
+    const q = listOf(LISTED);
+    expect(registry.get('trust-check')?.summary?.({ queries: [q] })).toBe(
+      'recognition · 3 authorities'
+    );
   });
 });
 

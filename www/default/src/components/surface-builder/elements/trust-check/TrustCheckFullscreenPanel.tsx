@@ -5,12 +5,18 @@ import { getIssuers } from '../../../../utils/issuersCache';
 import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
 import {
-  authorityNeedsSelection,
+  authorityCountLabel,
   isMigratedTrustCheck,
+  isMultiAuthorityQuery,
+  listedAuthorities,
   makeDefaultQuery,
+  queryAuthorityMissing,
   readOnlyTrustCheckMessage,
   readOnlyTrustCheckProtocol,
   readQueries,
+  addAuthorityRow,
+  removeAuthorityRow,
+  setAuthorityRow,
   trustCheckLeg,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
@@ -131,6 +137,21 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     );
   };
 
+  const updateQueryWith = (
+    idx: number,
+    fn: (q: TrustCheckQueryConfig) => TrustCheckQueryConfig
+  ) => {
+    setDraft(prev => prev.map((q, i) => (i === idx ? fn(q) : q)));
+  };
+
+  const addAuthorityRowAt = (idx: number) => updateQueryWith(idx, addAuthorityRow);
+
+  const setAuthorityRowAt = (idx: number, row: number, did: string, source?: AuthoritySource) =>
+    updateQueryWith(idx, q => setAuthorityRow(q, row, did, source));
+
+  const removeAuthorityRowAt = (idx: number, row: number) =>
+    updateQueryWith(idx, q => removeAuthorityRow(q, row));
+
   const updateEntityAt = (idx: number, value: string) => {
     updateQuerySubField(idx, 'entity_id', value);
   };
@@ -173,9 +194,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     // the caller leg a blank value is fine — it defaults to the verified
     // agent-identity-credential issuer — so only a *different* leftover
     // template blocks the save.
-    const hasAuthorityGap = draft.some(q =>
-      authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa)
-    );
+    const hasAuthorityGap = draft.some(q => queryAuthorityMissing(q, isApMa));
     if (hasAuthorityGap) return;
     updateFields({ queries: draft, trust_check_migrated: false });
     closeFullscreenEditor?.();
@@ -196,7 +215,12 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     const expanded = expandedIdx === idx;
     const nameValue = typeof q.name === 'string' ? q.name : '';
     const headerLabel = nameValue ? `Query ${idx + 1} · ${nameValue}` : `Query ${idx + 1}`;
-    const headerSummary = `${queryType} · ${registryNameById(q.trust_registry_id)}`;
+    const listed = listedAuthorities(q.query).length;
+    const headerSummary = [
+      queryType,
+      registryNameById(q.trust_registry_id),
+      ...(isMultiAuthorityQuery(q) ? [authorityCountLabel(listed)] : []),
+    ].join(' · ');
 
     return (
       <div
@@ -244,6 +268,9 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             updateQueryAt={updateQueryAt}
             updateQuerySubField={updateQuerySubField}
             updateAuthorityAt={updateAuthorityAt}
+            addAuthorityRowAt={addAuthorityRowAt}
+            setAuthorityRowAt={setAuthorityRowAt}
+            removeAuthorityRowAt={removeAuthorityRowAt}
             updateEntityAt={updateEntityAt}
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}
             saveAttempted={saveAttempted}

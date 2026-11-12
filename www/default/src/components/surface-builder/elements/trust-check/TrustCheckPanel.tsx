@@ -1,5 +1,8 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Form } from 'react-bootstrap';
+import { getAuthorities } from '../../../../utils/authoritiesCache';
+import { getIssuers } from '../../../../utils/issuersCache';
+import { topAndTail } from '../../../../utils/stringUtils';
 import { AppButton } from '../../../shared/AppButton';
 import { managedAgentTargetLegTrustCheckAllowed } from '../edges/archetypes';
 import InfoBanner from '../../../shared/InfoBanner';
@@ -8,6 +11,10 @@ import { useOptionalSurfaceMeta } from '../../SurfaceMetaContext';
 import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import MigratedTrustCheckWarning from './MigratedTrustCheckWarning';
 import {
+  authorityCountLabel,
+  isMultiAuthorityQuery,
+  listedAuthorities,
+  type TrustCheckQueryConfig,
   MANAGED_AGENT_TRUST_CHECK_DUPLICATED_NOTE,
   managedAgentTrustCheckRunsOnTransitPoints,
   readOnlyTrustCheckMessage,
@@ -79,6 +86,29 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
   const missingAuthorities = missingTrustCheckAuthorities(config, authorityDids);
   const shown = queries.slice(0, PREVIEW_MAX);
   const remaining = queries.length - shown.length;
+  const hasAuthorityList = queries.some(isMultiAuthorityQuery);
+  const [authorityNameByDid, setAuthorityNameByDid] = useState<ReadonlyMap<string, string>>(
+    () => new Map()
+  );
+  useEffect(() => {
+    if (!hasAuthorityList) return undefined;
+    let alive = true;
+    // Best effort: without a register the list shows DIDs instead of names.
+    Promise.all([getIssuers().catch(() => []), getAuthorities().catch(() => [])]).then(
+      ([issuers, authorities]) => {
+        if (!alive) return;
+        // Issuers win on a DID in both registers, as in the picker.
+        setAuthorityNameByDid(
+          new Map([...authorities, ...issuers].map(entry => [entry.did, entry.name] as const))
+        );
+      }
+    );
+    return () => {
+      alive = false;
+    };
+  }, [hasAuthorityList]);
+  const authorityNames = (q: TrustCheckQueryConfig): string[] =>
+    listedAuthorities(q.query).map(did => authorityNameByDid.get(did) ?? topAndTail(did, 16, 12));
   const renderEmptyState = () => (
     <div className="py-2 text-center" data-testid="trust-check-panel-empty-state">
       <div className="fw-semibold small mb-2" style={{ fontSize: '12px' }}>
@@ -123,6 +153,22 @@ const TrustCheckPanel: React.FC<ConfigPanelProps> = ({
                 }}
               >
                 <span className="fw-semibold">{typeLabel}</span>
+                {isMultiAuthorityQuery(q) && (
+                  <span
+                    className="d-block text-muted"
+                    style={{
+                      fontSize: '10px',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }}
+                    title={authorityNames(q).join(', ')}
+                    data-testid={`trust-check-panel-query-${idx}-authorities`}
+                  >
+                    {authorityCountLabel(listedAuthorities(q.query).length)}
+                    {listedAuthorities(q.query).length > 0 && `: ${authorityNames(q).join(', ')}`}
+                  </span>
+                )}
                 {nameValue && (
                   <span
                     className="d-block text-muted fst-italic"

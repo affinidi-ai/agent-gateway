@@ -13,7 +13,12 @@ jest.mock('../../../../utils/issuersCache', () => ({
 }));
 jest.mock('../../../../utils/authoritiesCache', () => ({
   getAuthorities: () =>
-    Promise.resolve([{ id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' }]),
+    Promise.resolve([
+      { id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' },
+      { id: 'a-a', name: 'authority-A', did: 'did:web:authority-a' },
+      { id: 'a-b', name: 'authority-B', did: 'did:web:authority-b' },
+      { id: 'a-c', name: 'authority-C', did: 'did:web:authority-c' },
+    ]),
 }));
 
 const AP_SLOT = 'request:trust-check-access_point_trust_check_list';
@@ -186,6 +191,28 @@ describe('TrustCheckPanel — sidebar context block', () => {
   });
 });
 
+describe('TrustCheckPanel — several Authorities', () => {
+  it('shows the number and names of the listed Authorities', async () => {
+    const config = {
+      queries: [
+        {
+          id: 'q-1',
+          trust_registry_id: 'tr-1',
+          query_type: 'recognition',
+          query: {
+            authority_ids: ['did:web:authority-a', 'did:web:issuer.example', 'did:web:unknown'],
+          },
+        },
+      ],
+    };
+    render(<TrustCheckPanel {...(baseProps(AP_SLOT, config) as any)} />);
+    await act(() => new Promise<void>(resolve => setTimeout(resolve, 0)));
+    expect(screen.getByTestId('trust-check-panel-query-0-authorities')).toHaveTextContent(
+      '3 authorities: authority-A, Acme Issuer, did:web:unknown'
+    );
+  });
+});
+
 describe('TrustCheckPanel — deleted Authority', () => {
   const GONE = 'did:web:deleted-authority.example';
   const query = (id: string, authority_id: string, authority_source?: string) => ({
@@ -287,6 +314,72 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     const [query] = updateFields.mock.calls[0][0].queries;
     expect(query.authority_source).toBe('issuer');
     expect(query.query.authority_id).toBe('did:web:issuer.example');
+  });
+
+  function pickInRow(row: number, label: string) {
+    fireEvent.click(screen.getByTestId(`trust-check-query-0-authority-${row}`));
+    fireEvent.click(screen.getByText(label));
+  }
+
+  it('saves several Authorities and an Issuer added row by row, each with its register', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    pickInRow(1, 'authority-B');
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    pickInRow(2, 'authority-C');
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    pickInRow(3, 'Acme Issuer');
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.query.authority_ids).toEqual([
+      'did:web:authority-a',
+      'did:web:authority-b',
+      'did:web:authority-c',
+      'did:web:issuer.example',
+    ]);
+    expect(query.query).not.toHaveProperty('authority_id');
+    expect(query.authority_sources).toEqual({
+      'did:web:authority-a': 'authority',
+      'did:web:authority-b': 'authority',
+      'did:web:authority-c': 'authority',
+      'did:web:issuer.example': 'issuer',
+    });
+    expect(query).not.toHaveProperty('authority_source');
+  });
+
+  it('does not save while an added row is empty', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    expect(updateFields).not.toHaveBeenCalled();
+    expect(screen.getByTestId('trust-check-query-0-authority-1')).toHaveClass('is-invalid');
+  });
+
+  it('saves a single authority_id again once the extra rows are removed', async () => {
+    const { updateFields } = await openEditor([stored('did:web:authority-a', 'authority')]);
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    pickInRow(1, 'authority-B');
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-0-remove'));
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    const [query] = updateFields.mock.calls[0][0].queries;
+    expect(query.query).toEqual({ authority_id: 'did:web:authority-b' });
+    expect(query.authority_source).toBe('authority');
+    expect(query).not.toHaveProperty('authority_sources');
+  });
+
+  it('opens a stored list of Authorities row by row, with nothing to save', async () => {
+    const listed = {
+      id: 'q-1',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: { 'did:web:authority-b': 'authority', 'did:web:issuer.example': 'issuer' },
+      query: { authority_ids: ['did:web:authority-b', 'did:web:issuer.example'] },
+    };
+    const { updateFields } = await openEditor([listed]);
+    expect(screen.getByTestId('trust-check-query-0-authority-0')).toHaveTextContent('authority-B');
+    expect(screen.getByTestId('trust-check-query-0-authority-1')).toHaveTextContent('Acme Issuer');
+    expect(screen.getByTestId('trust-check-save')).toBeDisabled();
+    expect(updateFields).not.toHaveBeenCalled();
   });
 
   it('flags a deleted Authority once the register has loaded', async () => {

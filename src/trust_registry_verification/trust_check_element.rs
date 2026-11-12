@@ -766,7 +766,7 @@ mod tests {
     }
 
     fn multi(authorities: &[&str]) -> TrustCheckElement {
-        let mut elem = elem_with_name("fi-recognised", None);
+        let mut elem = elem_with_name("authority-recognised", None);
         elem.query.authority_id = String::new();
         elem.query.authority_ids = Some(
             authorities
@@ -780,14 +780,14 @@ mod tests {
     #[test]
     fn multi_authority_element_round_trips_without_authority_id() {
         let v = json!({
-            "id": "fi-recognised",
+            "id": "authority-recognised",
             "trust_registry_id": "tr-main",
             "query_type": "recognition",
             "query": {
-                "authority_ids": ["did:web:fi-a", "did:web:fi-b"],
+                "authority_ids": ["did:web:authority-a", "did:web:authority-b"],
                 "entity_id": "{{input.caller.did}}"
             },
-            "authority_sources": { "did:web:fi-a": "authority" }
+            "authority_sources": { "did:web:authority-a": "authority" }
         });
         let elem: TrustCheckElement = serde_json::from_value(v.clone()).unwrap();
         assert_eq!(elem.query.authority_id, "");
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn validate_accepts_authority_list_up_to_the_limit() {
         let dids: Vec<String> = (0..TRUST_CHECK_AUTHORITIES_MAX)
-            .map(|i| format!("did:web:fi-{i}"))
+            .map(|i| format!("did:web:authority-{i}"))
             .collect();
         let refs: Vec<&str> = dids
             .iter()
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn validate_rejects_authority_list_over_the_limit() {
         let dids: Vec<String> = (0..=TRUST_CHECK_AUTHORITIES_MAX)
-            .map(|i| format!("did:web:fi-{i}"))
+            .map(|i| format!("did:web:authority-{i}"))
             .collect();
         let refs: Vec<&str> = dids
             .iter()
@@ -842,8 +842,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_both_authority_fields() {
-        let mut elem = multi(&["did:web:fi-a"]);
-        elem.query.authority_id = "did:web:fi-b".to_string();
+        let mut elem = multi(&["did:web:authority-a"]);
+        elem.query.authority_id = "did:web:authority-b".to_string();
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthorityBothSet));
     }
 
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn validate_rejects_blank_authority_entry() {
         assert_eq!(
-            multi(&["did:web:fi-a", "  "]).validate(),
+            multi(&["did:web:authority-a", "  "]).validate(),
             Err(TrustCheckElementValidationError::AuthoritiesEntryBlank { index: 1 })
         );
     }
@@ -870,23 +870,23 @@ mod tests {
     #[test]
     fn validate_rejects_duplicate_authority_entry() {
         assert_eq!(
-            multi(&["did:web:fi-a", "did:web:fi-b", " did:web:fi-a"]).validate(),
+            multi(&["did:web:authority-a", "did:web:authority-b", " did:web:authority-a"]).validate(),
             Err(TrustCheckElementValidationError::AuthoritiesDuplicate {
-                authority: "did:web:fi-a".to_string(),
+                authority: "did:web:authority-a".to_string(),
             })
         );
     }
 
     #[test]
     fn per_authority_expands_in_order_with_default_timeout() {
-        let expanded = multi(&["did:web:fi-a", "did:web:fi-b"]).per_authority();
+        let expanded = multi(&["did:web:authority-a", "did:web:authority-b"]).per_authority();
         let authorities: Vec<&str> = expanded
             .iter()
             .map(|e| e.query.authority_id.as_str())
             .collect();
-        assert_eq!(authorities, ["did:web:fi-a", "did:web:fi-b"]);
+        assert_eq!(authorities, ["did:web:authority-a", "did:web:authority-b"]);
         assert!(expanded.iter().all(|e| {
-            e.id == "fi-recognised"
+            e.id == "authority-recognised"
                 && e.query
                     .authority_ids
                     .is_none()
@@ -898,9 +898,9 @@ mod tests {
     fn per_authority_takes_each_source_from_the_authority_sources_map() {
         use crate::trust_registry_verification::authority_source::AuthoritySource;
 
-        let mut elem = multi(&["did:web:fi-a", "did:web:fi-b"]);
+        let mut elem = multi(&["did:web:authority-a", "did:web:authority-b"]);
         elem.authority_sources
-            .insert("did:web:fi-a".to_string(), AuthoritySource::Authority);
+            .insert("did:web:authority-a".to_string(), AuthoritySource::Authority);
         let sources: Vec<_> = elem
             .per_authority()
             .into_iter()
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_timeout_on_authority_list() {
-        let mut elem = multi(&["did:web:fi-a"]);
+        let mut elem = multi(&["did:web:authority-a"]);
         elem.timeout_secs = Some(2);
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritiesTimeoutSet));
     }
@@ -933,12 +933,19 @@ mod tests {
     #[test]
     fn expand_authorities_flattens_mixed_lists_in_order() {
         let single = elem_with_name("single", None);
-        let elements = [multi(&["did:web:fi-a", "did:web:fi-b"]), single];
+        let elements = [multi(&["did:web:authority-a", "did:web:authority-b"]), single];
         let expanded = expand_authorities(&elements);
         let pairs: Vec<(&str, &str)> = expanded
             .iter()
             .map(|e| (e.id.as_str(), e.query.authority_id.as_str()))
             .collect();
-        assert_eq!(pairs, [("fi-recognised", "did:web:fi-a"), ("fi-recognised", "did:web:fi-b"), ("single", "did:a")]);
+        assert_eq!(
+            pairs,
+            [
+                ("authority-recognised", "did:web:authority-a"),
+                ("authority-recognised", "did:web:authority-b"),
+                ("single", "did:a")
+            ]
+        );
     }
 }

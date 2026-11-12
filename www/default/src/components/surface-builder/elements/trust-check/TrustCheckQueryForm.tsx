@@ -9,8 +9,12 @@ import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE } from './templates';
 import {
   authorityNeedsSelection,
+  authorityRows,
+  canAddAuthorityRow,
   classifyTargetAuthoritySelection,
+  isMultiAuthorityQuery,
   readSubjectPickerState,
+  TRUST_CHECK_AUTHORITIES_MAX,
   subjectDescription,
   subjectForTemplate,
   subjectLabel,
@@ -102,6 +106,12 @@ interface TrustCheckQueryFormProps {
   updateQuerySubField: (index: number, field: string, value: string) => void;
   /** `source` is where a literal DID was picked from; absent for a template, which removes it. */
   updateAuthorityAt: (index: number, value: string, source?: AuthoritySource) => void;
+  /** Append an Authority row to the query; omit to hide **Add Authority**. */
+  addAuthorityRowAt?: (index: number) => void;
+  /** Set one row of a query that lists several Authorities. */
+  setAuthorityRowAt?: (index: number, row: number, did: string, source?: AuthoritySource) => void;
+  /** Remove one row of a query that lists several Authorities. */
+  removeAuthorityRowAt?: (index: number, row: number) => void;
   updateEntityAt: (index: number, value: string) => void;
   handleQueryTypeChangeAt: (index: number, next: TrustCheckRecordType) => void;
   /**
@@ -125,6 +135,9 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   updateQueryAt,
   updateQuerySubField,
   updateAuthorityAt,
+  addAuthorityRowAt,
+  setAuthorityRowAt,
+  removeAuthorityRowAt,
   updateEntityAt,
   handleQueryTypeChangeAt,
   saveAttempted = false,
@@ -132,7 +145,6 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   const queryType: TrustCheckRecordType =
     queryConfig.query_type === 'recognition' ? 'recognition' : 'authorization';
   const sq = queryConfig.query || {};
-  const authorityValue: string = typeof sq.authority_id === 'string' ? sq.authority_id : '';
   const entityValue: string = typeof sq.entity_id === 'string' ? sq.entity_id : '';
   const tid = (suffix: string) => `trust-check-query-${index}-${suffix}`;
 
@@ -190,16 +202,22 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
 
         <div className="col-12">
           <Form.Label className="fw-semibold small mb-1">Authority ID</Form.Label>
-          <IssuerAuthorityPicker
-            testid={tid('authority')}
+          <AuthorityRows
+            tidPrefix={`trust-check-query-${index}`}
             isApMa={isApMa}
-            storedValue={authorityValue}
-            storedSource={queryConfig.authority_source}
+            queryConfig={queryConfig}
             issuers={issuers}
             authorities={authorities}
             authoritiesLoaded={authoritiesLoaded}
-            invalid={saveAttempted && authorityNeedsSelection(authorityValue, isApMa)}
-            onChange={(did, source) => updateAuthorityAt(index, did, source)}
+            saveAttempted={saveAttempted}
+            onSingleChange={(did, source) => updateAuthorityAt(index, did, source)}
+            onRowChange={
+              setAuthorityRowAt
+                ? (row, did, source) => setAuthorityRowAt(index, row, did, source)
+                : undefined
+            }
+            onAddRow={addAuthorityRowAt ? () => addAuthorityRowAt(index) : undefined}
+            onRemoveRow={removeAuthorityRowAt ? row => removeAuthorityRowAt(index, row) : undefined}
           />
         </div>
 
@@ -385,6 +403,12 @@ interface IssuerAuthorityPickerProps {
   authorities: Authority[];
   authoritiesLoaded: boolean;
   invalid?: boolean;
+  /** False for a row of several Authorities: the caller-leg templates are not offered. */
+  allowTemplates?: boolean;
+  /** DIDs picked in other rows, not offered here. */
+  excludeDids?: ReadonlySet<string>;
+  /** False to leave out the explanation under the picker. */
+  showHint?: boolean;
   onChange: (did: string, source?: AuthoritySource) => void;
 }
 
@@ -428,28 +452,29 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   authorities,
   authoritiesLoaded,
   invalid = false,
+  allowTemplates = true,
+  excludeDids,
+  showHint = true,
   onChange,
 }) => {
-  const mappedIssuers = issuers.map(d => ({
-    did: d.did,
-    name: d.name,
-    description: d.description,
-  }));
-  const issuerDids = new Set(mappedIssuers.map(i => i.did));
+  const offered = (did: string) => did === storedValue || !excludeDids?.has(did);
+  const issuerDids = new Set(issuers.map(i => i.did));
+  const shownIssuers = issuers.filter(i => offered(i.did));
   const authorityList = authorities
-    .filter(a => !issuerDids.has(a.did))
+    .filter(a => !issuerDids.has(a.did) && offered(a.did))
     .map(a => ({ did: a.did, name: a.name, description: a.description }));
+  const templates = isApMa && allowTemplates;
   const trimmed = storedValue.trim();
   const isVerifiedIssuerDefault =
-    isApMa && (trimmed === '' || trimmed === AGENT_IDENTITY_ISSUER_DID_TEMPLATE);
+    templates && (trimmed === '' || trimmed === AGENT_IDENTITY_ISSUER_DID_TEMPLATE);
   // Known caller-leg templates that appear as first-class picker options —
   // treated as valid selections rather than "custom (from JSON API)".
   const isKnownCallerTemplate =
-    isApMa &&
+    templates &&
     (trimmed === AGENT_IDENTITY_ISSUER_DID_TEMPLATE ||
       trimmed === INPUT_GATEWAY_SOURCE_ID_TEMPLATE);
   const effectiveValue =
-    isApMa && trimmed === '' ? AGENT_IDENTITY_ISSUER_DID_TEMPLATE : storedValue;
+    templates && trimmed === '' ? AGENT_IDENTITY_ISSUER_DID_TEMPLATE : storedValue;
   const selection = classifyTargetAuthoritySelection(
     storedValue,
     issuers,
@@ -464,8 +489,8 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
     (selection.kind === 'legacy-template' || selection.kind === 'custom-did');
 
   if (
-    !isApMa &&
-    issuers.length === 0 &&
+    !templates &&
+    shownIssuers.length === 0 &&
     authorityList.length === 0 &&
     !hasCustom &&
     !missingAuthority
@@ -500,7 +525,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
 
   const options: Array<FormSelectOption<string>> = [];
 
-  if (isApMa) {
+  if (templates) {
     options.push({
       value: AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
       label: 'Agent identity credential issuer (default)',
@@ -517,12 +542,12 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   // a lone "Issuers" (or "Authorities") label above a single flat list
   // adds no information, so with one category we drop the header and the
   // per-item indent entirely.
-  const showGroupHeaders = issuers.length > 0 && authorityList.length > 0;
-  if (issuers.length > 0) {
+  const showGroupHeaders = shownIssuers.length > 0 && authorityList.length > 0;
+  if (shownIssuers.length > 0) {
     if (showGroupHeaders) {
       options.push({ value: GRP_ISSUERS, label: 'Issuers', disabled: true });
     }
-    for (const issuer of issuers) {
+    for (const issuer of shownIssuers) {
       options.push({
         value: issuer.did,
         label: issuer.name,
@@ -590,12 +615,153 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
           missing={[{ index: 0, did: missingAuthority }]}
         />
       )}
-      <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '11px' }}>
-        {isApMa
-          ? 'Pick the trust anchor the caller is checked against. The default resolves to the cryptographically-verified issuer of the caller’s agent identity credential; pick an Issuer or Authority to pin an explicit DID instead.'
-          : 'Pick the trust anchor the target is checked against. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. If you pick an Authority and it is deleted later, the check fails until you pick another.'}
-      </Form.Text>
+      {showHint && (
+        <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '11px' }}>
+          {isApMa
+            ? 'Pick the trust anchor the caller is checked against. The default resolves to the cryptographically-verified issuer of the caller’s agent identity credential; pick an Issuer or Authority to pin an explicit DID instead.'
+            : 'Pick the trust anchor the target is checked against. Its DID is stored directly, so the gateway never derives the authority from the target’s own agent card. If you pick an Authority and it is deleted later, the check fails until you pick another.'}
+        </Form.Text>
+      )}
     </>
+  );
+};
+
+interface AuthorityRowsProps {
+  /** `trust-check-query-<n>` */
+  tidPrefix: string;
+  isApMa: boolean;
+  queryConfig: TrustCheckQueryConfig;
+  issuers: Issuer[];
+  authorities: Authority[];
+  authoritiesLoaded: boolean;
+  saveAttempted: boolean;
+  /** Single-row change, the existing `authority_id` write. */
+  onSingleChange: (did: string, source?: AuthoritySource) => void;
+  onRowChange?: (row: number, did: string, source?: AuthoritySource) => void;
+  onAddRow?: () => void;
+  onRemoveRow?: (row: number) => void;
+}
+
+/**
+ * The query's Authority as a list of rows, like the Trust Recorder's custom resources: each row is
+ * an Issuer / Authority picker, **Add Authority** appends a row, and each row of several has a
+ * remove button. One row is the single `authority_id`, saved exactly as before; two or more are
+ * `authority_ids`, each recorded in `authority_sources` as picked from the Issuers or the
+ * Authorities register, and OPA gets one result per row in this order. Templates are offered
+ * only while there is one row, and a DID picked in one row is not offered in another.
+ */
+const AuthorityRows: React.FC<AuthorityRowsProps> = ({
+  tidPrefix,
+  isApMa,
+  queryConfig,
+  issuers,
+  authorities,
+  authoritiesLoaded,
+  saveAttempted,
+  onSingleChange,
+  onRowChange,
+  onAddRow,
+  onRemoveRow,
+}) => {
+  const rows = authorityRows(queryConfig);
+  const multi = isMultiAuthorityQuery(queryConfig);
+  const atCap = rows.length >= TRUST_CHECK_AUTHORITIES_MAX;
+  const canAdd = canAddAuthorityRow(queryConfig);
+
+  const addButton = onAddRow && (
+    <button
+      type="button"
+      className="btn btn-outline-secondary btn-sm mt-2"
+      onClick={onAddRow}
+      disabled={!canAdd}
+      title={
+        atCap
+          ? `A query checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities`
+          : canAdd
+            ? undefined
+            : 'Pick an Issuer or Authority in every row first'
+      }
+      data-testid={`${tidPrefix}-add-authority`}
+    >
+      <i className="fas fa-plus me-1" /> Add Authority
+    </button>
+  );
+
+  if (!multi) {
+    const [{ did, source }] = rows;
+    return (
+      <>
+        <IssuerAuthorityPicker
+          testid={`${tidPrefix}-authority`}
+          isApMa={isApMa}
+          storedValue={did}
+          storedSource={source}
+          issuers={issuers}
+          authorities={authorities}
+          authoritiesLoaded={authoritiesLoaded}
+          invalid={saveAttempted && authorityNeedsSelection(did, isApMa)}
+          onChange={onSingleChange}
+        />
+        {addButton}
+      </>
+    );
+  }
+
+  return (
+    <div data-testid={`${tidPrefix}-authorities`}>
+      {rows.map((row, r) => {
+        const others = new Set(rows.filter((_, i) => i !== r).map(o => o.did));
+        return (
+          <div key={r} className="d-flex gap-2 mb-2 align-items-start">
+            <div style={{ flex: '1 1 0', minWidth: 0 }}>
+              <IssuerAuthorityPicker
+                testid={`${tidPrefix}-authority-${r}`}
+                isApMa={isApMa}
+                allowTemplates={false}
+                excludeDids={others}
+                showHint={false}
+                storedValue={row.did}
+                storedSource={row.source}
+                issuers={issuers}
+                authorities={authorities}
+                authoritiesLoaded={authoritiesLoaded}
+                invalid={saveAttempted && row.did.trim() === ''}
+                onChange={(did, src) => onRowChange?.(r, did, src)}
+              />
+            </div>
+            {onRemoveRow && (
+              <button
+                type="button"
+                className="btn btn-outline-danger btn-sm"
+                onClick={() => onRemoveRow(r)}
+                title="Remove Authority"
+                data-testid={`${tidPrefix}-authority-${r}-remove`}
+              >
+                <i className="fas fa-times" />
+              </button>
+            )}
+          </div>
+        );
+      })}
+      <Form.Text
+        className="text-muted d-block"
+        style={{ fontSize: '11px' }}
+        data-testid={`${tidPrefix}-authority-count`}
+      >
+        {rows.length}/{TRUST_CHECK_AUTHORITIES_MAX} Authorities, one result each, in this order
+      </Form.Text>
+      {atCap && (
+        <Form.Text
+          className="text-warning d-block"
+          style={{ fontSize: '11px' }}
+          data-testid={`${tidPrefix}-authority-limit`}
+        >
+          A query checks at most {TRUST_CHECK_AUTHORITIES_MAX} Authorities. Remove one to add
+          another.
+        </Form.Text>
+      )}
+      {addButton}
+    </div>
   );
 };
 

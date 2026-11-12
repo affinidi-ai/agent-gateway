@@ -9,8 +9,7 @@ changes:
         answer or time out (a built-in 5 seconds per authority; timeout_secs is refused on such a
         query), and gives policy
         one result per authority under the element's id, so a surface can accept callers that any
-        participating organisation recognises. The dashboard keeps such a list when it saves a
-        surface but cannot edit it yet.
+        participating organisation recognises.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Link each authority a Trust Check lists to the Authorities register
       description: >-
@@ -19,6 +18,13 @@ changes:
         authority_id. A listed Authority that no longer exists fails only its own result with
         AUTHORITY_NOT_FOUND without querying its registry, while the other authorities are queried,
         and deleting an Authority that a Trust Check lists is refused naming that Trust Check.
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Pick several Authorities for one Trust Check query in the dashboard
+      description: >-
+        In the Trust Check editor, Add Authority adds another Issuer or Authority to a query, up
+        to 25. A query with several saves query.authority_ids with authority_sources recording
+        the register each was picked from; a query with one keeps authority_id as before. The
+        sidebar shows how many authorities each query checks and names them.
   changed: []
   fixed: []
   removed: []

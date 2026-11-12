@@ -278,11 +278,11 @@ A query that must accept an entity any of several organisations recognises lists
 
 ```json
 {
-  "id": "fi-recognised",
+  "id": "authority-recognised",
   "trust_registry_id": "tr-main",
   "query_type": "recognition",
   "query": {
-    "authority_ids": ["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"],
+    "authority_ids": ["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"],
     "entity_id": "{{ input.agent.did }}"
   }
 }
@@ -302,7 +302,7 @@ Because several results share an `id`, an any-of rule iterates them:
 ```rego
 allow if {
     some r in input.trust_check_results.caller
-    r.id == "fi-recognised"
+    r.id == "authority-recognised"
     r.ok
 }
 ```

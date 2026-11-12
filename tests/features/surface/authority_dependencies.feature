@@ -34,15 +34,15 @@ Feature: Authorities that Trust Checks and Trust Recorder entries use
   Scenario: A saved Trust Check that lists authorities records which of them are Authorities
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:acme.example, did:web:typed.example"
     Then the admin API response status is 201
-    And the stored Trust Check "fi-recognised" of the surface under test takes listed authority "did:web:acme.example" from the Authorities register
-    And the stored Trust Check "fi-recognised" of the surface under test does not link listed authority "did:web:typed.example" to any register
+    And the stored Trust Check "authority-recognised" of the surface under test takes listed authority "did:web:acme.example" from the Authorities register
+    And the stored Trust Check "authority-recognised" of the surface under test does not link listed authority "did:web:typed.example" to any register
 
   Scenario: Deleting an Authority that a Trust Check lists is refused naming the surface and the check
     Given the operator has created the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:typed.example, did:web:acme.example"
     When the operator deletes the Authority "Acme"
     Then the admin API response status is 409
     And the refusal names the surface under test as a record that uses it
-    And the refusal says Trust Check "fi-recognised" of the surface under test uses the Authority
+    And the refusal says Trust Check "authority-recognised" of the surface under test uses the Authority
     And the Authority "Acme" is stored
 
   Scenario: Deleting an Authority that a Trust Recorder entry uses is refused naming the entry

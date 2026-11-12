@@ -925,7 +925,7 @@ mod tests {
     }
 
     fn multi_authority(authorities: &[&str]) -> TrustCheckElement {
-        let mut element = elem("fi-recognised");
+        let mut element = elem("authority-recognised");
         element.query.authority_id = String::new();
         element.query.authority_ids = Some(
             authorities
@@ -954,48 +954,56 @@ mod tests {
 
     #[tokio::test]
     async fn caller_recognised_by_one_of_several_authorities_gets_one_result_per_authority() {
-        let element = multi_authority(&["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"]);
+        let element = multi_authority(&["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"]);
         let ctx = run_trust_check_stage(
             "surf",
             TrustCheckLeg::Caller,
             &[element, elem("plain")],
             &json!({}),
-            &RecognisedBy("did:web:fi-b"),
+            &RecognisedBy("did:web:authority-b"),
         )
         .await
         .expect("expected Some");
         assert_eq!(
             outcomes(&ctx.caller),
             [
-                ("did:web:fi-a", Some("NOT_RECOGNIZED")),
-                ("did:web:fi-b", None),
-                ("did:web:fi-c", Some("NOT_RECOGNIZED")),
+                ("did:web:authority-a", Some("NOT_RECOGNIZED")),
+                ("did:web:authority-b", None),
+                ("did:web:authority-c", Some("NOT_RECOGNIZED")),
                 ("did:a", Some("NOT_RECOGNIZED")),
             ]
         );
-        assert_eq!(ctx.caller[1].id, "fi-recognised");
+        assert_eq!(ctx.caller[1].id, "authority-recognised");
     }
 
     #[tokio::test]
     async fn caller_recognised_by_no_listed_authority_gets_not_recognized_for_each() {
-        let element = multi_authority(&["did:web:fi-a", "did:web:fi-b"]);
+        let element = multi_authority(&["did:web:authority-a", "did:web:authority-b"]);
         let ctx = run_trust_check_stage("surf", TrustCheckLeg::Caller, &[element], &json!({}), &RecognisedBy("none"))
             .await
             .expect("expected Some");
         assert_eq!(
             outcomes(&ctx.caller),
-            [("did:web:fi-a", Some("NOT_RECOGNIZED")), ("did:web:fi-b", Some("NOT_RECOGNIZED"))]
+            [("did:web:authority-a", Some("NOT_RECOGNIZED")), ("did:web:authority-b", Some("NOT_RECOGNIZED"))]
         );
     }
 
     #[tokio::test]
     async fn metadata_gate_fails_only_the_authority_that_needs_missing_metadata() {
-        let element = multi_authority(&["{{ input.agent.provider_did }}", "did:web:fi-b"]);
-        let ctx =
-            run_trust_check_stage("surf", TrustCheckLeg::Target, &[element], &json!({}), &RecognisedBy("did:web:fi-b"))
-                .await
-                .expect("expected Some");
-        assert_eq!(outcomes(&ctx.target), [("", Some("TRUST_REGISTRY_METADATA_UNAVAILABLE")), ("did:web:fi-b", None)]);
+        let element = multi_authority(&["{{ input.agent.provider_did }}", "did:web:authority-b"]);
+        let ctx = run_trust_check_stage(
+            "surf",
+            TrustCheckLeg::Target,
+            &[element],
+            &json!({}),
+            &RecognisedBy("did:web:authority-b"),
+        )
+        .await
+        .expect("expected Some");
+        assert_eq!(
+            outcomes(&ctx.target),
+            [("", Some("TRUST_REGISTRY_METADATA_UNAVAILABLE")), ("did:web:authority-b", None)]
+        );
     }
 
     #[tokio::test]
@@ -1031,7 +1039,7 @@ mod tests {
         assert!(
             results
                 .iter()
-                .all(|result| result.id == "fi-recognised")
+                .all(|result| result.id == "authority-recognised")
         );
         assert_eq!(
             *client.0.lock().unwrap(),

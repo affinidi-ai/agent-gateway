@@ -685,11 +685,27 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   template. The Authority picker writes `issuer` for an Issuer and `authority` for an Authority,
   and removes it for a caller-leg template; a preset (`applyPresetToQuery`) removes it; a stored
   custom DID or legacy template left untouched keeps what is stored.
-- **Authority lists.** A query stored with `query.authority_ids` (several authorities, set
-  through the API) keeps that list and its `authority_sources` map through every load and save
-  (`listedAuthorities`, `queryFromElement`, `buildEntry`), on every leg and in variants; the
-  save never adds `authority_id` or `authority_source` beside it. The panel cannot edit the list,
-  and such a query does not count as missing an Authority in `incompleteReason`.
+- **Authority lists.** A query stored with `query.authority_ids` (several authorities) keeps that
+  list and its `authority_sources` map through every load and save (`listedAuthorities`,
+  `queryFromElement`, `buildEntry`), on every leg and in variants; the save never adds
+  `authority_id` or `authority_source` beside it. In the fullscreen editor a query's **Authority
+  ID** is a list of rows, like the Trust Recorder's custom resources (`AuthorityRows`): each row
+  is the Issuer / Authority picker, **Add Authority** appends an empty row, and each row of
+  several has a remove button. One row is the single `authority_id` with `authority_source`,
+  exactly as before; two or more are `authority_ids` in row order, each DID recorded in
+  `authority_sources` as `issuer` or `authority` by the register it was picked from
+  (`authorityRows`, `addAuthorityRow`, `setAuthorityRow`, `removeAuthorityRow`). Removing rows
+  down to one makes the query single again. Templates (the caller-leg defaults) are offered only
+  while there is one row, and **Add Authority** stays disabled until every row holds a literal DID
+  (`canAddAuthorityRow`) and below `TRUST_CHECK_AUTHORITIES_MAX` (25, the gateway's limit); at the
+  limit the count line shows it. A DID picked in one row is not offered in another. A row whose
+  Authority was deleted shows the picker's "Deleted Authority" option and warning; it does not
+  block Save. An empty row is incomplete ("Select an Issuer or Authority for every Authority
+  row"), is marked invalid, and blocks the editor's Save. The sidebar lists "N authorities:
+  <names>" under such a query, reading names from the Issuers and Authorities registers (a DID
+  when neither has it), and the fullscreen card header adds "N authorities". A node with one such
+  query has the canvas summary `<type> · N authorities`; a node with several queries keeps "N
+  queries".
 - **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
   Authorities register no longer has is `missing-authority` (`classifyTargetAuthoritySelection`,
   checked against the Authorities only, even when an Issuer has the DID); the gateway fails it
@@ -724,6 +740,9 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
 | Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
 | Deleted Authority warning        | `trust-check-panel-authority-missing`, `trust-check-query-<n>-authority-missing`, each with `-dids` and `-add-authority-link` |
+| Add Authority                    | `trust-check-query-<n>-add-authority`                                                              |
+| Authority rows (two or more)     | `trust-check-query-<n>-authorities`; per row `-authority-<r>`, `-authority-<r>-remove`, `-authority-<r>-missing`; `-authority-count`, `-authority-limit` |
+| Sidebar authority count, names   | `trust-check-panel-query-<n>-authorities`                                                          |
 
 ## Trust Recorder
 

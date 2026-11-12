@@ -286,6 +286,128 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
   });
 });
 
+describe('TrustCheckQueryForm — several Authorities', () => {
+  const AUTHORITIES = [
+    { id: 'a-a', name: 'authority-A', did: 'did:web:authority-a' },
+    { id: 'a-b', name: 'authority-B', did: 'did:web:authority-b' },
+    { id: 'a-c', name: 'authority-C', did: 'did:web:authority-c' },
+  ];
+  const listedQuery = (authority_ids: string[], sources: Record<string, string> = {}) =>
+    ({
+      id: 'q-1',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: sources,
+      query: { authority_ids },
+    }) as TrustCheckQueryConfig;
+
+  const ISSUER = { id: 'd-1', name: 'issuer-A', did: 'did:web:issuer-a' };
+  const rowProps = () => ({
+    addAuthorityRowAt: jest.fn(),
+    setAuthorityRowAt: jest.fn(),
+    removeAuthorityRowAt: jest.fn(),
+  });
+
+  it('keeps a single-authority query on one picker, with Add Authority below it', () => {
+    renderForm(baseProps({ ...rowProps(), authorities: AUTHORITIES as any }));
+    expect(screen.getByTestId('trust-check-query-0-authority')).toBeInTheDocument();
+    expect(screen.queryByTestId('trust-check-query-0-authorities')).toBeNull();
+    // The caller-leg default is a template, which stays single-authority.
+    expect(screen.getByTestId('trust-check-query-0-add-authority')).toBeDisabled();
+  });
+
+  it('adds a row once a literal Issuer or Authority is picked', () => {
+    const props = { ...rowProps(), authorities: AUTHORITIES as any };
+    renderForm(
+      baseProps({
+        ...props,
+        queryConfig: {
+          id: 'q-1',
+          trust_registry_id: 'tr-1',
+          query_type: 'recognition',
+          authority_source: 'authority',
+          query: { authority_id: 'did:web:authority-a' },
+        },
+      })
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-add-authority'));
+    expect(props.addAuthorityRowAt).toHaveBeenCalledWith(0);
+  });
+
+  it('offers Issuers and Authorities in each row, not a DID another row has, nor templates', () => {
+    const props = { ...rowProps(), issuers: [ISSUER] as any, authorities: AUTHORITIES as any };
+    renderForm(
+      baseProps({
+        ...props,
+        queryConfig: listedQuery(['did:web:authority-a', ''], {
+          'did:web:authority-a': 'authority',
+        }),
+      })
+    );
+    expect(screen.getByTestId('trust-check-query-0-authority-count')).toHaveTextContent(
+      '2/25 Authorities'
+    );
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-1'));
+    expect(screen.getByText('issuer-A')).toBeInTheDocument();
+    expect(screen.getByText('authority-B')).toBeInTheDocument();
+    // authority-A shows only as row 0's selection, not as an option of row 1.
+    expect(screen.getAllByText('authority-A')).toHaveLength(1);
+    expect(screen.queryByText('Agent identity credential issuer (default)')).toBeNull();
+    fireEvent.click(screen.getByText('issuer-A'));
+    expect(props.setAuthorityRowAt).toHaveBeenCalledWith(0, 1, ISSUER.did, 'issuer');
+    fireEvent.click(screen.getByTestId('trust-check-query-0-authority-0-remove'));
+    expect(props.removeAuthorityRowAt).toHaveBeenCalledWith(0, 0);
+  });
+
+  it('allows no further Authority at the limit and shows it', () => {
+    const many = Array.from({ length: 25 }, (_, i) => `did:web:auth-${i}`);
+    renderForm(
+      baseProps({ ...rowProps(), authorities: AUTHORITIES as any, queryConfig: listedQuery(many) })
+    );
+    expect(screen.getByTestId('trust-check-query-0-add-authority')).toBeDisabled();
+    expect(screen.getByTestId('trust-check-query-0-authority-count')).toHaveTextContent(
+      '25/25 Authorities'
+    );
+    expect(screen.getByTestId('trust-check-query-0-authority-limit')).toHaveTextContent(
+      'at most 25 Authorities'
+    );
+  });
+
+  it('shows a listed Authority the register no longer has as deleted in its row', () => {
+    renderForm(
+      baseProps({
+        ...rowProps(),
+        authorities: AUTHORITIES as any,
+        queryConfig: listedQuery(['did:web:authority-a', 'did:web:gone'], {
+          'did:web:authority-a': 'authority',
+          'did:web:gone': 'authority',
+        }),
+      })
+    );
+    expect(screen.getByTestId('trust-check-query-0-authority-1')).toHaveTextContent(
+      'Deleted Authority'
+    );
+    expect(screen.getByTestId('trust-check-query-0-authority-1-missing')).toHaveTextContent(
+      'AUTHORITY_NOT_FOUND'
+    );
+  });
+
+  it('marks an empty row invalid after a save attempt', () => {
+    renderForm(
+      baseProps({
+        ...rowProps(),
+        authorities: AUTHORITIES as any,
+        queryConfig: listedQuery(['did:web:authority-a', ''], {
+          'did:web:authority-a': 'authority',
+        }),
+        saveAttempted: true,
+      })
+    );
+    expect(screen.getByTestId('trust-check-query-0-authority-1')).toHaveClass('is-invalid');
+    expect(screen.getByTestId('trust-check-query-0-authority-0')).not.toHaveClass('is-invalid');
+  });
+});
+
 describe('TrustCheckQueryForm — Authority source', () => {
   const AUTHORITY = { id: 'a-1', name: 'Payments Authority', did: 'did:web:auth.example' };
   const ISSUER = { id: 'd-1', name: 'Acme Inc', did: 'did:web:acme.example' };

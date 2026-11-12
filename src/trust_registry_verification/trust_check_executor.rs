@@ -922,7 +922,7 @@ mod tests {
     }
 
     fn multi_elem(authorities: &[&str]) -> TrustCheckElement {
-        let mut e = elem("fi-recognised", "tr-main", None);
+        let mut e = elem("authority-recognised", "tr-main", None);
         e.query.authority_id = String::new();
         e.query.authority_ids = Some(
             authorities
@@ -959,35 +959,42 @@ mod tests {
 
     #[tokio::test]
     async fn multi_authority_all_allow() {
-        let client = AuthorityClient::new(&[("did:web:fi-a", Answer::Allow), ("did:web:fi-b", Answer::Allow)]);
-        let results = run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b"])], &client).await;
+        let client =
+            AuthorityClient::new(&[("did:web:authority-a", Answer::Allow), ("did:web:authority-b", Answer::Allow)]);
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
         assert_eq!(results.len(), 2);
         assert!(
             results
                 .iter()
-                .all(|r| r.ok && r.id == "fi-recognised")
+                .all(|r| r.ok && r.id == "authority-recognised")
         );
     }
 
     #[tokio::test]
     async fn multi_authority_one_allow_among_denials_keeps_configuration_order() {
-        let client = AuthorityClient::new(&[("did:web:fi-b", Answer::Allow)]);
-        let results = run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"])], &client).await;
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let results =
+            run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"])], &client)
+                .await;
         assert_eq!(
             summary(&results),
             [
-                ("did:web:fi-a".to_string(), Some(NOT_RECOGNIZED.to_string())),
-                ("did:web:fi-b".to_string(), None),
-                ("did:web:fi-c".to_string(), Some(NOT_RECOGNIZED.to_string())),
+                ("did:web:authority-a".to_string(), Some(NOT_RECOGNIZED.to_string())),
+                ("did:web:authority-b".to_string(), None),
+                ("did:web:authority-c".to_string(), Some(NOT_RECOGNIZED.to_string())),
             ]
         );
-        assert_eq!(client.asked(), ["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"], "one query per authority");
+        assert_eq!(
+            client.asked(),
+            ["did:web:authority-a", "did:web:authority-b", "did:web:authority-c"],
+            "one query per authority"
+        );
     }
 
     #[tokio::test]
     async fn multi_authority_all_deny() {
         let client = AuthorityClient::new(&[]);
-        let results = run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b"])], &client).await;
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
         assert!(
             results
                 .iter()
@@ -1001,27 +1008,35 @@ mod tests {
         let budget = Duration::from_secs(
             crate::trust_registry_verification::trust_check_element::TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS.into(),
         );
-        let client =
-            AuthorityClient::new(&[("did:web:fi-a", Answer::Slow(budget * 2)), ("did:web:fi-b", Answer::Allow)]);
+        let client = AuthorityClient::new(&[
+            ("did:web:authority-a", Answer::Slow(budget * 2)),
+            ("did:web:authority-b", Answer::Allow),
+        ]);
         let started = tokio::time::Instant::now();
-        let results = run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b"])], &client).await;
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
         let elapsed = started.elapsed();
         assert!(elapsed >= budget && elapsed < budget * 2, "waited {elapsed:?}, timeout is {budget:?}");
         assert_eq!(
             summary(&results),
-            [("did:web:fi-a".to_string(), Some(QUERY_TIMEOUT.to_string())), ("did:web:fi-b".to_string(), None)]
+            [
+                ("did:web:authority-a".to_string(), Some(QUERY_TIMEOUT.to_string())),
+                ("did:web:authority-b".to_string(), None)
+            ]
         );
     }
 
     #[tokio::test]
     async fn multi_authority_one_transport_error_fails_only_that_authority() {
-        let client = AuthorityClient::new(&[("did:web:fi-a", Answer::Unreachable), ("did:web:fi-b", Answer::Allow)]);
-        let results = run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b"])], &client).await;
+        let client = AuthorityClient::new(&[
+            ("did:web:authority-a", Answer::Unreachable),
+            ("did:web:authority-b", Answer::Allow),
+        ]);
+        let results = run_multi(&[multi_elem(&["did:web:authority-a", "did:web:authority-b"])], &client).await;
         assert_eq!(
             summary(&results),
             [
-                ("did:web:fi-a".to_string(), Some(TRUST_REGISTRY_UNREACHABLE.to_string())),
-                ("did:web:fi-b".to_string(), None)
+                ("did:web:authority-a".to_string(), Some(TRUST_REGISTRY_UNREACHABLE.to_string())),
+                ("did:web:authority-b".to_string(), None)
             ]
         );
     }
@@ -1044,26 +1059,29 @@ mod tests {
     #[tokio::test]
     async fn multi_authority_slow_authority_does_not_block_siblings_or_other_elements() {
         let client = AuthorityClient::new(&[
-            ("did:web:fi-a", Answer::Slow(Duration::from_millis(300))),
-            ("did:web:fi-b", Answer::Slow(Duration::from_millis(300))),
+            ("did:web:authority-a", Answer::Slow(Duration::from_millis(300))),
+            ("did:web:authority-b", Answer::Slow(Duration::from_millis(300))),
             ("did:web:caller-gateway", Answer::Slow(Duration::from_millis(300))),
         ]);
         let started = std::time::Instant::now();
-        let results =
-            run_multi(&[multi_elem(&["did:web:fi-a", "did:web:fi-b"]), elem("single", "tr-a", Some(5))], &client).await;
+        let results = run_multi(
+            &[multi_elem(&["did:web:authority-a", "did:web:authority-b"]), elem("single", "tr-a", Some(5))],
+            &client,
+        )
+        .await;
         assert!(started.elapsed() < Duration::from_millis(800), "dispatches ran serially: {:?}", started.elapsed());
         let ids: Vec<&str> = results
             .iter()
             .map(|r| r.id.as_str())
             .collect();
-        assert_eq!(ids, ["fi-recognised", "fi-recognised", "single"]);
+        assert_eq!(ids, ["authority-recognised", "authority-recognised", "single"]);
         assert!(results.iter().all(|r| r.ok));
     }
 
     #[tokio::test]
     async fn multi_authority_records_one_audit_event_per_authority() {
-        let client = AuthorityClient::new(&[("did:web:fi-b", Answer::Allow)]);
-        let elements = [multi_elem(&["did:web:fi-a", "did:web:fi-b"])];
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let elements = [multi_elem(&["did:web:authority-a", "did:web:authority-b"])];
         let (_, events) = crate::audit::producer::capture(run_multi(&elements, &client)).await;
         let authorities: Vec<Option<String>> = events
             .iter()
@@ -1075,13 +1093,13 @@ mod tests {
             })
             .collect();
         assert_eq!(authorities.len(), 2);
-        assert!(authorities.contains(&Some("did:web:fi-a".to_string())));
-        assert!(authorities.contains(&Some("did:web:fi-b".to_string())));
+        assert!(authorities.contains(&Some("did:web:authority-a".to_string())));
+        assert!(authorities.contains(&Some("did:web:authority-b".to_string())));
     }
 
     #[tokio::test]
     async fn an_unavailable_target_fails_each_listed_authority() {
-        let elements = [multi_elem(&["did:web:fi-a", "did:web:fi-b"])];
+        let elements = [multi_elem(&["did:web:authority-a", "did:web:authority-b"])];
         let (results, events) = crate::audit::producer::capture(async {
             synthesize_unavailable_target("surface-9", &elements, AGENT_CARD_UNAVAILABLE, "card unavailable")
         })
@@ -1091,7 +1109,7 @@ mod tests {
         assert!(
             results
                 .iter()
-                .all(|r| r.id == "fi-recognised" && !r.ok)
+                .all(|r| r.id == "authority-recognised" && !r.ok)
         );
     }
 

@@ -219,7 +219,7 @@ async fn create_surface_with_trust_check_element(
 ) {
     create_surface(world, route, |payload, trust_registry_id| {
         let mut element = json!({
-            "id": "fi-recognised", "trust_registry_id": trust_registry_id, "query_type": "recognition"
+            "id": "authority-recognised", "trust_registry_id": trust_registry_id, "query_type": "recognition"
         });
         for (key, value) in fields
             .as_object()

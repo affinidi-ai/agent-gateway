@@ -1003,14 +1003,14 @@ mod tests {
 
     #[test]
     fn references_list_each_authority_of_a_list_with_its_own_source() {
-        let element = element(listed("fi", &[ACME, TYPED], json!({ ACME: "authority" })));
+        let element = element(listed("authority-recognised", &[ACME, TYPED], json!({ ACME: "authority" })));
 
         let references: Vec<(String, Option<AuthoritySource>, serde_json::Value)> = trust_check_references(&[element])
             .into_iter()
             .map(|reference| (reference.did, reference.source, serde_json::to_value(&reference.used_by).unwrap()))
             .collect();
 
-        let used_by = json!({"element": "trust_check", "id": "fi"});
+        let used_by = json!({"element": "trust_check", "id": "authority-recognised"});
         assert_eq!(
             references,
             [(ACME.to_string(), Some(AuthoritySource::Authority), used_by.clone()), (TYPED.to_string(), None, used_by)]
@@ -1021,7 +1021,8 @@ mod tests {
     fn classify_sets_the_source_of_each_listed_did_and_drops_unlisted_ones() {
         let template = "{{ input.agent.authority_did }}";
         let unlisted = json!({ "did:web:unlisted.example": "authority" });
-        let mut surface = surface(vec![listed("fi", &[ACME, BILLING, TYPED, template], unlisted)], BILLING);
+        let mut surface =
+            surface(vec![listed("authority-recognised", &[ACME, BILLING, TYPED, template], unlisted)], BILLING);
 
         assert!(registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None));
 
@@ -1031,9 +1032,9 @@ mod tests {
     #[test]
     fn classify_never_drops_a_link_of_a_listed_did() {
         let registers = registers(Vec::new());
-        let stored = surface(vec![listed("fi", &[TYPED], json!({ TYPED: "authority" }))], BILLING);
+        let stored = surface(vec![listed("authority-recognised", &[TYPED], json!({ TYPED: "authority" }))], BILLING);
 
-        let mut dropped = surface(vec![listed("fi", &[TYPED], json!({}))], BILLING);
+        let mut dropped = surface(vec![listed("authority-recognised", &[TYPED], json!({}))], BILLING);
         registers.classify_surface(&mut dropped, Some(&stored));
 
         assert_eq!(listed_sources(&dropped), json!({ TYPED: "authority" }));
@@ -1041,7 +1042,7 @@ mod tests {
 
     #[test]
     fn classify_trust_checks_sets_the_source_of_each_listed_did() {
-        let mut elements = [element(listed("fi", &[ACME, TYPED], json!({ TYPED: "issuer" })))];
+        let mut elements = [element(listed("authority-recognised", &[ACME, TYPED], json!({ TYPED: "issuer" })))];
 
         assert!(registers(vec![authority(ACME, None)]).classify_trust_checks(&mut elements, None, None));
 
@@ -1050,12 +1051,13 @@ mod tests {
 
     #[test]
     fn check_refuses_a_listed_authority_that_is_gone() {
-        let surface = surface(vec![listed("fi", &[ACME, TYPED], json!({ TYPED: "authority" }))], BILLING);
+        let surface =
+            surface(vec![listed("authority-recognised", &[ACME, TYPED], json!({ TYPED: "authority" }))], BILLING);
 
         assert_eq!(
             registers(vec![authority(ACME, None)]).check(&surface_references(&surface), None),
             Err(format!(
-                "Trust Check 'fi' uses Authority {TYPED}, which does not exist or belongs to another tenant. Pick \
+                "Trust Check 'authority-recognised' uses Authority {TYPED}, which does not exist or belongs to another tenant. Pick \
                  another Authority or remove the Trust Check"
             ))
         );
