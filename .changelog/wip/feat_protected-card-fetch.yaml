@@ -33,8 +33,8 @@ changes:
         Target redirect is relayed. Any other public read, a HEAD of the card path or the legacy
         agent.json included, is forwarded without the credential. A GET at the configured card
         location is the card fetch after source authentication, including for a caller who
-        failed it on a surface that forwards failed callers to policy; a closed surface or one
-        that rejects failed callers answers it 401.
+        failed it on a public Access Point; an Access Point that refuses failed callers, such
+        as a closed or legacy one, answers it 401.
     - timestamp: '2026-11-06T08:40:35Z'
       title: Read the agent card for a Fabric surface's policy with its Target credential
       description: >-

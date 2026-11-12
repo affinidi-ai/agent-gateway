@@ -514,11 +514,11 @@ Two things differ from the direct path:
 - Over Fabric a `GET` at the configured card location is the card fetch: the gateway sends it as
   its own request with `target.auth` and returns the card. When that location is not a public
   discovery path, such as `/cards/me`, source authentication still runs on it first. A caller who
-  failed source authentication gets the card on a surface that forwards failed callers to policy,
-  but a closed surface (`access_point.public: false`) or one whose
-  `caller_authentication.on_failure` is `reject` answers `401`. The sending gateway's own card
-  fetch carries no caller credential, so on such a surface it gets `401` at the configured
-  location.
+  failed source authentication gets the card on a public Access Point (`access_point.public: true`),
+  which hands failed callers to policy. Every other Access Point answers `401`: a closed one, a
+  legacy one stored without `public`, and a public one whose inbound identity is `from_jwt_claim`
+  or whose `caller_authentication.on_failure` is `reject`. The sending gateway's own card fetch
+  carries no caller credential, so on such a surface it gets `401` at the configured location.
 
 The card read for the receiving gateway's policy input also presents `target.auth` as the gateway,
 resolving it from the gateway's secrets store rather than opening one per request, and drops a
