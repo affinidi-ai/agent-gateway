@@ -104,6 +104,33 @@ bucket for the point, and `per_caller_rate_limit` gives each caller the point id
 of their own. Both are counted on each gateway node. See
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#per-caller-rate-limit-on-a-transit-point).
 
+## Browser origins of a surface
+
+A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
+origins allowed for every path the gateway serves and is read once, at startup. A surface owner who hosts
+a static page on their own domain, such as a chat page for an A2A agent, lists that origin on the surface
+instead, in `browser_origins`, with no `gateway.json` edit and no restart.
+
+| Field | Behaviour |
+| --- | --- |
+| `browser_origins` | A list of at most 20 exact origins: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo and any other scheme are refused with a `400` naming `browser_origins`. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+
+A cross-origin request, a preflight included, to a path that belongs to a surface is allowed when its
+`Origin` is in `network.cors` or in that surface's `browser_origins`. A path belongs to the surface whose
+route is the longest prefix of it, as when the gateway serves the request. A path that belongs to no
+surface uses `network.cors` only, and the public discovery documents keep their any-origin rule for
+`GET` and `HEAD`. An origin on one surface's list gets nothing on another surface, and a disabled or
+deleted surface allows none.
+
+`Access-Control-Allow-Credentials` is never sent, so a page's cookies and HTTP credentials do not go with
+the request; it authenticates the way any other caller does, with the credential the surface's Access Point
+checks. A saved change applies from the next request: the gateway reads the surface list on every request,
+and a reload or restart is not needed. A browser may reuse a preflight answer it already holds for a few
+seconds.
+
+A release that predates `browser_origins` refuses to load a surface that carries it (surfaces are read with
+unknown fields refused): before rolling back, clear it from every surface (`PATCH` `{"browser_origins": []}`).
+
 ## Secret references
 
 Any field documented as accepting a loader reference resolves through
@@ -205,7 +232,7 @@ Network topology and the surfaces served. The largest configuration file; the ex
 | `payment_ledger` | `retention_days` (default `7`, 1 to 400): how long the payments ledger keeps its hourly segments. `max_size_mb` (default `2048`, 16 to 1,048,576): the oldest segments are deleted early while the ledger is larger. Neither deletes a segment holding a payment still awaiting capture or void. Read at startup; a value out of range is clamped and logged as a warning. See [Taking the payment](#taking-the-payment). |
 | `client_ip` | `trusted_proxies`: proxy CIDRs whose `X-Forwarded-For` gives the client IP for the SAML and CLI login limits and the STS token endpoint throttle, and whose `X-Forwarded-Host` and `X-Forwarded-Proto` (or `Forwarded` `host` and `proto`) STS discovery may use when no inbound `external_urls` is set (default empty, so the TCP peer is the client and forwarded headers are ignored). Behind a load balancer, list it here: until then every caller it forwards counts as one client for these limits. A listed proxy that passes a caller's own `X-Forwarded-Host`, `X-Forwarded-Proto` or `Forwarded` through unchanged lets that caller choose the URLs STS discovery advertises, so have it set or strip them, or set inbound `external_urls`. Each listed proxy must append the address it saw to `X-Forwarded-For` or overwrite it; `Forwarded` is read only when `X-Forwarded-For` is absent. Separate from `tls.client_auth.trusted_proxies`. |
 | `facilitator_mode` | x402 facilitator behaviour. `facilitator_via_fabric`, `facilitator_via_http` and `enable_test_endpoints` are ignored, and a warning is logged when any is set: a peer's fabric x402 verify and settle requests are refused with `facilitator_disabled`, and `/api/x402/*` and the x402 test endpoints are not served. x402 payments already in the transaction store still settle. |
-| `cors` | Permitted dashboard origins |
+| `cors` | Exact origins whose pages may call the gateway from a browser: the dashboard, and any surface. Read once, at startup. A surface can allow more origins for itself alone with `browser_origins` (see [Browser origins of a surface](#browser-origins-of-a-surface)). |
 | `terms`, `affinidi_terms_url` | Whether Terms acceptance is enforced, and where metadata is fetched |
 | `logging` | Log redaction, for every configuration source. Only `redaction` is read here; level, JSON output, and directory come from `config.toml`. See [Log redaction](#log-redaction). |
 | `oauth_callback_route` | Where OAuth redirects land (`{route}/{segment}`), and the consent start page under it (`{route}/{segment}/start`). `{segment}` is the credential provider's id for a provider created now, and its `provider_id` for one created before callback paths ended in the id. A reverse proxy in front of the gateway must forward both. See [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-flow). |
