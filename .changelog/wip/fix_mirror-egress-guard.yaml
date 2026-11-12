@@ -1,0 +1,11 @@
+branch: fix/mirror-egress-guard
+changes:
+  added: []
+  changed: []
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-12T00:00:00Z'
+      title: Apply the Target egress guard to traffic mirror endpoints
+      description: A traffic mirror endpoint was neither checked on save nor before sending, so a surface editor could aim a mirror at a cloud metadata service. Saving a surface or variant now refuses a mirror endpoint that is not http or https or that names cloud metadata, and every mirrored request on the direct, fabric:// and owned MCP Proxy paths resolves DNS once, is refused for a metadata address, is pinned to the vetted address and does not follow redirects. Loopback and private addresses stay allowed, as for the Target.
+  breaking: []
