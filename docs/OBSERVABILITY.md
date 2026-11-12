@@ -193,6 +193,11 @@ reason, it counts every link. A provider without the setting is not counted.
 | `outcome` | `confirmed` (the link signs the caller in at their identity provider first); `unconfirmed` (the link goes straight to the vendor); `refused` (no link: the setting confirms no caller, or it sets `require`) |
 | `reason` | `none` for `confirmed`; otherwise why the caller is not confirmed: `path_not_covered`, `not_legacy_consent`, `pepper_unset`, `not_jwt_caller`, `strategy_unavailable`, `gateway_issuer`, `entra_caller_named_by_sub`, `id_token_claim_invalid`, `editable_claim`, `other_issuer`, `other_principal_claim` or `other_identity_hash` |
 
+`reason` is the first that holds, in the order of the [reason
+table](CREDENTIAL_DELEGATION.md#who-is-confirmed): a caller that is not a JWT caller is counted as
+`not_jwt_caller` even while the pepper is unset, so `pepper_unset` and the other reasons that
+confirm no caller are counted only once a JWT caller asks for a link.
+
 No label carries a caller identity. A link refused because the strategy cannot be read is not
 counted.
 

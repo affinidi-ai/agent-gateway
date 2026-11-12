@@ -2680,6 +2680,7 @@ mod tests {
         );
         let sealed = crate::delegation_vault::oauth::decode_confirmation_state(&sign_in.state).unwrap();
         assert!(crate::delegation_vault::oauth::is_claimed(&sealed).await, "the refused exchange used up the state");
+        assert_eq!(fixture.idp_refused_calls(), 1, "the identity provider refused the one exchange");
         assert_eq!(fixture.token_calls(), 0, "the vendor is never reached");
         assert_eq!(fixture.vault_records(), 0);
     }
@@ -2849,6 +2850,7 @@ mod tests {
             idp_token_endpoint: String,
             idp_answer: Arc<Mutex<serde_json::Value>>,
             idp_forms: Arc<Mutex<Vec<std::collections::HashMap<String, String>>>>,
+            idp_refused_calls: Arc<AtomicUsize>,
             _directory: tempfile::TempDir,
         }
 
@@ -3007,6 +3009,8 @@ mod tests {
                 let idp_answer = Arc::new(Mutex::new(serde_json::json!({})));
                 let idp_forms = Arc::new(Mutex::new(Vec::new()));
                 let (answer, idp_recorded) = (idp_answer.clone(), idp_forms.clone());
+                let idp_refused_calls = Arc::new(AtomicUsize::new(0));
+                let refused_counter = idp_refused_calls.clone();
                 let vendor = Router::new()
                     .route(
                         "/idp-token",
@@ -3043,8 +3047,12 @@ mod tests {
                     )
                     .route(
                         "/idp-token-refused",
-                        post(|| async {
-                            (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
+                        post(move || {
+                            let counter = refused_counter.clone();
+                            async move {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
+                            }
                         }),
                     )
                     .route(
@@ -3154,6 +3162,7 @@ mod tests {
                     idp_token_endpoint,
                     idp_answer,
                     idp_forms,
+                    idp_refused_calls,
                     _directory: directory,
                 };
                 fixture
@@ -3438,6 +3447,12 @@ mod tests {
                     .update(provider)
                     .await
                     .unwrap();
+            }
+
+            /// How many code exchanges the refusing login token endpoint answered.
+            pub fn idp_refused_calls(&self) -> usize {
+                self.idp_refused_calls
+                    .load(Ordering::SeqCst)
             }
 
             /// [`Self::confirm`] with `code` and the sign-in's own state and
