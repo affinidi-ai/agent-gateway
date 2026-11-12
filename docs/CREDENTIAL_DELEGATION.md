@@ -1980,6 +1980,7 @@ provider. It changes how new consent is obtained, not how stored grants are foun
 | `token_endpoint` | The identity provider's token endpoint. The code exchange goes through the provider egress |
 | `jwt_verification_strategy_id` | The JWT verification strategy that verifies the ID token. Its `expected_issuer` and `principal_claim` decide which callers are confirmed |
 | `id_token_principal_claim` | Optional. The ID-token claim that holds the caller's value, when it is not the strategy's `principal_claim` (see [Which claim names the caller](#which-claim-names-the-caller)) |
+| `require` | Optional, `false` by default. When `true`, a caller the setting cannot confirm gets no consent link and the request is refused, rather than a link that goes straight to the vendor (see [Who is confirmed](#who-is-confirmed)) |
 
 Register `{redirect URI}/confirm` as the login client's redirect URI at the identity provider,
 where `{redirect URI}` is the provider's own
@@ -2035,8 +2036,13 @@ refused as when the strategy cannot be read. The gateway logs `Consent confirmat
 caller of this provider: consent links are refused` at `WARN`, once per provider, surface and
 reason.
 
-Any other caller is minted a link as if the provider had no setting, and its start page leads
-straight to the vendor. The gateway logs this once per provider, surface and reason, with the
+With `require: true`, every other caller is refused the same way, and the gateway logs `Consent
+link refused: consent confirmation requires every caller to be confirmed` at `WARN`, once per
+provider, surface and reason. That includes API key, mTLS and DID callers, and consent through a
+Transit Point or over Fabric, so set it only on a provider whose callers can all be confirmed.
+
+Without `require`, any other caller is minted a link as if the provider had no setting, and its
+start page leads straight to the vendor. The gateway logs this once per provider, surface and reason, with the
 provider and surface ids and no detail of the caller. `PathNotCovered` is logged at `WARN` as
 `Consent link minted unconfirmed for a Transit Point or Fabric caller: a Transit Point caller's
 grant can also be released to the surface's Access Point callers when the Transit Point has no
@@ -2050,7 +2056,9 @@ callers all use the confirming strategy, it means the strategy's issuer or claim
 theirs and confirms nobody. `OtherIdentityHash` concerns one caller and is logged at `DEBUG` as
 `Consent link minted without confirming its caller at their identity provider`.
 A strategy that cannot be read also mints no link. The reasons are checked in the table's order,
-and the first that holds decides.
+and the first that holds decides. Every link of a provider with the setting is also counted in
+`agent_gateway_consent_confirmation_links_total` ([Consent confirmation link
+metric](OBSERVABILITY.md#consent-confirmation-link-metric)).
 
 | `reason` | No link is minted, or the link does not confirm its caller, because |
 | --- | --- |
@@ -2065,7 +2073,8 @@ and the first that holds decides.
 | `EditableClaim` | The strategy or the ID token names the caller by `email`, or the ID token by another claim a person can change |
 | `OtherIssuer`, `OtherPrincipalClaim`, `OtherIdentityHash` | The caller's issuer, principal claim or identity hash is not the strategy's |
 
-Consent confirmation therefore does not cover:
+Consent confirmation therefore does not confirm the following; with `require: true` they are
+refused instead:
 
 - API key, mTLS and DID callers;
 - consent through a Transit Point or over Fabric, which is not confirmed. A grant obtained

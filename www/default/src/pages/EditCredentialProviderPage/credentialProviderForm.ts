@@ -329,6 +329,7 @@ export interface ConsentConfirmationFormFields {
   cc_token_endpoint: string;
   cc_jwt_verification_strategy_id: string;
   cc_id_token_principal_claim: string;
+  cc_require: boolean;
 }
 
 export const EMPTY_CONSENT_CONFIRMATION_FIELDS: ConsentConfirmationFormFields = {
@@ -340,6 +341,7 @@ export const EMPTY_CONSENT_CONFIRMATION_FIELDS: ConsentConfirmationFormFields = 
   cc_token_endpoint: '',
   cc_jwt_verification_strategy_id: '',
   cc_id_token_principal_claim: '',
+  cc_require: false,
 };
 
 /** The consent confirmation inputs of a loaded provider record. */
@@ -359,6 +361,7 @@ export function consentConfirmationFieldsOf(
     cc_token_endpoint: text('token_endpoint'),
     cc_jwt_verification_strategy_id: text('jwt_verification_strategy_id'),
     cc_id_token_principal_claim: text('id_token_principal_claim'),
+    cc_require: stored.require === true,
   };
 }
 
@@ -390,7 +393,7 @@ export function missingConsentConfirmationField(
 export function consentConfirmationField(
   form: ConsentConfirmationFormFields,
   usesConsentFlow: boolean
-): Record<string, string> | null | undefined {
+): Record<string, string | boolean> | null | undefined {
   if (usesConsentFlow && form.consent_confirmation_enabled) {
     const claim = form.cc_id_token_principal_claim.trim();
     return {
@@ -400,6 +403,7 @@ export function consentConfirmationField(
       token_endpoint: form.cc_token_endpoint.trim(),
       jwt_verification_strategy_id: form.cc_jwt_verification_strategy_id,
       ...(claim ? { id_token_principal_claim: claim } : {}),
+      ...(form.cc_require ? { require: true } : {}),
     };
   }
   return form.consent_confirmation_stored ? null : undefined;

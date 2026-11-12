@@ -100,6 +100,21 @@ Feature: Consent confirmation
     Then the consent start response status is 302
     And the consent start response sends the browser to OAuth provider "calendar"
 
+  Scenario: An API key caller gets no consent link from a provider that requires consent confirmation
+    Given the surface accepts "JWT Bearer" and "API Key" source authentication
+    And OAuth provider "calendar" refuses a consent link to a caller it cannot confirm
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid API key
+    Then the response status is 503
+    And the MCP response is a JSON-RPC error with code -32603
+    And MCP server "bravo" was not called
+
+  Scenario: A JWT caller's consent start is still confirmed by a provider that requires consent confirmation
+    Given OAuth provider "calendar" refuses a consent link to a caller it cannot confirm
+    And caller "alice" has started OAuth consent for provider "calendar"
+    When caller "alice" confirms the consent start page for provider "calendar"
+    Then the consent start response status is 302
+    And the consent start response sends the browser to the identity provider
+
   Scenario: Consent confirmation cannot be saved while the identity hash pepper is unset
     When the operator creates the authorization code provider "mail" with consent confirmation
     Then the admin API response status is 400

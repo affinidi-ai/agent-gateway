@@ -306,6 +306,10 @@ pub struct ConsentConfirmation {
     pub jwt_verification_strategy_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token_principal_claim: Option<String>,
+    /// Refuse a consent link to a caller the setting cannot confirm, rather
+    /// than minting one that goes straight to the vendor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require: bool,
 }
 
 impl ConsentConfirmation {
@@ -1431,6 +1435,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn require_is_stored_only_when_set() {
+        let mut setting = confirming(consent_provider("a", "a", None))
+            .consent_confirmation
+            .unwrap();
+        let stored = serde_json::to_value(&setting).unwrap();
+        assert_eq!(stored.get("require"), None);
+        assert!(
+            !serde_json::from_value::<ConsentConfirmation>(stored)
+                .unwrap()
+                .require
+        );
+        setting.require = true;
+        let stored = serde_json::to_value(&setting).unwrap();
+        assert_eq!(stored["require"], serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<ConsentConfirmation>(stored)
+                .unwrap()
+                .require
+        );
+    }
+
     fn confirming(mut provider: CredentialProvider) -> CredentialProvider {
         provider.consent_confirmation = Some(ConsentConfirmation {
             client_id_secret_ref: "LOGIN_CLIENT_ID".into(),
@@ -1439,6 +1465,7 @@ mod tests {
             token_endpoint: "https://idp.example/token".into(),
             jwt_verification_strategy_id: "strategy".into(),
             id_token_principal_claim: None,
+            require: false,
         });
         provider
     }

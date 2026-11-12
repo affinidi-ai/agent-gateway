@@ -83,6 +83,17 @@ fn oauth_provider_confirms_its_caller(
         .consent_confirmation = true;
 }
 
+#[given(expr = "OAuth provider {string} refuses a consent link to a caller it cannot confirm")]
+fn oauth_provider_requires_confirmation(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    oauth_provider_confirms_its_caller(world, provider);
+    world
+        .surface_config
+        .consent_confirmation_required = true;
+}
+
 #[when(expr = "the operator creates the authorization code provider {string} with consent confirmation")]
 async fn operator_creates_provider_with_consent_confirmation(
     world: &mut SurfaceWorld,
@@ -284,6 +295,15 @@ async fn caller_has_started_oauth_consent_with_api_key(
     _provider: String,
 ) {
     caller_invokes_mcp_tool_with_valid_api_key(world, "schedule_meeting".to_string()).await;
+}
+
+#[when(expr = "caller {string} invokes MCP tool {string} with a valid API key")]
+async fn caller_invokes_mcp_tool_with_api_key(
+    world: &mut SurfaceWorld,
+    _caller: String,
+    tool_name: String,
+) {
+    caller_invokes_mcp_tool_with_valid_api_key(world, tool_name).await;
 }
 
 #[when(expr = "caller {string} confirms the consent start page for provider {string}")]

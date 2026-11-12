@@ -66,6 +66,8 @@ pub struct SurfaceConfigBuilder {
     pub identity_provider_endpoints: Option<IdentityProviderEndpoints>,
     /// The surface's OAuth provider has its caller sign in at the identity provider first.
     pub consent_confirmation: bool,
+    /// That provider refuses a consent link to a caller it cannot confirm.
+    pub consent_confirmation_required: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -247,6 +249,7 @@ impl Default for SurfaceConfigBuilder {
             identity_provider: false,
             identity_provider_endpoints: None,
             consent_confirmation: false,
+            consent_confirmation_required: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,

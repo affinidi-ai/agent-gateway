@@ -178,6 +178,24 @@ code exchanges of delegated user tokens are not counted either.
 
 No label carries a URL, provider id, secret or tenant.
 
+## Consent confirmation link metric
+
+`agent_gateway_consent_confirmation_links_total{provider_id,surface_id,outcome,reason}` is a
+Prometheus counter incremented once for each consent link a provider with
+[consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation) is asked for, whether it
+is minted or refused. Unlike the log line, which is written once per provider, surface and
+reason, it counts every link. A provider without the setting is not counted.
+
+| Label | Value |
+| --- | --- |
+| `provider_id` | The credential provider's `provider_id` |
+| `surface_id` | The surface the link is for |
+| `outcome` | `confirmed` (the link signs the caller in at their identity provider first); `unconfirmed` (the link goes straight to the vendor); `refused` (no link: the setting confirms no caller, or it sets `require`) |
+| `reason` | `none` for `confirmed`; otherwise why the caller is not confirmed: `path_not_covered`, `not_legacy_consent`, `pepper_unset`, `not_jwt_caller`, `strategy_unavailable`, `gateway_issuer`, `entra_caller_named_by_sub`, `id_token_claim_invalid`, `editable_claim`, `other_issuer`, `other_principal_claim` or `other_identity_hash` |
+
+No label carries a caller identity. A link refused because the strategy cannot be read is not
+counted.
+
 ## Transit Point call outcomes
 
 A Transit Point call that reaches the forward step is recorded in the dashboard's traffic as

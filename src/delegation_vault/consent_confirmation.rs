@@ -54,7 +54,7 @@ pub(crate) enum Unconfirmed {
 impl Unconfirmed {
     /// Whether the reason holds for every caller of the provider, a setting
     /// that confirms nobody, rather than for this caller or request only.
-    pub(crate) fn covers_every_caller(self) -> bool {
+    fn covers_every_caller(self) -> bool {
         match self {
             Self::NotLegacyConsent
             | Self::PepperUnset
@@ -70,6 +70,37 @@ impl Unconfirmed {
             | Self::OtherIdentityHash => false,
         }
     }
+
+    /// The reason's metric label.
+    fn label(self) -> &'static str {
+        match self {
+            Self::PathNotCovered => "path_not_covered",
+            Self::NotLegacyConsent => "not_legacy_consent",
+            Self::PepperUnset => "pepper_unset",
+            Self::NotJwtCaller => "not_jwt_caller",
+            Self::StrategyUnavailable => "strategy_unavailable",
+            Self::GatewayIssuer => "gateway_issuer",
+            Self::EntraCallerNamedBySub => "entra_caller_named_by_sub",
+            Self::IdTokenClaimInvalid => "id_token_claim_invalid",
+            Self::EditableClaim => "editable_claim",
+            Self::OtherIssuer => "other_issuer",
+            Self::OtherPrincipalClaim => "other_principal_claim",
+            Self::OtherIdentityHash => "other_identity_hash",
+        }
+    }
+}
+
+/// Whether `provider` mints no consent link for a caller it cannot confirm
+/// for `reason`: the setting confirms no caller, or it sets `require`.
+pub(crate) fn refuses(
+    provider: &CredentialProvider,
+    reason: Unconfirmed,
+) -> bool {
+    reason.covers_every_caller()
+        || provider
+            .consent_confirmation
+            .as_ref()
+            .is_some_and(|confirmation| confirmation.require)
 }
 
 /// Who a consent link is minted for.
@@ -519,12 +550,12 @@ async fn exchange_code(
         .map_err(|_| DelegationFailureReason::TokenExchangeFailed)?
 }
 
-/// Log once per provider, surface and reason why a caller of a provider with
-/// `consent_confirmation` was refused a link or minted one that does not
-/// confirm them: at warn for a setting that confirms nobody (no link is
-/// minted), a Transit Point or Fabric caller, a caller that is not a JWT
-/// Bearer caller, or a caller of another issuer or principal claim, at debug
-/// otherwise. Also note at debug that a confirmed caller was
+/// Count every consent link of a provider with `consent_confirmation` by
+/// outcome and reason, and log once per provider, surface and reason why a
+/// caller was refused a link or minted one that does not confirm them: at warn
+/// for a refusal (a setting that confirms nobody, or one that sets `require`),
+/// a Transit Point or Fabric caller, a caller that is not a JWT Bearer caller,
+/// or a caller of another issuer or principal claim, at debug otherwise. Also note at debug that a confirmed caller was
 /// verified by another strategy than the one that confirms them. Nothing
 /// about the caller is logged.
 pub(crate) fn note(
@@ -536,6 +567,17 @@ pub(crate) fn note(
     match decision {
         ConfirmDecision::Off => {}
         ConfirmDecision::Unconfirmed(reason) => {
+            let refused = refuses(provider, *reason);
+            crate::metrics::backends::prometheus::track_consent_confirmation_link(
+                &provider.provider_id,
+                surface_id,
+                if refused {
+                    "refused"
+                } else {
+                    "unconfirmed"
+                },
+                reason.label(),
+            );
             if !first_note(&provider.id, surface_id, &format!("{reason:?}")) {
                 return;
             }
@@ -546,6 +588,14 @@ pub(crate) fn note(
                     surface_id = %surface_id,
                     reason = ?reason,
                     "Consent confirmation confirms no caller of this provider: consent links are refused"
+                );
+            } else if refused {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    surface_id = %surface_id,
+                    reason = ?reason,
+                    "Consent link refused: consent confirmation requires every caller to be confirmed"
                 );
             } else if *reason == Unconfirmed::PathNotCovered {
                 warn!(
@@ -583,6 +633,12 @@ pub(crate) fn note(
             }
         }
         ConfirmDecision::Confirm(binding) => {
+            crate::metrics::backends::prometheus::track_consent_confirmation_link(
+                &provider.provider_id,
+                surface_id,
+                "confirmed",
+                "none",
+            );
             if verified_by_another_strategy(caller.identity(), binding)
                 && first_note(&provider.id, surface_id, "verified_by_another_strategy")
             {
@@ -1190,6 +1246,92 @@ mod tests {
                 .count();
             assert_eq!(warnings, usize::from(warned), "{reason:?}: {text}");
         }
+    }
+
+    /// Without `require` only a setting that confirms nobody refuses a link;
+    /// with it, every caller the setting cannot confirm is refused.
+    #[test]
+    fn require_refuses_every_caller_the_setting_cannot_confirm() {
+        use Unconfirmed::*;
+        let mut requiring = provider(true);
+        requiring
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .require = true;
+        for reason in [
+            PathNotCovered,
+            NotLegacyConsent,
+            PepperUnset,
+            NotJwtCaller,
+            StrategyUnavailable,
+            GatewayIssuer,
+            EntraCallerNamedBySub,
+            IdTokenClaimInvalid,
+            EditableClaim,
+            OtherIssuer,
+            OtherPrincipalClaim,
+            OtherIdentityHash,
+        ] {
+            assert!(refuses(&requiring, reason), "{reason:?}");
+            assert_eq!(refuses(&provider(true), reason), reason.covers_every_caller(), "{reason:?}");
+        }
+    }
+
+    /// Every consent link of a provider with the setting is counted by
+    /// outcome and reason, not only the first one logged.
+    #[test]
+    fn every_consent_link_of_a_confirming_provider_is_counted() {
+        use crate::metrics::backends::prometheus::CONSENT_CONFIRMATION_LINKS;
+        let surface_id = uuid::Uuid::new_v4().to_string();
+        let count = |provider: &CredentialProvider, outcome: &str, reason: &str| {
+            CONSENT_CONFIRMATION_LINKS
+                .with_label_values(&[provider.provider_id.as_str(), surface_id.as_str(), outcome, reason])
+                .get()
+        };
+        let mut requiring = provider(true);
+        requiring.provider_id = format!("requiring-{surface_id}");
+        requiring
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .require = true;
+        let minting = provider(true);
+        let unconfirmed = ConfirmDecision::Unconfirmed(Unconfirmed::NotJwtCaller);
+        let confirmed = ConfirmDecision::Confirm(ConsentConfirmBinding {
+            strategy_id: "confirming".to_string(),
+            strategy_digest: "digest".to_string(),
+            tenant_id: None,
+        });
+        for _ in 0..2 {
+            note(&minting, &surface_id, &unconfirmed, ConsentCaller::TransitOrFabric);
+            note(&requiring, &surface_id, &unconfirmed, ConsentCaller::TransitOrFabric);
+        }
+        note(&minting, &surface_id, &confirmed, ConsentCaller::TransitOrFabric);
+        note(&provider(false), &surface_id, &ConfirmDecision::Off, ConsentCaller::TransitOrFabric);
+        assert_eq!(count(&minting, "unconfirmed", "not_jwt_caller"), 2);
+        assert_eq!(count(&requiring, "refused", "not_jwt_caller"), 2);
+        assert_eq!(count(&requiring, "unconfirmed", "not_jwt_caller"), 0);
+        assert_eq!(count(&minting, "confirmed", "none"), 1);
+    }
+
+    #[test]
+    fn a_refusal_under_require_is_warned_of_once() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        let mut requiring = provider(true);
+        requiring
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .require = true;
+        let surface_id = uuid::Uuid::new_v4().to_string();
+        let decision = ConfirmDecision::Unconfirmed(Unconfirmed::OtherIdentityHash);
+        let logs = FormattedLogs::capture();
+        note(&requiring, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+        note(&requiring, &surface_id, &decision, ConsentCaller::TransitOrFabric);
+        let text = logs.text();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains(" WARN ") && text.contains("requires every caller to be confirmed"), "{text}");
     }
 
     #[test]

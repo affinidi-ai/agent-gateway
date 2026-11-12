@@ -97,7 +97,8 @@ pub fn build_authorization_url(
 /// vendor's authorization URL can be built. Its start state confirms `caller`
 /// at their identity provider when the provider's `consent_confirmation` can
 /// ([`consent_confirmation::decide`](super::consent_confirmation::decide)),
-/// and no link is minted while the setting confirms no caller of the provider.
+/// and no link is minted for a caller it cannot confirm while the setting
+/// confirms no caller of the provider or sets `require`.
 #[allow(clippy::too_many_arguments)]
 pub async fn mint_consent_link(
     provider: &CredentialProvider,
@@ -136,9 +137,11 @@ pub async fn mint_consent_link(
     super::consent_confirmation::note(provider, surface_id, &decision, caller);
     let stage = match decision {
         super::consent_confirmation::ConfirmDecision::Confirm(binding) => Some(ConsentStage::ConfirmStart(binding)),
-        super::consent_confirmation::ConfirmDecision::Unconfirmed(reason) if reason.covers_every_caller() => {
+        super::consent_confirmation::ConfirmDecision::Unconfirmed(reason)
+            if super::consent_confirmation::refuses(provider, reason) =>
+        {
             return Err(anyhow!(
-                "Provider '{}': consent confirmation confirms no caller ({reason:?})",
+                "Provider '{}': consent confirmation refuses this caller ({reason:?})",
                 provider.provider_id
             ));
         }

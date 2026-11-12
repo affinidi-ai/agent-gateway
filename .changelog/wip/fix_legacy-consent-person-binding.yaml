@@ -10,6 +10,21 @@ changes:
         optional ID-token principal claim, offering only strategies the provider's tenant can use,
         and shows the Confirmation redirect URI to register at the identity provider. Saving sends
         the setting while the switch is on and clears a stored one when it is switched off.
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Refuse consent links to callers consent confirmation cannot confirm
+      description: >-
+        consent_confirmation.require, off by default and set by the editor's Refuse callers that
+        can't be confirmed switch, refuses the request and mints no consent link for a caller the
+        setting cannot confirm, such as an API key, mTLS or DID caller, a Transit Point or Fabric
+        request, or a caller of another issuer, instead of a link that goes straight to the
+        vendor. Use it on a provider whose callers can all be confirmed.
+    - timestamp: '2026-11-12T12:05:00Z'
+      title: Count consent links of providers with consent confirmation
+      description: >-
+        The Prometheus counter agent_gateway_consent_confirmation_links_total counts every
+        consent link a provider with consent confirmation is asked for, by provider, surface,
+        outcome (confirmed, unconfirmed or refused) and reason, so operators can see how many
+        links skip the confirmation rather than only the first log line.
   changed:
     - timestamp: '2026-11-11T19:00:00Z'
       title: Refuse deleting a JWT verification strategy a credential provider uses

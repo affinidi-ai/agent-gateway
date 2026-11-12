@@ -1201,6 +1201,7 @@ fn consent_confirmation_json(surface_config: &SurfaceConfigBuilder) -> serde_jso
         "authorization_endpoint": endpoints.authorization_endpoint,
         "token_endpoint": endpoints.token_endpoint,
         "jwt_verification_strategy_id": "bdd-jwt-strategy",
+        "require": surface_config.consent_confirmation_required,
     })
 }
 

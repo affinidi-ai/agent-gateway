@@ -4037,6 +4037,37 @@ mod tests {
         assert_eq!(start_stage(&minted.result), None);
     }
 
+    /// A provider whose consent confirmation sets `require` mints no consent
+    /// link for a caller it cannot confirm, and still confirms one it can.
+    #[tokio::test]
+    async fn a_provider_requiring_confirmation_refuses_a_caller_it_cannot_confirm() {
+        crate::identity::credential_identity::configure_pepper_for_tests(true);
+        let directory = tempfile::tempdir().unwrap();
+        let (store, _strategy, mut provider, alice) = confirming_fixture(directory.path(), None).await;
+        provider
+            .consent_confirmation
+            .as_mut()
+            .unwrap()
+            .require = true;
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "key".to_string(),
+            provider_agent_id: None,
+        };
+        let api_key_hash = api_key
+            .principal_hash(None)
+            .unwrap();
+        let refused = consent_lookup(&provider, Some(&api_key), &api_key_hash, Some(&store)).await;
+        assert!(matches!(refused, DelegationLookupResult::Unavailable), "{}", result_tag(&refused));
+
+        let alice_hash = alice
+            .principal_hash(None)
+            .unwrap();
+        let refused = consent_lookup(&provider, Some(&alice), "sha256:someone-else", Some(&store)).await;
+        assert!(matches!(refused, DelegationLookupResult::Unavailable), "{}", result_tag(&refused));
+        let confirmed = minted_start_state(&provider, Some(&alice), &alice_hash, Some(&store)).await;
+        assert!(matches!(confirmed.stage, Some(crate::delegation_vault::ConsentStage::ConfirmStart(_))));
+    }
+
     /// On a surface of a tenant the caller's vault key is computed under that
     /// tenant, and the confirm binding records it.
     #[tokio::test]

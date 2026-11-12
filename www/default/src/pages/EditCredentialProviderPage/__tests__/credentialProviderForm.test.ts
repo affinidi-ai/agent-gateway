@@ -430,6 +430,16 @@ describe('consent confirmation', () => {
     expect(consentConfirmationField(loaded, false)).toBe(null);
   });
 
+  it('reads and sends require only while it is on', () => {
+    expect(loaded.cc_require).toBe(false);
+    const requiring = consentConfirmationFieldsOf({
+      consent_confirmation: { ...STORED, require: true },
+    });
+    expect(requiring.cc_require).toBe(true);
+    expect(consentConfirmationField(requiring, true)).toEqual({ ...STORED, require: true });
+    expect(consentConfirmationField({ ...requiring, cc_require: false }, true)).toEqual(STORED);
+  });
+
   it('leaves the field out when nothing is stored and the switch is off', () => {
     expect(consentConfirmationField(EMPTY_CONSENT_CONFIRMATION_FIELDS, true)).toBeUndefined();
   });

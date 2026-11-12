@@ -181,6 +181,19 @@ lazy_static! {
         h
     };
 
+    /// Consent links of providers with consent confirmation (labeled by
+    /// provider_id, surface_id, outcome, reason).
+    pub static ref CONSENT_CONFIRMATION_LINKS: IntCounterVec = {
+        let opts = Opts::new(
+            names::CONSENT_CONFIRMATION_LINKS_TOTAL,
+            "Consent links of providers with consent confirmation (outcome = confirmed|unconfirmed|refused; \
+             reason = none|<unconfirmed reason>)",
+        );
+        let counter = IntCounterVec::new(opts, &["provider_id", "surface_id", "outcome", "reason"]).unwrap();
+        REGISTRY.register(Box::new(counter.clone())).unwrap();
+        counter
+    };
+
     /// Trust Check element outcomes (labeled by trust_registry_id, query_type, result).
     /// `result` = `ok` (allowed) | `denied` (clean negative) | `error` (stage failure).
     pub static ref TRUST_CHECK: IntCounterVec = {
@@ -800,6 +813,21 @@ pub fn payment_gate_totals() -> PaymentGateTotals {
         }
     }
     totals
+}
+
+/// Count one consent link of a provider with consent confirmation.
+///
+/// `outcome` = `confirmed` | `unconfirmed` | `refused`
+/// `reason`  = `none` for a confirmed link, else why it does not confirm its caller
+pub fn track_consent_confirmation_link(
+    provider_id: &str,
+    surface_id: &str,
+    outcome: &str,
+    reason: &str,
+) {
+    CONSENT_CONFIRMATION_LINKS
+        .with_label_values(&[provider_id, surface_id, outcome, reason])
+        .inc();
 }
 
 /// Track a Trust Check element outcome.

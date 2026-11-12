@@ -246,6 +246,35 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
 
           <div className="mb-3">
             <div className="field-label-with-help">
+              <div className="form-check form-switch mb-0">
+                <input
+                  id="cc_require"
+                  name="cc_require"
+                  data-testid="credential-provider-consent-confirmation-require-switch"
+                  className="form-check-input"
+                  type="checkbox"
+                  role="switch"
+                  checked={form.cc_require}
+                  onChange={onChange}
+                />
+                <label htmlFor="cc_require" className="form-check-label">
+                  Refuse callers that can&apos;t be confirmed
+                </label>
+              </div>
+              <FieldHelp
+                ariaLabel="About refusing callers that can't be confirmed"
+                testId="field-help-cc-require"
+              >
+                Off: a caller the setting can&apos;t confirm, such as an API key, mTLS or DID
+                caller, a Transit Point or Fabric request, or a caller of another issuer, gets a
+                consent link that goes straight to the vendor. On: that caller gets no link and the
+                request is refused.
+              </FieldHelp>
+            </div>
+          </div>
+
+          <div className="mb-3">
+            <div className="field-label-with-help">
               <label htmlFor="cc_redirect_uri" className="mb-0">
                 Confirmation redirect URI
               </label>

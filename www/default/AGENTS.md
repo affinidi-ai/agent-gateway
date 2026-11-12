@@ -1164,7 +1164,9 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   "(not found)" only once the list loaded without it, and with the other-tenant label when it is
   another tenant's; a list that cannot be read shows "Strategies could not be loaded"
   (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
-  (`…-principal-claim-input`). The labels say "Login" so they never share a name with the
+  (`…-principal-claim-input`) and a **Refuse callers that can't be confirmed** switch
+(`credential-provider-consent-confirmation-require-switch`, writes `require`, off by default,
+sent only while on). The labels say "Login" so they never share a name with the
   provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
   read-only **Confirmation redirect URI**
   (`credential-provider-consent-confirmation-redirect-uri`, copy button

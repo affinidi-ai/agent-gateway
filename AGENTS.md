@@ -190,7 +190,8 @@ delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
 The credential provider editor shows a **Consent confirmation** switch and its login client
 (ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
-tenant's and appliance-wide ones; appliance-wide only on a new provider) and principal claim on a legacy consent provider (authorization
+tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
+**Refuse callers that can't be confirmed** switch (`require`) on a legacy consent provider (authorization
 code, no `issuer`), with the read-only Confirmation redirect URI to register; Save sends the
 setting while on, `null` when a stored one is switched off or the provider is no longer legacy
 consent, and nothing otherwise; see _Credential provider editor_ in
