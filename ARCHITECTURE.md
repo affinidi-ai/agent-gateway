@@ -157,7 +157,7 @@ logic.
 | Extension inspection | Parsing and validating declared extensions (`inspect_message_extensions`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
 | Caller identity | The configured caller identity (`from_mtls`, `from_api_key`, `static`, `from_jwt_claim`) and any inbound identity presentation, which Trust Check depends on. On a direct request, an inbound `from_api_key` identifies each caller by the API key it presents and replaces any body identity; Fabric receive does not read it ([`docs/FABRIC.md`](docs/FABRIC.md)) | [`src/proxy/caller_identity.rs`](src/proxy/caller_identity.rs), [`src/identity/`](src/identity/) |
 | Metadata injection | Operator-defined request metadata (`resolve_metadata_references`) | [`src/protocols/extensions.rs`](src/protocols/extensions.rs) |
-| Trust Check, caller leg | TRQP queries feeding policy input. Never denies; OPA decides. Discovery `GET` and `HEAD` requests skip it; any other method on a discovery-like path, such as a `POST` to `{route}/agent.json`, runs it. | [`src/trust_registry_verification/`](src/trust_registry_verification/) |
+| Trust Check, caller leg | TRQP queries feeding policy input. Never denies; OPA decides. Discovery `GET` and `HEAD` requests now require transit token validation and must pass through trust and policy checks (unlike the Access Point, where discovery is fully public). All outbound requests, including discovery, run Trust Check. | [`src/trust_registry_verification/`](src/trust_registry_verification/) |
 | Access Point OPA | `access_point.inbound_policy`, its own deny gate, independent of the surface policy | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
 | Appliance-wide surface policy | The global surface-plane set, deny-overrides, ahead of the surface's own policy | [`src/policies/global_policy.rs`](src/policies/global_policy.rs) |
 | Surface OPA | The per-surface policy gate | [`src/policies/surface_manager.rs`](src/policies/surface_manager.rs) |
@@ -207,11 +207,14 @@ Resource Server token, or in the second, with the transit token, unless it is ma
 before anything is forwarded or any credential resolved (see
 [`docs/SOURCE_AUTH.md`](docs/SOURCE_AUTH.md#transit-point-callers)). A discovery read, a `GET`
 or `HEAD` of a discovery document such as an agent card directly below the Transit Point,
-skips transit token validation and the trust and policy group, and is forwarded without
-credentials. It still meets a Transit Point's `source_auth` or Resource Server token, but on a
-Transit Point that authenticates its callers with the transit token alone, a discovery read is
-forwarded with no caller authentication at all. The outbound path does not evaluate the
-appliance-wide policies.
+requires transit token validation (like all Transit Point requests) and must pass through all
+trust and policy checks. However, the caller is reported to the target as unauthenticated
+(`CallerAssertion::Unauthenticated`) because discovery is metadata-only and should not identify
+the requester to the upstream. The request still meets a Transit Point's `source_auth` or
+Resource Server token requirements, but on a Transit Point that authenticates its callers with
+the transit token alone, a discovery read is forwarded with no caller identity to the target,
+though the transit token must be present and valid. The outbound path evaluates all three
+OPA scopes (gateway, surface, and Transit Point) for every request, including discovery reads.
 
 ## Full order
 

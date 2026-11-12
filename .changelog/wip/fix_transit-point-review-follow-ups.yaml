@@ -1,0 +1,42 @@
+branch: fix/transit-point-review-follow-ups
+changes:
+  added:
+    - timestamp: '2026-11-12T11:40:00+02:00'
+      title: Add test coverage for Transit Point discovery token requirement
+      description: >-
+        Unit tests and BDD scenarios verify that discovery reads require valid transit tokens
+        and carry no credentials to targets. Unit tests cover 15 discovery path patterns
+        (GET/HEAD at Transit Point root like /.well-known/agent-card.json, /agent.json,
+        /discovery, plus edge cases with traversals and non-canonical spellings). BDD
+        scenarios verify GET/HEAD methods with valid tokens (200), and GET without tokens
+        (401 rejection). All tests confirm discovery reads pass through the full security
+        pipeline including trust checks and OPA policies.
+  changed:
+    - timestamp: '2026-11-10T16:31:39+02:00'
+      title: Require transit token and policy evaluation for Transit Point discovery reads
+      description: >-
+        Discovery requests on Transit Points (GET/HEAD of agent cards, UCP, discovery paths)
+        now require a valid transit token and pass through trust context collection, trust
+        checks, and OPA policy evaluation (gateway, surface, and Transit Point scopes).
+        The caller is still reported as unauthenticated to the target because discovery is
+        metadata-only, but the gateway validates the request through its full security pipeline.
+        This closes the security gap where unauthenticated requests could reach target services
+        via discovery paths. Clients that previously called discovery without a transit token
+        will receive 401 Unauthorized and must provide a valid token. Access Point discovery
+        (which is public) is unaffected.
+  fixed: []
+  removed: []
+  security:
+    - timestamp: '2026-11-10T16:31:39+02:00'
+      title: ⭐ Never forward Transit Point discovery reads to target unauthenticated
+      description: >-
+        Previously, GET/HEAD requests for discovery documents on Transit Points
+        (/.well-known/agent-card.json, /agent.json, /discovery, etc.) bypassed all
+        security controls and were forwarded to the target without validation. This allowed
+        unauthenticated reconnaissance of targets on trusted networks (internal VPC,
+        localhost sidecars). An attacker with network access to a target could enumerate
+        its capabilities and identify attack vectors. Now all discovery reads require transit
+        token validation and pass through the full security pipeline including trust checks
+        and OPA policy evaluation. Targets can no longer be discovered without explicit
+        authorization from the gateway.
+  breaking: []

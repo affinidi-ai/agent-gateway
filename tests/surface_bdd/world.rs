@@ -10,6 +10,7 @@ use crate::bdd_support::actors::{
 };
 use crate::bdd_support::config::api_keys::UnreadableKeyFolders;
 use crate::bdd_support::gateway_process::GatewayProcess;
+use crate::bdd_support::http::collect_headers;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
 use crate::bdd_support::temp::TempDirGuard;
@@ -156,8 +157,30 @@ pub struct SurfaceWorld {
     pub oauth_confirmed_state: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
+    /// The last HTTP response from a transit point discovery request.
+    pub last_response: Option<RecordedResponse>,
+    /// Whether the target received a request (for verification).
+    pub target_received_request: bool,
+    /// The last error reason from a failed request.
+    pub last_error_reason: Option<String>,
+    /// Audit log entries from the gateway.
+    pub gateway_audit_log: Vec<String>,
+    /// Gateway-level OPA policy for testing.
+    pub gateway_policy: Option<String>,
+    /// Surface-level OPA policy for testing.
+    pub surface_policy: Option<String>,
+    /// Transit Point-level OPA policy for testing.
+    pub transit_point_policy: Option<String>,
+    /// Source IP to use for request.
+    pub request_source_ip: Option<String>,
+    /// Transit points in the current surface.
+    pub surface_config_transit_points: HashMap<String, String>,
+    /// Whether transit token is required for all requests.
+    pub requires_transit_token: bool,
     /// A surface the operator is about to save through the admin API.
     pub surface_draft: Option<serde_json::Value>,
+    /// URL of the transit point mock server for discovery tests (dynamic, set by GIVEN step).
+    pub transit_point_discovery_mock_url: Option<String>,
     /// A client presenting the personal access token an operator minted in the scenario.
     pub personal_access_token_client: Option<reqwest::Client>,
     /// API keys the scenario created, by scenario name: the owning surface id and the key id.
@@ -235,7 +258,18 @@ impl SurfaceWorld {
             oauth_binding_cookie: None,
             oauth_confirmed_state: None,
             transit_token: None,
+            last_response: None,
+            target_received_request: false,
+            last_error_reason: None,
+            gateway_audit_log: Vec::new(),
+            gateway_policy: None,
+            surface_policy: None,
+            transit_point_policy: None,
+            request_source_ip: None,
+            surface_config_transit_points: HashMap::new(),
+            requires_transit_token: false,
             surface_draft: None,
+            transit_point_discovery_mock_url: None,
             personal_access_token_client: None,
             api_keys: HashMap::new(),
             client_certificates: HashMap::new(),
@@ -461,6 +495,53 @@ impl SurfaceWorld {
 
     pub fn actors_mut(&mut self) -> &mut ActorRegistry {
         &mut self.actors
+    }
+
+    /// Helper method for transit point discovery BDD tests.
+    /// Records a request to a transit point and stores the response.
+    pub async fn record_request(
+        &mut self,
+        method: &str,
+        path: &str,
+        _transit_point: &str,
+        token: Option<String>,
+        _body: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.last_error_reason = None;
+        self.target_received_request = false;
+
+        // Get the mock URL from world context (set by GIVEN step)
+        let base_url = self
+            .transit_point_discovery_mock_url
+            .as_ref()
+            .ok_or("Transit point mock URL not configured")?;
+
+        let url = format!("{}{}", base_url, path);
+
+        let client = reqwest::Client::new();
+        let mut request = match method {
+            "GET" => client.get(&url),
+            "HEAD" => client.head(&url),
+            _ => return Err(format!("Unsupported method: {}", method).into()),
+        };
+
+        if let Some(token) = token {
+            request = request.header("X-Transit-Token", token);
+        }
+
+        let response = request.send().await?;
+        self.target_received_request = true;
+
+        self.last_response = Some(crate::bdd_support::admin_client::RecordedResponse {
+            status: response.status().as_u16(),
+            headers: collect_headers(response.headers()),
+            body: response
+                .json()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({})),
+        });
+
+        Ok(())
     }
 }
 

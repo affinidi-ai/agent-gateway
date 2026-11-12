@@ -18,4 +18,5 @@ pub mod target_auth_save;
 pub mod target_credential;
 pub mod terms;
 pub mod then;
+pub mod transit_point_discovery;
 pub mod when;

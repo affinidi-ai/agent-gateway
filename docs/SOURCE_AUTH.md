@@ -1124,6 +1124,36 @@ Points sends, keeps a stored base block with empty `points` holding only its lif
 a merge `PATCH` with `"transit_token_lifetime_secs": null` removes it, which sets it back
 to 300 seconds.
 
+#### Discovery document authentication on Transit Points
+
+Discovery documents (agent cards, UCP well-known, and similar metadata files) requested from
+a Transit Point must now include a valid transit token, matching the security model of all
+other Transit Point requests. A `GET` or `HEAD` of a discovery document path — `.well-known/agent-card.json`,
+`.well-known/agent.json`, `agent-card.json`, `agent.json`, `.well-known/ucp`,
+`.well-known/agent-card`, or `discovery` — is treated as a Transit Point request requiring:
+
+1. **Transit token validation**: The `X-Transit-Token` header must be present and valid (via
+   `step_validate_transit_token`), unless the Transit Point has `require_transit_token: false`,
+   in which case the token is optional but still validated if present.
+2. **Trust context and trust check**: The request goes through trust context collection and
+   Trust Check (target leg), just like non-discovery requests.
+3. **OPA evaluation**: Gateway, surface, and Transit Point policies are all evaluated.
+4. **Caller assertion**: Discovery reads are reported to the target as `CallerAssertion::Unauthenticated`,
+   meaning no caller identity is sent to the target. This preserves the metadata-only nature of
+   discovery while ensuring the gateway validates the request.
+
+This closes the security gap where unauthenticated requests could reach a target service via
+discovery paths. A target service on a trusted network (localhost or VPC) should not serve
+metadata without verifying the request comes through a properly validated gateway path.
+
+**Differences from Access Point discovery**:
+- Access Point discovery (`.well-known/agent-card.json` on an Access Point) remains fully public:
+  no authentication is required.
+- Transit Point discovery (same paths requested through a Transit Point) now requires the
+  transit token and passes through policy, but reports no caller identity to the target.
+- Deeper paths like `/x/discovery` already required authentication via the prior fix and continue
+  to require it.
+
 ### Per-caller rate limit on a Transit Point
 
 A Transit Point's `rate_limit` is one bucket for the point, shared by every caller. Give the point
