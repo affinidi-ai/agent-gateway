@@ -23,10 +23,10 @@ changes:
         logs later ones at once.
   removed:
     - timestamp: '2026-11-12T09:00:00Z'
-      title: Remove the legacy Access Point note and Close button from the Surface Builder
+      title: Remove the unset Public access note and Close button from the dashboard
       description: >-
-        The Access Point panel no longer shows the note about a surface stored without a Public
-        access setting, nor its Close Access Point button. The gateway's own warnings about such
+        The Access Point panel no longer shows the note under the Public access switch for a
+        surface stored without that setting, nor its Close Access Point button. The gateway's own warnings about such
         a surface are unchanged. Set Public access or access_point.public to choose.
   security: []
   breaking: []
