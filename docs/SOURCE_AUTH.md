@@ -389,7 +389,7 @@ To find the affected surfaces and callers:
 
 To keep handing failed callers to policy, mark the surface public (`access_point.public: true`,
 the **Public access** switch). To make the refusal explicit in storage, close it
-(`access_point.public: false`). Either writes `public`, which releases
+(`access_point.public: false`, set through the API or the JSON editor). Either writes `public`, which releases
 before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
 surface built from DynamoDB takes the same setting from an optional `public` attribute on its
 item: a boolean, or the string `"true"` or `"false"`. Any other value is ignored, so the surface

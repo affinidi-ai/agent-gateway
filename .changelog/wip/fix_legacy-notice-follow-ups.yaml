@@ -2,12 +2,6 @@ branch: fix/legacy-notice-follow-ups
 changes:
   added: []
   changed:
-    - timestamp: '2026-11-12T09:00:00Z'
-      title: Remove the legacy Access Point note and Close button from the Surface Builder
-      description: >-
-        The Access Point panel no longer shows the note about a surface stored without a Public
-        access setting, nor its Close Access Point button. The gateway's own warnings about such
-        a surface are unchanged. Set Public access or access_point.public to choose.
     - timestamp: '2026-11-12T10:00:00Z'
       title: Reword the start-up log line about a surface that refuses failed callers
       description: >-
@@ -27,6 +21,12 @@ changes:
         and an operator whose opt-out had no effect got no reason. The gateway now holds such
         warnings until logging starts and logs them then, naming the item and the type of value it held, never the value, and
         logs later ones at once.
-  removed: []
+  removed:
+    - timestamp: '2026-11-12T09:00:00Z'
+      title: Remove the legacy Access Point note and Close button from the Surface Builder
+      description: >-
+        The Access Point panel no longer shows the note about a surface stored without a Public
+        access setting, nor its Close Access Point button. The gateway's own warnings about such
+        a surface are unchanged. Set Public access or access_point.public to choose.
   security: []
   breaking: []

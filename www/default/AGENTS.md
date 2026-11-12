@@ -295,7 +295,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows no
   notice under the switch. Turning the
   switch off there clears `public`, so turning it on and off again keeps the surface legacy. A
-  `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
+  `public: false` the operator sets, in the panel on a surface that has `public`, or in the JSON editor, is sent. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
