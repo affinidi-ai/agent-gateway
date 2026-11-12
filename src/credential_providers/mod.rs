@@ -1382,10 +1382,10 @@ mod tests {
 
     #[test]
     fn sends_client_secret_follows_the_provider_type_and_the_held_reference() {
-        let provider = |provider_type: &str, client_authentication: Option<&str>, client_secret: Option<&str>| {
+        let provider = |provider_type: &str, client_authentication: Option<&str>, reference: Option<&str>| {
             serde_json::from_value::<CredentialProvider>(serde_json::json!({
                 "id": "p", "name": "p", "provider_id": "p", "provider_type": provider_type,
-                "client_authentication": client_authentication, "client_secret_secret_ref": client_secret,
+                "client_authentication": client_authentication, "client_secret_secret_ref": reference,
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             }))
             .unwrap()
@@ -1408,11 +1408,11 @@ mod tests {
             ("oauth2_authorization_code", None, Some(""), false),
             ("oauth2_jwt_bearer", Some("client_secret_basic"), Some("  "), false),
         ];
-        for (provider_type, client_authentication, client_secret, sends) in cases {
+        for (provider_type, client_authentication, reference, sends) in cases {
             assert_eq!(
-                provider(provider_type, client_authentication, client_secret).sends_client_secret(),
+                provider(provider_type, client_authentication, reference).sends_client_secret(),
                 sends,
-                "{provider_type}, client authentication {client_authentication:?}, client secret {client_secret:?}"
+                "{provider_type}, client authentication {client_authentication:?}, reference {reference:?}"
             );
         }
     }
