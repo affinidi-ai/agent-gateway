@@ -3263,6 +3263,8 @@ pub async fn create_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     refuse_validation_off_by_scoped_caller(
         &surface,
         None,
@@ -4245,6 +4247,8 @@ async fn validate_and_save_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, existing).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     let stored_a2a = existing.and_then(|existing| {
         existing
             .access_point
@@ -8513,6 +8517,7 @@ mod validation_tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            browser_origins: Vec::new(),
         }
     }
 

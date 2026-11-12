@@ -5033,6 +5033,17 @@ fn surface_accepts_mcp_origin(
     mcp_http["allowed_origins"] = serde_json::Value::Array(origins);
 }
 
+#[given(expr = "the surface allows browser origin {string}")]
+fn surface_allows_browser_origin(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    world
+        .surface_config
+        .browser_origins
+        .push(origin);
+}
+
 fn set_modern_tool_response(
     world: &mut SurfaceWorld,
     server_name: &str,

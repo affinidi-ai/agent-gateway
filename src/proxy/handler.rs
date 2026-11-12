@@ -9883,6 +9883,50 @@ fn boxed_proxy_handler(
     Box::pin(proxy_handler_with_mcp_runtime(addr, state, req, mcp_versions, mcp_continuations))
 }
 
+/// The surface a request path belongs to, with the route as normalised, the
+/// `$alias` after it and the rest of the path. The most specific route wins.
+pub(crate) fn match_surface_route<'a>(
+    channels: &'a [crate::state::SurfaceInfo],
+    path: &str,
+) -> Option<(&'a crate::state::SurfaceInfo, String, Option<String>, String)> {
+    let mut sorted_channels: Vec<_> = channels.iter().collect();
+    sorted_channels.sort_by_key(|channel| {
+        std::cmp::Reverse(
+            channel
+                .surface
+                .route()
+                .trim_end_matches('/')
+                .len(),
+        )
+    });
+
+    sorted_channels
+        .iter()
+        .find_map(|ch| {
+            let route = ch.surface.route();
+            let normalized_route = crate::config::route_claims::normalize_route(route);
+            // The parser treats "/" specially: a route of "/" matches every path.
+            // For prefix matching pass an empty string in that case so any leading
+            // `$alias` is honoured at the very start of the path.
+            let prefix: &str = if normalized_route == "/" {
+                ""
+            } else {
+                normalized_route.as_str()
+            };
+
+            crate::proxy::route_variant::parse_route_with_variant(path, prefix).map(|m| {
+                debug!(
+                    "Route matched: surface='{}' route='{}' alias={} tail={}",
+                    ch.surface.name,
+                    normalized_route,
+                    loggable::untrusted(m.alias.unwrap_or_default()),
+                    loggable::untrusted(&loggable::path(m.tail))
+                );
+                (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string())
+            })
+        })
+}
+
 async fn multi_channel_proxy_handler_in_request_scope(
     addr: SocketAddr,
     state: MultiSurfaceProxyState,
@@ -9912,42 +9956,7 @@ async fn multi_channel_proxy_handler_in_request_scope(
     // URL grammar: `/route[$alias][/rest]`.
     // Sort channels by route length (descending) so the most specific route wins.
     let channels = state.channels.read().await;
-    let mut sorted_channels: Vec<_> = channels.iter().collect();
-    sorted_channels.sort_by_key(|channel| {
-        std::cmp::Reverse(
-            channel
-                .surface
-                .route()
-                .trim_end_matches('/')
-                .len(),
-        )
-    });
-
-    let matched_channel = sorted_channels
-        .iter()
-        .find_map(|ch| {
-            let route = ch.surface.route();
-            let normalized_route = crate::config::route_claims::normalize_route(route);
-            // The parser treats "/" specially: a route of "/" matches every path.
-            // For prefix matching pass an empty string in that case so any leading
-            // `$alias` is honoured at the very start of the path.
-            let prefix: &str = if normalized_route == "/" {
-                ""
-            } else {
-                normalized_route.as_str()
-            };
-
-            crate::proxy::route_variant::parse_route_with_variant(&path, prefix).map(|m| {
-                debug!(
-                    "Route matched: surface='{}' route='{}' alias={} tail={}",
-                    ch.surface.name,
-                    normalized_route,
-                    loggable::untrusted(m.alias.unwrap_or_default()),
-                    loggable::untrusted(&loggable::path(m.tail))
-                );
-                (*ch, normalized_route, m.alias.map(|s| s.to_string()), m.tail.to_string())
-            })
-        });
+    let matched_channel = match_surface_route(&channels, &path);
 
     // Surface the alias as `virtual_channel_alias` for the downstream resolver
     // (which still operates on `ChannelMapping.virtual_channels` until the
@@ -9973,7 +9982,6 @@ async fn multi_channel_proxy_handler_in_request_scope(
                     // The refusal may wait on the caller's body, so it must not
                     // hold the surface list a surface update writes to.
                     let surface = Arc::clone(&ch.surface);
-                    drop(sorted_channels);
                     drop(channels);
                     return refuse_access_point_variant(&surface, &state.network_config, mcp_versions, req, &error)
                         .await;

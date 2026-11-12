@@ -329,6 +329,12 @@ fn write_single_surface_config_inner(
     if let Some(mcp_http) = &surface_config.mcp_http {
         surface_fixture = surface_fixture.with_mcp_http(mcp_http.clone());
     }
+    if !surface_config
+        .browser_origins
+        .is_empty()
+    {
+        surface_fixture = surface_fixture.with_browser_origins(&surface_config.browser_origins);
+    }
     if let Some(a2a) = &surface_config.a2a_settings {
         surface_fixture = surface_fixture.with_a2a_settings(a2a.clone());
     }

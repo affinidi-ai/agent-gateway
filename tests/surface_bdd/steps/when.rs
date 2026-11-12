@@ -1794,6 +1794,68 @@ async fn mcp_surface_with_a2a_settings_create_request_submitted(
     create_surface(world, payload).await;
 }
 
+#[when(expr = "the operator attempts to create a surface for route {string} that allows browser origins {string}")]
+async fn surface_with_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    origins: String,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        origins
+            .split(", ")
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "the operator attempts to create a surface for route {string} that allows {int} browser origins")]
+async fn surface_with_many_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    count: usize,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        (0..count)
+            .map(|index| format!("https://page{index}.example.com"))
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "a web page at origin {string} sends a preflight for a POST to the surface")]
+async fn web_page_sends_preflight_to_surface(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    ensure_gateway_running(world).await;
+    let url = format!(
+        "http://127.0.0.1:{}{}/foo",
+        world
+            .infra
+            .as_ref()
+            .unwrap()
+            .gateway_port,
+        world.surface_config.route
+    );
+    let response = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .expect("send preflight to gateway");
+    world.caller_response = Some(RecordedResponse {
+        status: response.status().as_u16(),
+        headers: collect_headers(response.headers()),
+        body: serde_json::Value::Null,
+    });
+}
+
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
 async fn invalid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
