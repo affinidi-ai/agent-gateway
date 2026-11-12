@@ -511,6 +511,23 @@ fn oauth_callback_response_sends_browser_to_oauth_provider(
     assert_sends_browser_to_oauth_provider(world, "OAuth callback response", &provider);
 }
 
+#[then("the OAuth callback response tells the person to switch account at the identity provider")]
+fn oauth_callback_response_tells_person_to_switch_account(world: &mut SurfaceWorld) {
+    let body = world
+        .caller_response
+        .as_ref()
+        .and_then(|response| response.body["text"].as_str())
+        .expect("the OAuth callback response is an HTML page")
+        .to_string();
+    assert!(
+        body.contains("switch to your own account at your identity provider"),
+        "expected the page to tell the person to switch account at the identity provider, got {body}"
+    );
+    for person in ["alice", "bob"] {
+        assert!(!body.contains(person), "the page names {person}: {body}");
+    }
+}
+
 #[then(expr = "the OAuth callback response does not send the browser to OAuth provider {string}")]
 fn oauth_callback_response_does_not_send_browser_to_oauth_provider(
     world: &mut SurfaceWorld,

@@ -2125,6 +2125,7 @@ mod tests {
 
     /// A person other than the one the link was minted for, signing in at
     /// the identity provider, is refused with 403 before the vendor: the
+    /// page tells them to switch account at the identity provider, the
     /// cookie is cleared, nothing is stored and the audit names only the
     /// reason.
     #[tokio::test]
@@ -2141,7 +2142,20 @@ mod tests {
             serde_json::json!({"id_token": fixture.id_token(&sign_in.nonce, serde_json::json!({"sub": "mallory"}))}),
         );
         let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
-        consent::assert_refused(&refused, StatusCode::FORBIDDEN, Some(&consent::cookie_name(&sign_in.cookie)));
+        consent::assert_refused_with(
+            &refused,
+            StatusCode::FORBIDDEN,
+            Some(&consent::cookie_name(&sign_in.cookie)),
+            crate::delegation_vault::handlers::CONSENT_IDENTITY_MISMATCH_PAGE,
+        );
+        assert!(
+            !refused
+                .body
+                .contains("mallory")
+                && !refused.body.contains("alice"),
+            "{}",
+            refused.body
+        );
         assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentIdentityMismatch]);
         let audited = format!("{events:?}");
         assert!(!audited.contains("mallory"), "{audited}");
@@ -2645,6 +2659,43 @@ mod tests {
         assert_eq!(fixture.idp_forms().len(), 1);
     }
 
+    /// A strategy that expects this gateway's own `sts.mcp_issuer`, set after
+    /// the link was minted, confirms nobody: the start POST is refused before
+    /// the identity provider and left unused, and a confirmation already under
+    /// way is refused before the code exchange.
+    #[tokio::test]
+    async fn a_strategy_for_the_gateways_own_issuer_is_refused_at_the_start_post_and_at_confirm() {
+        let mut fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let state = consent::start_state(&fixture.confirm_start_url(&strategy));
+        let start = crate::delegation_vault::oauth::decode_start_state(&state).unwrap();
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture.serve_with_gateway_mcp_issuer(&strategy.expected_issuer);
+
+        let (refused, events) = capture(async {
+            fixture
+                .start_post(&state, &[("origin", "https://198.51.100.7")])
+                .await
+        })
+        .await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, None);
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(
+            !crate::delegation_vault::oauth::is_claimed(&start).await,
+            "the refused start POST left the state unused"
+        );
+
+        let (refused, events) = capture(fixture.confirm_code(&sign_in)).await;
+        consent::assert_refused(&refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        assert_eq!(consent::reasons(&events), [DelegationFailureReason::ConsentStateInvalid]);
+        assert!(fixture.idp_forms().is_empty(), "no code is exchanged");
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// A login token endpoint that refuses the code exchange is refused with
     /// 400 after the confirmation state is claimed: the state is used up, the
     /// cookie cleared and nothing stored.
@@ -2909,8 +2960,18 @@ mod tests {
             status: StatusCode,
             cleared: Option<&str>,
         ) {
+            assert_refused_with(answer, status, cleared, crate::delegation_vault::handlers::CONSENT_REFUSED_PAGE);
+        }
+
+        /// [`assert_refused`] showing `page`.
+        pub fn assert_refused_with(
+            answer: &Answer,
+            status: StatusCode,
+            cleared: Option<&str>,
+            page: &str,
+        ) {
             assert_eq!(answer.status, status, "{}", answer.body);
-            assert_eq!(answer.body, crate::delegation_vault::handlers::CONSENT_REFUSED_PAGE);
+            assert_eq!(answer.body, page);
             assert_eq!(answer.header("cache-control"), Some("no-store"));
             assert_eq!(answer.header("referrer-policy"), Some("no-referrer"));
             assert_eq!(answer.header("location"), None);
@@ -3191,6 +3252,16 @@ mod tests {
                 self.app = create_delegation_vault_oauth_router(state.clone())
                     .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
                 self.state = state;
+            }
+
+            /// Serves from now on as a gateway whose `sts.mcp_issuer` is `issuer`.
+            pub fn serve_with_gateway_mcp_issuer(
+                &mut self,
+                issuer: &str,
+            ) {
+                let mut state = self.state.clone();
+                state.gateway_mcp_issuer = Some(issuer.to_string());
+                self.serve(state);
             }
 
             /// Serves from now on with `surfaces` as the surface store.

@@ -396,6 +396,17 @@ pub(super) const CONSENT_REFUSED_PAGE: &str = r#"<!DOCTYPE html>
 <p>Please start again from the original application.</p>
 </body></html>"#;
 
+/// The page a consent confirmation shows when the person signed in at the
+/// identity provider is not the caller the link was issued to: fixed text,
+/// so nothing about either person is shown.
+pub(super) const CONSENT_IDENTITY_MISMATCH_PAGE: &str = r#"<!DOCTYPE html>
+<html><head><title>Authorization Failed</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h2>Authorization Failed</h2>
+<p>The account you signed in with at your identity provider is not the one this link was issued to.</p>
+<p>Sign out of it or switch to your own account at your identity provider, then start again from the original application.</p>
+</body></html>"#;
+
 /// A consent refusal: its status and the reason the audit and the log name.
 struct ConsentRefusal {
     status: StatusCode,
@@ -446,7 +457,11 @@ fn consent_refused(
             )
         });
     }
-    let mut response = (status, Html(CONSENT_REFUSED_PAGE)).into_response();
+    let page = match reason {
+        DelegationFailureReason::ConsentIdentityMismatch => CONSENT_IDENTITY_MISMATCH_PAGE,
+        _ => CONSENT_REFUSED_PAGE,
+    };
+    let mut response = (status, Html(page)).into_response();
     consent_page_headers(&mut response, "no-referrer");
     if let Some(cleared) = cookie.and_then(|name| binding_cookie(name, "", 0).ok()) {
         attach_binding_cookie(&mut response, cleared);

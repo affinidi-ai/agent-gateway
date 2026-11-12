@@ -31,8 +31,8 @@ changes:
       description: >-
         DELETE /api/v1/jwt-verification-strategies/{id} now answers 409, listing the providers,
         while a credential provider's consent_confirmation.jwt_verification_strategy_id or its
-        consent_identity_strategy_id names the strategy, so deleting it no longer silently turns
-        off consent confirmation or breaks modern consent. This also applies to providers that
+        consent_identity_strategy_id names the strategy, so deleting it no longer breaks modern
+        consent and can't leave consent confirmation without its strategy. This also applies to providers that
         never set consent_confirmation. The Strategies tab's alert names those providers, counts
         the ones the user can't view, and says that a provider's consent confirmation is changed
         in its editor and its consent_identity_strategy_id through the API.
@@ -43,8 +43,8 @@ changes:
         it changes expected_issuer to one that a credential provider naming the strategy would
         refuse at its own save: an issuer of this gateway's own STS or an Entra issuer while
         callers are named by sub for consent_confirmation, or an issuer that is not a canonical
-        https URL for consent_identity_strategy_id. Before, such an edit silently made consent
-        confirmation confirm nobody, or stopped modern consent from finding the strategy.
+        https URL for consent_identity_strategy_id. Before, such an edit stopped modern consent
+        from finding the strategy.
   fixed:
     - timestamp: '2026-11-11T21:00:00Z'
       title: Report a caller JWT without an iss claim as an invalid issuer
@@ -61,14 +61,15 @@ changes:
         setting that names a login client at the callers' identity provider, whose client ID and
         secret are both read from the secrets store in the provider's own tenant, and the JWT
         verification strategy that identifies them. When a JWT caller whose issuer and principal
-        claim are that strategy's opens a consent link, the gateway first signs them in at the identity provider, verifies
-        the ID token and checks that it names the same person the link was issued to, and only
-        then continues to the vendor. Another person is refused with 403 before the vendor is
-        reached. Saving the setting checks the provider type, the strategy and its tenant, both
-        endpoints, the client ID and secret, the confirmation redirect URI, the principal claim and the
-        identity hash pepper. A setting that no longer confirms any caller, for example after
-        the pepper is lost on a redeploy, refuses consent links to JWT callers instead of minting
-        unconfirmed ones. Consent links of providers without the setting, of API key callers, and of Transit
-        Point and Fabric callers are minted as before, with a warning in the gateway log when the
-        provider has the setting.
+        claim are that strategy's opens a consent link, the gateway first signs them in at the
+        identity provider, verifies the ID token and checks that it names the same person the
+        link was issued to, and only then continues to the vendor. Another person is refused with
+        403 before the vendor is reached, on a page that tells them to switch account at the
+        identity provider. Saving the setting checks the provider type, the strategy and its
+        tenant, both endpoints, the client ID and secret, the confirmation redirect URI, the
+        principal claim and the identity hash pepper. A setting that no longer confirms any
+        caller, for example after the pepper is lost on a redeploy, refuses consent links to JWT
+        callers. Consent links of providers without the setting, of API key, mTLS and DID callers,
+        and of Transit Point and Fabric callers are minted as before unless the provider sets
+        require, with a warning in the gateway log when the provider has the setting.
   breaking: []

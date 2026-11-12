@@ -2161,7 +2161,11 @@ Refusals at `/confirm` show the fixed refusal page, clear the binding cookie whe
 names it, store nothing,
 and use the reasons in the table under [The callback](#the-callback). `consent_identity_mismatch`,
 `consent_identity_missing` and `browser_binding_mismatch` answer `403`. The others, which are
-about the state, the strategy or the setting, answer `400`.
+about the state, the strategy or the setting, answer `400`. For `consent_identity_mismatch` the
+page also says that the account signed in at the identity provider is not the one the link was
+issued to, and to sign out of it or switch account there before starting again: the gateway sends
+no `prompt`, so an identity provider that keeps the other account's session signs the person in as
+that account again. The page names neither person.
 
 #### Which claim names the caller
 

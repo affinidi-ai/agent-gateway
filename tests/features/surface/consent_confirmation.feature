@@ -44,6 +44,7 @@ Feature: Consent confirmation
     When the identity provider sends the caller back to the gateway
     Then the OAuth callback response status is 403
     And the OAuth callback response shows an authorization failure page
+    And the OAuth callback response tells the person to switch account at the identity provider
     And the OAuth callback response does not send the browser to OAuth provider "calendar"
     And OAuth provider "calendar" was not asked to exchange an authorization code
     And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "consent_identity_mismatch"
