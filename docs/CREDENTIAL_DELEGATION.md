@@ -1542,16 +1542,30 @@ can encrypt each caller's data with a key the gateway derives and its own operat
 surface's `caller_key` names a secret in the secrets store; on each request whose caller
 presented a JWT the gateway verified on that request, by JWT Bearer source authentication or
 by the Resource Server token of `mcp_http.authorization`, the Target receives
-HKDF-SHA256(secret, salt `agent-gateway-caller-key-v1`, info surface id `0x00` `iss` `0x00`
-claim name `0x00` claim value) in the surface's header, `x-caller-key` by default, as 32 bytes
-of base64url without padding. The claim is the first of `identity_claims` (`["sub"]` by
-default) the token carries as a non-empty string without NUL; a token without a string `iss`,
-or without any of the claims as such a string, gets no key. The same caller on the same surface
-gets the same key on every request, every variant of the surface included; another caller,
-another issuer, another surface or another secret gives another key. The setting and its rules
+HKDF-SHA256(secret, salt `agent-gateway-caller-key-v2`, info) in the surface's header,
+`x-caller-key` by default, as 32 bytes of base64url without padding. The info is the surface
+id, the key source, the audience claim, the accepted audiences, the token's `iss`, the claim's
+name and its value, each field preceded by its 4-byte big-endian length and each audience by
+its own, so no field can be read as part of another. The claim is the first of
+`identity_claims` (`["sub"]` by default) the token carries as a non-empty string; a token
+without a string `iss`, or without any of the claims as such a string, gets no key. The same
+caller on the same surface gets the same key on every request, every variant of the surface
+included; another caller, another issuer, another surface, another secret, another key source
+or another audience set gives another key. The setting and its rules
 are in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-caller-keys), and the
 derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 
+- **Bound to how the token was verified.** The token's `iss` is only what the token says, and
+  whoever can edit a JWT verification strategy can point it at a key set of their own and sign
+  a token with the real `iss` and any caller's subject. So the key is also bound to the key
+  source that verified the token: `jwks_uri:` and the strategy's JWKS URI as configured, which
+  the issuer's own key rotation behind that URI does not change, or `inline_jwks:sha256:` and
+  the SHA-256 of the RFC 8785 canonical JSON of a key set configured inline; an MCP Resource
+  Server token is verified against the gateway's own signing keys, an inline key set by the
+  same rule. It is bound as well to the audience claim and the audiences the token was accepted
+  against, sorted and without duplicates, so adding an audience to accept another
+  application's tokens changes every key. A forged token under a substituted key set, or one
+  accepted only through an added audience, gets a key no caller had.
 - **Who gets a key.** Only a caller with a JWT verified on the request. A caller identified by an
   API key, an API Key Provider key, DID Auth or mTLS gets none, nor does a caller without a
   credential or whose credential failed on a public Access Point. A Target bound by external
@@ -1581,9 +1595,12 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   surface's `caller_key` names is refused with `409` unless forced, as for any other secret a
   surface names (see [Records that are still in use](#records-that-are-still-in-use)). The derived key is
   not logged; the log redaction rules treat a `caller_key` field or attribute as a credential.
-- **Changing the setting.** Replacing the secret's value, the claims or the surface changes every
-  caller's key, so the Target can no longer read what it encrypted with the old keys. Keep the
-  secret for the surface's life.
+- **Changing the setting.** By design, replacing the secret's value, the claims or the surface,
+  and changing the key source (the strategy's JWKS URI, or its inline keys, an inline key
+  rotation included) or the audience claim or audiences the token is accepted against, changes
+  every caller's key, so the Target can no longer read what it encrypted with the old keys. For
+  a Resource Server token that includes a change of the gateway's own signing keys. Keep these
+  fixed for the surface's life, and prefer a JWKS URI over inline keys.
 
 ## Tenant isolation on a surface's upstream legs
 

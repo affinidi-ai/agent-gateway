@@ -1023,12 +1023,24 @@ admin API; a variant cannot override it.
 | --- | --- | --- |
 | `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
 | `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
-| `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string without NUL is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
+| `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
 
-The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v1`
-as the salt, and the surface id, `0x00`, the token's `iss`, `0x00`, the claim's name, `0x00`
-and the claim's value as the info, 32 bytes, base64url without padding. Changing the secret,
-the claims or the surface changes every caller's key. Only a caller whose JWT was verified on
+The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v2`
+as the salt, 32 bytes, base64url without padding. Its info is seven fields, each preceded by
+its length in bytes as a 4-byte big-endian integer, so no field can be read as part of
+another: the surface id; the key source, `jwks_uri:` and the JWT verification strategy's JWKS
+URI as configured, or `inline_jwks:sha256:` and the lowercase hex SHA-256 of the RFC 8785
+canonical JSON of a key set configured inline (the gateway's own signing keys for an MCP
+Resource Server token); the audience claim (`aud`, `azp` or `client_id`; `aud` for a Resource
+Server token); the audiences the token was accepted against (the method's `audiences`, or the
+resource for a Resource Server token), sorted, without duplicates, each preceded by its own
+4-byte length; the token's `iss`; the claim's name; and its value. Binding the key to the key
+source and the audiences means whoever edits the strategy to trust another key set, or adds an
+audience to accept another application's tokens, cannot obtain an existing caller's key with
+a token claiming that caller's `iss` and subject. By design, changing the secret, the claims,
+the surface, the strategy's JWKS URI or inline keys (an inline key rotation included), the
+audience claim or the audiences changes every caller's key; the issuer rotating the keys
+behind a JWKS URI does not. Only a caller whose JWT was verified on
 that request gets a key: no caller with an API key, DID Auth or mTLS, no caller without a
 credential or whose credential failed on a public Access Point, and no token without a string
 `iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
