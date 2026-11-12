@@ -199,19 +199,24 @@ pub(crate) fn sent_in_clear(endpoint: &str) -> bool {
     url::Url::parse(endpoint.trim()).is_ok_and(|url| url.scheme() == "http")
 }
 
-/// Whether the caller key may go to `endpoint` under `credential_policy.target_https`, as a
-/// Target credential may: always unless in clear, and in clear only while the rule is not
-/// `enforce`. Either way an `http` Target is logged once per surface, variant and mode.
+/// Whether the caller key may go to `endpoint` under `credential_policy.target_https`, by the
+/// test a Target credential is held to ([`crate::config::target_auth_rules::is_https_target`]):
+/// always to an `https` URL, and to any other endpoint only while the rule is not `enforce`.
+/// An `http` Target is logged once per surface, variant and mode; another endpoint, such as a
+/// `fabric://` or `proxy://` one, never carries the key out in clear and is not logged.
 fn target_https_allows(
     surface_id: &str,
     endpoint: &str,
     mode: crate::config::credential_policy::RuleMode,
 ) -> bool {
     static WARNED: std::sync::LazyLock<dashmap::DashSet<String>> = std::sync::LazyLock::new(Default::default);
-    if !sent_in_clear(endpoint) {
+    if crate::config::target_auth_rules::is_https_target(endpoint) {
         return true;
     }
     let enforced = mode.is_enforced();
+    if !sent_in_clear(endpoint) {
+        return !enforced;
+    }
     let variant = crate::observability::policy_audit::current_request_variant();
     let leg = format!(
         "{surface_id}\n{}\n{enforced}",
@@ -239,8 +244,8 @@ fn target_https_allows(
 
 /// The caller key header, name and value, for a request on `surface` from `identity` to the
 /// Target at `endpoint`: only on a surface with `caller_key`, from a caller whose JWT was
-/// verified on this request and names it, and to an `http` Target only while
-/// `credential_policy.target_https` is not `enforce`. When the secret cannot be read the
+/// verified on this request and names it, and to a Target that is not an `https` URL only
+/// while `credential_policy.target_https` is not `enforce`. When the secret cannot be read the
 /// request goes on without it, and a warning names the surface.
 pub(crate) async fn caller_key_header(
     surface: &AgentSurface,
@@ -776,5 +781,20 @@ mod tests {
             "withheld on every request, not only the first"
         );
         assert!(target_https_allows("surface-http", "http://agent.example", RuleMode::Warn));
+    }
+
+    /// The key is held to the test a Target credential is: under `enforce` only an `https` URL
+    /// with a host receives it.
+    #[test]
+    fn target_https_withholds_the_key_from_every_endpoint_a_target_credential_is_withheld_from() {
+        use crate::config::credential_policy::RuleMode;
+        for endpoint in ["fabric://gateway/surface", "proxy://memory", "a2a-proxy://agent", "not a url", "https://"] {
+            assert!(
+                !crate::config::target_auth_rules::is_https_target(endpoint),
+                "a Target credential is withheld from {endpoint}"
+            );
+            assert!(!target_https_allows("surface-other", endpoint, RuleMode::Enforce), "{endpoint}");
+            assert!(target_https_allows("surface-other", endpoint, RuleMode::Warn), "{endpoint}");
+        }
     }
 }

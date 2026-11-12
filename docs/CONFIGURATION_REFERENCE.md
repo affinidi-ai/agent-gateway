@@ -1066,8 +1066,8 @@ credential or whose credential failed on a public Access Point, and no token wit
 starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
 gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
 used such a header for its own purposes can no longer send it through. The key follows
-`credential_policy.target_https` as a Target credential does: to an `http` Target it is withheld
-under `enforce` and sent with a logged warning under `warn`. A save answers with a `Warning` when
+`credential_policy.target_https` as a Target credential does: under `enforce` it goes only to an
+`https://` URL with a host, and under `warn` an `http` Target gets it with a logged warning. A save answers with a `Warning` when
 the surface's Target, or a variant's, is `http`, or is one that never receives a key
 (`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See

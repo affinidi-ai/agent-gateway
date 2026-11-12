@@ -1579,8 +1579,9 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   receive, where the receiving gateway derives it for the JWT it verified. A `fabric://` Target
   is not sent the sending gateway's key; a `proxy://` MCP proxy's backend and an `a2a-proxy://`
   backend are sent none, and a REST MCP proxy tool argument cannot set a header of the caller key
-  family. As a Target credential, the key follows `credential_policy.target_https`: an `http`
-  Target gets none under `enforce`, and gets it with a logged warning under `warn`. A save warns
+  family. As a Target credential, the key follows `credential_policy.target_https`: under
+  `enforce` only an `https://` URL with a host gets it, and under `warn` an `http` Target gets it
+  with a logged warning. A save warns
   when a Target of the surface or a variant is `http` or never receives a key.
 - **A caller cannot supply one.** A surface's caller key header is always of the caller key
   family: `x-caller-key`, or `x-caller-key-` followed by lower-case words, such as

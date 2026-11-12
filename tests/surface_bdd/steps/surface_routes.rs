@@ -73,23 +73,6 @@ async fn operator_enables_surface(
     save_surface(world, &id, surface).await;
 }
 
-#[given(expr = "the operator has saved the surface allowing browser origin {string}")]
-async fn operator_saves_surface_with_browser_origin(
-    world: &mut SurfaceWorld,
-    origin: String,
-) {
-    crate::steps::when::ensure_gateway_running(world).await;
-    let id = crate::steps::credential_save::surface_id(world);
-    let mut surface = stored_surface(world, &id).await;
-    surface["browser_origins"] = serde_json::json!([origin]);
-    save_surface(world, &id, surface).await;
-    let saved = world
-        .admin_response
-        .as_ref()
-        .expect("the operator saved the surface");
-    assert_eq!(saved.status, 200, "save surface {id}: {saved:?}");
-}
-
 #[then(expr = "surface {string} is {word}")]
 async fn surface_has_status(
     world: &mut SurfaceWorld,

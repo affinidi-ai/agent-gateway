@@ -17,14 +17,6 @@ changes:
         the management caller, so a standing grant of browser access to an origin can be traced.
   changed:
     - timestamp: '2026-11-13T12:00:00Z'
-      title: Normalise stored browser origins on load and drop invalid ones
-      description: >-
-        A surface loaded from disk, such as one edited by hand under `_storage/`, now gets the
-        same `browser_origins` rules as an admin API save: each entry is normalised, and an
-        invalid one (an `http` origin among them), a duplicate or one past the 20th is dropped
-        with a warning naming the surface. Before, such entries were kept as written, so a
-        mixed-case origin never matched and an `http` origin was honoured.
-    - timestamp: '2026-11-13T12:00:00Z'
       title: Warn on saving a caller key its Target never or only in clear receives
       description: >-
         Saving a surface whose `caller_key` its Target, or a variant's, never receives
@@ -65,8 +57,9 @@ changes:
       description: >-
         A caller key was sent to an `http` Target even while `credential_policy.target_https`
         was `enforce`, and with no warning under `warn`. It now follows the rule as a Target
-        credential does, on the Access Point and on Fabric receive: an `http` Target gets no key
-        under `enforce`, and gets it with a logged warning under `warn`.
+        credential does, on the Access Point and on Fabric receive: a Target that is not an
+        `https` URL gets no key under `enforce`, and an `http` Target gets it with a logged
+        warning under `warn`.
     - timestamp: '2026-11-13T12:00:00Z'
       title: Refuse a REST MCP proxy tool argument that sets an x-caller-key header
       description: >-
@@ -79,4 +72,13 @@ changes:
         A `browser_origins` entry longer than 256 bytes is now refused before it is parsed, and
         a refused entry is quoted escaped and capped in the `400` message and the log, so an
         entry carrying CR or LF cannot forge log lines.
-  breaking: []
+  breaking:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Drop invalid browser origins from stored surfaces when they are loaded
+      description: >-
+        A surface loaded from disk, such as one edited by hand under `_storage/`, now gets the
+        same `browser_origins` rules as an admin API save: each entry is normalised, and an
+        invalid one (an `http` origin among them), a duplicate or one past the 20th is dropped
+        with a warning naming the surface, and the stored file is rewritten without it. Before,
+        such entries were kept as written, so a mixed-case origin never matched and an `http`
+        origin was honoured; a page on a dropped origin can no longer call the surface.

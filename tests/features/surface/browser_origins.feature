@@ -98,6 +98,6 @@ Feature: Browser origins of a surface
 
   Scenario: A browser origin saved through the admin API applies without a restart
     Given an A2A surface targeting managed agent "bravo"
-    And the operator has saved the surface allowing browser origin "https://chat.example.com"
+    And the operator has saved the surface with browser origins "https://chat.example.com"
     When a web page at origin "https://chat.example.com" sends a preflight for a POST to the surface
     Then the response includes header "access-control-allow-origin" with value "https://chat.example.com"

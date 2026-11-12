@@ -49,9 +49,23 @@ async fn operator_saves_surface_with_browser_origins(
     world: &mut SurfaceWorld,
     allowed: String,
 ) {
+    crate::steps::when::ensure_gateway_running(world).await;
     let mut surface = stored_surface(world).await;
     surface["browser_origins"] = origins(&allowed);
     save_surface(world, &surface).await;
+}
+
+#[given(expr = "the operator has saved the surface with browser origins {string}")]
+async fn operator_has_saved_surface_with_browser_origins(
+    world: &mut SurfaceWorld,
+    allowed: String,
+) {
+    operator_saves_surface_with_browser_origins(world, allowed).await;
+    let saved = world
+        .admin_response
+        .take()
+        .expect("the admin API must answer");
+    assert_eq!(saved.status, 200, "saving the surface: {}", saved.body);
 }
 
 #[when("the operator patches the surface's browser origins to an empty list")]
@@ -74,6 +88,31 @@ async fn stored_surface_allows_browser_origins(
 ) {
     let surface = stored_surface(world).await;
     assert_eq!(surface["browser_origins"], origins(&allowed), "the stored surface: {surface}");
+}
+
+#[then(
+    expr = "the VP Audit Log records that the operator changed the surface's browser origins from {string} to {string}"
+)]
+async fn audit_log_records_browser_origins_changed(
+    world: &mut SurfaceWorld,
+    previous: String,
+    current: String,
+) {
+    let user = crate::steps::policy_changes::user_id(world, None).await;
+    let surface = surface_id(world);
+    let (previous, current) = (origins(&previous), origins(&current));
+    let (found, events) = crate::steps::policy_changes::client(world, None)
+        .await
+        .wait_for_audit_event(|record| {
+            let change = &record["event"]["browser_origins_changed"];
+            record["surface_id"] == surface.as_str()
+                && change["actor"]["id"] == user.as_str()
+                && change["previous_origins"] == previous
+                && change["origins"] == current
+        })
+        .await
+        .expect("read the VP Audit Log");
+    assert!(found, "expected a browser_origins_changed record for surface {surface}, got {events:?}");
 }
 
 #[then("the stored surface allows no browser origins")]
