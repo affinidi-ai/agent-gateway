@@ -244,6 +244,7 @@ fn parse_stored_settings(content: &str) -> serde_json::Result<DashboardSettings>
 #[derive(Clone)]
 pub struct SettingsStore {
     settings: Arc<RwLock<DashboardSettings>>,
+    writes: Arc<tokio::sync::Mutex<()>>,
     storage_path: PathBuf,
 }
 
@@ -256,8 +257,16 @@ impl SettingsStore {
 
         Self {
             settings: Arc::new(RwLock::new(DashboardSettings::default())),
+            writes: Arc::new(tokio::sync::Mutex::new(())),
             storage_path,
         }
+    }
+
+    /// Serialises changes to the settings on this process: a caller that
+    /// reads, changes and saves them holds the guard from the read to the
+    /// save, so no other change lands in between and is lost.
+    pub async fn lock_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.lock().await
     }
 
     /// Load settings from disk (async version)
@@ -448,23 +457,6 @@ impl SettingsStore {
         Ok(())
     }
 
-    /// Applies `change` to the settings in memory under the store's lock, so a
-    /// change made meanwhile is kept, and saves when `change` returns true.
-    /// Returns whether it did.
-    pub async fn modify(
-        &self,
-        change: impl FnOnce(&mut DashboardSettings) -> bool,
-    ) -> Result<bool> {
-        let changed = {
-            let mut settings = self.settings.write().unwrap();
-            change(&mut settings)
-        };
-        if changed {
-            self.save().await?;
-        }
-        Ok(changed)
-    }
-
     /// Whether `flag` is explicitly on.
     pub fn flag_enabled(
         &self,
@@ -485,6 +477,7 @@ impl SettingsStore {
         &self,
         flag: &str,
     ) -> Result<bool> {
+        let _writing = self.lock_writes().await;
         {
             let mut settings = self.settings.write().unwrap();
             if settings
@@ -772,31 +765,29 @@ mod tests {
         assert!(store.flag_enabled("mediator_federation"));
     }
 
-    /// A change is saved when it reports one, applied to the settings in
-    /// memory at that moment, and nothing is saved when it reports none.
+    /// A flag is not turned on while another change holds the write guard,
+    /// and the change is kept beside it.
     #[tokio::test]
-    async fn a_modification_is_saved_only_when_it_changes_the_settings() {
+    async fn a_flag_waits_for_a_change_in_progress() {
         let temp_dir = TempDir::new().unwrap();
         let store = SettingsStore::new(temp_dir.path());
         store.load().await.unwrap();
-        store
-            .update(DashboardSettings {
-                badge_threshold_minutes: 9,
-                ..DashboardSettings::default()
-            })
-            .unwrap();
 
-        assert!(
-            store
-                .modify(|settings| {
-                    settings
-                        .audit_events
-                        .push("consent_granted".to_string());
-                    true
-                })
-                .await
-                .unwrap()
+        let ((), turned_on) = tokio::join!(
+            async {
+                let _writing = store.lock_writes().await;
+                let mut settings = store.get();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                settings.badge_threshold_minutes = 9;
+                store
+                    .update(settings)
+                    .unwrap();
+                store.save().await.unwrap();
+            },
+            store.enable_flag_if_unset("agent_pay_delegation")
         );
+
+        assert!(turned_on.unwrap());
         let reread = SettingsStore::new(temp_dir.path());
         reread.load().await.unwrap();
         assert_eq!(
@@ -805,28 +796,7 @@ mod tests {
                 .badge_threshold_minutes,
             9
         );
-        assert_eq!(reread.get().audit_events, ["consent_granted"]);
-
-        store
-            .update(DashboardSettings {
-                badge_threshold_minutes: 3,
-                ..store.get()
-            })
-            .unwrap();
-        assert!(
-            !store
-                .modify(|settings| settings.badge_threshold_minutes == 0)
-                .await
-                .unwrap()
-        );
-        reread.load().await.unwrap();
-        assert_eq!(
-            reread
-                .get()
-                .badge_threshold_minutes,
-            9,
-            "nothing was saved"
-        );
+        assert!(reread.flag_enabled("agent_pay_delegation"));
     }
 
     #[tokio::test]

@@ -8,8 +8,9 @@ changes:
         On the Active node, at startup or on promotion, the VP Audit Log selection and every
         integration event set that holds consent_granted get delegation_failed, the refused OAuth
         consent starts and callbacks. It is added once: audit_events_added.json in the settings
-        directory records it, so removing the event afterwards keeps it removed. The VP Audit Log
-        selection is changed in place, so a settings change saved meanwhile is kept.
+        directory records it, so removing the event afterwards keeps it removed. A settings or
+        event set change saved through the dashboard on the same node meanwhile is kept, and an
+        event set deleted meanwhile stays deleted.
     - timestamp: '2026-11-09T17:00:00Z'
       title: Name the agent in delegation_failed and record each refusal once per state
       description: >-

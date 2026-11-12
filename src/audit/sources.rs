@@ -176,9 +176,11 @@ pub async fn reload_sources() {
 /// Reloads `settings` from disk, keeping the settings already loaded when
 /// that fails.
 async fn reload(settings: Option<&SettingsStore>) {
-    if let Some(settings) = settings
-        && let Err(e) = settings.load().await
-    {
+    let Some(settings) = settings else {
+        return;
+    };
+    let _writing = settings.lock_writes().await;
+    if let Err(e) = settings.load().await {
         warn!(error = %e, "Failed to reload the dashboard settings; building the audit sinks from those already loaded");
     }
 }

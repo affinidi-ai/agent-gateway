@@ -48,11 +48,11 @@ pub async fn add_on_activation(
 
 /// Adds each event of [`ADDED_EVENTS`] the marker does not name to the
 /// selections that hold the event it extends and lack it, then writes the
-/// marker. Settings are read from disk first, so a newer copy is never
-/// overwritten, and the events are added under the store's lock, so a change
-/// made meanwhile is kept. The marker is written last: a failure leaves it unwritten and
-/// the next run adds what is still missing. Returns whether a selection
-/// changed.
+/// marker. Each selection is read and saved under its store's write guard,
+/// and the settings are read from disk under it, so a change saved on this
+/// process meanwhile is kept and a deleted event set stays deleted. The marker
+/// is written last: a failure leaves it unwritten and the next run adds what
+/// is still missing. Returns whether a selection changed.
 pub async fn add_once(
     settings: &SettingsStore,
     settings_dir: &Path,
@@ -78,11 +78,19 @@ pub async fn add_once(
     }
 
     let mut changed_sets = 0;
-    for mut event_set in event_sets
+    for listed in event_sets
         .list()
         .await
         .context("Failed to list the integration event sets")?
     {
+        let _writing = event_sets.lock_writes().await;
+        let Some(mut event_set) = event_sets
+            .find(&listed.id)
+            .await
+            .with_context(|| format!("Failed to read the event set {}", listed.id))?
+        else {
+            continue;
+        };
         let mut changed = false;
         for (event, extends) in &pending {
             if event_set.contains(&integration_event(extends)) {
@@ -101,33 +109,41 @@ pub async fn add_once(
         }
     }
 
-    settings
-        .load()
-        .await
-        .context("Failed to reload the dashboard settings")?;
-    let audit_log_changed = settings
-        .modify(|current| {
-            let mut changed = false;
-            for (event, extends) in &pending {
-                if current
+    let audit_log_changed = {
+        let _writing = settings.lock_writes().await;
+        settings
+            .load()
+            .await
+            .context("Failed to reload the dashboard settings")?;
+        let mut current = settings.get();
+        let mut changed = false;
+        for (event, extends) in &pending {
+            if current
+                .audit_events
+                .iter()
+                .any(|selected| selected == extends)
+                && !current
                     .audit_events
                     .iter()
-                    .any(|selected| selected == extends)
-                    && !current
-                        .audit_events
-                        .iter()
-                        .any(|selected| selected == event)
-                {
-                    current
-                        .audit_events
-                        .push((*event).to_string());
-                    changed = true;
-                }
+                    .any(|selected| selected == event)
+            {
+                current
+                    .audit_events
+                    .push((*event).to_string());
+                changed = true;
             }
-            changed
-        })
-        .await
-        .context("Failed to save the dashboard settings")?;
+        }
+        if changed {
+            settings
+                .update(current)
+                .context("Failed to change the dashboard settings")?;
+            settings
+                .save()
+                .await
+                .context("Failed to save the dashboard settings")?;
+        }
+        changed
+    };
 
     let marker: Vec<&str> = ADDED_EVENTS
         .iter()
@@ -402,6 +418,122 @@ mod tests {
         let settings = stores.settings.get();
         assert_eq!(settings.badge_threshold_minutes, 9);
         assert_eq!(settings.audit_events, ["consent_granted", "delegation_failed"]);
+    }
+
+    /// A settings change in progress when the upgrade runs is kept, and so is
+    /// the event the upgrade adds.
+    #[tokio::test]
+    async fn a_settings_change_in_progress_is_kept_beside_the_added_event() {
+        let stores = stores(&["consent_granted"]).await;
+
+        let ((), changed) = tokio::join!(
+            async {
+                let _writing = stores
+                    .settings
+                    .lock_writes()
+                    .await;
+                let mut settings = stores.settings.get();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                settings.badge_threshold_minutes = 9;
+                stores
+                    .settings
+                    .update(settings)
+                    .unwrap();
+                stores
+                    .settings
+                    .save()
+                    .await
+                    .unwrap();
+            },
+            add_once(&stores.settings, &stores.settings_dir, &stores.event_sets)
+        );
+
+        assert!(changed.unwrap());
+        let reread = SettingsStore::new(&stores.settings_dir);
+        reread.load().await.unwrap();
+        assert_eq!(
+            reread
+                .get()
+                .badge_threshold_minutes,
+            9
+        );
+        assert_eq!(reread.get().audit_events, ["consent_granted", "delegation_failed"]);
+    }
+
+    /// An event set change in progress when the upgrade runs is kept, and so
+    /// is the event the upgrade adds.
+    #[tokio::test]
+    async fn an_event_set_change_in_progress_is_kept_beside_the_added_event() {
+        let stores = stores(&[]).await;
+        let consent = event_set(&stores, &["consent_granted"]).await;
+
+        let ((), changed) = tokio::join!(
+            async {
+                let _writing = stores
+                    .event_sets
+                    .lock_writes()
+                    .await;
+                let mut edited = stored(&stores, &consent).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                edited
+                    .events
+                    .insert(integration_event("auth_failed"));
+                stores
+                    .event_sets
+                    .save(&edited)
+                    .await
+                    .unwrap();
+            },
+            add_once(&stores.settings, &stores.settings_dir, &stores.event_sets)
+        );
+
+        assert!(changed.unwrap());
+        assert_eq!(
+            sorted(
+                &stored(&stores, &consent)
+                    .await
+                    .events
+            ),
+            ["audit.auth_failed", "audit.consent_granted", "audit.delegation_failed"]
+        );
+    }
+
+    /// An event set deleted while the upgrade waits for it stays deleted.
+    #[tokio::test]
+    async fn an_event_set_deleted_meanwhile_stays_deleted() {
+        let stores = stores(&[]).await;
+        let consent = event_set(&stores, &["consent_granted"]).await;
+        let writing = stores
+            .event_sets
+            .lock_writes()
+            .await;
+
+        let upgrade = add_once(&stores.settings, &stores.settings_dir, &stores.event_sets);
+        tokio::pin!(upgrade);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut upgrade)
+                .await
+                .is_err(),
+            "the upgrade waits for the event set's write guard"
+        );
+        assert!(
+            stores
+                .event_sets
+                .delete(&consent.id)
+                .await
+                .unwrap()
+        );
+        drop(writing);
+
+        assert!(!upgrade.await.unwrap());
+        assert_eq!(
+            stores
+                .event_sets
+                .find(&consent.id)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
