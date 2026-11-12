@@ -995,8 +995,11 @@ async fn a_refused_provider_token_fails_a_card_fetch_over_fabric_with_target_aut
     for (sink, text) in
         [("response", response.to_string()), ("audit record", serde_json::to_string(&events).unwrap()), ("logs", logs)]
     {
-        for secret in [REFUSED_TOKEN_DESCRIPTION, PROVIDER_CLIENT_SECRET] {
-            assert!(!text.contains(secret), "{secret} reached the {sink}:\n{text}");
+        for (what, value) in [
+            ("the token endpoint's description", REFUSED_TOKEN_DESCRIPTION),
+            ("the client secret", PROVIDER_CLIENT_SECRET),
+        ] {
+            assert!(!text.contains(value), "{what} reached the {sink}");
         }
     }
 }
@@ -1193,7 +1196,11 @@ async fn the_policy_card_read_logs_the_card_location_and_the_cards_url_redacted(
     let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("/.well-known/agent.json?token="), "the card location was not logged:\n{logs}");
     assert!(logs.contains("agent.example/a2a"), "the card url was not logged:\n{logs}");
-    for secret in ["location-query-secret", "card-password", "card-query-secret"] {
-        assert!(!logs.contains(secret), "{secret} was logged:\n{logs}");
+    for (what, value) in [
+        ("the card location's query value", "location-query-secret"),
+        ("the card url's password", "card-password"),
+        ("the card url's query value", "card-query-secret"),
+    ] {
+        assert!(!logs.contains(value), "{what} was logged");
     }
 }
