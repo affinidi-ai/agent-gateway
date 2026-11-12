@@ -658,12 +658,22 @@ fn named_managed_agent_did_not_receive_header(
 
 /// The caller key the gateway derives for the caller whose token's `sub` is `subject` on the
 /// surface under test: HKDF-SHA256 over the fixture's secret, with salt
-/// `agent-gateway-caller-key-v1` and info `surface id, 0x00, iss, 0x00, "sub", 0x00, subject`,
-/// 32 bytes, base64url without padding.
+/// `agent-gateway-caller-key-v2` and as info the surface id, the strategy's key source
+/// (`jwks_uri:` and its JWKS URI), the audience claim, the sorted accepted audiences, `iss`,
+/// `sub` and `subject`, each field after its 4-byte big-endian length and each audience after
+/// its own; 32 bytes, base64url without padding.
 fn expected_caller_key(
     world: &SurfaceWorld,
     subject: &str,
 ) -> String {
+    fn length_prefixed(field: &[u8]) -> Vec<u8> {
+        let mut prefixed = u32::try_from(field.len())
+            .expect("a short field")
+            .to_be_bytes()
+            .to_vec();
+        prefixed.extend_from_slice(field);
+        prefixed
+    }
     let secret = world
         .surface_config
         .caller_key
@@ -674,18 +684,41 @@ fn expected_caller_key(
                 .as_deref()
         })
         .expect("the surface derives caller keys from a stored secret");
-    let issuer = match &world
+    let config = match &world
         .surface_config
         .source_auth
     {
-        Some(crate::world::SurfaceSourceAuthConfig::JwtBearer(config)) => config.issuer.as_str(),
+        Some(crate::world::SurfaceSourceAuthConfig::JwtBearer(config)) => config,
         other => panic!("the surface must require JWT Bearer source authentication, got {other:?}"),
     };
+    let mut audiences = config.audiences.clone();
+    audiences.sort();
+    audiences.dedup();
+    let audiences: Vec<u8> = audiences
+        .iter()
+        .flat_map(|audience| length_prefixed(audience.as_bytes()))
+        .collect();
     let surface_id = crate::steps::credential_save::surface_id(world);
-    let info = format!("{surface_id}\0{issuer}\0sub\0{subject}");
+    let key_source = format!("jwks_uri:{}", config.jwks_url);
+    let audience_claim = config
+        .audience_claim
+        .as_deref()
+        .unwrap_or("aud");
+    let info: Vec<u8> = [
+        surface_id.as_bytes(),
+        key_source.as_bytes(),
+        audience_claim.as_bytes(),
+        &audiences,
+        config.issuer.as_bytes(),
+        b"sub",
+        subject.as_bytes(),
+    ]
+    .into_iter()
+    .flat_map(length_prefixed)
+    .collect();
     let mut key = [0u8; 32];
-    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"agent-gateway-caller-key-v1"), secret.as_bytes())
-        .expand(info.as_bytes(), &mut key)
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"agent-gateway-caller-key-v2"), secret.as_bytes())
+        .expand(&info, &mut key)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
 }
