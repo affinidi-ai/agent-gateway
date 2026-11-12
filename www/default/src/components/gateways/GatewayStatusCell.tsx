@@ -11,6 +11,7 @@ const STATUS_BADGE: Record<string, string> = {
   active: 'text-bg-success',
   failed: 'text-bg-danger',
   'awaiting-approval': 'text-bg-warning',
+  'awaiting-mediator-access': 'text-bg-warning',
   pending: 'text-bg-warning',
 };
 
@@ -24,8 +25,13 @@ export function gatewayFailureTooltip(runtime?: ConnectionRuntimeStatus): string
   return parts.length ? parts.join('; ') : undefined;
 }
 
+const STATUS_LABEL: Record<string, string> = {
+  'awaiting-approval': 'AWAITING APPROVAL',
+  'awaiting-mediator-access': 'Waiting for mediator access',
+};
+
 export const gatewayStatusLabel = (status: string): string =>
-  status === 'awaiting-approval' ? 'AWAITING APPROVAL' : status.toUpperCase();
+  STATUS_LABEL[status] ?? status.toUpperCase();
 
 interface GatewayStatusCellProps {
   gateway: Pick<

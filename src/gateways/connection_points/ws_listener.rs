@@ -643,6 +643,13 @@ impl ConnectionPointListenerManager {
         if !self.is_active() {
             return Err("Connection point listeners are currently deactivated".to_string());
         }
+        if connection_point.awaiting_mediator_access {
+            info!(
+                "Not starting a listener for connection point '{}': it waits for mediator access",
+                connection_point.id
+            );
+            return Ok(());
+        }
 
         let cp_id = connection_point.id.clone();
         if let Err(e) = self
@@ -4265,37 +4272,43 @@ async fn handle_oob_connection_setup_as_inviter<CS: super::ConnectionPointStore 
             .await
             .map_err(|e| format!("Inbound gateway connection refused (appliance limit): {}", e.message()))?;
 
-        // Step 2: Create our secure DID for the permanent connection
-        info!("🔑 Creating our secure DID for permanent connection...");
+        // Step 2: Our secure DID for the permanent connection: the one the
+        // connection point reserved, else a new one
+        let our_secure_did = if let Some(reserved) = &connection_point.reserved_permanent {
+            info!("✓ Using the permanent DID reserved with the connection point: {}", reserved.did);
+            reserved.did.clone()
+        } else {
+            info!("🔑 Creating our secure DID for permanent connection...");
 
-        // Get network_config from manager
-        let network_config = manager_weak
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .and_then(|m| m.network_config.clone())
-            .ok_or_else(|| "Network config not available in listener manager".to_string())?;
+            let network_config = manager_weak
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .and_then(|m| m.network_config.clone())
+                .ok_or_else(|| "Network config not available in listener manager".to_string())?;
 
-        let secure_cp_id = uuid::Uuid::new_v4().to_string();
-        let (our_secure_did, _secure_secrets, _secure_doc) =
-            crate::gateways::connection_points::handlers::generate_connection_point_identity(
-                &secure_cp_id,
-                &network_config.did.domain,
-                std::path::Path::new(
-                    &bootstrap_config
-                        .storage_paths
-                        .connection_points,
-                ),
-                mediator_url,
-                &connection_point.did_method,
-                #[cfg(feature = "didwebvh")]
-                None,
-                #[cfg(feature = "didwebvh")]
-                None,
-            )
-            .await
-            .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
+            let secure_cp_id = uuid::Uuid::new_v4().to_string();
+            let (our_secure_did, _secure_secrets, _secure_doc) =
+                crate::gateways::connection_points::handlers::generate_connection_point_identity(
+                    &secure_cp_id,
+                    &network_config.did.domain,
+                    std::path::Path::new(
+                        &bootstrap_config
+                            .storage_paths
+                            .connection_points,
+                    ),
+                    mediator_url,
+                    &connection_point.did_method,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                    #[cfg(feature = "didwebvh")]
+                    None,
+                )
+                .await
+                .map_err(|e| format!("Failed to generate secure DID: {}", e))?;
 
-        info!("✓ Our secure DID created: {}", our_secure_did);
+            info!("✓ Our secure DID created: {}", our_secure_did);
+            our_secure_did
+        };
 
         // Step 3: Create the gateway record with AwaitingApproval status
         // Store the acceptor's information so admin can review and approve

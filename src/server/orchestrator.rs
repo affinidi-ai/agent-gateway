@@ -3180,12 +3180,14 @@ pub async fn run_axum_proxy(
                 }
             });
 
-            // Clean up pending OOB gateways from previous sessions
-            // Since temporary DID secrets are in-memory only, we cannot restart listeners after server restart
-            // These gateways should be cleaned up as they're from incomplete handshakes
+            // Clean up pending OOB gateways from previous sessions. A handshake that had
+            // started is not resumed after a restart, so its gateway is removed. A gateway
+            // paused for mediator access keeps its keys and state on disk and is kept
+            // until its invitation expires.
             if let Some(ref gw_store) = gateway_store {
                 let gw_store_clone = gw_store.clone();
                 let pending_store_clone = pending_connection_store.clone();
+                let paused_cp_store = cp_store.clone();
                 let started_at = chrono::Utc::now();
 
                 tokio::spawn(async move {
@@ -3193,6 +3195,8 @@ pub async fn run_axum_proxy(
 
                     // Small delay after startup
                     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+                    remove_lapsed_pauses(gw_store_clone.as_ref(), paused_cp_store.as_ref(), &pending_store_clone).await;
 
                     match gw_store_clone
                         .list_all()
@@ -4833,6 +4837,60 @@ async fn initialize_saml_state(
             &saml_config.login_throttle,
         )),
     })
+}
+
+/// Removes the gateways paused for mediator access whose invitation has expired,
+/// with their temporary connection point and pending pairing.
+async fn remove_lapsed_pauses(
+    gateway_store: &crate::gateways::FileSystemGatewayStore,
+    cp_store: &crate::gateways::FileSystemConnectionPointStore,
+    pending_store: &crate::gateways::PendingConnectionStore,
+) {
+    use crate::gateways::GatewayStore;
+    use crate::gateways::connection_points::ConnectionPointStore;
+
+    let Ok(gateways) = gateway_store.list_all().await else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    for gateway in gateways {
+        if gateway.status != crate::gateways::types::GatewayStatus::AwaitingMediatorAccess {
+            continue;
+        }
+        let points = cp_store
+            .list_by_gateway(&gateway.id)
+            .await
+            .unwrap_or_default();
+        let expires_at = points
+            .iter()
+            .find(|point| point.awaiting_mediator_access)
+            .and_then(|point| point.recorded_expires_at());
+        if !gateway.pause_has_lapsed(expires_at, now) {
+            continue;
+        }
+        info!(
+            "Removing gateway '{}' ({}): its invitation expired while it waited for mediator access",
+            gateway.name, gateway.id
+        );
+        let ids: Vec<String> = points
+            .iter()
+            .map(|point| point.id.clone())
+            .collect();
+        for id in &ids {
+            if let Err(e) = cp_store.delete(id).await {
+                warn!("Failed to delete connection point {} of an expired pause: {}", id, e);
+            }
+        }
+        pending_store
+            .remove_for_connection_points(&ids)
+            .await;
+        if let Err(e) = gateway_store
+            .delete(&gateway.id)
+            .await
+        {
+            error!("Failed to delete gateway '{}' of an expired pause: {}", gateway.id, e);
+        }
+    }
 }
 
 #[cfg(test)]

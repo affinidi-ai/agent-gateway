@@ -1,7 +1,14 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { apiClient } from '../api';
 import './OnboardWizard.css';
+import MediatorAccessStep, { MediatorAccessRefusal } from '../components/shared/MediatorAccessStep';
+import {
+  CONNECTION_POINT_DID_LABELS,
+  MediatorAccess,
+  labelledDids,
+  mediatorAccessRefusal,
+} from '../utils/mediatorAccess';
 
 // Import step components
 import SelectMediatorStep from '../components/gateway-create-connection-point/SelectMediatorStep';
@@ -9,7 +16,7 @@ import EnterDetailsStep from '../components/gateway-create-connection-point/Ente
 import CompleteStep from '../components/gateway-create-connection-point/CompleteStep';
 
 // Define wizard steps
-type WizardStep = 'select-mediator' | 'enter-details' | 'complete';
+type WizardStep = 'select-mediator' | 'enter-details' | 'mediator-access' | 'complete';
 
 interface ConnectionPointDetails {
   gatewayId: string | null;
@@ -24,10 +31,13 @@ interface WizardState extends ConnectionPointDetails {
   currentStep: WizardStep;
   mediatorId: string | null;
   connectionPoint: any;
+  mediatorAccess: MediatorAccess | null;
 }
 
 const CreateGatewayConnectionPointWizardPage: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const resumeId = searchParams.get('resume');
 
   const [wizardState, setWizardState] = useState<WizardState>({
     currentStep: 'select-mediator',
@@ -38,14 +48,44 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
     secret: '',
     didMethod: 'web',
     connectionPoint: null,
+    mediatorAccess: null,
   });
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [continuing, setContinuing] = useState(false);
+  const [refusal, setRefusal] = useState<MediatorAccessRefusal | null>(null);
+  const [continueError, setContinueError] = useState('');
+
+  useEffect(() => {
+    if (!resumeId) return;
+    const resume = async () => {
+      try {
+        setSaving(true);
+        const [connectionPoint, access] = await Promise.all([
+          apiClient.get(`/connection-points/${resumeId}`),
+          apiClient.get<MediatorAccess>(`/connection-points/${resumeId}/mediator-access`),
+        ]);
+        setWizardState(prev => ({
+          ...prev,
+          mediatorId: connectionPoint.data.mediator_id,
+          connectionPoint: connectionPoint.data,
+          mediatorAccess: access.data,
+          currentStep: 'mediator-access',
+        }));
+      } catch (err: any) {
+        setError(err.message || 'Failed to load the connection point.');
+      } finally {
+        setSaving(false);
+      }
+    };
+    resume();
+  }, [resumeId]);
 
   const steps: { key: WizardStep; label: string }[] = [
     { key: 'select-mediator', label: 'Select Mediator' },
     { key: 'enter-details', label: 'Enter Details' },
+    { key: 'mediator-access', label: 'Mediator Access' },
     { key: 'complete', label: 'Complete' },
   ];
 
@@ -104,18 +144,47 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
         secret: details.secret,
         expiry_seconds: details.expirySeconds,
         did_method: details.didMethod,
+        await_mediator_access: true,
       });
 
       setWizardState(prev => ({
         ...prev,
         connectionPoint: response.data.connection_point,
-        currentStep: 'complete',
+        mediatorAccess: response.data.mediator_access ?? null,
+        currentStep: response.data.mediator_access ? 'mediator-access' : 'complete',
       }));
     } catch (err: any) {
       console.error('Failed to create connection point:', err);
       setError(err.message || 'Failed to create connection point. Please try again.');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleContinue = async () => {
+    try {
+      setContinuing(true);
+      setRefusal(null);
+      setContinueError('');
+      const response = await apiClient.post(
+        `/connection-points/${wizardState.connectionPoint.id}/continue`,
+        {}
+      );
+      setWizardState(prev => ({
+        ...prev,
+        connectionPoint: response.data.connection_point,
+        mediatorAccess: null,
+        currentStep: 'complete',
+      }));
+    } catch (err: any) {
+      const refused = mediatorAccessRefusal(err, CONNECTION_POINT_DID_LABELS);
+      if (refused) {
+        setRefusal(refused);
+      } else {
+        setContinueError(err.message || 'Failed to continue. Please try again.');
+      }
+    } finally {
+      setContinuing(false);
     }
   };
 
@@ -165,6 +234,18 @@ const CreateGatewayConnectionPointWizardPage: React.FC = () => {
             initialDidMethod={wizardState.didMethod}
           />
         );
+      case 'mediator-access':
+        return wizardState.mediatorAccess ? (
+          <MediatorAccessStep
+            dids={labelledDids(wizardState.mediatorAccess, CONNECTION_POINT_DID_LABELS)}
+            mediatorName={wizardState.mediatorAccess.mediator_name}
+            refusal={refusal}
+            error={continueError}
+            continuing={continuing}
+            onContinue={handleContinue}
+            onLater={handleCancel}
+          />
+        ) : null;
       case 'complete':
         return (
           <CompleteStep connectionPoint={wizardState.connectionPoint} onFinish={handleFinish} />

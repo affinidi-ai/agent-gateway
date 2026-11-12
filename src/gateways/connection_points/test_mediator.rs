@@ -2,7 +2,8 @@
 //! mediator DID with an installed outcome gets that OOB invitation result, and
 //! its listener connects without a live mediator socket. An installed mediator
 //! can first refuse the DID a set number of times, which the first-call retry
-//! has to ride out.
+//! has to ride out. An installed mediator admits every DID except those marked
+//! refused, which the mediator access check of a paused pairing reads.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -102,4 +103,27 @@ pub(super) async fn oob_invitation(
 
 pub(super) fn connects_offline(mediator_did: &str) -> bool {
     outcomes().contains_key(mediator_did)
+}
+
+fn refused_dids() -> &'static dashmap::DashSet<String> {
+    static REFUSED: std::sync::OnceLock<dashmap::DashSet<String>> = std::sync::OnceLock::new();
+    REFUSED.get_or_init(dashmap::DashSet::new)
+}
+
+pub(crate) fn refuse(did: &str) {
+    refused_dids().insert(did.to_string());
+}
+
+pub(crate) fn admit(did: &str) {
+    refused_dids().remove(did);
+}
+
+/// Whether an installed mediator admits `did`; `None` for any other mediator.
+pub(crate) fn admits(
+    mediator_did: &str,
+    did: &str,
+) -> Option<bool> {
+    outcomes()
+        .contains_key(mediator_did)
+        .then(|| !refused_dids().contains(did))
 }

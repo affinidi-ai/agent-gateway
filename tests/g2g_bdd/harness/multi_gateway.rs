@@ -158,6 +158,11 @@ pub struct MultiGatewayHarness {
     /// empty when there is a single shared mediator). Held here purely for
     /// their `Drop` cleanup — see [`bridge_mediator_pairs`].
     _mediator_cross_bridges: Vec<MediatorCrossBridge>,
+    /// Pair through the pause for mediator access: each side mints its DIDs,
+    /// stops, and continues once they are admitted.
+    pub pause_for_mediator_access: bool,
+    /// gw_index -> the roles of the DIDs its pause waited for, in order.
+    pub mediator_access_pauses: HashMap<usize, Vec<String>>,
 }
 
 impl MultiGatewayHarness {
@@ -251,6 +256,8 @@ impl MultiGatewayHarness {
             remote_views: HashMap::new(),
             mediators,
             _mediator_cross_bridges: mediator_cross_bridges,
+            pause_for_mediator_access: false,
+            mediator_access_pauses: HashMap::new(),
         })
     }
 
@@ -452,33 +459,93 @@ impl MultiGatewayHarness {
             .await
             .with_context(|| format!("locate gateway {inviter_index} self gateway"))?;
 
-        let connection_point = inviter
-            .admin
-            .create_connection_point(
-                &inviter_self.id,
-                &inviter.mediator_id,
-                &format!("g2g-bdd-cp-gw{inviter_index}-to-gw{acceptor_index}"),
-                &format!("gateway {inviter_index} inviter connection point for gateway {acceptor_index}"),
-                FEDERATION_SECRET,
-                did_method,
-            )
-            .await
-            .with_context(|| format!("gateway {inviter_index} create connection point"))?;
+        let mut pauses: Vec<(usize, Vec<String>)> = Vec::new();
+        let connection_point = if self.pause_for_mediator_access {
+            let (paused, access) = inviter
+                .admin
+                .create_connection_point_awaiting_mediator_access(
+                    &inviter_self.id,
+                    &inviter.mediator_id,
+                    &format!("g2g-bdd-cp-gw{inviter_index}-to-gw{acceptor_index}"),
+                    FEDERATION_SECRET,
+                    did_method,
+                )
+                .await
+                .with_context(|| format!("gateway {inviter_index} create a paused connection point"))?;
+            if !paused.awaiting_mediator_access || !paused.oob_url.is_empty() {
+                bail!("gateway {inviter_index} opened an invitation before the mediator admitted its DIDs");
+            }
+            pauses.push((
+                inviter_index,
+                access
+                    .dids
+                    .iter()
+                    .map(|did| did.role.clone())
+                    .collect(),
+            ));
+            inviter
+                .admin
+                .continue_connection_point(&paused.id)
+                .await
+                .with_context(|| format!("gateway {inviter_index} continue its connection point"))?
+        } else {
+            inviter
+                .admin
+                .create_connection_point(
+                    &inviter_self.id,
+                    &inviter.mediator_id,
+                    &format!("g2g-bdd-cp-gw{inviter_index}-to-gw{acceptor_index}"),
+                    &format!("gateway {inviter_index} inviter connection point for gateway {acceptor_index}"),
+                    FEDERATION_SECRET,
+                    did_method,
+                )
+                .await
+                .with_context(|| format!("gateway {inviter_index} create connection point"))?
+        };
 
         let inviter_view_name = format!("gateway {acceptor_index} from gateway {inviter_index}");
 
-        let acceptor_view = acceptor
-            .admin
-            .connect_via_oob(
-                &connection_point.oob_url,
-                FEDERATION_SECRET,
-                &format!("gateway {inviter_index} from gateway {acceptor_index}"),
-                &format!("gateway {acceptor_index}'s view of gateway {inviter_index}"),
-                did_method,
-                acceptor_mediator_id.as_deref(),
-            )
-            .await
-            .with_context(|| format!("gateway {acceptor_index} connect via OOB to gateway {inviter_index}"))?;
+        let acceptor_view = if self.pause_for_mediator_access {
+            let (paused, access) = acceptor
+                .admin
+                .connect_via_oob_awaiting_mediator_access(
+                    &connection_point.oob_url,
+                    FEDERATION_SECRET,
+                    &format!("gateway {inviter_index} from gateway {acceptor_index}"),
+                    did_method,
+                )
+                .await
+                .with_context(|| format!("gateway {acceptor_index} accept the invitation up to the pause"))?;
+            if paused.status != GatewayStatus::AwaitingMediatorAccess {
+                bail!("gateway {acceptor_index} did not pause its acceptance: {:?}", paused.status);
+            }
+            pauses.push((
+                acceptor_index,
+                access
+                    .dids
+                    .iter()
+                    .map(|did| did.role.clone())
+                    .collect(),
+            ));
+            acceptor
+                .admin
+                .continue_gateway(&paused.id)
+                .await
+                .with_context(|| format!("gateway {acceptor_index} continue its acceptance"))?
+        } else {
+            acceptor
+                .admin
+                .connect_via_oob(
+                    &connection_point.oob_url,
+                    FEDERATION_SECRET,
+                    &format!("gateway {inviter_index} from gateway {acceptor_index}"),
+                    &format!("gateway {acceptor_index}'s view of gateway {inviter_index}"),
+                    did_method,
+                    acceptor_mediator_id.as_deref(),
+                )
+                .await
+                .with_context(|| format!("gateway {acceptor_index} connect via OOB to gateway {inviter_index}"))?
+        };
 
         let inviter_view = inviter
             .admin
@@ -530,6 +597,8 @@ impl MultiGatewayHarness {
             .await
             .with_context(|| format!("gateway {inviter_index} sees gateway {acceptor_index} Active"))?;
 
+        self.mediator_access_pauses
+            .extend(pauses);
         self.remote_views
             .insert((acceptor_index, inviter_index), acceptor_view_active);
         self.remote_views

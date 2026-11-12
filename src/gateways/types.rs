@@ -22,6 +22,10 @@ pub enum GatewayStatus {
     Pending,
     #[serde(rename = "awaiting-approval")]
     AwaitingApproval,
+    /// Paused before the pairing's first mediator call until the mediator admits
+    /// this gateway's handshake and permanent DIDs.
+    #[serde(rename = "awaiting-mediator-access")]
+    AwaitingMediatorAccess,
     Disabled,
     Failed,
 }
@@ -223,6 +227,17 @@ impl Gateway {
         self.status == GatewayStatus::Pending && self.created_at < started_at
     }
 
+    /// A gateway paused for mediator access whose temporary connection point has
+    /// expired, or is gone, can no longer continue.
+    pub fn pause_has_lapsed(
+        &self,
+        temporary_point_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.status == GatewayStatus::AwaitingMediatorAccess
+            && temporary_point_expires_at.is_none_or(|expires_at| expires_at <= now)
+    }
+
     pub fn new(
         name: String,
         description: String,
@@ -350,10 +365,35 @@ mod tests {
             !gateway_with(GatewayStatus::Pending, later).is_left_pending_by_an_earlier_run(started_at),
             "a pairing in flight in this run is not left over"
         );
-        for status in [GatewayStatus::Active, GatewayStatus::AwaitingApproval, GatewayStatus::Failed] {
+        for status in [
+            GatewayStatus::Active,
+            GatewayStatus::AwaitingApproval,
+            GatewayStatus::AwaitingMediatorAccess,
+            GatewayStatus::Failed,
+        ] {
             let gateway = gateway_with(status, earlier);
             assert!(!gateway.is_left_pending_by_an_earlier_run(started_at), "{:?}", gateway.status);
         }
+    }
+
+    #[test]
+    fn awaiting_mediator_access_serialises_with_hyphens() {
+        assert_eq!(serde_json::to_value(GatewayStatus::AwaitingMediatorAccess).unwrap(), "awaiting-mediator-access");
+        assert_eq!(
+            serde_json::from_value::<GatewayStatus>(serde_json::json!("awaiting-mediator-access")).unwrap(),
+            GatewayStatus::AwaitingMediatorAccess
+        );
+    }
+
+    #[test]
+    fn only_a_pause_whose_invitation_expired_has_lapsed() {
+        let now = chrono::Utc::now();
+        let paused = gateway_with(GatewayStatus::AwaitingMediatorAccess, now - chrono::Duration::days(3));
+
+        assert!(!paused.pause_has_lapsed(Some(now + chrono::Duration::days(1)), now), "a pause lasts for days");
+        assert!(paused.pause_has_lapsed(Some(now - chrono::Duration::seconds(1)), now));
+        assert!(paused.pause_has_lapsed(None, now), "a pause without its temporary connection point cannot continue");
+        assert!(!gateway_with(GatewayStatus::Pending, now).pause_has_lapsed(None, now));
     }
 
     fn pre_issuer_did_record_json() -> serde_json::Value {

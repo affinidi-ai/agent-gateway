@@ -85,6 +85,8 @@ pub struct TopologyBuilder {
     pub fabric_delegated_credentials: Vec<(usize, String)>,
     /// Transit Points given a target-leg Trust Check once the fabric routes are ready.
     pub transit_point_trust_checks: Vec<String>,
+    /// Gateways pair through the pause for mediator access.
+    pub pause_for_mediator_access: bool,
 }
 
 impl TopologyBuilder {
@@ -426,6 +428,9 @@ impl G2gWorld {
         let federation_pairs = self
             .topology
             .federation_pairs(count);
+        harness.pause_for_mediator_access = self
+            .topology
+            .pause_for_mediator_access;
         harness
             .federate_pairs(&federation_pairs)
             .await

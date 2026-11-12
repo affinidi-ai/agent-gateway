@@ -114,6 +114,25 @@ pub struct GatewayConnectionPoint {
     /// after the mediator record is removed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mediator_did: Option<String>,
+    /// Set while the connection point waits for its mediator to admit its DIDs.
+    /// Such a point has no listener and, on the inviter side, no invitation yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_mediator_access: bool,
+    /// The permanent connection point minted ahead of the pairing, so its DID can
+    /// be admitted on the mediator before the pairing needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_permanent: Option<ReservedPermanent>,
+}
+
+/// A permanent connection point whose keys are on disk but whose record is stored
+/// only when the pairing completes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReservedPermanent {
+    pub cp_id: String,
+    pub did: String,
+    /// The mediator the permanent connection point is homed on.
+    pub mediator_id: String,
+    pub mediator_did: String,
 }
 
 fn default_enabled() -> bool {
@@ -170,6 +189,8 @@ impl GatewayConnectionPoint {
             did_method: ConnectionPointDidMethod::default(),
             runtime_status: None,
             mediator_did: None,
+            awaiting_mediator_access: false,
+            reserved_permanent: None,
         }
     }
 

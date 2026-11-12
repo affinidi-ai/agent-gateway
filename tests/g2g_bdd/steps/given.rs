@@ -136,6 +136,17 @@ pub async fn a_fabric_with_n_gateways(
         .max(count);
 }
 
+#[given(regex = r"^a fabric with (\d+) gateways that pause for mediator access when they pair$")]
+pub async fn a_fabric_pairing_through_mediator_access(
+    world: &mut G2gWorld,
+    count: usize,
+) {
+    a_fabric_with_n_gateways(world, count).await;
+    world
+        .topology
+        .pause_for_mediator_access = true;
+}
+
 /// The receiving gateway admits Fabric streams as one whose surfaces serve
 /// only that MCP revision does; no product setting does this.
 #[given(expr = "gateway {int} admits only MCP protocol version \"2024-11-05\" over Fabric")]

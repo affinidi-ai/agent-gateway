@@ -806,10 +806,93 @@ impl GatewayAdminClient {
                     expiry_seconds: Some(3600),
                     secret: secret.to_string(),
                     did_method: Some(did_method.to_string()),
+                    await_mediator_access: false,
                 }),
             )
             .await?;
         Ok(response.connection_point)
+    }
+
+    /// Creates a Connection Point that stops after minting its DIDs, before
+    /// its first mediator call, and returns it with the DIDs it waits for.
+    pub async fn create_connection_point_awaiting_mediator_access(
+        &self,
+        gateway_id: &str,
+        mediator_id: &str,
+        name: &str,
+        secret: &str,
+        did_method: &str,
+    ) -> Result<(ConnectionPointRecord, MediatorAccessRecord)> {
+        let response: CreateConnectionPointResponse = self
+            .send_json(
+                Method::POST,
+                "/v1/connection-points",
+                Some(&CreateConnectionPointRequest {
+                    gateway_id: gateway_id.to_string(),
+                    mediator_id: mediator_id.to_string(),
+                    name: name.to_string(),
+                    description: String::new(),
+                    expiry_seconds: Some(3600),
+                    secret: secret.to_string(),
+                    did_method: Some(did_method.to_string()),
+                    await_mediator_access: true,
+                }),
+            )
+            .await?;
+        let access = response
+            .mediator_access
+            .context("a paused connection point names the DIDs it waits for")?;
+        Ok((response.connection_point, access))
+    }
+
+    pub async fn continue_connection_point(
+        &self,
+        id: &str,
+    ) -> Result<ConnectionPointRecord> {
+        let response: CreateConnectionPointResponse = self
+            .send_json(Method::POST, &format!("/v1/connection-points/{id}/continue"), Some(&serde_json::json!({})))
+            .await?;
+        Ok(response.connection_point)
+    }
+
+    /// Accepts an invitation up to the pause: the acceptance mints its DIDs and
+    /// stops before its first mediator call.
+    pub async fn connect_via_oob_awaiting_mediator_access(
+        &self,
+        oob_url: &str,
+        secret: &str,
+        name: &str,
+        did_method: &str,
+    ) -> Result<(GatewayRecord, MediatorAccessRecord)> {
+        let response: ConnectViaOobResponse = self
+            .send_json(
+                Method::POST,
+                "/v1/gateways/connect-via-oob",
+                Some(&ConnectViaOobRequest {
+                    oob_url: oob_url.to_string(),
+                    secret: secret.to_string(),
+                    name: name.to_string(),
+                    description: String::new(),
+                    did_method: Some(did_method.to_string()),
+                    acceptor_mediator_id: None,
+                    await_mediator_access: true,
+                }),
+            )
+            .await?;
+        let access = response
+            .mediator_access
+            .context("a paused acceptance names the DIDs it waits for")?;
+        Ok((response.gateway, access))
+    }
+
+    pub async fn continue_gateway(
+        &self,
+        id: &str,
+    ) -> Result<GatewayRecord> {
+        let response: ConnectViaOobResponse = self
+            .send_json(Method::POST, &format!("/v1/gateways/{id}/continue"), Some(&serde_json::json!({})))
+            .await?;
+        Ok(response.gateway)
     }
 
     pub async fn connect_via_oob(
@@ -832,6 +915,7 @@ impl GatewayAdminClient {
                     description: description.to_string(),
                     did_method: Some(did_method.to_string()),
                     acceptor_mediator_id: acceptor_mediator_id.map(str::to_string),
+                    await_mediator_access: false,
                 }),
             )
             .await?;
@@ -864,6 +948,7 @@ impl GatewayAdminClient {
                     description: description.to_string(),
                     did_method: Some(did_method.to_string()),
                     acceptor_mediator_id: acceptor_mediator_id.map(str::to_string),
+                    await_mediator_access: false,
                 }),
             )
             .await?;
@@ -1340,6 +1425,8 @@ pub enum GatewayStatus {
     Pending,
     #[serde(rename = "awaiting-approval")]
     AwaitingApproval,
+    #[serde(rename = "awaiting-mediator-access")]
+    AwaitingMediatorAccess,
     Disabled,
     Failed,
 }
@@ -1405,7 +1492,23 @@ pub struct MediatorRecord {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnectionPointRecord {
+    #[serde(default)]
+    pub id: String,
     pub oob_url: String,
+    #[serde(default)]
+    pub awaiting_mediator_access: bool,
+}
+
+/// The DIDs a paused pairing waits for the mediator to admit.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediatorAccessRecord {
+    pub dids: Vec<AwaitedDidRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AwaitedDidRecord {
+    pub role: String,
+    pub did: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1434,6 +1537,8 @@ struct CreateConnectionPointRequest {
     secret: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     did_method: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    await_mediator_access: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1446,6 +1551,8 @@ struct ConnectViaOobRequest {
     did_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     acceptor_mediator_id: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    await_mediator_access: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1475,11 +1582,15 @@ struct GatewayOpaPolicyConfigPayload {
 #[derive(Debug, Deserialize)]
 struct CreateConnectionPointResponse {
     connection_point: ConnectionPointRecord,
+    #[serde(default)]
+    mediator_access: Option<MediatorAccessRecord>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ConnectViaOobResponse {
     gateway: GatewayRecord,
+    #[serde(default)]
+    mediator_access: Option<MediatorAccessRecord>,
 }
 
 // ── Trust Registry types ───────────────────────────────────────────────

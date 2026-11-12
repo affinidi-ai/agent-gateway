@@ -524,6 +524,16 @@ pub async fn gateway_pings_gateway(
         .insert((from_gw, to_gw), success);
 }
 
+#[when(regex = r"^gateway (\d+) and gateway (\d+) ping each other$")]
+pub async fn gateways_ping_each_other(
+    world: &mut G2gWorld,
+    first: usize,
+    second: usize,
+) {
+    gateway_pings_gateway(world, first, second).await;
+    gateway_pings_gateway(world, second, first).await;
+}
+
 async fn accept_pending_oob(
     world: &mut G2gWorld,
     gateway: usize,

@@ -1615,6 +1615,45 @@ to it over `fabric://`) shows the gateway's message.
 | Detail surfaces, used by, health         | `payment-gateway-surfaces-refresh-button`, `-surfaces-error`, `-surfaces-empty`, `-surface-<id>`, `payment-gateway-surface-manifest-<id>-*`, `-used-by-<id>`, `-used-by-link-<id>`, `-used-by-empty`, `-used-by-error`, `-ping-button`, `-ping-result` |
 | Use as payment gateway                   | `gateways-use-as-payment-button-<id>` (Gateways tab), `gateway-use-as-payment-button` (edit page)                                                             |
 
+### Mediator access step
+
+A mediator in `explicit_allow` mode refuses DIDs its administrator has not added, so both peer
+pairing wizards stop after the gateway mints its DIDs, on one shared step
+(`components/shared/MediatorAccessStep.tsx`, helpers in `utils/mediatorAccess.ts`). The step
+always shows: the gateway cannot tell the mediator's mode, so the user decides.
+
+| Wizard | Steps | DIDs shown |
+| --- | --- | --- |
+| Create Connection Point (`/gateways/publish`) | select-mediator, enter-details, **mediator-access**, complete | Connection Point DID, Permanent DID for the paired gateway |
+| Add Gateway (`/gateways/connect`) | enter-details, enter-link, **mediator-access**, connect, complete | Temporary DID for the handshake, Permanent DID for this pairing |
+
+- Leaving enter-details (Create Connection Point) or enter-link (Add Gateway) posts with
+  `await_mediator_access: true`; the response's `mediator_access` fills the step.
+- The card header is "Allow these DIDs on the mediator" (`fa-user-shield`). One row per DID:
+  its label, `topAndTail(did, 16, 16)` and a `CopyButton`; **Copy all DIDs** copies them one
+  per line. Add Gateway also shows, in a warning `InfoBanner`, that the mediator is the
+  inviting gateway's and when the invitation expires.
+- **Continue later** returns to Connections and changes nothing. **Continue** calls
+  `POST /connection-points/{id}/continue` (then the existing complete step with the link and
+  secret) or moves to the connect step, which calls `POST /gateways/{id}/continue`.
+- A `409 mediator_access_refused` keeps the step and shows "Mediator {name} still refuses the
+  {label} ({short DID}). Ask its administrator to add it, then continue."
+- `?resume=<id>` opens either wizard at the step with the same DIDs, from
+  `GET /connection-points/{id}/mediator-access` or `GET /gateways/{id}/mediator-access`.
+- On Connections, a gateway with status `awaiting-mediator-access` and a Connection Point with
+  `awaiting_mediator_access` show the warning badge "Waiting for mediator access" and a
+  **Continue** button that opens its wizard with `?resume=`. Such a Connection Point has no
+  copy-link or copy-secret button until it has an invitation; such a gateway is treated as
+  pending (`isGatewayPending`): no ping, edit or row link.
+- The payment gateway wizard does not pause.
+
+| Element | Test id |
+| --- | --- |
+| Step and DIDs | `wizard-step-mediator-access`, `mediator-access-did-<role>` (`connection_point`, `temporary`, `permanent`), `mediator-access-copy-button-<role>`, `mediator-access-expiry` |
+| Actions | `mediator-access-copy-all`, `mediator-access-later-button`, `mediator-access-continue-button` |
+| Errors | `mediator-access-refused`, `mediator-access-error` |
+| Connections | `gateways-continue-button-<id>`, `connection-points-continue-button-<id>`, `connection-points-status-<id>`, `gateway-status-<id>` |
+
 ## Remote gateway Issuer DIDs
 
 The **Remote** tab of a remote gateway starts with the **Issuer DIDs** card

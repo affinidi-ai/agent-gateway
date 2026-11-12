@@ -825,6 +825,24 @@ pub async fn ping_succeeds(
     assert!(success, "ping from gateway {from_gw} to gateway {to_gw} did not succeed");
 }
 
+#[then(regex = r#"^gateway (\d+) waited for the mediator to admit its DIDs "([^"]+)"$"#)]
+pub async fn gateway_waited_for_mediator_access(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    roles: String,
+) {
+    let expected: Vec<String> = roles
+        .split(',')
+        .map(|role| role.trim().to_string())
+        .collect();
+    let waited = world
+        .harness()
+        .mediator_access_pauses
+        .get(&gw_index)
+        .unwrap_or_else(|| panic!("gateway {gw_index} did not pause for mediator access"));
+    assert_eq!(waited, &expected, "the DIDs gateway {gw_index} waited for");
+}
+
 /// How long a Remote record may take to gain an issuer DID after a restart:
 /// the exchange runs in the background once the pairing listener registers.
 const ISSUER_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);

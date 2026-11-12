@@ -288,6 +288,38 @@ manage its own access list (the Affinidi Portal registers DIDs with `71000`, whi
 list right). Without them the update is refused with `not_self_manageable`, logged as a warning,
 and a peer's messages are refused with `e.p.delivery.refused`.
 
+## Pausing for mediator access
+
+A mediator in `explicit_allow` mode refuses every DID its administrator has not added, and the
+gateway cannot tell from any record whether a mediator works that way. So creating a Connection
+Point and adding a gateway can each stop after minting their DIDs and before their first mediator
+call, show the DIDs, and continue when the operator says they are allowed. The dashboard always
+asks for the pause; the API pauses only when the request sets `await_mediator_access: true`, and
+otherwise behaves as without it ([`mediator_access.rs`](../src/gateways/mediator_access.rs)).
+
+| Step | Mints | Continued by |
+| --- | --- | --- |
+| `POST /v1/connection-points` | The Connection Point DID and the permanent DID it reserves for the paired gateway (`reserved_permanent`) | `POST /v1/connection-points/{id}/continue`: opens the inbox, creates the invitation, starts the listener |
+| `POST /v1/gateways/connect-via-oob` | The temporary DID for the handshake and the permanent DID for the pairing | `POST /v1/gateways/{id}/continue`: sends the connection-setup and leaves the gateway `pending` |
+
+A paused Connection Point is stored with `awaiting_mediator_access: true`, no invitation and no
+listener. A paused acceptance is a gateway with status `awaiting-mediator-access` and a temporary
+Connection Point that keeps the invitation, its secret and the reserved permanent DID. Both keep
+their keys and state on disk, survive a restart, and last until the invitation expires: the
+Connection Point's own expiry, and for an acceptance the invitation's `expires_time`, else seven
+days. The same expiry bounds an acceptance's wait for approval, with or without the pause. A
+restart removes a paused gateway whose invitation has expired. `GET …/{id}/mediator-access`
+returns the DIDs of a pause again: their role (`connection_point`, `temporary`, `permanent`), the
+mediator that must admit each, and the expiry.
+
+Continue authenticates every DID and reads its own mediator account first. While the mediator
+refuses one (`403`, or an ACL denial) it answers `409` with `code: mediator_access_refused` and the
+refused DID's `role` and `did`, and the pause stays. Continuing twice is serialised, and a pairing
+that already went on is returned as it is. The inviter's connection-setup and approval use the
+reserved permanent DID and mint none, so once both gateways continued, every DID of the pairing is
+already admitted when approval completes it. A Connection Point created without the pause reserves
+nothing and mints its permanent DID at approval as before.
+
 ## Runtime health behavior
 
 After a Gateway Ping timeout, the Gateway checks its mediator account. It reauthenticates and
