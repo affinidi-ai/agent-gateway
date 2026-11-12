@@ -3300,6 +3300,7 @@ mod tests {
     #[test]
     fn caller_context_preserves_raw_jwt_identity_evidence() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: serde_json::json!({
@@ -3332,6 +3333,7 @@ mod tests {
     #[test]
     fn caller_context_keeps_the_tokens_sub_beside_another_principal_claim() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub", "oid": "person-1" }),
@@ -3341,6 +3343,7 @@ mod tests {
         assert_eq!(caller.sub.as_deref(), Some("pairwise-sub"));
         assert_eq!(caller.principal.as_deref(), Some("person-1"));
         let without_sub = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "person-1".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "oid": "person-1" }),
@@ -3348,6 +3351,7 @@ mod tests {
         };
         assert_eq!(build_caller_context(&without_sub).sub, None);
         let without_oid = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "oid".to_string(),
             subject: "<none>".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "pairwise-sub" }),
@@ -3364,6 +3368,7 @@ mod tests {
     #[test]
     fn a_fabric_receive_caller_names_the_peer_and_a_direct_caller_none() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "alice".to_string(),
             claims: serde_json::json!({ "iss": "https://issuer.example", "sub": "alice" }),
             principal_claim: "sub".to_string(),
@@ -4189,6 +4194,7 @@ mod tests {
     #[tokio::test]
     async fn audit_policy_decision_records_the_authenticated_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com", "name": "Ada Lovelace"}),
@@ -4443,6 +4449,7 @@ mod tests {
     #[test]
     fn a_vp_injection_record_has_the_full_field_set() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-1".to_string(),
             claims: serde_json::json!({}),
@@ -4475,6 +4482,7 @@ mod tests {
     #[tokio::test]
     async fn a_vp_injection_without_a_caller_takes_the_requests_caller() {
         let identity = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-2".to_string(),
             claims: serde_json::json!({}),

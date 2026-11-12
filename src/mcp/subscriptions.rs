@@ -1873,6 +1873,7 @@ mod tests {
     #[test]
     fn subscription_expiry_uses_only_verified_identity_claims() {
         let claims = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "caller".into(),
             claims: json!({"exp": 1}),

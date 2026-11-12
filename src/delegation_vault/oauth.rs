@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{ConsentRequired, OAuthState, OAuthTokenResponse};
+use super::{ConsentRequired, ConsentStage, OAuthState, OAuthTokenResponse};
 use crate::config::credential_policy::{RuleMode, credential_policy};
 use crate::credential_providers::{CredentialProvider, GrantClientAuthentication};
 use crate::identity::ssi::vc_issuer::VcSigner;
@@ -41,8 +41,9 @@ pub fn binding_cookie_name(state: &OAuthState) -> Option<String> {
 }
 
 /// The gateway's consent start page for `provider`: `{redirect URI}/start`
-/// with a sealed start state. The person opens it and confirms; only then does
-/// the gateway build the vendor's authorization URL.
+/// with a sealed start state, of `stage` when it has one. The person opens it
+/// and confirms; only then does the gateway build the vendor's authorization
+/// URL.
 pub fn build_authorization_url(
     provider: &CredentialProvider,
     agent_did: &str,
@@ -50,6 +51,7 @@ pub fn build_authorization_url(
     surface_id: &str,
     scopes: &[String],
     gateway_base_url: &str,
+    stage: Option<ConsentStage>,
 ) -> Result<String> {
     let mut url = provider
         .consent_redirect_uri(gateway_base_url)
@@ -70,6 +72,7 @@ pub fn build_authorization_url(
         code_verifier: None,
         scopes: effective_scopes.to_vec(),
         browser_binding: None,
+        stage,
     };
     let start_path = format!("{}/start", url.path());
     url.set_path(&start_path);
@@ -91,13 +94,19 @@ pub fn build_authorization_url(
 /// The consent start page for `provider` ([`build_authorization_url`]), minted
 /// only when the start POST could complete: the redirect URI follows the
 /// consent rules and no other provider has it, the client ID resolves, and the
-/// vendor's authorization URL can be built.
+/// vendor's authorization URL can be built. Its start state confirms `caller`
+/// at their identity provider when the provider's `consent_confirmation` can
+/// ([`consent_confirmation::decide`](super::consent_confirmation::decide)),
+/// and no link is minted for a caller it cannot confirm while the setting
+/// confirms no caller of the provider or sets `require`.
 #[allow(clippy::too_many_arguments)]
 pub async fn mint_consent_link(
     provider: &CredentialProvider,
     agent_did: &str,
     user_identity_hash: &str,
     surface_id: &str,
+    surface_tenant_id: Option<&str>,
+    caller: super::consent_confirmation::ConsentCaller<'_>,
     scopes: &[String],
     gateway_base_url: &str,
     secrets_store: &Arc<dyn SecretsStore>,
@@ -122,13 +131,30 @@ pub async fn mint_consent_link(
     provider
         .consent_authorization_endpoint()
         .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
-    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url)
+    let decision = super::consent_confirmation::decide(provider, caller, surface_tenant_id, user_identity_hash)
+        .await
+        .context("Failed to read the consent confirmation strategy")?;
+    super::consent_confirmation::note(provider, surface_id, &decision, caller);
+    let stage = match decision {
+        super::consent_confirmation::ConfirmDecision::Confirm(binding) => Some(ConsentStage::ConfirmStart(binding)),
+        super::consent_confirmation::ConfirmDecision::Unconfirmed(reason)
+            if super::consent_confirmation::refuses(provider, reason) =>
+        {
+            return Err(anyhow!(
+                "Provider '{}': consent confirmation refuses this caller ({reason:?})",
+                provider.provider_id
+            ));
+        }
+        _ => None,
+    };
+    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url, stage)
 }
 
-/// What the consent start POST answers with: the vendor's authorization URL,
-/// the binding cookie's value and when the callback state expires.
+/// What the consent start POST answers with: the vendor's or, for a caller
+/// confirmed first, the identity provider's authorization URL, the binding
+/// cookie's value and when the state it carries expires.
 pub struct ConsentStart {
-    pub vendor_url: url::Url,
+    pub authorization_url: url::Url,
     pub cookie_name: String,
     pub cookie_value: zeroize::Zeroizing<String>,
     pub expires_at: chrono::DateTime<Utc>,
@@ -145,6 +171,46 @@ pub async fn begin_consent(
     redirect_uri: &url::Url,
     secrets_store: &Arc<dyn SecretsStore>,
 ) -> Result<ConsentStart> {
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let (vendor_url, callback) =
+        vendor_leg(provider, start, browser_binding, start.stage.clone(), redirect_uri, secrets_store).await?;
+    consent_started(vendor_url, &callback, cookie_value)
+}
+
+/// The vendor's authorization URL for a caller the
+/// [`ConsentStage::Confirmation`] state `confirmation` has confirmed: a
+/// [`ConsentStage::Vendor`] state sealed with `binding` on the confirmation's
+/// own browser binding, so the browser keeps its cookie, with a fresh nonce
+/// and PKCE verifier. The URL is the one [`begin_consent`] builds, but for its
+/// state and PKCE challenge.
+pub(super) async fn continue_to_vendor(
+    provider: &CredentialProvider,
+    confirmation: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<url::Url> {
+    let browser_binding = confirmation
+        .browser_binding
+        .clone()
+        .ok_or_else(|| anyhow!("OAuth state has no browser binding"))?;
+    let stage = Some(ConsentStage::Vendor(binding.clone()));
+    vendor_leg(provider, confirmation, browser_binding, stage, redirect_uri, secrets_store)
+        .await
+        .map(|(vendor_url, _)| vendor_url)
+}
+
+/// The vendor callback state that follows `from`, sealed with `stage` and
+/// `browser_binding`, a fresh nonce and PKCE verifier, and the vendor's
+/// authorization URL that carries it.
+async fn vendor_leg(
+    provider: &CredentialProvider,
+    from: &OAuthState,
+    browser_binding: String,
+    stage: Option<ConsentStage>,
+    redirect_uri: &url::Url,
+    secrets_store: &Arc<dyn SecretsStore>,
+) -> Result<(url::Url, OAuthState)> {
     let client_id_ref = provider
         .client_id_secret_ref
         .as_deref()
@@ -154,31 +220,99 @@ pub async fn begin_consent(
         .context("Failed to resolve client_id secret")?;
     let code_verifier = generate_pkce_verifier();
     let code_challenge = generate_pkce_challenge(&code_verifier);
-    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
-    rand::rng().fill(&mut binding[..]);
-    let expires_at = start
-        .expires_at
-        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES));
     let callback = OAuthState {
         nonce: Uuid::new_v4().to_string(),
-        expires_at,
+        expires_at: next_state_expiry(from),
         code_verifier: Some(code_verifier),
-        browser_binding: Some(base64_url_encode_bytes(&Sha256::digest(binding.as_slice()))),
-        ..start.clone()
+        browser_binding: Some(browser_binding),
+        stage,
+        ..from.clone()
     };
     let vendor_url = vendor_authorization_url(
         provider,
         &client_id,
         redirect_uri.as_str(),
-        &start.scopes,
+        &from.scopes,
         &encode_oauth_state(&callback)?,
         &code_challenge,
     )?;
+    Ok((vendor_url, callback))
+}
+
+/// Begin confirming the caller of a confirm start state sealed with `binding`
+/// at their identity provider, as [`begin_consent`] begins the vendor's
+/// consent: a PKCE verifier and 32 random binding bytes, sealed with the start
+/// state's consent in a [`ConsentStage::Confirmation`] state with a random ID
+/// token nonce and the time the sign-in began, and the authorization URL of
+/// `sign_in` with `response_mode=query`, since the binding cookie is
+/// `SameSite=Lax`.
+pub(super) fn begin_confirmation(
+    start: &OAuthState,
+    binding: &super::ConsentConfirmBinding,
+    sign_in: &super::consent_confirmation::SignIn,
+) -> Result<ConsentStart> {
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+    let (cookie_value, browser_binding) = new_browser_binding();
+    let id_token_nonce = Uuid::new_v4().to_string();
+    let confirmation = OAuthState {
+        nonce: Uuid::new_v4().to_string(),
+        expires_at: next_state_expiry(start),
+        code_verifier: Some(code_verifier),
+        browser_binding: Some(browser_binding),
+        stage: Some(ConsentStage::Confirmation(super::ConfirmationSignIn {
+            binding: binding.clone(),
+            nonce: id_token_nonce.clone(),
+            issued_at: Utc::now(),
+        })),
+        ..start.clone()
+    };
+    let mut url = sign_in
+        .authorization_endpoint
+        .clone();
+    url.query_pairs_mut()
+        .extend_pairs([
+            ("response_type", "code"),
+            ("client_id", sign_in.client_id.as_str()),
+            ("redirect_uri", sign_in.redirect_uri.as_str()),
+            ("scope", sign_in.scope),
+            ("state", encode_oauth_state(&confirmation)?.as_str()),
+            ("nonce", id_token_nonce.as_str()),
+            ("code_challenge", code_challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "query"),
+        ]);
+    consent_started(url, &confirmation, cookie_value)
+}
+
+/// When the state that follows `from` expires: with `from`, and at most
+/// [`CONSENT_STATE_LIFETIME_MINUTES`] from now.
+fn next_state_expiry(from: &OAuthState) -> chrono::DateTime<Utc> {
+    from.expires_at
+        .min(Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES))
+}
+
+/// 32 random browser binding bytes, as the cookie value that carries them and
+/// the SHA-256 a state seals.
+fn new_browser_binding() -> (zeroize::Zeroizing<String>, String) {
+    let mut binding = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rng().fill(&mut binding[..]);
+    (
+        zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
+        base64_url_encode_bytes(&Sha256::digest(binding.as_slice())),
+    )
+}
+
+fn consent_started(
+    authorization_url: url::Url,
+    state: &OAuthState,
+    cookie_value: zeroize::Zeroizing<String>,
+) -> Result<ConsentStart> {
     Ok(ConsentStart {
-        vendor_url,
-        cookie_name: binding_cookie_name(&callback).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
-        cookie_value: zeroize::Zeroizing::new(base64_url_encode_bytes(binding.as_slice())),
-        expires_at,
+        authorization_url,
+        cookie_name: binding_cookie_name(state).ok_or_else(|| anyhow!("OAuth state has no browser binding"))?,
+        cookie_value,
+        expires_at: state.expires_at,
     })
 }
 
@@ -210,32 +344,89 @@ fn vendor_authorization_url(
     Ok(url)
 }
 
-/// Decode a consent start state: one with neither a browser binding nor a PKCE
-/// verifier, which only [`build_authorization_url`] seals.
+/// Decode a consent start state: a start state without a stage, as
+/// [`build_authorization_url`] seals it, or a [`ConsentStage::ConfirmStart`] one.
 pub fn decode_start_state(encoded: &str) -> Result<OAuthState> {
-    let state = decode_oauth_state(encoded)?;
-    if state
-        .browser_binding
-        .is_some()
-        || state.code_verifier.is_some()
-    {
-        return Err(anyhow!("OAuth state is not a consent start state"));
-    }
-    Ok(state)
+    decode_consent_state(encoded, "start", &[StageKind::Start, StageKind::ConfirmStart])
 }
 
-/// Decode a consent callback state: one with a browser binding and a PKCE
-/// verifier, which only [`begin_consent`] seals.
+/// Decode the state the identity provider redirects back with: a
+/// [`ConsentStage::Confirmation`] state.
+pub fn decode_confirmation_state(encoded: &str) -> Result<OAuthState> {
+    decode_consent_state(encoded, "confirmation", &[StageKind::Confirmation])
+}
+
+/// Decode a consent callback state: a legacy vendor callback state, which only
+/// [`begin_consent`] seals, or a [`ConsentStage::Vendor`] one, which only
+/// [`continue_to_vendor`] seals.
 pub fn decode_callback_state(encoded: &str) -> Result<OAuthState> {
-    let state = decode_oauth_state(encoded)?;
-    if state
-        .browser_binding
-        .is_none()
-        || state.code_verifier.is_none()
-    {
-        return Err(anyhow!("OAuth state is not a consent callback state"));
+    decode_consent_state(encoded, "callback", &[StageKind::Vendor])
+}
+
+fn decode_consent_state(
+    encoded: &str,
+    route: &str,
+    accepted: &[StageKind],
+) -> Result<OAuthState> {
+    let (state, seal) = open_oauth_state(encoded)?;
+    match sealed_stage(&state, seal) {
+        Some(stage) if accepted.contains(&stage) => Ok(state),
+        _ => Err(anyhow!("OAuth state is not a consent {route} state")),
     }
-    Ok(state)
+}
+
+/// A [`ConsentStage`] without the binding it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageKind {
+    Start,
+    ConfirmStart,
+    Confirmation,
+    Vendor,
+}
+
+impl From<&ConsentStage> for StageKind {
+    fn from(stage: &ConsentStage) -> Self {
+        match stage {
+            ConsentStage::ConfirmStart(_) => Self::ConfirmStart,
+            ConsentStage::Confirmation(_) => Self::Confirmation,
+            ConsentStage::Vendor(_) => Self::Vendor,
+        }
+    }
+}
+
+/// The stage `state` is good for when it was sealed under `seal`, or `None`
+/// for a pairing the gateway never seals. A legacy state has no stage of its
+/// own: neither a browser binding nor a PKCE verifier makes it a start state,
+/// both make it a vendor callback state. A staged state's fields follow the
+/// same rule.
+fn sealed_stage(
+    state: &OAuthState,
+    seal: StateSeal,
+) -> Option<StageKind> {
+    let callback_fields = match (
+        state
+            .browser_binding
+            .is_some(),
+        state.code_verifier.is_some(),
+    ) {
+        (false, false) => false,
+        (true, true) => true,
+        _ => return None,
+    };
+    let stage = match (
+        seal,
+        state
+            .stage
+            .as_ref()
+            .map(StageKind::from),
+    ) {
+        (StateSeal::Legacy, None) if callback_fields => StageKind::Vendor,
+        (StateSeal::Legacy, None) => StageKind::Start,
+        (StateSeal::Confirm, Some(stage @ StageKind::ConfirmStart)) if !callback_fields => stage,
+        (StateSeal::Confirm, Some(stage @ (StageKind::Confirmation | StageKind::Vendor))) if callback_fields => stage,
+        _ => return None,
+    };
+    Some(stage)
 }
 
 /// Whether `cookie_value`, the value of `state`'s own binding cookie, is the
@@ -1492,6 +1683,51 @@ const SEALED_STATE_PREFIX: &str = "SEALED.";
 /// Derivation label, and AES-GCM associated data, for the OAuth state key.
 const OAUTH_STATE_KEY_LABEL: &[u8] = b"agent-gateway/oauth-state/v1";
 
+/// Derivation label, and AES-GCM associated data, for the key that seals every
+/// state with a [`ConsentStage`] of its own, so a gateway that predates
+/// consent stages opens none of them.
+const OAUTH_CONFIRM_STATE_KEY_LABEL: &[u8] = b"agent-gateway/oauth-state/confirm/v1";
+
+/// The key and label a state was sealed under: the legacy one, or the at-rest
+/// service, for a state without a stage; the confirm one for a staged state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateSeal {
+    Legacy,
+    Confirm,
+}
+
+impl StateSeal {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::Legacy => OAUTH_STATE_KEY_LABEL,
+            Self::Confirm => OAUTH_CONFIRM_STATE_KEY_LABEL,
+        }
+    }
+
+    fn seal(
+        self,
+        state_json: &str,
+    ) -> Result<String> {
+        let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .encrypt_with_aad(&self.key(), state_json.as_bytes(), self.label())
+            .map_err(|e| anyhow!("Failed to seal OAuth state: {e}"))?;
+        Ok(format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed)))
+    }
+
+    fn open(
+        self,
+        sealed: &[u8],
+    ) -> Option<Vec<u8>> {
+        crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .decrypt_with_aad(&self.key(), sealed, self.label())
+            .ok()
+    }
+
+    fn key(self) -> [u8; 32] {
+        crate::identity::credential_identity::derived_key(self.label())
+    }
+}
+
 /// How long a used state nonce is remembered: longer than a state lives.
 const USED_STATE_NONCE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
@@ -1507,9 +1743,11 @@ static USED_STATE_NONCES: std::sync::LazyLock<moka::future::Cache<String, ()>> =
 /// The state is serialized to JSON, sealed with AES-256-GCM and base64url-encoded
 /// for embedding in the authorization URL, so neither the OAuth provider nor any
 /// intermediary can read it (agent_did, user_identity_hash, surface_id, the PKCE
-/// code_verifier, etc.) or forge one. The at-rest encryption service seals it when
-/// enabled; otherwise a key derived from the identity hash pepper does, which
-/// gateways sharing `AG_IDENTITY_HASH_PEPPER` share.
+/// code_verifier, etc.) or forge one. A state without a stage is sealed by the
+/// at-rest encryption service when enabled, otherwise under the legacy label by a
+/// key derived from the identity hash pepper, which gateways sharing
+/// `AG_IDENTITY_HASH_PEPPER` share. A staged state is always sealed under the
+/// confirm label, and only when its fields fit its stage.
 pub(super) fn encode_oauth_state(state: &OAuthState) -> Result<String> {
     encode_oauth_state_with(state, crate::encryption::global::get_encryption_service())
 }
@@ -1520,53 +1758,54 @@ fn encode_oauth_state_with(
 ) -> Result<String> {
     let state_json = serde_json::to_string(state).context("Failed to serialize OAuth state")?;
 
-    let payload = match encryption {
-        Some(enc) if enc.is_enabled() => enc
+    let payload = match (&state.stage, encryption) {
+        (Some(_), _) if sealed_stage(state, StateSeal::Confirm).is_none() => {
+            return Err(anyhow!("OAuth state's fields do not fit its consent stage"));
+        }
+        (Some(_), _) => StateSeal::Confirm.seal(&state_json)?,
+        (None, Some(enc)) if enc.is_enabled() => enc
             .encrypt_string(state_json)
             .context("Failed to encrypt OAuth state")?,
-        _ => {
-            let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
-                .encrypt_with_aad(&oauth_state_key(), state_json.as_bytes(), OAUTH_STATE_KEY_LABEL)
-                .map_err(|e| anyhow!("Failed to seal OAuth state: {e}"))?;
-            format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed))
-        }
+        (None, _) => StateSeal::Legacy.seal(&state_json)?,
     };
 
     Ok(base64_url_encode(&payload))
 }
 
-fn oauth_state_key() -> [u8; 32] {
-    crate::identity::credential_identity::derived_key(OAUTH_STATE_KEY_LABEL)
-}
-
-/// Decode and validate the OAuth state parameter.
+/// Open the OAuth state parameter and say which seal it was under.
 ///
 /// Reverses `encode_oauth_state`: base64url-decode, open the seal, then parse JSON and
 /// check expiry. A state this gateway did not seal is rejected, so it cannot be forged.
-pub fn decode_oauth_state(encoded: &str) -> Result<OAuthState> {
-    decode_oauth_state_with(encoded, crate::encryption::global::get_encryption_service())
+fn open_oauth_state(encoded: &str) -> Result<(OAuthState, StateSeal)> {
+    open_oauth_state_with(encoded, crate::encryption::global::get_encryption_service())
 }
 
-fn decode_oauth_state_with(
+fn open_oauth_state_with(
     encoded: &str,
     encryption: Option<crate::encryption::EncryptionService>,
-) -> Result<OAuthState> {
+) -> Result<(OAuthState, StateSeal)> {
     let decoded_bytes = base64_url_decode(encoded).context("Failed to base64url decode state")?;
     let decoded_str = String::from_utf8(decoded_bytes).context("OAuth state is not valid UTF-8")?;
 
-    let state_json = if decoded_str.starts_with("ENC[") {
+    let (state_json, seal) = if decoded_str.starts_with("ENC[") {
         match encryption {
-            Some(enc) => enc
-                .decrypt_string(decoded_str)
-                .context("Failed to decrypt OAuth state — key may have rotated")?,
+            Some(enc) => (
+                enc.decrypt_string(decoded_str)
+                    .context("Failed to decrypt OAuth state — key may have rotated")?,
+                StateSeal::Legacy,
+            ),
             None => return Err(anyhow!("OAuth state is encrypted but encryption service is not available")),
         }
     } else if let Some(sealed) = decoded_str.strip_prefix(SEALED_STATE_PREFIX) {
         let sealed = base64_url_decode(sealed).context("Failed to base64url decode sealed OAuth state")?;
-        let opened = crate::encryption::aes_gcm::AesGcmEncryptor::new()
-            .decrypt_with_aad(&oauth_state_key(), &sealed, OAUTH_STATE_KEY_LABEL)
-            .map_err(|_| anyhow!("OAuth state was not issued by this gateway"))?;
-        String::from_utf8(opened).context("OAuth state is not valid UTF-8")?
+        let (opened, seal) = [StateSeal::Legacy, StateSeal::Confirm]
+            .into_iter()
+            .find_map(|seal| {
+                seal.open(&sealed)
+                    .map(|opened| (opened, seal))
+            })
+            .ok_or_else(|| anyhow!("OAuth state was not issued by this gateway"))?;
+        (String::from_utf8(opened).context("OAuth state is not valid UTF-8")?, seal)
     } else {
         return Err(anyhow!("OAuth state is not sealed — unsealed state is not accepted"));
     };
@@ -1578,7 +1817,7 @@ fn decode_oauth_state_with(
         return Err(anyhow!("OAuth state has expired"));
     }
 
-    Ok(state)
+    Ok((state, seal))
 }
 
 /// Mark a decoded state's nonce as used, so each state completes one callback.
@@ -1590,6 +1829,13 @@ pub async fn claim_oauth_state(state: &OAuthState) -> bool {
         .or_insert(())
         .await
         .is_fresh()
+}
+
+/// `state` sealed under the legacy label whatever its stage, as a gateway
+/// that predates consent stages would seal it.
+#[cfg(test)]
+pub(crate) fn seal_under_legacy_label(state: &OAuthState) -> String {
+    tests::seal_under(state, OAUTH_STATE_KEY_LABEL)
 }
 
 /// Whether `state`'s nonce was already claimed on this process.
@@ -1685,6 +1931,7 @@ mod tests {
             code_verifier: None,
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1713,6 +1960,7 @@ mod tests {
             code_verifier: None,
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
 
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
@@ -1828,6 +2076,7 @@ mod tests {
                 "surface",
                 &[],
                 "https://ignored.example",
+                None,
             )
             .unwrap(),
         )
@@ -1849,8 +2098,16 @@ mod tests {
 
         provider.callback_url = Some("http://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
         assert!(
-            build_authorization_url(&provider, "did:web:agent", "sha256:user", "surface", &[], "https://gw.example")
-                .is_err()
+            build_authorization_url(
+                &provider,
+                "did:web:agent",
+                "sha256:user",
+                "surface",
+                &[],
+                "https://gw.example",
+                None
+            )
+            .is_err()
         );
     }
 
@@ -1870,16 +2127,299 @@ mod tests {
             code_verifier: None,
             ..callback.clone()
         };
-        let [start, older, callback, binding_only] =
-            [start, older, callback, binding_only].map(|state| encode_oauth_state(&state).unwrap());
-        assert!(decode_start_state(&start).is_ok());
-        assert!(decode_callback_state(&callback).is_ok());
-        for refused in [&older, &callback, &binding_only] {
-            assert!(decode_start_state(refused).is_err());
+        let staged = |stage, shape: &OAuthState| OAuthState {
+            stage: Some(stage),
+            ..shape.clone()
+        };
+        let confirm_start = staged(ConsentStage::ConfirmStart(confirm_binding()), &start);
+        let confirmation = staged(ConsentStage::Confirmation(sign_in()), &callback);
+        let confirmed_vendor = staged(ConsentStage::Vendor(confirm_binding()), &callback);
+
+        type Decoder = fn(&str) -> Result<OAuthState>;
+        let decoders: [(&str, Decoder); 3] = [
+            ("start", decode_start_state),
+            ("confirmation", decode_confirmation_state),
+            ("callback", decode_callback_state),
+        ];
+        let accepted = [
+            ("legacy start", &start, encode_oauth_state(&start).unwrap(), "start"),
+            ("legacy start sealed by hand", &start, seal_under(&start, OAUTH_STATE_KEY_LABEL), "start"),
+            ("confirm start", &confirm_start, encode_oauth_state(&confirm_start).unwrap(), "start"),
+            ("confirm start sealed by hand", &confirm_start, seal_under(&confirm_start, CONFIRM_LABEL), "start"),
+            ("confirmation", &confirmation, encode_oauth_state(&confirmation).unwrap(), "confirmation"),
+            ("confirmation sealed by hand", &confirmation, seal_under(&confirmation, CONFIRM_LABEL), "confirmation"),
+            ("legacy vendor", &callback, encode_oauth_state(&callback).unwrap(), "callback"),
+            ("legacy vendor sealed by hand", &callback, seal_under(&callback, OAUTH_STATE_KEY_LABEL), "callback"),
+            ("confirmed vendor", &confirmed_vendor, encode_oauth_state(&confirmed_vendor).unwrap(), "callback"),
+            (
+                "confirmed vendor sealed by hand",
+                &confirmed_vendor,
+                seal_under(&confirmed_vendor, CONFIRM_LABEL),
+                "callback",
+            ),
+        ];
+        let mut refused_everywhere = vec![
+            ("older", encode_oauth_state(&older).unwrap()),
+            ("binding only", encode_oauth_state(&binding_only).unwrap()),
+        ];
+        for stage in [
+            ConsentStage::ConfirmStart(confirm_binding()),
+            ConsentStage::Confirmation(sign_in()),
+            ConsentStage::Vendor(confirm_binding()),
+        ] {
+            for shape in [&start, &callback] {
+                let state = staged(stage.clone(), shape);
+                refused_everywhere.push(("legacy label with a stage", seal_under(&state, OAUTH_STATE_KEY_LABEL)));
+                if sealed_stage(&state, StateSeal::Confirm).is_none() {
+                    refused_everywhere
+                        .push(("confirm label with a stage its fields contradict", seal_under(&state, CONFIRM_LABEL)));
+                }
+            }
         }
-        for refused in [&start, &older, &binding_only] {
-            assert!(decode_callback_state(refused).is_err());
+        for shape in [&start, &callback, &older, &binding_only] {
+            refused_everywhere.push(("confirm label without a stage", seal_under(shape, CONFIRM_LABEL)));
         }
+
+        for (name, state, encoded, route) in &accepted {
+            for (decoder_route, decode) in decoders {
+                match decode(encoded) {
+                    Ok(decoded) => {
+                        assert_eq!(decoder_route, *route, "{name} state accepted by the {decoder_route} decoder");
+                        assert!(decoded == **state, "{name} state decodes to what was sealed: {decoded:?}");
+                    }
+                    Err(error) => {
+                        assert_ne!(decoder_route, *route, "{name} state refused by its own decoder: {error}");
+                        assert_eq!(error.to_string(), format!("OAuth state is not a consent {decoder_route} state"));
+                    }
+                }
+            }
+        }
+        for (name, encoded) in &refused_everywhere {
+            for (decoder_route, decode) in decoders {
+                let error =
+                    decode(encoded).expect_err(&format!("{name} state accepted by the {decoder_route} decoder"));
+                assert_eq!(
+                    error.to_string(),
+                    format!("OAuth state is not a consent {decoder_route} state"),
+                    "{name} state at the {decoder_route} decoder"
+                );
+            }
+        }
+    }
+
+    const CONFIRM_LABEL: &[u8] = OAUTH_CONFIRM_STATE_KEY_LABEL;
+
+    fn confirm_binding() -> crate::delegation_vault::ConsentConfirmBinding {
+        crate::delegation_vault::ConsentConfirmBinding {
+            strategy_id: "strategy-1".to_string(),
+            strategy_digest: "ab".repeat(32),
+            tenant_id: Some("tenant-a".to_string()),
+        }
+    }
+
+    fn sign_in() -> crate::delegation_vault::ConfirmationSignIn {
+        crate::delegation_vault::ConfirmationSignIn {
+            binding: confirm_binding(),
+            nonce: "id-token-nonce".to_string(),
+            issued_at: Utc::now(),
+        }
+    }
+
+    pub(super) fn seal_under(
+        state: &OAuthState,
+        label: &[u8],
+    ) -> String {
+        let sealed = crate::encryption::aes_gcm::AesGcmEncryptor::new()
+            .encrypt_with_aad(
+                &crate::identity::credential_identity::derived_key(label),
+                serde_json::to_string(state)
+                    .unwrap()
+                    .as_bytes(),
+                label,
+            )
+            .unwrap();
+        base64_url_encode(&format!("{SEALED_STATE_PREFIX}{}", base64_url_encode_bytes(&sealed)))
+    }
+
+    /// What a gateway that predates consent stages does with a state: open the
+    /// seal with the one key and label it knows, or the at-rest service.
+    fn opened_by_a_gateway_without_stages(encoded: &str) -> bool {
+        let decoded = String::from_utf8(base64_url_decode(encoded).unwrap()).unwrap();
+        if let Some(sealed) = decoded.strip_prefix(SEALED_STATE_PREFIX) {
+            return crate::encryption::aes_gcm::AesGcmEncryptor::new()
+                .decrypt_with_aad(
+                    &crate::identity::credential_identity::derived_key(OAUTH_STATE_KEY_LABEL),
+                    &base64_url_decode(sealed).unwrap(),
+                    OAUTH_STATE_KEY_LABEL,
+                )
+                .is_ok();
+        }
+        crate::encryption::global::get_encryption_service().is_some_and(|enc| {
+            enc.decrypt_string(decoded)
+                .is_ok_and(|json| json.starts_with('{'))
+        })
+    }
+
+    #[test]
+    fn a_gateway_without_consent_stages_cannot_open_a_staged_state() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        let staged = [
+            OAuthState {
+                stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+                ..start.clone()
+            },
+            OAuthState {
+                stage: Some(ConsentStage::Confirmation(sign_in())),
+                ..callback.clone()
+            },
+            OAuthState {
+                stage: Some(ConsentStage::Vendor(confirm_binding())),
+                ..callback.clone()
+            },
+        ];
+        for encryption in [false, true] {
+            if encryption {
+                init_test_encryption();
+            }
+            for legacy in [&start, &callback] {
+                assert!(
+                    opened_by_a_gateway_without_stages(&encode_oauth_state(legacy).unwrap()),
+                    "a legacy state, encryption {encryption}"
+                );
+            }
+            for state in &staged {
+                let encoded = encode_oauth_state(state).unwrap();
+                let payload = String::from_utf8(base64_url_decode(&encoded).unwrap()).unwrap();
+                assert!(payload.starts_with(SEALED_STATE_PREFIX), "{:?}, encryption {encryption}", state.stage);
+                assert!(
+                    !opened_by_a_gateway_without_stages(&encoded),
+                    "{:?} opened under the legacy label, encryption {encryption}",
+                    state.stage
+                );
+                let (opened, seal) = open_oauth_state(&encoded).unwrap();
+                assert_eq!((&opened.stage, seal), (&state.stage, StateSeal::Confirm));
+            }
+        }
+        let enc = crate::encryption::global::get_encryption_service().unwrap();
+        for state in &staged {
+            let at_rest = base64_url_encode(
+                &enc.encrypt_string(serde_json::to_string(state).unwrap())
+                    .unwrap(),
+            );
+            for decode in [decode_start_state, decode_confirmation_state, decode_callback_state] {
+                assert!(decode(&at_rest).is_err(), "{:?} under the at-rest service", state.stage);
+            }
+        }
+    }
+
+    #[test]
+    fn a_staged_state_whose_fields_contradict_its_stage_is_never_sealed() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        for (stage, shape) in [
+            (ConsentStage::ConfirmStart(confirm_binding()), &callback),
+            (ConsentStage::Confirmation(sign_in()), &start),
+            (ConsentStage::Vendor(confirm_binding()), &start),
+            (ConsentStage::Vendor(confirm_binding()), &sample_state()),
+        ] {
+            let state = OAuthState {
+                stage: Some(stage.clone()),
+                ..shape.clone()
+            };
+            assert_eq!(
+                encode_oauth_state(&state)
+                    .unwrap_err()
+                    .to_string(),
+                "OAuth state's fields do not fit its consent stage",
+                "{stage:?} sealed with contradicting fields"
+            );
+        }
+    }
+
+    /// A confirm binding lives only inside a stage, and every staged state the
+    /// encoder seals is under the confirm label, so no state under the legacy
+    /// label can carry one.
+    #[test]
+    fn the_encoder_seals_no_confirm_binding_under_the_legacy_label() {
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        let callback = OAuthState {
+            browser_binding: Some(base64_url_encode_bytes(&Sha256::digest([1u8; 32]))),
+            ..sample_state()
+        };
+        for encryption in [false, true] {
+            if encryption {
+                init_test_encryption();
+            }
+            for state in [
+                OAuthState {
+                    stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+                    ..start.clone()
+                },
+                OAuthState {
+                    stage: Some(ConsentStage::Confirmation(sign_in())),
+                    ..callback.clone()
+                },
+                OAuthState {
+                    stage: Some(ConsentStage::Vendor(confirm_binding())),
+                    ..callback.clone()
+                },
+            ] {
+                let (_, seal) = open_oauth_state(&encode_oauth_state(&state).unwrap()).unwrap();
+                assert_eq!(seal, StateSeal::Confirm, "{:?}, encryption {encryption}", state.stage);
+            }
+            for legacy in [&start, &callback] {
+                let (opened, seal) = open_oauth_state(&encode_oauth_state(legacy).unwrap()).unwrap();
+                assert_eq!((opened.stage, seal), (None, StateSeal::Legacy), "encryption {encryption}");
+            }
+        }
+    }
+
+    /// The start POST copies its start state into the vendor callback state, so
+    /// a confirm start state, whose stage needs a start state's fields, never
+    /// becomes a vendor callback state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_consent_refuses_a_confirm_start_state() {
+        let (_directory, secrets) = secrets_with_tenants().await;
+        let mut provider = tenant_provider(None);
+        provider.provider_type = crate::credential_providers::CredentialProviderType::OAuth2AuthorizationCode;
+        provider.client_id_secret_ref = Some("WIDE".to_string());
+        provider.authorization_endpoint = Some("https://vendor.example/authorize".to_string());
+        let redirect_uri = url::Url::parse("https://gw.example/v1/identity/oauth/callback/provider").unwrap();
+        let start = OAuthState {
+            code_verifier: None,
+            ..sample_state()
+        };
+        assert!(
+            begin_consent(&provider, &start, &redirect_uri, &secrets)
+                .await
+                .is_ok(),
+            "a legacy start state begins consent"
+        );
+        let confirm_start = OAuthState {
+            stage: Some(ConsentStage::ConfirmStart(confirm_binding())),
+            ..start
+        };
+        let refused = begin_consent(&provider, &confirm_start, &redirect_uri, &secrets)
+            .await
+            .err()
+            .expect("a confirm start state does not begin vendor consent");
+        assert_eq!(refused.to_string(), "OAuth state's fields do not fit its consent stage");
     }
 
     #[test]
@@ -1924,7 +2464,19 @@ mod tests {
             code_verifier: Some("pkce-verifier".to_string()),
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         }
+    }
+
+    fn decode_oauth_state(encoded: &str) -> Result<OAuthState> {
+        open_oauth_state(encoded).map(|(state, _)| state)
+    }
+
+    fn decode_oauth_state_with(
+        encoded: &str,
+        encryption: Option<crate::encryption::EncryptionService>,
+    ) -> Result<OAuthState> {
+        open_oauth_state_with(encoded, encryption).map(|(state, _)| state)
     }
 
     #[test]
@@ -3233,6 +3785,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,
@@ -3286,6 +3839,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,
@@ -3406,6 +3960,7 @@ mod tests {
             code_verifier: Some("test_verifier_value_12345678901234567890".to_string()),
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -3426,6 +3981,7 @@ mod tests {
             code_verifier: None,
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
         let encoded = encode_oauth_state(&state).expect("encode should succeed");
         let decoded = decode_oauth_state(&encoded).expect("decode should succeed");
@@ -3467,6 +4023,7 @@ mod tests {
             api_key_secret_ref: None,
             jwt: Default::default(),
             description: None,
+            consent_confirmation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             callback_url: None,

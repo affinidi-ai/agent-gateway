@@ -1,6 +1,9 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::delegation_vault::consent_id_token::{
+    ConsentIdTokenError, ConsentIdTokenExpectation, verify_consent_id_token,
+};
 use crate::jwt_bearer::{JwtBearerVerifier, models::JwtVerificationStrategy};
 use crate::mcp::continuations::{ContinuationError, protected::ConsentTicket};
 use crate::sts::mcp_profile::McpIssuerProfile;
@@ -68,65 +71,18 @@ pub async fn verify_id_token(
     let principal_claim = strategy
         .principal_claim_name()
         .map_err(|_| ContinuationError::InvalidState)?;
-    if token.is_empty() || token.len() > 32 * 1024 || client_id.is_empty() || client_id.len() > 4096 {
-        return Err(ContinuationError::InvalidInputResponse);
-    }
-    let header = jsonwebtoken::decode_header(token).map_err(|_| ContinuationError::InvalidState)?;
-    if header
-        .typ
-        .as_deref()
-        .is_some_and(|typ| typ != "JWT")
-    {
-        return Err(ContinuationError::InvalidState);
-    }
-    let claims = verifier
-        .validate(token, strategy, &[client_id.to_string()], crate::jwt_bearer::models::AudienceClaim::Aud)
-        .await
-        .map_err(|_| ContinuationError::InvalidState)?;
-    profile
-        .validate_subject(&claims, principal_claim, now)
-        .map_err(|_| ContinuationError::InvalidState)?;
-    if claims
-        .get("nonce")
-        .and_then(Value::as_str)
-        != Some(nonce(ticket).as_str())
-        || claims
-            .get("iat")
-            .and_then(Value::as_u64)
-            .is_none_or(|issued| issued > now.saturating_add(120) || issued.saturating_add(120) < ticket.issued_at)
-    {
-        return Err(ContinuationError::InvalidState);
-    }
-    let multiple_audiences = match claims.get("aud") {
-        Some(Value::String(audience)) => {
-            if audience != client_id {
-                return Err(ContinuationError::InvalidState);
-            }
-            false
-        }
-        Some(Value::Array(audiences)) if !audiences.is_empty() => {
-            if audiences.iter().any(|value| {
-                value
-                    .as_str()
-                    .is_none_or(str::is_empty)
-            }) || !audiences
-                .iter()
-                .any(|value| value.as_str() == Some(client_id))
-            {
-                return Err(ContinuationError::InvalidState);
-            }
-            audiences.len() > 1
-        }
-        _ => return Err(ContinuationError::InvalidState),
+    let expected = ConsentIdTokenExpectation {
+        client_id,
+        principal_claim,
+        nonce: &nonce(ticket),
+        issued_at: ticket.issued_at,
     };
-    if (multiple_audiences || claims.get("azp").is_some())
-        && claims
-            .get("azp")
-            .and_then(Value::as_str)
-            != Some(client_id)
-    {
-        return Err(ContinuationError::InvalidState);
-    }
+    let claims = verify_consent_id_token(verifier, strategy, &expected, token, now)
+        .await
+        .map_err(|error| match error {
+            ConsentIdTokenError::Malformed => ContinuationError::InvalidInputResponse,
+            ConsentIdTokenError::KeysUnavailable | ConsentIdTokenError::Rejected(_) => ContinuationError::InvalidState,
+        })?;
     let subject = profile
         .bound_subject(&claims, principal_claim)
         .map_err(|_| ContinuationError::BindingMismatch)?;
@@ -233,6 +189,25 @@ mod tests {
                 "{field}"
             );
         }
+        assert_eq!(
+            verify_id_token(
+                &verifier,
+                &strategy,
+                &profile,
+                &ticket,
+                "provider-client",
+                &"a".repeat(32 * 1024 + 1),
+                now
+            )
+            .await,
+            Err(ContinuationError::InvalidInputResponse)
+        );
+        let mut other_nonce = claims.clone();
+        other_nonce["nonce"] = json!("different");
+        assert_eq!(
+            verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &sign(&other_nonce), now).await,
+            Err(ContinuationError::InvalidState)
+        );
         let mut multiple = claims.clone();
         multiple["aud"] = json!(["provider-client", "another-client"]);
         multiple["azp"] = json!("provider-client");
@@ -251,6 +226,15 @@ mod tests {
             verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &forged, now)
                 .await
                 .is_err()
+        );
+        let mut unreachable = strategy.clone();
+        unreachable.jwks_source = crate::jwt_bearer::models::JwksSource::Remote {
+            jwks_uri: "https://idp.example/jwks".to_string(),
+        };
+        assert_eq!(
+            verify_id_token(&verifier, &unreachable, &profile, &ticket, "provider-client", &sign(&claims), now).await,
+            Err(ContinuationError::InvalidState),
+            "keys that cannot be fetched refuse the continuation"
         );
     }
 
@@ -323,6 +307,24 @@ mod tests {
                 "{other:?}"
             );
         }
+        assert_eq!(
+            verify_id_token(&verifier, &strategy, &profile, &ticket, "provider-client", &id_token(None), now).await,
+            Err(ContinuationError::InvalidState),
+            "an ID token without the principal claim is refused before the binding is compared"
+        );
+        assert_eq!(
+            verify_id_token(
+                &verifier,
+                &strategy,
+                &profile,
+                &ticket,
+                "provider-client",
+                &id_token(Some("person-2")),
+                now
+            )
+            .await,
+            Err(ContinuationError::BindingMismatch)
+        );
         strategy.principal_claim = Some("iss".to_string());
         assert_eq!(
             verify_id_token(

@@ -6112,6 +6112,8 @@ async fn process_charged_forward_request(
                     &secrets_store,
                     &base_url,
                     true, // via_fabric = true (G2G path)
+                    // Transit and Fabric consent is not confirmed.
+                    crate::delegation_vault::consent_confirmation::ConsentCaller::TransitOrFabric,
                     Some(&delegation_audit_ctx),
                     // A Fabric request establishes no consent principal, so it never
                     // unlocks a modern consent record.

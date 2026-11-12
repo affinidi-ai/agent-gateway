@@ -188,6 +188,20 @@ surface a new DID; it revokes only after **Revoke API key**, and a failed revoke
 toast. See _API key
 delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#api-key-delete).
 
+The credential provider editor shows a **Consent confirmation** switch and its login client
+(ID and secret, both picked from the secrets store), endpoints, strategy (only the provider's
+tenant's and appliance-wide ones; appliance-wide only on a new provider), principal claim and a
+**Refuse callers that can't be confirmed** switch (`require`) on a legacy consent provider (authorization
+code, no `issuer`), with the read-only Confirmation redirect URI to register; Save sends the
+setting while on, `null` when a stored one is switched off or the provider is no longer legacy
+consent, and nothing otherwise; see _Credential provider editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
+
+The strategies tab shows a refused JWT verification strategy delete, and the strategy editor a
+refused issuer change, with the credential providers that still use the strategy, by name, and a
+count of those the user can't view; see _JWT verification strategy editor_ in
+[`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
+
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;
 see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).

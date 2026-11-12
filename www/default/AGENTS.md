@@ -1053,6 +1053,15 @@ strategy the field shows the stored claim, is disabled, and is left out of the u
 gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
 same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
 
+The Settings page's strategies tab (`SettingsPage/StrategiesTab.tsx`) shows a refused delete in
+its alert with the gateway's message, the credential providers a `409` lists as still using the
+strategy by name (else id), "and N you can't view" for its `hidden_references`, that a
+provider's consent confirmation is changed in its editor and its `consent_identity_strategy_id`
+through the API, and the status (`strategyDeleteError`). The delete's confirm dialog says
+credential providers that use the strategy block the delete. The strategy editor shows a `409`
+on save (an issuer change a provider using the strategy would refuse) with the same
+`strategyDeleteError` text, so it names those providers and where to change them.
+
 ## Credentials audit tab
 
 `pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
@@ -1141,6 +1150,47 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   was created and gives the gateway's reason, and the editor still opens the created provider, so
   saving again updates it instead of creating it a second time. The Provider ID input has no
   route prefix, since a new provider's callback path does not contain it.
+- An authorization code provider without an `issuer` (legacy consent) shows a **Consent
+  confirmation** section after the Callback URL (`ConsentConfirmationSection.tsx`,
+  `credential-provider-consent-confirmation-section`), with a switch
+  (`credential-provider-consent-confirmation-switch`) that is off by default and on when the
+  stored provider has `consent_confirmation`. While on it asks for Login Client ID and Login
+  Client Secret (each a `SecretSelect`, `credential-provider-cc_client_id_secret_ref-select` and
+  `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
+  Endpoint and Login Token Endpoint (`…-authorization-endpoint-input`, `…-token-endpoint-input`),
+  a JWT verification strategy from `GET /jwt-verification-strategies`
+  (`credential-provider-consent-confirmation-strategy-select`, loaded by `useJwtStrategyList`),
+  offering only strategies of the provider's tenant and appliance-wide ones, as the gateway's
+  reference rule allows; a new provider, which the dashboard creates appliance-wide, is offered
+  appliance-wide ones only. A stored strategy is listed by its id while the list loads, as
+  "(not found)" only once the list loaded without it, and with the other-tenant label when it is
+  another tenant's; a list that cannot be read shows "Strategies could not be loaded"
+  (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
+  (`…-principal-claim-input`) and a **Refuse callers that can't be confirmed** switch
+(`credential-provider-consent-confirmation-require-switch`, writes `require`, off by default,
+sent only while on; its `FieldHelp` says it acts on new links only, so a stored grant is still
+used, and that JWT callers get no link while the setting confirms nobody, whether it is on or not).
+The Login Client ID and Login Client Secret pickers offer the same tenant's secrets as the
+strategy picker: on a new provider, appliance-wide ones only. The labels say "Login" so they never share a name with the
+  provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
+  read-only **Confirmation redirect URI**
+  (`credential-provider-consent-confirmation-redirect-uri`, copy button
+  `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
+  shows followed by `/confirm`, which is what the gateway registers. Under it a line
+  (`credential-provider-consent-confirmation-redirect-uri-where`) says to add it to the allowed
+  redirect URIs of the login client, naming the secret that holds its ID once one is picked, at the
+  identity provider, and not at the vendor, whose OAuth app keeps the Callback URL. The line and
+  the field's `FieldHelp` both say the URI follows the Callback URL and cannot be edited on its
+  own, so it is registered again whenever the Callback URL changes. Without a Callback URL to
+  show, new or stored, a notice stands in its place
+  (`credential-provider-consent-confirmation-redirect-uri-pending`) saying the URI is shown
+  once the provider has a Callback URL. The Login Client Secret's `FieldHelp` says to register
+  the login client with `client_secret_post`. Save
+  refuses a blank required field first (`missingConsentConfirmationField`) and sends
+  `consentConfirmationField`: the setting while on (a blank principal claim left out), `null`
+  when a stored setting is switched off or the provider is no longer legacy consent, and no field
+  otherwise, so the gateway keeps what it has. The gateway's `400` reason shows like any other
+  save error.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
