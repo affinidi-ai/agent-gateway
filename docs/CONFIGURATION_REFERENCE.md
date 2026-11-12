@@ -329,7 +329,7 @@ The built-in rules, applied in this order:
 | Access and refresh tokens | The value of an `access_token`, `refresh_token` or `token` assignment |
 | Session identifiers | The value of a `session_id`, `sessionid`, `sid`, `jsessionid` or `connect.sid` assignment |
 | API key and secret assignments | The value after `api_key`, `api-key`, `apikey` or `secret` and an `=` or `:` |
-| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"` or `"cookie": "…"`, also with escaped quotes |
+| Quoted credential fields | The JSON-quoted value of a key naming a credential, such as `"authorization": "Bearer …"`, `"x-api-key": "…"`, `"x-caller-key": "…"` or `"cookie": "…"`, also with escaped quotes |
 | Personal access tokens | `agpat_…` tokens |
 | Private key material (PEM) | PEM private key blocks |
 | Email addresses | Email addresses |
@@ -345,8 +345,9 @@ In OTLP exports, an attribute whose name is a credential name is replaced with
 `<redacted>` whatever its value, because a rule pattern cannot match a structured
 attribute by its name. The names, ignoring case, are `authorization`, `cookie`, `token`,
 `session_id`, `sessionid`, `jsessionid`, `password`, `passwd`, `secret`, `secret_key`,
-`api_key`, `apikey`, `private_key`, `credential` and `credentials`, alone or after a `.`,
-`_` or `-`: `http.request.header.authorization`, `x-api-key` and `mcp_session_id` match,
+`api_key`, `apikey`, `caller_key`, `private_key`, `credential` and `credentials`, alone or after
+a `.`, `_` or `-`: `http.request.header.authorization`, `x-api-key`, `x-caller-key` and
+`mcp_session_id` match,
 `token_count` and `secret_id` do not. Fields named like a credential lose the
 8-character prefix the gateway logs for correlation, in local logs as well as in OTLP
 exports.
@@ -1002,6 +1003,38 @@ was deleted are dropped at startup, and their cases are `404`.
 - `target.mpp_auto_pay`, `target.mpp_auto_pay_max_amount` and
   `transit.points[*].payment_policy` are refused on save with the same code. A stored
   `mpp_auto_pay` is ignored: a `402` from a `fabric://` Target is passed back to the caller.
+
+## Surface caller keys
+
+A surface's optional `caller_key` gives its Target a stable key for each caller whose JWT the
+gateway verified on that request, so the Target can encrypt that caller's data with a key its
+own operator cannot derive. It is a surface field, not a configuration file, set through the
+admin API; a variant cannot override it.
+
+```json
+"caller_key": {
+  "secret_id": "agent-memory-keys",
+  "header": "x-caller-key",
+  "identity_claims": ["sub"]
+}
+```
+
+| Field | Default | Behaviour |
+| --- | --- | --- |
+| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
+| `header` | `x-caller-key` | The header the Target receives the key in. A lower-case HTTP header name. A save refuses a hop-by-hop header, `host`, `content-length`, `authorization`, `cookie`, a proxy forwarding header, a content or protocol header the gateway reads or sets (`accept`, `accept-encoding`, `content-type`, `content-encoding`, `mcp-protocol-version`, `mcp-session-id`, `last-event-id`, `a2a-version`, `a2a-extensions`, `x-a2a-extensions`), any other header reserved for the gateway (`x-transit-token`, `x-gateway-fabric-hops`, the caller-info and `did:webvh` identity headers, `x-gateway-trace-id`, `x-mirrored-request`), and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header. Names are compared ignoring case and `_` against `-`. |
+| `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string without NUL is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
+
+The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v1`
+as the salt, and the surface id, `0x00`, the token's `iss`, `0x00`, the claim's name, `0x00`
+and the claim's value as the info, 32 bytes, base64url without padding. Changing the secret,
+the claims or the surface changes every caller's key. Only a caller whose JWT was verified on
+that request gets a key: no caller with an API key, DID Auth or mTLS, no caller without a
+credential or whose credential failed on a public Access Point, and no token without a string
+`iss` or any of the claims. A caller's own copy of `x-caller-key`, or of the header any stored
+surface's `caller_key` names, is never forwarded, on any surface. A PUT that leaves `caller_key`
+out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ## Remote gateway records
 
