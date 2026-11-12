@@ -234,6 +234,25 @@ async fn managed_agent_has_started_oauth_consent_through_transit_point(
     transit_point: String,
     caller: String,
 ) {
+    managed_agent_calls_tool_through_transit_point(world, agent_name, transit_point, caller).await;
+}
+
+#[when(expr = "managed agent {string} asks for OAuth consent through Transit Point {string} for JWT caller {string}")]
+async fn managed_agent_asks_for_oauth_consent_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    caller: String,
+) {
+    managed_agent_calls_tool_through_transit_point(world, agent_name, transit_point, caller).await;
+}
+
+async fn managed_agent_calls_tool_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    caller: String,
+) {
     ensure_gateway_running(world).await;
     let access_point_token =
         crate::steps::when::create_valid_jwt_for_subject_with_world_claims(world, &caller, serde_json::json!({}));

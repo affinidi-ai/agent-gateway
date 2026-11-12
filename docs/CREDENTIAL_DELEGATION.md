@@ -2042,6 +2042,8 @@ With `require: true`, every other caller is refused the same way, and the gatewa
 link refused: consent confirmation requires every caller to be confirmed` at `WARN`, once per
 provider, surface and reason. That includes API key, mTLS and DID callers, and consent through a
 Transit Point or over Fabric, so set it only on a provider whose callers can all be confirmed.
+A Fabric partner's request is then refused with the same `503` as the others, not the partner
+consent refusal (`consent_not_available_for_partners`) it gets without `require`.
 
 Without `require`, any other caller is minted a link as if the provider had no setting, and its
 start page leads straight to the vendor. The gateway logs this once per provider, surface and reason, with the
