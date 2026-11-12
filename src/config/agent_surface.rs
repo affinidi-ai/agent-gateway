@@ -178,7 +178,7 @@ pub fn normalize_browser_origins(origins: &mut Vec<String>) -> Result<(), String
     if origins.len() > MAX_BROWSER_ORIGINS {
         return Err(format!("browser_origins: at most {MAX_BROWSER_ORIGINS} origins"));
     }
-    let mut normalized: Vec<String> = Vec::with_capacity(origins.len());
+    let mut normalized: Vec<String> = Vec::new();
     for origin in origins.iter() {
         let origin = normalize_browser_origin(origin)?;
         if !normalized.contains(&origin) {
