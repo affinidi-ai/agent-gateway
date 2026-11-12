@@ -1602,6 +1602,10 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   `agent_gateway_caller_key_secret_unreadable_total` (see
   [Caller key secret metric](OBSERVABILITY.md#caller-key-secret-metric)). The request is
   forwarded.
+- **A Target must refuse a request without the key.** A verified caller's request can reach the
+  Target without a key: when the secret cannot be read, and when `credential_policy.target_https`
+  withholds it. A Target that relies on the key to keep each caller's data apart must refuse
+  such a request, never treat it as anonymous or store the caller's data unkeyed.
 - **The secret must be random.** A save checks only its length, so a typed 32-character
   passphrase passes; anyone who guesses the secret can derive every caller's key. Make it at
   least 32 random bytes, such as the output of `openssl rand -base64 32`.

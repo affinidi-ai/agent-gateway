@@ -4404,6 +4404,31 @@ impl FabricPayment<'_> {
     }
 }
 
+/// The MCP HTTP policy a Fabric-received request to `surface` is admitted under. A framed
+/// stream checks the caller's browser `Origin` against the surface's allowlist and its
+/// `browser_origins`. A buffered `ForwardRequest` is not checked for it again: the sending
+/// gateway already checked it against its own surface.
+fn fabric_receive_http_policy(
+    surface: &crate::config::agent_surface::AgentSurface,
+    versions: crate::mcp::request_validation::McpVersionPolicy<'static>,
+    framed: bool,
+) -> Result<crate::mcp::modern_http::EndpointHttpPolicy, String> {
+    let policy = crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
+        surface.mcp_http.as_ref(),
+        std::slice::from_ref(
+            &surface
+                .access_point
+                .listen_address,
+        ),
+        versions,
+    )?;
+    Ok(if framed {
+        policy.with_browser_origins(&surface.browser_origins)
+    } else {
+        policy.without_origin_check()
+    })
+}
+
 async fn process_charged_forward_request(
     message: &ReceivedMessage,
     mut stream_request: Option<FabricStreamRequest>,
@@ -5039,16 +5064,8 @@ async fn process_charged_forward_request(
 
     let mut mcp_verified_binding = None;
     let (mcp_metadata_context, mut mcp_classification) = if surface.channel_protocol() == crate::config::ChannelProtocol::Mcp {
-        let http_policy = match crate::mcp::modern_http::EndpointHttpPolicy::with_versions(
-            surface.mcp_http.as_ref(),
-            std::slice::from_ref(&surface.access_point.listen_address),
-            mcp_versions,
-        ) {
-            // The sending gateway already checked the caller's browser Origin
-            // against its own surface, so a buffered ForwardRequest is not
-            // checked again against this surface's allowlist.
-            Ok(policy) if stream_request.is_none() => policy.without_origin_check(),
-            Ok(policy) => policy.with_browser_origins(&surface.browser_origins),
+        let http_policy = match fabric_receive_http_policy(&surface, mcp_versions, stream_request.is_some()) {
+            Ok(policy) => policy,
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
                 return axum_response_to_forward_result(crate::a2a::create_error_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Invalid MCP HTTP configuration")).await;

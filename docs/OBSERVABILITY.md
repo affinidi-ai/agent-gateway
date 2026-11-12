@@ -885,6 +885,7 @@ for when a save changes a pin.
 [Browser origins of a surface](CONFIGURATION_REFERENCE.md#browser-origins-of-a-surface).
 
 - `browser_origins_changed`: a create, `PUT` or `PATCH` changed the surface's `browser_origins`.
+  It is recorded only when the VP Audit Log or an integration selects the event.
   `previous_origins` is the list before the save (empty for a new surface) and `origins` the list
   after it. `actor` names the management caller as on policy change events, and the top level
   carries `surface_id` and `channel_name`. A save that leaves the list as it was, a new surface

@@ -202,8 +202,8 @@ pub(crate) fn sent_in_clear(endpoint: &str) -> bool {
 /// Whether the caller key may go to `endpoint` under `credential_policy.target_https`, by the
 /// test a Target credential is held to ([`crate::config::target_auth_rules::is_https_target`]):
 /// always to an `https` URL, and to any other endpoint only while the rule is not `enforce`.
-/// An `http` Target is logged once per surface, variant and mode; another endpoint, such as a
-/// `fabric://` or `proxy://` one, never carries the key out in clear and is not logged.
+/// An `http` Target is logged once per surface, variant, endpoint and mode; another endpoint,
+/// such as a `fabric://` or `proxy://` one, never carries the key out in clear and is not logged.
 fn target_https_allows(
     surface_id: &str,
     endpoint: &str,
@@ -219,10 +219,11 @@ fn target_https_allows(
     }
     let variant = crate::observability::policy_audit::current_request_variant();
     let leg = format!(
-        "{surface_id}\n{}\n{enforced}",
+        "{surface_id}\n{}\n{}\n{enforced}",
         variant
             .as_deref()
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        endpoint.trim()
     );
     if WARNED.insert(leg) {
         if enforced {

@@ -1003,7 +1003,12 @@ mod tests {
             .unwrap()
             .with_browser_origins(&browser_origins);
         assert_eq!(policy.validate_headers(&origin_of("https://chat.example.com")), Ok(()));
-        for origin in ["https://other.example.com", "http://plain.example.com", "https://Chat.Example.com:443"] {
+        for origin in [
+            "https://other.example.com",
+            "https://sub.example.com",
+            "http://plain.example.com",
+            "https://Chat.Example.com:443",
+        ] {
             assert_eq!(policy.validate_headers(&origin_of(origin)), Err(INVALID_ORIGIN), "{origin}");
         }
 

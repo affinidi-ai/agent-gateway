@@ -211,7 +211,8 @@ pub fn normalize_browser_origins(origins: &mut Vec<String>) -> Result<(), String
 /// Normalises a stored surface's `browser_origins` as it is loaded, so a surface
 /// file written outside the admin API follows the same rules: each entry as
 /// [`normalize_browser_origin`] renders it, an entry it refuses, a duplicate, or
-/// one past [`MAX_BROWSER_ORIGINS`] dropped with a warning naming the surface. The
+/// one past [`MAX_BROWSER_ORIGINS`] dropped with a warning naming the surface. A
+/// value that is not a list, `null` included, is removed the same way. The
 /// surface itself is never refused. Returns whether the record changed.
 fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
     let surface_id = value
@@ -219,10 +220,22 @@ fn normalize_stored_browser_origins(value: &mut serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let Some(stored) = value
-        .get_mut("browser_origins")
-        .and_then(serde_json::Value::as_array_mut)
-    else {
+    let Some(field) = value.get_mut("browser_origins") else {
+        return false;
+    };
+    if !field.is_array() {
+        tracing::warn!(
+            surface_id = %surface_id,
+            origin = %crate::observability::loggable::untrusted(&field.to_string()),
+            reason = "not a list",
+            "Dropping a stored browser_origins entry"
+        );
+        if let Some(record) = value.as_object_mut() {
+            record.remove("browser_origins");
+        }
+        return true;
+    }
+    let Some(stored) = field.as_array_mut() else {
         return false;
     };
     let drop = |entry: &str, reason: &str| {
@@ -4683,6 +4696,41 @@ mod tests {
         let surface: AgentSurface = serde_json::from_value(stored.clone()).unwrap();
         assert_eq!(surface.browser_origins, ["https://chat.example.com"]);
         assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once");
+    }
+
+    /// A hand-edited `browser_origins` that is not a list would fail to deserialise; it is
+    /// removed instead, so the surface still loads, without browser origins.
+    #[test]
+    fn a_stored_browser_origins_that_is_not_a_list_is_removed_and_the_surface_loads() {
+        for value in [
+            serde_json::json!("https://chat.example.com"),
+            serde_json::Value::Null,
+            serde_json::json!({ "origin": "https://chat.example.com" }),
+            serde_json::json!(7),
+        ] {
+            let mut stored = serde_json::json!({
+                "surface_id": "s-1",
+                "name": "s-1",
+                "access_point": { "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a" },
+                "target": { "endpoint": "https://agent.example" },
+                "browser_origins": value,
+            });
+            assert!(AgentSurface::migrate_raw_json(&mut stored).unwrap(), "re-persisted: {value}");
+            assert!(
+                stored
+                    .get("browser_origins")
+                    .is_none(),
+                "{value}"
+            );
+            let surface: AgentSurface = serde_json::from_value(stored.clone()).expect("the surface loads");
+            assert!(
+                surface
+                    .browser_origins
+                    .is_empty(),
+                "{value}"
+            );
+            assert!(!AgentSurface::migrate_raw_json(&mut stored).unwrap(), "normalised once: {value}");
+        }
     }
 
     #[test]

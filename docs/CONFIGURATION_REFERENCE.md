@@ -118,7 +118,8 @@ list also passes the MCP Origin check, so nothing else needs setting there eithe
 
 The same rules hold for a surface stored on disk, such as one edited by hand under `_storage/`: on load
 each entry is normalised, and an invalid entry, a duplicate or one past the 20th is dropped and logged as
-a warning naming the surface; the surface itself still loads.
+a warning naming the surface, as is the whole field when it is not a list; the surface itself still loads, and its stored file is rewritten without the
+dropped entries. The drop is logged, not audited: no `browser_origins_changed` event is recorded for it.
 
 A cross-origin request, a preflight included, to a path that belongs to a surface is allowed when its
 `Origin` is in `network.cors` or in that surface's `browser_origins`. A path belongs to the surface whose
@@ -136,7 +137,8 @@ On an MCP surface a request's `Origin`, when present, must also pass the MCP Ori
 framed Fabric stream the receiving surface's lists decide.
 
 Each save that changes the list records a `browser_origins_changed` audit event with the list before and
-after it (see [`OBSERVABILITY.md`](OBSERVABILITY.md)). A tenant-scoped PAT that may update the surface
+after it, when the VP Audit Log or an integration selects that event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). A tenant-scoped PAT that may update the surface
 may set the list: whoever owns a surface decides which pages may call it, as they decide its other
 settings, and the list opens the surface to those pages only, never to another surface. An origin whose
 domain later changes hands keeps its access until it is removed from the list.
@@ -1069,7 +1071,9 @@ used such a header for its own purposes can no longer send it through. The key f
 `credential_policy.target_https` as a Target credential does: under `enforce` it goes only to an
 `https://` URL with a host, and under `warn` an `http` Target gets it with a logged warning. A save answers with a `Warning` when
 the surface's Target, or a variant's, is `http`, or is one that never receives a key
-(`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). A PUT that leaves
+(`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). Unlike a Target
+credential, which an enforced rule refuses at save, a `caller_key` on an `http` Target under
+`enforce` saves with that `Warning`, and its requests are forwarded without the key. A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 

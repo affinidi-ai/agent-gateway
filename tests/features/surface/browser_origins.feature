@@ -71,6 +71,25 @@ Feature: Browser origins of a surface
     When a web page at origin "https://other.example.com" sends a preflight for a POST to the surface
     Then the response carries no "access-control-allow-origin" header
 
+  Scenario: A stored browser origin is matched in the form a browser sends
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface allows browser origin "https://Chat.Example.com"
+    When a web page at origin "https://chat.example.com" sends a preflight for a POST to the surface
+    Then the response includes header "access-control-allow-origin" with value "https://chat.example.com"
+
+  Scenario: A stored browser origin that is not https is dropped when the surface is loaded
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface allows browser origin "http://plain.example.com"
+    When a web page at origin "http://plain.example.com" sends a preflight for a POST to the surface
+    Then the response carries no "access-control-allow-origin" header
+
+  Scenario: A disabled surface opens no browser origin
+    Given an A2A surface targeting managed agent "bravo"
+    And the surface allows browser origin "https://chat.example.com"
+    And the operator has disabled the stored surface
+    When a web page at origin "https://chat.example.com" sends a preflight for a POST to the surface
+    Then the response carries no "access-control-allow-origin" header
+
   Scenario: A surface without browser origins answers no cross-origin page
     Given MCP surface "alpha" targets MCP server "bravo"
     When a web page at origin "https://chat.example.com" sends a preflight for a POST to the surface
