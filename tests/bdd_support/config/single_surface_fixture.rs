@@ -502,14 +502,17 @@ pub struct SurfaceTargetAuthProviderConfig {
     /// A JWT Bearer provider stores a client ID and a client secret although it sets no
     /// client authentication.
     pub stores_unused_client_references: bool,
-    /// A client credentials provider's stored record names no client secret, although the
-    /// secrets store holds one.
+    /// The provider's stored record names no client secret, although its type needs one and
+    /// the secrets store holds it.
     pub omits_client_secret_reference: bool,
+    /// The gateway's `insecure_token_endpoints` names this provider's token endpoint.
+    pub token_endpoint_listed_as_insecure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetAuthProviderGrant {
     ClientCredentials,
+    AuthorizationCode,
     JwtBearer,
 }
 
@@ -563,11 +566,12 @@ impl SurfaceTargetAuthProviderConfig {
             client_authentication: None,
             stores_unused_client_references: false,
             omits_client_secret_reference: false,
+            token_endpoint_listed_as_insecure: false,
         }
     }
 
     pub fn stores_client_id(&self) -> bool {
-        self.grant == TargetAuthProviderGrant::ClientCredentials
+        self.grant != TargetAuthProviderGrant::JwtBearer
             || self.stores_unused_client_references
             || self
                 .client_authentication
@@ -582,7 +586,7 @@ impl SurfaceTargetAuthProviderConfig {
 
     pub fn stores_client_secret(&self) -> bool {
         !self.omits_client_secret_reference
-            && (self.grant == TargetAuthProviderGrant::ClientCredentials
+            && (self.grant != TargetAuthProviderGrant::JwtBearer
                 || self.stores_unused_client_references
                 || self
                     .client_authentication

@@ -4,8 +4,9 @@ Feature: Credential rules when saving through the admin API
   appliance-wide or belongs to another tenant. An update cannot remove the client references
   an OAuth credential provider needs, even from a provider that keeps a plain http token
   endpoint. While the gateway only warns on plain http token endpoints, an update cannot give
-  a client secret to a provider that keeps such an endpoint and holds none, but can point one
-  that holds a client secret at another. A surface that already stores an appliance-wide
+  a client secret to a provider that keeps such an endpoint and holds none, unless the
+  gateway lists that endpoint as insecure on purpose, but can point one that holds a client
+  secret at another. A surface that already stores an appliance-wide
   secret keeps it while tenant credential isolation only warns, and is refused once the
   gateway enforces it. A surface whose stored Target credential, on the Target or a Transit
   Point, breaks the https or caller rule saves again unchanged and the save answers with a
@@ -48,6 +49,28 @@ Feature: Credential rules when saving through the admin API
     Then the admin API response status is 400
     And the admin API error response mentions "token_endpoint must be an https URL"
     And the stored credential provider has no client secret
+
+  Scenario: A stored authorization code provider with an http token endpoint and no client secret is refused an update that gives it one
+    Given an A2A surface targeting managed agent "bravo"
+    And the appliance stores an authorization code provider that no surface uses
+    And the credential provider has a plain http token endpoint
+    And the credential provider stores no client secret
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    When the operator gives the credential provider a client secret
+    Then the admin API response status is 400
+    And the admin API error response mentions "token_endpoint must be an https URL"
+    And the stored credential provider has no client secret
+
+  Scenario: A stored credential provider with a listed http token endpoint and no client secret is given one
+    Given an A2A surface targeting managed agent "bravo"
+    And the gateway authenticates to the managed agent with a client credentials provider
+    And the credential provider has a plain http token endpoint
+    And the gateway's insecure token endpoints list names the credential provider's token endpoint
+    And the credential provider stores no client secret
+    And the gateway only warns on the credential rule "token_endpoint_https"
+    When the operator gives the credential provider a client secret
+    Then the admin API response status is 200
+    And the stored credential provider has the client secret "bdd-target-client-secret"
 
   Scenario: A stored credential provider with an http token endpoint is given another client secret
     Given an A2A surface targeting managed agent "bravo"
