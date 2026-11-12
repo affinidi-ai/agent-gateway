@@ -54,7 +54,7 @@ pub(crate) enum Unconfirmed {
 impl Unconfirmed {
     /// Whether the reason holds for every caller of the provider, a setting
     /// that confirms nobody, rather than for this caller or request only.
-    fn covers_every_caller(self) -> bool {
+    pub(crate) fn covers_every_caller(self) -> bool {
         match self {
             Self::NotLegacyConsent
             | Self::PepperUnset
@@ -520,9 +520,11 @@ async fn exchange_code(
 }
 
 /// Log once per provider, surface and reason why a caller of a provider with
-/// `consent_confirmation` was minted a link that does not confirm them: at
-/// warn for a setting that confirms nobody, a Transit Point or Fabric caller,
-/// or a caller of another issuer or principal claim, at debug otherwise. Also note at debug that a confirmed caller was
+/// `consent_confirmation` was refused a link or minted one that does not
+/// confirm them: at warn for a setting that confirms nobody (no link is
+/// minted), a Transit Point or Fabric caller, a caller that is not a JWT
+/// Bearer caller, or a caller of another issuer or principal claim, at debug
+/// otherwise. Also note at debug that a confirmed caller was
 /// verified by another strategy than the one that confirms them. Nothing
 /// about the caller is logged.
 pub(crate) fn note(
@@ -543,7 +545,7 @@ pub(crate) fn note(
                     provider_id = %provider.provider_id,
                     surface_id = %surface_id,
                     reason = ?reason,
-                    "Consent confirmation confirms no caller of this provider: consent links are minted unconfirmed"
+                    "Consent confirmation confirms no caller of this provider: consent links are refused"
                 );
             } else if *reason == Unconfirmed::PathNotCovered {
                 warn!(
@@ -553,6 +555,13 @@ pub(crate) fn note(
                     "Consent link minted unconfirmed for a Transit Point or Fabric caller: a Transit Point \
                      caller's grant can also be released to the surface's Access Point callers when the \
                      Transit Point has no managed identity of its own"
+                );
+            } else if *reason == Unconfirmed::NotJwtCaller {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    surface_id = %surface_id,
+                    "Consent link minted unconfirmed for a caller that is not a JWT Bearer caller"
                 );
             } else if matches!(reason, Unconfirmed::OtherIssuer | Unconfirmed::OtherPrincipalClaim) {
                 warn!(
@@ -1160,11 +1169,12 @@ mod tests {
     }
 
     #[test]
-    fn another_issuer_or_principal_claim_is_warned_of_once_and_another_hash_is_not() {
+    fn a_non_jwt_caller_another_issuer_or_principal_claim_is_warned_of_once_and_another_hash_is_not() {
         use crate::component_tests::helpers::formatted_logs::FormattedLogs;
         let provider = provider(true);
         let surface_id = uuid::Uuid::new_v4().to_string();
         for (reason, warned) in [
+            (Unconfirmed::NotJwtCaller, true),
             (Unconfirmed::OtherIssuer, true),
             (Unconfirmed::OtherPrincipalClaim, true),
             (Unconfirmed::OtherIdentityHash, false),

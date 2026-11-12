@@ -3640,6 +3640,24 @@ mod tests {
         user_identity_hash: &str,
         strategies: Option<&dyn JwtVerificationStrategyStorage>,
     ) -> crate::delegation_vault::OAuthState {
+        let result = consent_lookup(provider, caller, user_identity_hash, strategies).await;
+        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = &result else {
+            panic!("expected a consent result, got {}", result_tag(&result));
+        };
+        let state = url::Url::parse(authorization_url)
+            .unwrap()
+            .query_pairs()
+            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+            .unwrap();
+        crate::delegation_vault::oauth::decode_start_state(&state).unwrap()
+    }
+
+    async fn consent_lookup(
+        provider: &CredentialProvider,
+        caller: Option<&AuthenticatedIdentity>,
+        user_identity_hash: &str,
+        strategies: Option<&dyn JwtVerificationStrategyStorage>,
+    ) -> DelegationLookupResult {
         let secrets: Arc<dyn SecretsStore> = Arc::new(MockSecretsStore::default());
         let results = resolve_delegation_credentials(
             &[make_binding(&provider.id)],
@@ -3658,20 +3676,17 @@ mod tests {
             None,
         )
         .await;
-        let DelegationLookupResult::ConsentRequired { authorization_url, .. } = &results[0].result else {
-            panic!("expected a consent result, got {}", result_tag(&results[0].result));
-        };
-        let state = url::Url::parse(authorization_url)
+        results
+            .into_iter()
+            .next()
             .unwrap()
-            .query_pairs()
-            .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
-            .unwrap();
-        crate::delegation_vault::oauth::decode_start_state(&state).unwrap()
+            .result
     }
 
     /// A consent link confirms its caller only when the provider's
-    /// `consent_confirmation` strategy recomputes the caller's vault key; any
-    /// other caller gets the link the provider mints without the setting.
+    /// `consent_confirmation` strategy recomputes the caller's vault key. A
+    /// caller the setting does not cover gets the link the provider mints
+    /// without the setting; a setting that confirms no caller mints no link.
     #[tokio::test]
     async fn a_consent_link_confirms_only_a_caller_its_strategy_recomputes() {
         use crate::delegation_vault::{ConsentConfirmBinding, ConsentStage, OAuthState};
@@ -3765,41 +3780,53 @@ mod tests {
                 .principal_hash(None)
                 .unwrap()
         };
-        let cases: [(&str, CredentialProvider, Option<&AuthenticatedIdentity>, String, bool); 9] = [
-            ("an API key caller", confirming(&strategy.id), Some(&api_key), api_key_hash, true),
-            ("no caller", confirming(&strategy.id), None, "sha256:user1".to_string(), true),
-            ("another issuer", confirming(&strategy.id), Some(&other_issuer), hash(&other_issuer), true),
-            ("another principal claim", confirming(&strategy.id), Some(&other_claim), hash(&other_claim), true),
-            ("another vault key", confirming(&strategy.id), Some(&alice), "sha256:someone-else".to_string(), true),
-            ("a deleted strategy", confirming("gone"), Some(&alice), alice_hash.clone(), true),
-            ("a strategy of another tenant", confirming(&other_tenant.id), Some(&alice), alice_hash.clone(), true),
-            (
-                "an Entra strategy naming callers by sub",
-                confirming(&entra_by_sub.id),
-                Some(&entra_alice),
-                hash(&entra_alice),
-                true,
-            ),
-            ("no strategy store", confirming(&strategy.id), Some(&alice), alice_hash.clone(), false),
+        let unconfirmed: [(&str, CredentialProvider, Option<&AuthenticatedIdentity>, String); 6] = [
+            ("an API key caller", confirming(&strategy.id), Some(&api_key), api_key_hash.clone()),
+            ("no caller", confirming(&strategy.id), None, "sha256:user1".to_string()),
+            ("another issuer", confirming(&strategy.id), Some(&other_issuer), hash(&other_issuer)),
+            ("another principal claim", confirming(&strategy.id), Some(&other_claim), hash(&other_claim)),
+            ("another vault key", confirming(&strategy.id), Some(&alice), "sha256:someone-else".to_string()),
+            ("an API key caller of a deleted strategy", confirming("gone"), Some(&api_key), api_key_hash),
         ];
         let as_minted_today = |state: OAuthState| OAuthState {
             nonce: String::new(),
             expires_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
             ..state
         };
-        for (case, provider, caller, user_hash, with_store) in &cases {
-            let strategies = with_store.then_some(&store as &dyn JwtVerificationStrategyStorage);
-            let minted = minted_start_state(provider, *caller, user_hash, strategies).await;
-            let today = minted_start_state(&without_setting, *caller, user_hash, strategies).await;
+        for (case, provider, caller, user_hash) in &unconfirmed {
+            let minted = minted_start_state(provider, *caller, user_hash, Some(&store)).await;
+            let today = minted_start_state(&without_setting, *caller, user_hash, Some(&store)).await;
             assert_eq!(minted.stage, None, "{case}");
             assert!(as_minted_today(minted) == as_minted_today(today), "{case}");
         }
 
+        let confirms_nobody: [(&str, CredentialProvider, &AuthenticatedIdentity, String, bool); 4] = [
+            ("a deleted strategy", confirming("gone"), &alice, alice_hash.clone(), true),
+            ("a strategy of another tenant", confirming(&other_tenant.id), &alice, alice_hash.clone(), true),
+            (
+                "an Entra strategy naming callers by sub",
+                confirming(&entra_by_sub.id),
+                &entra_alice,
+                hash(&entra_alice),
+                true,
+            ),
+            ("no strategy store", confirming(&strategy.id), &alice, alice_hash.clone(), false),
+        ];
+        for (case, provider, caller, user_hash, with_store) in &confirms_nobody {
+            let strategies = with_store.then_some(&store as &dyn JwtVerificationStrategyStorage);
+            let refused = consent_lookup(provider, Some(*caller), user_hash, strategies).await;
+            assert!(matches!(refused, DelegationLookupResult::Unavailable), "{case}: {}", result_tag(&refused));
+        }
+
         crate::identity::credential_identity::configure_pepper_for_tests(false);
-        let minted = minted_start_state(&confirming(&strategy.id), Some(&alice), &alice_hash, Some(&store)).await;
+        let refused = consent_lookup(&confirming(&strategy.id), Some(&alice), &alice_hash, Some(&store)).await;
+        assert!(
+            matches!(refused, DelegationLookupResult::Unavailable),
+            "without a configured pepper: {}",
+            result_tag(&refused)
+        );
         let today = minted_start_state(&without_setting, Some(&alice), &alice_hash, Some(&store)).await;
-        assert_eq!(minted.stage, None, "without a configured pepper");
-        assert!(as_minted_today(minted) == as_minted_today(today), "without a configured pepper");
+        assert_eq!(today.stage, None, "a provider without the setting still mints without a pepper");
     }
 
     /// A strategy store whose every read fails.

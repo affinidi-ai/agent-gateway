@@ -2026,26 +2026,33 @@ A consent link confirms its caller when all of these hold:
 Which strategy verified the caller does not matter. Another strategy with the same issuer and
 claim gives the same identity hash, so its callers are confirmed too.
 
+A reason that holds for every caller of the provider (`NotLegacyConsent`, `PepperUnset`,
+`StrategyUnavailable`, `GatewayIssuer`, `EntraCallerNamedBySub`, `IdTokenClaimInvalid`,
+`EditableClaim`) is a setting that confirms nobody. The save refuses each of them, so they arise
+only after the save: the pepper is missing after a redeploy, `sts.mcp_issuer` or the strategy
+changed, or a later release refuses the claim. No link is minted then, and the request is
+refused as when the strategy cannot be read. The gateway logs `Consent confirmation confirms no
+caller of this provider: consent links are refused` at `WARN`, once per provider, surface and
+reason.
+
 Any other caller is minted a link as if the provider had no setting, and its start page leads
 straight to the vendor. The gateway logs this once per provider, surface and reason, with the
-provider and surface ids and no detail of the caller. A reason that holds for every caller of
-the provider (`NotLegacyConsent`, `PepperUnset`, `StrategyUnavailable`, `GatewayIssuer`,
-`EntraCallerNamedBySub`, `IdTokenClaimInvalid`, `EditableClaim`) is a setting that confirms
-nobody, logged at `WARN` as `Consent confirmation confirms no caller of this provider: consent
-links are minted unconfirmed`. `PathNotCovered` is logged at `WARN` as `Consent link minted
-unconfirmed for a Transit Point or Fabric caller: a Transit Point caller's grant can also be
-released to the surface's Access Point callers when the Transit Point has no managed identity
-of its own`.
+provider and surface ids and no detail of the caller. `PathNotCovered` is logged at `WARN` as
+`Consent link minted unconfirmed for a Transit Point or Fabric caller: a Transit Point caller's
+grant can also be released to the surface's Access Point callers when the Transit Point has no
+managed identity of its own`. `NotJwtCaller` is logged at `WARN` as `Consent link minted
+unconfirmed for a caller that is not a JWT Bearer caller`, so a setting on a surface whose
+callers use API keys, mTLS or DIDs shows in the log.
 `OtherIssuer` and `OtherPrincipalClaim` are logged at `WARN` as `Consent link minted
 unconfirmed: the caller's issuer or principal claim is not the confirming strategy's`. It is
 expected on a surface that also accepts callers of another strategy; on a surface whose
 callers all use the confirming strategy, it means the strategy's issuer or claim differs from
-theirs and confirms nobody. The other reasons
-concern one caller or request, and are logged at `DEBUG` as `Consent link minted without
-confirming its caller at their identity provider`.
-The link fails instead only when the strategy cannot be read.
+theirs and confirms nobody. `OtherIdentityHash` concerns one caller and is logged at `DEBUG` as
+`Consent link minted without confirming its caller at their identity provider`.
+A strategy that cannot be read also mints no link. The reasons are checked in the table's order,
+and the first that holds decides.
 
-| `reason` | The link does not confirm its caller because |
+| `reason` | No link is minted, or the link does not confirm its caller, because |
 | --- | --- |
 | `PathNotCovered` | The request came through a Transit Point or over Fabric |
 | `NotLegacyConsent` | The provider is no longer legacy consent |
@@ -2156,6 +2163,11 @@ name the same person by the same value.
 The ID-token claim must be immutable and assigned by the identity provider. A claim a person
 can change is refused as the ID-token claim: `preferred_username`, `nickname`, `name`,
 `given_name`, `family_name`, `upn`, `unique_name`, `email` and `phone_number`.
+The gateway refuses only these standard claims. It cannot tell whether a custom attribute is
+editable, so check that before naming one: a Cognito `custom:` attribute the app client can
+write, an Auth0 claim built from `user_metadata`, or a Keycloak user-profile attribute users
+can edit lets a person set their own value to another caller's and be confirmed as that
+caller.
 
 `id_token_principal_claim` only chooses which ID-token claim supplies the value. The value is
 always hashed under the strategy's claim name. Use it for an identity provider whose ID token
