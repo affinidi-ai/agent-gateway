@@ -5,9 +5,9 @@
 /// Headers a Target credential may not use: those that frame the message or the connection,
 /// where it would be dropped or would change how the request is framed or routed, and those the
 /// gateway itself strips or sets on a request upstream (transit token, Fabric crossings, caller
-/// and gateway identity, the default caller key header, trace and mirror markers, the MCP
-/// session), where it would collide with the gateway's value.
-const RESERVED_HEADERS: [&str; 24] = [
+/// and gateway identity, trace and mirror markers, the MCP session), where it would collide
+/// with the gateway's value.
+const RESERVED_HEADERS: [&str; 23] = [
     "Host",
     "Content-Length",
     "Transfer-Encoding",
@@ -28,7 +28,6 @@ const RESERVED_HEADERS: [&str; 24] = [
     "X-Gateway-Did",
     "X-Did-Identity",
     "X-Did-Signed-Identity",
-    "X-Caller-Key",
     "X-Gateway-Trace-Id",
     "X-Mirrored-Request",
     "Mcp-Session-Id",
@@ -322,10 +321,7 @@ mod tests {
             assert!(!crate::protocols::extensions::should_forward_request_header(name), "{name}");
             assert!(reserved_header(name).is_some(), "{name}");
         }
-        for name in crate::proxy::caller_identity::CallerHeaders::NAMES
-            .into_iter()
-            .chain([crate::config::caller_key::DEFAULT_CALLER_KEY_HEADER])
-        {
+        for name in crate::proxy::caller_identity::CallerHeaders::NAMES {
             assert!(reserved_header(name).is_some(), "{name}");
         }
     }

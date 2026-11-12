@@ -99,9 +99,6 @@ fn header_problem(header: &str) -> Option<String> {
     if header != header.to_ascii_lowercase() {
         return Some("must be lower case".to_string());
     }
-    if header == DEFAULT_CALLER_KEY_HEADER {
-        return None;
-    }
     if let Some(reserved) = reserved_header(header) {
         return Some(format!("must not be the reserved header {reserved}"));
     }
