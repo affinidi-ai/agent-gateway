@@ -5048,7 +5048,7 @@ async fn process_charged_forward_request(
             // against its own surface, so a buffered ForwardRequest is not
             // checked again against this surface's allowlist.
             Ok(policy) if stream_request.is_none() => policy.without_origin_check(),
-            Ok(policy) => policy,
+            Ok(policy) => policy.with_browser_origins(&surface.browser_origins),
             Err(error) => {
                 channel_warn!(config_id, "Invalid MCP HTTP configuration: {}", error);
                 return axum_response_to_forward_result(crate::a2a::create_error_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Invalid MCP HTTP configuration")).await;
@@ -5977,6 +5977,7 @@ async fn process_charged_forward_request(
 
     if let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
         &surface,
+        surface.target_endpoint(),
         authenticated_identity.as_ref(),
         get_secrets_store().as_ref(),
     )
@@ -9428,6 +9429,9 @@ mod mcp_receive_tests;
 
 #[cfg(test)]
 mod fabric_transit_tests;
+
+#[cfg(test)]
+mod fabric_caller_key_tests;
 
 #[cfg(test)]
 mod variant_routing_tests;

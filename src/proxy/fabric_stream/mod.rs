@@ -285,7 +285,8 @@ impl StreamRuntime {
                     .listen_address,
             ),
             crate::mcp::request_validation::McpPathKind::FabricReceive,
-        )?;
+        )?
+        .with_browser_origins(&surface.browser_origins);
         // The peer is authenticated and the route resolved, so a refused caller
         // header (such as an untrusted Origin) is answered on the stream the way
         // a direct endpoint answers it, instead of leaving the sender to time out.

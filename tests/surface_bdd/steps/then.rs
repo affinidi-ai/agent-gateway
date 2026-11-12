@@ -656,6 +656,25 @@ fn named_managed_agent_did_not_receive_header(
     assert_collaborator_header_absent(&request.headers, &header_name, &format!("managed agent '{}'", agent_name));
 }
 
+#[then(expr = "managed agent {string} received no header with value {string}")]
+fn named_managed_agent_received_no_header_with_value(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    value: String,
+) {
+    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    for request in get_observed_target_requests(target, &agent_name) {
+        assert!(
+            !request
+                .headers
+                .values()
+                .any(|received| received == &value),
+            "managed agent '{agent_name}' received a header with value '{value}'; headers: {:?}",
+            request.headers
+        );
+    }
+}
+
 /// The caller key the gateway derives for the caller whose token's `sub` is `subject` on the
 /// surface under test: HKDF-SHA256 over the fixture's secret, with salt
 /// `agent-gateway-caller-key-v2` and as info the surface id, the strategy's key source

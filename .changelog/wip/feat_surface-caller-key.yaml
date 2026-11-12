@@ -22,7 +22,11 @@ changes:
         characters) or one the surface already uses, invalid claims, and a secret of fewer than
         32 bytes; a PUT that leaves the setting out, as a Surface Builder save does, keeps it.
         Log redaction treats `caller_key` fields and attributes as credentials.
-  changed:
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking:
     - timestamp: '2026-11-12T12:00:00Z'
       title: Stop forwarding any x-caller-key header a caller sends, on every surface
       description: >-
@@ -33,7 +37,3 @@ changes:
         `caller_key`, so no caller can supply or spoof a caller key and no surface's choice of
         header affects another's traffic. A Target that read such a header from its callers must
         take it under another name.
-  fixed: []
-  removed: []
-  security: []
-  breaking: []

@@ -1578,7 +1578,10 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
 - **Where it is sent.** On the request to an HTTP(S) Target, from the Access Point and on Fabric
   receive, where the receiving gateway derives it for the JWT it verified. A `fabric://` Target
   is not sent the sending gateway's key; a `proxy://` MCP proxy's backend and an `a2a-proxy://`
-  backend are sent none.
+  backend are sent none, and a REST MCP proxy tool argument cannot set a header of the caller key
+  family. As a Target credential, the key follows `credential_policy.target_https`: an `http`
+  Target gets none under `enforce`, and gets it with a logged warning under `warn`. A save warns
+  when a Target of the surface or a variant is `http` or never receives a key.
 - **A caller cannot supply one.** A surface's caller key header is always of the caller key
   family: `x-caller-key`, or `x-caller-key-` followed by lower-case words, such as
   `x-caller-key-memory`. The Access Point, mirror, Fabric send and receive, Transit Point, agent
@@ -1594,7 +1597,13 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   that read such a header from its callers must take it under another name.
 - **When the secret cannot be read.** A missing secret, one outside the surface's tenant, one of
   fewer than 32 bytes, or a secrets store that fails, leaves the header out and logs a warning
-  naming the surface and the reason, never the secret. The request is forwarded.
+  naming the surface and the reason, never the secret, and counts it in
+  `agent_gateway_caller_key_secret_unreadable_total` (see
+  [Caller key secret metric](OBSERVABILITY.md#caller-key-secret-metric)). The request is
+  forwarded.
+- **The secret must be random.** A save checks only its length, so a typed 32-character
+  passphrase passes; anyone who guesses the secret can derive every caller's key. Make it at
+  least 32 random bytes, such as the output of `openssl rand -base64 32`.
 - **The secret stays in the store.** The surface holds only its `secret_id`; the value is read
   from the secrets store for each derivation, and is never logged or returned by the admin API. Deleting a secret a
   surface's `caller_key` names is refused with `409` unless forced, as for any other secret a

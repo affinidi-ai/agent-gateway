@@ -109,18 +109,37 @@ of their own. Both are counted on each gateway node. See
 A browser page can call a surface only from an allowed origin. `network.cors` in `gateway.json` lists
 origins allowed for every path the gateway serves and is read once, at startup. A surface owner who hosts
 a static page on their own domain, such as a chat page for an A2A agent, lists that origin on the surface
-instead, in `browser_origins`, with no `gateway.json` edit and no restart.
+instead, in `browser_origins`, with no `gateway.json` edit and no restart. On an MCP surface the same
+list also passes the MCP Origin check, so nothing else needs setting there either.
 
 | Field | Behaviour |
 | --- | --- |
-| `browser_origins` | A list of at most 20 exact origins: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo and any other scheme are refused with a `400` naming `browser_origins`. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+| `browser_origins` | A list of at most 20 exact origins, each at most 256 bytes: `https`, a host, an optional port, and nothing else. A wildcard, a path (a trailing `/` included), a query, a fragment, userinfo, any other scheme and a longer entry are refused with a `400` naming `browser_origins` and quoting the entry escaped. Each is stored in the form the URL parser normalises it to (the host in lower case, the default port `443` dropped), and a duplicate is dropped. Absent or empty, the surface behaves as before. A `PUT` that leaves it out keeps the stored list, so a Surface Builder save keeps it; `[]` clears it, with `PUT` or `PATCH`. Set it on the surface itself; a variant has no list of its own and uses its surface's. |
+
+The same rules hold for a surface stored on disk, such as one edited by hand under `_storage/`: on load
+each entry is normalised, and an invalid entry, a duplicate or one past the 20th is dropped and logged as
+a warning naming the surface; the surface itself still loads.
 
 A cross-origin request, a preflight included, to a path that belongs to a surface is allowed when its
 `Origin` is in `network.cors` or in that surface's `browser_origins`. A path belongs to the surface whose
-route is the longest prefix of it, as when the gateway serves the request. A path that belongs to no
-surface uses `network.cors` only, and the public discovery documents keep their any-origin rule for
-`GET` and `HEAD`. An origin on one surface's list gets nothing on another surface, and a disabled or
-deleted surface allows none.
+route is the longest prefix of it, as when the gateway serves the request, under a `network.channels`
+prefix or a `network.routes` entry of type `proxy`. A path that belongs to no surface uses `network.cors`
+only, and the public discovery documents keep their any-origin rule for `GET` and `HEAD`. An origin on one
+surface's list gets nothing on another surface, and a disabled or deleted surface allows none, from the
+moment the gateway stops serving it. Protected resource metadata
+(`/.well-known/oauth-protected-resource`) is not a surface path: where a channel prefix of `/` or
+`/.well-known` also serves it, only `network.cors` applies to it, and elsewhere any origin may read it.
+
+On an MCP surface a request's `Origin`, when present, must also pass the MCP Origin check (see
+[`MCP_METADATA.md`](MCP_METADATA.md)): it admits the gateway's own external URLs,
+`mcp_http.allowed_origins` and the surface's `browser_origins`, and refuses any other with `403`. Over a
+framed Fabric stream the receiving surface's lists decide.
+
+Each save that changes the list records a `browser_origins_changed` audit event with the list before and
+after it (see [`OBSERVABILITY.md`](OBSERVABILITY.md)). A tenant-scoped PAT that may update the surface
+may set the list: whoever owns a surface decides which pages may call it, as they decide its other
+settings, and the list opens the surface to those pages only, never to another surface. An origin whose
+domain later changes hands keeps its access until it is removed from the list.
 
 `Access-Control-Allow-Credentials` is never sent, so a page's cookies and HTTP credentials do not go with
 the request; it authenticates the way any other caller does, with the credential the surface's Access Point
@@ -1021,7 +1040,7 @@ admin API; a variant cannot override it.
 
 | Field | Default | Behaviour |
 | --- | --- | --- |
-| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
+| `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. The secret is the only thing that keeps anyone from deriving every caller's key, so make it at least 32 random bytes, such as the output of `openssl rand -base64 32`, never a typed passphrase. |
 | `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
 | `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
 
@@ -1046,7 +1065,11 @@ credential or whose credential failed on a public Access Point, and no token wit
 `iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
 starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
 gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
-used such a header for its own purposes can no longer send it through. A PUT that leaves
+used such a header for its own purposes can no longer send it through. The key follows
+`credential_policy.target_https` as a Target credential does: to an `http` Target it is withheld
+under `enforce` and sent with a logged warning under `warn`. A save answers with a `Warning` when
+the surface's Target, or a variant's, is `http`, or is one that never receives a key
+(`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent). A PUT that leaves
 `caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 

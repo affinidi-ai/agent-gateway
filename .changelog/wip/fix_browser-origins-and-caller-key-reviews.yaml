@@ -1,0 +1,82 @@
+branch: fix/browser-origins-and-caller-key-reviews
+changes:
+  added:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Count requests forwarded without a caller key because its secret is unreadable
+      description: >-
+        `agent_gateway_caller_key_secret_unreadable_total{surface_id,reason}` counts each request
+        on a surface with `caller_key` that is forwarded without its key because the secret could
+        not be read (no store, a store error, a missing secret, one outside the surface's tenant
+        or one under 32 bytes), so a sustained secrets-store failure can be alerted on rather than
+        found only in the logs.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Audit each save that changes a surface's browser origins
+      description: >-
+        A create, PUT or PATCH that changes `browser_origins` now records a
+        `browser_origins_changed` audit event (group Auth) with the list before and after it and
+        the management caller, so a standing grant of browser access to an origin can be traced.
+  changed:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Normalise stored browser origins on load and drop invalid ones
+      description: >-
+        A surface loaded from disk, such as one edited by hand under `_storage/`, now gets the
+        same `browser_origins` rules as an admin API save: each entry is normalised, and an
+        invalid one (an `http` origin among them), a duplicate or one past the 20th is dropped
+        with a warning naming the surface. Before, such entries were kept as written, so a
+        mixed-case origin never matched and an `http` origin was honoured.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Warn on saving a caller key its Target never or only in clear receives
+      description: >-
+        Saving a surface whose `caller_key` its Target, or a variant's, never receives
+        (`fabric://`, `proxy://`, `a2a-proxy://`, or bound by external consent), or whose Target
+        is `http`, now answers with a `Warning` naming the variant, so an operator sees the
+        setting has no effect or sends keys in clear.
+  fixed:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Keep a surface's browser origins when the Surface Builder saves it
+      description: >-
+        A PUT that leaves `browser_origins` out, as every Surface Builder save does, wiped the
+        list, so origins set through the API stopped working after any dashboard save. It now
+        keeps the stored list; `[]` still clears it.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Admit an MCP surface's browser origins on its calls, not only on the preflight
+      description: >-
+        On an MCP surface the preflight from a listed browser origin passed, but the call itself
+        was refused with `403` by the MCP Origin check, which read only
+        `mcp_http.allowed_origins`. That check now also admits the surface's `browser_origins`,
+        on its Access Point and its framed Fabric stream receiver; an entry that is not an exact
+        origin is ignored there.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Apply browser origins on network routes of type proxy
+      description: >-
+        A surface served under a `network.routes` entry of type `proxy` ignored its
+        `browser_origins` and used `network.cors` only. Such routes now apply the surface's list
+        as `network.channels` prefixes do.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Refuse browser origins of a surface the gateway no longer serves
+      description: >-
+        Right after a surface was disabled or deleted, a page on one of its browser origins could
+        still pass the CORS check until the route list caught up. The check now also refuses a
+        surface the gateway has stopped serving.
+  removed: []
+  security:
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Hold caller keys to credential_policy.target_https like Target credentials
+      description: >-
+        A caller key was sent to an `http` Target even while `credential_policy.target_https`
+        was `enforce`, and with no warning under `warn`. It now follows the rule as a Target
+        credential does, on the Access Point and on Fabric receive: an `http` Target gets no key
+        under `enforce`, and gets it with a logged warning under `warn`.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Refuse a REST MCP proxy tool argument that sets an x-caller-key header
+      description: >-
+        A REST MCP proxy tool whose header parameter was named in the caller key family could
+        pass the caller's argument to its backend in that header. Such an argument is now
+        refused as invalid, so no caller can supply a caller key on any path.
+    - timestamp: '2026-11-13T12:00:00Z'
+      title: Cap browser origin entries at 256 bytes and escape them in refusals
+      description: >-
+        A `browser_origins` entry longer than 256 bytes is now refused before it is parsed, and
+        a refused entry is quoted escaped and capped in the `400` message and the log, so an
+        entry carrying CR or LF cannot forge log lines.
+  breaking: []
