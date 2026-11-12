@@ -18,7 +18,7 @@ folder of static files that the process serves.
 | [Storage](#storage) | A persistent, writable volume, with backups | Yes |
 | [Network](#network) | A public DNS name, a trusted TLS certificate, and a load balancer (recommended) | Yes |
 | [Outbound access](#outbound-access) | Egress to your agents and to each service you enable | Yes |
-| [Secrets](#secrets-and-keys) | A backup encryption key, an encryption-at-rest key for real credentials, and `AG_IDENTITY_HASH_PEPPER` for more than one instance | Yes |
+| [Secrets](#secrets-and-keys) | A backup encryption key, an encryption-at-rest key for real credentials, and `AG_IDENTITY_HASH_PEPPER` for more than one instance or consent confirmation | Yes |
 | [Time](#time) | NTP on the host | Yes |
 | [Fabric](#fabric) | A DIDComm mediator | Only to connect gateways |
 
@@ -229,7 +229,7 @@ proxy as before.
 | --- | --- | --- |
 | `backup_encryption_key` | Yes. The gateway does not start without it. | 64 hex characters, for example `openssl rand -hex 32`. Prefer `file://` with a mounted secret, so the key does not appear in the process environment or `docker inspect`. |
 | Encryption-at-rest key | When the gateway holds real credentials | A 32-byte key. A configuration from `--generate-bootstrap` has encryption at rest off, so `_storage/` holds secrets in plain text until you turn it on. The development setup turns it on for the environments it creates. Choose the key source before the gateway stores data. See [Secrets and encryption at rest](CAPABILITIES.md#secrets-and-encryption-at-rest). |
-| `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance or keep grants by binding (`consent_mode: external`); otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. |
+| `AG_IDENTITY_HASH_PEPPER` | Required when you run more than one instance, keep grants by binding (`consent_mode: external`) or use consent confirmation on a credential provider; otherwise recommended | At least 64 hex characters (32 bytes), for example `openssl rand -hex 32`, with the same value on every instance. Without it, DIDs derived from mTLS, API key or JWT-claim credentials change on every restart, and with encryption at rest off, OAuth consent started before a restart or on another instance fails. A provider with consent confirmation cannot be saved without it, and if it is lost on a redeploy that provider gives JWT callers no consent link. |
 
 Store the backup key and the encryption-at-rest key away from the backups. Losing either
 key makes the backups or `_storage/` unreadable. See [Secret references](CONFIGURATION_REFERENCE.md#secret-references)
