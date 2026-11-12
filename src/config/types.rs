@@ -2588,6 +2588,10 @@ pub struct TrustRecorderEntry {
     /// without a distinct authority the recorder degenerates to
     /// self-assertion, which some trust registries reject.
     pub authority_did: String,
+    /// The register `authority_did` was picked from. Absent on the
+    /// `{{ surface.issuer_did }}` template and on an entry not yet classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_source: Option<crate::trust_registry_verification::authority_source::AuthoritySource>,
     /// authority=<authority_did>, entity=<agent DID>, action="is", resource="ownedAgent"
     #[serde(default = "default_false")]
     pub include_owned_agent: bool,
@@ -3271,6 +3275,14 @@ pub struct BootstrapConfig {
     /// the file's.
     #[serde(skip)]
     pub pinned_external_consent_issuers: Option<Option<std::collections::HashMap<String, Vec<String>>>>,
+
+    /// `gateway.json`'s `external_consent_issuer_patterns` as the gateway
+    /// started with it, set or not
+    /// ([`Self::pin_external_consent_issuer_patterns`]); `None` until pinned.
+    /// Every later load of `gateway.json` takes this value instead of the
+    /// file's.
+    #[serde(skip)]
+    pub pinned_external_consent_issuer_patterns: Option<Option<Vec<crate::config::network::IssuerPattern>>>,
 
     /// VP Audit Log rotation (`[audit]`). Omitted from a generated
     /// `config.toml` while it holds the defaults.

@@ -102,7 +102,10 @@ standard DID tooling such as the Universal Resolver. Its own DID is served at
 `/.well-known/did.jsonl`, each managed agent's under `/dids/{path}/did.jsonl`, and surfaces,
 issuers, trust registries, and Connection Points each at their own path. Each document
 carries the verification methods and service endpoints another system needs to check a
-signature.
+signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
+their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
+Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
+already has one keeps publishing the document it was created with.
 
 ## Federation across organisations
 
@@ -186,8 +189,9 @@ Several independent layers, evaluated before a request is forwarded.
 
 A closed Access Point, which the admin API creates by default, refuses a missing or invalid
 caller credential with a `401` before policy and the Target; until it has caller
-authentication it is not ready and refuses every request with a `503`. On a public or legacy Access
-Point the request continues with no caller identity and the failure is passed to policy, so
+authentication it is not ready and refuses every request with a `503`. A legacy Access Point
+(stored without `public`) refuses a failed caller with `401` too. Only on a public Access
+Point does the request continue with no caller identity and the failure is passed to policy, so
 such a surface that must reject unauthenticated callers needs a policy that denies them. An
 MCP Access Point that publishes protected resource metadata always refuses the request with
 a `401`, direct or over Fabric; a direct request's challenge points at that metadata. See

@@ -9,8 +9,8 @@ Feature: Trust Check on the Access Point request edge
   include NOT_RECOGNIZED, NOT_AUTHORIZED, TRUST_REGISTRY_UNREACHABLE,
   QUERY_FAILED, QUERY_TIMEOUT, TRUST_REGISTRY_PROBLEM_REPORT,
   TRUST_REGISTRY_PARSE_ERROR, TEMPLATE_RESOLUTION_FAILED,
-  AGENT_CARD_UNAVAILABLE, TARGET_AGENT_IDENTITY_UNAVAILABLE, and
-  IDENTITY_VP_VERIFICATION_FAILED.
+  AGENT_CARD_UNAVAILABLE, TARGET_AGENT_IDENTITY_UNAVAILABLE,
+  IDENTITY_VP_VERIFICATION_FAILED, and AUTHORITY_NOT_FOUND.
 
   Background:
     Given an A2A surface targeting managed agent "bravo"
@@ -85,3 +85,15 @@ Feature: Trust Check on the Access Point request edge
     And managed agent "bravo" was not called
     And the caller Trust Check for trust registry "alpha-registry" of type "recognition" reported result "error"
     And the caller Trust Check reported error code "TEMPLATE_RESOLUTION_FAILED"
+
+  # ── Deleted Authority ──────────────────────────────────────────────
+
+  Scenario: A Trust Check whose Authority no longer exists fails without asking its trust registry
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "{{ input.agent.did }}"
+    And the caller-leg Trust Check takes its authority from an Authority that no longer exists
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And managed agent "bravo" was not called
+    And the caller Trust Check reported error code "AUTHORITY_NOT_FOUND"

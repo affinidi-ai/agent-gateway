@@ -405,20 +405,31 @@ impl FilesystemIdentityStore {
     }
 
     /// Moves the record's inline rotations to its rotation history, then saves the record.
-    /// The history is cut to the record's `rotation_count` first, so rotations saved to a
-    /// history whose record save then failed are not kept twice.
+    /// Rotations saved to a history whose record save then failed are not kept twice: the
+    /// history is cut to the record's `rotation_count`, or, while that is 0, inline rotations
+    /// already at its end are dropped.
     async fn persist(
         &self,
         record: &mut AgentIdentityRecord,
     ) -> Result<()> {
         if !record.rotations.is_empty() {
-            let mut rotations = self
-                .stored_rotations(record)
-                .await?;
+            let (mut rotations, already_saved) = if record.rotation_count == 0 {
+                self.uncounted_rotations(record)
+                    .await?
+            } else {
+                (
+                    self.stored_rotations(record)
+                        .await?,
+                    0,
+                )
+            };
+            record
+                .rotations
+                .drain(..already_saved);
             rotations.append(&mut record.rotations);
             record.rotation_count = rotations.len();
             self.rotation_storage
-                .save(&RotationHistory {
+                .save_atomic(&RotationHistory {
                     identity_hash: record.identity_hash.clone(),
                     rotations,
                 })
@@ -453,6 +464,58 @@ impl FilesystemIdentityStore {
         }
         rotations.truncate(record.rotation_count);
         Ok(rotations)
+    }
+
+    /// The rotation history of a record that counts none, kept when one exists: a release
+    /// that does not track `rotation_count` drops it when it saves the record. Also returns
+    /// how many of the record's inline rotations are already at the end of that history,
+    /// saved there before a failed record save, so the caller does not keep them twice.
+    /// Rotations are matched by value, which is sound because a credential's `updated_at`
+    /// only moves forward: a new rotation equals the history's tail only when it is that
+    /// rotation, saved there before a failed record save. A rotation saved before a failed
+    /// record save stays when the credential rotates again before the retry, since nothing
+    /// tells it apart from the kept history; it shows as one extra version. A history that
+    /// does not decrypt or parse is replaced, as it was before such a history was kept, since
+    /// nothing counts it. Any other read failure, such as a disk or key service outage, fails
+    /// the write, so a history that may read again is never replaced.
+    async fn uncounted_rotations(
+        &self,
+        record: &AgentIdentityRecord,
+    ) -> Result<(Vec<CredentialRotation>, usize)> {
+        let rotations = match self
+            .rotation_storage
+            .get(&record.identity_hash)
+            .await
+        {
+            Ok(history) => history
+                .map(|history| history.rotations)
+                .unwrap_or_default(),
+            Err(e) if !e.is::<crate::storage::filesystem::UnreadableRecord>() => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    identity_hash = %record.identity_hash,
+                    error = %e,
+                    "Replacing the unreadable rotation history of a record that counts no rotations"
+                );
+                return Ok((Vec::new(), 0));
+            }
+        };
+        if rotations.is_empty() {
+            return Ok((rotations, 0));
+        }
+        tracing::warn!(
+            identity_hash = %record.identity_hash,
+            stored = rotations.len(),
+            "Keeping the identity rotation history of a record that counts no rotations"
+        );
+        let already_saved = (1..=record
+            .rotations
+            .len()
+            .min(rotations.len()))
+            .rev()
+            .find(|&n| rotations.ends_with(&record.rotations[..n]))
+            .unwrap_or(0);
+        Ok((rotations, already_saved))
     }
 
     async fn save_record(
@@ -1810,6 +1873,277 @@ mod tests {
             .map(|rotation| rotation.rotated_at)
             .collect();
         assert_eq!(rotated_at, vec![Some(at(60)), Some(at(120))]);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_history_of_a_record_without_rotation_count_is_kept_on_its_next_rotation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        store
+            .apply_managed_source("h", &observed(60), &api_key_fields())
+            .await
+            .unwrap();
+        let record_path = temp_dir.path().join("h.json");
+        let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("rotation_count");
+        std::fs::write(&record_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+
+        store
+            .apply_managed_source("h", &observed(120), &api_key_fields())
+            .await
+            .unwrap();
+
+        let rotated_at: Vec<_> = store
+            .rotations("h")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|rotation| rotation.rotated_at)
+            .collect();
+        assert_eq!(rotated_at, vec![Some(at(60)), Some(at(120))]);
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.rotation_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_unreadable_history_of_a_record_without_rotation_count_is_replaced_on_its_next_rotation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        std::fs::write(
+            temp_dir
+                .path()
+                .join(ROTATION_HISTORY_DIR)
+                .join("h.json"),
+            b"{\"identity_hash\":\"h\",\"rotat",
+        )
+        .unwrap();
+
+        store
+            .apply_managed_source("h", &observed(60), &api_key_fields())
+            .await
+            .unwrap();
+
+        let rotated_at: Vec<_> = store
+            .rotations("h")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|rotation| rotation.rotated_at)
+            .collect();
+        assert_eq!(rotated_at, vec![Some(at(60))]);
+    }
+
+    #[tokio::test]
+    async fn test_history_of_a_record_without_rotation_count_that_fails_to_load_is_not_replaced() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        let history_dir = temp_dir
+            .path()
+            .join(ROTATION_HISTORY_DIR);
+        std::fs::write(history_dir.join("h.json.enc"), b"encrypted history").unwrap();
+
+        let result = store
+            .apply_managed_source("h", &observed(60), &api_key_fields())
+            .await;
+
+        assert!(result.is_err(), "a read failure other than a torn file fails the rotation");
+        assert!(
+            !history_dir
+                .join("h.json")
+                .exists(),
+            "the history that may read again is not replaced"
+        );
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.rotation_count, 0);
+        assert_eq!(record.credential_updated_at, Some(at(0)));
+    }
+
+    #[tokio::test]
+    async fn test_rotation_saved_before_a_failed_first_record_save_is_not_kept_twice() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        store
+            .rotation_storage
+            .save(&RotationHistory {
+                identity_hash: "h".to_string(),
+                rotations: vec![CredentialRotation {
+                    rotated_at: Some(at(60)),
+                    previous: std::collections::HashMap::new(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        store
+            .apply_managed_source("h", &observed(60), &api_key_fields())
+            .await
+            .unwrap();
+
+        let rotated_at: Vec<_> = store
+            .rotations("h")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|rotation| rotation.rotated_at)
+            .collect();
+        assert_eq!(rotated_at, vec![Some(at(60))]);
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.rotation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_rotation_saved_before_a_failed_record_save_stays_when_the_credential_rotates_again() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .create(credential_record(api_key_fields(), Some(at(0))))
+            .await
+            .unwrap();
+        store
+            .rotation_storage
+            .save(&RotationHistory {
+                identity_hash: "h".to_string(),
+                rotations: vec![CredentialRotation {
+                    rotated_at: Some(at(60)),
+                    previous: std::collections::HashMap::new(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        store
+            .apply_managed_source("h", &observed(120), &api_key_fields())
+            .await
+            .unwrap();
+
+        let rotated_at: Vec<_> = store
+            .rotations("h")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|rotation| rotation.rotated_at)
+            .collect();
+        assert_eq!(rotated_at, vec![Some(at(60)), Some(at(120))]);
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.rotation_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_record_without_rotation_count_merges_its_inline_rotations_into_kept_history_on_any_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut legacy = serde_json::to_value(credential_record(api_key_fields(), Some(at(120)))).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("rotation_count");
+        legacy["rotations"] = serde_json::json!([{ "rotated_at": at(120) }]);
+        std::fs::write(temp_dir.path().join("h.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let store = FilesystemIdentityStore::new(temp_dir.path())
+            .await
+            .unwrap();
+        store
+            .rotation_storage
+            .save(&RotationHistory {
+                identity_hash: "h".to_string(),
+                rotations: vec![CredentialRotation {
+                    rotated_at: Some(at(60)),
+                    previous: std::collections::HashMap::new(),
+                }],
+            })
+            .await
+            .unwrap();
+        let rotated_at = |rotations: Vec<CredentialRotation>| -> Vec<_> {
+            rotations
+                .into_iter()
+                .map(|rotation| rotation.rotated_at)
+                .collect()
+        };
+        assert_eq!(
+            rotated_at(
+                store
+                    .rotations("h")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            ),
+            vec![Some(at(120))],
+            "before a write only the inline rotations are listed"
+        );
+
+        store
+            .update_usage("h", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rotated_at(
+                store
+                    .rotations("h")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            ),
+            vec![Some(at(60)), Some(at(120))]
+        );
+        let record = store
+            .find_by_hash("h")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.rotations.is_empty());
+        assert_eq!(record.rotation_count, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

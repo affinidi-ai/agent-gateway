@@ -11,12 +11,19 @@ import { useSaveAction } from '../hooks/useSaveAction';
 import { deepLinks } from '../utils/deepLinks';
 import { DOCS_URL } from '../config/docs';
 import ClientAuthenticationSelect from './EditCredentialProviderPage/ClientAuthenticationSelect';
+import ConsentConfirmationSection from './EditCredentialProviderPage/ConsentConfirmationSection';
 import JwtAssertionSection from './EditCredentialProviderPage/JwtAssertionSection';
 import { SecretOption as Secret, SecretOptions } from './EditCredentialProviderPage/SecretSelect';
 import { splitByTenant, type OwnerTenant } from '../utils/tenantScope';
 import {
+  ConsentConfirmationFormFields,
   CredentialProviderType,
+  EMPTY_CONSENT_CONFIRMATION_FIELDS,
   EMPTY_JWT_FIELDS,
+  consentConfirmationField,
+  consentConfirmationFieldsOf,
+  consentConfirmationRedirectUri,
+  missingConsentConfirmationField,
   clientAuthenticationOf,
   JwtFormFields,
   entraRejectsResource,
@@ -31,7 +38,7 @@ import {
   isHttpsAddress,
 } from './EditCredentialProviderPage/credentialProviderForm';
 
-interface CredentialProviderForm extends JwtFormFields {
+interface CredentialProviderForm extends JwtFormFields, ConsentConfirmationFormFields {
   name: string;
   provider_id: string;
   provider_type: CredentialProviderType;
@@ -53,6 +60,8 @@ interface CredentialProviderForm extends JwtFormFields {
   resource: string;
   /** The issuer of an external consent provider, whose other settings are fixed. */
   issuer: string;
+  /** Whether an external consent provider's token requests send its resource; never sent on save. */
+  send_resource: boolean;
 }
 
 interface RoutingConfig {
@@ -80,7 +89,9 @@ const EMPTY_FORM: CredentialProviderForm = {
   callback_url: '',
   resource: '',
   issuer: '',
+  send_resource: true,
   ...EMPTY_JWT_FIELDS,
+  ...EMPTY_CONSENT_CONFIRMATION_FIELDS,
 };
 
 const EditCredentialProviderPage: React.FC = () => {
@@ -179,8 +190,10 @@ const EditCredentialProviderPage: React.FC = () => {
         callback_url: data.callback_url ?? '',
         resource: data.resource ?? '',
         issuer: data.issuer ?? '',
+        send_resource: data.send_resource ?? true,
         client_authentication: clientAuthenticationOf(data),
         ...jwtFieldsOf(data),
+        ...consentConfirmationFieldsOf(data),
       });
     } catch (e: any) {
       setError(e.message ?? 'Unknown error');
@@ -239,7 +252,12 @@ const EditCredentialProviderPage: React.FC = () => {
         return;
       }
 
-      const missing = form.issuer ? null : missingProviderField(form);
+      const missing = form.issuer
+        ? null
+        : (missingProviderField(form) ??
+          (usesConsentFlow && form.consent_confirmation_enabled
+            ? missingConsentConfirmationField(form)
+            : null));
       if (missing) {
         setError(missing);
         return;
@@ -290,6 +308,9 @@ const EditCredentialProviderPage: React.FC = () => {
 
       if (takesCallbackUrl && callbackUrl) {
         body.callback_url = callbackUrl;
+      }
+      if (!form.issuer) {
+        body.consent_confirmation = consentConfirmationField(form, usesConsentFlow);
       }
 
       const send = async (url: string, method: string, payload: unknown) => {
@@ -489,6 +510,17 @@ const EditCredentialProviderPage: React.FC = () => {
                 resource were checked against that server when it was created and are fixed: only
                 its name, description, default scopes and token refresh can be changed here. Create
                 a new provider to change anything else.
+              </div>
+            )}
+
+            {form.issuer && entraRejectsResource(form.token_endpoint, form.resource, form) && (
+              <div
+                className="alert alert-warning py-2"
+                role="status"
+                data-testid="credential-provider-entra-resource-warning"
+              >
+                <i className="fas fa-exclamation-triangle me-2" aria-hidden="true" />
+                {entraResourceMessage(form.resource, form)}
               </div>
             )}
 
@@ -716,6 +748,17 @@ const EditCredentialProviderPage: React.FC = () => {
                       </div>
                     )}
                   </div>
+                )}
+
+                {usesConsentFlow && (
+                  <ConsentConfirmationSection
+                    form={form}
+                    redirectUri={consentConfirmationRedirectUri(shownCallbackUrl)}
+                    secrets={secrets}
+                    ownerTenant={isNew ? null : ownerTenant}
+                    loadingSecrets={loadingSecrets}
+                    onChange={handleChange}
+                  />
                 )}
 
                 {form.provider_type === 'oauth2_jwt_bearer' && (

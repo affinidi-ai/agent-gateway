@@ -680,6 +680,14 @@ pub async fn surface_requires_api_key(
     });
 }
 
+#[given(expr = "surface {string} is stored as a legacy surface")]
+fn surface_is_stored_as_a_legacy_surface(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).legacy_access_point = true;
+}
+
 /// Saves the surface through its gateway's admin API with
 /// `access_point.public: false`, the state a surface created through the
 /// admin API has: its Access Point refuses a caller whose credential is
@@ -704,6 +712,16 @@ async fn operator_has_closed_the_access_point(
         .update_surface(&surface_id, &surface)
         .await
         .expect("close the Access Point");
+}
+
+/// Its Access Point hands a caller whose credential is missing or invalid to
+/// policy instead of refusing it.
+#[given(expr = "surface {string} is stored with a public Access Point")]
+fn surface_is_stored_with_a_public_access_point(
+    world: &mut G2gWorld,
+    surface_name: String,
+) {
+    surface_spec_mut(world, &surface_name).access_point_public = Some(true);
 }
 
 #[given(
@@ -887,6 +905,51 @@ fn remote_record_id(
         .remote_id(gw_index, peer_gw)
         .unwrap_or_else(|| panic!("gateway {gw_index} holds no Remote record for gateway {peer_gw}"))
         .to_string()
+}
+
+#[given(regex = r#"^managed agent "([^"]+)" compresses its replies with gzip (when asked|even when not asked)$"#)]
+pub fn managed_agent_compresses_its_replies(
+    world: &mut G2gWorld,
+    agent_name: String,
+    when: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    let stream = if when == "when asked" {
+        crate::bdd_support::mock_server::MockStream::GzipWhenAsked
+    } else {
+        crate::bdd_support::mock_server::MockStream::Gzip
+    };
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_gzip
+        .insert(surface_id, stream);
+}
+
+#[given(expr = "managed agent {string} serves an agent card")]
+pub fn managed_agent_serves_an_agent_card(
+    world: &mut G2gWorld,
+    agent_name: String,
+) {
+    let (gw_index, surface_id) = world.target(&agent_name);
+    world
+        .topology
+        .plan_mut(gw_index)
+        .mock_responses
+        .insert(
+            surface_id,
+            serde_json::json!({
+                "protocolVersion": "0.3.0",
+                "name": "g2g-target-agent",
+                "description": "A managed agent behind a paired gateway",
+                "url": "http://mock.local",
+                "version": "1.0.0",
+                "capabilities": {},
+                "defaultInputModes": ["text/plain"],
+                "defaultOutputModes": ["text/plain"],
+                "skills": []
+            }),
+        );
 }
 
 #[given(expr = "surface {string} serves an agent card naming agent DID {string}")]

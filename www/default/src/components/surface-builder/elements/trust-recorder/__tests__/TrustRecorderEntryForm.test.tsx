@@ -133,10 +133,12 @@ describe('TrustRecorderEntryForm — Authority dropdown', () => {
 
     expect(updateEntry).toHaveBeenCalledWith(0, {
       authority_did: 'did:webvh:scid:gateway.example:issuers:issuer-1',
+      authority_source: 'issuer',
     });
-    expect(updateEntry).not.toHaveBeenCalledWith(0, {
-      authority_did: 'did:webvh:scid:gateway.example',
-    });
+    expect(updateEntry).not.toHaveBeenCalledWith(
+      0,
+      expect.objectContaining({ authority_did: 'did:webvh:scid:gateway.example' })
+    );
   });
 
   it('de-duplicates a DID that is both an Authority and an Issuer (Authority wins)', () => {
@@ -577,5 +579,94 @@ describe('TrustRecorderFullscreenPanel — Issuer, Authority and Entity explaine
     expect(link).toHaveAttribute('target', '_blank');
     expect(link).toHaveAttribute('rel', 'noopener noreferrer');
     expect(link).toHaveTextContent('Read the Trust Recorder guide');
+  });
+});
+
+describe('TrustRecorderEntryForm — Authority source', () => {
+  const AUTHORITY: Authority = {
+    id: 'auth-1',
+    name: 'Payments Authority',
+    did: 'did:web:auth.example',
+    created_at: '2026-07-01T10:00:00Z',
+    updated_at: '2026-07-01T10:00:00Z',
+  };
+  const ISSUER: Issuer = {
+    id: 'issuer-1',
+    name: 'Acme Issuer',
+    did: 'did:web:acme-issuer.example',
+    created_at: '2026-07-01T10:00:00Z',
+    updated_at: '2026-07-01T10:00:00Z',
+  };
+  const GONE = 'did:web:deleted-authority.example';
+
+  it('writes authority_source "authority" when an Authority is picked', () => {
+    const updateEntry = jest.fn();
+    renderForm(baseProps({ authorities: [AUTHORITY], issuers: [ISSUER], updateEntry }));
+    fireEvent.click(screen.getByTestId('trust-recorder-entry-0-authority'));
+    fireEvent.click(screen.getByRole('option', { name: /Payments Authority/ }));
+    expect(updateEntry).toHaveBeenCalledWith(0, {
+      authority_did: AUTHORITY.did,
+      authority_source: 'authority',
+    });
+  });
+
+  it('removes authority_source when switching to Use surface Issuer', () => {
+    const updateEntry = jest.fn();
+    renderForm(
+      baseProps({
+        authorities: [AUTHORITY],
+        entry: baseEntry({ authority_did: AUTHORITY.did, authority_source: 'authority' }),
+        updateEntry,
+      })
+    );
+    fireEvent.click(
+      screen.getByTestId('trust-recorder-entry-0-authority-mode-surface-issuer-radio')
+    );
+    const patch = updateEntry.mock.calls[0][1];
+    expect(patch.authority_did).toBe('{{ surface.issuer_did }}');
+    expect(Object.prototype.hasOwnProperty.call(patch, 'authority_source')).toBe(true);
+    expect(patch.authority_source).toBeUndefined();
+  });
+
+  it('shows Configuration required for an entry whose Authority was deleted', () => {
+    renderForm(
+      baseProps({
+        authorities: [AUTHORITY],
+        entry: baseEntry({ authority_did: GONE, authority_source: 'authority' }),
+      })
+    );
+    expect(screen.getByTestId('trust-recorder-entry-0-authority')).toHaveTextContent(
+      'Deleted Authority'
+    );
+    const warning = screen.getByTestId('trust-recorder-entry-0-authority-missing');
+    expect(warning).toHaveTextContent('Configuration required');
+    expect(warning).toHaveTextContent(
+      'The Authority this entry uses no longer exists, so the entry writes no records until this is fixed.'
+    );
+    expect(warning).toHaveTextContent(GONE);
+  });
+
+  it('does not warn while the Authorities register has not loaded', () => {
+    renderForm(
+      baseProps({
+        authorities: [],
+        authoritiesLoaded: false,
+        entry: baseEntry({ authority_did: GONE, authority_source: 'authority' }),
+      })
+    );
+    expect(screen.queryByTestId('trust-recorder-entry-0-authority-missing')).toBeNull();
+  });
+
+  it('does not warn for a DID that is not from the Authorities register', () => {
+    renderForm(
+      baseProps({
+        authorities: [AUTHORITY],
+        entry: baseEntry({ authority_did: GONE, authority_source: 'did' }),
+      })
+    );
+    expect(screen.queryByTestId('trust-recorder-entry-0-authority-missing')).toBeNull();
+    expect(screen.getByTestId('trust-recorder-entry-0-authority')).toHaveTextContent(
+      'Custom (from JSON API)'
+    );
   });
 });

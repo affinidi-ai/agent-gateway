@@ -1,0 +1,20 @@
+branch: feat/sign-in-failed-event
+changes:
+  added:
+    - timestamp: '2026-11-10T13:00:00Z'
+      title: ⭐ Raise user.login_failed for failed console sign-ins and name the login method
+      description: >-
+        A new integration event, user.login_failed, is raised when a passkey sign-in reaches
+        credential verification and fails, and when a SAML response is rejected, so a SIEM or
+        Agent Watch can see failed sign-ins. It carries LOGIN_METHOD (passkey or saml) and
+        FAILURE_REASON (invalid_credential, not_approved, unknown_user or saml_rejected), and the
+        user variables only when the account exists, taken from the stored account; the username
+        a caller typed never leaves the appliance. user.login now carries LOGIN_METHOD too. The
+        answer a failed sign-in gets is unchanged. Failed sign-in deliveries are held to 10 of
+        the 100 background tasks, so a flood of failed sign-ins cannot starve other events. See
+        docs/INTEGRATIONS.md.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

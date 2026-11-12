@@ -2,12 +2,97 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use aws_sdk_dynamodb::Client as DynamoDbClient;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::{
     A2aConfig, ExtensionInspectionConfig, GatewayConfig, IntegrationConfig, LoggingConfig, McpConfig, TlsConfig,
 };
 use crate::storage::ConfigurationStore;
+
+/// Warnings raised while an item is parsed. The gateway reads its DynamoDB
+/// configuration before it installs its log subscriber, so a warning raised
+/// then is held until [`start_logging_warnings`] and logged at once afterwards.
+#[derive(Default)]
+struct DeferredWarnings {
+    started: bool,
+    pending: Vec<String>,
+}
+
+impl DeferredWarnings {
+    /// Holds `message` until logging starts, or hands it back to log now.
+    fn record(
+        &mut self,
+        message: String,
+    ) -> Option<String> {
+        if self.started {
+            Some(message)
+        } else {
+            self.pending.push(message);
+            None
+        }
+    }
+
+    /// Marks logging as started and returns the held messages, oldest first.
+    fn start(&mut self) -> Vec<String> {
+        self.started = true;
+        std::mem::take(&mut self.pending)
+    }
+}
+
+static DEFERRED_WARNINGS: Mutex<DeferredWarnings> = Mutex::new(DeferredWarnings {
+    started: false,
+    pending: Vec::new(),
+});
+
+fn warn_when_logging(message: String) {
+    let now = DEFERRED_WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .record(message);
+    if let Some(message) = now {
+        warn!("{message}");
+    }
+}
+
+/// Logs the warnings held while the DynamoDB configuration was read, and logs
+/// later ones at once. Call it right after the log subscriber is installed.
+pub fn start_logging_warnings() {
+    let held = DEFERRED_WARNINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .start();
+    for message in held {
+        warn!("{message}");
+    }
+}
+
+/// The type of an ignored `public` attribute's value; its content is never logged.
+fn describe_attribute(value: &aws_sdk_dynamodb::types::AttributeValue) -> &'static str {
+    use aws_sdk_dynamodb::types::AttributeValue;
+    match value {
+        AttributeValue::S(_) => "string",
+        AttributeValue::N(_) => "number",
+        AttributeValue::Null(_) => "null",
+        AttributeValue::M(_) => "map",
+        AttributeValue::L(_) => "list",
+        AttributeValue::B(_) => "binary value",
+        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_) => "set",
+        _ => "value of an unsupported type",
+    }
+}
+
+/// The warning for a `public` attribute of item `config_id` that holds `value`.
+fn ignored_public_message(
+    config_id: &str,
+    value: &aws_sdk_dynamodb::types::AttributeValue,
+) -> String {
+    format!(
+        "Ignoring the DynamoDB channel attribute 'public' of item '{config_id}': found {}, expected a boolean, or the \
+         string 'true' or 'false'; the surface keeps no Public access setting",
+        describe_attribute(value)
+    )
+}
 
 /// DynamoDB-based configuration store
 ///
@@ -16,7 +101,8 @@ use crate::storage::ConfigurationStore;
 /// - Sort Key: `config_id` (String) - e.g., channel name, or "default" for singleton configs
 ///
 /// Attributes depend on config_type:
-/// - For channels: name, description, listen_address, target_endpoint, managed_identity (with extension_rules for identity schema)
+/// - For channels: name, description, listen_address, target_endpoint, managed_identity (with extension_rules for identity schema),
+///   and an optional boolean `public` (`access_point.public`)
 /// - For tls: cert_path, key_path, verify_upstream
 /// - For a2a: default_version, max_body_size, timeout_seconds
 /// - For logging: level, json
@@ -150,6 +236,28 @@ impl DynamoDbConfigStore {
         }
     }
 
+    /// The item's `public` attribute, the surface's `access_point.public`: a
+    /// boolean, or the string `"true"` or `"false"`. `None` when it has none,
+    /// a legacy surface; any other value is logged and ignored.
+    fn parse_public(item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>) -> Option<bool> {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let value = item.get("public")?;
+        let public = match value {
+            AttributeValue::Bool(public) => Some(*public),
+            AttributeValue::S(text) if text == "true" => Some(true),
+            AttributeValue::S(text) if text == "false" => Some(false),
+            _ => None,
+        };
+        if public.is_none() {
+            let config_id = item
+                .get("config_id")
+                .and_then(|v| v.as_s().ok())
+                .map_or("", String::as_str);
+            warn_when_logging(ignored_public_message(config_id, value));
+        }
+        public
+    }
+
     /// Parse a DynamoDB item into an AgentSurface
     fn parse_channel_item(
         &self,
@@ -259,6 +367,7 @@ impl DynamoDbConfigStore {
                         protected_resource: None,
                         on_failure: crate::config::agent_surface::OnFailure::Continue,
                     }),
+                public: Self::parse_public(&item),
                 ..Default::default()
             },
             target: Target {
@@ -331,11 +440,119 @@ mod tests {
     use aws_sdk_dynamodb::types::AttributeValue;
     use std::collections::HashMap;
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(
+            &mut self,
+            buf: &[u8],
+        ) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_warning_raised_before_logging_starts_is_logged_once_when_it_starts() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::warn_when_logging("held-until-logging-starts-marker".to_string());
+            let before = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert!(!before.contains("held-until-logging-starts-marker"), "nothing is logged before the start");
+
+            super::start_logging_warnings();
+            super::start_logging_warnings();
+        });
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged
+                .matches("held-until-logging-starts-marker")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("WARN"), "{logged}");
+    }
+
     #[test]
     fn parse_channel_protocol_defaults_to_a2a_when_missing() {
         let item = HashMap::new();
         let protocol = DynamoDbConfigStore::parse_channel_protocol(&item).expect("protocol should parse");
         assert_eq!(protocol, crate::config::ChannelProtocol::A2a);
+    }
+
+    #[test]
+    fn warnings_recorded_before_logging_starts_are_held_and_flushed_in_order() {
+        let mut deferred = super::DeferredWarnings::default();
+
+        assert_eq!(deferred.record("first".to_string()), None);
+        assert_eq!(deferred.record("second".to_string()), None);
+        assert_eq!(deferred.start(), ["first".to_string(), "second".to_string()]);
+        assert_eq!(deferred.start(), Vec::<String>::new(), "a flush leaves nothing pending");
+    }
+
+    #[test]
+    fn warnings_recorded_once_logging_has_started_are_returned_to_log_at_once() {
+        let mut deferred = super::DeferredWarnings::default();
+        deferred.start();
+
+        assert_eq!(deferred.record("late".to_string()), Some("late".to_string()));
+        assert_eq!(deferred.start(), Vec::<String>::new(), "nothing is held back after the start");
+    }
+
+    #[test]
+    fn the_ignored_public_message_names_the_item_and_only_the_type_of_the_value() {
+        let message = |value: AttributeValue| super::ignored_public_message("orders", &value);
+
+        assert_eq!(
+            message(AttributeValue::S("yes".to_string())),
+            "Ignoring the DynamoDB channel attribute 'public' of item 'orders': found string, expected a \
+             boolean, or the string 'true' or 'false'; the surface keeps no Public access setting"
+        );
+        assert!(message(AttributeValue::N("1".to_string())).contains("found number,"));
+        assert!(message(AttributeValue::Null(true)).contains("found null,"));
+        assert!(message(AttributeValue::L(Vec::new())).contains("found list,"));
+    }
+
+    #[test]
+    fn the_ignored_public_message_never_contains_the_value() {
+        let map = AttributeValue::M(HashMap::from([("secret".to_string(), AttributeValue::S("hidden".to_string()))]));
+        for value in [map, AttributeValue::S("hunter2".to_string()), AttributeValue::N("424242".to_string())] {
+            let message = super::ignored_public_message("orders", &value);
+            for leaked in ["hidden", "secret", "hunter2", "424242"] {
+                assert!(!message.contains(leaked), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_public_reads_the_optional_boolean_attribute() {
+        assert_eq!(DynamoDbConfigStore::parse_public(&HashMap::new()), None, "missing: a legacy surface");
+        for public in [true, false] {
+            let item = HashMap::from([("public".to_string(), AttributeValue::Bool(public))]);
+            assert_eq!(DynamoDbConfigStore::parse_public(&item), Some(public));
+        }
+        for (text, public) in [("true", Some(true)), ("false", Some(false)), ("yes", None)] {
+            let item = HashMap::from([("public".to_string(), AttributeValue::S(text.to_string()))]);
+            assert_eq!(DynamoDbConfigStore::parse_public(&item), public, "string {text:?}");
+        }
+        let number = HashMap::from([("public".to_string(), AttributeValue::N("1".to_string()))]);
+        assert_eq!(DynamoDbConfigStore::parse_public(&number), None, "a number is not a boolean");
     }
 
     #[test]

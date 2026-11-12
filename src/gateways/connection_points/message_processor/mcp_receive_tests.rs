@@ -2872,7 +2872,8 @@ async fn sts_tenant_fabric_flow() {
 
 /// A closed Access Point refuses a Fabric caller without a valid credential
 /// before policy and the Target, in the caller's protocol shape, while a
-/// surface stored without `on_failure` still forwards it. A closed Access
+/// legacy surface stored without `public` or `on_failure` refuses it too; only
+/// a public one forwards it to policy. A closed Access
 /// Point stored without caller authentication is not ready and refuses every
 /// caller with `503`.
 async fn closed_access_point_fabric_flow() {
@@ -2940,6 +2941,7 @@ async fn closed_access_point_fabric_flow() {
         serde_json::from_value::<AgentSurface>(json!({
             "surface_id": id, "name": id,
             "access_point": {"listen_address": "https://gateway.example", "route": format!("/{id}"), "protocol": protocol,
+                "public": true,
                 "caller_authentication": {"methods": [{"type": "jwt_bearer", "jwt_verification_strategy_id": strategy.id, "audiences": []}]}},
             "target": {"endpoint": format!("http://{}", target.addr)},
             "identity_slots": {"inbound": {"type": "from_jwt_claim", "claim": "oid", "namespace_claims": []}}
@@ -2952,6 +2954,11 @@ async fn closed_access_point_fabric_flow() {
         surface("legacy-mcp", "mcp", None),
         from_jwt_claim("jwt-claim-mcp", "mcp"),
         from_jwt_claim("jwt-claim-a2a", "a2a"),
+        {
+            let mut public = surface("public-mcp", "mcp", None);
+            public.access_point.public = Some(true);
+            public
+        },
         not_ready("unready-mcp", "mcp"),
         not_ready("unready-a2a", "a2a"),
     ] {
@@ -3049,9 +3056,13 @@ async fn closed_access_point_fabric_flow() {
     assert_eq!(admitted["status"], 200, "{admitted}");
     assert_eq!(reached(), 1, "a valid caller reaches the Target");
 
-    let forwarded = send("legacy-mcp", Some(foreign_token)).await;
+    let refused = send("legacy-mcp", Some(foreign_token.clone())).await;
+    assert_eq!(refused["status"], 401, "{refused}");
+    assert_eq!(reached(), 1, "a legacy surface refuses a failed caller before the Target");
+
+    let forwarded = send("public-mcp", Some(foreign_token)).await;
     assert_eq!(forwarded["status"], 200, "{forwarded}");
-    assert_eq!(reached(), 2, "a surface stored without on_failure forwards a failed caller to policy");
+    assert_eq!(reached(), 2, "a public surface forwards a failed caller to policy");
 
     let valid = sign_jwt(json!({"iss": fixture.issuer, "sub": "user-1", "exp": now_secs() + 300}), &fixture.kid);
     for token in [None, Some(valid)] {
@@ -3320,7 +3331,7 @@ async fn fabric_tool_call_batch_flow() {
         assert_eq!(response["headers"]["content-type"], "application/problem+json", "{tool}");
         assert_eq!(
             body,
-            json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+            json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "code": "batch_not_supported", "detail": "JSON-RPC batches are not supported"}),
             "{tool}"
         );
         assert_eq!(

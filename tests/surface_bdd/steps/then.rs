@@ -310,6 +310,53 @@ fn agent_card_describes_a2a_proxy(
     );
 }
 
+fn served_card_url(world: &mut SurfaceWorld) -> String {
+    let response = get_caller_response(world);
+    response
+        .body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("agent card url must be present, got {}", response.body))
+        .to_string()
+}
+
+#[then("the agent card points callers at the surface Access Point")]
+fn agent_card_points_callers_at_the_access_point(world: &mut SurfaceWorld) {
+    let url = served_card_url(world);
+    let gateway_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .gateway_port;
+    let route = world
+        .surface_config
+        .route
+        .trim_end_matches('/');
+    assert_eq!(
+        url,
+        format!("http://localhost:{gateway_port}{route}"),
+        "agent card url should be the Access Point at route '{route}'"
+    );
+}
+
+#[then(expr = "the agent card points callers at Transit Point {string}")]
+fn agent_card_points_callers_at_transit_point(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+) {
+    let url = served_card_url(world);
+    let outbound_port = world
+        .infra
+        .as_ref()
+        .expect("scenario infra must be initialised before asserting on the agent card")
+        .outbound_port;
+    assert_eq!(
+        url,
+        format!("http://localhost:{outbound_port}/transit/{transit_point}"),
+        "agent card url should be Transit Point '{transit_point}'"
+    );
+}
+
 #[then(expr = "the agent card url points to the surface Access Point")]
 fn agent_card_url_points_to_surface_access_point(world: &mut SurfaceWorld) {
     let response = get_caller_response(world);
@@ -607,6 +654,97 @@ fn named_managed_agent_did_not_receive_header(
 ) {
     let request = get_observed_request_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
     assert_collaborator_header_absent(&request.headers, &header_name, &format!("managed agent '{}'", agent_name));
+}
+
+/// The caller key the gateway derives for the caller whose token's `sub` is `subject` on the
+/// surface under test: HKDF-SHA256 over the fixture's secret, with salt
+/// `agent-gateway-caller-key-v2` and as info the surface id, the strategy's key source
+/// (`jwks_uri:` and its JWKS URI), the audience claim, the sorted accepted audiences, `iss`,
+/// `sub` and `subject`, each field after its 4-byte big-endian length and each audience after
+/// its own; 32 bytes, base64url without padding.
+fn expected_caller_key(
+    world: &SurfaceWorld,
+    subject: &str,
+) -> String {
+    fn length_prefixed(field: &[u8]) -> Vec<u8> {
+        let mut prefixed = u32::try_from(field.len())
+            .expect("a short field")
+            .to_be_bytes()
+            .to_vec();
+        prefixed.extend_from_slice(field);
+        prefixed
+    }
+    let secret = world
+        .surface_config
+        .caller_key
+        .as_ref()
+        .and_then(|caller_key| {
+            caller_key
+                .secret_value
+                .as_deref()
+        })
+        .expect("the surface derives caller keys from a stored secret");
+    let config = match &world
+        .surface_config
+        .source_auth
+    {
+        Some(crate::world::SurfaceSourceAuthConfig::JwtBearer(config)) => config,
+        other => panic!("the surface must require JWT Bearer source authentication, got {other:?}"),
+    };
+    let mut audiences = config.audiences.clone();
+    audiences.sort();
+    audiences.dedup();
+    let audiences: Vec<u8> = audiences
+        .iter()
+        .flat_map(|audience| length_prefixed(audience.as_bytes()))
+        .collect();
+    let surface_id = crate::steps::credential_save::surface_id(world);
+    let key_source = format!("jwks_uri:{}", config.jwks_url);
+    let audience_claim = config
+        .audience_claim
+        .as_deref()
+        .unwrap_or("aud");
+    let info: Vec<u8> = [
+        surface_id.as_bytes(),
+        key_source.as_bytes(),
+        audience_claim.as_bytes(),
+        &audiences,
+        config.issuer.as_bytes(),
+        b"sub",
+        subject.as_bytes(),
+    ]
+    .into_iter()
+    .flat_map(length_prefixed)
+    .collect();
+    let mut key = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"agent-gateway-caller-key-v2"), secret.as_bytes())
+        .expand(&info, &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+}
+
+#[then(expr = "managed agent {string} received the caller key of {string} in header {string} on every request")]
+fn managed_agent_received_caller_key_on_every_request(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    subject: String,
+    header: String,
+) {
+    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let forwarded: Vec<_> = get_observed_target_requests(target, &agent_name)
+        .iter()
+        .filter(|request| !is_agent_card_discovery(request))
+        .collect();
+    assert!(!forwarded.is_empty(), "managed agent '{agent_name}' received no request");
+    let expected = expected_caller_key(world, &subject);
+    for request in forwarded {
+        assert_collaborator_header_value(
+            &request.headers,
+            &header,
+            &expected,
+            &format!("managed agent '{agent_name}'"),
+        );
+    }
 }
 
 #[then("the admin API response includes a surface id")]
@@ -976,6 +1114,50 @@ fn admin_api_error_response_mentions(
     expected: String,
 ) {
     assert_json_body_mentions(&get_admin_response(world).body, &expected, "admin API error response");
+}
+
+fn assert_neutral_problem_response(
+    world: &SurfaceWorld,
+    expected: &serde_json::Value,
+    context: &str,
+) {
+    assert_eq!(
+        get_response_headers_value(world)
+            .get("content-type")
+            .map(String::as_str),
+        Some("application/problem+json"),
+        "{context} content type"
+    );
+    assert_json_bodies_equal(get_response_body_value(world), expected, context);
+}
+
+#[then(expr = "the response says only that no surface is served at {string}")]
+fn response_says_only_no_surface_is_served_at(
+    world: &mut SurfaceWorld,
+    path: String,
+) {
+    let expected = serde_json::json!({
+        "type": "about:blank",
+        "title": "Not Found",
+        "status": 404,
+        "code": "no_route",
+        "detail": format!(
+            "No surface is served at {path}. Check the entry point URL, and that the surface is saved and enabled."
+        )
+    });
+    assert_neutral_problem_response(world, &expected, "route miss refusal");
+}
+
+#[then("the response says only that JSON-RPC batches are not supported")]
+fn response_says_only_batches_are_not_supported(world: &mut SurfaceWorld) {
+    let expected = serde_json::json!({
+        "type": "about:blank",
+        "title": "Unprocessable Entity",
+        "status": 422,
+        "code": "batch_not_supported",
+        "detail": "JSON-RPC batches are not supported"
+    });
+    assert_neutral_problem_response(world, &expected, "batch refusal");
 }
 
 #[then("the response says only that the Access Point is not available")]
@@ -1433,6 +1615,12 @@ fn response_body_is_error(
             "status": 502,
             "detail": "Upstream redirected"
         }),
+        "agent_card_upstream_compressed" => serde_json::json!({
+            "type": "https://a2a-protocol.org/errors/proxy-error",
+            "title": "Bad Gateway",
+            "status": 502,
+            "detail": "Upstream response is compressed"
+        }),
         other => panic!("unsupported expected response error: {}", other),
     };
 
@@ -1756,6 +1944,26 @@ fn agent_card_contains_credential(world: &mut SurfaceWorld) {
     assert!(
         uris.contains(&AGENT_IDENTITY_CREDENTIAL_URI),
         "agent card extensions should contain credential URI, got: {:?}",
+        uris
+    );
+}
+
+#[then("the agent card does not contain the credential extension")]
+fn agent_card_does_not_contain_credential(world: &mut SurfaceWorld) {
+    let body = get_response_body_value(world);
+    let uris: Vec<&str> = body
+        .pointer("/capabilities/extensions")
+        .and_then(|extensions| extensions.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|ext| {
+            ext.get("uri")
+                .and_then(|u| u.as_str())
+        })
+        .collect();
+    assert!(
+        !uris.contains(&AGENT_IDENTITY_CREDENTIAL_URI),
+        "agent card extensions should NOT contain credential URI, got: {:?}",
         uris
     );
 }
@@ -2875,6 +3083,36 @@ fn response_includes_header_with_value(
     assert_collaborator_header_value(get_response_headers_value(world), &header_name, &expected_value, "response");
 }
 
+#[then(expr = "the response carries no {string} header")]
+fn response_carries_no_header(
+    world: &mut SurfaceWorld,
+    header_name: String,
+) {
+    let headers = get_response_headers_value(world);
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case(&header_name)),
+        "response must not carry '{}'; headers: {:?}",
+        header_name,
+        headers
+    );
+}
+
+#[then(expr = "the created surface allows browser origins {string}")]
+fn created_surface_allows_browser_origins(
+    world: &mut SurfaceWorld,
+    expected: String,
+) {
+    let body = &get_admin_response(world).body;
+    let expected: Vec<&str> = expected.split(", ").collect();
+    assert_eq!(
+        body.pointer("/browser_origins"),
+        Some(&serde_json::json!(expected)),
+        "unexpected browser origins in {body}"
+    );
+}
+
 #[then(expr = "the response carries a non-empty {string} header")]
 fn response_carries_non_empty_header(
     world: &mut SurfaceWorld,
@@ -3472,12 +3710,17 @@ fn oauth_provider_received_refresh_request(
     );
 }
 
+/// Delegation audit records name a provider by its record id, which is not
+/// its `provider_id` slug when the gateway gave it an id of its own.
 #[then(expr = "the delegation audit trail contains event {string} for OAuth provider {string}")]
 async fn delegation_audit_trail_contains_event(
     world: &mut SurfaceWorld,
     event: String,
     provider: String,
 ) {
+    let record_id = world
+        .surface_config
+        .provider_record_id(&provider);
     let (found, events) = eventually_delegation_audit_events(world, |events| {
         events.iter().any(|entry| {
             entry
@@ -3487,11 +3730,31 @@ async fn delegation_audit_trail_contains_event(
                 && entry
                     .get("provider_id")
                     .and_then(|value| value.as_str())
-                    == Some(provider.as_str())
+                    == Some(record_id.as_str())
         })
     })
     .await;
-    assert!(found, "expected delegation audit event '{event}' for provider '{provider}', got {events:?}");
+    assert!(found, "expected delegation audit event '{event}' for provider '{provider}' ({record_id}), got {events:?}");
+}
+
+#[then(expr = "the delegation audit trail has no event {string} for OAuth provider {string}")]
+async fn delegation_audit_trail_has_no_event(
+    world: &mut SurfaceWorld,
+    event: String,
+    provider: String,
+) {
+    let events = read_delegation_audit_events(world).await;
+    let found = events.iter().find(|entry| {
+        entry
+            .get("event")
+            .and_then(|value| value.as_str())
+            == Some(event.as_str())
+            && entry
+                .get("provider_id")
+                .and_then(|value| value.as_str())
+                == Some(provider.as_str())
+    });
+    assert!(found.is_none(), "expected no delegation audit event '{event}' for provider '{provider}', got {found:?}");
 }
 
 #[then(expr = "the delegation audit trail records a refused consent for OAuth provider {string} with reason {string}")]

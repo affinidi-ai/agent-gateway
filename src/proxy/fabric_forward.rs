@@ -680,8 +680,18 @@ pub(crate) fn with_pinned_alias(
     }
 }
 
+/// Puts `Accept-Encoding: identity` in place of any value the caller sent, in
+/// the headers of a buffered `ForwardRequest`: the remote gateway carries the
+/// Target's answer back as text.
+pub(crate) fn ask_for_an_uncompressed_answer(headers: &mut HashMap<String, String>) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case("accept-encoding"));
+    headers.insert("ACCEPT-ENCODING".to_string(), "identity".to_string());
+}
+
 /// The body of the `ForwardRequest` sending `req` to `channel`, the part of
-/// the `fabric://` Target after the gateway id, with the alias it pins.
+/// the `fabric://` Target after the gateway id, with the alias it pins. The
+/// remote gateway carries the Target's answer back as text, so the Target is
+/// asked for an uncompressed one whatever the caller accepts.
 fn forward_request_body(
     channel: &str,
     req: &FabricForwardRequest<'_>,
@@ -689,12 +699,14 @@ fn forward_request_body(
     deadline_ms: u64,
 ) -> serde_json::Value {
     let (channel_id, variant_alias) = pinned_alias(channel);
+    let mut headers = req.headers.clone();
+    ask_for_an_uncompressed_answer(&mut headers);
     with_pinned_alias(
         serde_json::json!({
             "channel_id": channel_id,
             "method": req.method.as_str(),
             "path": req.path,
-            "headers": req.headers,
+            "headers": headers,
             "body": body,
             "trace_id": req.trace_id,
             "deadline_ms": deadline_ms,
@@ -1152,6 +1164,36 @@ mod tests {
             assert_eq!(body["channel_id"], surface, "{channel}");
             assert_eq!(body["virtual_channel_alias"], serde_json::json!(alias), "{channel}: {body}");
             assert_eq!(body["active_variant_alias"], serde_json::json!(alias), "{channel}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_forward_request_asks_the_target_for_an_uncompressed_answer() {
+        let method = Method::GET;
+        for caller in [None, Some(("accept-encoding", "gzip, br")), Some(("ACCEPT-ENCODING", "gzip"))] {
+            let mut headers = HashMap::from([("accept".to_string(), "application/json".to_string())]);
+            if let Some((name, value)) = caller {
+                headers.insert(name.to_string(), value.to_string());
+            }
+            let request = FabricForwardRequest {
+                fabric_target: "",
+                method: &method,
+                path: "/.well-known/agent-card.json",
+                headers,
+                body: Bytes::new(),
+                timeout: Duration::from_secs(1),
+                trace_id: "trace",
+                log_label: "Orders",
+                extra_body: None,
+            };
+
+            let body = forward_request_body("orders", &request, serde_json::Value::Null, 0);
+
+            assert_eq!(
+                body["headers"],
+                serde_json::json!({"accept": "application/json", "ACCEPT-ENCODING": "identity"}),
+                "{caller:?}"
+            );
         }
     }
 

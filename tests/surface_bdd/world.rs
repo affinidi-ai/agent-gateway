@@ -13,13 +13,24 @@ use crate::bdd_support::gateway_process::GatewayProcess;
 use crate::bdd_support::http::collect_headers;
 use crate::bdd_support::jwt::JwksServer;
 use crate::bdd_support::mock_server::{MockResponse, MockServer, ReceivedRequest};
+use crate::bdd_support::oidc::OidcProvider;
+use crate::bdd_support::passkey::SoftPasskey;
+use crate::bdd_support::redis_stream::RedisStreamStandIn;
 use crate::bdd_support::temp::TempDirGuard;
 
+/// A passkey sign-in the gateway issued a challenge for.
+#[derive(Debug, Clone)]
+pub struct StartedSignIn {
+    pub username: String,
+    pub challenge_id: String,
+    pub request_options: serde_json::Value,
+}
+
 pub use crate::bdd_support::config::single_surface_fixture::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder, SurfaceCredentialDelegationConfig,
-    SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig,
-    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceConfigBuilder,
+    SurfaceCredentialDelegationConfig, SurfaceCustomMetadataConfig, SurfaceSourceAuthConfig, SurfaceTargetAuthConfig,
+    SurfaceTransitPointConfig, TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig,
 };
 
 use tempfile::TempDir;
@@ -155,6 +166,8 @@ pub struct SurfaceWorld {
     pub oauth_binding_cookie: Option<String>,
     /// The state the vendor got after the caller confirmed the consent start page.
     pub oauth_confirmed_state: Option<String>,
+    /// Where the identity provider sends the caller back to the gateway after they signed in.
+    pub consent_confirmation_callback: Option<String>,
     /// The transit token the managed agent sends on its Transit Point calls.
     pub transit_token: Option<String>,
     /// The last HTTP response from a transit point discovery request.
@@ -177,6 +190,8 @@ pub struct SurfaceWorld {
     pub surface_config_transit_points: HashMap<String, String>,
     /// Whether transit token is required for all requests.
     pub requires_transit_token: bool,
+    /// The ids of the credential providers the operator created, by `provider_id` slug.
+    pub credential_provider_ids: HashMap<String, String>,
     /// A surface the operator is about to save through the admin API.
     pub surface_draft: Option<serde_json::Value>,
     /// URL of the transit point mock server for discovery tests (dynamic, set by GIVEN step).
@@ -185,6 +200,16 @@ pub struct SurfaceWorld {
     pub personal_access_token_client: Option<reqwest::Client>,
     /// API keys the scenario created, by scenario name: the owning surface id and the key id.
     pub api_keys: HashMap<String, (String, String)>,
+    /// The Redis stream an integration delivers sign-in events to.
+    pub sign_in_stream: Option<RedisStreamStandIn>,
+    /// The passkeys console users registered in the scenario, by username.
+    pub passkeys: HashMap<String, SoftPasskey>,
+    /// The passkey sign-in started last and not yet finished.
+    pub started_sign_in: Option<StartedSignIn>,
+    /// The event payload a sign-in step last found on the Redis stream.
+    pub sign_in_event: Option<serde_json::Value>,
+    /// The payload with Agent Watch's record content a sign-in step last found on the stream.
+    pub sign_in_record: Option<serde_json::Value>,
     /// Client certificates the scenario stored through the admin API, by scenario name: the
     /// stored certificate id.
     pub client_certificates: HashMap<String, String>,
@@ -257,6 +282,7 @@ impl SurfaceWorld {
             oauth_callback_query: None,
             oauth_binding_cookie: None,
             oauth_confirmed_state: None,
+            consent_confirmation_callback: None,
             transit_token: None,
             last_response: None,
             target_received_request: false,
@@ -268,10 +294,16 @@ impl SurfaceWorld {
             request_source_ip: None,
             surface_config_transit_points: HashMap::new(),
             requires_transit_token: false,
+            credential_provider_ids: HashMap::new(),
             surface_draft: None,
             transit_point_discovery_mock_url: None,
             personal_access_token_client: None,
             api_keys: HashMap::new(),
+            sign_in_stream: None,
+            passkeys: HashMap::new(),
+            started_sign_in: None,
+            sign_in_event: None,
+            sign_in_record: None,
             client_certificates: HashMap::new(),
             temp_dir: get_default_temp_dir(),
             debug: is_debug,
@@ -609,6 +641,8 @@ pub struct ScenarioInfra {
     pub transit_point_mocks: HashMap<String, MockServer>,
     pub affinidi_well: Option<MockServer>,
     pub _jwks_server: Option<JwksServer>,
+    /// The callers' identity provider, where a consent confirmation signs the person in.
+    pub identity_provider: Option<OidcProvider>,
     pub gateway_port: u16,
     pub outbound_port: u16,
 }

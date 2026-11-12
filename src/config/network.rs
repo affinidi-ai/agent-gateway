@@ -78,6 +78,16 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_consent_issuers: Option<HashMap<String, Vec<String>>>,
 
+    /// Issuers the credential providers of external consent may name besides
+    /// those of `external_consent_issuers`, one pattern per vendor whose
+    /// issuer carries the customer's tenant, such as
+    /// `https://login.microsoftonline.com/{tenant}/v2.0`. Set, even empty, it
+    /// limits issuers as `external_consent_issuers` does. Only this file sets
+    /// it; no tenant or API caller can add to it. A pattern that is not valid
+    /// matches nothing and is named at startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_consent_issuer_patterns: Option<Vec<IssuerPattern>>,
+
     /// How many refreshes of a grant by binding the authorization server may
     /// refuse, by an answer other than `invalid_grant`, since the last that
     /// succeeded, before a call whose grant cannot be used answers
@@ -124,6 +134,36 @@ pub struct NetworkConfig {
     /// How long and how large the delegated payments ledger is kept.
     #[serde(default)]
     pub payment_ledger: crate::config::types::PaymentLedgerConfig,
+}
+
+/// One entry of `external_consent_issuer_patterns`: the issuers of one vendor
+/// that differ only by the customer's tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuerPattern {
+    /// An `https` issuer with one `{tenant}` standing for a whole path segment
+    /// or for the leftmost label of its host.
+    pub issuer: String,
+    /// What may stand for `{tenant}`.
+    pub tenant: IssuerTenant,
+    /// The origins the endpoints and `jwks_uri` of a matching issuer may use
+    /// beyond its own host, as in `external_consent_issuers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_origins: Vec<String>,
+    /// The resource origins permitted beyond a matching issuer's own host, as
+    /// in `external_consent_resource_origins`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_origins: Vec<String>,
+}
+
+/// What may stand for `{tenant}` in an [`IssuerPattern`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IssuerTenant {
+    /// A UUID in its canonical 8-4-4-4-12 hex form, in either case.
+    Uuid,
+    /// A DNS label: 1 to 63 lower-case letters, digits and `-`, neither
+    /// starting nor ending with `-`.
+    Label,
 }
 
 fn default_external_consent_refresh_refusals() -> u32 {

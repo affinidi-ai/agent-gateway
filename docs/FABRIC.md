@@ -441,6 +441,12 @@ request received by the destination gateway:
    card location, the sending gateway's own card fetch; any other discovery read, the
    `/.well-known/agent.json` fallback included, gets none (see
    [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#target-authentication-from-a-credential-provider)).
+   The Target's answer travels back as text, so the request, a framed stream's included, asks
+   for an uncompressed one (`Accept-Encoding: identity`) in place of whatever the sender accepts;
+   a buffered answer compressed all the same is refused with `502` rather than carried corrupted.
+   The sending gateway also sends `Accept-Encoding: identity` on every buffered forward and card
+   read, from an Access Point's `fabric://` Target and from a Transit Point alike, so a receiving
+   gateway without this check still gets an uncompressed answer.
 9. Apply response processing, including MCP tool-list filtering when configured, before packaging
    the DIDComm response.
 
@@ -474,8 +480,11 @@ does not recheck the caller's browser Origin against its own `mcp_http.allowed_o
 the paired sending gateway's check, as it trusts that peer for every other forwarded header. The
 exception is the caller-info and `did:webvh` identity headers (`x-caller-did`,
 `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `x-did-identity`,
-`x-did-signed-identity`): the receiving gateway drops every copy the peer sent, so the agent behind
-it never takes a peer's value for one.
+`x-did-signed-identity`) and the caller key family (`x-caller-key` and every name starting
+`x-caller-key-`): the receiving gateway drops every copy the peer sent, so the agent
+behind it never takes a peer's value for one. A receiving surface with `caller_key` derives its
+own key for a JWT it verified on the request; see
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ### Which variant serves a request over Fabric
 

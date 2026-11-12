@@ -292,11 +292,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Access Point and Caller Context elements carry `public` and `caller_authentication.on_failure`
   through a load and rebuild unchanged; `withCallerAccessSettled`
   (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
-  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
-  legacy state, "Not enforced (legacy)", under the switch with a **Close Access Point** button
-  (`access-point-close-button`, hidden when read-only) that sets `public: false`. Turning the
-  switch off there clears `public`, so turning it on and off again keeps the stored rules. A
-  `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
+  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), turning the switch off
+  clears `public`, so turning it on and off again keeps `public` unset. A `public: false`
+  set in the JSON editor shows `access-point-closing-notice` under the switch until the save,
+  and is sent, like one set with the switch on a surface that has `public`. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
@@ -330,9 +329,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
   The dashboard shows none of these after a save (`shownSaveWarnings` in
-  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
-  Access Point panel already show the Access Point's state, and turning Public access on is the
-  operator's own choice. Every other `Warning` header is shown.
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored). Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
   and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
@@ -504,6 +501,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
   message names the setting shows in the section and in the sidebar, which also shows whether
   discovery is on.
+- **Accepted Audiences** adds a value left in the field when the field loses focus or on
+  Cmd/Ctrl+S, so a typed audience is saved without pressing Enter, comma, or Add. It adds
+  nothing while discovery is on, and skips empty and duplicate values.
 - A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
   operator switched off as `protected_resource: null` in the same PUT
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
@@ -670,6 +670,39 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   "N Transit Points need Trust Check review" ("1 Transit Point needs …" for one), counting each
   Transit Point with a flagged migrated copy, on the canvas and in every other loaded variant
   snapshot (it says how many are in other variants), hidden at zero.
+- **Authority source.** A Trust Check query and a Trust Recorder entry carry `authority_source`
+  (`AuthoritySource` in `types.ts`: `authority` or `issuer`) beside a literal anchor DID found in
+  that register, and none beside a template or a DID in neither. `queriesFromWire`, `readQueries`
+  and `buildEntry` (Trust Check) and `readEntries` (Trust Recorder) keep it through every load and
+  save, on the caller, Managed Agent and Transit Point lists and in variants. The gateway
+  recomputes it on every save from the registers and never drops `authority`, so a link to a
+  deleted Authority stays one;
+  `authoritySourceFor` (`_shared/authorityReference.ts`) drops it beside an empty value or a
+  template. The Authority picker writes `issuer` for an Issuer and `authority` for an Authority,
+  and removes it for a caller-leg template; a preset (`applyPresetToQuery`) removes it; a stored
+  custom DID or legacy template left untouched keeps what is stored.
+- **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
+  Authorities register no longer has is `missing-authority` (`classifyTargetAuthoritySelection`,
+  checked against the Authorities only, even when an Issuer has the DID); the gateway fails it
+  with `AUTHORITY_NOT_FOUND`. The register is `authorityDids` in `SurfaceMetaContext`, from
+  `useAuthorityDids` (`hooks/useAuthorityDids.ts`), which both surface pages call: read when the
+  page opens and when the tab becomes visible again, and updated by every
+  `getAuthorities({ refresh: true })` through `subscribeAuthorities`, so an Authority added in
+  another tab clears the problem. Nothing is flagged while it loads or after it failed; the
+  fullscreen editors flag only once their own read loaded (`authoritiesLoaded`). It follows the
+  blocking API key pattern: the node gets the red `unconfigured-ring` with "Authority deleted"
+  under its label; the sidebar panel, and the picker in the fullscreen editor, show the shared
+  `MissingAuthorityWarning` (`_shared/MissingAuthorityWarning.tsx`, a non-collapsible `danger`
+  `InfoBanner` titled "Configuration required", `role="alert"`) saying the check fails with
+  `AUTHORITY_NOT_FOUND` until it is fixed, the fixes (pick another Authority, add an Authority
+  with the same DID through `deepLinks.authority`, or remove the Trust Check) and the stored DID
+  ("Query <n>: <did>" when the node has several queries); the picker shows the DID as a locked
+  "Deleted Authority" option marked invalid. Save is blocked on both surface pages, in the base
+  and every variant, with the full warning and **Show me** (`firstMissingAuthorityNode` in
+  `elements/missingAuthority.ts`). It is not part of `configured` or `getIncompleteReason`. The
+  panel copy says the DID is stored directly and that, for an Authority, the gateway fails the
+  check once that Authority is deleted. The Audit Log words `AUTHORITY_NOT_FOUND` as "the
+  Authority this Trust Check uses no longer exists" (`TRUST_ERROR_LABEL`).
 
 | Element                          | Test id                                                                                            |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -681,6 +714,7 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
 | Migrated warning and Keep        | `trust-check-panel-migrated-warning`, `trust-check-fullscreen-migrated-warning`, each with `-keep` |
 | Review summary                   | `surface-migrated-trust-checks-summary`                                                            |
 | Migrated canvas badge            | `surface-node-trust-check-migrated-badge`                                                          |
+| Deleted Authority warning        | `trust-check-panel-authority-missing`, `trust-check-query-<n>-authority-missing`, each with `-dids` and `-add-authority-link` |
 
 ## Trust Recorder
 
@@ -700,11 +734,20 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   Never describe it as signing records or setting the Authority.
 - The fullscreen editor opens with a collapsed `InfoBanner` explaining Authority, Entity, the
   entry Issuer and the surface Issuer, linked to the Trust elements guide.
+- The entry's explicit Authority select writes `authority_source: 'authority'` for a DID of the
+  Authorities register and `'issuer'` for an Issuer; **Use surface Issuer** and **Explicit DID**
+  remove it (see _Authority source_ under Trust Check). An entry whose Authority was deleted gets
+  the same ring, "Authority deleted" reason, `MissingAuthorityWarning` (the entry writes no records
+  until it is fixed; "Entry <n>: <did>" in the sidebar when there are several), locked "Deleted
+  Authority" option and Save block as a Trust Check. The recorder then reports `skipped` with
+  reason `authority_not_found`, worded "Authority not found" by `utils/trustRecorderStatus.ts` in
+  the Last outcome row and the Identities page chip.
 
 | Element                            | Test id                                                                                                                           |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | Panel warning                      | `trust-recorder-panel-no-surface-issuer-warning`                                                                                  |
 | Entry warning                      | `trust-recorder-entry-<index>-no-surface-issuer-warning`                                                                          |
+| Deleted Authority warning          | `trust-recorder-panel-authority-missing`, `trust-recorder-entry-<index>-authority-missing`, each with `-dids` and `-add-authority-link` |
 | Explainer toggle, body, guide link | `trust-recorder-fullscreen-context-toggle`, `trust-recorder-fullscreen-context-body`, `trust-recorder-fullscreen-context-doclink` |
 | Canvas node, by element type       | `surface-node-<type>`, for example `surface-node-trust-recorder`                                                                  |
 
@@ -833,13 +876,30 @@ surface, never the unsaved form.
   happened and what to do, for example "Check that the agent is running, then Refresh."
   **Refresh** needs `surfaces.edit`; without it the button is disabled with the reason as its title
   and description. A successful Refresh replaces the failed state with the new cards and puts
-  "Card refreshed." with the fetch result (OK, failing or not served, never the cause, which the
-  alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
+  "Card refreshed." with the fetch result (OK, served without a managed identity, failing or not
+  served, never the cause, which the alert gives) in a visually hidden status region (`agent-card-refresh-status`), cleared when the
   next Refresh starts; a 429 shows a warning toast and keeps the cards on screen; a refused or
   failed Refresh shows an error toast. The tab heading (`agent-card-heading`, `tabIndex=-1`) takes
   focus when **Retry** replaces itself with the loading status.
+- A card served without a managed identity (`served_without_identity`, cause `identity_missing`)
+  is a served card: the badge reads **Served – No managed identity** in the warning tone with no
+  `agent-card-fetch-cause` beside it (a served card names no cause in the header), a warning
+  alert (`agent-card-served-without-identity`, never danger) reads "The managed agent's card has no
+  identity extension, so the gateway serves it without an identity credential.", and the comparison
+  and raw panels show as for an OK fetch. `isCardServed` in `utils/agentCardPreview.ts` is the one
+  check for "the card is served"; the Managed Agent panel's fetch line reads "Card fetch: Served –
+  No managed identity" in the warning tone (`agent-card-fetch-warning`, icon
+  `fa-circle-exclamation`), and the card counts as the last served card (`lastServed`).
 - A failed or not-served fetch shows a danger alert with the cause text (`agent-card-failed`,
-  `agent-card-failed-cause`) and opens both raw panels. The managed panel reads "Not available:
+  `agent-card-failed-cause`) and opens both raw panels. For `identity_failed` the alert names
+  `fetch.identity_error` with its own text (`CARD_IDENTITY_ERROR_TEXT`: an identity extension the
+  gateway can use is missing, the extension is invalid, the card could not be read for its
+  identity, a DID could not be issued, or the gateway could not attach its credential), and keeps
+  the generic "Check the gateway logs, then Refresh." only when the gateway names none. When
+  `fetch.identity_slot` is `external_identity` the alert uses `CARD_EXTERNAL_IDENTITY_ERROR_TEXT`
+  instead, which points at the external Identity element rather than the managed agent's card. The
+  parser rejects an `identity_error` or `identity_slot` beside any other cause. The managed panel
+  reads "Not available:
   <cause — HTTP n>." (`agent-card-raw-before-missing`), or shows the managed card when the gateway
   fetched it but will not serve it. The served panel shows, in this order: the card the gateway
   returns in `after` whatever the fetch status, with "The card the gateway last served for this
@@ -872,12 +932,14 @@ surface, never the unsaved form.
   is the served card URL, and only when `safeHttpUrl` passes (http or https, no user info), opened
   with `rel="noopener noreferrer"`. The parser keeps no token, secret, secret id or upstream error
   body, so the view has nothing of that kind to show.
-- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: failing (<cause — HTTP
-  n>)** or **Card: generated by the gateway**, with an icon, and a **View agent cards** link button
+- The Managed Agent panel shows one line, **Card fetch: OK**, **Card fetch: Served – No managed
+  identity**, **Card fetch: failing (<cause — HTTP n>)** or **Card: generated by the gateway**, with
+  an icon, and a **View agent cards** link button
   (`managed-agent-card-fetch`, `managed-agent-card-fetch-status`, `managed-agent-card-fetch-icon`,
   `managed-agent-card-fetch-link`), through `agent-card/AgentCardFetchLine.tsx`. The status text
-  uses `agent-card-fetch-ok` and `agent-card-fetch-failing` (AA colours in both themes, scoped to
-  `.agent-card-fetch-line`), not `text-success` or `text-danger`. `AgentCardFetchLine` reads the
+  uses `agent-card-fetch-ok`, `agent-card-fetch-warning` and `agent-card-fetch-failing` (AA colours
+  in both themes, scoped to `.agent-card-fetch-line`), not `text-success`, `text-warning` or
+  `text-danger`. `AgentCardFetchLine` reads the
   preview with its own `useAgentCardPreview` call and never calls Refresh; it reads again when
   `SurfaceMetaContext.agentCardFetchRevision` changes, which the shell bumps on a save and on each
   successful Refresh in the Agent Cards view (`AgentCardTab` `onRefreshed`), so the line does not
@@ -987,6 +1049,15 @@ strategy the field shows the stored claim, is disabled, and is left out of the u
 gateway refuses a change to it. A save's `Warning` headers, such as another strategy naming the
 same issuer's callers by a different claim, are shown in a warning toast that stays until closed.
 
+The Settings page's strategies tab (`SettingsPage/StrategiesTab.tsx`) shows a refused delete in
+its alert with the gateway's message, the credential providers a `409` lists as still using the
+strategy by name (else id), "and N you can't view" for its `hidden_references`, that a
+provider's consent confirmation is changed in its editor and its `consent_identity_strategy_id`
+through the API, and the status (`strategyDeleteError`). The delete's confirm dialog says
+credential providers that use the strategy block the delete. The strategy editor shows a `409`
+on save (an issuer change a provider using the strategy would refuse) with the same
+`strategyDeleteError` text, so it names those providers and where to change them.
+
 ## Credentials audit tab
 
 `pages/CredentialsPage/CredentialAuditTab.tsx` shows an expanded event's caller. **Subject** is
@@ -1031,10 +1102,14 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
   secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
-  `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
-  rejects it (AADSTS901002), the form warns under Token Endpoint
-  (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
-  (`credential-provider-entra-resource-badge`).
+  `entraRejectsResource` finds the provider's token requests send it to a Microsoft identity
+  platform v2.0 token endpoint, which rejects it (AADSTS901002), the form warns
+  (`credential-provider-entra-resource-warning`: under Token Endpoint, or under the external
+  consent notice for a provider with an `issuer`) and the list row shows a warning icon
+  (`credential-provider-entra-resource-badge`). An external consent provider with
+  `send_resource: false` sends no `resource` and is not warned; one that sends it is told to be
+  re-created with `send_resource: false` (`entraResourceMessage`), since its resource is required
+  and fixed. `send_resource` is never sent on save.
 - The secret pickers offer only secrets of the provider's own tenant (`SecretOptions` in
   `SecretSelect.tsx`; the tenant is the loaded provider's `tenant_id`, unknown while creating). A
   stored secret outside that tenant stays selectable with the same labels: "appliance-wide, stops
@@ -1071,6 +1146,47 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   was created and gives the gateway's reason, and the editor still opens the created provider, so
   saving again updates it instead of creating it a second time. The Provider ID input has no
   route prefix, since a new provider's callback path does not contain it.
+- An authorization code provider without an `issuer` (legacy consent) shows a **Consent
+  confirmation** section after the Callback URL (`ConsentConfirmationSection.tsx`,
+  `credential-provider-consent-confirmation-section`), with a switch
+  (`credential-provider-consent-confirmation-switch`) that is off by default and on when the
+  stored provider has `consent_confirmation`. While on it asks for Login Client ID and Login
+  Client Secret (each a `SecretSelect`, `credential-provider-cc_client_id_secret_ref-select` and
+  `credential-provider-cc_client_secret_secret_ref-select`), Login Authorization
+  Endpoint and Login Token Endpoint (`…-authorization-endpoint-input`, `…-token-endpoint-input`),
+  a JWT verification strategy from `GET /jwt-verification-strategies`
+  (`credential-provider-consent-confirmation-strategy-select`, loaded by `useJwtStrategyList`),
+  offering only strategies of the provider's tenant and appliance-wide ones, as the gateway's
+  reference rule allows; a new provider, which the dashboard creates appliance-wide, is offered
+  appliance-wide ones only. A stored strategy is listed by its id while the list loads, as
+  "(not found)" only once the list loaded without it, and with the other-tenant label when it is
+  another tenant's; a list that cannot be read shows "Strategies could not be loaded"
+  (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
+  (`…-principal-claim-input`) and a **Refuse callers that can't be confirmed** switch
+(`credential-provider-consent-confirmation-require-switch`, writes `require`, off by default,
+sent only while on; its `FieldHelp` says it acts on new links only, so a stored grant is still
+used, and that JWT callers get no link while the setting confirms nobody, whether it is on or not).
+The Login Client ID and Login Client Secret pickers offer the same tenant's secrets as the
+strategy picker: on a new provider, appliance-wide ones only. The labels say "Login" so they never share a name with the
+  provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
+  read-only **Confirmation redirect URI**
+  (`credential-provider-consent-confirmation-redirect-uri`, copy button
+  `credential-provider-consent-confirmation-redirect-uri-copy`) is the Callback URL the editor
+  shows followed by `/confirm`, which is what the gateway registers. Under it a line
+  (`credential-provider-consent-confirmation-redirect-uri-where`) says to add it to the allowed
+  redirect URIs of the login client, naming the secret that holds its ID once one is picked, at the
+  identity provider, and not at the vendor, whose OAuth app keeps the Callback URL. The line and
+  the field's `FieldHelp` both say the URI follows the Callback URL and cannot be edited on its
+  own, so it is registered again whenever the Callback URL changes. Without a Callback URL to
+  show, new or stored, a notice stands in its place
+  (`credential-provider-consent-confirmation-redirect-uri-pending`) saying the URI is shown
+  once the provider has a Callback URL. The Login Client Secret's `FieldHelp` says to register
+  the login client with `client_secret_post`. Save
+  refuses a blank required field first (`missingConsentConfirmationField`) and sends
+  `consentConfirmationField`: the setting while on (a blank principal claim left out), `null`
+  when a stored setting is switched off or the provider is no longer legacy consent, and no field
+  otherwise, so the gateway keeps what it has. The gateway's `400` reason shows like any other
+  save error.
 - A provider with an `issuer` (external consent) shows a notice naming the issuer
   (`credential-provider-external-notice`) in place of the type, endpoint, client, callback and
   additional parameter inputs, which the gateway keeps fixed; Save sends only its name,
@@ -1100,9 +1216,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
 
 The API Keys tab of `/secrets` (`api-keys-delete-button-<key id>`) and `/api-keys/:agentId/:keyId`
 (**Delete**) share `useApiKeyAction('delete', …)` (`src/components/api-keys/ApiKeyActionDialog.tsx`). The
-delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built
-like `TemplateConflictModal` (`modal fade show` with `display: block`, `modal-dialog-centered`,
-a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`). Its title "Delete API key"
+delete button sends nothing: it opens the confirmation dialog `api-key-delete-dialog`, built on
+the shared `components/shared/WarningDialog.tsx` (`modal fade show` with `display: block`,
+`modal-dialog-centered`, a `modal-backdrop fade show` sibling; `role="dialog"`, `aria-modal`, named
+by its title). Its title "Delete API key"
 carries a red warning icon (`fa-triangle-exclamation text-danger`); the body names the key's
 client id and key id and says, in plain words, that callers using the key will be refused,
 surfaces that use it will stop working until another key is picked, and the delete can't be
@@ -1127,6 +1244,26 @@ toast that stays until dismissed: "Revoke failed: <gateway message>".
 When the key's surface was deleted (`surface_deleted: true` on `GET /api-keys/{agent_id}/{key_id}`),
 the detail page shows the info alert "This API key is no longer in use because the associated
 surface has been deleted." (`api-key-surface-deleted-info`) at the top of Key Information.
+
+## Authority delete
+
+The Authorities list (`pages/AuthoritiesPage.tsx`, `authorities-delete-button-<id>`) and the
+Authority editor (`pages/EditAuthorityPage.tsx`, `authority-editor-delete-button`) delete through
+`apiClient.deleteAuthority` after the two-step `DeleteButton`. While Trust Checks or Trust Recorder
+entries use the Authority, the gateway answers `409` with `references` and `hidden_references`;
+`authorityInUse` (`components/authorities/authorityInUse.ts`) reads them from `ApiError.body`, the
+raw error body the API client keeps, and `AuthorityInUseDialog` (`authority-in-use-dialog`, a
+`WarningDialog` titled "Authority in use") opens in place of the error. It says the Authority is
+used by Trust Checks or Trust Recorder entries and to point them at another Authority or remove
+them, then delete it, and lists each surface, linked to `/surfaces/<id>` in a new tab
+(`authority-in-use-dialog-surface-<id>`, `-surface-link-<id>`), and STS client, not linked
+(`authority-in-use-dialog-sts-client-<id>`), each with one line per use from
+`describeAuthorityUse`: "Trust Check “<name>” on the Access Point", "… on the Managed Agent's
+target", "… on Transit Point <alias>", "Trust Recorder entry for <trust registry name or id>",
+with "in variant <alias>" for a variant. "N more you can't view." (`authority-in-use-dialog-hidden`)
+follows while `hidden_references` is above zero. Its only action is **Close**
+(`authority-in-use-dialog-close`): the dashboard never sends `force=true`. Any other failure keeps
+the list page's error alert and the editor's error toast. Every value is rendered as React text.
 
 ## Policy definition editor
 
@@ -1266,8 +1403,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,
   through the `useEntryVersions` hook), showing `identities-version-history-loading` while it
   loads and `identities-version-history-error` with `identities-version-history-retry-button`
-  when it fails. It refetches only when a member's `rotation_count` changes, and an entry
-  with no rotations builds its DID versions without a request; see
+  when it fails. It refetches only when a member's `rotation_count` changes, showing the
+  loading state until the new list arrives, and closing Version History aborts the fetch. An
+  entry with no rotations builds its DID versions without a request; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when

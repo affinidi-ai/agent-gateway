@@ -3231,6 +3231,7 @@ pub async fn create_surface(
         resource_scope(&scope),
     )
     .await?;
+    super::surface_tenancy::validate_authority_sources(&state, &mut surface, None).await?;
     super::surface_tenancy::validate_external_consent_bindings(&state, &mut surface, None).await?;
 
     // Reject overlapping outbound listener routes before they can reach
@@ -3251,6 +3252,7 @@ pub async fn create_surface(
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
     validate_resolved_variants(&surface)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
 
     surface
         .validate()
@@ -3262,6 +3264,8 @@ pub async fn create_surface(
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, None).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     refuse_validation_off_by_scoped_caller(
         &surface,
         None,
@@ -3397,6 +3401,7 @@ pub async fn update_surface(
     retain_a2a_settings(&mut surface, &existing);
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
+    super::surface_caller_key::retain_caller_key(&mut surface, &existing, &sent);
 
     let (saved, warnings) = validate_and_save_surface(
         &state,
@@ -4228,6 +4233,7 @@ async fn validate_and_save_surface(
         existing,
     )?;
     super::surface_tenancy::validate_surface_references(state, &surface, existing, context, scope).await?;
+    super::surface_tenancy::validate_authority_sources(state, &mut surface, existing).await?;
     super::surface_tenancy::validate_external_consent_bindings(state, &mut surface, existing).await?;
     validate_listen_path_collisions(&surface, store, &state.network_config).await?;
     validate_access_point_route_collisions(&surface, store, &state.network_config).await?;
@@ -4239,10 +4245,13 @@ async fn validate_and_save_surface(
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface, existing)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
     normalize_a2a_settings(&mut surface, existing).map_err(SurfaceApiError::BadRequest)?;
+    crate::config::agent_surface::normalize_browser_origins(&mut surface.browser_origins)
+        .map_err(SurfaceApiError::BadRequest)?;
     let stored_a2a = existing.and_then(|existing| {
         existing
             .access_point
@@ -4759,6 +4768,7 @@ async fn apply_surface_change_while_locked(
     // DashMap clear) and safe (worst case is the next few requests
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
+    crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
 
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {
@@ -8508,8 +8518,10 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            browser_origins: Vec::new(),
         }
     }
 
@@ -9444,6 +9456,7 @@ mod validation_tests {
             .trust_check_list = vec![crate::trust_registry_verification::trust_check_element::TrustCheckElement {
             id: "tc-1".to_string(),
             trust_registry_id: "tr-1".to_string(),
+            authority_source: None,
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:web:authority.example".to_string(),
@@ -11486,6 +11499,7 @@ mod tests {
             trust_registry_id: registry.into(),
             issuer_did: "did:example:issuer".into(),
             authority_did: "did:example:authority".into(),
+            authority_source: None,
             include_owned_agent: true,
             custom_resources: vec![],
         }

@@ -1,10 +1,16 @@
 import {
+  EMPTY_CONSENT_CONFIRMATION_FIELDS,
   EMPTY_JWT_FIELDS,
+  consentConfirmationField,
+  consentConfirmationFieldsOf,
+  consentConfirmationRedirectUri,
+  missingConsentConfirmationField,
   callbackUrlFor,
   callbackUrlToSave,
   isHttpsAddress,
   ProviderFormValues,
   entraRejectsResource,
+  entraResourceMessage,
   clientAuthenticationOf,
   jwtFieldsOf,
   jwtKeyUnidentified,
@@ -247,6 +253,20 @@ describe('credential provider form', () => {
     expect(entraRejectsResource('not a url', 'https://ai.azure.com')).toBe(false);
   });
 
+  it('flags an external consent provider only while it still sends its resource', () => {
+    const v2 = 'https://login.microsoftonline.com/tenant-id/oauth2/v2.0/token';
+    const resource = 'https://graph.microsoft.com';
+    const issuer = 'https://login.microsoftonline.com/tenant-id/v2.0';
+    expect(entraRejectsResource(v2, resource, { issuer, send_resource: false })).toBe(false);
+    expect(entraRejectsResource(v2, resource, { issuer, send_resource: true })).toBe(true);
+    expect(entraRejectsResource(v2, resource, { issuer })).toBe(true);
+    expect(entraRejectsResource(v2, resource, { send_resource: false })).toBe(true);
+    const external = entraResourceMessage(resource, { issuer });
+    expect(external).toContain('re-create the provider with send_resource set to false');
+    expect(external).not.toContain('/.default');
+    expect(entraResourceMessage(resource)).toContain(`"${resource}/.default"`);
+  });
+
   it('drops a signing algorithm the selected type does not support', () => {
     expect(
       providerCredentialFields({ ...jwtAuth, jwt_signing_algorithm: 'ES256' }).jwt_signing_algorithm
@@ -376,5 +396,75 @@ describe('callbackUrlToSave', () => {
         storedPath: '',
       })
     ).toBe('');
+  });
+});
+
+describe('consent confirmation', () => {
+  const STORED = {
+    client_id_secret_ref: 'LOGIN_CLIENT_ID',
+    client_secret_secret_ref: 'LOGIN_SECRET',
+    authorization_endpoint: 'https://idp.example/authorize',
+    token_endpoint: 'https://idp.example/token',
+    jwt_verification_strategy_id: 'strategy-1',
+  };
+  const loaded = consentConfirmationFieldsOf({ consent_confirmation: STORED });
+
+  it('reads a stored setting as switched on, and none as switched off', () => {
+    expect(loaded.consent_confirmation_enabled).toBe(true);
+    expect(loaded.consent_confirmation_stored).toBe(true);
+    expect(loaded.cc_client_id_secret_ref).toBe('LOGIN_CLIENT_ID');
+    expect(consentConfirmationFieldsOf({})).toEqual(EMPTY_CONSENT_CONFIRMATION_FIELDS);
+  });
+
+  it('sends the setting while switched on, without a blank principal claim', () => {
+    expect(consentConfirmationField(loaded, true)).toEqual(STORED);
+    expect(
+      consentConfirmationField({ ...loaded, cc_id_token_principal_claim: ' oid ' }, true)
+    ).toEqual({ ...STORED, id_token_principal_claim: 'oid' });
+  });
+
+  it('clears a stored setting switched off or on a provider that no longer uses legacy consent', () => {
+    expect(consentConfirmationField({ ...loaded, consent_confirmation_enabled: false }, true)).toBe(
+      null
+    );
+    expect(consentConfirmationField(loaded, false)).toBe(null);
+  });
+
+  it('reads and sends require only while it is on', () => {
+    expect(loaded.cc_require).toBe(false);
+    const requiring = consentConfirmationFieldsOf({
+      consent_confirmation: { ...STORED, require: true },
+    });
+    expect(requiring.cc_require).toBe(true);
+    expect(consentConfirmationField(requiring, true)).toEqual({ ...STORED, require: true });
+    expect(consentConfirmationField({ ...requiring, cc_require: false }, true)).toEqual(STORED);
+  });
+
+  it('leaves the field out when nothing is stored and the switch is off', () => {
+    expect(consentConfirmationField(EMPTY_CONSENT_CONFIRMATION_FIELDS, true)).toBeUndefined();
+  });
+
+  it('names the first missing required field', () => {
+    expect(missingConsentConfirmationField(loaded)).toBeNull();
+    expect(missingConsentConfirmationField({ ...loaded, cc_client_id_secret_ref: '' })).toBe(
+      'Login Client ID is required for consent confirmation.'
+    );
+    expect(
+      missingConsentConfirmationField({
+        ...loaded,
+        cc_token_endpoint: '',
+        cc_jwt_verification_strategy_id: '',
+      })
+    ).toBe('Login Token Endpoint is required for consent confirmation.');
+    expect(
+      missingConsentConfirmationField({ ...loaded, cc_jwt_verification_strategy_id: '' })
+    ).toBe('JWT verification strategy is required for consent confirmation.');
+  });
+
+  it('appends /confirm to the Callback URL, and has none without one', () => {
+    expect(consentConfirmationRedirectUri('https://gw.example/prefix/callback/cp-1')).toBe(
+      'https://gw.example/prefix/callback/cp-1/confirm'
+    );
+    expect(consentConfirmationRedirectUri('')).toBe('');
   });
 });

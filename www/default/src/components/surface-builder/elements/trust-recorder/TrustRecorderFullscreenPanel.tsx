@@ -30,6 +30,7 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
   const [registries, setRegistries] = useState<TrustRegistry[]>([]);
   const [issuers, setIssuers] = useState<Issuer[]>([]);
   const [authorities, setAuthorities] = useState<Authority[]>([]);
+  const [authoritiesLoaded, setAuthoritiesLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [issuersLoadError, setIssuersLoadError] = useState<string | null>(null);
   const [authoritiesLoadError, setAuthoritiesLoadError] = useState<string | null>(null);
@@ -68,7 +69,9 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
     let cancelled = false;
     getAuthorities({ refresh: true })
       .then(list => {
-        if (!cancelled) setAuthorities(list);
+        if (cancelled) return;
+        setAuthorities(list);
+        setAuthoritiesLoaded(true);
       })
       .catch(err => {
         if (!cancelled) setAuthoritiesLoadError(err?.message || 'Failed to load authorities');
@@ -232,6 +235,7 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
             registries={registries}
             issuers={issuers}
             authorities={authorities}
+            authoritiesLoaded={authoritiesLoaded}
             loadError={loadError}
             issuersLoadError={issuersLoadError}
             authoritiesLoadError={authoritiesLoadError}
@@ -279,7 +283,8 @@ const TrustRecorderFullscreenPanel: React.FC<ConfigPanelProps> = ({
           <dd>
             The trust anchor that asserts every record this entry writes. Pick an Authority or an
             Issuer, or <em>Use surface Issuer</em> to assert with the Issuer selected in the Surface
-            settings.
+            settings. Its DID is stored directly; when it is an Authority, the gateway also
+            remembers that, and the entry writes no records once that Authority is deleted.
           </dd>
           <dt>Entity</dt>
           <dd>

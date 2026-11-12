@@ -287,21 +287,8 @@ async fn a_fabric_request_reaches_the_agent_with_one_transit_token_issued_for_it
     )))
     .await;
     assert_eq!(auth_failures(&events), 1, "the surface checks the peer's key");
-    assert_eq!(response["status"], 200, "no policy refuses the unverified request: {response}");
-    let refused = target
-        .received()
-        .pop()
-        .unwrap();
-    let refused_claims = issuer
-        .validate(header_values(&refused, "x-transit-token")[0], 300)
-        .unwrap();
-    assert_eq!(
-        refused_claims
-            .fabric
-            .and_then(|fabric| fabric.principal_hash),
-        None,
-        "a key the surface refused verifies no caller"
-    );
+    assert_eq!(response["status"], 401, "the surface refuses the unverified request: {response}");
+    assert!(target.received().is_empty(), "a refused request never reaches the agent");
     for (case, hops_header, expected_hops) in [("an older peer", None, 1), ("three crossings", Some("3"), 3)] {
         let mut headers = json!({ "content-type": "application/json", "x-api-key": CALLER_KEY,
             "X-Transit-Token": "token-the-peer-sent", "x-transit-token": "another-token-the-peer-sent" });
@@ -764,10 +751,12 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 
     let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        strategy_id: None,
         principal_claim: "sub".to_string(),
         subject: "alice".to_string(),
         claims: json!({ "iss": "https://idp.example", "sub": "alice", "email": "alice@example.com",
             "name": "Alice", "phone": "+15550100" }),
+        verification: Default::default(),
     };
     let mut verified = caller(Some("did:web:agent.example"), IdentityVerification::Vp);
     verified.verified_identity = Some(&alice);
@@ -987,9 +976,9 @@ async fn a_partner_request_gets_no_per_user_credential_on_fabric_receive() {
 
 /// A service-level binding, such as an API key provider, keys no caller's
 /// grant, so it reaches a partner's request without the opt-in, as long as the
-/// receiving surface verified a caller of the request; without one the request
-/// is refused with `403` before the Target is called, even when the peer names
-/// a caller in the identity extension.
+/// receiving surface verified a caller of the request; without one the closed
+/// Access Point refuses the request with `401` before the Target is called,
+/// even when the peer names a caller in the identity extension.
 #[tokio::test]
 async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in() {
     if ran_in_child("ATG_FABRIC_RECEIVE_SERVICE_CREDENTIAL_CHILD").await {
@@ -1016,11 +1005,96 @@ async fn a_service_level_credential_reaches_a_partner_request_without_the_opt_in
         assert_eq!(header_values(&received[before], "x-service-key"), [SERVICE_KEY], "{case}");
 
         let reached = received.len();
-        let (response, body, rejected) = refused(&send("not-the-key", request)).await;
+        let response = forward_response(&send("not-the-key", request)).await;
+        assert_eq!(response["status"], 401, "{case}: {response}");
+        assert_eq!(target.received().len(), reached, "{case}: the Target is not called");
+    }
+}
+
+/// A public Access Point forwards a request whose peer key it refused, and the
+/// transit token it issues for that request names the peer but no principal, so
+/// an unverified caller never becomes a person the agent can act for.
+#[tokio::test]
+async fn a_public_surface_issues_a_fabric_token_without_a_principal_for_a_key_it_refused() {
+    if ran_in_child("ATG_FABRIC_PUBLIC_REFUSED_KEY_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut public = surface("a2a", &target.url, &["crm"]);
+    public.access_point.public = Some(true);
+    let (peer, _issuer_dir) = receiver(root.path(), &public).await;
+
+    let (response, events) = crate::audit::producer::capture(forward_response(&forward_request(
+        root.path(),
+        json!({ "content-type": "application/json", "x-api-key": "a-key-the-surface-refuses" }),
+        a2a_body(),
+    )))
+    .await;
+    let auth_failures = events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { blocking: false, .. }))
+        .count();
+    assert_eq!(auth_failures, 1, "the public surface checked the peer's key and refused it");
+    assert_eq!(response["status"], 200, "a public surface forwards the unverified request: {response}");
+    let forwarded = target
+        .received()
+        .pop()
+        .expect("the agent received the request");
+    let claims = test_issuer()
+        .validate(header_values(&forwarded, "x-transit-token")[0], 300)
+        .unwrap();
+    assert_eq!(
+        claims.fabric,
+        Some(FabricTransitClaims {
+            peer_gateway_id: peer.id.clone(),
+            peer_issuer_did: Some(PEER_ISSUER_DID.to_string()),
+            hops: 1,
+            caller_did: None,
+            principal_hash: None,
+        }),
+        "a key the surface refused verifies no caller, and the token still names the peer"
+    );
+    assert_eq!(claims.user_identity_hash, None);
+    assert_eq!(claims.sub, None);
+    assert_eq!(
+        claims
+            .identity_source
+            .as_deref(),
+        Some("fabric-asserted")
+    );
+}
+
+/// A public Access Point hands a partner's request whose caller it did not
+/// verify on, but a service-level binding still is not released to it: the
+/// request is refused with `403` before the Target is called, even when the
+/// peer names a caller in the identity extension.
+#[tokio::test]
+async fn a_public_surface_releases_no_service_credential_to_a_partner_whose_caller_it_did_not_verify() {
+    if ran_in_child("ATG_FABRIC_RECEIVE_PUBLIC_SERVICE_CREDENTIAL_CHILD").await {
+        return;
+    }
+    let target = RecordingTarget::start(axum::http::StatusCode::OK, &[]).await;
+    let root = tempfile::tempdir().unwrap();
+    let mut delegating = surface("a2a", &target.url, &[]);
+    delegating.access_point.public = Some(true);
+    delegating.outbound_credentials = vec![binding(SERVICE_PROVIDER)];
+    let _receiver = receiver(root.path(), &delegating).await;
+    install_delegation_stores(root.path(), &target.url, &[]).await;
+
+    for (case, request) in
+        [("no caller named", a2a_body()), ("peer names a caller", naming(json!({ "agentId": "alice" })))]
+    {
+        let (response, body, rejected) = refused(&forward_request(
+            root.path(),
+            json!({ "content-type": "application/json", "x-api-key": "not-the-key" }),
+            request,
+        ))
+        .await;
         assert_eq!(response["status"], 403, "{case}: {response}");
         assert_eq!(body["reason"], "partner_caller_not_verified", "{case}: {body}");
         assert_eq!(rejected, [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)], "{case}");
-        assert_eq!(target.received().len(), reached, "{case}: the Target is not called");
+        assert!(target.received().is_empty(), "{case}: the Target is not called");
     }
 }
 
@@ -1213,9 +1287,11 @@ async fn a_jwt_the_receiving_surface_verified_is_the_fabric_tokens_principal_wit
         .validate(header_values(&received, "x-transit-token")[0], 300)
         .unwrap();
     let verified = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        strategy_id: None,
         principal_claim: "sub".to_string(),
         subject: "user-123".to_string(),
         claims,
+        verification: Default::default(),
     };
     assert_eq!(token.user_identity_hash, None);
     assert_eq!(

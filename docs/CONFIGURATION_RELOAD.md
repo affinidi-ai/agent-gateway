@@ -304,8 +304,8 @@ those surfaces, then restart with `"enforce"`. An
 unknown value fails startup, and an absent section means every rule is `"warn"`. The report also names a stored JWT Bearer provider without a subject under a fifth rule, `jwt_subject`, which only warns and has no setting. A provider with
 an `issuer` always needs public `https` endpoints, whatever `insecure_token_endpoints` says, and
 its issuer metadata and revocation calls have their own 10 second timeouts, not
-`token_request_timeout_secs`. `external_consent_resource_origins` is read once at startup and
-needs a restart, see
+`token_request_timeout_secs`. `external_consent_resource_origins`, `external_consent_issuers` and
+`external_consent_issuer_patterns` are read once at startup and need a restart, see
 [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#gatewayjson).
 
 ## Audit log rotation

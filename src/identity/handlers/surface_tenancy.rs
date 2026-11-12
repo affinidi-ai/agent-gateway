@@ -70,8 +70,45 @@ pub async fn validate_surface_references(
         .provider_keys(&provider_key_ids(surface)?)
         .await?;
     validate_target_auth_methods(state, surface).await?;
+    super::surface_caller_key::validate_caller_key_secret(state, surface).await?;
     let https_proxies = super::surface_target_auth::https_mcp_proxies(state).await;
     super::surface_target_auth::validate_target_auth_rules(surface, stored, &https_proxies)
+}
+
+/// Classifies each literal authority DID of `surface` by the register it is in, then refuses a
+/// source set on a template and a link to an Authority that does not exist or belongs to
+/// another tenant. A DID that `stored` (the surface as stored, if any) linked to an Authority
+/// stays linked, so a save cannot turn a deleted Authority into a plain DID. Without an
+/// Authority store nothing is classified or refused.
+pub async fn validate_authority_sources(
+    state: &IdentityApiState,
+    surface: &mut AgentSurface,
+    stored: Option<&AgentSurface>,
+) -> Result<(), SurfaceApiError> {
+    use crate::trust_registry_verification::authority_source::{AuthorityRegisters, surface_references};
+
+    let Some(authorities) = state
+        .authority_store
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    if surface_references(surface).is_empty() {
+        return Ok(());
+    }
+    let registers = AuthorityRegisters::load(
+        authorities,
+        state
+            .issuer_store
+            .as_deref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .map_err(|error| internal("Authority", error))?;
+    registers.classify_surface(surface, stored);
+    registers
+        .check(&surface_references(surface), surface.tenant_id.as_deref())
+        .map_err(SurfaceApiError::BadRequest)
 }
 
 pub(crate) const TARGET_AUTH_NEEDS_CONSENT: &str =
@@ -181,10 +218,7 @@ pub async fn validate_external_consent_bindings(
         &state
             .network_config
             .external_consent_resource_origins,
-        state
-            .network_config
-            .external_consent_issuers
-            .as_ref(),
+        crate::credential_providers::external::IssuerRules::of(&state.network_config),
         proxies,
     )
     .await
@@ -470,7 +504,7 @@ async fn check_external_consent_bindings(
     surface: &AgentSurface,
     storage: GrantStorage,
     resource_origins: &std::collections::HashMap<String, Vec<String>>,
-    issuers: Option<&std::collections::HashMap<String, Vec<String>>>,
+    issuers: crate::credential_providers::external::IssuerRules<'_>,
     proxies: Option<&dyn McpProxyStore>,
 ) -> Result<(), SurfaceApiError> {
     check_external_transit_point_ids(surface)?;
@@ -684,7 +718,7 @@ struct GrantRules<'a> {
     tenant_id: Option<&'a str>,
     storage: GrantStorage,
     resource_origins: &'a std::collections::HashMap<String, Vec<String>>,
-    issuers: Option<&'a std::collections::HashMap<String, Vec<String>>>,
+    issuers: crate::credential_providers::external::IssuerRules<'a>,
     proxies: Option<&'a dyn McpProxyStore>,
 }
 
@@ -770,15 +804,17 @@ impl GrantRules<'_> {
             }
         }
         .map_err(refuse)?;
-        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins) {
+        if !crate::credential_providers::external::resource_permitted(&provider, self.resource_origins, self.issuers) {
             return Err(refuse(
                 "the credential provider's resource is not permitted for its issuer: on the issuer's host or one of \
-                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins",
+                 its subdomains, or listed for the issuer in the gateway's external_consent_resource_origins or an \
+                 external_consent_issuer_patterns entry it matches",
             ));
         }
         if let Err(field) = crate::credential_providers::external::issuer_permitted(&provider, self.issuers) {
             return Err(refuse(&format!(
-                "the credential provider's {field} is not permitted by the gateway's external_consent_issuers"
+                "the credential provider's {field} is not permitted by the gateway's external_consent_issuers or \
+                 external_consent_issuer_patterns"
             )));
         }
         Ok(())
@@ -1855,6 +1891,9 @@ fn collect_effective_surface_references(
     }
 
     collect_target_auth_reference(surface.target.auth.as_ref(), references);
+    if let Some(caller_key) = surface.caller_key.as_ref() {
+        push_reference_with_rule(references, ResourceKind::Secrets, &caller_key.secret_id, true);
+    }
     for metadata in std::iter::once(
         surface
             .target
@@ -4121,6 +4160,7 @@ mod tests {
                 trust_registry_id: "tr-base-recorder".into(),
                 issuer_did: "did:example:issuer".into(),
                 authority_did: "did:example:authority".into(),
+                authority_source: None,
                 include_owned_agent: true,
                 custom_resources: Vec::new(),
             }],
@@ -4139,6 +4179,7 @@ mod tests {
                             trust_registry_id: "tr-variant-recorder".into(),
                             issuer_did: "did:example:variant-issuer".into(),
                             authority_did: "did:example:variant-authority".into(),
+                            authority_source: None,
                             include_owned_agent: true,
                             custom_resources: Vec::new(),
                         }],
@@ -4376,7 +4417,7 @@ mod tests {
             &surface,
             storage,
             &std::collections::HashMap::new(),
-            None,
+            crate::credential_providers::external::IssuerRules::default(),
             proxies,
         )
         .await
@@ -4710,7 +4751,7 @@ mod tests {
                 &surface,
                 GRANTS_KEPT,
                 &std::collections::HashMap::new(),
-                None,
+                crate::credential_providers::external::IssuerRules::default(),
                 Some(&proxies),
             )
             .await;
@@ -4777,7 +4818,7 @@ mod tests {
                     &surface,
                     GRANTS_KEPT,
                     &std::collections::HashMap::new(),
-                    None,
+                    crate::credential_providers::external::IssuerRules::default(),
                     Some(proxies),
                 )
                 .await
@@ -5126,7 +5167,7 @@ mod tests {
                     &surface,
                     storage,
                     &std::collections::HashMap::new(),
-                    issuers.as_ref(),
+                    crate::credential_providers::external::IssuerRules::new(issuers.as_ref(), None),
                     None,
                 )
                 .await
@@ -5151,6 +5192,74 @@ mod tests {
                 "{message}"
             ),
             other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a binding whose provider's issuer matches a pattern is
+    /// saved, and one whose issuer matches none is refused.
+    #[tokio::test]
+    async fn a_binding_is_saved_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::credential_providers::external::PermittedIssuers;
+        let directory = tempfile::tempdir().unwrap();
+        let providers = providers_with(&directory).await;
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "external-tenant", "tenant_id": "tenant-a", "name": "external-tenant",
+                    "provider_id": "external-tenant", "issuer": "https://203.0.113.30/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b",
+                    "resource": "https://203.0.113.30/mcp",
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let storage = GrantStorage {
+            encrypted: true,
+            stable_ids: true,
+        };
+        let check = |provider: &str, patterns: Vec<IssuerPattern>| {
+            let providers = providers.clone();
+            let surface = surface_binding(external(provider, Some("owner")), serde_json::json!([]), None);
+            async move {
+                let issuers = PermittedIssuers::new(None, Some(patterns));
+                check_external_consent_bindings(
+                    Some(&providers),
+                    &surface,
+                    storage,
+                    &std::collections::HashMap::new(),
+                    issuers.rules(),
+                    None,
+                )
+                .await
+            }
+        };
+        let tenant_pattern = || {
+            vec![IssuerPattern {
+                issuer: "https://203.0.113.30/{tenant}".into(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }]
+        };
+        assert!(
+            check("external-tenant", tenant_pattern())
+                .await
+                .is_ok()
+        );
+        for (provider, patterns) in [("external-a", tenant_pattern()), ("external-tenant", Vec::new())] {
+            match check(provider, patterns).await {
+                Err(SurfaceApiError::BadRequest(message)) => assert!(
+                    message.contains(
+                        "issuer is not permitted by the gateway's external_consent_issuers or \
+                         external_consent_issuer_patterns"
+                    ),
+                    "{provider}: {message}"
+                ),
+                other => panic!("{provider}: expected a 400, got {other:?}"),
+            }
         }
     }
 
@@ -5797,7 +5906,7 @@ mod tests {
                 stable_ids: true,
             },
             &std::collections::HashMap::new(),
-            Some(&std::collections::HashMap::new()),
+            crate::credential_providers::external::IssuerRules::new(Some(&std::collections::HashMap::new()), None),
             None,
         )
         .await;

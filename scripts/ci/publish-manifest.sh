@@ -16,13 +16,24 @@ set -euo pipefail
 : "${VERSION:?}"
 : "${GITHUB_OUTPUT:?}"
 
-# One -t flag per derived tag; reference each pushed digest as a manifest source
-# so the list spans every built architecture.
-tags=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$META_JSON")
-sources=$(printf "${IMAGE_NAME}@sha256:%s " *)
+# One -t flag per derived tag.
+tag_args=()
+while IFS= read -r line; do
+  tag_args+=("${line}")
+done < <(jq -r '.tags[] | "-t", .' <<<"$META_JSON")
 
-# shellcheck disable=SC2086 # tags/sources are intentionally word-split into args
-docker buildx imagetools create $tags $sources
+# Each marker file is named after a pushed digest. Refuse anything else so a
+# stray or tampered file cannot add an arbitrary source reference.
+sources=()
+for marker in *; do
+  if [[ ! "${marker}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "::error::unexpected digest marker '${marker}'"
+    exit 1
+  fi
+  sources+=("${IMAGE_NAME}@sha256:${marker}")
+done
+
+docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
 digest=$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
   --format '{{ json .Manifest.Digest }}' | tr -d '"')

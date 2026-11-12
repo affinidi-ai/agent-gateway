@@ -1405,9 +1405,10 @@ async fn access_point_refuses_tool_call_batches_before_tool_level_controls() {
         assert_eq!(
             body,
             json!({
-                "type": "https://a2a-protocol.org/errors/proxy-error",
+                "type": "about:blank",
                 "title": "Unprocessable Entity",
                 "status": 422,
+                "code": "batch_not_supported",
                 "detail": "JSON-RPC batches are not supported"
             }),
             "{tool}"

@@ -214,6 +214,9 @@ pub(crate) enum OutboundPipelineError {
     #[error("Failed to read upstream response")]
     UpstreamResponseReadFailed,
 
+    #[error("Upstream response is compressed")]
+    UpstreamResponseCompressed,
+
     #[error("Response extension validation failed: {0}")]
     #[allow(dead_code)]
     ResponseValidationFailed(String),
@@ -335,6 +338,7 @@ impl OutboundPipelineError {
             Self::TargetAuthUnavailable { .. }
             | Self::UpstreamConnectionFailed(_)
             | Self::UpstreamResponseReadFailed
+            | Self::UpstreamResponseCompressed
             | Self::ResponseValidationFailed(_)
             | Self::UnrewritableExtendedAgentCardResponse { .. } => StatusCode::BAD_GATEWAY,
 
@@ -448,6 +452,12 @@ impl IntoResponse for OutboundPipelineError {
                     StatusCode::BAD_REQUEST
                 },
             );
+        }
+        if matches!(
+            self,
+            Self::OutboundDisabled | Self::MissingVirtualChannelAlias | Self::UnknownVirtualChannelAlias(_)
+        ) {
+            return crate::protocols::no_transit_point_response();
         }
         // ConsentRequired carries a pre-formed JSON body for the caller
         if let Self::ConsentRequired(body) = self {
@@ -1163,7 +1173,7 @@ async fn outbound_proxy_handler_in_request_scope(
     }
     step_inject_credentials(&state, &mut ctx).await?;
 
-    request_uncompressed_extended_agent_card(&mut ctx);
+    request_uncompressed_agent_card(&mut ctx);
     request_uncompressed_mcp_response(&mut ctx);
 
     // [12] Forward Request. A target that cannot be reached, or whose response
@@ -1176,7 +1186,10 @@ async fn outbound_proxy_handler_in_request_scope(
         }
     };
     let upstream_response = step_answer_a_refused_grant(&state, &mut ctx, upstream_response).await?;
-    refuse_a_compressed_mcp_answer(&ctx, &upstream_response)?;
+    if let Err(error) = refuse_a_compressed_answer(&ctx, &upstream_response) {
+        step_record_metrics(&state, &ctx, false);
+        return Err(error);
+    }
 
     if matches!(
         ctx.mcp_classification
@@ -5378,6 +5391,8 @@ async fn step_inject_credentials(
         secrets_store,
         base_url,
         false,
+        // Transit and Fabric consent is not confirmed.
+        crate::delegation_vault::consent_confirmation::ConsentCaller::TransitOrFabric,
         Some(&audit_ctx),
         // Transit resolves callers to an identity hash only, which carries no
         // issuer, so it can never unlock a modern consent record.
@@ -5797,23 +5812,17 @@ async fn step_inject_external_grant(
         Err(crate::credential_providers::external::PROXY_CHANGED) => return Err(refuse_a_changed_mcp_proxy(ctx)),
         Err(_) => return Err(refuse_external_grant(ctx, "destination_not_the_resource")),
     };
+    let issuers = crate::credential_providers::external::IssuerRules::of(&state.network_config);
     if !crate::credential_providers::external::resource_permitted(
         &provider,
         &state
             .network_config
             .external_consent_resource_origins,
+        issuers,
     ) {
         return Err(refuse_external_grant(ctx, "resource_not_permitted_for_issuer"));
     }
-    if crate::credential_providers::external::issuer_permitted(
-        &provider,
-        state
-            .network_config
-            .external_consent_issuers
-            .as_ref(),
-    )
-    .is_err()
-    {
+    if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         return Err(refuse_external_grant(ctx, "issuer_not_permitted"));
     }
     let surface = ctx.surface.clone();
@@ -7075,18 +7084,22 @@ fn request_uncompressed_mcp_response(ctx: &mut OutboundPipelineContext) {
     }
 }
 
-/// An MCP Transit Point's target is asked for an uncompressed answer
-/// ([`request_uncompressed_mcp_response`]); one compressed all the same is
-/// refused, since tool gating and the response checks read the body as it is
-/// sent, and would read none of it.
-fn refuse_a_compressed_mcp_answer(
+/// An MCP Transit Point's target, and the target of a public agent card read,
+/// are asked for an uncompressed answer ([`request_uncompressed_mcp_response`],
+/// [`request_uncompressed_agent_card`]); one compressed all the same is
+/// refused, an agent card only when it would be rewritten. Tool gating and the
+/// response checks read the body as it is sent, and a card that cannot be
+/// rewritten would point its callers past the Transit Point.
+fn refuse_a_compressed_answer(
     ctx: &OutboundPipelineContext,
     upstream: &UpstreamResponse,
 ) -> Result<(), OutboundPipelineError> {
     let UpstreamResponse::Http(response) = upstream else {
         return Ok(());
     };
-    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp {
+    if ctx.virtual_channel.protocol != crate::config::agent_surface::TransitProtocol::Mcp
+        && !is_agent_card_response(&ctx.request_path, response.status())
+    {
         return Ok(());
     }
     if crate::proxy::upstream_body::is_compressed(response.headers()) {
@@ -7094,10 +7107,10 @@ fn refuse_a_compressed_mcp_answer(
             request_id = %ctx.request_id,
             alias = %ctx.virtual_channel.alias,
             surface_variant = crate::observability::policy_audit::current_request_variant().as_deref(),
-            "An MCP Transit Point's target compressed its answer although none was accepted - refusing it, since \
+            "A Transit Point's target compressed its answer although none was accepted - refusing it, since \
              its body could not be checked"
         );
-        return Err(OutboundPipelineError::UpstreamResponseReadFailed);
+        return Err(OutboundPipelineError::UpstreamResponseCompressed);
     }
     Ok(())
 }
@@ -7207,10 +7220,14 @@ async fn step_answer_a_refused_grant(
     Ok(UpstreamResponse::Http(retried))
 }
 
-/// A compressed extended card cannot be rewritten, so the Target is asked for an
-/// uncompressed one.
-fn request_uncompressed_extended_agent_card(ctx: &mut OutboundPipelineContext) {
-    if is_rest_extended_card_request(ctx) || is_rpc_extended_card_request(ctx) {
+/// A compressed agent card cannot be rewritten, so the Target is asked for an
+/// uncompressed one. [`step_process_response`] rewrites a public card on a
+/// Transit Point of any protocol.
+fn request_uncompressed_agent_card(ctx: &mut OutboundPipelineContext) {
+    if crate::proxy::paths::is_well_known_agent_card_path(&ctx.request_path)
+        || is_rest_extended_card_request(ctx)
+        || is_rpc_extended_card_request(ctx)
+    {
         ctx.original_headers
             .insert(axum::http::header::ACCEPT_ENCODING, axum::http::HeaderValue::from_static("identity"));
     }
@@ -7396,7 +7413,8 @@ async fn step_process_response(
                 match e {
                     crate::proxy::upstream_body::UpstreamBodyError::TimedOut => OutboundPipelineError::UpstreamTimeout,
                     crate::proxy::upstream_body::UpstreamBodyError::TooLarge(_)
-                    | crate::proxy::upstream_body::UpstreamBodyError::Read(_) => {
+                    | crate::proxy::upstream_body::UpstreamBodyError::Read(_)
+                    | crate::proxy::upstream_body::UpstreamBodyError::Compressed => {
                         OutboundPipelineError::UpstreamResponseReadFailed
                     }
                 }
@@ -10161,7 +10179,7 @@ mod tests {
                 assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tool}");
                 assert_eq!(
                     error,
-                    json!({"type": "https://a2a-protocol.org/errors/proxy-error", "title": "Unprocessable Entity", "status": 422, "detail": "JSON-RPC batches are not supported"}),
+                    json!({"type": "about:blank", "title": "Unprocessable Entity", "status": 422, "code": "batch_not_supported", "detail": "JSON-RPC batches are not supported"}),
                     "{tool}"
                 );
             }
@@ -10611,6 +10629,31 @@ mod tests {
     fn test_resolve_virtual_channel_unknown_alias() {
         let result = resolve_virtual_channel("/outbound/surfaces/order/unknown/foo", &test_surface());
         assert!(matches!(result, Err(OutboundPipelineError::UnknownVirtualChannelAlias(_))));
+    }
+
+    #[tokio::test]
+    async fn a_transit_point_miss_gets_one_neutral_no_route_response() {
+        let expected = serde_json::json!({
+            "type": "about:blank",
+            "title": "Not Found",
+            "status": 404,
+            "code": "no_route",
+            "detail": "No Transit Point is served at this path. Check the Transit Point URL, and that the Transit Point is saved and enabled.",
+        });
+        for error in [
+            OutboundPipelineError::OutboundDisabled,
+            OutboundPipelineError::MissingVirtualChannelAlias,
+            OutboundPipelineError::UnknownVirtualChannelAlias("partner-z".into()),
+        ] {
+            let label = error.to_string();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{label}");
+            assert_eq!(response.headers()["content-type"], "application/problem+json", "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), expected, "{label}");
+        }
     }
 
     #[test]
@@ -12618,10 +12661,15 @@ mod tests {
             "x-gateway-did",
             "X-DID-Identity",
             "x-did-signed-identity",
+            "x-caller-key",
+            "x_caller_key",
+            "X-Caller-Key-Memory",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }
-        for forwarded in ["x-api-key", "accept", "content-type", "mcp-protocol-version", "x-caller-context"] {
+        for forwarded in
+            ["x-api-key", "accept", "content-type", "mcp-protocol-version", "x-caller-context", "x-caller-keys"]
+        {
             assert!(should_forward_outbound_request_header(forwarded, None), "{forwarded}");
         }
     }
@@ -14807,9 +14855,11 @@ mod tests {
         surface.outbound_credentials =
             vec![serde_json::from_value(json!({ "credential_provider_id": "provider" })).unwrap()];
         let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+            verification: Default::default(),
         };
         let alice_hash = alice
             .principal_hash(None)
@@ -14897,9 +14947,11 @@ mod tests {
         .principal_hash(None)
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+            verification: Default::default(),
         };
         let direct_client_hash = direct_client
             .principal_hash(None)
@@ -15045,9 +15097,11 @@ mod tests {
             .insert(axum::http::header::AUTHORIZATION, unverified_bearer(json!({ "tid": "forged" })));
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "contoso" }),
+            verification: Default::default(),
         });
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
         let captured = capture_workload_binding_caller(&ctx, &config).expect("a verified JWT caller is captured");
@@ -15079,9 +15133,11 @@ mod tests {
     fn outbound_policy_input_carries_a_client_the_transit_points_source_auth_verified() {
         let mut ctx = test_pipeline_context();
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice", "tid": "tenant-1" }),
+            verification: Default::default(),
         });
         ctx.authenticated_by = Some(crate::surface_context::TransitClientVerification::SourceAuth);
         Arc::make_mut(&mut ctx.surface).tenant_id = Some("tenant-a".to_string());
@@ -15104,9 +15160,11 @@ mod tests {
         assert_eq!(transit_caller_json(&ctx)["verification"], "anonymous", "the client is not the caller");
 
         ctx.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "<none>".to_string(),
             claims: json!({ "iss": "https://idp.example", "client_id": "no-subject" }),
+            verification: Default::default(),
         });
         assert_eq!(
             transit_client_json(&ctx),
@@ -15121,9 +15179,11 @@ mod tests {
         authenticate_by_resource_token(
             &mut ctx,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+                verification: Default::default(),
             },
         );
         assert_eq!(
@@ -15550,9 +15610,11 @@ mod tests {
         authenticate_by_resource_token(
             &mut resource_caller,
             crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "sub".to_string(),
                 subject: "alice".to_string(),
                 claims: json!({ "sub": "alice", "tid": "tenant-1" }),
+                verification: Default::default(),
             },
         );
         assert!(decide(&mut resource_caller, only_tenant), "the verified client's claims reach the response policy");
@@ -16701,6 +16763,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
@@ -16724,6 +16787,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
@@ -17699,9 +17763,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt_caller = |subject: &str| crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: subject.to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": subject }),
+            verification: Default::default(),
         };
         state
             .delegation_vault_store
@@ -17981,6 +18047,65 @@ mod tests {
         assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
     }
 
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a grant is released while its provider's issuer matches a
+    /// pattern, and refused, with the reason logged, while none does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_is_released_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::delegation_vault::grants::GrantKey;
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = external_grant_state(directory.path(), true).await;
+        state
+            .credential_provider_store
+            .as_ref()
+            .unwrap()
+            .create(
+                serde_json::from_value(json!({
+                    "id": "vendor-tenant", "name": "vendor-tenant", "provider_id": "vendor-tenant",
+                    "issuer": "https://vendor.example/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b",
+                    "resource": "https://vendor.example/mcp", "default_scopes": ["read"],
+                    "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let surface = transit_surface(json!([vendor_transit_point(VENDOR_HOP, "vendor-tenant", "owner")]), json!([]));
+        store_grant(&state, GrantKey::owner(None, "transit-fabric", VENDOR_HOP, "vendor-tenant"), "access", 3600).await;
+        let caller = "a".repeat(64);
+        let patterns = |issuer: &str| {
+            Some(vec![IssuerPattern {
+                issuer: issuer.to_string(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }])
+        };
+
+        Arc::make_mut(&mut state.network_config).external_consent_issuer_patterns =
+            patterns("https://other.example/{tenant}");
+        let logs = FormattedLogs::capture();
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        assert!(
+            step_inject_credentials(&state, &mut ctx)
+                .await
+                .is_err()
+        );
+        assert_eq!(bearer(&ctx), None);
+        let text = logs.text();
+        assert!(text.contains("issuer_not_permitted"), "{text}");
+
+        Arc::make_mut(&mut state.network_config).external_consent_issuer_patterns =
+            patterns("https://vendor.example/{tenant}");
+        let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&caller));
+        step_inject_credentials(&state, &mut ctx)
+            .await
+            .expect("a matching pattern permits the issuer");
+        assert_eq!(bearer(&ctx).as_deref(), Some("Bearer access"));
+    }
+
     /// A gateway whose provider `fixture-vendor` is served by test fixtures:
     /// its token and revocation endpoints on `authorization_server`, its
     /// resource on `vendor`, both on the test allow-list.
@@ -18036,7 +18161,7 @@ mod tests {
         request_uncompressed_mcp_response(ctx);
         let upstream = step_forward_request(state, ctx).await?;
         let upstream = step_answer_a_refused_grant(state, ctx, upstream).await?;
-        refuse_a_compressed_mcp_answer(ctx, &upstream)?;
+        refuse_a_compressed_answer(ctx, &upstream)?;
         match upstream {
             UpstreamResponse::Http(response) => Ok(response.status()),
             _ => panic!("an HTTP forward answers over HTTP"),
@@ -18066,9 +18191,63 @@ mod tests {
             let mut ctx = external_grant_context(&surface, VENDOR_HOP, Some(&"a".repeat(64)));
             let sent = send_with_grant(&state, &mut ctx).await;
             assert_eq!(
-                matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)),
+                matches!(sent, Err(OutboundPipelineError::UpstreamResponseCompressed)),
                 refused,
                 "{protocol} {encoding}: {sent:?}"
+            );
+        }
+    }
+
+    /// A Transit Point's public agent card is read uncompressed, whatever the
+    /// agent accepts and whatever the Transit Point's protocol, so it can be
+    /// rewritten; one compressed all the same is refused rather than passed on
+    /// pointing past the Transit Point. A card the gateway would not rewrite (a
+    /// refusal) passes on, and A2A messages keep the agent's own encoding.
+    #[test]
+    fn a_public_agent_card_on_a_transit_point_is_read_uncompressed() {
+        for (protocol, path, status, card, refused) in [
+            ("a2a", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("a2a", "/mcp/vendor/.well-known/agent.json", 200, true, true),
+            ("ap2", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("http", "/mcp/vendor/.well-known/agent-card.json", 200, true, true),
+            ("a2a", "/mcp/vendor/.well-known/agent-card.json", 404, true, false),
+            ("a2a", "/mcp/vendor", 200, false, false),
+            ("http", "/mcp/vendor/items", 200, false, false),
+        ] {
+            let mut point = vendor_transit_point(VENDOR_HOP, "vendor", "owner");
+            point["protocol"] = json!(protocol);
+            let surface = transit_surface(json!([point]), json!([]));
+            let mut ctx = external_grant_context(&surface, VENDOR_HOP, None);
+            ctx.request_path = path.to_string();
+            ctx.original_headers
+                .insert(axum::http::header::ACCEPT_ENCODING, "gzip, br".parse().unwrap());
+
+            request_uncompressed_agent_card(&mut ctx);
+
+            let expected = if card {
+                "identity"
+            } else {
+                "gzip, br"
+            };
+            assert_eq!(
+                ctx.original_headers[axum::http::header::ACCEPT_ENCODING],
+                expected,
+                "{protocol} {path} {status}"
+            );
+            let compressed = UpstreamResponse::Http(reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .header("content-encoding", "gzip")
+                    .body(b"\x1f\x8b\x08".to_vec())
+                    .unwrap(),
+            ));
+            assert_eq!(
+                matches!(
+                    refuse_a_compressed_answer(&ctx, &compressed),
+                    Err(OutboundPipelineError::UpstreamResponseCompressed)
+                ),
+                refused,
+                "{protocol} {path} {status}"
             );
         }
     }
@@ -18437,7 +18616,7 @@ mod tests {
         })
         .await;
 
-        assert!(matches!(sent, Err(OutboundPipelineError::UpstreamResponseReadFailed)), "{sent:?}");
+        assert!(matches!(sent, Err(OutboundPipelineError::UpstreamResponseCompressed)), "{sent:?}");
         let calls = connector_calls(&events);
         assert_eq!(calls.len(), 1, "{events:?}");
         match &calls[0].event {
@@ -21250,10 +21429,12 @@ mod tests {
         assert!(vendor.requests().is_empty());
 
         let oid_caller = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "00000000-0000-0000-0000-0000000000aa".to_string(),
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://login.example.com", "sub": "pairwise",
                 "oid": "00000000-0000-0000-0000-0000000000aa" }),
+            verification: Default::default(),
         }
         .principal_hash(None)
         .unwrap();
@@ -22027,12 +22208,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = delegation_state(directory.path(), &[("provider", "token-caller-access")]).await;
         let jwt = |claims: serde_json::Value| AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: claims["sub"]
                 .as_str()
                 .unwrap_or("<none>")
                 .to_string(),
             claims,
+            verification: Default::default(),
         };
         let alice = jwt(json!({ "iss": "https://idp.example", "sub": "alice" }));
         let store_grant = |id: &'static str, user_identity_hash: String, access_token: &'static str| {
@@ -22145,12 +22328,14 @@ mod tests {
         let named_by = |principal_claim: &str, sub: &str| {
             let claims = json!({ "iss": "https://idp.example", "sub": sub, "oid": "person-1" });
             AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 subject: claims[principal_claim]
                     .as_str()
                     .unwrap()
                     .to_string(),
                 principal_claim: principal_claim.to_string(),
                 claims,
+                verification: Default::default(),
             }
         };
         let by_oid = named_by("oid", "sub-in-the-first-app");
@@ -22200,9 +22385,11 @@ mod tests {
             );
         }
         let without_oid = AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: "<none>".to_string(),
             principal_claim: "oid".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "sub-in-the-first-app" }),
+            verification: Default::default(),
         };
         assert!(
             step_inject_credentials(&state, &mut context(without_oid))
@@ -22237,9 +22424,11 @@ mod tests {
         };
         let mut no_agent = no_caller();
         no_agent.authenticated_identity = Some(crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "alice".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "alice" }),
+            verification: Default::default(),
         });
         no_agent.authenticated_by = Some(SourceAuth);
         no_agent.resolved_identity = ProtectedAgentIdentity::Anonymous;
@@ -23698,9 +23887,11 @@ mod tests {
         .principal_hash(Some("tenant-a"))
         .unwrap();
         let direct_client = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "dave".to_string(),
             claims: json!({ "iss": "https://idp.example", "sub": "dave" }),
+            verification: Default::default(),
         };
         for (provider, tenant) in [("tenant-own", "tenant-a"), ("tenant-foreign", "tenant-b")] {
             state

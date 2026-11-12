@@ -100,6 +100,8 @@ pub struct ApiKeyProviderFixture {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CredentialProviderFixture {
     pub id: String,
+    /// The tenant that owns the provider; appliance-wide when `None`.
+    pub tenant_id: Option<String>,
     pub name: String,
     pub provider_id: String,
     pub provider_type: String,
@@ -115,6 +117,7 @@ pub struct CredentialProviderFixture {
     pub authorization_response_issuer: Option<String>,
     /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
     pub jwt_settings: Option<serde_json::Value>,
+    pub consent_confirmation: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -488,6 +491,9 @@ fn write_credential_provider_fixture(
         "created_at": provider.created_at.to_rfc3339(),
         "updated_at": provider.updated_at.to_rfc3339(),
     });
+    if let Some(tenant_id) = &provider.tenant_id {
+        value["tenant_id"] = serde_json::json!(tenant_id);
+    }
     if let Some(endpoint) = &provider.authorization_endpoint {
         value["authorization_endpoint"] = serde_json::json!(endpoint);
     }
@@ -508,6 +514,9 @@ fn write_credential_provider_fixture(
     }
     if let Some(issuer) = &provider.authorization_response_issuer {
         value["authorization_response_issuer"] = serde_json::json!(issuer);
+    }
+    if let Some(confirmation) = &provider.consent_confirmation {
+        value["consent_confirmation"] = confirmation.clone();
     }
     if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
         for (name, setting) in settings {

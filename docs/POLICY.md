@@ -269,24 +269,80 @@ surface id, the request's trace id and the authenticated caller (on the Access P
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
 
+### The authority of a Trust Check
+
+`query.authority_id` is stored as text: a literal DID, or a template resolved per request.
+`authority_source` beside it records the register a literal DID was found in
+([`authority_source.rs`](../src/trust_registry_verification/authority_source.rs)):
+
+| `authority_source` | Meaning |
+| --- | --- |
+| `authority` | Linked to the Authority with that DID. The Authority must still exist. |
+| `issuer` | An Issuer has that DID. |
+| absent | A template, or a DID in neither register. |
+
+Every save of a surface or STS client sets it for each literal DID: `authority` when the write
+sends `authority`, when the stored record already had the DID as `authority`, or when an
+Authority the record's tenant may use has the DID; else `issuer` when such an Issuer has it;
+else none. A link to an Authority is never dropped, so a client that leaves the field out or
+sends another value cannot turn a deleted Authority into a plain DID. A save is refused with
+`400` when a source is set on a template, or when a link names an Authority that does not exist
+or belongs to another tenant; both answer alike. Without an Authority store nothing is set or
+refused. Stored surfaces are classified the same way on each load (an active node saves the
+ones that changed; a standby node keeps them in memory), and stored STS clients at startup on
+an active node.
+
+A link from a surface or STS client to an Authority is an ownership reference: moving the
+Authority, the surface or the STS client to a tenant that would make it cross-tenant is refused
+with `409`, like any other cross-tenant reference.
+
+`DELETE /v1/authorities/{id}` is refused with `409` while a Trust Check or a Trust Recorder
+entry on any surface (base or variant) or STS client names the Authority's DID, counting only
+records whose tenant may use the Authority: a record of another tenant that names the same DID
+neither holds the Authority nor learns of it. The answer lists
+the surfaces and STS clients the caller may view, each with `uses`: the Trust Checks
+(`element: trust_check`, `id`, `name`, `placement` (`access_point`, `target` or
+`transit_point`), `transit_point`, `variant`) and Trust Recorder entries
+(`element: trust_recorder`, `trust_registry_id`, `variant`) that name it, and
+`hidden_references` counts the rest. `?force=true` deletes it anyway, but only when the caller
+may view every record that names it, and records an `authority_force_deleted` event (see
+[`OBSERVABILITY.md`](OBSERVABILITY.md)). The records keep their configuration. A delete and a
+surface save never interleave: the save re-checks its new links under the lock the delete
+holds.
+
+A Trust Check linked to an Authority that no longer exists fails with `AUTHORITY_NOT_FOUND`
+without querying its trust registry, whether the Authority was deleted with force, removed from
+`_storage/`, or never existed; so does one whose Authority store is missing or unreadable. The
+result keeps the configured `authority_id`, so policy and the audit trail can see which DID was
+refused. The check looks the DID up among all Authorities, whose DIDs are unique; whether the
+record's tenant may use it is checked on save and on tenant moves. A DID with no source is not
+checked, so a forced delete leaves a record that a node has not classified yet, such as an STS
+client stored while the node was in standby, querying the DID until its next save or startup.
+Likewise a record naming an Authority that was deleted before this check existed has no source
+on its first load, because no register has the DID any more, and its Trust Check keeps running.
+Each load logs, per surface and STS client, the literal DIDs it names that are in neither
+register, so such a record can be found and pointed at an Authority or removed.
+
 ## Failed caller authentication
 
-A closed Access Point (`access_point.public: false`, which the admin API sets on every surface
-it creates unless it is public), and one whose `caller_authentication.on_failure` is `reject`,
-refuse a missing or invalid credential with `401` before policy, see
+Every Access Point that is not public refuses a missing or invalid credential with `401`
+before policy: a closed one (`access_point.public: false`, which the admin API sets on every
+surface it creates unless it is public), a legacy one stored without `public`, and any whose
+`caller_authentication.on_failure` is `reject`, see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#closed-and-public-access-points). An Access Point whose
-inbound identity is `from_jwt_claim`, direct or over fabric, refuses one the same way, because
-no caller identity can be derived without a valid JWT. That refusal runs before gateway policy,
-so a gateway deny does not apply to it, and surface policy never sees the request. Its body is
-the generic `Caller credential missing or invalid`; the reason is logged. Otherwise source auth
-does not refuse a request whose credential is missing or invalid. The request continues with no caller identity, `input.source_auth` is
+inbound identity is `from_jwt_claim`, public or not, direct or over fabric, refuses one the
+same way, because no caller identity can be derived without a valid JWT. These refusals run
+before gateway policy, so a gateway deny does not apply to them, and surface policy never sees
+the request. Their body is the generic `Caller credential missing or invalid`; the reason is
+logged. Only on any other public Access Point (`public: true`) does source auth hand a request
+whose credential is missing or invalid to policy. The request continues with no caller identity, `input.source_auth` is
 `{"method": "failed", "attempted_method": ..., "reason": ...}`, where `attempted_method` is
 the method selected for the request (see
 [`SOURCE_AUTH.md`](SOURCE_AUTH.md#several-methods-on-one-access-point)). On every forwarding
 path (direct inbound, `proxy://` MCP Targets, `a2a-proxy://` Targets, Fabric send and
 Fabric receive, the last for surfaces without protected resource metadata) the stored
 target credential, or the A2A proxy's Direct Line secret, is not attached, because it
-vouches that the gateway vetted the caller. A legacy surface that
+vouches that the gateway vetted the caller. A public surface that
 must reject such callers needs a policy that denies `input.source_auth.method == "failed"`.
 Server-side source-auth errors (missing configuration, internal failures) still block
 with `500`. A request to an MCP Access Point that publishes protected resource
@@ -302,8 +358,9 @@ itself, with `401`, before any policy runs, so an outbound policy never sees
 
 Over Fabric, the sending Gateway strips the credential headers of every method its own
 surface configures before forwarding. A receiving surface without protected resource metadata that requires
-source authentication on that same header therefore sees every Fabric caller as failed and
-forwards without its target credential; one with the metadata, or a closed one, refuses them with `401`. Require caller authentication on one side of the Fabric hop, or use a
+source authentication on that same header therefore sees every Fabric caller as failed: a
+public one forwards them without its target credential, and every other one refuses them
+with `401`. Require caller authentication on one side of the Fabric hop, or use a
 different credential header on each side.
 
 ## Caller identity verification in policy input

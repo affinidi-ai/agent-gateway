@@ -225,7 +225,11 @@ denies — OPA decides. The checker is a port (`StsTrustChecker`); production wr
 the trust-registry listener manager (`ListenerTrustChecker`, wired in
 `build_sts_router` from `create_identity_api_router`'s
 `trust_registry_listener_manager`), and when no manager is wired the list is
-skipped (`DisabledTrustChecker`).
+skipped (`DisabledTrustChecker`). A client's Trust Checks record and check their
+`authority_source` on save as a surface's do, an Authority they name cannot be
+deleted without force, and a check linked to an Authority that is gone fails with
+`AUTHORITY_NOT_FOUND`; see
+[_The authority of a Trust Check_](POLICY.md#the-authority-of-a-trust-check).
 
 ## Managed connections
 

@@ -207,8 +207,8 @@ mod tests {
         RejectionReason, RejectionStage, RequestFailureOutcome, TargetAuthLeg, TargetAuthMethodKind, TargetKind,
     };
     use crate::delegation_vault::audit::{
-        McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage, PolicyChangeDetails,
-        SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
+        AuthorityForceDeleteDetails, McpProxyPinChangeDetails, PaymentEventDetails, PaymentRail, PaymentStage,
+        PolicyChangeDetails, SecretForceDeleteDetails, TargetAuthChangeDetails, audit_event,
     };
     use std::collections::HashSet;
 
@@ -251,9 +251,11 @@ mod tests {
         name: Option<&str>,
     ) -> AuditCallerContext {
         crate::delegation_vault::audit::build_caller_context(&crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"iss": "https://idp.example.com", "email": email, "name": name}),
+            verification: Default::default(),
         })
     }
 
@@ -448,9 +450,11 @@ mod tests {
         assert_eq!(with(jwt_caller(Some(""), None)), "user-123", "an empty claim is skipped");
         let by_oid = crate::delegation_vault::audit::build_caller_context(
             &crate::source_auth::AuthenticatedIdentity::JwtBearer {
+                strategy_id: None,
                 principal_claim: "oid".to_string(),
                 subject: "person-1".to_string(),
                 claims: serde_json::json!({"iss": "https://idp.example.com", "sub": "pairwise", "oid": "person-1"}),
+                verification: Default::default(),
             },
         );
         assert_eq!(with(by_oid), "person-1", "the principal claim's value names the caller, not the token's sub");
@@ -566,6 +570,7 @@ mod tests {
             | DelegationAuditAction::PolicyChangeRefused(_)
             | DelegationAuditAction::TargetAuthChanged(_)
             | DelegationAuditAction::SecretForceDeleted(_)
+            | DelegationAuditAction::AuthorityForceDeleted(_)
             | DelegationAuditAction::McpProxyPinChanged(_) => {}
         }
     }
@@ -694,6 +699,13 @@ mod tests {
             DelegationAuditAction::SecretForceDeleted(Box::new(SecretForceDeleteDetails {
                 actor: Actor::user("u-1"),
                 secret_id: "billing_api_key".to_string(),
+                force: true,
+                referrers: Vec::new(),
+            })),
+            DelegationAuditAction::AuthorityForceDeleted(Box::new(AuthorityForceDeleteDetails {
+                actor: Actor::user("u-1"),
+                authority_id: "authority-1".to_string(),
+                did: "did:web:authority.example".to_string(),
                 force: true,
                 referrers: Vec::new(),
             })),

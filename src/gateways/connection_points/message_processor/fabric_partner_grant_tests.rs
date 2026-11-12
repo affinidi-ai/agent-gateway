@@ -411,9 +411,11 @@ impl Receiver {
         tenant: Option<&str>,
     ) -> String {
         crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: subject.to_string(),
             claims: json!({ "iss": self.idp.issuer, "sub": subject }),
             principal_claim: "sub".to_string(),
+            verification: Default::default(),
         }
         .principal_hash(tenant)
         .unwrap()
@@ -511,8 +513,15 @@ impl Receiver {
             vault_population_notifier: None,
             egress_allowlist: None,
             resource_origins: Arc::new(HashMap::new()),
-            issuers: Arc::new(None),
+            issuers: Default::default(),
             mcp_proxy_store: None,
+            identity_strategies: self.strategies.clone(),
+            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                crate::jwt_bearer::JwksClient::new(),
+            ))),
+            provider_egress: self.egress(),
+            gateway_mcp_issuer: None,
+            config_surfaces: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));
@@ -1131,8 +1140,10 @@ async fn a_partner_credential_that_names_every_user_alike_never_releases_a_grant
 /// verifies only a token whose `iss` is empty, and a caller with an empty
 /// issuer has no identity hash, so the request is refused as one whose caller
 /// the surface did not verify. A grant kept under the hash an empty issuer
-/// would give stays unused. A strategy that cannot be read verifies no caller
-/// either: the request fails as a gateway fault, with no grant released.
+/// would give stays unused. A token naming an issuer does not verify, so the
+/// closed Access Point refuses it with `401`. A strategy that cannot be read
+/// verifies no caller either: the request fails as a gateway fault, with no
+/// grant released.
 #[tokio::test]
 async fn a_strategy_that_names_no_issuer_releases_no_grant_to_a_partner() {
     if ran_in_child("ATG_FABRIC_PARTNER_GRANT_NO_ISSUER_CHILD").await {
@@ -1181,8 +1192,7 @@ async fn a_strategy_that_names_no_issuer_releases_no_grant_to_a_partner() {
     )
     .await;
     assert_eq!(released(&events), 0, "a token naming an issuer does not verify: {events:?}");
-    assert_eq!(status_and_reason(&response), (json!(403), json!("partner_caller_not_verified")), "{response}");
-    assert_eq!(rejections(&events), [(RejectionStage::Admission, RejectionReason::ConsentIdentityRequired, true)]);
+    assert_eq!(response["status"], 401, "the closed Access Point refuses the unverified token: {response}");
 
     receiver
         .strategies
@@ -1266,7 +1276,9 @@ async fn a_partner_whose_caller_the_surface_did_not_verify_gets_no_grant() {
 
 /// A transit token the peer sends, even one this gateway issued naming another
 /// person who has a grant, never selects that grant, and never stands in for
-/// a caller the surface verified.
+/// a caller the surface verified: without the caller's own credential the
+/// closed Access Point refuses the request with `401`, and a public one refuses
+/// it as one whose caller it did not verify.
 #[tokio::test]
 async fn a_transit_token_the_peer_sends_never_selects_a_grant() {
     if ran_in_child("ATG_FABRIC_PARTNER_GRANT_TRANSIT_TOKEN_CHILD").await {
@@ -1290,16 +1302,23 @@ async fn a_transit_token_the_peer_sends_never_selects_a_grant() {
             RejectionReason::ConsentNotAvailableForPartners,
         )
         .await;
-    receiver
-        .assert_refused(
-            &receiver.partner_request(json!({ "content-type": "application/json", "x-transit-token": token })),
-            "partner_caller_not_verified",
-            RejectionReason::ConsentIdentityRequired,
-        )
-        .await;
+    let token_only = json!({ "content-type": "application/json", "x-transit-token": token });
+    let response = forward_response(&receiver.partner_request(token_only.clone())).await;
+    assert_eq!(response["status"], 401, "{response}");
 
     receiver
         .assert_released(&receiver.partner_request(receiver.as_user("bob")), "Bearer bob-access")
+        .await;
+
+    let mut public = receiver.surface(true);
+    public.access_point.public = Some(true);
+    receiver.serve(&public).await;
+    receiver
+        .assert_refused(
+            &receiver.partner_request(token_only),
+            "partner_caller_not_verified",
+            RejectionReason::ConsentIdentityRequired,
+        )
         .await;
 }
 

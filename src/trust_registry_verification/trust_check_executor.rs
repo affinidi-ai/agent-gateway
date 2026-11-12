@@ -123,6 +123,12 @@ pub const IDENTITY_VP_VERIFICATION_FAILED: &str = "IDENTITY_VP_VERIFICATION_FAIL
 /// `entity_id` from the wire.
 pub const TARGET_AGENT_IDENTITY_UNAVAILABLE: &str = "TARGET_AGENT_IDENTITY_UNAVAILABLE";
 
+/// Stage failure code: the element's authority was picked from the
+/// Authorities register (`authority_source: authority`) and that Authority
+/// no longer exists. The registry is not queried; the result keeps the
+/// configured `authority_id`.
+pub const AUTHORITY_NOT_FOUND: &str = "AUTHORITY_NOT_FOUND";
+
 /// Stage failure code: a recognition query returned a negative verdict.
 /// Fires when the registry either answers spec-compliantly with
 /// `{ recognized: false, ... }` or (workaround for registries that emit
@@ -609,6 +615,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
@@ -844,6 +851,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Authorization,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
@@ -1196,6 +1204,7 @@ mod tests {
         TrustCheckElement {
             id: id.to_string(),
             trust_registry_id: registry.to_string(),
+            authority_source: None,
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "{{input.caller.gateway.did}}".to_string(),

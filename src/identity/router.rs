@@ -915,9 +915,25 @@ pub fn create_identity_api_router(
     let oidc_provider_router = if let (Some(store), Some(storage), Some(sess_mgr)) =
         (jwt_verification_strategy_store, passkey_storage_for_manager.as_ref(), session_manager_for_manager.as_ref())
     {
+        let references = crate::credential_providers::references::ReferenceStores {
+            credential_providers: state
+                .credential_provider_store
+                .clone(),
+            ..Default::default()
+        };
+        let gateway_issuer = crate::jwt_bearer::handlers::GatewayMcpIssuer(
+            state
+                .network_config
+                .sts
+                .mcp_issuer
+                .as_ref()
+                .map(|profile| profile.issuer.clone()),
+        );
         let state: crate::jwt_bearer::handlers::JwtVerificationStrategyState = store;
         info!("JWT verification strategy management routes registered");
         let router = crate::jwt_bearer::router::create_jwt_verification_strategies_router(state)
+            .layer(Extension(references))
+            .layer(Extension(gateway_issuer))
             .layer(middleware::from_fn(crate::auth_manager::middleware::extract_user_id))
             .layer(Extension(sess_mgr.clone()))
             .layer(Extension(storage.clone()))
@@ -1809,6 +1825,17 @@ pub fn create_identity_api_router(
 
     // Create authority routes if store is provided
     let authority_router = if let Some(store) = authority_store {
+        let authority_references = crate::credential_providers::references::ReferenceStores {
+            surfaces: state
+                .agent_surface_store
+                .clone()
+                .map(|store| store as Arc<dyn crate::surfaces::AgentSurfaceStore>),
+            sts_clients: sts_client_store.clone(),
+            ..Default::default()
+        };
+        let authority_rbac = passkey_storage_for_manager
+            .as_ref()
+            .map(|storage| crate::auth_manager::middleware::RbacGuard::new(storage.clone(), rbac_config.clone()));
         Router::new()
             .route(
                 "/v1/authorities",
@@ -1851,6 +1878,8 @@ pub fn create_identity_api_router(
             )
             .layer(Extension(store))
             .layer(Extension(issuer_tr_listener_manager))
+            .layer(Extension(authority_references))
+            .layer(Extension(authority_rbac))
     } else {
         Router::new()
     };

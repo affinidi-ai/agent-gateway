@@ -70,10 +70,13 @@ Point, identifies callers by the same claim.
   names a different claim is refused with `400`, and an update that leaves it out keeps it. To
   use another claim:
   1. Create a new strategy for the issuer that names the claim.
-  2. Point every surface method, and every credential provider whose
-     `consent_identity_strategy_id` names the old strategy, at the new one.
-  3. Delete the old strategy. Nothing checks that it is unused, so a provider still naming it
-     would answer its consents with not found.
+  2. Point every surface method, every credential provider whose
+     `consent_identity_strategy_id` names the old strategy, and every credential provider whose
+     `consent_confirmation.jwt_verification_strategy_id` names it, at the new one.
+  3. Delete the old strategy. The delete answers `409`, naming the providers, while a credential
+     provider's `consent_identity_strategy_id` or `consent_confirmation.jwt_verification_strategy_id`
+     still names it ([Consent confirmation](CREDENTIAL_DELEGATION.md#turning-it-on)). Nothing
+     checks surface methods, so point them at the new strategy first.
   4. Have callers connect again, since their identity hashes have changed.
 
   From step 1 to step 3, token exchange and `jwt-bearer` redemption refuse the issuer's tokens
@@ -153,9 +156,9 @@ that method:
 3. A request that carries credentials for more than one method fails source authentication
    as the primary method, audited as `ambiguous_credentials`, and neither credential is
    verified, so a caller can't choose the identity the gateway asserts. Like any failed
-   credential, it is refused on a closed Access Point, with `on_failure: reject`, on an inbound
-   `from_jwt_claim` identity, or beside protected resource metadata, and otherwise passed to
-   policy as
+   credential, it is refused on every Access Point that is not public (closed or legacy), with
+   `on_failure: reject`, on an inbound `from_jwt_claim` identity, or beside protected resource
+   metadata, and otherwise passed to policy as
    `input.source_auth.method == "failed"`. This includes a JWT or API key sent over a
    connection that presents a client certificate, on a surface that also accepts mTLS, and an
    MCP client's own `Bearer` token sent beside an API key when a JWT bearer method reads
@@ -322,7 +325,7 @@ admits callers without a valid credential
 
 | `access_point.public` | Meaning |
 | --- | --- |
-| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. It keeps the behaviour its stored fields describe: no `caller_authentication` admits every caller, and `on_failure` defaults to `continue`. |
+| absent | A legacy surface: one the admin API did not create, such as a surface built from DynamoDB or restored or edited by hand without the field. A caller whose credential is missing or invalid is refused, as on a closed Access Point, whatever `on_failure` stores; the gateway decides this when it serves the request and writes nothing to the stored surface. Without `caller_authentication` it admits every caller and is always ready. |
 | `false` | Closed. The admin API writes it on every surface it creates when the request does not set `public: true`. A failed caller is refused whatever `on_failure` stores, including on a surface edited by hand. |
 | `true` | Public: callers without credentials are admitted. On every save the admin API sets `caller_authentication.on_failure` to `continue`, on the base and on every variant override that sets `caller_authentication`, so a caller whose credential fails goes on to policy. Every save answers with a `Warning` header. |
 
@@ -335,6 +338,66 @@ On a closed surface the admin API, on create and on every update:
   override that sets `caller_authentication`;
 - keeps the stored `public` value when an update leaves it out, so a client that drops the
   field cannot reopen the surface.
+
+#### Legacy Access Points after upgrading
+
+v1.0.7 and earlier handed a caller whose credential was missing or invalid to policy on
+a legacy surface (no `public`) that authenticates callers without `on_failure: reject`, an
+inbound `from_jwt_claim` identity or protected resource metadata, so such a caller reached the
+Target unless a policy denied `input.source_auth.method == "failed"`. Every surface created before
+v1.0.4 (2026-11-02), built from DynamoDB, restored from an older backup or edited by hand
+without `public` is legacy, unless it was later closed or made public. Such a surface now
+refuses that caller with `401` before policy and the Target, on direct inbound, `proxy://` MCP
+Targets, `a2a-proxy://` Targets and Fabric receive, as a closed Access Point does. Nothing is
+written to the stored surface.
+
+Callers that stop working after the upgrade:
+
+- clients whose key or token is revoked, expired, wrong or for another audience, which reached
+  the Target unnoticed;
+- callers that send no credential at all, such as internal services, scripts and monitors;
+- anonymous callers a policy admitted on purpose (an "anonymous tier");
+- partners over Fabric when the sending surface checks the same credential header: the sending
+  gateway strips that header, so every partner request arrives without it (see
+  [`POLICY.md`](POLICY.md#failed-caller-authentication)).
+
+Callers with a valid credential, public and closed surfaces, and legacy surfaces without
+`caller_authentication` (which still admit every caller) are unaffected.
+
+These refusals return before the surface rate limit, as on a closed Access Point (see
+[Closed and public Access Points](#closed-and-public-access-points)), so repeated wrong
+credentials no longer use up its budget, and are not throttled by it either. Use high-entropy
+API keys, and limit requests per client upstream of the gateway if credential guessing is a
+concern.
+
+To find the affected surfaces and callers:
+
+- from storage, with no traffic needed: a surface is affected when it stores no `public` and
+  its Access Point, or an enabled variant, sets `caller_authentication` without
+  `on_failure: reject`, an inbound `from_jwt_claim` identity or protected resource metadata;
+- before upgrading, look in the audit log for `auth_failed` events with `blocking: false` on
+  surfaces stored without `public`: each is a caller that is now refused. Public surfaces
+  record the same event and are unaffected. The VP Audit Log keeps `auth_failed` only while
+  it is in the `audit_events` selection (Settings › VP Audit; see
+  [`OBSERVABILITY.md`](OBSERVABILITY.md)), so select it, ahead of the upgrade, to see these
+  callers;
+- after upgrading, the gateway logs a warning when it starts (not on a configuration reload,
+  a storage refresh or a backup restore, so restart after one) for each active legacy surface
+  whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
+  resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
+  already), naming the surface:
+  `This Access Point is configured for authenticated callers only. Any request without valid
+  credentials is denied with a 401 Unauthorized response. To allow requests from those callers,
+  switch the Access Point to Public access.`.
+
+To keep handing failed callers to policy, mark the surface public (`access_point.public: true`,
+the **Public access** switch). To make the refusal explicit in storage, close it
+(`access_point.public: false`, set through the API or the JSON editor). Either writes `public`, which releases
+before v1.0.4 cannot load (see [Upgrading and rolling back](#upgrading-and-rolling-back)). A
+surface built from DynamoDB takes the same setting from an optional `public` attribute on its
+item: a boolean, or the string `"true"` or `"false"`. Any other value is ignored, so the surface
+keeps no Public access setting, and the gateway logs a warning naming the item and the type of value it held (never
+the value), at start and on a later load.
 
 #### Not ready Access Points
 
@@ -410,7 +473,9 @@ owning surface no longer exists, which the gate does not refuse. It is `false` f
 or `unknown` one. Another surface's revoked key stays `unavailable`; the surface's
 `serving_status` already shows that it does not serve.
 
-On a closed surface, with `on_failure: reject`, or with an inbound `from_jwt_claim` identity, a missing or invalid credential is refused
+On every Access Point that is not public (closed or legacy), on a public one stored with
+`on_failure: reject`, and with an inbound `from_jwt_claim` identity, a missing or invalid
+credential is refused
 with `401` before policy and the target, on direct inbound, `proxy://` MCP Targets,
 `a2a-proxy://` Targets and Fabric receive. These refusals return before the surface rate limit,
 so they don't use up its budget: an anonymous caller can't exhaust the budget of the callers it
@@ -434,7 +499,9 @@ them, which is every surface created after the upgrade; see
 
 ### Failed credentials with `on_failure: continue`
 
-With `on_failure: continue`, a missing or invalid credential does not refuse the request.
+On a public Access Point, whose saves store `on_failure: continue`, a missing or invalid
+credential does not refuse the request. `on_failure: continue` stored on any other Access Point
+has no effect: closed and legacy ones refuse the caller.
 That includes an mTLS certificate that lacks the configured binding field. The request
 continues with no caller identity, and policy sees `input.source_auth` as
 `{"method": "failed", "attempted_method": ..., "reason": ...}`. Only server-side errors,
@@ -450,7 +517,7 @@ all sends that credential for every caller, and is held to
 in `warn` a warning is logged once, in `enforce` the credential is withheld and a new or
 changed Target authentication, or a new `a2a-proxy://` Target, on such a surface is refused on
 save. To reject
-unauthenticated callers at such an Access Point, close it (`public: false` with caller
+unauthenticated callers at a public Access Point, close it (`public: false` with caller
 authentication), or attach a policy that denies them:
 
 ```rego
@@ -794,6 +861,13 @@ whole surface at load (it skips and logs it) instead of serving its Transit Poin
   the fields to load such a surface on the older release opens it: one without source
   authentication then admits every caller, and one with it hands a failed caller to policy.
   Back up `_storage/agent_surfaces/` before upgrading.
+- A legacy surface (no `public`) with source authentication refuses a failed caller with
+  `401`; v1.0.7 and earlier handed that caller to policy. Nothing is written to the stored
+  surface, so a rollback to v1.0.7 or earlier loads it unchanged, and hands its failed callers
+  to policy again. A surface closed with `public: false` before upgrading keeps refusing failed
+  callers after a rollback to v1.0.4–v1.0.7; releases before v1.0.4 cannot load it. See
+  [Legacy Access Points after upgrading](#legacy-access-points-after-upgrading) to find the
+  callers that are refused and to keep admitting them.
 
 ### Transit Point source authentication
 
@@ -1037,10 +1111,28 @@ The signing key is 32 random bytes the gateway creates on its first start, in
 encrypted like the gateway's other keys when encryption at rest is on. A key file that is
 not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
 loads it, and the file written when encryption at rest is turned on later is owner-only
-too. The file is created by linking a complete copy into place, so the directory must be on
-a filesystem that supports hard links; one that does not stops the first start with an error
-saying so. A key file that cannot be read stops the gateway from starting. Every token names
-the key in its `kid` header, and a token that names another key, or none, is refused.
+too. A volume that applies its own mode, such as an SMB share mounted without
+`file_mode=0600`, keeps the key readable beyond its owner; the gateway warns about it and
+starts, so mount such a share with the options under
+[Storage](DEPLOYMENT_REQUIREMENTS.md#storage). The file is created by linking a complete
+copy into place. When that link fails for any reason other than the file already existing,
+as every link does on a filesystem without hard links such as an Azure Files SMB share, the
+gateway logs a warning and creates the file exclusively instead, filling it in place; one
+instance still wins the creation, and an instance reading the file while another fills it
+waits up to 5 seconds for it to be complete. Filling it takes milliseconds, so the wait
+covers a storage backend that stalls; an instance that still cannot read a file with content
+in it by then stops with an error and reads the complete file when it is restarted, so such
+a stall costs one restart. A directory the file cannot be made in at all still stops the
+start. A key file that cannot be read stops the gateway from starting and is never replaced,
+with one exception: a key file that holds no content at all, which a first start killed
+between creating the file and filling it leaves behind, is removed and a new key created in
+its place, so an interrupted first start does not stop every later one. Only an instance
+that read the file empty and found it unchanged 5 seconds later removes it, and an instance
+creating the key removes nothing, so a file another instance is filling is left alone. A
+file with any content in it, even damaged, is kept and named in the error instead. Instances
+that recover the same empty file together still end on one key, and one that finds the key
+gone while it is creating it reads it again rather than stopping. Every token names the key
+in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
 accepts the tokens the Active instance issued; instances that do not share it refuse each
 other's tokens, so every instance that serves a managed agent's Transit Point calls must share
@@ -1216,7 +1308,9 @@ except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
 `Authorization` and its `Cookie`, its proxy forwarding headers, the caller-info and
 `did:webvh` identity headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`,
-`x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the header its `source_auth`
+`x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the caller key headers
+(`x-caller-key` and every name starting `x-caller-key-`, also spelled with `_` for `-`; see
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys)), the header its `source_auth`
 reads, a header named like the Transit Point's `target_auth` header or like the
 `custom_header` of a credential binding that can apply on it, and any header a Header
 Metadata Mapping is set to strip. Other headers, such as an API key header the agent sends for
@@ -1262,6 +1356,20 @@ identity presentation reports `vp` or `vp_unanchored` regardless of the configur
 on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
 
+### A missing identity on the public agent card
+
+On the protected slot, `payload_extraction` refuses a response that carries no identity with
+`422 identity_extension_missing`, and one whose identity is present but invalid with `422
+identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
+which is served without an identity credential on any identity error. The public agent card of
+an A2A or AP2 surface is the exception for a missing identity: a named card with neither
+`agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no identity
+credential and no Trust Recorder write. The gateway logs a `WARN` once per surface, and again
+only after that card carried an identity, after the surface changes, or after a configuration
+reload or restart. An agent that publishes no identity, such as a Microsoft Foundry agent, stays
+discoverable. Its messages are still refused while the slot reads the identity from the response.
+See [`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for which cards qualify and the codes.
+
 ### `from_api_key` on the inbound slot
 
 The inbound slot stores no key. Each request's caller DID comes from the API key that request
@@ -1274,9 +1382,9 @@ presents to the surface's caller authentication:
 
 Per-key caller identity therefore needs an API Key Provider.
 
-- A missing, invalid or revoked key resolves no caller identity. On a closed Access Point, or
-  with `on_failure: reject`, the request is refused with `401` before policy; otherwise policy
-  sees `input.source_auth.method == "failed"` and decides; see
+- A missing, invalid or revoked key resolves no caller identity. On an Access Point that is
+  not public (closed or legacy), or with `on_failure: reject`, the request is refused with `401`
+  before policy; on a public one policy sees `input.source_auth.method == "failed"` and decides; see
   [`POLICY.md`](POLICY.md#failed-caller-authentication).
 - A key is checked against this node's cached copy of its record; validation reads and writes
   no key record. A key another node revoked, rotated or deleted stops authenticating here at
@@ -1708,9 +1816,25 @@ Each rotation in the history has `rotated_at` (the credential's new `updated_at`
 is kept, so the fields before the first one are the ones the identity was created with. The
 history is stored apart from the record, one file per identity hash under the identity store's
 `@rotations/` directory, written through the same storage layer (encrypted at rest when storage
-encryption is on). It is written only when a rotation is recorded, so the usage update every
-request makes does not rewrite it. A record written before the history existed keeps its
-rotations inline in `rotations`; the next write of that record moves them to the history.
+encryption is on). It is written when a rotation is recorded, and when a record that still
+holds rotations inline is next written, so the usage update every request makes does not
+otherwise rewrite it. Each write replaces the whole file through a temporary file, so an
+interrupted write leaves the earlier history in place. A record written before the history
+existed keeps its rotations inline in `rotations`; the next write of that record moves them
+to the history.
+
+A record that counts no rotations beside an existing history file, as after the record was
+saved by a release that does not track `rotation_count`, lists only the rotations it holds
+inline, if any, until the history is next written: on its next rotation, or on its next write
+of any kind while it holds rotations inline. That write keeps the history on file and adds to
+it, or replaces it when the file does not decrypt or parse. Rotations it already saved at the
+end of the history before a failed record save are not added again; when the credential
+rotated again before that write, the saved rotation stays and shows as one extra version. Any
+other failure to read the file,
+such as a disk or key service outage, fails the write and leaves the file in place. A history
+file that cannot be read, such as one torn by an interrupted write before writes went through
+a temporary file, fails every rotation of a record that counts rotations, and its rotations
+request answers `500`, until the file is restored or removed.
 
 Identities rows and WebSocket identity updates carry `rotation_count`, not the rotations.
 `GET /api/v1/identities/by-hash/{identity_hash}/rotations` lists them, oldest first, under the
@@ -1718,12 +1842,14 @@ same session authentication as the other dashboard routes:
 
 | Query | Meaning |
 | --- | --- |
-| `limit` | Rotations per page, 1 to 1000. Default 1000. |
+| `limit` | Rotations per page. Default 1000; a value from 0 up is clamped to 1 to 1000, and a negative or non-numeric value is refused with `400`. |
 | `before` | History index the page ends before. Default: the end of the history, so the first page is the newest. |
 
 The answer is `{ "rotations": [...], "total": n, "start": i }`: the history's entries
 `start` to `start + rotations.length - 1` of `total`. Ask again with `before=start` for the
-page before it until `start` is `0`. An unknown identity hash answers `404`.
+page before it until `start` is `0`. An unknown identity hash answers `404`. Paging bounds the
+size of each answer only: every page reads and decrypts the whole history file, so a client
+that loads every page reads it once per page.
 
 On each use of a credential-derived managed identity, the gateway compares the credential
 with the record. A certificate counts as rotated when its fingerprint, subject or issuer
@@ -1784,6 +1910,14 @@ issuer was deleted (deleting an Issuer does not check whether a surface still us
 template does not resolve and the entry is skipped with a warning rather than written
 with a placeholder.
 
+An entry's `authority_source` records whether a literal `authority_did` is linked to an
+Authority (`authority`) or found among the Issuers (`issuer`); see
+[_The authority of a Trust Check_](POLICY.md#the-authority-of-a-trust-check) for how it is set
+and checked on save. An entry linked to an Authority that no longer exists writes nothing and is
+skipped with `authority_not_found`, so no new record is written under a DID nothing vouches for.
+Deleting an Authority is refused while an entry names it. Records already written stay in the
+trust registry.
+
 An entry's `issuer_did` is not a signer and does not set the authority. It is written as
 the `entity_id` of custom records whose `entity_target` is `issuer`, and nothing else. The
 dashboard warns on the Trust Recorder panel and on the entry while the surface has no Issuer
@@ -1804,7 +1938,7 @@ Each entry has one state:
 | Recorded (`recorded`) | At least one record was written or already existed, and none failed. |
 | Partly recorded (`partial`) | Some records were written or already existed and some failed. |
 | Failed (`failed`) | No record was written. The reason is `no_response` (no reply within 10 seconds), `rejected` (the registry sent a problem report) or `error`. |
-| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve) or `error` (the trust registry lookup failed). |
+| Skipped (`skipped`) | The entry was not written. The reason is `registry_not_found`, `registry_not_connected`, `no_surface_issuer` (the `{{ surface.issuer_did }}` template did not resolve), `authority_not_found` (the Authority the entry was picked from no longer exists) or `error` (the trust registry lookup failed). |
 | Not attempted yet (`not_attempted`) | The surface has a Trust Recorder and no outcome is stored yet, for example right after it was added. |
 
 An entry that declares no records is not reported. The identity's overall state combines its

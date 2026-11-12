@@ -39,6 +39,61 @@ pub trait AgentSurfaceStore: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+/// Classifies each literal authority DID of a stored surface by the register it is in, and
+/// when `persist` saves a surface whose sources changed, so a Trust Check or Trust Recorder
+/// entry whose Authority is deleted later fails instead of carrying on under a plain DID. A
+/// link to an Authority is never dropped, so registers read only in part cannot undo one.
+/// Before saving, the surface is read again and that copy is classified and served, so a
+/// write that landed since `surfaces` was listed is kept; a surface deleted since is dropped.
+/// A surface that fails to save keeps its classification in memory and is saved on the next
+/// load. Literal DIDs in neither register are logged, since one may name an Authority deleted
+/// before its link was recorded.
+///
+/// Called from the same load paths as [`strip_unsupported_header_metadata_mappings`].
+pub async fn record_authority_sources<S: AgentSurfaceStore + ?Sized>(
+    store: &S,
+    surfaces: &mut Vec<AgentSurface>,
+    persist: bool,
+    registers: &crate::trust_registry_verification::authority_source::AuthorityRegisters,
+) {
+    use crate::trust_registry_verification::authority_source::{surface_references, warn_unlinked};
+
+    let mut gone = Vec::new();
+    for surface in surfaces.iter_mut() {
+        let changed = registers.classify_surface(surface, None);
+        if changed && persist {
+            match store
+                .get(&surface.surface_id)
+                .await
+            {
+                Ok(Some(mut stored)) => {
+                    let stored_changed = registers.classify_surface(&mut stored, None);
+                    *surface = stored;
+                    if stored_changed && let Err(error) = store.save(surface).await {
+                        warn!(
+                            surface_id = %surface.surface_id,
+                            %error,
+                            "Failed to save where the authority DIDs of a surface's Trust Checks and Trust Recorder \
+                             entries come from"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    gone.push(surface.surface_id.clone());
+                    continue;
+                }
+                Err(error) => warn!(
+                    surface_id = %surface.surface_id,
+                    %error,
+                    "Failed to read a surface again before saving where its authority DIDs come from"
+                ),
+            }
+        }
+        warn_unlinked(&surface.surface_id, &surface_references(surface));
+    }
+    surfaces.retain(|surface| !gone.contains(&surface.surface_id));
+}
+
 /// Auto-clear `header_metadata_mapping` config that targets a protocol other
 /// than A2A/AP2, persisting the correction to storage.
 ///
@@ -863,6 +918,149 @@ mod tests {
                 .expect("get should succeed")
                 .is_none(),
             "a valid surface is not rewritten"
+        );
+    }
+
+    fn surface_linking(
+        id: &str,
+        did: &str,
+    ) -> AgentSurface {
+        serde_json::from_value(serde_json::json!({
+            "surface_id": id, "name": id,
+            "access_point": {
+                "listen_address": "0.0.0.0:8443", "route": format!("/{id}"), "protocol": "a2a",
+                "trust_check_list": [{
+                    "id": "check", "trust_registry_id": "tr-1", "query_type": "recognition",
+                    "query": {"authority_id": did, "entity_id": "{{ input.agent.did }}"}
+                }]
+            },
+            "target": {"endpoint": "https://agent.example.com"}
+        }))
+        .expect("surface")
+    }
+
+    async fn registers_with_authority(
+        did: &str
+    ) -> crate::trust_registry_verification::authority_source::AuthorityRegisters {
+        use crate::authorities::AuthorityStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let authorities = crate::authorities::FileSystemAuthorityStore::new(dir.path().to_path_buf())
+            .await
+            .expect("authority store");
+        authorities
+            .create(&crate::authorities::types::Authority::new("a-1".into(), "Acme".into(), did.into(), None, None))
+            .await
+            .expect("create authority");
+        crate::trust_registry_verification::authority_source::AuthorityRegisters::load(&authorities, None)
+            .await
+            .expect("registers")
+    }
+
+    fn source_of(
+        surface: &AgentSurface
+    ) -> Option<crate::trust_registry_verification::authority_source::AuthoritySource> {
+        surface
+            .access_point
+            .trust_check_list[0]
+            .authority_source
+    }
+
+    #[tokio::test]
+    async fn an_active_node_saves_the_surfaces_whose_authority_sources_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = listed(
+            &store,
+            vec![surface_linking("linked", "did:web:acme"), surface_linking("unlinked", "did:web:typed")],
+        )
+        .await;
+
+        record_authority_sources(&store, &mut surfaces, true, &registers).await;
+
+        let saved = store
+            .get("linked")
+            .await
+            .expect("get")
+            .expect("the linked surface is stored");
+        assert_eq!(
+            source_of(&saved),
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
+        assert_eq!(surfaces.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_since_the_listing_is_classified_and_kept_rather_than_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = listed(&store, vec![surface_linking("linked", "did:web:acme")]).await;
+        let mut written = surface_linking("linked", "did:web:acme");
+        written.name = "renamed since".to_string();
+        store
+            .save(&written)
+            .await
+            .expect("save");
+
+        record_authority_sources(&store, &mut surfaces, true, &registers).await;
+
+        let saved = store
+            .get("linked")
+            .await
+            .expect("get")
+            .expect("stored");
+        assert_eq!(saved.name, "renamed since");
+        assert_eq!(
+            source_of(&saved),
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
+        assert_eq!(surfaces[0].name, "renamed since", "the copy served is the one stored");
+    }
+
+    #[tokio::test]
+    async fn a_surface_deleted_since_the_listing_is_not_saved_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = listed(&store, vec![surface_linking("linked", "did:web:acme")]).await;
+        store
+            .delete("linked")
+            .await
+            .expect("delete");
+
+        record_authority_sources(&store, &mut surfaces, true, &registers).await;
+
+        assert!(surfaces.is_empty());
+        assert!(
+            store
+                .get("linked")
+                .await
+                .expect("get")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_standby_node_classifies_authority_sources_without_saving_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = test_store(dir.path()).await;
+        let registers = registers_with_authority("did:web:acme").await;
+        let mut surfaces = vec![surface_linking("linked", "did:web:acme")];
+
+        record_authority_sources(&store, &mut surfaces, false, &registers).await;
+
+        assert_eq!(
+            source_of(&surfaces[0]),
+            Some(crate::trust_registry_verification::authority_source::AuthoritySource::Authority)
+        );
+        assert!(
+            store
+                .get("linked")
+                .await
+                .expect("get")
+                .is_none()
         );
     }
 

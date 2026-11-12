@@ -374,6 +374,7 @@ async fn async_main() -> Result<()> {
     // Initialize logging
     // before this point consider using println
     let _guard: Option<WorkerGuard> = init_logging(&config, &bootstrap_config, otlp_auth_header)?;
+    storage::start_logging_warnings();
 
     let retired_a2a_switches =
         surfaces::RetiredA2aSwitches::read(&bootstrap_config).unwrap_or(surfaces::RetiredA2aSwitches {
@@ -463,8 +464,9 @@ async fn async_main() -> Result<()> {
     x402::init_gateway_facilitator_service().await;
     info!("Gateway facilitator service initialized - ready for ATM infrastructure");
 
-    // NOW load surfaces (after logging is initialized so errors are logged)
-    // Only for "local" configuration source
+    // Load local surfaces after logging is initialized so errors are logged;
+    // other sources loaded theirs with the configuration, before logging, so
+    // their legacy Access Point notices are logged here.
     if bootstrap_config.channel_config_source == "local" {
         info!("Loading surfaces from local storage (after logging initialized)");
         match load_surfaces(&bootstrap_config).await {
@@ -477,6 +479,8 @@ async fn async_main() -> Result<()> {
                 return Err(e.context("Failed to load surfaces from local storage"));
             }
         }
+    } else {
+        config::log_legacy_access_point_notices(&config.surfaces);
     }
 
     // Print ASCII art banner (always to terminal and logs)
@@ -972,15 +976,48 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
     surfaces::fall_back_to_first_source_auth_methods(&store, &mut channels, !crate::server::mode::is_standby()).await?;
     config::log_additional_source_auth_method_notices(&channels);
     config::log_unchecked_audience_warnings(&channels);
+    config::log_legacy_access_point_notices(&channels);
     surfaces::clear_dangling_default_variants(&store, &mut channels).await?;
     surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
         surfaces::RetiredA2aSwitches::read(bootstrap)
     })
     .await;
+    if let Some(registers) = authority_registers(bootstrap).await {
+        surfaces::record_authority_sources(&store, &mut channels, !crate::server::mode::is_standby(), &registers).await;
+    }
 
     info!("✅ Loaded {} surface(s) from local storage", channels.len());
 
     Ok(channels)
+}
+
+/// The Authorities and Issuers stored surfaces classify their authority DIDs against, or
+/// `None` when the Authorities cannot be read.
+async fn authority_registers(
+    bootstrap: &BootstrapConfig
+) -> Option<crate::trust_registry_verification::authority_source::AuthorityRegisters> {
+    let paths = &bootstrap.storage_paths;
+    let authorities = crate::authorities::FileSystemAuthorityStore::new(PathBuf::from(&paths.authorities))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Authority store; stored authority DIDs stay unclassified"),
+        )
+        .ok()?;
+    let issuers = crate::issuers::FileSystemIssuerStore::new(PathBuf::from(&paths.issuers))
+        .await
+        .inspect_err(
+            |error| warn!(%error, "Failed to open the Issuer store; no authority DID is classified as an Issuer"),
+        )
+        .ok();
+    crate::trust_registry_verification::authority_source::AuthorityRegisters::load(
+        &authorities,
+        issuers
+            .as_ref()
+            .map(|store| store as &dyn crate::issuers::IssuerStore),
+    )
+    .await
+    .inspect_err(|error| warn!(%error, "Failed to read the Authorities; stored authority DIDs stay unclassified"))
+    .ok()
 }
 
 /// Auto-disable surfaces whose access-point `(port, route)` claim duplicates
@@ -1483,6 +1520,7 @@ fn render_default_bootstrap_toml(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        pinned_external_consent_issuer_patterns: None,
         audit: config::AuditConfig::default(),
     };
     let toml_str = toml::to_string_pretty(&config)?;

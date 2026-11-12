@@ -94,6 +94,26 @@ impl JwtVerificationStrategy {
         }
     }
 
+    /// Lowercase hex SHA-256 of what decides which tokens this strategy
+    /// accepts and whom they name: the expected issuer, the JWKS source and
+    /// the principal claim. Its name and timestamps are left out, so renaming
+    /// it keeps the digest. Audiences and algorithms are not the strategy's:
+    /// the Caller Context method that uses it sets them. `None` for a strategy
+    /// whose principal claim names nobody.
+    pub fn verification_digest(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let principal_claim = self
+            .principal_claim_name()
+            .ok()?;
+        let encoded = serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "expected_issuer": self.expected_issuer,
+            "jwks_source": self.jwks_source,
+            "principal_claim": principal_claim,
+        }))
+        .ok()?;
+        Some(hex::encode(Sha256::digest(encoded)))
+    }
+
     /// The stored claim in the form the API stores it: `None` for `sub`.
     pub fn normalized_principal_claim(&self) -> Result<Option<String>, JwtBearerError> {
         normalize_principal_claim(
@@ -111,19 +131,28 @@ pub fn normalize_principal_claim(claim: Option<&str>) -> Result<Option<String>, 
     let Some(claim) = claim else {
         return Ok(None);
     };
-    if claim.is_empty() || claim.len() > MAX_PRINCIPAL_CLAIM_LEN {
-        return Err(format!("principal_claim must be 1 to {MAX_PRINCIPAL_CLAIM_LEN} characters"));
+    if let Some(problem) = identifying_claim_problem(claim) {
+        return Err(format!("principal_claim {problem}"));
     }
-    if !claim
+    Ok((claim != DEFAULT_PRINCIPAL_CLAIM).then(|| claim.to_string()))
+}
+
+/// What keeps `claim` from naming a caller, worded to follow the setting's name: it must be
+/// 1 to 128 printable ASCII characters with no spaces, and not a claim that names the token,
+/// its issuer, audience, client, tenant, session or lifetime rather than a person.
+pub fn identifying_claim_problem(claim: &str) -> Option<String> {
+    if claim.is_empty() || claim.len() > MAX_PRINCIPAL_CLAIM_LEN {
+        Some(format!("must be 1 to {MAX_PRINCIPAL_CLAIM_LEN} characters"))
+    } else if !claim
         .bytes()
         .all(|byte| byte.is_ascii_graphic())
     {
-        return Err("principal_claim must be printable ASCII with no spaces".to_string());
+        Some("must be printable ASCII with no spaces".to_string())
+    } else if NON_IDENTIFYING_CLAIMS.contains(&claim) {
+        Some(format!("cannot be '{claim}': it does not identify a caller"))
+    } else {
+        None
     }
-    if NON_IDENTIFYING_CLAIMS.contains(&claim) {
-        return Err(format!("principal_claim cannot be '{claim}': it does not identify a caller"));
-    }
-    Ok((claim != DEFAULT_PRINCIPAL_CLAIM).then(|| claim.to_string()))
 }
 
 /// The claim a JWT Bearer method matches against its `audiences`.
@@ -230,6 +259,44 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn the_verification_digest_changes_only_with_what_verifies_and_names_a_caller() {
+        let strategy = make_strategy();
+        let digest = strategy
+            .verification_digest()
+            .unwrap();
+        assert_eq!(digest.len(), 64, "{digest}");
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        );
+
+        let mut unchanged = strategy.clone();
+        unchanged.name = "Renamed".to_string();
+        unchanged.updated_at = Utc::now() + chrono::Duration::days(1);
+        unchanged.principal_claim = Some(DEFAULT_PRINCIPAL_CLAIM.to_string());
+        assert_eq!(unchanged.verification_digest(), Some(digest.clone()));
+
+        let mut issuer = strategy.clone();
+        issuer.expected_issuer = "https://other.example.com".to_string();
+        let mut jwks = strategy.clone();
+        jwks.jwks_source = JwksSource::Remote {
+            jwks_uri: "https://issuer.example.com/other-jwks.json".to_string(),
+        };
+        let mut inline = strategy.clone();
+        inline.jwks_source = JwksSource::Static { jwks: Vec::new() };
+        let mut claim = strategy.clone();
+        claim.principal_claim = Some("oid".to_string());
+        for (field, changed) in [("issuer", issuer), ("jwks_uri", jwks), ("static jwks", inline), ("claim", claim)] {
+            assert_ne!(changed.verification_digest(), Some(digest.clone()), "{field}");
+        }
+
+        let mut refused = strategy;
+        refused.principal_claim = Some("iss".to_string());
+        assert_eq!(refused.verification_digest(), None);
     }
 
     #[test]

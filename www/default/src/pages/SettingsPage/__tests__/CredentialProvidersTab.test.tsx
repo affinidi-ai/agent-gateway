@@ -53,6 +53,35 @@ describe('CredentialProvidersTab', () => {
     expect(screen.getAllByTestId('credential-provider-entra-resource-badge')).toHaveLength(1);
   });
 
+  it('flags an external consent Entra v2.0 provider only while it sends its resource', async () => {
+    const external = (name: string, send_resource?: boolean) => ({
+      ...item(
+        name,
+        'https://login.microsoftonline.com/t/oauth2/v2.0/token',
+        'https://graph.microsoft.com'
+      ),
+      provider_type: 'oauth2_authorization_code',
+      issuer: 'https://login.microsoftonline.com/t/v2.0',
+      ...(send_resource === undefined ? {} : { send_resource }),
+    });
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([external('entra-sends'), external('entra-quiet', false)]),
+    });
+    render(
+      <MemoryRouter>
+        <CredentialProvidersTab />
+      </MemoryRouter>
+    );
+    const flagged = await screen.findByRole('row', { name: /^entra-sends/ });
+    const badge = within(flagged).getByTestId('credential-provider-entra-resource-badge');
+    expect(badge).toHaveAttribute(
+      'title',
+      expect.stringContaining('re-create the provider with send_resource set to false')
+    );
+    expect(screen.getAllByTestId('credential-provider-entra-resource-badge')).toHaveLength(1);
+  });
+
   it('says why a delete was refused, naming the surface that binds the provider', () => {
     const body = JSON.stringify({
       error: 'The credential provider is bound by an agent surface; remove the binding first',

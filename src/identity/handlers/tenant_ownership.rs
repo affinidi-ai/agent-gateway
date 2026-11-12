@@ -584,8 +584,87 @@ async fn collect_references(state: &IdentityApiState) -> Result<Vec<OwnershipRef
     collect_connection_point_references(state, &mut references).await?;
     collect_credential_references(state, &mut references).await?;
     collect_global_references(state, &mut references).await?;
+    collect_authority_references(state, &mut references).await?;
 
     Ok(references)
+}
+
+/// An edge from each surface and STS client to every Authority its Trust Checks and Trust
+/// Recorder entries are linked to, so neither end moves to a tenant that would make the link
+/// cross-tenant.
+async fn collect_authority_references(
+    state: &IdentityApiState,
+    references: &mut Vec<OwnershipReference>,
+) -> Result<(), OwnershipApiError> {
+    use crate::trust_registry_verification::authority_source::{surface_references, trust_check_references};
+
+    let Some(store) = state.authority_store.as_ref() else {
+        return Ok(());
+    };
+    let authorities = store
+        .list_all()
+        .await
+        .map_err(internal)?;
+    if let Some(surfaces) = state
+        .agent_surface_store
+        .as_ref()
+    {
+        for surface in surfaces
+            .list_all()
+            .await
+            .map_err(internal)?
+        {
+            let source = endpoint(ResourceKind::Surfaces, &surface.surface_id, surface.tenant_id.clone(), true);
+            references.extend(authority_edges(&authorities, source, surface_references(&surface)));
+        }
+    }
+    if let Some(sts_clients) = state
+        .sts_client_store
+        .as_ref()
+    {
+        for client in sts_clients
+            .list()
+            .await
+            .map_err(internal)?
+        {
+            let source = endpoint(ResourceKind::StsClients, &client.id, client.tenant_id.clone(), true);
+            references.extend(authority_edges(&authorities, source, trust_check_references(&client.trust_check_list)));
+        }
+    }
+    Ok(())
+}
+
+/// The edges from `source` to each of `authorities` that one of its `references` is linked to.
+fn authority_edges(
+    authorities: &[crate::authorities::types::Authority],
+    source: OwnershipEndpoint,
+    references: Vec<crate::trust_registry_verification::authority_source::AuthorityReference>,
+) -> Vec<OwnershipReference> {
+    use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+    authorities
+        .iter()
+        .filter(|authority| {
+            references
+                .iter()
+                .any(|reference| reference.source == Some(AuthoritySource::Authority) && reference.did == authority.did)
+        })
+        .map(|authority| {
+            let target = owned(
+                ResourceKind::Authorities,
+                authority.id.clone(),
+                authority.name.clone(),
+                authority.tenant_id.clone(),
+            );
+            OwnershipReference {
+                source: source.clone(),
+                target: endpoint_from_owned(&target),
+                context: "Trust Check or Trust Recorder authority".to_string(),
+                same_tenant: false,
+                custom_metadata: false,
+            }
+        })
+        .collect()
 }
 
 async fn collect_connection_point_references(
@@ -633,6 +712,46 @@ async fn collect_connection_point_references(
     Ok(())
 }
 
+/// What a credential provider names, as (kind, id, context, same tenant): its
+/// secrets, which must be of its own tenant, and the strategies of its consent
+/// identity and its consent confirmation.
+fn credential_provider_references(
+    provider: &crate::credential_providers::CredentialProvider
+) -> Vec<(ResourceKind, &str, &'static str, bool)> {
+    let secrets = provider
+        .secret_refs()
+        .into_iter()
+        .map(|id| (ResourceKind::Secrets, id, "credential provider secret", true));
+    let strategies = [
+        provider
+            .consent_identity_strategy_id
+            .as_deref()
+            .map(|id| {
+                (ResourceKind::JwtVerificationStrategies, id, "credential provider consent identity strategy", false)
+            }),
+        provider
+            .consent_confirmation
+            .as_ref()
+            .map(|confirmation| {
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    confirmation
+                        .jwt_verification_strategy_id
+                        .as_str(),
+                    "credential provider consent confirmation strategy",
+                    false,
+                )
+            }),
+    ];
+    secrets
+        .chain(
+            strategies
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
 async fn collect_credential_references(
     state: &IdentityApiState,
     references: &mut Vec<OwnershipReference>,
@@ -647,52 +766,8 @@ async fn collect_credential_references(
             .map_err(internal)?
         {
             let source = endpoint(ResourceKind::CredentialProviders, &provider.id, provider.tenant_id.clone(), true);
-            for id in [
-                provider
-                    .client_id_secret_ref
-                    .as_deref(),
-                provider
-                    .client_secret_secret_ref
-                    .as_deref(),
-                provider
-                    .api_key_secret_ref
-                    .as_deref(),
-                provider
-                    .jwt
-                    .jwt_signing_key_secret_ref
-                    .as_deref(),
-                provider
-                    .jwt
-                    .jwt_certificate_secret_ref
-                    .as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                add_reference_with_rule(
-                    state,
-                    references,
-                    source.clone(),
-                    ResourceKind::Secrets,
-                    id,
-                    "credential provider secret",
-                    true,
-                )
-                .await?;
-            }
-            if let Some(id) = provider
-                .consent_identity_strategy_id
-                .as_deref()
-            {
-                add_reference(
-                    state,
-                    references,
-                    source,
-                    ResourceKind::JwtVerificationStrategies,
-                    id,
-                    "credential provider consent identity strategy",
-                )
-                .await?;
+            for (kind, id, context, same_tenant) in credential_provider_references(&provider) {
+                add_reference_with_rule(state, references, source.clone(), kind, id, context, same_tenant).await?;
             }
         }
     }
@@ -1759,6 +1834,55 @@ mod tests {
         assert!(refuse_moving_a_bound_provider(&[], "provider").is_ok());
     }
 
+    #[test]
+    fn a_provider_with_consent_confirmation_references_its_login_secrets_and_strategy() {
+        let provider = |consent_confirmation: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
+                "provider_type": "oauth2_authorization_code",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "consent_identity_strategy_id": "identity-strategy",
+                "consent_confirmation": consent_confirmation,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let confirming = provider(serde_json::json!({
+            "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
+            "jwt_verification_strategy_id": "confirmation-strategy"
+        }));
+        assert_eq!(
+            credential_provider_references(&confirming),
+            [
+                (ResourceKind::Secrets, "CLIENT_ID", "credential provider secret", true),
+                (ResourceKind::Secrets, "CLIENT_SECRET", "credential provider secret", true),
+                (ResourceKind::Secrets, "LOGIN_CLIENT_ID", "credential provider secret", true),
+                (ResourceKind::Secrets, "LOGIN_SECRET", "credential provider secret", true),
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    "identity-strategy",
+                    "credential provider consent identity strategy",
+                    false
+                ),
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    "confirmation-strategy",
+                    "credential provider consent confirmation strategy",
+                    false
+                ),
+            ]
+        );
+        let plain = provider(serde_json::Value::Null);
+        assert_eq!(
+            credential_provider_references(&plain)
+                .into_iter()
+                .map(|(_, id, _, _)| id)
+                .collect::<Vec<_>>(),
+            ["CLIENT_ID", "CLIENT_SECRET", "identity-strategy"]
+        );
+    }
+
     /// Slugs are unique per tenant, so a provider moves only into a tenant
     /// with no other provider of its slug.
     #[tokio::test]
@@ -1808,6 +1932,64 @@ mod tests {
                 .await
                 .is_ok(),
             "the provider's own slug does not count against it"
+        );
+    }
+
+    fn authority_edge_of(
+        source: OwnershipEndpoint,
+        authority_tenant: Option<&str>,
+    ) -> Vec<OwnershipReference> {
+        let mut authority = crate::authorities::types::Authority::new(
+            "authority-1".into(),
+            "Acme".into(),
+            "did:web:acme".into(),
+            None,
+            None,
+        );
+        authority.tenant_id = authority_tenant.map(str::to_string);
+        let elements: Vec<crate::trust_registry_verification::TrustCheckElement> =
+            serde_json::from_value(serde_json::json!([
+                {"id": "linked", "trust_registry_id": "tr", "query_type": "recognition", "authority_source": "authority",
+                 "query": {"authority_id": "did:web:acme", "entity_id": ""}},
+                {"id": "issuer", "trust_registry_id": "tr", "query_type": "recognition", "authority_source": "issuer",
+                 "query": {"authority_id": "did:web:other", "entity_id": ""}}
+            ]))
+            .unwrap();
+        authority_edges(
+            &[authority],
+            source,
+            crate::trust_registry_verification::authority_source::trust_check_references(&elements),
+        )
+    }
+
+    #[test]
+    fn an_authority_cannot_move_to_another_tenant_while_a_record_of_this_tenant_is_linked_to_it() {
+        let surface = endpoint(ResourceKind::Surfaces, "orders", Some("tenant-a".into()), true);
+        let edges = authority_edge_of(surface, Some("tenant-a"));
+        assert_eq!(edges.len(), 1, "only the link to an Authority is an edge");
+        assert_eq!(edges[0].target.id, "authority-1");
+
+        let conflicts =
+            reassignment_conflicts(&edges, ResourceKind::Authorities, "authority-1", Some("tenant-b"), RuleMode::Warn);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].reason, "The proposed tenant would make this reference cross-tenant");
+        assert!(
+            reassignment_conflicts(&edges, ResourceKind::Authorities, "authority-1", None, RuleMode::Warn).is_empty(),
+            "an appliance-wide Authority may still be used by a tenant's surface"
+        );
+    }
+
+    #[test]
+    fn an_sts_client_cannot_move_away_from_the_tenant_of_its_linked_authority() {
+        let client = endpoint(ResourceKind::StsClients, "client-1", Some("tenant-a".into()), true);
+        let edges = authority_edge_of(client, Some("tenant-a"));
+
+        let conflicts =
+            reassignment_conflicts(&edges, ResourceKind::StsClients, "client-1", Some("tenant-b"), RuleMode::Warn);
+        assert_eq!(conflicts.len(), 1);
+        assert!(
+            reassignment_conflicts(&edges, ResourceKind::StsClients, "client-1", Some("tenant-a"), RuleMode::Warn)
+                .is_empty()
         );
     }
 

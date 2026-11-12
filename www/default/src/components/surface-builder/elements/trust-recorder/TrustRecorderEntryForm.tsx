@@ -5,6 +5,8 @@ import { topAndTail } from '../../../../utils/stringUtils';
 import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
 import FormSelect, { type FormSelectOption } from '../../../shared/FormSelect';
+import { missingAuthorityDid } from '../_shared/authorityReference';
+import MissingAuthorityWarning from '../_shared/MissingAuthorityWarning';
 import {
   SURFACE_ISSUER_DID_TEMPLATE,
   type CustomResource,
@@ -20,6 +22,11 @@ interface TrustRecorderEntryFormProps {
   registries: TrustRegistry[];
   issuers: Issuer[];
   authorities: Authority[];
+  /**
+   * True once the Authorities register has loaded, so an Authority it no longer has can be
+   * reported as deleted. Never set while it loads or after it failed to load.
+   */
+  authoritiesLoaded?: boolean;
   loadError: string | null;
   issuersLoadError: string | null;
   authoritiesLoadError: string | null;
@@ -47,6 +54,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
   registries,
   issuers,
   authorities,
+  authoritiesLoaded = true,
   loadError,
   issuersLoadError,
   authoritiesLoadError,
@@ -97,9 +105,9 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
       label: a.name,
       description: a.description || (a.did ? topAndTail(a.did, 16, 12) : undefined),
     }));
-  const authorityDidSet = new Set(authorityFromAuthorities.map(o => o.value));
+  const authorityRegisterDids = new Set(authorityFromAuthorities.map(o => o.value));
   const authorityFromIssuers: FormSelectOption<string>[] = issuers
-    .filter(d => !!d.did && !authorityDidSet.has(d.did))
+    .filter(d => !!d.did && !authorityRegisterDids.has(d.did))
     .map(d => ({
       value: d.did,
       label: d.name,
@@ -115,6 +123,9 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
     ? 'surface-issuer'
     : 'explicit';
   const explicitAuthority = authorityMode === 'explicit' ? storedAuthority : '';
+  const missingAuthority = authoritiesLoaded
+    ? missingAuthorityDid(explicitAuthority, entry.authority_source, authorityRegisterDids)
+    : null;
   const storedAuthorityIsKnown =
     !explicitAuthority || authorityOptions.some(o => o.value === explicitAuthority);
   const authorityOptionsWithCustom: FormSelectOption<string>[] = storedAuthorityIsKnown
@@ -123,7 +134,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
         ...authorityOptions,
         {
           value: explicitAuthority,
-          label: 'Custom (from JSON API)',
+          label: missingAuthority ? 'Deleted Authority' : 'Custom (from JSON API)',
           description: explicitAuthority ? topAndTail(explicitAuthority, 16, 12) : undefined,
           disabled: true,
         },
@@ -217,7 +228,7 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
               checked={authorityMode === 'explicit'}
               onChange={() => {
                 if (authorityMode === 'explicit') return;
-                updateEntry(index, { authority_did: '' });
+                updateEntry(index, { authority_did: '', authority_source: undefined });
               }}
               data-testid={tid('authority-mode-explicit-radio')}
             />
@@ -229,7 +240,10 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
               checked={authorityMode === 'surface-issuer'}
               onChange={() => {
                 if (authorityMode === 'surface-issuer') return;
-                updateEntry(index, { authority_did: SURFACE_ISSUER_DID_TEMPLATE });
+                updateEntry(index, {
+                  authority_did: SURFACE_ISSUER_DID_TEMPLATE,
+                  authority_source: undefined,
+                });
               }}
               data-testid={tid('authority-mode-surface-issuer-radio')}
             />
@@ -239,12 +253,24 @@ const TrustRecorderEntryForm: React.FC<TrustRecorderEntryFormProps> = ({
               <FormSelect<string>
                 value={explicitAuthority}
                 options={authorityOptionsWithCustom}
-                onChange={next => updateEntry(index, { authority_did: next })}
+                onChange={next =>
+                  updateEntry(index, {
+                    authority_did: next,
+                    authority_source: authorityRegisterDids.has(next) ? 'authority' : 'issuer',
+                  })
+                }
                 placeholder="Select an authority"
                 disabled={authorityOptionsWithCustom.length === 0}
-                isInvalid={saveAttempted && !explicitAuthority}
+                isInvalid={(saveAttempted && !explicitAuthority) || !!missingAuthority}
                 testid={tid('authority')}
               />
+              {missingAuthority && (
+                <MissingAuthorityWarning
+                  testid={tid('authority-missing')}
+                  element="trust-recorder"
+                  missing={[{ index, did: missingAuthority }]}
+                />
+              )}
               {saveAttempted && !explicitAuthority && (
                 <div className="invalid-feedback d-block">
                   Select an Authority or an Issuer to act as the trust anchor.

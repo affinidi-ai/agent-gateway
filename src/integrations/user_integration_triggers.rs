@@ -1,10 +1,73 @@
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use serde::Serialize;
 use std::collections::HashMap;
 
-use super::delivery::dispatch::dispatch;
+use super::background_tasks::TaskShare;
+use super::delivery::dispatch::{dispatch, dispatch_within};
 use crate::auth::storage::UserData;
 use crate::auth::types::{UserRole, UserStatus};
+
+/// How a console user signed in, or tried to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMethod {
+    Passkey,
+    Saml,
+}
+
+impl LoginMethod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passkey => "passkey",
+            Self::Saml => "saml",
+        }
+    }
+}
+
+/// Why a console sign-in failed. Only the variants for an existing account carry it, as stored,
+/// so the event never repeats what the caller typed.
+#[derive(Debug, Clone, Copy)]
+pub enum LoginFailure<'a> {
+    InvalidCredential(&'a UserData),
+    NotApproved(&'a UserData),
+    UnknownUser,
+    SamlRejected,
+}
+
+impl<'a> LoginFailure<'a> {
+    /// The failure of a passkey sign-in whose credential did not verify, by the account the
+    /// sign-in named: none, one that is not approved, or one whose passkey was not presented.
+    pub fn of_passkey_account(account: Option<&'a UserData>) -> Self {
+        match account {
+            None => Self::UnknownUser,
+            Some(user) if user.status != UserStatus::Approved => Self::NotApproved(user),
+            Some(user) => Self::InvalidCredential(user),
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::InvalidCredential(_) => "invalid_credential",
+            Self::NotApproved(_) => "not_approved",
+            Self::UnknownUser => "unknown_user",
+            Self::SamlRejected => "saml_rejected",
+        }
+    }
+
+    fn account(&self) -> Option<&'a UserData> {
+        match self {
+            Self::InvalidCredential(user) | Self::NotApproved(user) => Some(user),
+            Self::UnknownUser | Self::SamlRejected => None,
+        }
+    }
+}
+
+/// At most this many background tasks, a tenth of the limit, deliver failed sign-ins at once.
+/// Anyone can fail a sign-in, so a flood of them is skipped beyond this share and never starves
+/// the deliveries of other events.
+const MAX_FAILED_SIGN_IN_TASKS: usize = 10;
+
+static FAILED_SIGN_INS: Lazy<TaskShare> = Lazy::new(|| TaskShare::new("failed sign-ins", MAX_FAILED_SIGN_IN_TASKS));
 
 pub fn trigger_user_created(user: &UserData) {
     dispatch("user.created", user_runtime_values("user.created", None, Some(user)));
@@ -25,8 +88,37 @@ pub fn trigger_user_deleted(user: &UserData) {
     dispatch("user.deleted", user_runtime_values("user.deleted", Some(user), None));
 }
 
-pub fn trigger_user_login(user: &UserData) {
-    dispatch("user.login", user_runtime_values("user.login", None, Some(user)));
+pub fn trigger_user_login(
+    user: &UserData,
+    method: LoginMethod,
+) {
+    dispatch("user.login", login_values(user, method));
+}
+
+pub fn trigger_user_login_failed(
+    method: LoginMethod,
+    failure: LoginFailure<'_>,
+) {
+    dispatch_within(&FAILED_SIGN_INS, "user.login_failed", login_failed_values(method, failure));
+}
+
+fn login_values(
+    user: &UserData,
+    method: LoginMethod,
+) -> HashMap<String, String> {
+    let mut values = user_runtime_values("user.login", None, Some(user));
+    values.insert("LOGIN_METHOD".to_string(), method.as_str().to_string());
+    values
+}
+
+fn login_failed_values(
+    method: LoginMethod,
+    failure: LoginFailure<'_>,
+) -> HashMap<String, String> {
+    let mut values = user_runtime_values("user.login_failed", None, failure.account());
+    values.insert("LOGIN_METHOD".to_string(), method.as_str().to_string());
+    values.insert("FAILURE_REASON".to_string(), failure.reason().to_string());
+    values
 }
 
 pub fn trigger_user_accessed(user: &UserData) {
@@ -94,7 +186,7 @@ fn user_runtime_values(
 
 #[cfg(test)]
 mod tests {
-    use super::user_runtime_values;
+    use super::{LoginFailure, LoginMethod, login_failed_values, login_values, user_runtime_values};
     use crate::auth::storage::UserData;
     use crate::auth::types::{UserRole, UserStatus};
     use std::collections::BTreeSet;
@@ -199,6 +291,74 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&values["OLD_STATE"]).unwrap()["role"], "poweruser");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&values["NEW_STATE"]).unwrap()["role"], "administrator");
         assert_eq!(values["USER_ROLE"], "administrator");
+    }
+
+    fn value<'a>(
+        values: &'a std::collections::HashMap<String, String>,
+        name: &str,
+    ) -> Option<&'a str> {
+        values
+            .get(name)
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn a_sign_in_names_its_method_and_the_user() {
+        let values = login_values(&user(), LoginMethod::Saml);
+
+        assert_eq!(value(&values, "EVENT_TYPE"), Some("user.login"));
+        assert_eq!(value(&values, "LOGIN_METHOD"), Some("saml"));
+        assert_eq!(value(&values, "USER_ID"), Some("u-1"));
+    }
+
+    #[test]
+    fn a_failed_sign_in_of_an_existing_account_names_the_stored_account_its_method_and_reason() {
+        let user = user();
+        for (failure, reason) in [
+            (LoginFailure::InvalidCredential(&user), "invalid_credential"),
+            (LoginFailure::NotApproved(&user), "not_approved"),
+        ] {
+            let values = login_failed_values(LoginMethod::Passkey, failure);
+
+            assert_eq!(value(&values, "EVENT_TYPE"), Some("user.login_failed"));
+            assert_eq!(value(&values, "LOGIN_METHOD"), Some("passkey"));
+            assert_eq!(value(&values, "FAILURE_REASON"), Some(reason));
+            assert_eq!(value(&values, "USER_ID"), Some("u-1"));
+            assert_eq!(value(&values, "USERNAME"), Some("jane.doe"));
+            assert_eq!(value(&values, "USER_EMAIL"), Some("jane@example.test"));
+            assert_eq!(value(&values, "USER_ROLE"), Some("poweruser"));
+            assert_eq!(value(&values, "USER_STATUS"), Some("approved"));
+            assert_eq!(keys(&values["NEW_STATE"]).len(), 6);
+        }
+    }
+
+    #[test]
+    fn a_failed_sign_in_without_an_account_names_no_user() {
+        for (method, failure, method_name, reason) in [
+            (LoginMethod::Passkey, LoginFailure::UnknownUser, "passkey", "unknown_user"),
+            (LoginMethod::Saml, LoginFailure::SamlRejected, "saml", "saml_rejected"),
+        ] {
+            let values = login_failed_values(method, failure);
+
+            assert_eq!(value(&values, "LOGIN_METHOD"), Some(method_name));
+            assert_eq!(value(&values, "FAILURE_REASON"), Some(reason));
+            for name in ["USER_ID", "USERNAME", "USER_EMAIL", "USER_ROLE", "USER_STATUS"] {
+                assert_eq!(value(&values, name), None, "{reason} fills {name}");
+            }
+            assert_eq!(value(&values, "OLD_STATE"), Some(""));
+            assert_eq!(value(&values, "NEW_STATE"), Some(""));
+        }
+    }
+
+    #[test]
+    fn a_failed_passkey_sign_in_is_classified_by_the_account_it_named() {
+        let approved = user();
+        let mut pending = user();
+        pending.status = UserStatus::New;
+
+        assert!(matches!(LoginFailure::of_passkey_account(None), LoginFailure::UnknownUser));
+        assert!(matches!(LoginFailure::of_passkey_account(Some(&pending)), LoginFailure::NotApproved(_)));
+        assert!(matches!(LoginFailure::of_passkey_account(Some(&approved)), LoginFailure::InvalidCredential(_)));
     }
 
     #[test]

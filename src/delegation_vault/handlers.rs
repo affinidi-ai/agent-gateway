@@ -1,7 +1,10 @@
 //! API handlers for delegation vault management and OAuth callback
 
 use super::{
-    DelegationToken, DelegationTokenListItem, notifier::SharedVaultPopulationNotifier, oauth,
+    DelegationToken, DelegationTokenListItem,
+    notifier::SharedVaultPopulationNotifier,
+    oauth,
+    read_scope::{VaultReadScope, VaultReader},
     storage::DelegationVaultStorage,
 };
 use crate::audit::events::DelegationFailureReason;
@@ -10,6 +13,7 @@ use crate::auth_manager::pat::PatDelegationContext;
 use crate::credential_providers::storage::CredentialProviderStorage;
 use crate::identity::VCIssuer;
 use crate::identity::ssi::vc_issuer::VcSigner;
+use crate::observability::loggable;
 use crate::secrets::SecretsStore;
 use crate::surfaces::AgentSurfaceStore;
 use axum::{
@@ -54,11 +58,80 @@ pub struct DelegationVaultState {
     pub egress_allowlist: Option<String>,
     /// gateway.json's `external_consent_resource_origins`.
     pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
-    /// gateway.json's `external_consent_issuers`.
-    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// gateway.json's `external_consent_issuers` and
+    /// `external_consent_issuer_patterns`.
+    pub issuers: Arc<crate::credential_providers::external::PermittedIssuers>,
     /// The MCP Proxies a `proxy://` Transit Point's binding sends its grants
     /// through.
     pub mcp_proxy_store: Option<Arc<crate::mcp_proxies::FileSystemMcpProxyStore>>,
+    pub identity_strategies: Arc<dyn crate::jwt_bearer::JwtVerificationStrategyStorage>,
+    pub verifier: Arc<crate::jwt_bearer::JwtBearerVerifier>,
+    pub provider_egress: oauth::TokenEgress,
+    /// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
+    /// tokens, through which no consent confirmation confirms a caller.
+    pub gateway_mcp_issuer: Option<String>,
+    /// The surfaces the gateway serves from its configuration snapshot: static
+    /// or configured-source surfaces, plus its copies of stored surfaces. Each
+    /// copy is checked alongside `agent_surface_store`.
+    pub config_surfaces: Option<Arc<dyn ConfigSurfaces>>,
+}
+
+/// Looks up a surface the gateway serves from its configuration, as it is now.
+#[async_trait::async_trait]
+pub trait ConfigSurfaces: Send + Sync {
+    async fn config_surface(
+        &self,
+        surface_id: &str,
+    ) -> Option<crate::config::agent_surface::AgentSurface>;
+}
+
+#[async_trait::async_trait]
+impl ConfigSurfaces for crate::proxy::surface_manager::SurfaceTaskManager {
+    async fn config_surface(
+        &self,
+        surface_id: &str,
+    ) -> Option<crate::config::agent_surface::AgentSurface> {
+        self.get_config()
+            .await
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == surface_id)
+            .cloned()
+    }
+}
+
+/// A read refused because the credential providers could not be read. It
+/// answers `500` with `refusal` and no detail.
+struct ProvidersUnreadable {
+    refusal: &'static str,
+}
+
+impl IntoResponse for ProvidersUnreadable {
+    fn into_response(self) -> Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": self.refusal }))).into_response()
+    }
+}
+
+/// What the caller may read of the agent-keyed tokens and the delegation
+/// audit. While the credential providers cannot be read, a caller that needs
+/// them is refused with `refusal` and no detail.
+async fn caller_read_scope(
+    state: &DelegationVaultState,
+    reader: &VaultReader,
+    action: &'static str,
+    refusal: &'static str,
+) -> Result<VaultReadScope, ProvidersUnreadable> {
+    VaultReadScope::of(Some(state.provider_store.as_ref()), reader)
+        .await
+        .map_err(|error| {
+            warn!(
+                target: "credential_delegation",
+                action,
+                error = %error,
+                "Delegation vault read refused: the credential providers could not be read"
+            );
+            ProvidersUnreadable { refusal }
+        })
 }
 
 /// GET /api/v1/delegation-vault
@@ -66,9 +139,11 @@ pub async fn list_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
 ) -> impl IntoResponse {
-    // Fail closed: listing enumerates every user's/agent's grants, so it must be
-    // attributable to an authenticated actor — symmetric with the revokes.
+    // Fail closed: the list shows other users' and agents' grants, every one
+    // the caller's read scope covers, so it must be attributable to an
+    // authenticated actor, as the revokes are.
     if management_caller_context(caller.as_ref(), delegation.as_ref()).is_none() {
         warn!(
             target: "credential_delegation",
@@ -78,6 +153,10 @@ pub async fn list_tokens(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let scope = match caller_read_scope(&state, &reader, "list", "Failed to list").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     match state
         .vault_store
@@ -87,13 +166,14 @@ pub async fn list_tokens(
         Ok(tokens) => {
             let items: Vec<DelegationTokenListItem> = tokens
                 .iter()
+                .filter(|t| scope.reads(Some(&t.credential_provider_id)))
                 .map(|t| t.into())
                 .collect();
             (StatusCode::OK, Json(serde_json::to_value(items).unwrap())).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to list: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "list", error = %e, "Delegation token list failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to list"}))).into_response()
         }
     }
 }
@@ -103,6 +183,7 @@ pub async fn get_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a single-grant read must be attributable to an authenticated
@@ -117,23 +198,27 @@ pub async fn get_token(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "no authenticated caller"})))
             .into_response();
     }
+    let scope = match caller_read_scope(&state, &reader, "get", "Failed to get").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     match state
         .vault_store
         .get(&id)
         .await
     {
-        Ok(Some(token)) => {
+        Ok(Some(token)) if scope.reads(Some(&token.credential_provider_id)) => {
             // Return metadata only — never expose access_token/refresh_token via API
             let item: DelegationTokenListItem = (&token).into();
             (StatusCode::OK, Json(serde_json::to_value(item).unwrap())).into_response()
         }
-        Ok(None) => {
+        Ok(_) => {
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to get: {}", e)})))
-                .into_response()
+            warn!(target: "credential_delegation", action = "get", error = %e, "Delegation token read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to get"}))).into_response()
         }
     }
 }
@@ -143,6 +228,7 @@ pub async fn revoke_token(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a revoke must be attributable to an authenticated actor.
@@ -159,6 +245,15 @@ pub async fn revoke_token(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            id = %loggable::untrusted(&id),
+            action = "revoke",
+            "Delegation token revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
@@ -191,8 +286,14 @@ pub async fn revoke_token(
             (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Delegation token not found"}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                id = %loggable::untrusted(&id),
+                action = "revoke",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation token revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
@@ -202,6 +303,7 @@ pub async fn revoke_user_tokens(
     State(state): State<DelegationVaultState>,
     caller: Option<Extension<AuthGuardOk>>,
     delegation: Option<Extension<PatDelegationContext>>,
+    reader: VaultReader,
     Path(user_hash): Path<String>,
 ) -> impl IntoResponse {
     // Fail closed: a mass-revoke must be attributable to an authenticated actor.
@@ -218,6 +320,15 @@ pub async fn revoke_user_tokens(
                 .into_response();
         }
     };
+    if !reader.is_appliance_wide() {
+        warn!(
+            target: "credential_delegation",
+            user_hash = %loggable::untrusted(&user_hash),
+            action = "revoke_all",
+            "Delegation mass-revoke refused: only an appliance-wide caller revokes"
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
 
     match state
         .vault_store
@@ -248,8 +359,14 @@ pub async fn revoke_user_tokens(
             (StatusCode::OK, Json(serde_json::json!({"revoked": count}))).into_response()
         }
         Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Failed to revoke: {}", e)})))
-                .into_response()
+            warn!(
+                target: "credential_delegation",
+                user_hash = %loggable::untrusted(&user_hash),
+                action = "revoke_all",
+                error = %loggable::untrusted(&e.to_string()),
+                "Delegation mass-revoke failed"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to revoke"}))).into_response()
         }
     }
 }
@@ -277,6 +394,17 @@ pub(super) const CONSENT_REFUSED_PAGE: &str = r#"<!DOCTYPE html>
 <h2>Authorization Failed</h2>
 <p>The authorization could not be completed.</p>
 <p>Please start again from the original application.</p>
+</body></html>"#;
+
+/// The page a consent confirmation shows when the person signed in at the
+/// identity provider is not the caller the link was issued to: fixed text,
+/// so nothing about either person is shown.
+pub(super) const CONSENT_IDENTITY_MISMATCH_PAGE: &str = r#"<!DOCTYPE html>
+<html><head><title>Authorization Failed</title></head>
+<body style="font-family: sans-serif; padding: 40px; text-align: center;">
+<h2>Authorization Failed</h2>
+<p>The account you signed in with at your identity provider is not the one this link was issued to.</p>
+<p>Sign out of it or switch to your own account at your identity provider, then start again from the original application.</p>
 </body></html>"#;
 
 /// A consent refusal: its status and the reason the audit and the log name.
@@ -329,7 +457,11 @@ fn consent_refused(
             )
         });
     }
-    let mut response = (status, Html(CONSENT_REFUSED_PAGE)).into_response();
+    let page = match reason {
+        DelegationFailureReason::ConsentIdentityMismatch => CONSENT_IDENTITY_MISMATCH_PAGE,
+        _ => CONSENT_REFUSED_PAGE,
+    };
+    let mut response = (status, Html(page)).into_response();
     consent_page_headers(&mut response, "no-referrer");
     if let Some(cleared) = cookie.and_then(|name| binding_cookie(name, "", 0).ok()) {
         attach_binding_cookie(&mut response, cleared);
@@ -450,8 +582,10 @@ struct StartRefused {
     audited: Option<String>,
 }
 
-/// Decodes the start state `params` carry and resolves its provider, whose
-/// redirect URI must follow the consent rules and be no other provider's.
+/// Decodes the start state `params` carry, one without a stage or a
+/// [`ConsentStage::ConfirmStart`](super::ConsentStage::ConfirmStart) one, and
+/// resolves its provider, whose redirect URI must follow the consent rules and
+/// be no other provider's.
 async fn resolve_consent_start(
     state: &DelegationVaultState,
     path_segment: &str,
@@ -533,6 +667,17 @@ pub async fn consent_start_page(
         None => None,
     }
     .unwrap_or_else(|| start.surface_id.clone());
+    let provider_name = html_escape(&provider.name);
+    let (sign_in_first, button) = match &start.stage {
+        Some(super::ConsentStage::ConfirmStart(_)) => (
+            format!(
+                "<p>You sign in to your identity provider first, to confirm it is you, and then continue to \
+                 {provider_name}.</p>\n"
+            ),
+            format!("Sign in, then continue to {provider_name}"),
+        ),
+        _ => (String::new(), format!("Continue to {provider_name}")),
+    };
     let scopes = if start.scopes.is_empty() {
         "(none)".to_string()
     } else {
@@ -551,12 +696,12 @@ pub async fn consent_start_page(
 <dt>Scopes</dt><dd><code>{scopes}</code></dd>
 </dl>
 <p>Continue only if you started this from your own application.</p>
-<form method="post" action="start">
+{sign_in_first}<form method="post" action="start">
 <input type="hidden" name="state" value="{state}">
-<button type="submit">Continue to {provider}</button>
+<button type="submit">{button}</button>
 </form>
 </body></html>"#,
-        provider = html_escape(&provider.name),
+        provider = provider_name,
         agent = html_escape(&start.agent_did),
         surface = html_escape(&surface_name),
         scopes = html_escape(&scopes),
@@ -609,10 +754,11 @@ fn same_origin_post(
 
 /// POST {callback_path}/start
 ///
-/// The person confirmed the start page: build the vendor's URL and the
+/// The person confirmed the start page: build the vendor's URL, or the
+/// identity provider's for a start state that confirms its caller, and the
 /// binding cookie, then claim the start state, set the cookie and send the
-/// browser to the vendor. A start state is used once on this process, and a
-/// POST refused before the claim leaves it unused.
+/// browser there. A start state is used once on this process, and a POST
+/// refused before the claim leaves it unused.
 pub async fn consent_start(
     State(state): State<DelegationVaultState>,
     Path(provider_id): Path<String>,
@@ -646,24 +792,22 @@ pub async fn consent_start(
             audited,
         );
     }
-    let begun = match oauth::begin_consent(&provider, &start, &redirect_uri, &state.secrets_store).await {
-        Ok(begun) => begun,
-        Err(e) => {
-            let reason = if e.is::<oauth::ProviderSecretError>() {
-                DelegationFailureReason::CredentialsUnavailable
-            } else {
-                DelegationFailureReason::AuthorizationUrlInvalid
-            };
-            warn!(
-                target: "credential_delegation",
-                provider_id = %provider.provider_id,
-                error = %e,
-                "Could not begin OAuth consent"
-            );
-            return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited);
+    let begun = match &start.stage {
+        None => begin_vendor_consent(&state, &provider, &start, &redirect_uri).await,
+        Some(super::ConsentStage::ConfirmStart(binding)) => {
+            begin_confirmation(&state, &provider, &start, binding).await
         }
+        Some(_) => Err(DelegationFailureReason::ConsentStateInvalid),
     };
-    let Ok(location) = HeaderValue::from_str(begun.vendor_url.as_str()) else {
+    let begun = match begun {
+        Ok(begun) => begun,
+        Err(reason) => return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited),
+    };
+    let Ok(location) = HeaderValue::from_str(
+        begun
+            .authorization_url
+            .as_str(),
+    ) else {
         return consent_refused(
             ConsentRefusal::bad_request(DelegationFailureReason::AuthorizationUrlInvalid),
             &provider_id,
@@ -707,6 +851,269 @@ pub async fn consent_start(
         .insert(header::LOCATION, location);
     consent_page_headers(&mut response, "no-referrer");
     attach_binding_cookie(&mut response, cookie);
+    response
+}
+
+async fn begin_vendor_consent(
+    state: &DelegationVaultState,
+    provider: &crate::credential_providers::CredentialProvider,
+    start: &super::OAuthState,
+    redirect_uri: &url::Url,
+) -> Result<oauth::ConsentStart, DelegationFailureReason> {
+    oauth::begin_consent(provider, start, redirect_uri, &state.secrets_store)
+        .await
+        .map_err(|e| {
+            warn!(
+                target: "credential_delegation",
+                provider_id = %provider.provider_id,
+                error = %e,
+                "Could not begin OAuth consent"
+            );
+            if e.is::<oauth::ProviderSecretError>() {
+                DelegationFailureReason::CredentialsUnavailable
+            } else {
+                DelegationFailureReason::AuthorizationUrlInvalid
+            }
+        })
+}
+
+async fn begin_confirmation(
+    state: &DelegationVaultState,
+    provider: &crate::credential_providers::CredentialProvider,
+    start: &super::OAuthState,
+    binding: &super::ConsentConfirmBinding,
+) -> Result<oauth::ConsentStart, DelegationFailureReason> {
+    let sign_in = super::consent_confirmation::sign_in(
+        provider,
+        binding,
+        state
+            .identity_strategies
+            .as_ref(),
+        state
+            .gateway_mcp_issuer
+            .as_deref(),
+        &state.secrets_store,
+        &state.gateway_base_url,
+    )
+    .await?;
+    oauth::begin_confirmation(start, binding, &sign_in).map_err(|e| {
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            error = %e,
+            "Could not begin consent confirmation"
+        );
+        DelegationFailureReason::ConsentStateInvalid
+    })
+}
+
+/// The reason a provider's `error` answer is refused with: a denied consent
+/// for an RFC 6749 error code, an invalid response otherwise; and the code
+/// the log may name.
+fn provider_error(error: &str) -> (DelegationFailureReason, &str) {
+    let valid = !error.is_empty()
+        && error.len() <= 128
+        && error
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid {
+        (DelegationFailureReason::ConsentDenied, error)
+    } else {
+        (DelegationFailureReason::ConsentResponseInvalid, oauth::UNRECOGNIZED_ERROR)
+    }
+}
+
+/// Refuses a confirmation state whose surface no longer exists under the
+/// tenant the caller's `user_identity_hash` was computed for, or cannot be
+/// read. Every copy of the surface this gateway holds, in the surface store
+/// and among those served from the gateway configuration, must be of that
+/// tenant, so the check holds whichever copy is served.
+async fn sealed_surface_unchanged(
+    state: &DelegationVaultState,
+    provider_id: &str,
+    sealed: &super::OAuthState,
+    binding: &super::ConsentConfirmBinding,
+) -> Result<(), DelegationFailureReason> {
+    let stored = match &state.agent_surface_store {
+        Some(surfaces) => match surfaces
+            .get(&sealed.surface_id)
+            .await
+        {
+            Ok(surface) => surface,
+            Err(error) => {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider_id,
+                    surface_id = %sealed.surface_id,
+                    error = %error,
+                    "Consent confirmation refused: the surface could not be read"
+                );
+                return Err(DelegationFailureReason::CredentialsUnavailable);
+            }
+        },
+        None => None,
+    };
+    let configured = match &state.config_surfaces {
+        Some(configured) => {
+            configured
+                .config_surface(&sealed.surface_id)
+                .await
+        }
+        None => None,
+    };
+    let copies = [stored, configured];
+    let present = copies
+        .iter()
+        .flatten()
+        .count();
+    if present > 0
+        && copies
+            .iter()
+            .flatten()
+            .all(|surface| surface.tenant_id == binding.tenant_id)
+    {
+        Ok(())
+    } else {
+        Err(DelegationFailureReason::ConsentStateInvalid)
+    }
+}
+
+/// GET {callback_path}/confirm
+///
+/// The identity provider's redirect after a consent confirmation sign-in. The
+/// state must be a confirmation state of this gateway, held by the browser
+/// that posted its start page, and is used once; its surface must still exist
+/// under the sealed tenant, and its provider must still confirm through the
+/// sealed strategy. An identity provider error is a denied
+/// consent. Once the caller is confirmed
+/// ([`confirm_caller`](super::consent_confirmation::confirm_caller)) the
+/// browser goes on to the vendor with a vendor state on the same browser
+/// binding, so its cookie stays as it is. A caller the sign-in does not
+/// confirm is refused with 403; every refusal clears the cookie and stores
+/// nothing.
+pub async fn consent_confirmation_callback(
+    State(state): State<DelegationVaultState>,
+    Path(provider_id): Path<String>,
+    cookies: Option<Extension<super::consent_cookie::ConsentCookies>>,
+    query: Result<Query<OAuthCallbackQuery>, QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return consent_refused(
+            ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid),
+            &provider_id,
+            None,
+            None,
+        );
+    };
+    let sealed = query
+        .state
+        .as_deref()
+        .and_then(|encoded| oauth::decode_confirmation_state(encoded).ok());
+    let cookie_name = sealed
+        .as_ref()
+        .and_then(oauth::binding_cookie_name);
+    let audited = sealed
+        .as_ref()
+        .map(|sealed| refused_provider(&provider_id, sealed).to_string());
+    let refuse = |reason: DelegationFailureReason| {
+        let status = match reason {
+            DelegationFailureReason::ConsentIdentityMismatch
+            | DelegationFailureReason::ConsentIdentityMissing
+            | DelegationFailureReason::BrowserBindingMismatch => StatusCode::FORBIDDEN,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        consent_refused(ConsentRefusal { status, reason }, &provider_id, cookie_name.as_deref(), audited.as_deref())
+    };
+    let (Some(sealed), Some(cookie_name)) = (&sealed, cookie_name.as_deref()) else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    let Some(super::ConsentStage::Confirmation(sign_in)) = &sealed.stage else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    let presented = cookies
+        .as_ref()
+        .and_then(|Extension(cookies)| cookies.get(cookie_name));
+    if !oauth::browser_binding_matches(sealed, presented) {
+        return refuse(DelegationFailureReason::BrowserBindingMismatch);
+    }
+    if let Err(reason) = sealed_surface_unchanged(&state, &provider_id, sealed, &sign_in.binding).await {
+        return refuse(reason);
+    }
+    if !oauth::claim_oauth_state(sealed).await {
+        return refuse(DelegationFailureReason::ConsentStateReused);
+    }
+    let provider = match consent_provider(&state, &provider_id, sealed).await {
+        Ok(provider) => provider,
+        Err(refusal) => return refuse(refusal.reason),
+    };
+    let Some(confirmation) = super::consent_confirmation::confirmation_for(&provider, &sign_in.binding) else {
+        return refuse(DelegationFailureReason::ConsentStateInvalid);
+    };
+    if let Some(error) = &query.error {
+        let (reason, logged) = provider_error(error);
+        warn!(
+            target: "credential_delegation",
+            provider_id = %provider.provider_id,
+            oauth_error = %logged,
+            "Identity provider returned an error to the consent confirmation"
+        );
+        return refuse(reason);
+    }
+    let Some(code) = query
+        .code
+        .as_deref()
+        .filter(|code| !code.is_empty())
+    else {
+        return refuse(DelegationFailureReason::ConsentResponseInvalid);
+    };
+    if let Err(reason) = super::consent_confirmation::confirm_caller(
+        &state,
+        &provider,
+        confirmation,
+        sealed,
+        sign_in,
+        code,
+        query.iss.as_deref(),
+    )
+    .await
+    {
+        return refuse(reason);
+    }
+    let Ok(redirect_uri) = provider.consent_redirect_uri(&state.gateway_base_url) else {
+        return refuse(DelegationFailureReason::RedirectUriInvalid);
+    };
+    let vendor_url =
+        match oauth::continue_to_vendor(&provider, sealed, &sign_in.binding, &redirect_uri, &state.secrets_store).await
+        {
+            Ok(vendor_url) => vendor_url,
+            Err(e) => {
+                warn!(
+                    target: "credential_delegation",
+                    provider_id = %provider.provider_id,
+                    error = %e,
+                    "Could not continue a confirmed consent to the vendor"
+                );
+                return refuse(if e.is::<oauth::ProviderSecretError>() {
+                    DelegationFailureReason::CredentialsUnavailable
+                } else {
+                    DelegationFailureReason::AuthorizationUrlInvalid
+                });
+            }
+        };
+    let Ok(location) = HeaderValue::from_str(vendor_url.as_str()) else {
+        return refuse(DelegationFailureReason::AuthorizationUrlInvalid);
+    };
+    info!(
+        target: "credential_delegation",
+        provider_id = %provider.provider_id,
+        action = "consent_confirmed",
+        "Consent caller confirmed at their identity provider"
+    );
+    let mut response = StatusCode::FOUND.into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, location);
+    consent_page_headers(&mut response, "no-referrer");
     response
 }
 
@@ -756,22 +1163,13 @@ pub async fn oauth_callback(
     );
 
     if let Some(error) = &query.error {
-        let valid = !error.is_empty()
-            && error.len() <= 128
-            && error
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        let (reason, logged) = provider_error(error);
         warn!(
             target: "credential_delegation",
             provider_id = plain_slug(named),
-            oauth_error = %if valid { error.as_str() } else { oauth::UNRECOGNIZED_ERROR },
+            oauth_error = %logged,
             "OAuth provider returned an error"
         );
-        let reason = if valid {
-            DelegationFailureReason::ConsentDenied
-        } else {
-            DelegationFailureReason::ConsentResponseInvalid
-        };
         return refuse(ConsentRefusal::bad_request(reason));
     }
 
@@ -945,7 +1343,7 @@ pub async fn oauth_callback(
                     super::audit::DelegationAuditAction::ConsentGranted,
                     Some(&oauth_state.agent_did),
                     Some(&oauth_state.user_identity_hash),
-                    Some(&oauth_state.provider_id),
+                    Some(&provider.id),
                     Some(&oauth_state.surface_id),
                 );
                 evt.scopes = Some(granted_scopes.clone());
@@ -1123,13 +1521,21 @@ pub struct AuditLogQuery {
 }
 
 /// GET /api/v1/delegation-audit
-pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoResponse {
+pub async fn list_audit_events(
+    State(state): State<DelegationVaultState>,
+    reader: VaultReader,
+    Query(query): Query<AuditLogQuery>,
+) -> impl IntoResponse {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query
         .page_size
         .unwrap_or(25)
         .clamp(1, 100);
     let filter = query.filter.as_deref();
+    let scope = match caller_read_scope(&state, &reader, "audit", "Failed to read audit log").await {
+        Ok(scope) => scope,
+        Err(refused) => return refused.into_response(),
+    };
 
     // Exclude VP-audit categories (policy decisions / trust checks) up front so
     // `events`, `total`, and `total_pages` stay consistent — they belong to the
@@ -1142,6 +1548,7 @@ pub async fn list_audit_events(Query(query): Query<AuditLogQuery>) -> impl IntoR
             exclude_vp_audit: true,
             ..Default::default()
         },
+        scope,
     )
     .await;
 
@@ -1156,7 +1563,7 @@ fn audit_response(result: anyhow::Result<super::audit::AuditLogPage>) -> (Status
     match body {
         Ok(body) => (StatusCode::OK, Json(body)),
         Err(e) => {
-            warn!(target: "credential_delegation", error = %e, "Failed to read the VP Audit Log");
+            warn!(target: "credential_delegation", action = "audit", error = %e, "Failed to read the VP Audit Log");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to read the audit log"})))
         }
     }

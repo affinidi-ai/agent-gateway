@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::secrets::SecretsStore;
@@ -125,6 +125,35 @@ pub trait StsClientStorage: Send + Sync {
         &self,
         id: &str,
     ) -> Result<()>;
+}
+
+/// Classifies each literal authority DID of a stored client's Trust Checks by the register it
+/// is in and saves the clients whose sources changed, as stored surfaces are on load.
+pub async fn record_authority_sources(
+    store: &dyn StsClientStorage,
+    registers: &crate::trust_registry_verification::authority_source::AuthorityRegisters,
+) {
+    let clients = match store.list().await {
+        Ok(clients) => clients,
+        Err(error) => {
+            warn!(%error, "Failed to list STS clients; their authority DIDs stay unclassified");
+            return;
+        }
+    };
+    for mut client in clients {
+        let changed = registers.classify_trust_checks(&mut client.trust_check_list, client.tenant_id.as_deref(), None);
+        crate::trust_registry_verification::authority_source::warn_unlinked(
+            &client.id,
+            &crate::trust_registry_verification::authority_source::trust_check_references(&client.trust_check_list),
+        );
+        if !changed {
+            continue;
+        }
+        let id = client.id.clone();
+        if let Err(error) = store.update(client).await {
+            warn!(client = %id, %error, "Failed to save where an STS client's Trust Check authority DIDs come from");
+        }
+    }
 }
 
 /// Filesystem-backed STS client store (`{storage_dir}/{id}.json`), inheriting
@@ -278,5 +307,73 @@ impl StsClientRegistry for StoreBackedClientRegistry {
         }
 
         Ok(client.to_record())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authorities::AuthorityStore;
+    use crate::trust_registry_verification::authority_source::{AuthorityRegisters, AuthoritySource};
+
+    #[tokio::test]
+    async fn stored_clients_get_the_source_of_their_trust_check_authorities() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemStsClientStore::new(dir.path().join("sts"))
+            .await
+            .unwrap();
+        let client = |id: &str, did: &str| -> StsClient {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "client_id": id, "name": id,
+                "trust_check_list": [{
+                    "id": "check", "trust_registry_id": "tr-1", "query_type": "recognition",
+                    "query": {"authority_id": did, "entity_id": "{{ input.sts.client_id }}"}
+                }],
+                "created_at": Utc::now(), "updated_at": Utc::now()
+            }))
+            .unwrap()
+        };
+        store
+            .create(client("linked", "did:web:acme"))
+            .await
+            .unwrap();
+        store
+            .create(client("unlinked", "did:web:typed"))
+            .await
+            .unwrap();
+        let authorities = crate::authorities::FileSystemAuthorityStore::new(dir.path().join("authorities"))
+            .await
+            .unwrap();
+        authorities
+            .create(&crate::authorities::types::Authority::new(
+                "a-1".into(),
+                "Acme".into(),
+                "did:web:acme".into(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        let registers = AuthorityRegisters::load(&authorities, None)
+            .await
+            .unwrap();
+
+        record_authority_sources(&store, &registers).await;
+
+        let source = |id: &str| {
+            let store = &store;
+            let id = id.to_string();
+            async move {
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .trust_check_list[0]
+                    .authority_source
+            }
+        };
+        assert_eq!(source("linked").await, Some(AuthoritySource::Authority));
+        assert_eq!(source("unlinked").await, None);
     }
 }

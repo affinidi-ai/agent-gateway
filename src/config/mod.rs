@@ -5,6 +5,7 @@ mod agent_surface_accessors;
 pub(crate) mod agent_surface_compat;
 pub mod agent_surface_variants;
 mod bootstrap;
+pub mod caller_key;
 pub mod credential_policy;
 pub mod encryption_config;
 pub mod header_metadata_mapping;
@@ -28,8 +29,8 @@ pub use network::*;
 pub use pepper_cache_config::PepperCacheConfig;
 pub(crate) use proxy::{
     fall_back_to_first_source_auth_method, fall_back_to_first_source_auth_methods_in_memory,
-    log_additional_source_auth_method_notices, log_source_auth_fallbacks, log_unchecked_audience_warnings,
-    validate_source_auth_config, validate_source_auth_method,
+    log_additional_source_auth_method_notices, log_legacy_access_point_notices, log_source_auth_fallbacks,
+    log_unchecked_audience_warnings, validate_source_auth_config, validate_source_auth_method,
 };
 pub use rbac_config::*;
 pub use types::*;

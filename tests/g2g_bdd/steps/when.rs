@@ -247,14 +247,39 @@ pub async fn agent_card_fetched_from_surface(
     gw_index: usize,
     surface_name: String,
 ) {
+    fetch_agent_card(world, gw_index, &surface_name, &[]).await;
+}
+
+#[when(
+    expr = "the caller fetches the agent card from gateway {int} surface {string} with header {string} set to {string}"
+)]
+pub async fn agent_card_fetched_from_surface_with_header(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: String,
+    header_name: String,
+    header_value: String,
+) {
+    fetch_agent_card(world, gw_index, &surface_name, &[(&header_name, &header_value)]).await;
+}
+
+async fn fetch_agent_card(
+    world: &mut G2gWorld,
+    gw_index: usize,
+    surface_name: &str,
+    headers: &[(&str, &str)],
+) {
     world.start().await;
-    let (_gw, surface_id) = world.surface(&surface_name);
+    let (_gw, surface_id) = world.surface(surface_name);
     let port = world
         .harness()
         .gw(gw_index)
         .port;
-    let response = Client::new()
-        .get(format!("http://127.0.0.1:{port}/{surface_id}/.well-known/agent-card.json"))
+    let mut request = Client::new().get(format!("http://127.0.0.1:{port}/{surface_id}/.well-known/agent-card.json"));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request
         .send()
         .await
         .expect("caller request must succeed at the transport layer");

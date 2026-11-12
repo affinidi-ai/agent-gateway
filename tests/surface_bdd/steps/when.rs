@@ -4,6 +4,7 @@ use crate::bdd_support::actors::{PRIMARY_COLLABORATOR_KEY, SECONDARY_COLLABORATO
 use crate::bdd_support::admin_client::AdminApiClient;
 use crate::bdd_support::caller::{RecordedHttpResponse, post_json};
 use crate::bdd_support::config;
+use crate::bdd_support::config::single_surface_fixture::IdentityProviderEndpoints;
 use crate::bdd_support::config::single_surface_writer::JwksFiles;
 use crate::bdd_support::debug::log_to_file;
 use crate::bdd_support::gateway_process::{GatewayProcess, SURFACE_TEST_AUTH_TOKEN as TEST_AUTH_TOKEN};
@@ -16,11 +17,15 @@ use crate::bdd_support::json_rpc::{
 };
 use crate::bdd_support::jwt::{self, JwksServer};
 use crate::bdd_support::mock_server::MockServer;
+use crate::bdd_support::oidc::OidcProvider;
 use crate::bdd_support::temp::{TempDirGuard, create_project_temp_dir};
 use crate::world::{
     JwtSourceAuthConfig, RecordedResponse, ScenarioInfra, SurfaceSourceAuthConfig, SurfaceWorld, TargetObservations,
     debug_line, mcp_identity_schema_with_field,
 };
+
+/// The identity hash pepper of a gateway whose callers can sign in at their identity provider.
+const IDENTITY_HASH_PEPPER: &str = "6264642d6964656e746974792d686173682d7065707065722d666f722d746573";
 
 async fn read_mock_observation(mock: &MockServer) -> TargetObservations {
     TargetObservations::from_requests(mock.requests().await)
@@ -342,6 +347,27 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     } else {
         (None, None)
     };
+    let identity_provider = if world
+        .surface_config
+        .identity_provider
+    {
+        let issuer = &jwks_files
+            .as_ref()
+            .expect("the callers' identity provider issues the tokens JWT Bearer source authentication verifies")
+            .issuer;
+        let provider = OidcProvider::start_with_issuer(issuer).await;
+        oauth_endpoint_allowlist.push(provider.authorization_endpoint());
+        oauth_endpoint_allowlist.push(provider.token_endpoint());
+        world
+            .surface_config
+            .identity_provider_endpoints = Some(IdentityProviderEndpoints {
+            authorization_endpoint: provider.authorization_endpoint(),
+            token_endpoint: provider.token_endpoint(),
+        });
+        Some(provider)
+    } else {
+        None
+    };
 
     if has_outbound_listener {
         config::single_surface_writer::write_single_surface_config_with_outbound_listener(
@@ -415,6 +441,13 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
+    if identity_provider.is_some()
+        && !world
+            .surface_config
+            .identity_hash_pepper_unset
+    {
+        gateway_env.insert("AG_IDENTITY_HASH_PEPPER".to_string(), IDENTITY_HASH_PEPPER.to_string());
+    }
     // A credentialed MCP proxy tool call vets its REST backend like any stored
     // backend, and the JWKS fetch vets its JWKS URI; both refuse loopback unless
     // the egress allow-list names the mock.
@@ -473,6 +506,7 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         transit_point_mocks,
         affinidi_well,
         _jwks_server: jwks_server,
+        identity_provider,
         gateway_port,
         outbound_port,
     });
@@ -566,6 +600,24 @@ pub(crate) fn build_surface_payload(
         .surface_name
         .as_deref()
         .unwrap_or("bdd-created-surface");
+    let public = world
+        .surface_config
+        .access_point_public
+        .unwrap_or_else(|| {
+            world
+                .surface_config
+                .source_auth
+                .is_none()
+                && world
+                    .surface_config
+                    .additional_source_auth
+                    .is_empty()
+                && world
+                    .surface_config
+                    .mcp_http
+                    .as_ref()
+                    .is_none_or(|mcp_http| mcp_http["authorization"].is_null())
+        });
 
     serde_json::json!({
         "name": surface_name,
@@ -575,7 +627,7 @@ pub(crate) fn build_surface_payload(
             "listen_address": format!("http://localhost:{}", infra.gateway_port),
             "route": route,
             "protocol": world.surface_config.protocol,
-            "public": true,
+            "public": public,
         },
         "target": {
             "endpoint": target_url,
@@ -1776,6 +1828,68 @@ async fn mcp_surface_with_a2a_settings_create_request_submitted(
     create_surface(world, payload).await;
 }
 
+#[when(expr = "the operator attempts to create a surface for route {string} that allows browser origins {string}")]
+async fn surface_with_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    origins: String,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        origins
+            .split(", ")
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "the operator attempts to create a surface for route {string} that allows {int} browser origins")]
+async fn surface_with_many_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    count: usize,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        (0..count)
+            .map(|index| format!("https://page{index}.example.com"))
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "a web page at origin {string} sends a preflight for a POST to the surface")]
+async fn web_page_sends_preflight_to_surface(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    ensure_gateway_running(world).await;
+    let url = format!(
+        "http://127.0.0.1:{}{}/foo",
+        world
+            .infra
+            .as_ref()
+            .unwrap()
+            .gateway_port,
+        world.surface_config.route
+    );
+    let response = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .expect("send preflight to gateway");
+    world.caller_response = Some(RecordedResponse {
+        status: response.status().as_u16(),
+        headers: collect_headers(response.headers()),
+        body: serde_json::Value::Null,
+    });
+}
+
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
 async fn invalid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
@@ -1997,7 +2111,7 @@ async fn request_without_token(world: &mut SurfaceWorld) {
     send_request_and_record(world, vec![]).await;
 }
 
-fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
+pub(crate) fn get_jwt_source_auth_issuer(world: &SurfaceWorld) -> String {
     world
         .surface_config
         .source_auth
@@ -2079,7 +2193,7 @@ fn create_valid_jwt_for_subject(
     jwt::sign_jwt(claims)
 }
 
-fn create_valid_jwt_for_subject_with_world_claims(
+pub(crate) fn create_valid_jwt_for_subject_with_world_claims(
     world: &SurfaceWorld,
     subject: &str,
     extra_claims: serde_json::Value,
@@ -2158,6 +2272,7 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
+#[given("the caller has sent a request to the surface with a valid token")]
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -2165,6 +2280,29 @@ async fn request_with_valid_token(world: &mut SurfaceWorld) {
     let audience = caller_token_audience(world);
     let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
     send_request_with_bearer_token(world, token).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid token and header {string} set to {string}")]
+async fn request_with_valid_token_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), (name, value)]).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and header {string} set to {string}")]
+async fn request_with_valid_api_key_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    let api_key = build_valid_api_key_source_auth_header(world);
+    send_request_and_record(world, vec![api_key, (name, value)]).await;
 }
 
 #[when(expr = "the caller sends a request to the surface with a token for audience {string}")]
@@ -2809,7 +2947,7 @@ async fn managed_agent_asks_for_tools_through_transit_point_with_issued_token(
     .await;
 }
 
-async fn send_mcp_request_through_transit_point_path_with_headers(
+pub(crate) async fn send_mcp_request_through_transit_point_path_with_headers(
     world: &mut SurfaceWorld,
     agent_name: &str,
     path: &str,
@@ -2874,13 +3012,13 @@ async fn send_a2a_request_through_transit_point(
     .await;
 }
 
-pub(crate) async fn send_a2a_body_through_transit_point(
+/// The URL managed agent `agent_name` calls Transit Point `transit_point` at,
+/// once the gateway's outbound listener is ready.
+async fn transit_point_url(
     world: &mut SurfaceWorld,
     agent_name: &str,
     transit_point: &str,
-    headers: Vec<(String, String)>,
-    body: serde_json::Value,
-) {
+) -> String {
     world
         .actors
         .expect_target_kind(agent_name, TargetActorKind::ManagedAgent);
@@ -2896,7 +3034,33 @@ pub(crate) async fn send_a2a_body_through_transit_point(
         .wait_for_secondary_port(outbound_port, std::time::Duration::from_secs(15))
         .await
         .unwrap_or_else(|error| panic!("outbound listener did not become ready on port {outbound_port}: {error}"));
-    let url = format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point);
+    format!("http://127.0.0.1:{}/transit/{}", outbound_port, transit_point)
+}
+
+async fn record_transit_point_response(
+    world: &mut SurfaceWorld,
+    response: reqwest::Response,
+) {
+    let status = response.status().as_u16();
+    let headers = collect_headers(response.headers());
+    let body = response
+        .json()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    world.caller_response = Some(RecordedResponse { status, headers, body });
+
+    record_mock_observation(world).await;
+    record_replacement_mock_observation(world).await;
+}
+
+pub(crate) async fn send_a2a_body_through_transit_point(
+    world: &mut SurfaceWorld,
+    agent_name: &str,
+    transit_point: &str,
+    headers: Vec<(String, String)>,
+    body: serde_json::Value,
+) {
+    let url = transit_point_url(world, agent_name, transit_point).await;
 
     world.sent_body = Some(body.clone());
     let client = reqwest::Client::new();
@@ -2912,16 +3076,7 @@ pub(crate) async fn send_a2a_body_through_transit_point(
         .await
         .expect("send A2A request through Transit Point");
 
-    let status = response.status().as_u16();
-    let headers = collect_headers(response.headers());
-    let body = response
-        .json()
-        .await
-        .unwrap_or(serde_json::Value::Null);
-    world.caller_response = Some(RecordedResponse { status, headers, body });
-
-    record_mock_observation(world).await;
-    record_replacement_mock_observation(world).await;
+    record_transit_point_response(world, response).await;
 }
 
 #[when(
@@ -2956,6 +3111,42 @@ async fn managed_agent_sends_a2a_request_through_transit_point_with_header(
     value: String,
 ) {
     send_a2a_request_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)]).await;
+}
+
+#[when(
+    regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request with the agent-identity extension through Transit Point \"([^\"]+)\" with header \"([^\"]+)\" set to \"([^\"]+)\"$"#
+)]
+async fn managed_agent_sends_identity_request_through_transit_point_with_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let mut body = build_a2a_message_send_body("hello");
+    crate::bdd_support::json_rpc::attach_agent_identity_payload(&mut body);
+    send_a2a_body_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)], body).await;
+}
+
+#[when(
+    expr = "managed agent {string} fetches the agent card of Transit Point {string} with header {string} set to {string}"
+)]
+async fn managed_agent_fetches_transit_point_card_with_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let url = transit_point_url(world, &agent_name, &transit_point).await;
+    let response = reqwest::Client::new()
+        .get(format!("{url}/.well-known/agent-card.json"))
+        .header(header, value)
+        .send()
+        .await
+        .expect("fetch agent card through Transit Point");
+
+    record_transit_point_response(world, response).await;
 }
 
 #[when(regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request through Transit Point \"([^\"]+)\"$"#)]
@@ -3385,7 +3576,7 @@ async fn redirect_back_after_confirming_start_page(
     world.oauth_binding_cookie = Some(cookie);
 }
 
-fn valid_code_query(
+pub(crate) fn valid_code_query(
     state: &str,
     extra: &[(&str, &str)],
 ) -> String {
@@ -3484,7 +3675,7 @@ async fn oauth_provider_redirects_with_provider_error(
     send_oauth_callback_and_record(world, &provider, "error=access_denied&error_description=bdd-denied", None).await;
 }
 
-async fn send_oauth_callback_and_record(
+pub(crate) async fn send_oauth_callback_and_record(
     world: &mut SurfaceWorld,
     provider: &str,
     query: &str,
@@ -3508,7 +3699,7 @@ async fn send_oauth_callback_and_record(
     record_replacement_mock_observation(world).await;
 }
 
-async fn record_html_response(
+pub(crate) async fn record_html_response(
     world: &mut SurfaceWorld,
     resp: reqwest::Response,
 ) {
@@ -3522,20 +3713,19 @@ async fn record_html_response(
     world.caller_response = Some(RecordedResponse { status, headers, body });
 }
 
-fn no_redirect_client() -> reqwest::Client {
+pub(crate) fn no_redirect_client() -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("build a client that does not follow redirects")
 }
 
-/// Confirm the consent start page of the latest consent_required answer, as
-/// the person's browser does, and return the callback state the gateway sent
-/// to the vendor and the binding cookie it set, as its `name=value` pair.
-pub(crate) async fn confirm_consent_start_page(
+/// Open the consent start page of the latest consent_required answer and
+/// confirm it, as the person's browser does, and return the gateway's answer.
+pub(crate) async fn post_consent_start_page(
     world: &SurfaceWorld,
     provider: &str,
-) -> (String, String) {
+) -> reqwest::Response {
     let start = latest_consent_start_url(world, provider);
     let origin = start
         .origin()
@@ -3548,34 +3738,52 @@ pub(crate) async fn confirm_consent_start_page(
         .await
         .expect("open the consent start page");
     assert_eq!(page.status().as_u16(), 200, "the consent start page opens");
-    let mut action = start.clone();
+    let mut action = start;
     action.set_query(None);
-    let started = client
+    client
         .post(action)
         .header("origin", origin)
         .form(&[("state", state.as_str())])
         .send()
         .await
-        .expect("confirm the consent start page");
-    assert_eq!(started.status().as_u16(), 302, "the consent start POST sends the browser to the vendor");
-    let cookie = started
-        .headers()
+        .expect("confirm the consent start page")
+}
+
+/// The binding cookie a consent start POST set, as its `name=value` pair.
+pub(crate) fn consent_binding_cookie(headers: &reqwest::header::HeaderMap) -> String {
+    headers
         .get("set-cookie")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .filter(|pair| pair.starts_with("__Host-ag_consent_"))
         .expect("the consent start POST sets the binding cookie")
-        .to_string();
-    let vendor = started
-        .headers()
+        .to_string()
+}
+
+/// The URL a gateway answer sends the browser to.
+pub(crate) fn redirect_location(headers: &reqwest::header::HeaderMap) -> url::Url {
+    headers
         .get("location")
         .and_then(|value| value.to_str().ok())
-        .map(|location| url::Url::parse(location).expect("the vendor URL is a URL"))
-        .expect("the consent start POST names the vendor URL");
+        .map(|location| url::Url::parse(location).expect("the redirect location is a URL"))
+        .expect("the answer sends the browser on")
+}
+
+/// Confirm the consent start page of the latest consent_required answer, as
+/// the person's browser does, and return the callback state the gateway sent
+/// to the vendor and the binding cookie it set, as its `name=value` pair.
+pub(crate) async fn confirm_consent_start_page(
+    world: &SurfaceWorld,
+    provider: &str,
+) -> (String, String) {
+    let started = post_consent_start_page(world, provider).await;
+    assert_eq!(started.status().as_u16(), 302, "the consent start POST sends the browser to the vendor");
+    let cookie = consent_binding_cookie(started.headers());
+    let vendor = redirect_location(started.headers());
     (query_value(&vendor, "state"), cookie)
 }
 
-fn query_value(
+pub(crate) fn query_value(
     url: &url::Url,
     name: &str,
 ) -> String {
@@ -3956,6 +4164,16 @@ pub(crate) async fn caller_invokes_mcp_tool_with_valid_token(
     send_json_request_and_record(world, body, vec![("authorization".to_string(), format!("Bearer {token}"))]).await;
 }
 
+pub(crate) async fn caller_invokes_mcp_tool_with_valid_api_key(
+    world: &mut SurfaceWorld,
+    tool_name: String,
+) {
+    ensure_gateway_running(world).await;
+    let header = build_valid_api_key_source_auth_header(world);
+    let body = build_mcp_tool_call_body(&tool_name, serde_json::json!({}));
+    send_json_request_and_record(world, body, vec![header]).await;
+}
+
 #[when(expr = "caller {string} invokes MCP tool {string} with a valid token and a valid inbound identity payload")]
 async fn caller_invokes_mcp_tool_with_valid_token_and_identity_and_audit_recorded(
     world: &mut SurfaceWorld,
@@ -4134,6 +4352,15 @@ async fn mcp_modern_batch_sent(world: &mut SurfaceWorld) {
         build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-batch-second"), &McpVersion::Modern, true),
     ]);
     send_json_request_and_record(world, batch, modern_mcp_request_headers(&McpVersion::Modern, "tools/list")).await;
+}
+
+#[when("the caller sends a legacy batch of MCP tool catalog requests")]
+async fn mcp_legacy_batch_sent(world: &mut SurfaceWorld) {
+    let batch = serde_json::Value::Array(vec![
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-first")),
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-second")),
+    ]);
+    send_json_request_and_record(world, batch, vec![]).await;
 }
 
 #[when(expr = "the caller asks the MCP surface for available tools with header {string} set to {string}")]

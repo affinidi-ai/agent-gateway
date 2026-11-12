@@ -303,6 +303,12 @@ impl SourceAuthMiddleware {
             subject,
             principal_claim,
             claims,
+            verification: crate::source_auth::JwtVerification::of(
+                &jwt_strategy,
+                &config.audiences,
+                config.audience_claim,
+            ),
+            strategy_id: Some(jwt_strategy.id),
         })
     }
 
@@ -1802,6 +1808,50 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         }
     }
 
+    /// A verified token records where the keys that verified it come from, the strategy's JWKS
+    /// URI as configured, and the audiences it was accepted against, sorted and without
+    /// duplicates, which a caller key is bound to.
+    #[tokio::test]
+    async fn a_verified_jwt_records_its_key_source_and_accepted_audiences() {
+        let kid = "source-auth-test-key";
+        let (mw, strategy_id, _server) = jwt_test_setup().await;
+        let strategy = mw
+            .provider_store()
+            .get(&strategy_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let JwksSource::Remote { jwks_uri } = &strategy.jwks_source else {
+            panic!("the test strategy fetches its keys");
+        };
+        let token = make_token(
+            json!({
+                "iss": "https://issuer.example.com", "sub": "user-1", "aud": "my-audience",
+                "exp": now_secs() + 3600, "iat": now_secs(),
+            }),
+            kid,
+        );
+        let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
+            jwt_verification_strategy_id: strategy_id.clone(),
+            audiences: vec!["other-audience".to_string(), "my-audience".to_string(), "my-audience".to_string()],
+            ..Default::default()
+        });
+
+        let identity = mw
+            .authenticate(&config, &bearer(&token), "test-channel", SessionView::base("test-surface-id"), None)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(
+            identity.jwt_verification(),
+            Some(&crate::source_auth::JwtVerification {
+                key_source: format!("jwks_uri:{jwks_uri}"),
+                audience_claim: "aud".to_string(),
+                audiences: vec!["my-audience".to_string(), "other-audience".to_string()],
+            })
+        );
+    }
+
     /// Tokens of `https://issuer.example.com` are this STS's, minted for the
     /// connection their `client_id` names: `alpha` of tenant A, `global` of
     /// no tenant, and any other unknown.
@@ -2021,7 +2071,7 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
         let kid = "source-auth-test-key";
         let (mw, strategy_id, _server) = jwt_test_setup_naming(Some("oid")).await;
         let config = SourceAuthConfig::JwtBearer(JwtBearerAuthConfig {
-            jwt_verification_strategy_id: strategy_id,
+            jwt_verification_strategy_id: strategy_id.clone(),
             audiences: vec!["my-audience".to_string()],
             ..Default::default()
         });
@@ -2050,9 +2100,15 @@ MC4CAQAwBQYDK2VwBCIEIPiOVQaSEcxl/NogGyUAX88ouBy1bWJFMp4gi0pcCgcY
             .await
             .expect("a token with the claim authenticates");
         match &identity {
-            AuthenticatedIdentity::JwtBearer { subject, principal_claim, .. } => {
+            AuthenticatedIdentity::JwtBearer {
+                subject,
+                principal_claim,
+                strategy_id: verified_by,
+                ..
+            } => {
                 assert_eq!(subject, "00000000-0000-0000-0000-0000000000aa");
                 assert_eq!(principal_claim, "oid");
+                assert_eq!(verified_by.as_deref(), Some(strategy_id.as_str()), "the identity names its strategy");
             }
             _ => panic!("expected a JwtBearer identity"),
         }
