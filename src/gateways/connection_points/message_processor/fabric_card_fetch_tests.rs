@@ -289,7 +289,8 @@ async fn a_card_fetch_at_a_configured_location_carries_no_transit_token() {
 /// Other public reads skip caller authentication and so reach the Target without
 /// its credential, as they were sent: another discovery path, a `HEAD` of the
 /// card path, the legacy `agent.json`, and a card path spelled with a query or
-/// dot segments. A request from an authenticated caller still carries it.
+/// dot segments. So does a `POST` to the card path from a caller who failed
+/// source authentication. A request from an authenticated caller still carries it.
 #[tokio::test]
 async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_without_its_credential() {
     if ran_in_child("ATG_FABRIC_PUBLIC_PATH_CHILD").await {
@@ -309,6 +310,7 @@ async fn a_public_path_over_fabric_other_than_the_card_reaches_the_target_withou
         ("GET", "/.well-known/agent.json"),
         ("GET", "/.well-known/agent-card.json?view=full"),
         ("GET", "/x/../.well-known/agent-card.json"),
+        ("POST", "/.well-known/agent-card.json"),
     ] {
         let response = forward_response(&peer_request(root.path(), method, path)).await;
         assert_eq!(response["status"], 401, "{method} {path}: {response}");
@@ -1154,10 +1156,10 @@ async fn the_policy_card_read_resolves_no_credential_for_a_target_that_is_not_ht
     assert_eq!(token_endpoint.requests(), 0, "no provider token is requested for a card that cannot be read");
 }
 
-/// The card read for the policy input logs the card's `url` without its
-/// userinfo or query values, as it logs the card location.
+/// The card read for the policy input logs the card location it fetches without
+/// its query values, and the card's `url` without its userinfo or query values.
 #[tokio::test]
-async fn the_policy_card_read_logs_the_cards_url_redacted() {
+async fn the_policy_card_read_logs_the_card_location_and_the_cards_url_redacted() {
     use axum::response::IntoResponse;
     use tracing::instrument::WithSubscriber;
     let app = axum::Router::new().fallback(|| async {
@@ -1170,7 +1172,8 @@ async fn the_policy_card_read_logs_the_cards_url_redacted() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap();
-    let card_url = format!("http://{}/.well-known/agent.json", listener.local_addr().unwrap());
+    let card_url =
+        format!("http://{}/.well-known/agent.json?token=location-query-secret", listener.local_addr().unwrap());
     let _server = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -1182,20 +1185,15 @@ async fn the_policy_card_read_logs_the_cards_url_redacted() {
         .with_ansi(false)
         .finish();
 
-    let card = super::fetch_agent_card(
-        &card_url,
-        None,
-        Duration::from_secs(5),
-        super::fabric_body_limits(&surface("a2a", "http://127.0.0.1", &[])),
-        SURFACE_ID,
-    )
-    .with_subscriber(subscriber)
-    .await;
+    let card = super::read_policy_agent_card(&surface("a2a", "http://127.0.0.1", &[]), &card_url, SURFACE_ID)
+        .with_subscriber(subscriber)
+        .await;
 
     assert_eq!(card.unwrap()["name"], "agent");
     let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("/.well-known/agent.json?token="), "the card location was not logged:\n{logs}");
     assert!(logs.contains("agent.example/a2a"), "the card url was not logged:\n{logs}");
-    for secret in ["card-password", "card-query-secret"] {
+    for secret in ["location-query-secret", "card-password", "card-query-secret"] {
         assert!(!logs.contains(secret), "{secret} was logged:\n{logs}");
     }
 }

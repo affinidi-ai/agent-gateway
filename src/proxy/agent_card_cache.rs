@@ -361,6 +361,46 @@ mod tests {
     }
 
     #[test]
+    fn a_surface_card_outlives_a_missing_one_and_both_expire() {
+        let cache = AgentCardCache::default();
+        let url = "https://a.example.com/.well-known/agent.json";
+        let target_auth = r#"{"method":"a"}"#;
+        cache.insert_surface_card("orders", url, target_auth, Some(json!({"kind": "protected"})));
+        cache.insert_surface_card("billing", url, target_auth, None);
+        let backdate = |surface_id: &str, age: Duration| {
+            let key = (surface_id.to_string(), url.to_string(), target_auth.to_string());
+            if let Some(mut entry) = cache
+                .surface_cards
+                .get_mut(&key)
+            {
+                entry.fetched_at = Instant::now()
+                    .checked_sub(age)
+                    .expect("monotonic clock far enough from its origin");
+            }
+        };
+        backdate("orders", NEGATIVE_TTL);
+        backdate("billing", NEGATIVE_TTL);
+        assert_eq!(
+            cache.lookup_surface_card("orders", url, target_auth),
+            Some(Some(json!({"kind": "protected"}))),
+            "a card is kept past the TTL of a missing one"
+        );
+        assert!(
+            cache
+                .lookup_surface_card("billing", url, target_auth)
+                .is_none(),
+            "a missing card expired"
+        );
+        backdate("orders", POSITIVE_TTL);
+        assert!(
+            cache
+                .lookup_surface_card("orders", url, target_auth)
+                .is_none(),
+            "a card expired"
+        );
+    }
+
+    #[test]
     fn verified_vp_roundtrip_and_invalidation() {
         let cache = AgentCardCache::default();
         let vp = "{\"vp\":\"target\"}";

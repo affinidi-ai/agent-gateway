@@ -206,16 +206,18 @@ Feature: Protected agent card fetch over Fabric
     And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
     And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
     And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
-    When the caller sends a GET request to gateway 1 surface "charlie" path "<path>"
+    When the caller sends a <method> request to gateway 1 surface "charlie" path "<path>"
     Then the response status is 200
-    And managed agent "bravo" received a GET request at path "<forwarded path>"
-    And the GET request at path "<forwarded path>" to managed agent "bravo" did not carry header "x-target-api-key"
+    And managed agent "bravo" received a <method> request at path "<path>"
+    And the <method> request at path "<path>" to managed agent "bravo" did not carry header "x-target-api-key"
 
     Examples:
-      | path                              | forwarded path                    |
-      | /discovery                        | /discovery                        |
-      | /.well-known/ucp                  | /.well-known/ucp                  |
-      | /x/agent-card.json                | /x/agent-card.json                |
+      | method | path               |
+      | GET    | /discovery         |
+      | GET    | /.well-known/ucp   |
+      | GET    | /x/agent-card.json |
+      | HEAD   | /x/agent-card.json |
+      | HEAD   | /discovery         |
 
   Scenario: gateway 2 forwards an authenticated caller's POST to its configured card location with its body and Target credential
     Given a fabric with 2 gateways
@@ -245,6 +247,31 @@ Feature: Protected agent card fetch over Fabric
     And managed agent "bravo" received a POST request at path "/cards/me"
     And the POST request at path "/cards/me" to managed agent "bravo" did not carry header "x-target-api-key"
     And the POST request at path "/cards/me" to managed agent "bravo" carried the caller's A2A message parts
+
+  Scenario: gateway 2 forwards a HEAD of its configured card location from a caller without an API key without its Target credential
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" is stored with a public Access Point
+    And surface "alpha" fetches its agent card from path "/cards/me"
+    And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a HEAD request to gateway 1 surface "charlie" path "/cards/me"
+    Then the response status is 200
+    And managed agent "bravo" received a HEAD request at path "/cards/me"
+    And the HEAD request at path "/cards/me" to managed agent "bravo" did not carry header "x-target-api-key"
+
+  Scenario: gateway 2 refuses the configured card location to a caller without an API key on a closed Access Point
+    Given a fabric with 2 gateways
+    And gateway 2 has an A2A surface "alpha" targeting managed agent "bravo"
+    And surface "alpha" requires "API Key" source authentication
+    And surface "alpha" fetches its agent card from path "/cards/me"
+    And surface "alpha" injects target authentication from secret "bdd-target-auth-secret" with value "bdd-target-secret" as header "x-target-api-key"
+    And gateway 1 has an A2A surface "charlie" forwarding over fabric to gateway 2 surface "alpha"
+    When the caller sends a GET request to gateway 1 surface "charlie" path "/cards/me"
+    Then the response status is 401
+    And the response says "Caller credential missing or invalid"
+    And managed agent "bravo" was not called
 
   Scenario: gateway 2 does not treat a card path whose case differs as its agent card fetch
     Given a fabric with 2 gateways
