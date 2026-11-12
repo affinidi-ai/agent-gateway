@@ -58,6 +58,16 @@ fn recorded_location(
     url::Url::parse(location).expect("the redirect location is a URL")
 }
 
+/// `response` when it sends the browser on with `302`.
+fn redirected(
+    response: reqwest::Response,
+    what: &str,
+) -> reqwest::Response {
+    Some(response)
+        .filter(|response| response.status().as_u16() == 302)
+        .expect(what)
+}
+
 fn without_query(url: &url::Url) -> String {
     let mut endpoint = url.clone();
     endpoint.set_query(None);
@@ -76,7 +86,12 @@ fn oauth_provider_confirms_its_caller(
     world: &mut SurfaceWorld,
     provider: String,
 ) {
-    assert_eq!(delegated_provider(world), provider, "only the surface's own OAuth provider confirms its caller");
+    world
+        .surface_config
+        .credential_delegation
+        .as_ref()
+        .filter(|delegation| delegation.provider_id == provider)
+        .expect("only the surface's own OAuth provider confirms its caller");
     callers_identity_provider_is_available(world);
     world
         .surface_config
@@ -92,6 +107,13 @@ fn oauth_provider_requires_confirmation(
     world
         .surface_config
         .consent_confirmation_required = true;
+}
+
+#[given("the gateway runs without an identity hash pepper")]
+fn gateway_runs_without_identity_hash_pepper(world: &mut SurfaceWorld) {
+    world
+        .surface_config
+        .identity_hash_pepper_unset = true;
 }
 
 #[when(expr = "the operator creates the authorization code provider {string} with consent confirmation")]
@@ -116,7 +138,7 @@ async fn operator_creates_provider_with_consent_confirmation(
 
 /// The JWT verification strategy that verifies the surface's JWT callers, which a
 /// confirming OAuth provider confirms them through.
-const CALLERS_STRATEGY_ID: &str = "bdd-jwt-strategy";
+pub(crate) const CALLERS_STRATEGY_ID: &str = "bdd-jwt-strategy";
 
 #[when("the operator deletes the JWT verification strategy that confirms the callers")]
 async fn operator_deletes_confirming_strategy(world: &mut SurfaceWorld) {
@@ -193,49 +215,22 @@ const SURFACE_ID: &str = "bdd-surface";
 async fn operator_has_deleted_consent_surface(world: &mut SurfaceWorld) {
     world.created_surface_id = Some(SURFACE_ID.to_string());
     crate::steps::when::delete_surface(world).await;
-    let status = world
+    world
         .admin_response
         .as_ref()
-        .map(|response| response.status);
-    assert!(status.is_some_and(|status| (200..300).contains(&status)), "the operator deletes the surface: {status:?}");
-}
-
-#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
-fn transit_point_injects_oauth_delegated_credentials(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-    provider: String,
-) {
-    crate::steps::given::transit_point_config_mut(world, &transit_point).delegated_credentials = true;
-    crate::steps::given::surface_requires_oauth_delegated_credentials(world, provider);
-}
-
-/// The audience a Transit Point's JWT callers' tokens are issued for.
-const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
-
-#[given(expr = "Transit Point {string} authenticates its callers with JWT Bearer")]
-fn transit_point_authenticates_its_callers_with_jwt_bearer(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-) {
-    crate::steps::given::transit_point_config_mut(world, &transit_point).source_auth = Some(serde_json::json!({
-        "type": "jwt_bearer",
-        "jwt_verification_strategy_id": CALLERS_STRATEGY_ID,
-        "audiences": [TRANSIT_AUDIENCE],
-        "forward_header": false,
-    }));
+        .filter(|response| (200..300).contains(&response.status))
+        .expect("the operator deletes the surface");
 }
 
 /// The JWT caller calls the Access Point, and the managed agent then calls a
 /// tool through the Transit Point with the transit token it was handed, named
 /// as the managed agent, and the caller's JWT.
 #[given(
-    expr = "managed agent {string} has started OAuth consent for provider {string} through Transit Point {string} for JWT caller {string}"
+    expr = "managed agent {string} has started OAuth consent through Transit Point {string} for JWT caller {string}"
 )]
 async fn managed_agent_has_started_oauth_consent_through_transit_point(
     world: &mut SurfaceWorld,
     agent_name: String,
-    _provider: String,
     transit_point: String,
     caller: String,
 ) {
@@ -269,7 +264,7 @@ async fn managed_agent_has_started_oauth_consent_through_transit_point(
     let token = crate::steps::when::create_valid_jwt_for_subject_with_world_claims(
         world,
         &caller,
-        serde_json::json!({ "aud": TRANSIT_AUDIENCE }),
+        serde_json::json!({ "aud": crate::steps::given::TRANSIT_AUDIENCE }),
     );
     let body = crate::bdd_support::json_rpc::build_mcp_tool_call_body("schedule_meeting", serde_json::json!({}));
     crate::steps::when::send_mcp_request_through_transit_point_path_with_headers(
@@ -288,28 +283,22 @@ async fn identity_provider_omits_nonce(world: &mut SurfaceWorld) {
     identity_provider(world).omit_nonce();
 }
 
-#[given(expr = "caller {string} has started OAuth consent for provider {string} with a valid API key")]
-async fn caller_has_started_oauth_consent_with_api_key(
-    world: &mut SurfaceWorld,
-    _caller: String,
-    _provider: String,
-) {
+#[given("an API key caller has started OAuth consent")]
+async fn api_key_caller_has_started_oauth_consent(world: &mut SurfaceWorld) {
     caller_invokes_mcp_tool_with_valid_api_key(world, "schedule_meeting".to_string()).await;
 }
 
-#[when(expr = "caller {string} invokes MCP tool {string} with a valid API key")]
-async fn caller_invokes_mcp_tool_with_api_key(
+#[when(expr = "an API key caller invokes MCP tool {string}")]
+async fn api_key_caller_invokes_mcp_tool(
     world: &mut SurfaceWorld,
-    _caller: String,
     tool_name: String,
 ) {
     caller_invokes_mcp_tool_with_valid_api_key(world, tool_name).await;
 }
 
-#[when(expr = "caller {string} confirms the consent start page for provider {string}")]
+#[when(expr = "the caller confirms the consent start page for provider {string}")]
 async fn caller_confirms_consent_start_page(
     world: &mut SurfaceWorld,
-    _caller: String,
     provider: String,
 ) {
     let started = post_consent_start_page(world, &provider).await;
@@ -318,42 +307,75 @@ async fn caller_confirms_consent_start_page(
 
 /// Confirm the consent start page, sign `person` in at the identity provider and
 /// keep where it sends the browser back to, with the binding cookie.
-#[given(expr = "caller {string} has signed in at the identity provider as {string}")]
+#[given(expr = "the caller has signed in at the identity provider as {string}")]
 async fn caller_has_signed_in_at_identity_provider(
     world: &mut SurfaceWorld,
-    _caller: String,
     person: String,
 ) {
     let provider = delegated_provider(world);
-    let started = post_consent_start_page(world, &provider).await;
-    assert_eq!(started.status().as_u16(), 302, "the consent start POST sends the browser to the identity provider");
+    let started = redirected(
+        post_consent_start_page(world, &provider).await,
+        "the consent start POST sends the browser to the identity provider",
+    );
     let cookie = consent_binding_cookie(started.headers());
     let sign_in = redirect_location(started.headers());
     let identity_provider = identity_provider(world);
     identity_provider
         .sign_in(&person)
         .await;
-    let signed_in = no_redirect_client()
-        .get(
-            identity_provider
-                .local_url(&sign_in)
-                .expect("the consent start POST sends the browser to the identity provider"),
-        )
-        .send()
-        .await
-        .expect("sign in at the identity provider");
-    assert_eq!(signed_in.status().as_u16(), 302, "the identity provider sends the browser back to the gateway");
+    let signed_in = redirected(
+        no_redirect_client()
+            .get(
+                identity_provider
+                    .local_url(&sign_in)
+                    .expect("the consent start POST sends the browser to the identity provider"),
+            )
+            .send()
+            .await
+            .expect("sign in at the identity provider"),
+        "the identity provider sends the browser back to the gateway",
+    );
     world.consent_confirmation_callback = Some(redirect_location(signed_in.headers()).to_string());
     world.oauth_binding_cookie = Some(cookie);
 }
 
 #[when("the identity provider sends the caller back to the gateway")]
 async fn identity_provider_sends_caller_back(world: &mut SurfaceWorld) {
-    ensure_gateway_running(world).await;
     let callback = world
         .consent_confirmation_callback
         .clone()
         .expect("the caller signed in at the identity provider first");
+    send_to_confirmation_callback(world, callback).await;
+}
+
+/// The identity provider answers the sign-in with `error` instead of a code,
+/// as RFC 6749 has it, keeping the sign-in's `state`.
+#[when(expr = "the identity provider sends the caller back to the gateway with error {string}")]
+async fn identity_provider_sends_caller_back_with_error(
+    world: &mut SurfaceWorld,
+    error: String,
+) {
+    let mut callback = url::Url::parse(
+        world
+            .consent_confirmation_callback
+            .as_deref()
+            .expect("the caller signed in at the identity provider first"),
+    )
+    .expect("the identity provider sends the browser back to a URL");
+    let state = query_value(&callback, "state");
+    callback
+        .query_pairs_mut()
+        .clear()
+        .append_pair("error", &error)
+        .append_pair("state", &state);
+    send_to_confirmation_callback(world, callback.to_string()).await;
+}
+
+async fn send_to_confirmation_callback(
+    world: &mut SurfaceWorld,
+    callback: String,
+) {
+    ensure_gateway_running(world).await;
     let mut request = no_redirect_client().get(callback);
     if let Some(cookie) = &world.oauth_binding_cookie {
         request = request.header("cookie", cookie);
@@ -386,11 +408,11 @@ async fn oauth_provider_has_sent_caller_back_with_valid_code(
         .oauth_binding_cookie
         .clone();
     send_oauth_callback_and_record(world, &provider, &valid_code_query(&state, &[]), cookie.as_deref()).await;
-    let status = world
+    world
         .caller_response
         .as_ref()
-        .map(|response| response.status);
-    assert_eq!(status, Some(200), "the OAuth callback stores the delegated credentials");
+        .filter(|response| response.status == 200)
+        .expect("the OAuth callback stores the delegated credentials");
 }
 
 #[then("the consent start response sends the browser to the identity provider")]

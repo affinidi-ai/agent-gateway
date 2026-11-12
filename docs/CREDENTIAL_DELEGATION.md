@@ -2095,7 +2095,8 @@ refused instead:
    reads "Sign in, then continue to {provider}".
 2. The start POST checks the setting again. The setting must still name the sealed strategy,
    the strategy must exist with the provider's tenant able to reference it, and its issuer,
-   JWKS source and principal claim must be unchanged. The `authorization_endpoint` must pass
+   JWKS source and principal claim must be unchanged, and the setting must still pass the save
+   rules for the strategy and claims, as at `/confirm`. The `authorization_endpoint` must pass
    the save rules, without its host being resolved. The login client ID is read from
    `client_id_secret_ref` as the provider's other
    [secrets](#provider-secrets-belong-to-the-providers-tenant) are read; a secret that
@@ -2231,7 +2232,10 @@ which request it completes.
 provider nor anyone else who sees a URL can read it (the PKCE code verifier included) or forge
 one naming a different agent or user. When encryption at rest is enabled, its key seals the
 state; otherwise a key derived from `AG_IDENTITY_HASH_PEPPER` does, so gateways that share the
-pepper can open each other's states
+pepper can open each other's states. A state with a consent stage (the confirm start, the
+confirmation and the confirmed vendor state of [consent confirmation](#consent-confirmation)) is
+always sealed under its own label with a key derived from `AG_IDENTITY_HASH_PEPPER`, whether or
+not encryption at rest is enabled
 ([`encode_oauth_state`, `decode_start_state`, `decode_confirmation_state`, `decode_callback_state`, `claim_oauth_state`](../src/delegation_vault/oauth.rs)).
 
 The code exchange, the legacy and `2026-07-28` refresh, and the `2026-07-28` consent exchange

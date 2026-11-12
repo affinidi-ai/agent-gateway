@@ -198,14 +198,12 @@ pub struct OAuthState {
 }
 
 /// The step of a consent flow a sealed [`OAuthState`] is good for. Every
-/// stage but `Start` carries the binding the caller is confirmed against, so a
-/// state can carry one only under the confirm seal.
+/// stage carries the binding the caller is confirmed against, so a state can
+/// carry one only under the confirm seal; a start state that confirms no
+/// caller has no stage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentStage {
-    /// The consent start page and its POST. Never sealed: a start state that
-    /// confirms no caller has no stage.
-    Start,
     /// The consent start page and its POST, for a caller confirmed at their
     /// identity provider before the vendor.
     ConfirmStart(ConsentConfirmBinding),
@@ -613,7 +611,10 @@ mod tests {
             serde_json::from_value::<OAuthState>(extra).is_err(),
             "a confirm binding with a field it does not have is refused"
         );
-        assert_eq!(serde_json::to_value(ConsentStage::Start).unwrap(), "start");
+        assert!(
+            serde_json::from_value::<ConsentStage>(serde_json::json!("start")).is_err(),
+            "a start state that confirms no caller has no stage"
+        );
 
         let issued_at = Utc::now();
         let confirmation = serde_json::to_value(ConsentStage::Confirmation(ConfirmationSignIn {

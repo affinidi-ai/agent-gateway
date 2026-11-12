@@ -387,7 +387,6 @@ enum StageKind {
 impl From<&ConsentStage> for StageKind {
     fn from(stage: &ConsentStage) -> Self {
         match stage {
-            ConsentStage::Start => Self::Start,
             ConsentStage::ConfirmStart(_) => Self::ConfirmStart,
             ConsentStage::Confirmation(_) => Self::Confirmation,
             ConsentStage::Vendor(_) => Self::Vendor,
@@ -2164,7 +2163,6 @@ mod tests {
             ("binding only", encode_oauth_state(&binding_only).unwrap()),
         ];
         for stage in [
-            ConsentStage::Start,
             ConsentStage::ConfirmStart(confirm_binding()),
             ConsentStage::Confirmation(sign_in()),
             ConsentStage::Vendor(confirm_binding()),
@@ -2332,8 +2330,6 @@ mod tests {
             ..sample_state()
         };
         for (stage, shape) in [
-            (ConsentStage::Start, &start),
-            (ConsentStage::Start, &callback),
             (ConsentStage::ConfirmStart(confirm_binding()), &callback),
             (ConsentStage::Confirmation(sign_in()), &start),
             (ConsentStage::Vendor(confirm_binding()), &start),

@@ -16,6 +16,7 @@ use crate::credential_providers::{
     ConfirmationClaims, ConfirmationStrategyRefusal, ConsentConfirmation, CredentialProvider,
 };
 use crate::jwt_bearer::JwtVerificationStrategyStorage;
+use crate::jwt_bearer::models::JwtVerificationStrategy;
 use crate::secrets::SecretsStore;
 use crate::source_auth::AuthenticatedIdentity;
 
@@ -238,24 +239,46 @@ pub(crate) struct SignIn {
 
 /// The sign-in a confirm start state sealed with `binding` leads to, checked
 /// again at the start POST: the provider still has `consent_confirmation`, it
-/// names the sealed strategy, the provider's tenant can still reference that
-/// strategy, its verification digest is the sealed one, the authorization
-/// endpoint passes the save rules without its host being resolved, and the
-/// login client ID can be read from the provider's tenant. A start POST that
-/// fails one is refused, never sent to the vendor.
+/// names the sealed strategy, that strategy is still the sealed one
+/// ([`sealed_strategy`]), the authorization endpoint passes the save rules
+/// without its host being resolved, and the login client ID can be read from
+/// the provider's tenant. A start POST that fails one is refused, never sent
+/// to the vendor.
 pub(crate) async fn sign_in(
     provider: &CredentialProvider,
     binding: &ConsentConfirmBinding,
     strategies: &dyn JwtVerificationStrategyStorage,
+    gateway_issuer: Option<&str>,
     secrets_store: &Arc<dyn SecretsStore>,
     gateway_base_url: &str,
 ) -> Result<SignIn, DelegationFailureReason> {
-    let confirmation = provider
-        .consent_confirmation
-        .as_ref()
-        .filter(|confirmation| confirmation.jwt_verification_strategy_id == binding.strategy_id)
-        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
-    let strategy = strategies
+    let confirmation = confirmation_for(provider, binding).ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let strategy = sealed_strategy(provider, binding, strategies).await?;
+    let claims = confirmation
+        .claims_through(&strategy, gateway_issuer)
+        .map_err(|_| DelegationFailureReason::ConsentStateInvalid)?;
+    let authorization_endpoint = confirmation
+        .authorization_endpoint_url_unresolved()
+        .map_err(|_| DelegationFailureReason::AuthorizationUrlInvalid)?;
+    let redirect_uri = url::Url::parse(&provider.consent_confirmation_redirect_uri(gateway_base_url))
+        .map_err(|_| DelegationFailureReason::RedirectUriInvalid)?;
+    let client_id = login_client_id(provider, confirmation, secrets_store).await?;
+    Ok(SignIn {
+        authorization_endpoint,
+        client_id,
+        redirect_uri,
+        scope: sign_in_scope(claims.id_token_claim),
+    })
+}
+
+/// The strategy `binding` was sealed with, reloaded: the provider's tenant
+/// can still reference it and its verification digest is the sealed one.
+async fn sealed_strategy(
+    provider: &CredentialProvider,
+    binding: &ConsentConfirmBinding,
+    strategies: &dyn JwtVerificationStrategyStorage,
+) -> Result<JwtVerificationStrategy, DelegationFailureReason> {
+    strategies
         .get(&binding.strategy_id)
         .await
         .map_err(|_| DelegationFailureReason::CredentialsUnavailable)?
@@ -270,27 +293,7 @@ pub(crate) async fn sign_in(
                             .as_str(),
                     )
         })
-        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
-    let strategy_claim = strategy
-        .principal_claim_name()
-        .map_err(|_| DelegationFailureReason::ConsentStateInvalid)?;
-    let authorization_endpoint = confirmation
-        .authorization_endpoint_url_unresolved()
-        .map_err(|_| DelegationFailureReason::AuthorizationUrlInvalid)?;
-    let redirect_uri = url::Url::parse(&provider.consent_confirmation_redirect_uri(gateway_base_url))
-        .map_err(|_| DelegationFailureReason::RedirectUriInvalid)?;
-    let client_id = login_client_id(provider, confirmation, secrets_store).await?;
-    Ok(SignIn {
-        authorization_endpoint,
-        client_id,
-        redirect_uri,
-        scope: sign_in_scope(
-            confirmation
-                .id_token_principal_claim
-                .as_deref()
-                .unwrap_or(strategy_claim),
-        ),
-    })
+        .ok_or(DelegationFailureReason::ConsentStateInvalid)
 }
 
 /// The login client ID, read from the secrets store in the provider's tenant
@@ -337,9 +340,8 @@ pub(crate) fn confirmation_for<'a>(
 }
 
 /// Confirm the caller a confirmation state `sealed` was minted for, from the
-/// identity provider's `code` and `iss`. The sealed strategy is reloaded and
-/// must be one the provider's tenant can reference, with the sealed digest,
-/// that the save rules still accept
+/// identity provider's `code` and `iss`. The sealed strategy is reloaded
+/// ([`sealed_strategy`]) and must be one the save rules still accept
 /// ([`ConsentConfirmation::claims_through`]). The code is exchanged at the
 /// login client's token endpoint with PKCE, and the ID token is verified by
 /// that strategy for the login client, with the sealed nonce and issued no
@@ -356,23 +358,14 @@ pub(crate) async fn confirm_caller(
     iss: Option<&str>,
 ) -> Result<(), DelegationFailureReason> {
     let binding = &sign_in.binding;
-    let strategy = vault
-        .identity_strategies
-        .get(&binding.strategy_id)
-        .await
-        .map_err(|_| DelegationFailureReason::CredentialsUnavailable)?
-        .filter(|strategy| {
-            crate::tenancy::can_reference(provider.tenant_id.as_deref(), strategy.tenant_id.as_deref())
-                && strategy
-                    .verification_digest()
-                    .as_deref()
-                    == Some(
-                        binding
-                            .strategy_digest
-                            .as_str(),
-                    )
-        })
-        .ok_or(DelegationFailureReason::ConsentStateInvalid)?;
+    let strategy = sealed_strategy(
+        provider,
+        binding,
+        vault
+            .identity_strategies
+            .as_ref(),
+    )
+    .await?;
     let claims = confirmation
         .claims_through(
             &strategy,

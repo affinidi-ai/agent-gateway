@@ -14,7 +14,7 @@ Feature: Consent confirmation through a Transit Point
 
   Scenario: A JWT caller's consent start through a Transit Point goes straight to the OAuth provider
     Given OAuth provider "calendar" confirms its caller at the identity provider
-    And managed agent "example-agent" has started OAuth consent for provider "calendar" through Transit Point "alpha" for JWT caller "alice"
-    When caller "alice" confirms the consent start page for provider "calendar"
+    And managed agent "example-agent" has started OAuth consent through Transit Point "alpha" for JWT caller "alice"
+    When the caller confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to OAuth provider "calendar"

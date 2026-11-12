@@ -68,6 +68,8 @@ pub struct SurfaceConfigBuilder {
     pub consent_confirmation: bool,
     /// That provider refuses a consent link to a caller it cannot confirm.
     pub consent_confirmation_required: bool,
+    /// The gateway runs without an identity hash pepper, even with the callers' identity provider.
+    pub identity_hash_pepper_unset: bool,
     pub mcp_identity_payload_schema: Option<serde_json::Value>,
     pub required_mcp_identity_field: Option<String>,
     pub constrained_mcp_identity_field: Option<String>,
@@ -250,6 +252,7 @@ impl Default for SurfaceConfigBuilder {
             identity_provider_endpoints: None,
             consent_confirmation: false,
             consent_confirmation_required: false,
+            identity_hash_pepper_unset: false,
             mcp_identity_payload_schema: None,
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,

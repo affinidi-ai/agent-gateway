@@ -13,7 +13,7 @@ Feature: Consent confirmation
   Scenario: A JWT caller's consent start sends the browser to the identity provider before the OAuth provider
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
-    When caller "alice" confirms the consent start page for provider "calendar"
+    When the caller confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to the identity provider
     And the consent start response asks the identity provider to send the browser back to the consent confirmation callback
@@ -21,7 +21,7 @@ Feature: Consent confirmation
   Scenario: A caller who signs in at the identity provider as themselves is sent on to the OAuth provider
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
-    And caller "alice" has signed in at the identity provider as "alice"
+    And the caller has signed in at the identity provider as "alice"
     When the identity provider sends the caller back to the gateway
     Then the OAuth callback response status is 302
     And the OAuth callback response sends the browser to OAuth provider "calendar"
@@ -29,7 +29,7 @@ Feature: Consent confirmation
   Scenario: Delegated credentials obtained after consent confirmation are injected into the MCP server request
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
-    And caller "alice" has signed in at the identity provider as "alice"
+    And the caller has signed in at the identity provider as "alice"
     And the identity provider has sent the caller back to the gateway
     And OAuth provider "calendar" has sent the caller back with a valid authorization code
     When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
@@ -40,7 +40,7 @@ Feature: Consent confirmation
   Scenario: Another person who signs in at the identity provider is refused before the OAuth provider
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
-    And caller "alice" has signed in at the identity provider as "bob"
+    And the caller has signed in at the identity provider as "bob"
     When the identity provider sends the caller back to the gateway
     Then the OAuth callback response status is 403
     And the OAuth callback response shows an authorization failure page
@@ -53,17 +53,27 @@ Feature: Consent confirmation
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
     And the identity provider issues ID tokens without the nonce of the sign-in
-    And caller "alice" has signed in at the identity provider as "alice"
+    And the caller has signed in at the identity provider as "alice"
     When the identity provider sends the caller back to the gateway
     Then the OAuth callback response status is 403
     And the OAuth callback response shows an authorization failure page
     And OAuth provider "calendar" was not asked to exchange an authorization code
     And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "consent_identity_missing"
 
+  Scenario: An identity provider error at the sign-in ends the consent as denied
+    Given OAuth provider "calendar" confirms its caller at the identity provider
+    And caller "alice" has started OAuth consent for provider "calendar"
+    And the caller has signed in at the identity provider as "alice"
+    When the identity provider sends the caller back to the gateway with error "access_denied"
+    Then the OAuth callback response status is 400
+    And the OAuth callback response shows an authorization failure page
+    And OAuth provider "calendar" was not asked to exchange an authorization code
+    And the delegation audit trail records a refused consent for OAuth provider "calendar" with reason "consent_denied"
+
   Scenario: A sign-in whose surface was deleted meanwhile is refused before the OAuth provider
     Given OAuth provider "calendar" confirms its caller at the identity provider
     And caller "alice" has started OAuth consent for provider "calendar"
-    And caller "alice" has signed in at the identity provider as "alice"
+    And the caller has signed in at the identity provider as "alice"
     And the operator has deleted the surface the consent link was minted on
     When the identity provider sends the caller back to the gateway
     Then the OAuth callback response status is 400
@@ -88,22 +98,22 @@ Feature: Consent confirmation
   Scenario: A JWT caller's consent start goes straight to the OAuth provider without consent confirmation
     Given the callers' identity provider is available
     And caller "alice" has started OAuth consent for provider "calendar"
-    When caller "alice" confirms the consent start page for provider "calendar"
+    When the caller confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to OAuth provider "calendar"
 
   Scenario: An API key caller's consent start goes straight to the OAuth provider with consent confirmation
     Given the surface accepts "JWT Bearer" and "API Key" source authentication
     And OAuth provider "calendar" confirms its caller at the identity provider
-    And caller "alice" has started OAuth consent for provider "calendar" with a valid API key
-    When caller "alice" confirms the consent start page for provider "calendar"
+    And an API key caller has started OAuth consent
+    When the caller confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to OAuth provider "calendar"
 
   Scenario: An API key caller gets no consent link from a provider that requires consent confirmation
     Given the surface accepts "JWT Bearer" and "API Key" source authentication
     And OAuth provider "calendar" refuses a consent link to a caller it cannot confirm
-    When caller "alice" invokes MCP tool "schedule_meeting" with a valid API key
+    When an API key caller invokes MCP tool "schedule_meeting"
     Then the response status is 503
     And the MCP response is a JSON-RPC error with code -32603
     And MCP server "bravo" was not called
@@ -111,9 +121,26 @@ Feature: Consent confirmation
   Scenario: A JWT caller's consent start is still confirmed by a provider that requires consent confirmation
     Given OAuth provider "calendar" refuses a consent link to a caller it cannot confirm
     And caller "alice" has started OAuth consent for provider "calendar"
-    When caller "alice" confirms the consent start page for provider "calendar"
+    When the caller confirms the consent start page for provider "calendar"
     Then the consent start response status is 302
     And the consent start response sends the browser to the identity provider
+
+  Scenario: A JWT caller gets no consent link while consent confirmation confirms no caller
+    Given OAuth provider "calendar" confirms its caller at the identity provider
+    And the gateway runs without an identity hash pepper
+    When caller "alice" invokes MCP tool "schedule_meeting" with a valid token
+    Then the response status is 503
+    And the MCP response is a JSON-RPC error with code -32603
+    And MCP server "bravo" was not called
+
+  Scenario: An API key caller's consent start goes straight to the OAuth provider while consent confirmation confirms no caller
+    Given the surface accepts "JWT Bearer" and "API Key" source authentication
+    And OAuth provider "calendar" confirms its caller at the identity provider
+    And the gateway runs without an identity hash pepper
+    And an API key caller has started OAuth consent
+    When the caller confirms the consent start page for provider "calendar"
+    Then the consent start response status is 302
+    And the consent start response sends the browser to OAuth provider "calendar"
 
   Scenario: Consent confirmation cannot be saved while the identity hash pepper is unset
     When the operator creates the authorization code provider "mail" with consent confirmation

@@ -1018,7 +1018,6 @@ mod tests {
             (None, None, "openid"),
             (None, Some("sub"), "openid"),
             (Some("oid"), None, "openid profile"),
-            (Some("preferred_username"), None, "openid profile"),
             (None, Some("oid"), "openid profile"),
             (Some("oid"), Some("sub"), "openid"),
         ] {
@@ -1061,8 +1060,9 @@ mod tests {
 
     /// A start state that confirms its caller is refused, audited and left
     /// unused, never sent to the vendor, while its provider no longer confirms
-    /// through the sealed strategy, no longer uses legacy consent or has an
-    /// authorization endpoint the save rules refuse; once the provider is
+    /// through the sealed strategy, names the caller by a claim the save rules
+    /// refuse, no longer uses legacy consent or has an authorization endpoint
+    /// the save rules refuse; once the provider is
     /// restored the same state goes to the identity provider.
     #[tokio::test]
     async fn a_confirm_start_the_provider_no_longer_confirms_is_refused_and_left_unused() {
@@ -1105,6 +1105,17 @@ mod tests {
                         .as_mut()
                         .unwrap()
                         .jwt_verification_strategy_id = other.id.clone()
+                }),
+                DelegationFailureReason::ConsentStateInvalid,
+            ),
+            (
+                "ID-token claim the save rules refuse",
+                changed(&|provider| {
+                    provider
+                        .consent_confirmation
+                        .as_mut()
+                        .unwrap()
+                        .id_token_principal_claim = Some("email".to_string())
                 }),
                 DelegationFailureReason::ConsentStateInvalid,
             ),
@@ -2634,6 +2645,45 @@ mod tests {
         assert_eq!(fixture.idp_forms().len(), 1);
     }
 
+    /// A login token endpoint that refuses the code exchange is refused with
+    /// 400 after the confirmation state is claimed: the state is used up, the
+    /// cookie cleared and nothing stored.
+    #[tokio::test]
+    async fn a_refused_identity_provider_code_exchange_uses_up_the_confirmation() {
+        let fixture = consent::Fixture::new().await;
+        let strategy = fixture
+            .confirming_at_idp(None, None)
+            .await;
+        let sign_in = fixture
+            .sign_in(&strategy, &consent::caller_hash("sub", "alice"))
+            .await;
+        fixture
+            .refuse_idp_token_exchange()
+            .await;
+        let (results, events) = capture(async {
+            vec![
+                fixture
+                    .confirm_code(&sign_in)
+                    .await,
+                fixture
+                    .confirm_code(&sign_in)
+                    .await,
+            ]
+        })
+        .await;
+        for refused in &results {
+            consent::assert_refused(refused, StatusCode::BAD_REQUEST, Some(&consent::cookie_name(&sign_in.cookie)));
+        }
+        assert_eq!(
+            consent::reasons(&events),
+            [DelegationFailureReason::TokenExchangeFailed, DelegationFailureReason::ConsentStateReused]
+        );
+        let sealed = crate::delegation_vault::oauth::decode_confirmation_state(&sign_in.state).unwrap();
+        assert!(crate::delegation_vault::oauth::is_claimed(&sealed).await, "the refused exchange used up the state");
+        assert_eq!(fixture.token_calls(), 0, "the vendor is never reached");
+        assert_eq!(fixture.vault_records(), 0);
+    }
+
     /// An identity provider error ends the consent as denied: audited, the
     /// cookie cleared and no code exchanged.
     #[tokio::test]
@@ -2992,6 +3042,12 @@ mod tests {
                         }),
                     )
                     .route(
+                        "/idp-token-refused",
+                        post(|| async {
+                            (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
+                        }),
+                    )
+                    .route(
                         "/token-refused",
                         post(|| async {
                             (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({"error": "invalid_grant"})))
@@ -3089,7 +3145,9 @@ mod tests {
                     forms,
                     egress: crate::delegation_vault::oauth::TokenEgress {
                         timeout: std::time::Duration::from_secs(5),
-                        exact_allowlist: Some(format!("{token_endpoint},{idp_token_endpoint}")),
+                        exact_allowlist: Some(format!(
+                            "{token_endpoint},{idp_token_endpoint},{idp_token_endpoint}-refused"
+                        )),
                         policy: Default::default(),
                     },
                     token_endpoint,
@@ -3360,6 +3418,26 @@ mod tests {
                     .unwrap_or_default();
                 self.get(&format!("/v1/identity/oauth/callback/github/confirm?{query}"), &headers)
                     .await
+            }
+
+            /// Point the provider's login token endpoint at one that refuses
+            /// every code exchange with `400 invalid_grant`.
+            pub async fn refuse_idp_token_exchange(&self) {
+                let mut provider = self
+                    .providers
+                    .get(PROVIDER_ID)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                provider
+                    .consent_confirmation
+                    .as_mut()
+                    .unwrap()
+                    .token_endpoint = format!("{}-refused", self.idp_token_endpoint);
+                self.providers
+                    .update(provider)
+                    .await
+                    .unwrap();
             }
 
             /// [`Self::confirm`] with `code` and the sign-in's own state and

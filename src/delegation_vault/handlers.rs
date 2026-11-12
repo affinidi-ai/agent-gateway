@@ -874,6 +874,9 @@ async fn begin_confirmation(
         state
             .identity_strategies
             .as_ref(),
+        state
+            .gateway_mcp_issuer
+            .as_deref(),
         &state.secrets_store,
         &state.gateway_base_url,
     )

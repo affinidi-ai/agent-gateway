@@ -441,7 +441,11 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
     if world.terms_enabled {
         gateway_env.insert("AFFINIDI_TERMS_REFRESH_INTERVAL_SECONDS".to_string(), "1".to_string());
     }
-    if identity_provider.is_some() {
+    if identity_provider.is_some()
+        && !world
+            .surface_config
+            .identity_hash_pepper_unset
+    {
         gateway_env.insert("AG_IDENTITY_HASH_PEPPER".to_string(), IDENTITY_HASH_PEPPER.to_string());
     }
     // A credentialed MCP proxy tool call vets its REST backend like any stored
