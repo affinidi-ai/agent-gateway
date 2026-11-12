@@ -378,6 +378,14 @@ async fn start_gateway_if_needed(world: &mut SurfaceWorld) {
         );
     }
 
+    if world.gateway_did_without_assertion_multikey {
+        crate::steps::gateway_did::seed_gateway_did_without_assertion_multikey(
+            &temp_dir
+                .path()
+                .join("_storage/vc_keys"),
+        );
+    }
+
     if world.affinidi_cache_seeded {
         let cache_dir = temp_dir
             .path()

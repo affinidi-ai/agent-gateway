@@ -29,7 +29,7 @@ fn extract_domain_from_proxy_did(proxy_did: &str) -> String {
 }
 
 /// The public JWK of a DIDComm key-agreement secret, without its private `d` parameter.
-fn public_key_agreement_jwk(
+pub(crate) fn public_key_agreement_jwk(
     secret: &affinidi_tdk_common::secrets_resolver::secrets::Secret,
     label: &str,
 ) -> Result<serde_json::Value> {
@@ -43,10 +43,44 @@ fn public_key_agreement_jwk(
     Ok(public_jwk)
 }
 
+/// Adds `multikey_id` to the document's `assertionMethod`; returns false when it is already
+/// listed. Refuses a document that does not publish `multikey_id` as the Multikey of
+/// `signing_key`, so only the gateway's own signing key is ever authorized.
+fn add_signing_key_to_assertion_method(
+    document: &mut serde_json::Value,
+    multikey_id: &str,
+    signing_key: &JWK,
+) -> Result<bool> {
+    let expected_key = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(signing_key)?;
+    let published = document["verificationMethod"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|method| method["id"] == multikey_id)
+        .with_context(|| format!("DID document does not publish {multikey_id}"))?;
+    anyhow::ensure!(
+        published["type"] == "Multikey" && published["publicKeyMultibase"] == expected_key.as_str(),
+        "DID document publishes a key other than the gateway signing key as {multikey_id}"
+    );
+
+    let assertion_method = document
+        .get_mut("assertionMethod")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("DID document has no assertionMethod")?;
+    if assertion_method
+        .iter()
+        .any(|id| *id == multikey_id)
+    {
+        return Ok(false);
+    }
+    assertion_method.push(json!(multikey_id));
+    Ok(true)
+}
+
 /// The gateway's DID document. The Ed25519 signing key is published twice: as `#key-1`
 /// (JsonWebKey2020) and as the Multikey the `eddsa-rdfc-2022` signer references. Both are
 /// listed under `assertionMethod`, so verifiers accept the credentials the gateway signs.
-fn gateway_did_document(
+pub(crate) fn gateway_did_document(
     proxy_did: &str,
     signing_key: &JWK,
     x25519_key_id: &str,
@@ -465,6 +499,110 @@ impl VCIssuer {
                 p256_public_jwk,
             )
         }
+    }
+
+    /// Lists the signing Multikey under `assertionMethod` in the gateway's published DID
+    /// document when it is missing, as in documents written before the Multikey was listed. A
+    /// `did:webvh` DID gets a new log version signed with the gateway key, so the DID does not
+    /// change; a `did:web` DID gets its `did.json` rewritten. Returns whether the document changed.
+    pub async fn authorize_signing_key_for_assertions(&self) -> Result<bool> {
+        let config = self.config.read().await;
+        let multikey_id = format!("{}#{}", config.proxy_did, DEFAULT_SIGNING_KEY_ID);
+
+        if config
+            .proxy_did
+            .starts_with("did:webvh:")
+        {
+            #[cfg(feature = "didwebvh")]
+            return Self::append_assertion_method_version(&config, &multikey_id).await;
+            #[cfg(not(feature = "didwebvh"))]
+            return Ok(false);
+        }
+
+        let Some(content) = crate::storage::did_artifacts::read_did_document(&config.storage_path).await? else {
+            return Ok(false);
+        };
+        let mut document: serde_json::Value = serde_json::from_str(&content)?;
+        if !add_signing_key_to_assertion_method(&mut document, &multikey_id, &config.signing_key)? {
+            return Ok(false);
+        }
+        crate::storage::did_artifacts::write_did_document(
+            &config.storage_path,
+            &serde_json::to_string_pretty(&document)?,
+        )
+        .await?;
+        info!("Gateway DID {} now lists its signing key under assertionMethod", config.proxy_did);
+        Ok(true)
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn append_assertion_method_version(
+        config: &VCIssuerConfig,
+        multikey_id: &str,
+    ) -> Result<bool> {
+        use crate::identity::didwebvh::handlers::{build_signing_secret, build_webvh_state};
+        use crate::storage::did_artifacts::{append_did_log_raw, read_did_log_raw, write_did_document};
+
+        let Some(log) = read_did_log_raw(&config.storage_path).await? else {
+            return Ok(false);
+        };
+        let entries: Vec<String> = log
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        let latest: serde_json::Value = serde_json::from_str(
+            entries
+                .last()
+                .context("Gateway DID log has no entries")?,
+        )?;
+        let mut document = latest
+            .get("state")
+            .cloned()
+            .context("Gateway DID log entry has no state")?;
+        if !add_signing_key_to_assertion_method(&mut document, multikey_id, &config.signing_key)? {
+            return Ok(false);
+        }
+
+        // A version's versionTime, in whole seconds, must be later than the previous one's,
+        // which a log published earlier in the same startup can share.
+        let previous_time = chrono::DateTime::parse_from_rfc3339(
+            latest["versionTime"]
+                .as_str()
+                .context("Gateway DID log entry has no versionTime")?,
+        )?;
+        let wait = (previous_time + chrono::Duration::seconds(1)).signed_duration_since(chrono::Utc::now());
+        if let Ok(wait) = wait.to_std() {
+            tokio::time::sleep(wait).await;
+        }
+
+        let state = build_webvh_state(&config.proxy_did, &entries)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let signing_key =
+            build_signing_secret(&serde_json::to_value(&config.signing_key)?).map_err(|e| anyhow::anyhow!(e))?;
+        let update = didwebvh_rs::prelude::update_did(
+            didwebvh_rs::prelude::UpdateDIDConfig::builder()
+                .state(state)
+                .signing_key(signing_key)
+                .document(document)
+                .build()?,
+        )
+        .await?;
+        let entry_json = serde_json::to_string(update.log_entry())?;
+        append_did_log_raw(&config.storage_path, &log, &entry_json).await?;
+
+        let entry: serde_json::Value = serde_json::from_str(&entry_json)?;
+        let scid = crate::identity::didwebvh::identifier::parse_did_webvh(&config.proxy_did)?
+            .scid
+            .context("Gateway DID has no SCID")?;
+        let parallel_doc =
+            crate::identity::didwebvh::generate_parallel_did_web(&entry["state"], &config.proxy_did, &scid);
+        write_did_document(&config.storage_path, &serde_json::to_string_pretty(&parallel_doc)?).await?;
+
+        info!("Gateway DID {} now lists its signing key under assertionMethod", config.proxy_did);
+        Ok(true)
     }
 
     /// Migrate the gateway `proxy_did` from `did:web:` to `did:webvh:` on first boot after upgrade.
@@ -1975,6 +2113,222 @@ mod tests {
         let err = public_key_agreement_jwk(&secret, "X25519").unwrap_err();
 
         assert_eq!(err.to_string(), "X25519 secret is not a JWK");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn did_log_entries(issuer: &VCIssuer) -> Vec<serde_json::Value> {
+        crate::storage::did_artifacts::read_did_log_raw(
+            &issuer
+                .get_storage_path()
+                .await,
+        )
+        .await
+        .unwrap()
+        .expect("the gateway must publish a did.jsonl log")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+    }
+
+    /// A gateway that published its DID log without the signing Multikey under
+    /// assertionMethod gets one new, verifiable version that lists it, under the same DID, and
+    /// nothing else in the document changes.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_appends_a_version_that_authorizes_the_signing_key() {
+        let (issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let before = did_log_entries(&issuer).await;
+        assert_eq!(before.len(), 1);
+        assert_eq!(key_ids(&before[0]["state"], "assertionMethod"), vec![format!("{did}#key-1")]);
+
+        let repaired = issuer
+            .authorize_signing_key_for_assertions()
+            .await
+            .unwrap();
+
+        assert!(repaired, "the repair must report that it changed the document");
+        let after = did_log_entries(&issuer).await;
+        assert_eq!(after.len(), 2, "the repair appends exactly one version");
+        assert_eq!(after[0], before[0], "the published first version must not change");
+        assert_eq!(
+            issuer
+                .get_issuer_did()
+                .await
+                .unwrap(),
+            did,
+            "the gateway DID must not change"
+        );
+        assert_eq!(after[1]["state"]["id"], did.as_str());
+        assert_signing_key_authorized_for_assertions(&after[1]["state"], &did);
+
+        let mut unchanged = after[1]["state"].clone();
+        unchanged["assertionMethod"] = before[0]["state"]["assertionMethod"].clone();
+        assert_eq!(unchanged, before[0]["state"], "only assertionMethod may change");
+
+        let dir = issuer
+            .get_storage_path()
+            .await;
+        let log = crate::storage::did_artifacts::read_did_log_raw(&dir)
+            .await
+            .unwrap()
+            .unwrap();
+        let raw_entries: Vec<String> = log
+            .lines()
+            .map(str::to_string)
+            .collect();
+        crate::identity::didwebvh::handlers::build_webvh_state(&did, &raw_entries)
+            .await
+            .expect("the repaired log must verify as a did:webvh log");
+
+        let did_json: serde_json::Value = serde_json::from_str(
+            &crate::storage::did_artifacts::read_did_document(&dir)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            key_ids(&did_json, "assertionMethod")
+                .iter()
+                .any(|id| id.ends_with(&format!("#{DEFAULT_SIGNING_KEY_ID}"))),
+            "the stored did.json must list the signing key under assertionMethod: {did_json}"
+        );
+    }
+
+    /// A repaired gateway is not repaired again, so restarts never add more versions.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_runs_once() {
+        let (issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        assert!(
+            issuer
+                .authorize_signing_key_for_assertions()
+                .await
+                .unwrap()
+        );
+
+        let repaired_again = issuer
+            .authorize_signing_key_for_assertions()
+            .await
+            .unwrap();
+
+        assert!(!repaired_again);
+        assert_eq!(
+            did_log_entries(&issuer)
+                .await
+                .len(),
+            2
+        );
+    }
+
+    /// A gateway whose document already lists the signing key keeps its log as it is.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_leaves_a_correct_document_unchanged() {
+        let (issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer().await;
+        let before = did_log_entries(&issuer).await;
+
+        let repaired = issuer
+            .authorize_signing_key_for_assertions()
+            .await
+            .unwrap();
+
+        assert!(!repaired);
+        assert_eq!(did_log_entries(&issuer).await, before);
+    }
+
+    /// A log that does not verify is reported and left as it is.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn repair_refuses_a_log_that_does_not_verify() {
+        let (issuer, _temp_dir) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let dir = issuer
+            .get_storage_path()
+            .await;
+        let mut entry = did_log_entries(&issuer).await[0].clone();
+        entry["state"]["service"] = json!([]);
+        let tampered = entry.to_string();
+        crate::storage::did_artifacts::write_did_log_raw(&dir, &tampered)
+            .await
+            .unwrap();
+
+        assert!(
+            issuer
+                .authorize_signing_key_for_assertions()
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::storage::did_artifacts::read_did_log_raw(&dir)
+                .await
+                .unwrap()
+                .unwrap(),
+            format!("{tampered}\n")
+        );
+    }
+
+    #[test]
+    fn signing_key_is_added_to_assertion_method_once() {
+        let key = crate::identity::test_helpers::test_signing_key();
+        let did = "did:web:example.com";
+        let multikey_id = format!("{did}#{DEFAULT_SIGNING_KEY_ID}");
+        let mut document = gateway_did_document(did, &key, "x", json!({}), "p", json!({})).unwrap();
+        document["assertionMethod"] = json!([format!("{did}#key-1")]);
+
+        assert!(add_signing_key_to_assertion_method(&mut document, &multikey_id, &key).unwrap());
+        assert!(!add_signing_key_to_assertion_method(&mut document, &multikey_id, &key).unwrap());
+
+        assert_eq!(key_ids(&document, "assertionMethod"), vec![format!("{did}#key-1"), multikey_id]);
+    }
+
+    /// Only the gateway's own signing key is ever authorized, never a key published under its id.
+    #[test]
+    fn signing_key_is_not_authorized_when_the_document_publishes_another_key() {
+        let did = "did:web:example.com";
+        let multikey_id = format!("{did}#{DEFAULT_SIGNING_KEY_ID}");
+        let other_key = crate::identity::test_helpers::test_signing_key();
+        let mut document = gateway_did_document(did, &other_key, "x", json!({}), "p", json!({})).unwrap();
+        document["assertionMethod"] = json!([format!("{did}#key-1")]);
+        let before = document.clone();
+
+        let err = add_signing_key_to_assertion_method(
+            &mut document,
+            &multikey_id,
+            &crate::identity::test_helpers::test_signing_key(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("a key other than the gateway signing key"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(document, before);
+    }
+
+    #[test]
+    fn signing_key_is_not_authorized_when_the_document_does_not_publish_it() {
+        let key = crate::identity::test_helpers::test_signing_key();
+        let did = "did:web:example.com";
+        let multikey_id = format!("{did}#{DEFAULT_SIGNING_KEY_ID}");
+        let mut document = json!({
+            "id": did,
+            "verificationMethod": [],
+            "assertionMethod": [format!("{did}#key-1")]
+        });
+
+        let err = add_signing_key_to_assertion_method(&mut document, &multikey_id, &key).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not publish"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(key_ids(&document, "assertionMethod"), vec![format!("{did}#key-1")]);
     }
 
     /// The issued VC's issuer field must match the proxy_did.

@@ -397,6 +397,9 @@ async fn sync_raw_did_log_if_missing(
     }
 }
 
+/// Adds the versions of the gateway DID log that the resolver index does not hold yet, so
+/// `/v1/resolve` answers with the latest gateway DID document. An index whose versions differ
+/// from the log's is left unchanged.
 #[cfg(feature = "didwebvh")]
 async fn sync_gateway_did_log(
     storage: &Arc<dyn crate::storage::DidLogStorage>,
@@ -407,20 +410,82 @@ async fn sync_gateway_did_log(
         return;
     }
 
-    match tokio::fs::read_to_string(log_src).await {
-        Ok(content) => {
-            sync_raw_did_log_if_missing(
-                storage,
-                gateway_did,
-                &content,
-                "Gateway DID registered for resolution via /v1/resolve",
-                "Gateway DID already present in log storage",
-                "Failed to register gateway DID log entry",
-                "Could not check gateway DID log storage",
-            )
-            .await;
+    let content = match tokio::fs::read_to_string(log_src).await {
+        Ok(content) => content,
+        Err(e) => {
+            warn!("Could not read gateway DID log for sync: {}", e);
+            return;
         }
-        Err(e) => warn!("Could not read gateway DID log for sync: {}", e),
+    };
+    let lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let indexed = match storage
+        .load_all(gateway_did)
+        .await
+    {
+        Ok(indexed) => indexed,
+        Err(e) => {
+            warn!("Could not check gateway DID log storage: {}", e);
+            return;
+        }
+    };
+    if indexed.len() >= lines.len() {
+        debug!("Gateway DID already present in log storage");
+        return;
+    }
+    if let Some(last) = indexed.last() {
+        let log_version = serde_json::from_str::<serde_json::Value>(lines[indexed.len() - 1])
+            .ok()
+            .and_then(|entry| {
+                entry["versionId"]
+                    .as_str()
+                    .map(str::to_string)
+            });
+        if log_version.as_deref() != Some(last.version_id.as_str()) {
+            warn!("Gateway DID log storage does not match the gateway DID log; leaving it unchanged");
+            return;
+        }
+    }
+    for line in &lines[indexed.len()..] {
+        if let Err(e) = storage
+            .append_raw(gateway_did, line)
+            .await
+        {
+            warn!("Failed to register gateway DID log entry: {}", e);
+            return;
+        }
+    }
+    debug!("Gateway DID registered for resolution via /v1/resolve");
+}
+
+/// On the Active node, lists the gateway signing key under `assertionMethod` in the gateway
+/// DID document when it is missing, then brings the resolver index up to the gateway DID log.
+#[cfg(feature = "didwebvh")]
+async fn repair_and_sync_gateway_did(
+    issuer: &crate::identity::VCIssuer,
+    storage: &Arc<dyn crate::storage::DidLogStorage>,
+) {
+    if !crate::server::mode::is_standby()
+        && let Err(e) = issuer
+            .authorize_signing_key_for_assertions()
+            .await
+    {
+        warn!("Could not list the gateway signing key under assertionMethod in the gateway DID document: {e:#}");
+    }
+
+    let gateway_did = issuer
+        .get_issuer_did()
+        .await
+        .unwrap_or_default();
+    if gateway_did.starts_with("did:webvh:") {
+        let log_src = issuer
+            .get_storage_path()
+            .await
+            .join("did.jsonl");
+        sync_gateway_did_log(storage, &gateway_did, &log_src).await;
     }
 }
 
@@ -2563,19 +2628,10 @@ pub async fn run_axum_proxy(
 
             // Register the gateway's own DID in log storage so /v1/resolve can find it.
             // The VCIssuer stores the gateway DID at {vc_keys}/did.jsonl, while the resolver
-            // uses FileDidLogStorage keyed by DID. Sync once at startup if not already present.
+            // uses FileDidLogStorage keyed by DID. A Standby node repairs the document when
+            // it is promoted.
             if let Some(ref issuer) = vc_issuer {
-                let gateway_did = issuer
-                    .get_issuer_did()
-                    .await
-                    .unwrap_or_default();
-                if gateway_did.starts_with("did:webvh:") {
-                    let log_src = issuer
-                        .get_storage_path()
-                        .await
-                        .join("did.jsonl");
-                    sync_gateway_did_log(&storage, &gateway_did, &log_src).await;
-                }
+                repair_and_sync_gateway_did(issuer, &storage).await;
             }
 
             identity_state.didwebvh_log_storage = Some(storage.clone());
@@ -4395,6 +4451,13 @@ pub async fn run_axum_proxy(
                                 crate::integrations::migration::cleanup::start_cleanup_if_pending(storage_paths).await;
                             }
 
+                            // A node that booted Standby lists the gateway signing key under
+                            // assertionMethod in the gateway DID document now.
+                            #[cfg(feature = "didwebvh")]
+                            if let Some(storage) = &identity_state_for_mode.didwebvh_log_storage {
+                                repair_and_sync_gateway_did(&identity_state_for_mode.vc_issuer, storage).await;
+                            }
+
                             // Take over the audit journal before admitting traffic,
                             // continuing from what the previous Active node wrote.
                             crate::delegation_vault::audit::set_audit_pipeline_mode(
@@ -5017,5 +5080,156 @@ mod tests {
             .unwrap();
         enable_agent_pay_ui_in_use(&store, &settings, true).await;
         assert!(!settings.flag_enabled(FLAG_AGENT_PAY), "an operator's off is kept");
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn in_mode<T>(
+        mode: crate::server::mode::ServerMode,
+        run: impl std::future::Future<Output = T>,
+    ) -> T {
+        use crate::server::mode;
+        let _guard = mode::TEST_GUARD.lock().await;
+        let previous = mode::current_mode();
+        mode::set_server_mode(mode);
+        let result = run.await;
+        mode::set_server_mode(previous);
+        if previous == mode::ServerMode::Active {
+            mode::mark_activation_ready(mode::current_activation_generation());
+        }
+        result
+    }
+
+    #[cfg(feature = "didwebvh")]
+    fn index(dir: &std::path::Path) -> std::sync::Arc<dyn crate::storage::DidLogStorage> {
+        std::sync::Arc::new(crate::storage::FileDidLogStorage::new(dir))
+    }
+
+    #[cfg(feature = "didwebvh")]
+    async fn indexed_assertion_method(
+        storage: &std::sync::Arc<dyn crate::storage::DidLogStorage>,
+        did: &str,
+    ) -> Vec<String> {
+        let entries = storage
+            .load_all(did)
+            .await
+            .unwrap();
+        let latest = serde_json::to_value(
+            entries
+                .last()
+                .expect("the index must hold the gateway DID"),
+        )
+        .unwrap();
+        latest["state"]["assertionMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// On the Active node a repaired gateway DID log reaches the resolver index, which already
+    /// held the first version, so `/v1/resolve` answers with the repaired document.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn active_node_repairs_the_gateway_did_and_updates_the_resolver_index() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+        let log_src = issuer
+            .get_storage_path()
+            .await
+            .join("did.jsonl");
+        super::sync_gateway_did_log(&storage, &did, &log_src).await;
+        assert_eq!(indexed_assertion_method(&storage, &did).await, vec![format!("{did}#key-1")]);
+
+        in_mode(crate::server::mode::ServerMode::Active, super::repair_and_sync_gateway_did(&issuer, &storage)).await;
+
+        assert_eq!(
+            storage
+                .load_all(&did)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            indexed_assertion_method(&storage, &did).await,
+            vec![format!("{did}#key-1"), format!("{did}#key-2")]
+        );
+    }
+
+    /// A Standby node shares storage with the Active node, so it leaves the gateway DID log to
+    /// the Active node and repairs it only once promoted.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn standby_node_does_not_repair_the_gateway_did() {
+        let (issuer, keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        let log_before = std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+
+        in_mode(crate::server::mode::ServerMode::Standby, super::repair_and_sync_gateway_did(&issuer, &storage)).await;
+
+        assert_eq!(std::fs::read_to_string(keys.path().join("did.jsonl")).unwrap(), log_before);
+        assert_eq!(indexed_assertion_method(&storage, &did).await, vec![format!("{did}#key-1")]);
+    }
+
+    /// An index whose versions differ from the gateway DID log is left unchanged rather than
+    /// extended with versions that do not follow its own.
+    #[cfg(feature = "didwebvh")]
+    #[tokio::test]
+    async fn resolver_index_that_differs_from_the_gateway_did_log_is_left_unchanged() {
+        let (issuer, _keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let (other, _other_keys) = crate::identity::test_helpers::test_vc_issuer_without_assertion_multikey().await;
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        assert!(
+            issuer
+                .authorize_signing_key_for_assertions()
+                .await
+                .unwrap()
+        );
+        let other_log = std::fs::read_to_string(
+            other
+                .get_storage_path()
+                .await
+                .join("did.jsonl"),
+        )
+        .unwrap();
+        let index_dir = tempfile::tempdir().unwrap();
+        let storage = index(index_dir.path());
+        storage
+            .append_raw(&did, other_log.trim())
+            .await
+            .unwrap();
+        let log_src = issuer
+            .get_storage_path()
+            .await
+            .join("did.jsonl");
+
+        super::sync_gateway_did_log(&storage, &did, &log_src).await;
+
+        assert_eq!(
+            storage
+                .load_all(&did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -132,6 +132,7 @@ pub struct SurfaceWorld {
     pub human_clients: HashMap<String, Vec<AdminApiClient>>,
     pub terms_enabled: bool,
     pub affinidi_cache_seeded: bool,
+    pub gateway_did_without_assertion_multikey: bool,
     pub affinidi_well_available: bool,
     pub affinidi_terms_manifest: serde_json::Value,
     pub caller_did: Option<String>,
@@ -226,6 +227,7 @@ impl SurfaceWorld {
             human_clients: HashMap::new(),
             terms_enabled: false,
             affinidi_cache_seeded: false,
+            gateway_did_without_assertion_multikey: false,
             affinidi_well_available: true,
             affinidi_terms_manifest: serde_json::json!({
                 "schema_version": 1,

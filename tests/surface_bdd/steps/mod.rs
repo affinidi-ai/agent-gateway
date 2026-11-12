@@ -3,6 +3,7 @@ pub mod authority_dependencies;
 pub mod credential_references;
 pub mod credential_save;
 pub mod dashboard_routes;
+pub mod gateway_did;
 pub mod given;
 pub mod identities;
 pub mod identity_api_keys;
