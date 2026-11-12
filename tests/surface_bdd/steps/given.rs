@@ -1573,7 +1573,7 @@ async fn operator_updates_transit_point_listen_path(
     crate::steps::when::update_transit_point_listen_path(world, &transit_point, &new_path).await;
 }
 
-async fn install_replacement_mock(
+pub(crate) async fn install_replacement_mock(
     world: &mut SurfaceWorld,
     replacement_response: serde_json::Value,
 ) {

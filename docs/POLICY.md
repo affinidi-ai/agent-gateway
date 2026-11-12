@@ -687,6 +687,24 @@ TOCTOU on the remaining validate-then-connect fetch sinks.
   loopback and private receivers are allowed, cloud metadata is blocked, redirects are not followed.
   The mediator directory request (`AG_MEDIATOR_DIRECTORY_URL`, [`INTEGRATIONS.md`](INTEGRATIONS.md#mediator-directory))
   uses the same client and the same rules.
+- `egress::pinned_forward_client` pins every **traffic mirror** request
+  (`target.networking.mirror.endpoint`, `src/proxy/mirror.rs`) on the direct, `fabric://` and owned MCP
+  Proxy paths, so the mirror gets the same send-time check as the Target: a cloud metadata address is
+  never contacted, the connection is pinned to the address resolved for that request, and a 3xx is
+  returned rather than followed. A refused mirror is never contacted: a direct or MCP Proxy request
+  logs a warning and continues, and a `fabric://` request that waits for its mirror answers `503`
+  with the failure class (`blocked by egress policy` or `DNS resolution failed`). A fire-and-forget
+  mirror is vetted inside its own task, so slow DNS never delays the live request. Saving a surface
+  or variant also refuses a mirror endpoint that is not `http` or `https` or that names cloud
+  metadata, with `400` `target.networking.mirror.endpoint: <reason>`; that check resolves no DNS, so
+  the send-time check is the control for a surface written without the admin API (a hand edit under
+  `_storage/`, a restore, DynamoDB). Loopback and private addresses stay allowed, as for the Target,
+  so an editor can still point a mirror at an internal service. Each mirrored request resolves DNS
+  and builds a fresh client; none is pooled, because a cached client would reopen the rebinding
+  window. A stored surface whose mirror would be refused still loads: each mirrored request logs one
+  refusal, and the surface gets `400` on its next save, for any edit, until the mirror is fixed. With
+  `HTTP_PROXY` or `HTTPS_PROXY` set, the pinned client sends through the proxy, which resolves the
+  host again, as for the Target above.
 - `egress::pinned_forward_client` also pins the **agent-card fetch** from an
   `http(s)` surface target whenever it carries `target.auth`
   (`src/proxy/handler/agent_card.rs`), so the

@@ -21,4 +21,5 @@ pub mod target_credential;
 pub mod tenant_records;
 pub mod terms;
 pub mod then;
+pub mod traffic_mirroring;
 pub mod when;
