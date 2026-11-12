@@ -3202,7 +3202,7 @@ pub async fn connect_via_oob<
         // Open ACL so the inviter's connection-accepted can reach us on mediators
         // with explicit-allow defaults (the temporary listener is System type and
         // ws_listener skips ACL setup for that type).
-        set_acl_to_allow_everything_and_more_retrying(
+        match set_acl_to_allow_everything_and_more_retrying(
             didcomm_client.atm(),
             Arc::clone(didcomm_client.profile()),
             crate::gateways::connection_points::first_call_retry::policy_for_listed(
@@ -3212,12 +3212,16 @@ pub async fn connect_via_oob<
             .await,
         )
         .await
-        .map_err(|e| {
-            info!("  ℹ️  Could not set ACL: {:?}", e);
-            info!("  Continuing anyway - may work with default mediator permissions");
-        })
-        .ok();
-        info!("  ✓ ACL set to allow-all for temporary DID");
+        {
+            Ok(()) => info!("  ✓ ACL set to allow-all for temporary DID"),
+            // Not fatal: on a mediator whose default already admits the inviter
+            // the handshake still works.
+            Err(e) => warn!(
+                "  ⚠️  Could not open the temporary DID's inbox on the mediator: {}. \
+                 The inviter's connection-accepted may be refused; continuing.",
+                e
+            ),
+        }
 
         didcomm_client
             .pack_and_send_message(&connection_message, &inviter_temporary_did, &temporary_did)
