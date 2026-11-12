@@ -1247,8 +1247,12 @@ async fn create_oob_invitation(
     set_acl_to_allow_everything_and_more(&atm, profile.clone())
         .await
         .map_err(|e| {
-            warn!("  ⚠️  Failed to set ACL on mediator: {:?}", e);
-            warn!("  OOB connections may FAIL if mediator is in ExplicitAllow mode");
+            warn!(
+                "  ⚠️  Could not open this connection point's inbox on the mediator: {}. \
+                 Until it can, the mediator refuses connection-setup from other gateways \
+                 (e.p.delivery.refused) unless its default admits them.",
+                e
+            );
         })
         .ok();
 

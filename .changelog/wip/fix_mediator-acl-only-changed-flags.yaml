@@ -1,0 +1,26 @@
+branch: fix/mediator-acl-only-changed-flags
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-12T16:00:00Z'
+      title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
+      description: >-
+        Each mediator account ACL update the gateway sends (opening a Connection Point or temporary
+        listener, and locking a paired Connection Point to its peer) now names only the access-list
+        mode and anonymous receipt. It used to also set blocked, local, invitations, send and receive
+        rights and the three self-manage flags, which a mediator lets only an administrator change,
+        so on an explicit_allow mediator the whole update was refused with not_self_manageable
+        unless the account had been registered with the queue-limit rights. The connection-setup
+        was then refused with e.p.delivery.refused (error 73). An account registered with the
+        right to manage its own access list, such as the Affinidi Portal's 71000, now opens and
+        locks itself, and two gateways pair and ping each other.
+    - timestamp: '2026-11-12T16:05:00Z'
+      title: Log a refused inbox update as a warning, not as success
+      description: >-
+        When the mediator refuses to open a temporary listener's or Connection Point's inbox, the
+        gateway now logs a warning with the mediator's reason and what it means for the pairing,
+        instead of logging that the ACL was set to allow-all. The flow continues as before.
+  removed: []
+  security: []
+  breaking: []

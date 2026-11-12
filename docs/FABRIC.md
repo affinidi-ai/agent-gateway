@@ -279,6 +279,15 @@ to every sender, since it does not serve a single known peer. The mediator's own
 subject to the access list. The two Trust Tasks of an ACL change are serialized per DID. A failed
 change is logged and the listener continues; the account check below restores it.
 
+The account update names only the access-list mode and anonymous receipt; every other flag is
+left as the mediator stored it. A mediator lets only its administrator change `blocked`, `local`
+and the `selfManage*` flags, and refuses a whole update that names one of them at another value.
+So on an `explicit_allow` mediator the account needs, from its registration or the mediator's
+default ACL, the right to change its own access-list mode and anonymous receipt and the right to
+manage its own access list (the Affinidi Portal registers DIDs with `71000`, which carries the
+list right). Without them the update is refused with `not_self_manageable`, logged as a warning,
+and a peer's messages are refused with `e.p.delivery.refused`.
+
 ## Runtime health behavior
 
 After a Gateway Ping timeout, the Gateway checks its mediator account. It reauthenticates and
