@@ -723,23 +723,17 @@ async fn route_unaudited(
     {
         return Err(unavailable(surface, "destination_not_the_resource"));
     }
+    let issuers = crate::credential_providers::external::IssuerRules::of(&state.network_config);
     if !crate::credential_providers::external::resource_permitted(
         &provider,
         &state
             .network_config
             .external_consent_resource_origins,
+        issuers,
     ) {
         return Err(unavailable(surface, "resource_not_permitted_for_issuer"));
     }
-    if crate::credential_providers::external::issuer_permitted(
-        &provider,
-        state
-            .network_config
-            .external_consent_issuers
-            .as_ref(),
-    )
-    .is_err()
-    {
+    if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         return Err(unavailable(surface, "issuer_not_permitted"));
     }
     let timeout = std::time::Duration::from_secs(

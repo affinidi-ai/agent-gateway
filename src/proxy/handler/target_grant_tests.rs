@@ -719,6 +719,79 @@ async fn the_grant_goes_only_to_its_providers_resource() {
     );
 }
 
+/// `external_consent_issuer_patterns` alone limits issuers as the exact list
+/// does: while no pattern matches the provider's issuer the grant is refused
+/// for it, before anything is sent; once one does, the request passes the
+/// operator's rules and is refused only later, here because the vendor's
+/// host does not resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_grant_goes_only_while_its_providers_issuer_matches_an_operator_pattern() {
+    use crate::component_tests::helpers::formatted_logs::FormattedLogs;
+    use crate::config::network::{IssuerPattern, IssuerTenant};
+    let mut fixture = Fixture::new(vec![Answer::status(200)], vec![vendor_result()]).await;
+    fixture
+        .store(&owner_key(), "owner-access")
+        .await;
+    let patterns = |issuer: &str| {
+        Some(vec![IssuerPattern {
+            issuer: issuer.to_string(),
+            tenant: IssuerTenant::Uuid,
+            endpoint_origins: Vec::new(),
+            resource_origins: Vec::new(),
+        }])
+    };
+    let refusal_reasons =
+        |text: &str| (text.contains("issuer_not_permitted"), text.contains("forward_refused_by_strict_egress"));
+
+    Arc::make_mut(&mut fixture.router.network_config).external_consent_issuer_patterns =
+        patterns("https://vendor.invalid/{tenant}");
+    let logs = FormattedLogs::capture();
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["data"], json!({"reason": "connector_unavailable"}));
+    let text = logs.text();
+    assert_eq!(refusal_reasons(&text), (true, false), "{text}");
+    assert!(
+        fixture
+            .vendor
+            .requests()
+            .is_empty()
+    );
+
+    let issuer = "https://vendor.invalid/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+    let providers = fixture
+        .router
+        .credential_provider_store
+        .clone()
+        .unwrap();
+    let mut provider = providers
+        .get("vendor")
+        .await
+        .unwrap()
+        .unwrap();
+    provider.issuer = Some(issuer.into());
+    provider.authorization_endpoint = Some(format!("{issuer}/authorize"));
+    provider.token_endpoint = Some(format!("{issuer}/token"));
+    provider.revocation_endpoint = None;
+    provider.resource = Some("https://vendor.invalid/mcp".into());
+    providers
+        .update(provider)
+        .await
+        .unwrap();
+    fixture
+        .serve(vendor_surface("mcp", "https://vendor.invalid/mcp", "owner"))
+        .await;
+    let logs = FormattedLogs::capture();
+    let (status, _, body) = fixture
+        .send(mcp_call(Some(KEY)))
+        .await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let text = logs.text();
+    assert_eq!(refusal_reasons(&text), (false, true), "{text}");
+}
+
 /// Two calls that release the Target's grant at once, while its refresh is
 /// due, refresh it once: the call that did not claim the refresh waits for it
 /// rather than taking it for a dead one, so the grant is neither abandoned

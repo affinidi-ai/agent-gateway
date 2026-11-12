@@ -511,7 +511,7 @@ impl Receiver {
             vault_population_notifier: None,
             egress_allowlist: None,
             resource_origins: Arc::new(HashMap::new()),
-            issuers: Arc::new(None),
+            issuers: Default::default(),
             mcp_proxy_store: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)

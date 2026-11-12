@@ -208,23 +208,17 @@ async fn permitted_provider(
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "provider_unavailable"))?
         .filter(|provider| provider.is_external_consent() && provider.tenant_id.as_deref() == tenant_id)
         .ok_or((StatusCode::CONFLICT, "provider_unavailable"))?;
-    if crate::credential_providers::external::issuer_permitted(
-        &provider,
-        state
-            .issuers
-            .as_ref()
-            .as_ref(),
-    )
-    .is_err()
-    {
+    let issuers = state.issuers.rules();
+    if crate::credential_providers::external::issuer_permitted(&provider, issuers).is_err() {
         warn!(
             target: "credential_delegation",
             credential_provider_id = %provider.id,
-            "The gateway's external_consent_issuers does not permit a provider's issuer; its connect is refused"
+            "The gateway's external_consent_issuers and external_consent_issuer_patterns do not permit a provider's \
+             issuer; its connect is refused"
         );
         return Err((StatusCode::FORBIDDEN, "issuer_not_permitted"));
     }
-    if !crate::credential_providers::external::resource_permitted(&provider, &state.resource_origins) {
+    if !crate::credential_providers::external::resource_permitted(&provider, &state.resource_origins, issuers) {
         return Err((StatusCode::FORBIDDEN, "resource_not_permitted"));
     }
     Ok(provider)
@@ -1976,7 +1970,8 @@ mod tests {
         );
 
         let mut state = fixture.state.clone();
-        state.issuers = Arc::new(Some(HashMap::new()));
+        state.issuers =
+            Arc::new(crate::credential_providers::external::PermittedIssuers::new(Some(HashMap::new()), None));
         let (status, answer) = read(
             start_connect(
                 State(state),
@@ -1995,6 +1990,120 @@ mod tests {
                 .token_requests()
                 .is_empty()
         );
+    }
+
+    /// `external_consent_issuer_patterns` alone limits issuers as the exact
+    /// list does: a connect for a provider whose issuer matches a pattern
+    /// starts, and its completion passes the rule and reaches the token
+    /// endpoint (here a loopback one Strict egress refuses, so nothing leaves);
+    /// once no pattern matches, the completion and a new start are refused
+    /// `issuer_not_permitted`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_runs_only_while_its_providers_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        use crate::credential_providers::external::PermittedIssuers;
+        let mut fixture = Fixture::new(vec![Answer::status(500)]).await;
+        let issuer = "https://203.0.113.10/1b4e28ba-2fa1-4d3b-a3f5-ef19b5a7633b";
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.issuer = Some(issuer.into());
+        provider.authorization_endpoint = Some(format!("{issuer}/authorize"));
+        provider.token_endpoint = Some("https://127.0.0.1:1/token".into());
+        provider.revocation_endpoint = None;
+        provider.resource = Some("https://203.0.113.10/mcp".into());
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        let mut surface = surfaces
+            .get("surface")
+            .await
+            .unwrap()
+            .unwrap();
+        for point in &mut surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+        {
+            point.target_endpoint = "https://203.0.113.10/mcp".into();
+        }
+        surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        let matching = Arc::new(PermittedIssuers::new(
+            None,
+            Some(vec![IssuerPattern {
+                issuer: "https://203.0.113.10/{tenant}".into(),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: vec!["https://127.0.0.1:1".into()],
+                resource_origins: Vec::new(),
+            }]),
+        ));
+        let none_matching = Arc::new(PermittedIssuers::new(None, Some(Vec::new())));
+        let complete = |fixture: &Fixture, connect_id: String| {
+            let fixture_state = fixture.state.clone();
+            async move {
+                read(
+                    complete_connect(
+                        State(fixture_state),
+                        caller(),
+                        None,
+                        tenant_context(Some("tenant-a")),
+                        None,
+                        Path(connect_id),
+                        Json(serde_json::from_value(json!({"code": "c", "iss": issuer})).unwrap()),
+                    )
+                    .await,
+                )
+                .await
+            }
+        };
+
+        fixture.state.issuers = Arc::clone(&matching);
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let connect_id = started["connect_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            complete(&fixture, connect_id).await,
+            (StatusCode::BAD_GATEWAY, json!({"status": "failed", "reason": "token_endpoint_unreachable"}))
+        );
+
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let connect_id = started["connect_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fixture.state.issuers = none_matching;
+        assert_eq!(
+            complete(&fixture, connect_id).await,
+            (StatusCode::FORBIDDEN, json!({"status": "failed", "reason": "issuer_not_permitted"}))
+        );
+        let (status, answer) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!((status, answer["code"].as_str()), (StatusCode::FORBIDDEN, Some("issuer_not_permitted")));
     }
 
     fn caller_extension() -> Option<Extension<AuthGuardOk>> {

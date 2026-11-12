@@ -566,6 +566,9 @@ pub async fn run_axum_proxy(
     bootstrap_config
         .pin_external_consent_issuers()
         .context("Configuration validation failed")?;
+    bootstrap_config
+        .pin_external_consent_issuer_patterns()
+        .context("Configuration validation failed")?;
     let config = Arc::new(config);
     let bootstrap_config = Arc::new(bootstrap_config);
 
@@ -1923,8 +1926,20 @@ pub async fn run_axum_proxy(
                  (each must be an exact origin, with no wildcard, path or userinfo); they permit nothing"
             );
         }
-        match &network_config.external_consent_issuers {
-            Some(issuers) => {
+        if let Some(patterns) = &network_config.external_consent_issuer_patterns {
+            let invalid = crate::credential_providers::external::invalid_issuer_pattern_entries(patterns);
+            if !invalid.is_empty() {
+                error!(
+                    target: "credential_delegation",
+                    entries = ?invalid,
+                    "external_consent_issuer_patterns in gateway.json names entries that are not valid (each issuer \
+                     an https issuer whose one tenant placeholder is a whole path segment or the leftmost label of a \
+                     fixed host, each origin with no wildcard, path or userinfo); they permit nothing"
+                );
+            }
+        }
+        match (&network_config.external_consent_issuers, &network_config.external_consent_issuer_patterns) {
+            (Some(issuers), _) => {
                 let invalid = crate::credential_providers::external::invalid_issuer_entries(issuers);
                 if !invalid.is_empty() {
                     error!(
@@ -1938,10 +1953,21 @@ pub async fn run_axum_proxy(
                 info!(
                     target: "credential_delegation",
                     issuers = issuers.len(),
-                    "external_consent_issuers is set: external consent providers may name only the issuers it lists"
+                    issuer_patterns = network_config
+                        .external_consent_issuer_patterns
+                        .as_ref()
+                        .map_or(0, Vec::len),
+                    "external_consent_issuers is set: external consent providers may name only the issuers it lists \
+                     or external_consent_issuer_patterns matches"
                 );
             }
-            None => info!(
+            (None, Some(patterns)) => info!(
+                target: "credential_delegation",
+                issuer_patterns = patterns.len(),
+                "external_consent_issuer_patterns is set: external consent providers may name only the issuers it \
+                 matches"
+            ),
+            (None, None) => info!(
                 target: "credential_delegation",
                 "external_consent_issuers is not set: external consent providers may name any issuer whose metadata \
                  they match"
@@ -3669,9 +3695,7 @@ pub async fn run_axum_proxy(
                 network_config
                     .external_consent_resource_origins
                     .clone(),
-                network_config
-                    .external_consent_issuers
-                    .clone(),
+                crate::credential_providers::external::PermittedIssuers::of(&network_config),
                 reference_stores.clone(),
             );
 
@@ -3700,11 +3724,7 @@ pub async fn run_axum_proxy(
                         .external_consent_resource_origins
                         .clone(),
                 ),
-                issuers: Arc::new(
-                    network_config
-                        .external_consent_issuers
-                        .clone(),
-                ),
+                issuers: Arc::new(crate::credential_providers::external::PermittedIssuers::of(&network_config)),
                 mcp_proxy_store: identity_state
                     .mcp_proxy_store
                     .clone(),

@@ -57,10 +57,11 @@ pub struct CredentialProviderState {
     /// gateway.json's `external_consent_resource_origins`: the resource origins
     /// permitted, beyond the issuer's own host, for each issuer's providers.
     pub resource_origins: Arc<std::collections::HashMap<String, Vec<String>>>,
-    /// gateway.json's `external_consent_issuers`: when set, the only issuers an
-    /// external consent provider may name, with the origins their endpoints may
-    /// use beyond the issuer's own host.
-    pub issuers: Arc<Option<std::collections::HashMap<String, Vec<String>>>>,
+    /// gateway.json's `external_consent_issuers` and
+    /// `external_consent_issuer_patterns`: when either is set, the only issuers
+    /// an external consent provider may name, with the origins their endpoints
+    /// may use beyond the issuer's own host.
+    pub issuers: Arc<super::external::PermittedIssuers>,
     pub references: super::references::ReferenceStores,
     /// Decides which referrers a 409 may name; `None` names none.
     pub rbac: Option<crate::auth_manager::middleware::RbacGuard>,
@@ -834,15 +835,19 @@ pub async fn create_provider(
         return response;
     }
 
-    if provider.is_external_consent() && tenant_context(&context).is_some() && state.issuers.is_none() {
+    let issuers = state.issuers.rules();
+    if provider.is_external_consent() && tenant_context(&context).is_some() && !issuers.is_set() {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
-            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers"
+            "Refused a tenant's credential provider with an issuer: the gateway lists no external_consent_issuers or \
+             external_consent_issuer_patterns"
         );
         return super::external::ExternalProviderError::IssuersRequired.into_response();
     }
-    if provider.is_external_consent() && !super::external::resource_permitted(&provider, &state.resource_origins) {
+    if provider.is_external_consent()
+        && !super::external::resource_permitted(&provider, &state.resource_origins, issuers)
+    {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
@@ -851,19 +856,14 @@ pub async fn create_provider(
         return super::external::ExternalProviderError::ResourceNotPermitted.into_response();
     }
     if provider.is_external_consent()
-        && let Err(field) = super::external::issuer_permitted(
-            &provider,
-            state
-                .issuers
-                .as_ref()
-                .as_ref(),
-        )
+        && let Err(field) = super::external::issuer_permitted(&provider, issuers)
     {
         warn!(
             target: "credential_delegation",
             provider_id = ?provider.provider_id,
             field,
-            "Refused a credential provider that the gateway's external_consent_issuers does not permit"
+            "Refused a credential provider that the gateway's external_consent_issuers and \
+             external_consent_issuer_patterns do not permit"
         );
         return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
     }
@@ -891,19 +891,13 @@ pub async fn create_provider(
             );
             return error.into_response();
         }
-        if let Err(field) = super::external::metadata_permitted(
-            &metadata,
-            state
-                .issuers
-                .as_ref()
-                .as_ref(),
-        ) {
+        if let Err(field) = super::external::metadata_permitted(&metadata, issuers) {
             warn!(
                 target: "credential_delegation",
                 provider_id = ?provider.provider_id,
                 field,
-                "Refused a credential provider whose issuer's metadata the gateway's external_consent_issuers does \
-                 not permit"
+                "Refused a credential provider whose issuer's metadata the gateway's external_consent_issuers and \
+                 external_consent_issuer_patterns do not permit"
             );
             return super::external::ExternalProviderError::IssuerNotPermitted(field).into_response();
         }
@@ -1771,7 +1765,7 @@ mod jwt_provider_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Arc::default(),
-            issuers: Arc::default(),
+            issuers: Default::default(),
             references: Default::default(),
             rbac: None,
         }
@@ -4907,10 +4901,13 @@ mod external_provider_tests {
             vault: None,
             egress_allowlist: None,
             resource_origins: Default::default(),
-            issuers: Arc::new(Some(std::collections::HashMap::from([(
-                crate::credential_providers::external::tests::ISSUER.to_string(),
-                Vec::new(),
-            )]))),
+            issuers: Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+                Some(std::collections::HashMap::from([(
+                    crate::credential_providers::external::tests::ISSUER.to_string(),
+                    Vec::new(),
+                )])),
+                None,
+            )),
             references: Default::default(),
             rbac: None,
         }
@@ -4924,7 +4921,7 @@ mod external_provider_tests {
     async fn a_tenant_creates_an_external_provider_only_once_the_operator_lists_its_issuers() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = state(&directory, Ok(metadata())).await;
-        state.issuers = Arc::new(None);
+        state.issuers = Arc::default();
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "external_consent_issuers_required");
@@ -4945,12 +4942,49 @@ mod external_provider_tests {
             .into_response();
         assert_eq!(operator.status(), StatusCode::CREATED, "an operator's own provider needs no list");
 
-        state.issuers = Arc::new(Some(std::collections::HashMap::from([(
-            crate::credential_providers::external::tests::ISSUER.to_string(),
-            Vec::new(),
-        )])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([(
+                crate::credential_providers::external::tests::ISSUER.to_string(),
+                Vec::new(),
+            )])),
+            None,
+        ));
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    /// `external_consent_issuer_patterns`, even empty, counts as the
+    /// operator's list for a tenant: an issuer it does not match is refused as
+    /// not permitted, and one it matches is created, without
+    /// `external_consent_issuers`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tenant_creates_an_external_provider_whose_issuer_matches_an_operator_pattern() {
+        use crate::config::network::{IssuerPattern, IssuerTenant};
+        let issuer =
+            format!("{}/0c7a1e52-3b9d-4f68-a2e4-5d81f6b39c07", crate::credential_providers::external::tests::ISSUER);
+        let mut tenant_metadata = metadata();
+        tenant_metadata.issuer = issuer.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(&directory, Ok(tenant_metadata)).await;
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(None, Some(Vec::new())));
+        let request = || create_request(|body| body["issuer"] = json!(issuer));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], "provider_issuer_not_permitted");
+        assert_eq!(body["field"], "issuer");
+
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            None,
+            Some(vec![IssuerPattern {
+                issuer: format!("{}/{{tenant}}", crate::credential_providers::external::tests::ISSUER),
+                tenant: IssuerTenant::Uuid,
+                endpoint_origins: Vec::new(),
+                resource_origins: Vec::new(),
+            }]),
+        ));
+        let (status, body) = create(&state, "tenant-a", request()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["issuer"], json!(issuer));
     }
 
     /// With `external_consent_issuers` set, a provider is created only for a
@@ -4967,8 +5001,10 @@ mod external_provider_tests {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Box::pin(async { Ok(metadata()) })
         });
-        state.issuers =
-            Arc::new(Some(std::collections::HashMap::from([("https://issuer.example".to_string(), Vec::new())])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([("https://issuer.example".to_string(), Vec::new())])),
+            None,
+        ));
         let (status, body) = create(&state, "tenant-a", create_request(|_| {})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["code"], "provider_issuer_not_permitted");
@@ -4980,8 +5016,10 @@ mod external_provider_tests {
                 .is_empty()
         );
 
-        state.issuers =
-            Arc::new(Some(std::collections::HashMap::from([("https://203.0.113.10".to_string(), Vec::new())])));
+        state.issuers = Arc::new(crate::credential_providers::external::PermittedIssuers::new(
+            Some(std::collections::HashMap::from([("https://203.0.113.10".to_string(), Vec::new())])),
+            None,
+        ));
         let mut jwks_elsewhere = metadata();
         jwks_elsewhere.jwks_uri = Some("https://203.0.113.66/jwks".into());
         state.issuer_metadata = answering(Ok(jwks_elsewhere));
