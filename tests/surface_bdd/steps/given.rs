@@ -3261,6 +3261,16 @@ fn stored_vp_audit_log_selection_holds_only(
         .stored_audit_events = Some(vec![event]);
 }
 
+#[given(expr = "a stored integration event set holds only audit event {string}")]
+fn stored_integration_event_set_holds_only(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    world
+        .surface_config
+        .stored_event_set_events = Some(vec![event]);
+}
+
 #[given(expr = "audit event {string} was already added to the stored audit selections once")]
 fn audit_event_was_already_added_once(
     world: &mut SurfaceWorld,
@@ -4471,6 +4481,7 @@ fn a_gateway(
         affinidi_terms_url: None,
         settings: None,
         audit_events_added: None,
+        stored_event_set_events: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),
@@ -4527,6 +4538,7 @@ fn a_gateway_with_outbound_listener(
         affinidi_terms_url: None,
         settings: None,
         audit_events_added: None,
+        stored_event_set_events: None,
         identity_route_key: "api".to_string(),
         bootstrap_surfaces: vec![],
         agent_surfaces: HashMap::new(),

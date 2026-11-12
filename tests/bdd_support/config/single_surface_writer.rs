@@ -255,6 +255,9 @@ fn write_single_surface_config_inner(
     config_tree.audit_events_added = surface_config
         .audit_events_added
         .clone();
+    config_tree.stored_event_set_events = surface_config
+        .stored_event_set_events
+        .clone();
     config_tree.terms_enabled = options
         .affinidi_terms_url
         .is_some();

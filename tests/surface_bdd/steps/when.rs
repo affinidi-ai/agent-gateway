@@ -4496,6 +4496,10 @@ async fn start_gateways(world: &mut SurfaceWorld) {
                 .surface_config
                 .audit_events_added
                 .clone();
+            fixture.stored_event_set_events = world
+                .surface_config
+                .stored_event_set_events
+                .clone();
             fixture
         })
         .collect::<Vec<_>>();

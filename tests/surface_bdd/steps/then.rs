@@ -3869,6 +3869,49 @@ async fn vp_audit_log_selection_does_not_include(
     );
 }
 
+#[then(expr = "the stored integration event set includes audit event {string}")]
+async fn stored_integration_event_set_includes(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    let events = stored_integration_event_set(world).await;
+    let expected = format!("audit.{event}");
+    assert!(
+        events.contains(&expected),
+        "expected the stored integration event set to include '{expected}', got {events:?}"
+    );
+}
+
+#[then(expr = "the stored integration event set does not include audit event {string}")]
+async fn stored_integration_event_set_does_not_include(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    let events = stored_integration_event_set(world).await;
+    let unexpected = format!("audit.{event}");
+    assert!(
+        !events.contains(&unexpected),
+        "expected the stored integration event set not to include '{unexpected}', got {events:?}"
+    );
+}
+
+/// The events of the stored integration event set, as the running gateway's integrations API
+/// reports them.
+async fn stored_integration_event_set(world: &mut SurfaceWorld) -> Vec<String> {
+    crate::steps::when::ensure_gateway_running(world).await;
+    crate::steps::when::ensure_admin_session(world).await;
+    let path = format!("/v1/integrations/event-sets/{}", crate::bdd_support::config::config_tree::STORED_EVENT_SET_ID);
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, &path, None)
+        .await
+        .expect("reading the event set should complete");
+    assert_eq!(response.status, 200, "reading the event set: {}", response.body);
+    serde_json::from_value(response.body["events"].clone()).expect("the event set carries an events list")
+}
+
 /// The VP Audit Log selection the running gateway's settings API reports.
 async fn vp_audit_log_selection(world: &mut SurfaceWorld) -> Vec<String> {
     crate::steps::when::ensure_gateway_running(world).await;
