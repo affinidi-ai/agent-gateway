@@ -1116,6 +1116,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_authority_samples_the_counter_once_per_authority() {
+        let registry = "tr-per-authority-counter";
+        let count = || {
+            ["ok", "denied", "error"]
+                .iter()
+                .map(|result| {
+                    crate::metrics::backends::prometheus::TRUST_CHECK
+                        .with_label_values(&[registry, "recognition", result])
+                        .get()
+                })
+                .sum::<u64>()
+        };
+        let mut element = multi_elem(&["did:web:authority-a", "did:web:authority-b"]);
+        element.trust_registry_id = registry.to_string();
+        let client = AuthorityClient::new(&[("did:web:authority-b", Answer::Allow)]);
+        let before = count();
+        run_multi(&[element], &client).await;
+        assert_eq!(count() - before, 2);
+    }
+
+    #[tokio::test]
+    async fn a_single_authority_resolving_to_an_empty_value_fails_before_dispatch() {
+        let element = elem("blank-authority", "tr-a", None);
+        let input = json!({
+            "input": {
+                "caller": {
+                    "did": "did:web:caller",
+                    "gateway": { "did": "" }
+                }
+            }
+        });
+        let client = AuthorityClient::new(&[("", Answer::Allow)]);
+        let results =
+            execute_list("surf", TrustCheckLeg::Caller, &[element], &ExecutionContext { input: &input }, &client).await;
+        assert_eq!(
+            summary(&results),
+            [("{{input.caller.gateway.did}}".to_string(), Some(TEMPLATE_RESOLUTION_FAILED.to_string()))]
+        );
+        assert!(client.asked().is_empty(), "a blank authority must not reach the registry");
+    }
+
+    #[tokio::test]
     async fn an_unavailable_target_fails_each_listed_authority() {
         let elements = [multi_elem(&["did:web:authority-a", "did:web:authority-b"])];
         let (results, events) = crate::audit::producer::capture(async {

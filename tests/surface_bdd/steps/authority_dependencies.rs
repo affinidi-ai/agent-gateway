@@ -330,6 +330,22 @@ async fn operator_creates_surface_with_authority_and_list(
     create_surface_with_trust_check_query(world, &route, query).await;
 }
 
+#[when(
+    expr = "the operator creates the surface for route {string} with a caller-leg Trust Check against DID {string} that takes listed authority {string} from the Authorities register"
+)]
+async fn operator_creates_surface_with_authority_and_listed_source(
+    world: &mut SurfaceWorld,
+    route: String,
+    did: String,
+    listed: String,
+) {
+    let fields = json!({
+        "query": {"authority_id": did, "entity_id": "{{ input.agent.did }}"},
+        "authority_sources": {listed: "authority"}
+    });
+    create_surface_with_trust_check_element(world, &route, fields).await;
+}
+
 #[then(expr = "the stored Trust Check {string} of the surface under test lists authorities {string}")]
 async fn stored_trust_check_lists_authorities(
     world: &mut SurfaceWorld,
@@ -397,11 +413,32 @@ async fn operator_has_created_sts_client_with_trust_check(
     client_id: String,
     did: String,
 ) {
+    create_sts_client_with_trust_check_query(world, &client_id, json!({"authority_id": did})).await;
+}
+
+#[given(
+    expr = "the operator has created the managed connection {string} with a Trust Check listing authorities {string}"
+)]
+async fn operator_has_created_sts_client_with_authority_list(
+    world: &mut SurfaceWorld,
+    client_id: String,
+    authorities: String,
+) {
+    let query = json!({"authority_ids": authority_list(&authorities)});
+    create_sts_client_with_trust_check_query(world, &client_id, query).await;
+}
+
+async fn create_sts_client_with_trust_check_query(
+    world: &mut SurfaceWorld,
+    client_id: &str,
+    mut query: Value,
+) {
+    query["entity_id"] = json!("{{ input.sts.client_id }}");
     let body = json!({
         "client_id": client_id, "name": client_id,
         "trust_check_list": [{
             "id": "sts-check", "trust_registry_id": "bdd-registry", "query_type": "recognition",
-            "query": {"authority_id": did, "entity_id": "{{ input.sts.client_id }}"}
+            "query": query
         }]
     });
     let response = send(world, Method::POST, "/v1/sts/clients", Some(&body)).await;

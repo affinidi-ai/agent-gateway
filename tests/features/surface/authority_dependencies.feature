@@ -60,6 +60,13 @@ Feature: Authorities that Trust Checks and Trust Recorder entries use
     And the refusal names the managed connection "cli" as a record that uses it
     And the Authority "Acme" is stored
 
+  Scenario: Deleting an Authority that a managed connection's Trust Check lists is refused naming the connection
+    Given the operator has created the managed connection "cli" with a Trust Check listing authorities "did:web:typed.example, did:web:acme.example"
+    When the operator deletes the Authority "Acme"
+    Then the admin API response status is 409
+    And the refusal names the managed connection "cli" as a record that uses it
+    And the Authority "Acme" is stored
+
   Scenario: An access token that cannot view surfaces only counts them
     Given the operator has created the surface for route "/orders" with a caller-leg Trust Check "acme-check" against DID "did:web:acme.example"
     When an access token that may delete Authorities but not view surfaces deletes the Authority "Acme"

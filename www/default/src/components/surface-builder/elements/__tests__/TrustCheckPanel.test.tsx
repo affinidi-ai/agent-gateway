@@ -382,6 +382,27 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
     expect(updateFields).not.toHaveBeenCalled();
   });
 
+  it('refuses to save queries naming more than 25 Authorities in total', async () => {
+    const listOf = (id: string, count: number) => ({
+      id,
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      query: { authority_ids: Array.from({ length: count }, (_, i) => `did:web:${id}-${i}`) },
+    });
+    const { updateFields } = await openEditor([
+      listOf('first', 20),
+      listOf('second', 6),
+      stored('did:web:authority-a', 'authority'),
+    ]);
+    fireEvent.click(screen.getByTestId('trust-check-query-2-remove'));
+    expect(screen.getByTestId('trust-check-authority-total-limit')).toHaveTextContent(
+      'Remove 1 to save'
+    );
+    expect(screen.getByTestId('trust-check-add-query')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('trust-check-save'));
+    expect(updateFields).not.toHaveBeenCalled();
+  });
+
   it('flags a deleted Authority once the register has loaded', async () => {
     await openEditor([stored('did:web:deleted-authority.example', 'authority')]);
     expect(screen.getByTestId('trust-check-query-0-authority-missing')).toHaveTextContent(

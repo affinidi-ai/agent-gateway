@@ -379,7 +379,8 @@ pub struct TrustCheckResult {
     /// without depending on array index (element order is stored config,
     /// not a stable contract). Always present on the wire. An element that
     /// lists several authorities yields one result per authority, all with
-    /// this `id` and each with its own `authority_id`.
+    /// this `id` and each with its own `authority_id`, except the codes that
+    /// omit it (see `docs/POLICY.md#several-authorities-in-one-query`).
     pub id: String,
     pub trust_registry_id: String,
     pub query_type: TrqpQueryType,

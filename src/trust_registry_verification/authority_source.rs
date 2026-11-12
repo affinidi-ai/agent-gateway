@@ -1076,6 +1076,35 @@ mod tests {
     }
 
     #[test]
+    fn check_refuses_a_listed_authority_another_tenant_owns_as_it_refuses_a_missing_one() {
+        let references =
+            trust_check_references(&[element(listed("authority-recognised", &[TYPED, ACME], json!({ ACME: "authority" })))]);
+        let other_tenants = registers(vec![authority(ACME, Some("tenant-b"))]);
+
+        let refusal = other_tenants
+            .check(&references, Some("tenant-a"))
+            .unwrap_err();
+        assert_eq!(
+            Err(refusal),
+            registers(Vec::new()).check(&references, Some("tenant-a")),
+            "another tenant's listed Authority is refused exactly as a missing one"
+        );
+        assert_eq!(other_tenants.check(&references, Some("tenant-b")), Ok(()));
+    }
+
+    #[test]
+    fn check_refuses_a_source_on_a_listed_template() {
+        let template = "{{ input.agent.authority_did }}";
+        let surface = surface(vec![listed("authority-recognised", &[ACME, template], json!({ template: "issuer" }))], BILLING);
+
+        assert_eq!(
+            registers(Vec::new()).check(&surface_references(&surface), None),
+            Err("Trust Check 'authority-recognised': authority_source cannot be set on a template; remove it or use a DID"
+                .to_string())
+        );
+    }
+
+    #[test]
     fn check_refuses_a_kept_listed_authority_that_is_gone() {
         let registers = registers(vec![authority(ACME, None)]);
         let stored = surface(

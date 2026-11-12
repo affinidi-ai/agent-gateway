@@ -17,23 +17,34 @@ Feature: Trust Checks that list several authorities
   Scenario: A Trust Check that names one authority and also lists authorities is refused
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check against DID "did:web:authority-a" that also lists authorities "did:web:authority-b"
     Then the admin API response status is 400
+    And the admin API error response mentions "query.authority_id and query.authority_ids cannot both be set"
+
+  Scenario: A Trust Check that names one authority and sets sources for listed authorities is refused
+    When the operator creates the surface for route "/orders" with a caller-leg Trust Check against DID "did:web:authority-a" that takes listed authority "did:web:authority-a" from the Authorities register
+    Then the admin API response status is 400
+    And the admin API error response mentions "authority_sources cannot be set without query.authority_ids"
 
   Scenario: A Trust Check that lists authorities and sets its own timeout is refused
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-b" and a timeout of 2 seconds
     Then the admin API response status is 400
+    And the admin API error response mentions "timeout_secs cannot be set when query.authority_ids is set"
 
   Scenario: A Trust Check that lists the same authority twice is refused
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, did:web:authority-a"
     Then the admin API response status is 400
+    And the admin API error response mentions "query.authority_ids[1] repeats an earlier entry"
 
   Scenario: A Trust Check that lists more than 25 authorities is refused
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing 26 distinct authorities
     Then the admin API response status is 400
+    And the admin API error response mentions "query.authority_ids has 26 entries (max 25)"
 
   Scenario: Trust Checks of one leg that list more than 25 authorities in total are refused
     When the operator creates the surface for route "/orders" with two caller-leg Trust Checks listing 20 and 6 distinct authorities
     Then the admin API response status is 400
+    And the admin API error response mentions "caller trust_check_list queries 26 authorities in total (max 25)"
 
   Scenario: A Trust Check that lists a blank authority is refused
     When the operator creates the surface for route "/orders" with a caller-leg Trust Check listing authorities "did:web:authority-a, "
     Then the admin API response status is 400
+    And the admin API error response mentions "query.authority_ids[1] must not be blank"

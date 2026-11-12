@@ -9,13 +9,15 @@ changes:
         gateway queries every listed authority in parallel, waits for each to answer or time out
         (a built-in 5 seconds per authority; timeout_secs is refused on such a query), and gives
         policy one result per authority under the element's id, so a surface can accept callers
-        that any participating organisation recognises.
+        that any participating organisation recognises. A gateway older than this feature skips any
+        surface or managed connection whose Trust Check lists several authorities, so change such
+        queries to a single authority_id before rolling back.
     - timestamp: '2026-11-12T00:00:00Z'
       title: Link each authority a Trust Check lists to the Authorities register
       description: >-
         Saving a surface or managed connection records, per DID in query.authority_ids, whether
         it was picked from the Authorities register (authority_sources), as it does for
-        authority_id. A listed Authority that no longer exists fails only its own result with
+        authority_id, and refuses authority_sources on a query without query.authority_ids. A listed Authority that no longer exists fails only its own result with
         AUTHORITY_NOT_FOUND without querying its registry, while the other authorities are queried,
         and deleting an Authority that a Trust Check lists is refused naming that Trust Check.
     - timestamp: '2026-11-12T00:00:00Z'

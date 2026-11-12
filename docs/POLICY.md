@@ -325,6 +325,13 @@ result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usua
 Builder's fullscreen editor builds the list row by row; see _Authority lists_ in
 [`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
+A gateway older than this feature cannot read `query.authority_ids`. It skips any stored surface
+or managed connection with a Trust Check that lists several authorities, and logs a parse error.
+Requests to that surface fail as unknown, and that client cannot authenticate. Before rolling
+back, or before a standby on an older version takes over, change each such query to a single
+`authority_id`. Surfaces and managed connections whose queries name one authority load as
+before.
+
 ### The authority of a Trust Check
 
 `query.authority_id` is stored as text: a literal DID, or a template resolved per request.

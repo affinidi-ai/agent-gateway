@@ -1491,6 +1491,23 @@ fn transit_point_has_target_trust_check(
         .push(element);
 }
 
+#[given(expr = "the target-leg Trust Check of transit point {string} lists authorities {string}")]
+fn transit_point_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    transit_point: String,
+    authorities: String,
+) {
+    let element = transit_point_config_mut(world, &transit_point)
+        .trust_check_list
+        .last_mut()
+        .expect("the transit point has a target-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
+}
+
 #[given(expr = "transit point {string} has a policy that denies unless every target Trust Check succeeded")]
 fn transit_point_has_policy_denying_unless_target_trust_checks_ok(
     world: &mut SurfaceWorld,
