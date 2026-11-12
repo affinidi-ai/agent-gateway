@@ -192,7 +192,7 @@ impl CallerHeaders {
     ];
 
     /// Whether `name` is one of [`Self::NAMES`], in any case, or a caller key
-    /// header ([`crate::proxy::caller_key::is_caller_key_header`]). The Access
+    /// header ([`crate::config::caller_key::is_caller_key_header`]). The Access
     /// Point, Fabric receive and Transit Point request filters drop these from
     /// what a caller or a peer gateway sent, so an agent or a Transit Point's
     /// target sees only the values the gateway sets.
@@ -200,7 +200,7 @@ impl CallerHeaders {
         Self::NAMES
             .iter()
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
-            || crate::proxy::caller_key::is_caller_key_header(name)
+            || crate::config::caller_key::is_caller_key_header(name)
     }
 
     /// Build the caller-info header set from a [`CallerIdentity`].

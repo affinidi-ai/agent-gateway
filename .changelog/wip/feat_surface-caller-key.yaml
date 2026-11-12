@@ -12,14 +12,23 @@ changes:
         identity claim the token carries as a string, as 32 bytes of base64url without padding,
         so a Target that keeps data per caller can encrypt it with a key its own operator cannot
         derive. API key, DID Auth, mTLS and anonymous callers, and callers whose credential
-        failed, get none. A caller's own `x-caller-key`, or a header any stored surface's
-        `caller_key` names, is never forwarded, on any surface. When the secret cannot be read
-        the request is forwarded without the header and a warning names the surface. A save
-        refuses a header that is not a lower-case header name, one the gateway reserves, reads
-        or sets, or one the surface already uses, invalid claims, and a secret of fewer than 32
-        bytes; a PUT that leaves the setting out, as a Surface Builder save does, keeps it. Log
-        redaction treats `caller_key` fields and attributes as credentials.
-  changed: []
+        failed, get none. When the secret cannot be read the request is forwarded without the
+        header and a warning names the surface. A save refuses a header outside the caller key
+        family (`x-caller-key`, or `x-caller-key-` followed by lower-case words, at most 64
+        characters) or one the surface already uses, invalid claims, and a secret of fewer than
+        32 bytes; a PUT that leaves the setting out, as a Surface Builder save does, keeps it.
+        Log redaction treats `caller_key` fields and attributes as credentials.
+  changed:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Stop forwarding any x-caller-key header a caller sends, on every surface
+      description: >-
+        Every header whose name, lower-cased with `_` read as `-`, is `x-caller-key` or starts
+        with `x-caller-key-` is now dropped from what a caller, a managed agent or a peer gateway
+        sends, on every surface and path (Access Point, mirror, Fabric send and receive, Transit
+        Point, agent card fetch and MCP proxy backend), whether or not the surface sets
+        `caller_key`, so no caller can supply or spoof a caller key and no surface's choice of
+        header affects another's traffic. A Target that read such a header from its callers must
+        take it under another name.
   fixed: []
   removed: []
   security: []

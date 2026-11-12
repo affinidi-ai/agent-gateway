@@ -4770,11 +4770,6 @@ async fn apply_surface_change_while_locked(
     crate::proxy::agent_card_cache::invalidate_all();
     crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
 
-    match change {
-        SurfaceChange::Upsert(surface) => crate::proxy::caller_key::record_surface(surface),
-        SurfaceChange::Delete(id) => crate::proxy::caller_key::forget_surface(id),
-    }
-
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {
         SurfaceChange::Upsert(surface) => surface.surface_id.as_str(),

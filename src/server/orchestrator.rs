@@ -1377,7 +1377,6 @@ pub async fn run_axum_proxy(
             match surface_store.list_all().await {
                 Ok(surfaces) => {
                     for surface in &surfaces {
-                        crate::proxy::caller_key::record_surface(surface);
                         if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
                             continue;
                         }
@@ -4647,7 +4646,6 @@ async fn rederive_planes_on_activation(
         match store.list_all().await {
             Ok(surfaces) => {
                 for surface in &surfaces {
-                    crate::proxy::caller_key::record_surface(surface);
                     if surface.status != crate::config::agent_surface::SurfaceStatus::Active {
                         continue;
                     }

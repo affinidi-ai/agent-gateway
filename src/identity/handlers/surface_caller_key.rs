@@ -148,8 +148,19 @@ mod tests {
 
     #[test]
     fn an_invalid_caller_key_is_refused() {
-        let invalid = surface(serde_json::json!({ "caller_key": { "secret_id": "caller-keys", "header": "Host" } }));
-        assert_eq!(refusal(&invalid), Some("caller_key.header must be lower case".to_string()));
+        for header in ["x-api-key", "x-user-vault-key", "Host"] {
+            let invalid =
+                surface(serde_json::json!({ "caller_key": { "secret_id": "caller-keys", "header": header } }));
+            assert_eq!(
+                refusal(&invalid),
+                Some(
+                    "caller_key.header must be x-caller-key, or x-caller-key- followed by lower-case letters and digits \
+                     in words joined by single hyphens, at most 64 characters"
+                        .to_string()
+                ),
+                "{header}"
+            );
+        }
     }
 
     #[test]
@@ -157,37 +168,37 @@ mod tests {
         let cases = [
             (
                 serde_json::json!({
-                    "caller_key": { "secret_id": "caller-keys", "header": "x-api-key" },
+                    "caller_key": { "secret_id": "caller-keys", "header": "x-caller-key-client" },
                     "access_point": {
                         "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a",
                         "caller_authentication": { "methods": [
-                            { "type": "api_key", "extraction": { "source": "http_header", "field": "X-API-Key" }, "secret_id": "key" }
+                            { "type": "api_key", "extraction": { "source": "http_header", "field": "X-Caller-Key-Client" }, "secret_id": "key" }
                         ] }
                     }
                 }),
-                "caller_key.header x-api-key is already used by source authentication",
+                "caller_key.header x-caller-key-client is already used by source authentication",
             ),
             (
                 serde_json::json!({
-                    "caller_key": { "secret_id": "caller-keys", "header": "x-vendor-key" },
+                    "caller_key": { "secret_id": "caller-keys", "header": "x-caller-key-vendor" },
                     "target": {
                         "endpoint": "https://agent.example",
                         "auth": { "method": { "static_secret": {
-                            "secret_id": "vendor", "header_name": "X-Vendor-Key", "header_format": "{value}"
+                            "secret_id": "vendor", "header_name": "X-Caller-Key-Vendor", "header_format": "{value}"
                         } } }
                     }
                 }),
-                "caller_key.header x-vendor-key is already used by a Target or delegated credential",
+                "caller_key.header x-caller-key-vendor is already used by a Target or delegated credential",
             ),
             (
                 serde_json::json!({
-                    "caller_key": { "secret_id": "caller-keys", "header": "x-tenant" },
+                    "caller_key": { "secret_id": "caller-keys", "header": "x-caller-key-tenant" },
                     "access_point": {
                         "listen_address": "0.0.0.0:9000", "route": "/agent", "protocol": "a2a",
-                        "header_metadata_mapping": { "headers": [ { "header": "X-Tenant", "field": "tenant" } ] }
+                        "header_metadata_mapping": { "headers": [ { "header": "X-Caller-Key-Tenant", "field": "tenant" } ] }
                     }
                 }),
-                "caller_key.header x-tenant is already used by header metadata mapping",
+                "caller_key.header x-caller-key-tenant is already used by header metadata mapping",
             ),
         ];
         for (extra, message) in cases {
@@ -198,13 +209,13 @@ mod tests {
     #[test]
     fn a_caller_key_header_a_variant_sends_is_refused() {
         let with_variant = surface(serde_json::json!({
-            "caller_key": { "secret_id": "caller-keys", "header": "x-vendor-key" },
+            "caller_key": { "secret_id": "caller-keys", "header": "x-caller-key-vendor" },
             "variants": [ {
                 "id": "variant-1", "alias": "beta", "name": "Beta",
                 "overrides": { "target": {
                     "endpoint": "https://agent.example",
                     "auth": { "method": { "static_secret": {
-                        "secret_id": "vendor", "header_name": "x-vendor-key", "header_format": "{value}"
+                        "secret_id": "vendor", "header_name": "x_caller_key_vendor", "header_format": "{value}"
                     } } }
                 } }
             } ]
@@ -212,7 +223,7 @@ mod tests {
         assert_eq!(
             refusal(&with_variant),
             Some(
-                "caller_key.header x-vendor-key is already used by a Target or delegated credential in variant 'beta'"
+                "caller_key.header x-caller-key-vendor is already used by a Target or delegated credential in variant 'beta'"
                     .to_string()
             )
         );

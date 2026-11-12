@@ -6,13 +6,12 @@
 //! HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v1` as the
 //! salt and `surface id, 0x00, iss, 0x00, claim name, 0x00, claim value` as the info, 32 bytes,
 //! base64url without padding. The claim is the first of `identity_claims` the token carries as
-//! a non-empty string. No other caller gets a key, and a caller's own header of that name, or
-//! of any name a stored surface's `caller_key` uses, is never forwarded.
+//! a non-empty string. No other caller gets a key, and no header of the caller key family
+//! ([`crate::config::caller_key::is_caller_key_header`]) a caller sends is ever forwarded.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use base64::Engine;
-use dashmap::DashMap;
 use hkdf::Hkdf;
 use serde_json::Value;
 use sha2::Sha256;
@@ -20,40 +19,11 @@ use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::config::agent_surface::AgentSurface;
-use crate::config::caller_key::{CallerKeyConfig, DEFAULT_CALLER_KEY_HEADER, MIN_SECRET_BYTES};
-use crate::config::target_auth_rules::same_header_name;
+use crate::config::caller_key::{CallerKeyConfig, MIN_SECRET_BYTES};
 use crate::secrets::SecretsStore;
 use crate::source_auth::AuthenticatedIdentity;
 
 const SALT: &[u8] = b"agent-gateway-caller-key-v1";
-
-/// The caller key header each stored surface's `caller_key` names, by surface id.
-static CONFIGURED_HEADERS: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
-
-/// Note the caller key header `surface` names, or that it names none.
-pub(crate) fn record_surface(surface: &AgentSurface) {
-    match surface.caller_key.as_ref() {
-        Some(config) => {
-            CONFIGURED_HEADERS.insert(surface.surface_id.clone(), config.header.clone());
-        }
-        None => forget_surface(&surface.surface_id),
-    }
-}
-
-/// Forget the caller key header of a deleted surface.
-pub(crate) fn forget_surface(surface_id: &str) {
-    CONFIGURED_HEADERS.remove(surface_id);
-}
-
-/// Whether `name` is a caller key header: the default, or one a stored surface's `caller_key`
-/// names, compared without regard to case or to `_` against `-`, since some servers read both
-/// spellings as one. Only the gateway sets these, so a caller's copy is never forwarded.
-pub fn is_caller_key_header(name: &str) -> bool {
-    same_header_name(name, DEFAULT_CALLER_KEY_HEADER)
-        || CONFIGURED_HEADERS
-            .iter()
-            .any(|entry| same_header_name(name, entry.value()))
-}
 
 /// What names a caller for its key: the token's issuer and the identity claim with its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,10 +332,10 @@ mod tests {
         assert_eq!(first, second, "one caller's key is stable across requests");
 
         let renamed =
-            surface("surface-1", serde_json::json!({ "secret_id": "caller-keys", "header": "x-user-vault-key" }));
+            surface("surface-1", serde_json::json!({ "secret_id": "caller-keys", "header": "x-caller-key-memory" }));
         assert_eq!(
             header_for(&renamed, Some(&alice()), &secrets).await,
-            Some(("x-user-vault-key".to_string(), "_gfJk16BtniPoTKJ7mn5nYKby4Gmbw7sxgLohCnKI34".to_string()))
+            Some(("x-caller-key-memory".to_string(), "_gfJk16BtniPoTKJ7mn5nYKby4Gmbw7sxgLohCnKI34".to_string()))
         );
     }
 
@@ -425,32 +395,5 @@ mod tests {
                 .is_some(),
             "the surface's own tenant's secret"
         );
-    }
-
-    #[test]
-    fn the_default_and_every_stored_surfaces_caller_key_header_are_caller_key_headers() {
-        for name in ["x-caller-key", "X-Caller-Key", "x_caller_key"] {
-            assert!(is_caller_key_header(name), "{name}");
-        }
-        let header = "x-caller-key-registry-test";
-        assert!(!is_caller_key_header(header));
-        record_surface(&surface(
-            "caller-key-registry-test",
-            serde_json::json!({ "secret_id": "caller-keys", "header": header }),
-        ));
-        assert!(is_caller_key_header(header));
-        assert!(is_caller_key_header("X_Caller_Key_Registry_Test"));
-        assert!(!is_caller_key_header("x-caller-key-registry"));
-        forget_surface("caller-key-registry-test");
-        assert!(!is_caller_key_header(header));
-
-        let mut renamed = surface(
-            "caller-key-registry-rename-test",
-            serde_json::json!({ "secret_id": "caller-keys", "header": "x-caller-key-before-rename" }),
-        );
-        record_surface(&renamed);
-        renamed.caller_key = None;
-        record_surface(&renamed);
-        assert!(!is_caller_key_header("x-caller-key-before-rename"), "a surface that drops caller_key");
     }
 }

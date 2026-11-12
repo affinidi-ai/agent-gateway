@@ -22198,20 +22198,11 @@ allow if {
         assert!(!should_forward_ap_request_header_with_mapping("X-Gateway-Fabric-Hops", &[], None, None));
     }
 
-    /// A caller key the caller sends never reaches the Target or a Fabric peer: the default
-    /// header and one a stored surface's `caller_key` names, in any spelling, on a surface
-    /// without the setting too.
+    /// A caller key the caller sends never reaches the Target or a Fabric peer: any header of
+    /// the caller key family, in any spelling. A header outside the family still does.
     #[test]
     fn a_caller_key_the_caller_sends_is_stripped() {
-        let mut configured: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
-            "surface_id": "ap-strip-caller-key", "name": "keyed",
-            "access_point": { "listen_address": "0.0.0.0:9000", "route": "/keyed", "protocol": "a2a" },
-            "target": { "endpoint": "https://agent.example" },
-            "caller_key": { "secret_id": "caller-keys", "header": "x-ap-strip-vault-key" },
-        }))
-        .unwrap();
-        crate::proxy::caller_key::record_surface(&configured);
-        for name in ["x-caller-key", "X-Caller-Key", "x_caller_key", "x-ap-strip-vault-key", "X_AP_Strip_Vault_Key"] {
+        for name in ["x-caller-key", "X-Caller-Key", "x_caller_key", "x-caller-key-memory", "X_Caller_Key_Memory"] {
             assert!(!should_forward_ap_request_header_with_mapping(name, &[], None, None), "{name}");
             assert!(!forwards_ap_caller_header(name, &[], None, None, &[]), "{name}");
             let mut headers = HeaderMap::new();
@@ -22223,10 +22214,10 @@ allow if {
             assert!(!buffered.contains_key(&name.to_uppercase()), "{name}");
             assert!(streamed.get(name).is_none(), "{name}");
         }
-        assert!(should_forward_ap_request_header_with_mapping("x-ap-strip-vault", &[], None, None));
-        configured.caller_key = None;
-        crate::proxy::caller_key::record_surface(&configured);
-        assert!(should_forward_ap_request_header_with_mapping("x-ap-strip-vault-key", &[], None, None));
+        for name in ["x-api-key", "x-caller-keys", "x-caller-did-hint"] {
+            assert!(should_forward_ap_request_header_with_mapping(name, &[], None, None), "{name}");
+            assert!(forwards_ap_caller_header(name, &[], None, None, &[]), "{name}");
+        }
     }
 
     #[test]

@@ -3,31 +3,36 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::target_auth_rules::{is_header_name, reserved_header, same_header_name};
-
-/// The header a caller key is sent in when `caller_key.header` is not set. A caller's header
-/// of this name is never forwarded, on any surface.
+/// The header a caller key is sent in when `caller_key.header` is not set, and the first word
+/// of every caller key header: `x-caller-key`, or `x-caller-key-` and more.
 pub const DEFAULT_CALLER_KEY_HEADER: &str = "x-caller-key";
+
+/// The longest caller key header.
+pub const MAX_CALLER_KEY_HEADER_LEN: usize = 64;
 
 /// The fewest bytes a caller key secret holds: fewer would let whoever sees the keys guess it.
 pub const MIN_SECRET_BYTES: usize = 32;
 
-/// Headers the gateway reads or sets on a forwarded request besides the reserved ones
-/// ([`reserved_header`]): the caller's credentials and cookies, and the content and protocol
-/// headers of the request it forwards.
-const GATEWAY_HEADERS: [&str; 11] = [
-    "authorization",
-    "cookie",
-    "accept",
-    "accept-encoding",
-    "content-type",
-    "content-encoding",
-    "mcp-protocol-version",
-    "last-event-id",
-    "a2a-version",
-    "a2a-extensions",
-    "x-a2a-extensions",
-];
+/// Whether a header named `name` belongs to the caller key family, which only the gateway
+/// sets: once lower-cased, with `_` read as `-` as some servers do, it is `x-caller-key` or
+/// starts with `x-caller-key-`. A caller's, an agent's or a peer gateway's copy of such a
+/// header is never forwarded, on any surface.
+pub fn is_caller_key_header(name: &str) -> bool {
+    let fold = |byte: u8| match byte {
+        b'_' => b'-',
+        byte => byte.to_ascii_lowercase(),
+    };
+    let name = name.as_bytes();
+    let prefix = DEFAULT_CALLER_KEY_HEADER.as_bytes();
+    name.len() >= prefix.len()
+        && name
+            .iter()
+            .zip(prefix)
+            .all(|(byte, expected)| fold(*byte) == *expected)
+        && name
+            .get(prefix.len())
+            .is_none_or(|byte| fold(*byte) == b'-')
+}
 
 /// Where a surface's caller keys come from and how its Target receives them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,9 +60,9 @@ fn default_identity_claims() -> Vec<String> {
 }
 
 impl CallerKeyConfig {
-    /// The first problem with the setting on its own: no secret, a header that is no lower-case
-    /// HTTP header name or that the gateway reserves, reads or sets, or an identity claim list
-    /// that is empty, repeats a claim or names one that does not identify a caller.
+    /// The first problem with the setting on its own: no secret, a header outside the caller key
+    /// family ([`header_problem`]), or an identity claim list that is empty, repeats a claim or
+    /// names one that does not identify a caller.
     pub fn validate(&self) -> Result<(), String> {
         if self
             .secret_id
@@ -91,25 +96,28 @@ impl CallerKeyConfig {
     }
 }
 
-/// What is wrong with `header` as a caller key header, if anything.
+/// What is wrong with `header` as a caller key header, if anything: it must be
+/// `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits
+/// joined by single hyphens, at most [`MAX_CALLER_KEY_HEADER_LEN`] characters in all.
 fn header_problem(header: &str) -> Option<String> {
-    if !is_header_name(header) {
-        return Some("must be an HTTP header name".to_string());
-    }
-    if header != header.to_ascii_lowercase() {
-        return Some("must be lower case".to_string());
-    }
-    if let Some(reserved) = reserved_header(header) {
-        return Some(format!("must not be the reserved header {reserved}"));
-    }
-    if GATEWAY_HEADERS
-        .iter()
-        .any(|gateway| same_header_name(gateway, header))
-        || crate::proxy::outbound_handler::is_proxy_forwarding_header(header)
-    {
-        return Some(format!("must not be {header}, which the gateway reads or sets itself"));
-    }
-    None
+    let in_family = header == DEFAULT_CALLER_KEY_HEADER
+        || header
+            .strip_prefix(DEFAULT_CALLER_KEY_HEADER)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|rest| {
+                rest.split('-').all(|word| {
+                    !word.is_empty()
+                        && word
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                })
+            });
+    (!in_family || header.len() > MAX_CALLER_KEY_HEADER_LEN).then(|| {
+        format!(
+            "must be x-caller-key, or x-caller-key- followed by lower-case letters and digits in words joined \
+             by single hyphens, at most {MAX_CALLER_KEY_HEADER_LEN} characters"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -149,38 +157,59 @@ mod tests {
     }
 
     #[test]
-    fn a_caller_key_header_is_a_lower_case_header_name_the_gateway_leaves_alone() {
-        for accepted in ["x-caller-key", "x-user-vault-key", "x_tenant_key", "caller-key"] {
+    fn a_caller_key_header_is_x_caller_key_or_one_of_its_family() {
+        let longest = format!("x-caller-key-{}", "a".repeat(MAX_CALLER_KEY_HEADER_LEN - 13));
+        for accepted in
+            ["x-caller-key", "x-caller-key-memory", "x-caller-key-user-vault-2", "x-caller-key-7", longest.as_str()]
+        {
             let setting = config(serde_json::json!({ "secret_id": "caller-keys", "header": accepted }));
             assert_eq!(setting.validate(), Ok(()), "{accepted}");
         }
-        let refused = [
-            ("", "caller_key.header must be an HTTP header name"),
-            ("x caller key", "caller_key.header must be an HTTP header name"),
-            ("x-caller-key\r\n", "caller_key.header must be an HTTP header name"),
-            ("X-Caller-Key", "caller_key.header must be lower case"),
-            ("connection", "caller_key.header must not be the reserved header Connection"),
-            ("transfer-encoding", "caller_key.header must not be the reserved header Transfer-Encoding"),
-            ("host", "caller_key.header must not be the reserved header Host"),
-            ("x-transit-token", "caller_key.header must not be the reserved header X-Transit-Token"),
-            ("x-caller-did", "caller_key.header must not be the reserved header X-Caller-Did"),
-            ("x_gateway_trace_id", "caller_key.header must not be the reserved header X-Gateway-Trace-Id"),
-            ("mcp-session-id", "caller_key.header must not be the reserved header Mcp-Session-Id"),
-            ("authorization", "caller_key.header must not be authorization, which the gateway reads or sets itself"),
-            ("cookie", "caller_key.header must not be cookie, which the gateway reads or sets itself"),
-            (
-                "accept-encoding",
-                "caller_key.header must not be accept-encoding, which the gateway reads or sets itself",
-            ),
-            (
-                "x-forwarded-for",
-                "caller_key.header must not be x-forwarded-for, which the gateway reads or sets itself",
-            ),
-            ("forwarded", "caller_key.header must not be forwarded, which the gateway reads or sets itself"),
-        ];
-        for (header, message) in refused {
-            let setting = config(serde_json::json!({ "secret_id": "caller-keys", "header": header }));
-            assert_eq!(setting.validate(), Err(message.to_string()), "{header:?}");
+        let refusal = "caller_key.header must be x-caller-key, or x-caller-key- followed by lower-case letters and \
+                       digits in words joined by single hyphens, at most 64 characters";
+        let too_long = format!("{longest}a");
+        for refused in [
+            "",
+            "X-Caller-Key",
+            "x_caller_key",
+            "x-caller-keys",
+            "x-caller-key-",
+            "x-caller-key--memory",
+            "x-caller-key-memory-",
+            "x-caller-key-Memory",
+            "x-caller-key-user_vault",
+            "x-caller-key-memory\r\n",
+            "x-user-vault-key",
+            "x-api-key",
+            "authorization",
+            "host",
+            "x-transit-token",
+            too_long.as_str(),
+        ] {
+            let setting = config(serde_json::json!({ "secret_id": "caller-keys", "header": refused }));
+            assert_eq!(setting.validate(), Err(refusal.to_string()), "{refused:?}");
+        }
+    }
+
+    #[test]
+    fn the_caller_key_family_is_every_spelling_of_x_caller_key_and_its_longer_names() {
+        for name in [
+            "x-caller-key",
+            "X-Caller-Key",
+            "x_caller_key",
+            "X_CALLER_KEY",
+            "x-caller-key-memory",
+            "X_Caller_Key_Memory",
+            "x-caller-key_memory",
+            "x-caller-key-",
+            "x-caller-key-anything.at_all",
+        ] {
+            assert!(is_caller_key_header(name), "{name}");
+        }
+        for name in
+            ["x-caller-keys", "x-caller-ke", "x-caller", "caller-key", "x-api-key", "x-caller-did", "xx-caller-key", ""]
+        {
+            assert!(!is_caller_key_header(name), "{name}");
         }
     }
 

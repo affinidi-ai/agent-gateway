@@ -11554,6 +11554,7 @@ mod tests {
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
                 "X-Caller-Key": "peer-sent",
                 "x_caller_key": "peer-sent",
+                "X-Caller-Key-Memory": "peer-sent",
                 "Cookie": "__Host-session_token=peer-dashboard-session",
                 "Accept-Encoding": "gzip, br",
                 "x-peer-context": "kept"
@@ -11574,6 +11575,7 @@ mod tests {
             "x-did-signed-identity",
             "x-caller-key",
             "x_caller_key",
+            "x-caller-key-memory",
             "cookie",
         ] {
             assert!(

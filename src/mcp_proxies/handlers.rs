@@ -2246,8 +2246,8 @@ pub(crate) async fn handle_modern_surface_request(
 
 /// Extract headers from an inbound request that should be forwarded to the
 /// upstream REST backend. Skips hop-by-hop, host, content-length, and
-/// internal gateway headers, and any caller key header
-/// ([`crate::proxy::caller_key::is_caller_key_header`]), which only the gateway
+/// internal gateway headers, and any header of the caller key family
+/// ([`crate::config::caller_key::is_caller_key_header`]), which only the gateway
 /// sets. Converts from axum `HeaderMap` to reqwest `HeaderMap`.
 fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
     let mut forwarded = ReqwestHeaderMap::new();
@@ -2270,7 +2270,7 @@ fn extract_forwardable_headers(headers: &HeaderMap) -> ReqwestHeaderMap {
                 | "content-type"
                 | "host"
                 | "accept"
-        ) || crate::proxy::caller_key::is_caller_key_header(&name)
+        ) || crate::config::caller_key::is_caller_key_header(&name)
         {
             continue;
         }
@@ -4795,12 +4795,14 @@ mod tests {
         let mut caller = axum::http::HeaderMap::new();
         caller.insert("x-caller-key", axum::http::HeaderValue::from_static("forged"));
         caller.insert("x_caller_key", axum::http::HeaderValue::from_static("forged"));
+        caller.insert("x-caller-key-memory", axum::http::HeaderValue::from_static("forged"));
         caller.insert("x-api-key", axum::http::HeaderValue::from_static("backend-key"));
 
         let forwarded = super::extract_forwardable_headers(&caller);
 
         assert!(!forwarded.contains_key("x-caller-key"));
         assert!(!forwarded.contains_key("x_caller_key"));
+        assert!(!forwarded.contains_key("x-caller-key-memory"));
         assert_eq!(forwarded["x-api-key"], "backend-key");
     }
 
