@@ -36,7 +36,8 @@ use crate::bdd_support::config::agent_surface::{
     AccessPointFixture, AgentSurfaceFixture, TargetFixture, TransitPointFixture,
 };
 
-const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+pub(crate) const AGENT_IDENTITY_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity/v1";
+const AGENT_IDENTITY_CREDENTIAL_URI: &str = "https://fabric.affinidi.io/extensions/agent-identity-credential/v1";
 
 fn set_primary_target_response(
     world: &mut SurfaceWorld,
@@ -3560,6 +3561,34 @@ async fn managed_agent_response_has_identity(
             }
         }
     });
+    set_managed_agent_message_response(world, response).await;
+}
+
+#[given(expr = "managed agent {string} responds without the agent-identity extension")]
+async fn managed_agent_response_has_no_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "kind": "message",
+            "messageId": "msg-001",
+            "role": "agent",
+            "parts": [{"kind": "text", "text": "response"}]
+        }
+    });
+    set_managed_agent_message_response(world, response).await;
+}
+
+async fn set_managed_agent_message_response(
+    world: &mut SurfaceWorld,
+    response: serde_json::Value,
+) {
     // Surfaces created through the admin API start the mock before this step.
     if let Some(infra) = world.infra.as_ref() {
         infra
@@ -3632,6 +3661,26 @@ fn managed_agent_streams_a_task_claiming_identity(
     set_primary_target_response(world, streamed_task(Some(message)));
 }
 
+#[given(
+    expr = "managed agent {string} streams a task whose final status message declares its identity without the payload"
+)]
+fn managed_agent_streams_a_task_with_an_invalid_identity_claim(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let message = serde_json::json!({
+        "messageId": "bdd-agent-message",
+        "role": "ROLE_AGENT",
+        "parts": [{ "text": "done" }],
+        "extensions": [AGENT_IDENTITY_URI],
+        "metadata": {}
+    });
+    set_primary_target_response(world, streamed_task(Some(message)));
+}
+
 #[given(expr = "managed agent {string} streams the error {string}")]
 fn managed_agent_streams_an_error(
     world: &mut SurfaceWorld,
@@ -3667,6 +3716,54 @@ fn managed_agent_publishes_agent_card_with_identity(
                     }
                 }
             ]
+        }
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(expr = "managed agent {string} publishes an agent card without the agent-identity extension")]
+fn managed_agent_publishes_agent_card_without_identity(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {"streaming": false}
+    });
+    set_primary_target_response(world, agent_card);
+}
+
+#[given(
+    expr = "managed agent {string} publishes an agent card whose identity credential names a different DID than its presentation"
+)]
+fn managed_agent_publishes_agent_card_with_mismatched_credential(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+) {
+    world
+        .actors
+        .expect_target_kind(&agent_name, TargetActorKind::ManagedAgent);
+    let presentation = serde_json::json!({
+        "holder": "did:key:z6MkPresentationHolder",
+        "verifiableCredential": {"credentialSubject": {"id": "did:key:z6MkPresentationHolder"}}
+    });
+    let agent_card = serde_json::json!({
+        "name": "test-agent",
+        "url": "http://mock.local",
+        "version": "1.0.0",
+        "capabilities": {
+            "extensions": [{
+                "uri": AGENT_IDENTITY_CREDENTIAL_URI,
+                "params": {
+                    "did": "did:key:z6MkClaimedAgent",
+                    "verifiablePresentation": presentation.to_string()
+                }
+            }]
         }
     });
     set_primary_target_response(world, agent_card);

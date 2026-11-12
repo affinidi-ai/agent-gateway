@@ -4761,6 +4761,7 @@ async fn apply_surface_change_while_locked(
     // DashMap clear) and safe (worst case is the next few requests
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
+    crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
 
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {

@@ -261,7 +261,9 @@ _Identities page_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#identities-page).
 
 The Agent Cards view of an A2A or AP2 surface shows the managed agent's card beside the served card,
-and the Managed Agent panel shows its fetch status; see _Agent Cards tab_ in
+and the Managed Agent panel shows its fetch status, including a card served without a managed
+identity, in the warning tone; a card refused for its identity names the identity error; see
+_Agent Cards tab_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#agent-cards-tab).
 
 The Identities page shows one row per surface Managed Agent, with its earlier DIDs (from its

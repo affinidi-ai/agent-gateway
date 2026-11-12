@@ -36,6 +36,14 @@ Feature: A2A event streams on a direct surface
     And the final task status is "TASK_STATE_COMPLETED"
     And the stream ended with the error code "identity_extension_missing"
 
+  Scenario: A stream whose identity claim is invalid ends with an identity validation error
+    Given the surface has managed identity enabled
+    And managed agent "bravo" streams a task whose final status message declares its identity without the payload
+    When the caller sends a streaming message to the surface
+    Then the response status is 200
+    And the caller received the stream events "task, statusUpdate, artifactUpdate, error"
+    And the stream ended with the error code "identity_validation_failed"
+
   Scenario: A stream that only carries the managed agent's error gets no identity error
     Given the surface has managed identity enabled
     And managed agent "bravo" streams the error "Task not found"
