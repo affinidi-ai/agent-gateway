@@ -660,6 +660,38 @@ describe('trustCheckDefinition — multiple queries per node', () => {
   it('flags an empty queries[] as incomplete', () => {
     expect(trustCheckDefinition.incompleteReason({ queries: [] })).toMatch(/at least one/i);
   });
+
+  describe('Authorities in total across the queries', () => {
+    const listing = (n: number, prefix: string) => ({
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: Object.fromEntries(
+        Array.from({ length: n }, (_, i) => [`did:web:${prefix}-${i}`, 'authority'])
+      ),
+      query: {
+        authority_ids: Array.from({ length: n }, (_, i) => `did:web:${prefix}-${i}`),
+        entity_id: '{{ input.agent.did }}',
+      },
+    });
+    const singleQuery = {
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_source: 'authority',
+      query: { authority_id: 'did:web:one', entity_id: '{{ input.agent.did }}' },
+    };
+
+    it('accepts 25 Authorities in total, a single-authority query counting one', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({ queries: [listing(24, 'a'), singleQuery] })
+      ).toBeNull();
+    });
+
+    it('flags more than 25 Authorities in total as incomplete', () => {
+      expect(
+        trustCheckDefinition.incompleteReason({ queries: [listing(20, 'a'), listing(6, 'b')] })
+      ).toMatch(/26 Authorities.*at most 25 in total/);
+    });
+  });
 });
 
 describe('trustCheckDefinition — hydrate → buildPayload round-trip', () => {

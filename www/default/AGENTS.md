@@ -698,9 +698,12 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   down to one makes the query single again. Templates (the caller-leg defaults) are offered only
   while there is one row, and **Add Authority** stays disabled until every row holds a literal DID
   (`canAddAuthorityRow`) and below `TRUST_CHECK_AUTHORITIES_MAX` (25 per query); at the limit the
-  count line shows it. The gateway also refuses on save a Trust Check list whose queries name more
-  than 25 authorities in total (a single-authority query counts one); the editor does not check
-  that total, so such a Save gets the gateway's `400`. A DID picked in one row is not offered in another. A row whose
+  count line shows it. The gateway also refuses a Trust Check list whose queries name more than 25
+  authorities in total (a single-authority query counts one), and the editor holds the same total
+  (`listAuthorityCount`): at 25, **Add Authority** and **Add Another Query** are disabled and the
+  Queries card says why (`trust-check-authority-total-limit`); above it (a stored list), the node is
+  incomplete ("Lists N Authorities; a Trust Check checks at most 25 in total") and the editor's
+  Save stays blocked until enough are removed. A DID picked in one row is not offered in another. A row whose
   Authority was deleted shows the picker's "Deleted Authority" option and warning, and like a
   deleted single Authority it is listed in the panel's "Configuration required" warning, draws the
   node unconfigured and blocks Save (`missingTrustCheckAuthorities` walks `authorityRows`). An

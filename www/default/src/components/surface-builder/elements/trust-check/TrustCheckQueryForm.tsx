@@ -112,6 +112,8 @@ interface TrustCheckQueryFormProps {
   setAuthorityRowAt?: (index: number, row: number, did: string, source?: AuthoritySource) => void;
   /** Remove one row of a query that lists several Authorities. */
   removeAuthorityRowAt?: (index: number, row: number) => void;
+  /** Authorities the whole Trust Check list names (`listAuthorityCount`); defaults to this query's. */
+  listAuthorityTotal?: number;
   updateEntityAt: (index: number, value: string) => void;
   handleQueryTypeChangeAt: (index: number, next: TrustCheckRecordType) => void;
   /**
@@ -138,6 +140,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   addAuthorityRowAt,
   setAuthorityRowAt,
   removeAuthorityRowAt,
+  listAuthorityTotal,
   updateEntityAt,
   handleQueryTypeChangeAt,
   saveAttempted = false,
@@ -210,6 +213,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
             authorities={authorities}
             authoritiesLoaded={authoritiesLoaded}
             saveAttempted={saveAttempted}
+            listTotal={listAuthorityTotal}
             onSingleChange={(did, source) => updateAuthorityAt(index, did, source)}
             onRowChange={
               setAuthorityRowAt
@@ -635,6 +639,8 @@ interface AuthorityRowsProps {
   authorities: Authority[];
   authoritiesLoaded: boolean;
   saveAttempted: boolean;
+  /** Authorities the whole Trust Check list names; defaults to this query's rows. */
+  listTotal?: number;
   /** Single-row change, the existing `authority_id` write. */
   onSingleChange: (did: string, source?: AuthoritySource) => void;
   onRowChange?: (row: number, did: string, source?: AuthoritySource) => void;
@@ -658,6 +664,7 @@ const AuthorityRows: React.FC<AuthorityRowsProps> = ({
   authorities,
   authoritiesLoaded,
   saveAttempted,
+  listTotal,
   onSingleChange,
   onRowChange,
   onAddRow,
@@ -666,7 +673,9 @@ const AuthorityRows: React.FC<AuthorityRowsProps> = ({
   const rows = authorityRows(queryConfig);
   const multi = isMultiAuthorityQuery(queryConfig);
   const atCap = rows.length >= TRUST_CHECK_AUTHORITIES_MAX;
-  const canAdd = canAddAuthorityRow(queryConfig);
+  const total = listTotal ?? rows.length;
+  const listAtCap = !atCap && total >= TRUST_CHECK_AUTHORITIES_MAX;
+  const canAdd = canAddAuthorityRow(queryConfig, total);
 
   const addButton = onAddRow && (
     <button
@@ -677,9 +686,11 @@ const AuthorityRows: React.FC<AuthorityRowsProps> = ({
       title={
         atCap
           ? `A query checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities`
-          : canAdd
-            ? undefined
-            : 'Pick an Issuer or Authority in every row first'
+          : listAtCap
+            ? `A Trust Check checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities in total`
+            : canAdd
+              ? undefined
+              : 'Pick an Issuer or Authority in every row first'
       }
       data-testid={`${tidPrefix}-add-authority`}
     >

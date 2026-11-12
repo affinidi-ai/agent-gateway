@@ -8,6 +8,7 @@ import {
   authorityCountLabel,
   isMigratedTrustCheck,
   isMultiAuthorityQuery,
+  listAuthorityCount,
   listedAuthorities,
   makeDefaultQuery,
   queryAuthorityMissing,
@@ -18,6 +19,7 @@ import {
   removeAuthorityRow,
   setAuthorityRow,
   trustCheckLeg,
+  TRUST_CHECK_AUTHORITIES_MAX,
   type TrustCheckQueryConfig,
   type TrustCheckRecordType,
 } from './definition';
@@ -144,7 +146,10 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     setDraft(prev => prev.map((q, i) => (i === idx ? fn(q) : q)));
   };
 
-  const addAuthorityRowAt = (idx: number) => updateQueryWith(idx, addAuthorityRow);
+  const addAuthorityRowAt = (idx: number) =>
+    setDraft(prev =>
+      prev.map((q, i) => (i === idx ? addAuthorityRow(q, listAuthorityCount(prev)) : q))
+    );
 
   const setAuthorityRowAt = (idx: number, row: number, did: string, source?: AuthoritySource) =>
     updateQueryWith(idx, q => setAuthorityRow(q, row, did, source));
@@ -162,6 +167,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
 
   const addQuery = () => {
     if (draft.length >= TRUST_CHECK_LIST_MAX) return;
+    if (listAuthorityCount(draft) >= TRUST_CHECK_AUTHORITIES_MAX) return;
     const next = [...draft, makeDefaultQuery()];
     setDraft(next);
     setExpandedIdx(next.length - 1);
@@ -196,6 +202,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     // template blocks the save.
     const hasAuthorityGap = draft.some(q => queryAuthorityMissing(q, isApMa));
     if (hasAuthorityGap) return;
+    if (listAuthorityCount(draft) > TRUST_CHECK_AUTHORITIES_MAX) return;
     updateFields({ queries: draft, trust_check_migrated: false });
     closeFullscreenEditor?.();
   };
@@ -208,6 +215,8 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
     if (!id) return 'no registry';
     return registries.find(r => r.id === id)?.name || id;
   };
+
+  const listTotal = listAuthorityCount(draft);
 
   const renderCard = (q: TrustCheckQueryConfig, idx: number) => {
     const queryType: TrustCheckRecordType =
@@ -271,6 +280,7 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             addAuthorityRowAt={addAuthorityRowAt}
             setAuthorityRowAt={setAuthorityRowAt}
             removeAuthorityRowAt={removeAuthorityRowAt}
+            listAuthorityTotal={listTotal}
             updateEntityAt={updateEntityAt}
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}
             saveAttempted={saveAttempted}
@@ -281,6 +291,8 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
   };
 
   const atCap = draft.length >= TRUST_CHECK_LIST_MAX;
+  const authoritiesAtCap = listTotal >= TRUST_CHECK_AUTHORITIES_MAX;
+  const overAuthorityCap = listTotal > TRUST_CHECK_AUTHORITIES_MAX;
 
   return (
     <div className="container-fluid py-4">
@@ -336,12 +348,29 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             draft.map((q, idx) => renderCard(q, idx))
           )}
 
+          {authoritiesAtCap && (
+            <p
+              className={`small mb-3 ${overAuthorityCap ? 'text-danger' : 'text-warning'}`}
+              data-testid="trust-check-authority-total-limit"
+            >
+              {overAuthorityCap
+                ? `These queries name ${listTotal} Authorities; a Trust Check checks at most ${TRUST_CHECK_AUTHORITIES_MAX} in total. Remove ${listTotal - TRUST_CHECK_AUTHORITIES_MAX} to save.`
+                : `These queries name ${TRUST_CHECK_AUTHORITIES_MAX} Authorities, the most a Trust Check checks in total. Remove one to add another Authority or query.`}
+            </p>
+          )}
+
           <button
             type="button"
             className="btn btn-outline-primary btn-sm"
             onClick={addQuery}
-            disabled={atCap}
-            title={atCap ? `Maximum ${TRUST_CHECK_LIST_MAX} queries per leg` : undefined}
+            disabled={atCap || authoritiesAtCap}
+            title={
+              atCap
+                ? `Maximum ${TRUST_CHECK_LIST_MAX} queries per leg`
+                : authoritiesAtCap
+                  ? `A Trust Check checks at most ${TRUST_CHECK_AUTHORITIES_MAX} Authorities in total`
+                  : undefined
+            }
             data-testid="trust-check-add-query"
           >
             <i className="fas fa-plus me-1" /> Add Another Query

@@ -12,6 +12,7 @@ import {
   addAuthorityRow,
   authorityRows,
   canAddAuthorityRow,
+  listAuthorityCount,
   removeAuthorityRow,
   setAuthorityRow,
   TRUST_CHECK_AUTHORITIES_MAX,
@@ -261,6 +262,23 @@ describe('several Authorities per query', () => {
     expect(authorityRows(full)).toHaveLength(TRUST_CHECK_AUTHORITIES_MAX);
     expect(canAddAuthorityRow(full)).toBe(false);
     expect(addAuthorityRow(full)).toBe(full);
+  });
+
+  it('counts the Authorities of a whole list, a single-authority query counting one', () => {
+    expect(listAuthorityCount([single(AUTHORITY, 'authority'), listOf(LISTED)])).toBe(
+      1 + LISTED.length
+    );
+    expect(listAuthorityCount([])).toBe(0);
+  });
+
+  it('adds no row once the whole list names the maximum', () => {
+    const q = listOf(LISTED);
+    expect(canAddAuthorityRow(q, TRUST_CHECK_AUTHORITIES_MAX - 1)).toBe(true);
+    expect(addAuthorityRow(q, TRUST_CHECK_AUTHORITIES_MAX - 1).query?.authority_ids).toHaveLength(
+      LISTED.length + 1
+    );
+    expect(canAddAuthorityRow(q, TRUST_CHECK_AUTHORITIES_MAX)).toBe(false);
+    expect(addAuthorityRow(q, TRUST_CHECK_AUTHORITIES_MAX)).toBe(q);
   });
 
   it('removes a row, and goes back to a single authority_id at one row', () => {

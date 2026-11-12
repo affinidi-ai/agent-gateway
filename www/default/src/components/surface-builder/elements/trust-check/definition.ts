@@ -583,20 +583,36 @@ function withAuthorityRows(q: TrustCheckQueryConfig, rows: AuthorityRow[]): Trus
 }
 
 /**
- * True when another Authority row can be added: below `TRUST_CHECK_AUTHORITIES_MAX`, and every
- * row holds a literal DID (a template stays single-authority, and an empty row is filled first).
+ * Authorities a Trust Check list names in total, a single-authority query counting one. The
+ * gateway refuses a list above `TRUST_CHECK_AUTHORITIES_MAX`.
  */
-export function canAddAuthorityRow(q: TrustCheckQueryConfig): boolean {
+export function listAuthorityCount(queries: TrustCheckQueryConfig[]): number {
+  return queries.reduce((n, q) => n + authorityRows(q).length, 0);
+}
+
+/**
+ * True when another Authority row can be added: the query and its whole list (`listTotal`,
+ * from `listAuthorityCount`) are below `TRUST_CHECK_AUTHORITIES_MAX`, and every row holds a
+ * literal DID (a template stays single-authority, and an empty row is filled first).
+ */
+export function canAddAuthorityRow(
+  q: TrustCheckQueryConfig,
+  listTotal: number = authorityRows(q).length
+): boolean {
   const rows = authorityRows(q);
   return (
     rows.length < TRUST_CHECK_AUTHORITIES_MAX &&
+    listTotal < TRUST_CHECK_AUTHORITIES_MAX &&
     rows.every(r => r.did.trim() !== '' && !isTemplateValue(r.did))
   );
 }
 
 /** Append an empty Authority row, to be picked next; a no-op when `canAddAuthorityRow` is false. */
-export function addAuthorityRow(q: TrustCheckQueryConfig): TrustCheckQueryConfig {
-  if (!canAddAuthorityRow(q)) return q;
+export function addAuthorityRow(
+  q: TrustCheckQueryConfig,
+  listTotal?: number
+): TrustCheckQueryConfig {
+  if (!canAddAuthorityRow(q, listTotal)) return q;
   return withAuthorityRows(q, [...authorityRows(q), { did: '' }]);
 }
 
@@ -969,6 +985,9 @@ export const trustCheckDefinition: NodeDefinition = {
   incompleteReason: c => {
     const queries = readQueries(c);
     if (queries.length === 0) return 'Needs at least one query';
+    const total = listAuthorityCount(queries);
+    if (total > TRUST_CHECK_AUTHORITIES_MAX)
+      return `Lists ${total} Authorities; a Trust Check checks at most ${TRUST_CHECK_AUTHORITIES_MAX} in total`;
     const isTargetLeg = c?._edge === 'ma-tp';
     for (let i = 0; i < queries.length; i++) {
       const q = queries[i];

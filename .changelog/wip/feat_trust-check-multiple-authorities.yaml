@@ -22,7 +22,8 @@ changes:
       title: Pick several Authorities for one Trust Check query in the dashboard
       description: >-
         In the Trust Check editor, Add Authority adds another Issuer or Authority to a query, up
-        to 25. A query with several saves query.authority_ids with authority_sources recording
+        to 25, and the editor stops adding Authorities or queries once the Trust Check names 25
+        in total, the gateway's limit, so Save is not refused. A query with several saves query.authority_ids with authority_sources recording
         the register each was picked from; a query with one keeps authority_id as before. The
         sidebar shows how many authorities each query checks and names them. A listed Authority
         that was deleted blocks Save, as a single one does.
