@@ -444,6 +444,16 @@ unknown name is rejected (400). `GET /v1/settings/audit-events` lists the catalo
 entry with its `event` name, `label`, `description`, `group` and `group_label`, and
 `GET /v1/integrations/catalog` lists the same events as `audit.<event>` with their group.
 
+**Events added since.** A new event that extends a selected one is added to the stored selections
+once, on the Active node at startup or on promotion: `delegation_failed`, the refused OAuth
+consent starts and callbacks, is added to `audit_events` and to every event set that holds
+`consent_granted` and lacks it. `audit_events_added.json` in the settings directory names the
+events added, so an event removed afterwards stays removed; delete the file to add them again. A
+failure is logged as an `ERROR` (`audit.selection_upgrade.failed`), writes no marker, and the next
+start tries again. `delegation_failed` is recorded at most once per consent state and reason, so
+a link opened again and again until it expires is one record (see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#the-callback)).
+
 **Delegation events.** `token_injected`, `token_refreshed`, `refresh_failed` and the other
 delegated credential events name the agent half of the credential's vault key as `agent_did`.
 For a delegated credential released on Fabric receive (`via_fabric: true`) it is the receiving

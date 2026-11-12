@@ -2057,6 +2057,16 @@ pub async fn run_axum_proxy(
                 Some(secrets_store.as_ref()),
             )
             .await;
+            crate::audit::selection_upgrade::add_on_activation(
+                crate::storage::settings_store::global_settings_store(),
+                std::path::Path::new(
+                    &bootstrap_config
+                        .storage_paths
+                        .settings,
+                ),
+                &definition_stores.event_sets,
+            )
+            .await;
         }
         // Only a node holding renamed live directories, from this sweep or an earlier one,
         // runs the job that deletes them after the retention.
@@ -4411,6 +4421,17 @@ pub async fn run_axum_proxy(
                                 crate::integrations::delivery::dispatch::invalidate_routes().await;
                                 crate::audit::sources::rebuild_sinks().await;
                                 crate::integrations::migration::cleanup::start_cleanup_if_pending(storage_paths).await;
+                            }
+                            // Stored audit selections get the events added since, once.
+                            if crate::audit::selection_upgrade::add_on_activation(
+                                crate::storage::settings_store::global_settings_store(),
+                                std::path::Path::new(&storage_paths.settings),
+                                &definition_stores.event_sets,
+                            )
+                            .await
+                            {
+                                crate::integrations::delivery::dispatch::invalidate_routes().await;
+                                crate::audit::sources::rebuild_sinks().await;
                             }
 
                             // Take over the audit journal before admitting traffic,

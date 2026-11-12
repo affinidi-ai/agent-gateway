@@ -422,35 +422,61 @@ impl ConsentRefusal {
     }
 }
 
+/// A refusal of a request carrying a state this gateway sealed for its stage:
+/// the provider it names, the agent the state was issued for, and the state's
+/// nonce.
+#[derive(Clone)]
+struct AuditedRefusal {
+    provider_id: String,
+    agent_did: String,
+    nonce: String,
+}
+
+impl AuditedRefusal {
+    fn of(
+        path_segment: &str,
+        sealed: &super::OAuthState,
+    ) -> Self {
+        Self {
+            provider_id: refused_provider(path_segment, sealed).to_string(),
+            agent_did: sealed.agent_did.clone(),
+            nonce: sealed.nonce.clone(),
+        }
+    }
+}
+
 /// The fixed refusal page for `refusal`, with `Cache-Control: no-store`,
 /// `Referrer-Policy: no-referrer` and the binding cookie cleared on
 /// `cookie`, logged as a WARN with the reason and the provider it names, only
-/// when that is a plain slug. It is audited as `delegation_failed` only when
-/// `audited` names the provider: the request carried a state this gateway
+/// when that is a plain slug. It is audited as `delegation_failed`, naming the
+/// agent, only when `audited` is set: the request carried a state this gateway
 /// sealed for its stage, so requests without one cannot flood the audit log or
-/// its integrations. Without one, the path's segment names the provider.
-fn consent_refused(
+/// its integrations. A state is audited at most once per reason. Without one,
+/// the path's segment names the provider.
+async fn consent_refused(
     refusal: ConsentRefusal,
     path_segment: &str,
     cookie: Option<&str>,
-    audited: Option<&str>,
+    audited: Option<&AuditedRefusal>,
 ) -> Response {
     let ConsentRefusal { status, reason } = refusal;
-    let provider_id = plain_slug(audited.unwrap_or(path_segment));
+    let provider_id = plain_slug(audited.map_or(path_segment, |audited| audited.provider_id.as_str()));
     warn!(
         target: "credential_delegation",
         provider_id,
         reason = ?reason,
         "OAuth consent refused"
     );
-    if audited.is_some() {
+    if let Some(audited) = audited
+        && oauth::first_refusal(&audited.nonce, reason).await
+    {
         super::audit::emit("delegation_failed", || {
             super::audit::audit_event(
                 super::audit::DelegationAuditAction::DelegationFailed {
                     reason,
                     provider_id: provider_id.map(str::to_string),
                 },
-                None,
+                Some(&audited.agent_did),
                 None,
                 provider_id,
                 None,
@@ -576,10 +602,10 @@ struct ConsentStartRequest {
 }
 
 /// Why a consent start was refused and, when its start state was valid so the
-/// refusal is audited, the provider it names.
+/// refusal is audited, what it is audited with.
 struct StartRefused {
     refusal: ConsentRefusal,
-    audited: Option<String>,
+    audited: Option<AuditedRefusal>,
 }
 
 /// Decodes the start state `params` carry, one without a stage or a
@@ -601,10 +627,10 @@ async fn resolve_consent_start(
             refusal: ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid),
             audited: None,
         })?;
-    let named = refused_provider(path_segment, &start).to_string();
+    let audited = AuditedRefusal::of(path_segment, &start);
     let refuse = |refusal| StartRefused {
         refusal,
-        audited: Some(named.clone()),
+        audited: Some(audited.clone()),
     };
     let provider = consent_provider(state, path_segment, &start)
         .await
@@ -654,7 +680,7 @@ pub async fn consent_start_page(
     {
         Ok(request) => request,
         Err(StartRefused { refusal, audited }) => {
-            return consent_refused(refusal, &provider_id, None, audited.as_deref());
+            return consent_refused(refusal, &provider_id, None, audited.as_ref()).await;
         }
     };
     let surface_name = match &state.agent_surface_store {
@@ -777,10 +803,11 @@ pub async fn consent_start(
     {
         Ok(request) => request,
         Err(StartRefused { refusal, audited }) => {
-            return consent_refused(refusal, &provider_id, None, audited.as_deref());
+            return consent_refused(refusal, &provider_id, None, audited.as_ref()).await;
         }
     };
-    let audited = Some(refused_provider(&provider_id, &start));
+    let audited = AuditedRefusal::of(&provider_id, &start);
+    let audited = Some(&audited);
     if !same_origin_post(&headers, &redirect_uri) {
         return consent_refused(
             ConsentRefusal {
@@ -790,7 +817,8 @@ pub async fn consent_start(
             &provider_id,
             None,
             audited,
-        );
+        )
+        .await;
     }
     let begun = match &start.stage {
         None => begin_vendor_consent(&state, &provider, &start, &redirect_uri).await,
@@ -801,7 +829,7 @@ pub async fn consent_start(
     };
     let begun = match begun {
         Ok(begun) => begun,
-        Err(reason) => return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited),
+        Err(reason) => return consent_refused(ConsentRefusal::bad_request(reason), &provider_id, None, audited).await,
     };
     let Ok(location) = HeaderValue::from_str(
         begun
@@ -813,7 +841,8 @@ pub async fn consent_start(
             &provider_id,
             None,
             audited,
-        );
+        )
+        .await;
     };
     let max_age = (begun.expires_at - Utc::now())
         .num_seconds()
@@ -829,7 +858,8 @@ pub async fn consent_start(
             &provider_id,
             None,
             audited,
-        );
+        )
+        .await;
     };
     if !oauth::claim_oauth_state(&start).await {
         return consent_refused(
@@ -837,7 +867,8 @@ pub async fn consent_start(
             &provider_id,
             None,
             audited,
-        );
+        )
+        .await;
     }
     info!(
         target: "credential_delegation",
@@ -1003,7 +1034,8 @@ pub async fn consent_confirmation_callback(
             &provider_id,
             None,
             None,
-        );
+        )
+        .await;
     };
     let sealed = query
         .state
@@ -1014,7 +1046,7 @@ pub async fn consent_confirmation_callback(
         .and_then(oauth::binding_cookie_name);
     let audited = sealed
         .as_ref()
-        .map(|sealed| refused_provider(&provider_id, sealed).to_string());
+        .map(|sealed| AuditedRefusal::of(&provider_id, sealed));
     let refuse = |reason: DelegationFailureReason| {
         let status = match reason {
             DelegationFailureReason::ConsentIdentityMismatch
@@ -1022,32 +1054,32 @@ pub async fn consent_confirmation_callback(
             | DelegationFailureReason::BrowserBindingMismatch => StatusCode::FORBIDDEN,
             _ => StatusCode::BAD_REQUEST,
         };
-        consent_refused(ConsentRefusal { status, reason }, &provider_id, cookie_name.as_deref(), audited.as_deref())
+        consent_refused(ConsentRefusal { status, reason }, &provider_id, cookie_name.as_deref(), audited.as_ref())
     };
     let (Some(sealed), Some(cookie_name)) = (&sealed, cookie_name.as_deref()) else {
-        return refuse(DelegationFailureReason::ConsentStateInvalid);
+        return refuse(DelegationFailureReason::ConsentStateInvalid).await;
     };
     let Some(super::ConsentStage::Confirmation(sign_in)) = &sealed.stage else {
-        return refuse(DelegationFailureReason::ConsentStateInvalid);
+        return refuse(DelegationFailureReason::ConsentStateInvalid).await;
     };
     let presented = cookies
         .as_ref()
         .and_then(|Extension(cookies)| cookies.get(cookie_name));
     if !oauth::browser_binding_matches(sealed, presented) {
-        return refuse(DelegationFailureReason::BrowserBindingMismatch);
+        return refuse(DelegationFailureReason::BrowserBindingMismatch).await;
     }
     if let Err(reason) = sealed_surface_unchanged(&state, &provider_id, sealed, &sign_in.binding).await {
-        return refuse(reason);
+        return refuse(reason).await;
     }
     if !oauth::claim_oauth_state(sealed).await {
-        return refuse(DelegationFailureReason::ConsentStateReused);
+        return refuse(DelegationFailureReason::ConsentStateReused).await;
     }
     let provider = match consent_provider(&state, &provider_id, sealed).await {
         Ok(provider) => provider,
-        Err(refusal) => return refuse(refusal.reason),
+        Err(refusal) => return refuse(refusal.reason).await,
     };
     let Some(confirmation) = super::consent_confirmation::confirmation_for(&provider, &sign_in.binding) else {
-        return refuse(DelegationFailureReason::ConsentStateInvalid);
+        return refuse(DelegationFailureReason::ConsentStateInvalid).await;
     };
     if let Some(error) = &query.error {
         let (reason, logged) = provider_error(error);
@@ -1057,14 +1089,14 @@ pub async fn consent_confirmation_callback(
             oauth_error = %logged,
             "Identity provider returned an error to the consent confirmation"
         );
-        return refuse(reason);
+        return refuse(reason).await;
     }
     let Some(code) = query
         .code
         .as_deref()
         .filter(|code| !code.is_empty())
     else {
-        return refuse(DelegationFailureReason::ConsentResponseInvalid);
+        return refuse(DelegationFailureReason::ConsentResponseInvalid).await;
     };
     if let Err(reason) = super::consent_confirmation::confirm_caller(
         &state,
@@ -1077,10 +1109,10 @@ pub async fn consent_confirmation_callback(
     )
     .await
     {
-        return refuse(reason);
+        return refuse(reason).await;
     }
     let Ok(redirect_uri) = provider.consent_redirect_uri(&state.gateway_base_url) else {
-        return refuse(DelegationFailureReason::RedirectUriInvalid);
+        return refuse(DelegationFailureReason::RedirectUriInvalid).await;
     };
     let vendor_url =
         match oauth::continue_to_vendor(&provider, sealed, &sign_in.binding, &redirect_uri, &state.secrets_store).await
@@ -1097,11 +1129,12 @@ pub async fn consent_confirmation_callback(
                     DelegationFailureReason::CredentialsUnavailable
                 } else {
                     DelegationFailureReason::AuthorizationUrlInvalid
-                });
+                })
+                .await;
             }
         };
     let Ok(location) = HeaderValue::from_str(vendor_url.as_str()) else {
-        return refuse(DelegationFailureReason::AuthorizationUrlInvalid);
+        return refuse(DelegationFailureReason::AuthorizationUrlInvalid).await;
     };
     info!(
         target: "credential_delegation",
@@ -1136,7 +1169,8 @@ pub async fn oauth_callback(
             &provider_id,
             None,
             None,
-        );
+        )
+        .await;
     };
     let callback_state = query
         .state
@@ -1147,12 +1181,12 @@ pub async fn oauth_callback(
         .and_then(oauth::binding_cookie_name);
     let audited = callback_state
         .as_ref()
-        .map(|sealed| refused_provider(&provider_id, sealed).to_string());
+        .map(|sealed| AuditedRefusal::of(&provider_id, sealed));
     let named = audited
-        .as_deref()
-        .unwrap_or(&provider_id);
+        .as_ref()
+        .map_or(provider_id.as_str(), |audited| audited.provider_id.as_str());
     let refuse =
-        |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref(), audited.as_deref());
+        |refusal: ConsentRefusal| consent_refused(refusal, &provider_id, cookie_name.as_deref(), audited.as_ref());
     info!(
         target: "credential_delegation",
         provider_id = plain_slug(named),
@@ -1170,15 +1204,15 @@ pub async fn oauth_callback(
             oauth_error = %logged,
             "OAuth provider returned an error"
         );
-        return refuse(ConsentRefusal::bad_request(reason));
+        return refuse(ConsentRefusal::bad_request(reason)).await;
     }
 
     let (Some(oauth_state), Some(cookie_name)) = (callback_state, cookie_name.as_deref()) else {
-        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid));
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateInvalid)).await;
     };
     let provider = match consent_provider(&state, &provider_id, &oauth_state).await {
         Ok(provider) => provider,
-        Err(refusal) => return refuse(refusal),
+        Err(refusal) => return refuse(refusal).await,
     };
 
     let presented = cookies
@@ -1188,16 +1222,17 @@ pub async fn oauth_callback(
         return refuse(ConsentRefusal {
             status: StatusCode::FORBIDDEN,
             reason: DelegationFailureReason::BrowserBindingMismatch,
-        });
+        })
+        .await;
     }
     if let Some(expected) = provider
         .authorization_response_issuer
         .as_deref()
     {
         match query.iss.as_deref() {
-            None => return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMissing)),
+            None => return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMissing)).await,
             Some(iss) if iss != expected => {
-                return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMismatch));
+                return refuse(ConsentRefusal::bad_request(DelegationFailureReason::IssMismatch)).await;
             }
             Some(_) => {}
         }
@@ -1206,13 +1241,13 @@ pub async fn oauth_callback(
         .code
         .filter(|code| !code.is_empty())
     else {
-        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid));
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentResponseInvalid)).await;
     };
 
     // Each state stores at most one credential, and the code is exchanged only
     // for a state not used before.
     if !oauth::claim_oauth_state(&oauth_state).await {
-        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused));
+        return refuse(ConsentRefusal::bad_request(DelegationFailureReason::ConsentStateReused)).await;
     }
 
     let token_response = match oauth::exchange_code_for_tokens(
@@ -1234,7 +1269,7 @@ pub async fn oauth_callback(
                 error = %e,
                 "Token exchange failed during the OAuth callback"
             );
-            return refuse(ConsentRefusal::bad_request(DelegationFailureReason::TokenExchangeFailed));
+            return refuse(ConsentRefusal::bad_request(DelegationFailureReason::TokenExchangeFailed)).await;
         }
     };
 
@@ -1460,7 +1495,8 @@ pub async fn oauth_callback(
             return refuse(ConsentRefusal {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 reason: DelegationFailureReason::VaultStoreRejected,
-            });
+            })
+            .await;
         }
     }
 

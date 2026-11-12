@@ -3783,6 +3783,107 @@ async fn delegation_audit_trail_records_refused_consent(
     );
 }
 
+#[then(
+    expr = "the delegation audit trail records exactly {int} refused consent(s) for OAuth provider {string} with reason {string}"
+)]
+async fn delegation_audit_trail_records_exactly_refused_consents(
+    world: &mut SurfaceWorld,
+    expected: usize,
+    provider: String,
+    reason: String,
+) {
+    let refused = |events: &[serde_json::Value]| {
+        events
+            .iter()
+            .filter(|entry| {
+                let failure = entry.pointer("/event/delegation_failed");
+                failure
+                    .and_then(|failure| failure.get("reason"))
+                    .and_then(|value| value.as_str())
+                    == Some(reason.as_str())
+                    && failure
+                        .and_then(|failure| failure.get("provider_id"))
+                        .and_then(|value| value.as_str())
+                        == Some(provider.as_str())
+            })
+            .count()
+    };
+    let (_, events) = eventually_delegation_audit_events(world, |events| refused(events) >= expected).await;
+    assert_eq!(
+        refused(&events),
+        expected,
+        "expected exactly {expected} refused consent(s) for provider '{provider}' with reason '{reason}' in the \
+         delegation audit trail, got {events:?}"
+    );
+}
+
+#[then(expr = "the refused consent for OAuth provider {string} with reason {string} names the agent")]
+async fn refused_consent_names_the_agent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    reason: String,
+) {
+    let (found, events) = eventually_delegation_audit_events(world, |events| {
+        events.iter().any(|entry| {
+            let failure = entry.pointer("/event/delegation_failed");
+            failure
+                .and_then(|failure| failure.get("reason"))
+                .and_then(|value| value.as_str())
+                == Some(reason.as_str())
+                && failure
+                    .and_then(|failure| failure.get("provider_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(provider.as_str())
+                && entry
+                    .get("agent_did")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|agent| !agent.is_empty())
+        })
+    })
+    .await;
+    assert!(
+        found,
+        "expected the refused consent for provider '{provider}' with reason '{reason}' to name the agent, got \
+         {events:?}"
+    );
+}
+
+#[then(expr = "the VP Audit Log selection includes audit event {string}")]
+async fn vp_audit_log_selection_includes(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    let selection = vp_audit_log_selection(world).await;
+    assert!(selection.contains(&event), "expected the VP Audit Log selection to include '{event}', got {selection:?}");
+}
+
+#[then(expr = "the VP Audit Log selection does not include audit event {string}")]
+async fn vp_audit_log_selection_does_not_include(
+    world: &mut SurfaceWorld,
+    event: String,
+) {
+    let selection = vp_audit_log_selection(world).await;
+    assert!(
+        !selection.contains(&event),
+        "expected the VP Audit Log selection not to include '{event}', got {selection:?}"
+    );
+}
+
+/// The VP Audit Log selection the running gateway's settings API reports.
+async fn vp_audit_log_selection(world: &mut SurfaceWorld) -> Vec<String> {
+    crate::steps::when::ensure_gateway_running(world).await;
+    crate::steps::when::ensure_admin_session(world).await;
+    let response = world
+        .admin_client
+        .as_ref()
+        .expect("admin client must exist")
+        .send_recorded_json::<serde_json::Value>(reqwest::Method::GET, "/v1/settings", None)
+        .await
+        .expect("reading the settings should complete");
+    assert_eq!(response.status, 200, "reading the settings: {}", response.body);
+    serde_json::from_value(response.body["audit_events"].clone()).expect("the settings carry an audit_events list")
+}
+
 /// Audit records reach the log shortly after the request that produced them,
 /// so a check reads the log again until it holds what is expected, for up to
 /// five seconds. Returns whether `expected` held and the events last read.

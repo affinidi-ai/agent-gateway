@@ -102,6 +102,10 @@ pub struct SurfaceConfigBuilder {
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
     pub audit_log_keeps_every_event: bool,
+    /// The VP Audit Log selection stored before the gateway starts.
+    pub stored_audit_events: Option<Vec<String>>,
+    /// The audit events the settings directory records as already added to the stored selections.
+    pub audit_events_added: Option<Vec<String>>,
     /// The gateway logs its `audit` target events at info level and keeps its log for the
     /// scenario to read.
     pub logs_audit_events: bool,
@@ -272,6 +276,8 @@ impl Default for SurfaceConfigBuilder {
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
+            stored_audit_events: None,
+            audit_events_added: None,
             logs_audit_events: false,
             tenant_id: None,
             enforced_credential_rules: Vec::new(),

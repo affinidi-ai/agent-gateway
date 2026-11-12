@@ -1880,8 +1880,9 @@ callback alone reads the cookies taken.
 The provider's `authorization_endpoint` must be an `https` URL with a host and no credentials or fragment;
 it and `additional_params` together hold at most 32 parameters, none of `response_type`,
 `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge` or `code_challenge_method`, none
-repeated, with names of at most 128 bytes and values of at most 2048. The URL uses PKCE with the
-`S256` challenge method.
+repeated, with names of at most 128 bytes and values of at most 2048. Names are compared without
+regard to ASCII case, so `State` is reserved and `prompt` and `Prompt` repeat each other. The URL
+uses PKCE with the `S256` challenge method.
 
 ### The callback
 
@@ -1907,12 +1908,16 @@ other cookie is set. Every refusal is logged as a `WARN` with the reason and the
 never the state, the code, the cookie or `iss`. It is also recorded as a `delegation_failed`
 audit event whose `reason` names the check, but only when the request carried a state this
 gateway sealed for that stage; a request with a missing, forged, expired or other-stage state is
-only logged, so a stream of such requests cannot flood the audit log or its integrations. The log
-and the event name the provider by its `provider_id` when the path's segment is the sealed
-state's own credential provider id, as it is at a callback path ending in that id; otherwise they
-name it by the path's segment. The audit routes therefore show a refusal only to appliance-wide
-callers, while `consent_granted`, which names the provider's record id, also reaches the
-provider's tenant ([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)):
+only logged, so a stream of such requests cannot flood the audit log or its integrations. Each
+sealed state is recorded at most once per `reason` on this process while its nonce is remembered
+(15 minutes), so a start link opened again and again until it expires gives one
+`consent_state_reused` event; every refusal is still logged. The event's `agent_did` is the
+agent the sealed state was issued for. The log and the event name the provider by its
+`provider_id` when the path's segment is the sealed state's own credential provider id, as it is
+at a callback path ending in that id; otherwise they name it by the path's segment. The audit
+routes therefore show a refusal only to appliance-wide callers, while `consent_granted`, which
+names the provider's record id, also reaches the provider's tenant
+([`ACCESS_TOKENS.md`](ACCESS_TOKENS.md#delegation-audit-records)):
 
 | `reason` | Refused because |
 | --- | --- |

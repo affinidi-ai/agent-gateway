@@ -163,6 +163,8 @@ pub struct GatewayBootstrapFixture {
     pub affinidi_terms_url: Option<String>,
     /// Dashboard settings the gateway starts with; defaults when absent.
     pub settings: Option<serde_json::Value>,
+    /// The audit events the settings directory records as already added to the stored selections.
+    pub audit_events_added: Option<Vec<String>>,
 }
 
 impl GatewayBootstrapFixture {
@@ -192,6 +194,7 @@ impl GatewayBootstrapFixture {
             terms_enabled: false,
             affinidi_terms_url: None,
             settings: None,
+            audit_events_added: None,
         }
     }
 
@@ -364,6 +367,10 @@ pub fn write_gateway_config_tree(
 
     if let Some(settings) = &fixture.settings {
         std::fs::write(storage_dir.join("settings/settings.json"), serde_json::to_string_pretty(settings).unwrap())
+            .unwrap();
+    }
+    if let Some(added) = &fixture.audit_events_added {
+        std::fs::write(storage_dir.join("settings/audit_events_added.json"), serde_json::to_string(added).unwrap())
             .unwrap();
     }
     if with_toml {

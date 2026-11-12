@@ -1,0 +1,33 @@
+branch: fix/consent-audit-follow-ups
+changes:
+  added: []
+  changed:
+    - timestamp: '2026-11-09T17:00:00Z'
+      title: Add delegation_failed once to stored selections that select consent_granted
+      description: >-
+        On the Active node, at startup or on promotion, the VP Audit Log selection and every
+        integration event set that holds consent_granted get delegation_failed, the refused OAuth
+        consent starts and callbacks. It is added once: audit_events_added.json in the settings
+        directory records it, so removing the event afterwards keeps it removed. The VP Audit Log
+        selection is changed in place, so a settings change saved meanwhile is kept.
+    - timestamp: '2026-11-09T17:00:00Z'
+      title: Name the agent in delegation_failed and record each refusal once per state
+      description: >-
+        A delegation_failed event now carries agent_did, the agent the sealed consent state was
+        issued for. Each sealed state is recorded at most once per reason on this process while
+        its nonce is remembered (15 minutes), so a start link opened again and again gives one
+        consent_state_reused event; every refusal is still logged as a WARN.
+  fixed: []
+  removed: []
+  security: []
+  breaking:
+    - timestamp: '2026-11-09T17:00:00Z'
+      title: Compare authorization parameter names without regard to ASCII case
+      description: >-
+        Reserved and repeated authorization parameter names are now compared without regard to
+        ASCII case, so State or SCOPE count as reserved and prompt and Prompt repeat each other.
+        Creating or updating a provider with such names is refused with 400, and a stored
+        provider whose authorization_endpoint query or additional_params hold one stops getting
+        consent links, with an ERROR naming its provider id at startup and reload. Remedy:
+        rename or remove the reserved or case-duplicate parameter names in the provider's
+        authorization_endpoint query or additional_params.

@@ -249,6 +249,12 @@ fn write_single_surface_config_inner(
     if surface_config.audit_log_keeps_every_event {
         config_tree.settings = Some(crate::bdd_support::admin_client::audit_log_keeping_every_event());
     }
+    if let Some(events) = &surface_config.stored_audit_events {
+        config_tree.settings = Some(serde_json::json!({ "audit_enabled": true, "audit_events": events }));
+    }
+    config_tree.audit_events_added = surface_config
+        .audit_events_added
+        .clone();
     config_tree.terms_enabled = options
         .affinidi_terms_url
         .is_some();
