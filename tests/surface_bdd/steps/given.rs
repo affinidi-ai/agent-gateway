@@ -712,6 +712,30 @@ fn surface_has_caller_trust_check_with_entity_template(
         .push(element);
 }
 
+#[given(expr = "the caller-leg Trust Check lists authorities {string}")]
+fn caller_trust_check_lists_authorities(
+    world: &mut SurfaceWorld,
+    authorities: String,
+) {
+    let element = world
+        .surface_config
+        .caller_trust_check_list
+        .last_mut()
+        .expect("the surface has a caller-leg Trust Check");
+    let query = element["query"]
+        .as_object_mut()
+        .expect("the Trust Check has a query");
+    query.remove("authority_id");
+    query.insert("authority_ids".to_string(), serde_json::json!(authority_list(&authorities)));
+}
+
+pub(crate) fn authority_list(authorities: &str) -> Vec<String> {
+    authorities
+        .split(',')
+        .map(|did| did.trim().to_string())
+        .collect()
+}
+
 const DELETED_AUTHORITY_DID: &str = "did:web:deleted-authority.example";
 
 #[given("the caller-leg Trust Check takes its authority from an Authority that no longer exists")]

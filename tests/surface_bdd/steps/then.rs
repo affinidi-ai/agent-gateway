@@ -1163,6 +1163,38 @@ async fn no_trust_check_audit_event_is_recorded(world: &mut SurfaceWorld) {
     );
 }
 
+#[then(expr = "the caller Trust Check reported error code {string} for authority {string}")]
+async fn caller_trust_check_reported_error_code_for_authority(
+    world: &mut SurfaceWorld,
+    expected_code: String,
+    authority: String,
+) {
+    let reports_code = |event: &serde_json::Value| {
+        event
+            .get("event")
+            .and_then(|action| action.get("trust_check"))
+            .is_some_and(|trust_check| {
+                trust_check["leg"] == "caller"
+                    && trust_check["authority_id"] == authority.as_str()
+                    && trust_check["error_code"] == expected_code.as_str()
+            })
+    };
+    let (found, events) = vp_audit_events_matching(world, reports_code).await;
+    assert!(
+        found,
+        "expected a caller-leg Trust Check audit event for authority {authority:?} with error code \
+         {expected_code:?}; observed {:?}",
+        events
+            .iter()
+            .filter_map(|event| {
+                event
+                    .get("event")
+                    .and_then(|action| action.get("trust_check"))
+            })
+            .collect::<Vec<_>>()
+    );
+}
+
 async fn assert_trust_check_error_code(
     world: &mut SurfaceWorld,
     leg: &str,

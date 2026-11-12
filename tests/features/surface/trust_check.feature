@@ -86,6 +86,19 @@ Feature: Trust Check on the Access Point request edge
     And the caller Trust Check for trust registry "alpha-registry" of type "recognition" reported result "error"
     And the caller Trust Check reported error code "TEMPLATE_RESOLUTION_FAILED"
 
+  # ── Several authorities ────────────────────────────────────────────
+
+  Scenario: A caller Trust Check that lists several authorities asks about each one
+    Given the surface has a caller-leg Trust Check for trust registry "alpha-registry" of type "recognition" with entity template "did:web:example.com:agent"
+    And the caller-leg Trust Check lists authorities "did:web:fi-a, did:web:fi-b"
+    And the surface has a policy that denies unless every caller Trust Check succeeded
+    And the VP Audit Log keeps every audit event
+    When the caller sends a request to the surface
+    Then the response status is 403
+    And managed agent "bravo" was not called
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:fi-a"
+    And the caller Trust Check reported error code "TRUST_REGISTRY_UNREACHABLE" for authority "did:web:fi-b"
+
   # ── Deleted Authority ──────────────────────────────────────────────
 
   Scenario: A Trust Check whose Authority no longer exists fails without asking its trust registry

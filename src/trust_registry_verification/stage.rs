@@ -15,7 +15,7 @@ use crate::observability::trust_check_audit::{TrustCheckAuditEvent, TrustCheckOr
 use crate::trust_registry_verification::authority_source::MissingAuthorities;
 use crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures;
 use crate::trust_registry_verification::trust_check_element::{
-    TrustCheckElement, TrustCheckLeg, TrustCheckResult, TrustCheckResultsContext,
+    TrustCheckElement, TrustCheckLeg, TrustCheckResult, TrustCheckResultsContext, expand_authorities,
 };
 use crate::trust_registry_verification::trust_check_executor::{
     AUTHORITY_NOT_FOUND, ExecutionContext, NOT_AUTHORIZED, NOT_RECOGNIZED, TrqpClient, execute_list, synthesize_failure,
@@ -88,6 +88,8 @@ async fn run_trust_check_stage_with<C: TrqpClient + ?Sized>(
     authorities: Option<&dyn AuthorityStore>,
 ) -> Option<TrustCheckResultsContext> {
     let wrapped = json!({ "input": input });
+    let expanded = expand_authorities(elements);
+    let elements = &*expanded;
     let missing = MissingAuthorities::find(
         elements
             .iter()
@@ -278,9 +280,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-a".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:a".to_string(),
+                authority_ids: None,
                 entity_id: "did:e".to_string(),
                 action: None,
                 resource: None,
@@ -898,5 +902,130 @@ mod tests {
                 .all(|result| result.ok)
         );
         assert_eq!(client.0.lock().unwrap().len(), 2);
+    }
+
+    struct RecognisedBy(&'static str);
+
+    #[async_trait]
+    impl TrqpClient for RecognisedBy {
+        async fn query(
+            &self,
+            _registry_id: &str,
+            _query_type: TrqpQueryType,
+            params: &TrqpQueryParams,
+        ) -> Result<TrqpOutcome, TrqpClientError> {
+            if params.authority_id == self.0 {
+                Ok(TrqpOutcome::Allowed)
+            } else {
+                Ok(TrqpOutcome::Denied {
+                    detail: "Registry answered `recognized: false`".to_string(),
+                })
+            }
+        }
+    }
+
+    fn multi_authority(authorities: &[&str]) -> TrustCheckElement {
+        let mut element = elem("fi-recognised");
+        element.query.authority_id = String::new();
+        element.query.authority_ids = Some(
+            authorities
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        );
+        element
+    }
+
+    fn outcomes(results: &[TrustCheckResult]) -> Vec<(&str, Option<&str>)> {
+        results
+            .iter()
+            .map(|r| {
+                (
+                    r.authority_id
+                        .as_deref()
+                        .unwrap_or_default(),
+                    r.error
+                        .as_ref()
+                        .map(|e| e.code.as_str()),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn caller_recognised_by_one_of_several_authorities_gets_one_result_per_authority() {
+        let element = multi_authority(&["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"]);
+        let ctx = run_trust_check_stage(
+            "surf",
+            TrustCheckLeg::Caller,
+            &[element, elem("plain")],
+            &json!({}),
+            &RecognisedBy("did:web:fi-b"),
+        )
+        .await
+        .expect("expected Some");
+        assert_eq!(
+            outcomes(&ctx.caller),
+            [
+                ("did:web:fi-a", Some("NOT_RECOGNIZED")),
+                ("did:web:fi-b", None),
+                ("did:web:fi-c", Some("NOT_RECOGNIZED")),
+                ("did:a", Some("NOT_RECOGNIZED")),
+            ]
+        );
+        assert_eq!(ctx.caller[1].id, "fi-recognised");
+    }
+
+    #[tokio::test]
+    async fn caller_recognised_by_no_listed_authority_gets_not_recognized_for_each() {
+        let element = multi_authority(&["did:web:fi-a", "did:web:fi-b"]);
+        let ctx = run_trust_check_stage("surf", TrustCheckLeg::Caller, &[element], &json!({}), &RecognisedBy("none"))
+            .await
+            .expect("expected Some");
+        assert_eq!(
+            outcomes(&ctx.caller),
+            [("did:web:fi-a", Some("NOT_RECOGNIZED")), ("did:web:fi-b", Some("NOT_RECOGNIZED"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_gate_fails_only_the_authority_that_needs_missing_metadata() {
+        let element = multi_authority(&["{{ input.agent.provider_did }}", "did:web:fi-b"]);
+        let ctx =
+            run_trust_check_stage("surf", TrustCheckLeg::Target, &[element], &json!({}), &RecognisedBy("did:web:fi-b"))
+                .await
+                .expect("expected Some");
+        assert_eq!(outcomes(&ctx.target), [("", Some("TRUST_REGISTRY_METADATA_UNAVAILABLE")), ("did:web:fi-b", None)]);
+    }
+
+    #[tokio::test]
+    async fn multi_authority_checks_are_not_checked_against_the_authorities_register() {
+        let (store, _dir) = authority_store("did:web:present").await;
+        let client = CountingClient(std::sync::Mutex::new(Vec::new()));
+        let mut element = multi_authority(&["did:web:gone", "did:web:present"]);
+        element
+            .authority_sources
+            .insert(
+                "did:web:gone".to_string(),
+                crate::trust_registry_verification::authority_source::AuthoritySource::Authority,
+            );
+
+        let ctx = run_trust_check_stage_with(
+            "surf".into(),
+            TrustCheckLeg::Caller,
+            &[element],
+            &json!({}),
+            &client,
+            Some(&store),
+        )
+        .await
+        .expect("expected Some");
+
+        assert!(
+            ctx.caller
+                .iter()
+                .all(|result| result.ok)
+        );
+        assert_eq!(*client.0.lock().unwrap(), ["did:web:gone", "did:web:present"]);
     }
 }

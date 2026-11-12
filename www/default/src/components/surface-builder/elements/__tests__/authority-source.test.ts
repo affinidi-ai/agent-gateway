@@ -140,6 +140,37 @@ describe('authority_source — wire round-trip', () => {
     expect(rebuilt.access_point.trust_recorder.entries[0]).not.toHaveProperty('authority_source');
   });
 
+  it('keeps a stored authority list and its sources through hydration and save', () => {
+    const payload = surface();
+    const listed = {
+      id: 'fi-recognised',
+      trust_registry_id: 'tr-1',
+      query_type: 'recognition',
+      authority_sources: { [AUTHORITY]: 'authority' },
+      query: { authority_ids: [AUTHORITY, ISSUER], entity_id: '{{ input.agent.did }}' },
+    };
+    payload.access_point.trust_check_list = [listed];
+    payload.transit.points[0].trust_check_list = [{ ...listed, id: 'tp-listed' }];
+    const nodes = hydrateSurfaceCanvas(payload as AgentSurface).nodes;
+    const rebuilt = rebuild(nodes);
+
+    for (const element of [
+      rebuilt.access_point.trust_check_list[0],
+      rebuilt.transit.points[0].trust_check_list[0],
+    ]) {
+      expect(element.query).toEqual({
+        authority_ids: [AUTHORITY, ISSUER],
+        entity_id: '{{ input.agent.did }}',
+      });
+      expect(element.authority_sources).toEqual({ [AUTHORITY]: 'authority' });
+      expect(element).not.toHaveProperty('authority_source');
+    }
+    const trustChecks = nodes.filter(n => n.type === 'trust-check');
+    expect(trustChecks.map(n => registry.getIncompleteReason(n.type, n.config, n))).toEqual(
+      trustChecks.map(() => null)
+    );
+  });
+
   it('sends no authority_source when none is stored', () => {
     const payload = surface();
     payload.access_point.trust_check_list = [check('plain', AUTHORITY)];

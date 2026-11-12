@@ -8,6 +8,9 @@
 //! target and for fabric send. This module owns the configuration shape and
 //! the runtime result shape only.
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -34,6 +37,13 @@ pub const TRUST_CHECK_NAME_MAX_CODE_POINTS: usize = 64;
 /// a free display label — even though today both caps are the same value.
 pub const TRUST_CHECK_ID_MAX_CODE_POINTS: usize = 64;
 
+/// Maximum number of entries in `query.authority_ids`.
+pub const TRUST_CHECK_AUTHORITIES_MAX: usize = 25;
+
+/// Per-authority timeout of a multi-authority element. Fixed: such an
+/// element cannot set `timeout_secs`.
+pub const TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS: u32 = 5;
+
 /// TRQP query family supported in v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,9 +67,16 @@ pub enum TrqpQueryType {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrqpQueryParams {
-    /// Authority DID (or template) the query is asked against.
-    #[serde(default)]
+    /// Authority DID (or template) the query is asked against. Empty when
+    /// `authority_ids` is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub authority_id: String,
+
+    /// Authority DIDs (or templates) the query is asked against, each in its
+    /// own TRQP query with its own result. Mutually exclusive with
+    /// `authority_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_ids: Option<Vec<String>>,
 
     /// Entity DID (or template). Blank inherits the placement-derived
     /// subject DID at execution time.
@@ -107,6 +124,11 @@ pub struct TrustCheckElement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_source: Option<super::authority_source::AuthoritySource>,
 
+    /// The register each literal DID of `query.authority_ids` was picked
+    /// from, keyed by DID. Templates never have an entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub authority_sources: BTreeMap<String, super::authority_source::AuthoritySource>,
+
     pub query_type: TrqpQueryType,
 
     pub query: TrqpQueryParams,
@@ -118,7 +140,9 @@ pub struct TrustCheckElement {
     /// Operators editing the surface JSON directly may set a value to
     /// tighten the bound for a specific element; `Some(n)` wraps the TRQP
     /// call in `tokio::time::timeout(Duration::from_secs(n), …)` on top of
-    /// the transport's own timeout.
+    /// the transport's own timeout. Refused on an element that sets
+    /// `query.authority_ids`, whose authorities each wait
+    /// [`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`].
     ///
     /// [`TrustRegistryListenerManager`]: crate::trust_registries::communication::TrustRegistryListenerManager
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,6 +170,18 @@ pub enum TrustCheckElementValidationError {
     IdForbiddenChars,
     #[error("query.authority_id must not be blank")]
     AuthorityBlank,
+    #[error("query.authority_id and query.authority_ids cannot both be set")]
+    AuthorityBothSet,
+    #[error("query.authority_ids must not be empty")]
+    AuthoritiesEmpty,
+    #[error("query.authority_ids has {got} entries (max {max})")]
+    AuthoritiesTooMany { got: usize, max: usize },
+    #[error("query.authority_ids[{index}] must not be blank")]
+    AuthoritiesEntryBlank { index: usize },
+    #[error("query.authority_ids lists '{authority}' more than once")]
+    AuthoritiesDuplicate { authority: String },
+    #[error("timeout_secs cannot be set when query.authority_ids is set")]
+    AuthoritiesTimeoutSet,
     #[error("name exceeds {max} code points (got {got})")]
     NameTooLong { got: usize, max: usize },
     #[error("name contains control or bidi-override codepoints")]
@@ -174,14 +210,7 @@ impl TrustCheckElement {
         {
             return Err(TrustCheckElementValidationError::IdForbiddenChars);
         }
-        if self
-            .query
-            .authority_id
-            .trim()
-            .is_empty()
-        {
-            return Err(TrustCheckElementValidationError::AuthorityBlank);
-        }
+        self.validate_authorities()?;
         if let Some(name) = &self.name {
             let count = name.chars().count();
             if count > TRUST_CHECK_NAME_MAX_CODE_POINTS {
@@ -199,6 +228,96 @@ impl TrustCheckElement {
         }
         Ok(())
     }
+
+    fn validate_authorities(&self) -> Result<(), TrustCheckElementValidationError> {
+        let single_set = !self
+            .query
+            .authority_id
+            .trim()
+            .is_empty();
+        let Some(authorities) = &self.query.authority_ids else {
+            return if single_set {
+                Ok(())
+            } else {
+                Err(TrustCheckElementValidationError::AuthorityBlank)
+            };
+        };
+        if single_set {
+            return Err(TrustCheckElementValidationError::AuthorityBothSet);
+        }
+        if self.timeout_secs.is_some() {
+            return Err(TrustCheckElementValidationError::AuthoritiesTimeoutSet);
+        }
+        if authorities.is_empty() {
+            return Err(TrustCheckElementValidationError::AuthoritiesEmpty);
+        }
+        if authorities.len() > TRUST_CHECK_AUTHORITIES_MAX {
+            return Err(TrustCheckElementValidationError::AuthoritiesTooMany {
+                got: authorities.len(),
+                max: TRUST_CHECK_AUTHORITIES_MAX,
+            });
+        }
+        let mut seen = HashSet::with_capacity(authorities.len());
+        for (index, authority) in authorities.iter().enumerate() {
+            let authority = authority.trim();
+            if authority.is_empty() {
+                return Err(TrustCheckElementValidationError::AuthoritiesEntryBlank { index });
+            }
+            if !seen.insert(authority) {
+                return Err(TrustCheckElementValidationError::AuthoritiesDuplicate {
+                    authority: authority.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// One single-authority element per listed authority, in configuration
+    /// order, each keeping this element's `id` and waiting
+    /// [`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`]. A single-authority
+    /// element is returned unchanged.
+    pub fn per_authority(&self) -> Vec<TrustCheckElement> {
+        let Some(authorities) = &self.query.authority_ids else {
+            return vec![self.clone()];
+        };
+        authorities
+            .iter()
+            .map(|authority| TrustCheckElement {
+                authority_source: None,
+                authority_sources: BTreeMap::new(),
+                query: TrqpQueryParams {
+                    authority_id: authority.clone(),
+                    authority_ids: None,
+                    ..self.query.clone()
+                },
+                timeout_secs: Some(TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS),
+                ..self.clone()
+            })
+            .collect()
+    }
+}
+
+/// `elements` with every multi-authority element replaced by its
+/// [`TrustCheckElement::per_authority`] expansion, in configuration order.
+/// Borrows `elements` when none lists several authorities.
+pub fn expand_authorities(elements: &[TrustCheckElement]) -> Cow<'_, [TrustCheckElement]> {
+    if elements
+        .iter()
+        .all(|element| {
+            element
+                .query
+                .authority_ids
+                .is_none()
+        })
+    {
+        return Cow::Borrowed(elements);
+    }
+    Cow::Owned(
+        elements
+            .iter()
+            .flat_map(TrustCheckElement::per_authority)
+            .collect(),
+    )
 }
 
 /// True for codepoints disallowed in a `TrustCheckElement.name`: every
@@ -246,7 +365,9 @@ pub struct TrustCheckResult {
     /// Mirrors [`TrustCheckElement::id`] so a Rego rule can address a
     /// specific result via `input.trust_check_results.{caller|target}[]`
     /// without depending on array index (element order is stored config,
-    /// not a stable contract). Always present on the wire.
+    /// not a stable contract). Always present on the wire. An element that
+    /// lists several authorities yields one result per authority, all with
+    /// this `id` and each with its own `authority_id`.
     pub id: String,
     pub trust_registry_id: String,
     pub query_type: TrqpQueryType,
@@ -316,6 +437,7 @@ mod tests {
     fn base_query(authority: &str) -> TrqpQueryParams {
         TrqpQueryParams {
             authority_id: authority.to_string(),
+            authority_ids: None,
             entity_id: "{{input.caller.did}}".to_string(),
             action: None,
             resource: None,
@@ -330,6 +452,7 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-x".to_string(),
             authority_source: None,
+            authority_sources: BTreeMap::new(),
             query_type: TrqpQueryType::Recognition,
             query: base_query("did:a"),
             timeout_secs: None,
@@ -343,8 +466,10 @@ mod tests {
             id: "tc-1".to_string(),
             trust_registry_id: "tr-a".to_string(),
             authority_source: None,
+            authority_sources: BTreeMap::new(),
             query_type: TrqpQueryType::Authorization,
             query: TrqpQueryParams {
+                authority_ids: None,
                 authority_id: "{{input.caller.gateway.did}}".to_string(),
                 entity_id: "{{input.caller.did}}".to_string(),
                 action: Some("invoke".to_string()),
@@ -366,8 +491,10 @@ mod tests {
             id: "tc-2".to_string(),
             trust_registry_id: "tr-b".to_string(),
             authority_source: None,
+            authority_sources: BTreeMap::new(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
+                authority_ids: None,
                 authority_id: "{{input.target.gateway.did}}".to_string(),
                 entity_id: "{{input.target.did}}".to_string(),
                 action: None,
@@ -424,8 +551,10 @@ mod tests {
             id: "tc-3c".to_string(),
             trust_registry_id: "tr-c".to_string(),
             authority_source: None,
+            authority_sources: BTreeMap::new(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
+                authority_ids: None,
                 authority_id: "did:a".to_string(),
                 entity_id: "did:e".to_string(),
                 action: None,
@@ -630,5 +759,167 @@ mod tests {
     fn validate_rejects_name_with_bidi_override() {
         let elem = elem_with_name("tc-bidi", Some("foo\u{202E}bar"));
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::NameForbiddenChars));
+    }
+
+    fn multi(authorities: &[&str]) -> TrustCheckElement {
+        let mut elem = elem_with_name("fi-recognised", None);
+        elem.query.authority_id = String::new();
+        elem.query.authority_ids = Some(
+            authorities
+                .iter()
+                .map(|a| a.to_string())
+                .collect(),
+        );
+        elem
+    }
+
+    #[test]
+    fn multi_authority_element_round_trips_without_authority_id() {
+        let v = json!({
+            "id": "fi-recognised",
+            "trust_registry_id": "tr-main",
+            "query_type": "recognition",
+            "query": {
+                "authority_ids": ["did:web:fi-a", "did:web:fi-b"],
+                "entity_id": "{{input.caller.did}}"
+            },
+            "authority_sources": { "did:web:fi-a": "authority" }
+        });
+        let elem: TrustCheckElement = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(elem.query.authority_id, "");
+        assert_eq!(elem.validate(), Ok(()));
+        assert_eq!(serde_json::to_value(&elem).unwrap(), v);
+    }
+
+    #[test]
+    fn single_authority_element_serialises_as_before() {
+        let v = serde_json::to_value(elem_with_name("tc", None)).unwrap();
+        assert_eq!(v["query"]["authority_id"], "did:a");
+        assert!(
+            v["query"]
+                .get("authority_ids")
+                .is_none()
+        );
+        assert!(
+            v.get("authority_sources")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn validate_accepts_authority_list_up_to_the_limit() {
+        let dids: Vec<String> = (0..TRUST_CHECK_AUTHORITIES_MAX)
+            .map(|i| format!("did:web:fi-{i}"))
+            .collect();
+        let refs: Vec<&str> = dids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(multi(&refs).validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_authority_list_over_the_limit() {
+        let dids: Vec<String> = (0..=TRUST_CHECK_AUTHORITIES_MAX)
+            .map(|i| format!("did:web:fi-{i}"))
+            .collect();
+        let refs: Vec<&str> = dids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            multi(&refs).validate(),
+            Err(TrustCheckElementValidationError::AuthoritiesTooMany {
+                got: TRUST_CHECK_AUTHORITIES_MAX + 1,
+                max: TRUST_CHECK_AUTHORITIES_MAX,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_both_authority_fields() {
+        let mut elem = multi(&["did:web:fi-a"]);
+        elem.query.authority_id = "did:web:fi-b".to_string();
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthorityBothSet));
+    }
+
+    #[test]
+    fn validate_rejects_neither_authority_field() {
+        let mut elem = elem_with_name("tc", None);
+        elem.query.authority_id = String::new();
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthorityBlank));
+    }
+
+    #[test]
+    fn validate_rejects_empty_authority_list() {
+        assert_eq!(multi(&[]).validate(), Err(TrustCheckElementValidationError::AuthoritiesEmpty));
+    }
+
+    #[test]
+    fn validate_rejects_blank_authority_entry() {
+        assert_eq!(
+            multi(&["did:web:fi-a", "  "]).validate(),
+            Err(TrustCheckElementValidationError::AuthoritiesEntryBlank { index: 1 })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_authority_entry() {
+        assert_eq!(
+            multi(&["did:web:fi-a", "did:web:fi-b", " did:web:fi-a"]).validate(),
+            Err(TrustCheckElementValidationError::AuthoritiesDuplicate {
+                authority: "did:web:fi-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn per_authority_expands_in_order_with_default_timeout() {
+        let expanded = multi(&["did:web:fi-a", "did:web:fi-b"]).per_authority();
+        let authorities: Vec<&str> = expanded
+            .iter()
+            .map(|e| e.query.authority_id.as_str())
+            .collect();
+        assert_eq!(authorities, ["did:web:fi-a", "did:web:fi-b"]);
+        assert!(expanded.iter().all(|e| {
+            e.id == "fi-recognised"
+                && e.query
+                    .authority_ids
+                    .is_none()
+                && e.timeout_secs == Some(TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS)
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_timeout_on_authority_list() {
+        let mut elem = multi(&["did:web:fi-a"]);
+        elem.timeout_secs = Some(2);
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritiesTimeoutSet));
+    }
+
+    #[test]
+    fn validate_keeps_timeout_on_single_authority_element() {
+        let mut elem = elem_with_name("tc", None);
+        elem.timeout_secs = Some(2);
+        assert_eq!(elem.validate(), Ok(()));
+    }
+
+    #[test]
+    fn per_authority_leaves_a_single_authority_element_unchanged() {
+        let elem = elem_with_name("tc", None);
+        assert_eq!(elem.per_authority(), vec![elem.clone()]);
+        assert!(matches!(expand_authorities(std::slice::from_ref(&elem)), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn expand_authorities_flattens_mixed_lists_in_order() {
+        let single = elem_with_name("single", None);
+        let elements = [multi(&["did:web:fi-a", "did:web:fi-b"]), single];
+        let expanded = expand_authorities(&elements);
+        let pairs: Vec<(&str, &str)> = expanded
+            .iter()
+            .map(|e| (e.id.as_str(), e.query.authority_id.as_str()))
+            .collect();
+        assert_eq!(pairs, [("fi-recognised", "did:web:fi-a"), ("fi-recognised", "did:web:fi-b"), ("single", "did:a")]);
     }
 }

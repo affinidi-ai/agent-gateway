@@ -16708,9 +16708,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
+                authority_ids: None,
                 entity_id: "{{ input.agent.did }}".to_string(),
                 action: None,
                 resource: None,
@@ -16732,9 +16734,11 @@ mod tests {
             id: id.to_string(),
             trust_registry_id: "tr-test".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: TrqpQueryType::Recognition,
             query: TrqpQueryParams {
                 authority_id: "did:test:authority".to_string(),
+                authority_ids: None,
                 entity_id: "{{ input.agent.provider_did }}".to_string(),
                 action: None,
                 resource: None,

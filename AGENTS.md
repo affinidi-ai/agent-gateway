@@ -229,6 +229,9 @@ Authority pickers set it. One whose Authority was deleted from the Authorities r
 unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
+A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
+`authority_sources` through every dashboard save, which cannot edit it; see _Authority lists_
+under _Trust Check_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Audit Log names the surface variant of each request record and describes `request_rejected`
 records, and the Metrics page badges configured variant aliases only; see _Audit page: surface

@@ -685,6 +685,11 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   template. The Authority picker writes `issuer` for an Issuer and `authority` for an Authority,
   and removes it for a caller-leg template; a preset (`applyPresetToQuery`) removes it; a stored
   custom DID or legacy template left untouched keeps what is stored.
+- **Authority lists.** A query stored with `query.authority_ids` (several authorities, set
+  through the API) keeps that list and its `authority_sources` map through every load and save
+  (`listedAuthorities`, `queryFromElement`, `buildEntry`), on every leg and in variants; the
+  save never adds `authority_id` or `authority_source` beside it. The panel cannot edit the list,
+  and such a query does not count as missing an Authority in `incompleteReason`.
 - **Deleted Authority.** A query whose `authority_source` is `authority` and whose DID the loaded
   Authorities register no longer has is `missing-authority` (`classifyTargetAuthoritySelection`,
   checked against the Authorities only, even when an Issuer has the DID); the gateway fails it

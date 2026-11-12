@@ -456,8 +456,11 @@ export interface TrustCheckQueryConfig {
   name?: string;
   /** Where the literal `query.authority_id` came from; absent for a template. */
   authority_source?: AuthoritySource;
+  /** Where each literal DID of `query.authority_ids` came from, keyed by DID. */
+  authority_sources?: Record<string, AuthoritySource>;
   query?: {
     authority_id?: string;
+    authority_ids?: string[];
     action?: string;
     resource?: string;
     [k: string]: unknown;
@@ -497,8 +500,21 @@ function queryFromElement(e: any): TrustCheckQueryConfig {
     query_type: e.query_type === 'recognition' ? 'recognition' : 'authorization',
     name: typeof e.name === 'string' ? e.name : undefined,
     ...(source ? { authority_source: source } : {}),
+    ...(e.authority_sources && typeof e.authority_sources === 'object'
+      ? { authority_sources: e.authority_sources }
+      : {}),
     query,
   };
+}
+
+/**
+ * The authorities a query lists in `authority_ids`, or an empty list for a
+ * single-authority query. The dashboard keeps such a list through every save
+ * but does not edit it.
+ */
+export function listedAuthorities(query: TrustCheckQueryConfig['query']): string[] {
+  const ids = query?.authority_ids;
+  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
 }
 
 /** Read a wire `trust_check_list` into the node's `queries[]` shape. */
@@ -602,6 +618,7 @@ function queryKey(q: TrustCheckQueryConfig): string {
     q.trust_registry_id ?? '',
     q.query_type === 'recognition' ? 'recognition' : 'authorization',
     String(query.authority_id ?? '').trim(),
+    listedAuthorities(query),
     String(query.entity_id ?? '').trim(),
     String(query.action ?? '').trim(),
     String(query.resource ?? '').trim(),
@@ -671,8 +688,11 @@ function buildEntry(
   const explicitAuthority =
     typeof stored.authority_id === 'string' ? stored.authority_id.trim() : '';
   const explicitEntity = typeof stored.entity_id === 'string' ? stored.entity_id.trim() : '';
-  const query: Record<string, string> = {
-    authority_id: explicitAuthority || defaultAuthorityIdTemplate(edge),
+  const authorities = explicitAuthority ? [] : listedAuthorities(stored);
+  const query: Record<string, string | string[]> = {
+    ...(authorities.length > 0
+      ? { authority_ids: authorities }
+      : { authority_id: explicitAuthority || defaultAuthorityIdTemplate(edge) }),
     entity_id: explicitEntity || defaultEntityIdTemplate(edge),
   };
   if (typeof stored.action === 'string' && stored.action) query.action = stored.action;
@@ -684,7 +704,16 @@ function buildEntry(
     query,
   };
   if (typeof q.name === 'string' && q.name.length > 0) entry.name = q.name;
-  const source = authoritySourceFor(query.authority_id, q.authority_source);
+  if (authorities.length > 0) {
+    if (q.authority_sources && Object.keys(q.authority_sources).length > 0) {
+      entry.authority_sources = q.authority_sources;
+    }
+    return entry;
+  }
+  const source = authoritySourceFor(
+    explicitAuthority || defaultAuthorityIdTemplate(edge),
+    q.authority_source
+  );
   if (source) entry.authority_source = source;
   return entry;
 }
@@ -817,7 +846,10 @@ export const trustCheckDefinition: NodeDefinition = {
       const q = queries[i];
       const prefix = queries.length > 1 ? `Query ${i + 1}: ` : '';
       if (!q.trust_registry_id) return `${prefix}Trust registry must be selected`;
-      if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
+      if (
+        listedAuthorities(q.query).length === 0 &&
+        authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)
+      ) {
         return isTargetLeg
           ? `${prefix}Select an Issuer or Authority for the target-leg Authority`
           : `${prefix}Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority`;

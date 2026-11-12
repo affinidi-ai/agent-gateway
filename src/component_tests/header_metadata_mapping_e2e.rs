@@ -208,9 +208,11 @@ async fn header_metadata_mapping_is_available_to_trust_check_templates() {
             id: "caller-template".to_string(),
             trust_registry_id: "tr-unreachable".to_string(),
             authority_source: None,
+            authority_sources: Default::default(),
             query_type: crate::trust_registry_verification::trust_check_element::TrqpQueryType::Recognition,
             query: crate::trust_registry_verification::trust_check_element::TrqpQueryParams {
                 authority_id: "did:example:authority".to_string(),
+                authority_ids: None,
                 entity_id: "{{ input.a2a.message.metadata[\"https://fabric.affinidi.io/extensions/header-metadata/v1\"].tenant_id }}".to_string(),
                 action: None,
                 resource: None,

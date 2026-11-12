@@ -260,6 +260,8 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds 1 to `TRUST_CHECK_AUTHORITIES_MAX` (25) distinct, non-blank DIDs or templates. |
+| `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is
 addressable from policy while `name` is only a label. Counts are code points, not bytes.
@@ -268,6 +270,47 @@ When an audit sink selects `trust_check`, each element's outcome is recorded wit
 surface id, the request's trace id and the authenticated caller (on the Access Point, Fabric
 and MCP-proxy paths), so a trust check can be tied to the request and principal that
 triggered it. On the outbound path the record also names the Transit Point.
+
+### Several authorities in one query
+
+A query that must accept an entity any of several organisations recognises lists them in
+`query.authority_ids` instead of `query.authority_id`:
+
+```json
+{
+  "id": "fi-recognised",
+  "trust_registry_id": "tr-main",
+  "query_type": "recognition",
+  "query": {
+    "authority_ids": ["did:web:fi-a", "did:web:fi-b", "did:web:fi-c"],
+    "entity_id": "{{ input.agent.did }}"
+  }
+}
+```
+
+The gateway sends one TRQP query per listed authority, all at once, and waits until each one
+answers or reaches its built-in 5-second timeout (`QUERY_TIMEOUT`); it never stops early and
+never combines the answers. Such an element cannot set `timeout_secs`. Each
+authority gets its own result, in list order, all carrying the element's `id` and each its own
+`authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A
+template that fails to resolve, a missing metadata field or an unreachable registry fails only
+that authority's result. When the target cannot be checked at all (for example its agent card
+is unavailable), every listed authority gets a result with that error code.
+
+Because several results share an `id`, an any-of rule iterates them:
+
+```rego
+allow if {
+    some r in input.trust_check_results.caller
+    r.id == "fi-recognised"
+    r.ok
+}
+```
+
+A rule that addresses one result by `id` alone matches every authority of the element. Listed
+DIDs are not checked against the Authorities register: `authority_sources`, which maps a listed
+DID to the register it was picked from, is stored but does not yet raise `AUTHORITY_NOT_FOUND`.
+The Surface Builder keeps a stored list when it saves the surface but cannot edit it.
 
 ### The authority of a Trust Check
 
