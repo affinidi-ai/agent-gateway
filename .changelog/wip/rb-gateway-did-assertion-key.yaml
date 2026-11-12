@@ -1,0 +1,17 @@
+branch: rb-gateway-did-assertion-key
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-12T10:00:00Z'
+      title: List the gateway's signing key under assertionMethod in its DID document
+      description: >-
+        The gateway signs the credentials it issues with its Ed25519 Multikey (#key-2), but
+        the DID document it published when first started listed only #key-1 under
+        assertionMethod, so strict Data Integrity verifiers rejected every credential the
+        gateway signed. A new gateway now lists both keys under assertionMethod, and the
+        document is built in one place so the published and generated copies cannot differ.
+        A gateway that already published its DID log keeps that document.
+  removed: []
+  security: []
+  breaking: []
