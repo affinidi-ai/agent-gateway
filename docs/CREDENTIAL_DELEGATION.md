@@ -2031,8 +2031,10 @@ A reason that holds for every caller of the provider (`NotLegacyConsent`, `Peppe
 `StrategyUnavailable`, `GatewayIssuer`, `EntraCallerNamedBySub`, `IdTokenClaimInvalid`,
 `EditableClaim`) is a setting that confirms nobody. The save refuses each of them, so they arise
 only after the save: the pepper is missing after a redeploy, `sts.mcp_issuer` or the strategy
-changed, or a later release refuses the claim. No link is minted then, and the request is
-refused as when the strategy cannot be read. The gateway logs `Consent confirmation confirms no
+changed, or a later release refuses the claim. No link is minted then for a JWT caller, and
+the request is refused as when the strategy cannot be read. A Transit Point or Fabric request
+and a caller that is not a JWT caller are told apart first, so they keep getting links as
+below. The gateway logs `Consent confirmation confirms no
 caller of this provider: consent links are refused` at `WARN`, once per provider, surface and
 reason.
 
@@ -2063,9 +2065,9 @@ metric](OBSERVABILITY.md#consent-confirmation-link-metric)).
 | `reason` | No link is minted, or the link does not confirm its caller, because |
 | --- | --- |
 | `PathNotCovered` | The request came through a Transit Point or over Fabric |
+| `NotJwtCaller` | The caller is not a `jwt_bearer` caller, or there is none |
 | `NotLegacyConsent` | The provider is no longer legacy consent |
 | `PepperUnset` | `AG_IDENTITY_HASH_PEPPER` is not set |
-| `NotJwtCaller` | The caller is not a `jwt_bearer` caller, or there is none |
 | `StrategyUnavailable` | The strategy is gone, the provider's tenant cannot reference it, or its `principal_claim` names no caller |
 | `GatewayIssuer` | The strategy expects this gateway's own `sts.mcp_issuer` |
 | `EntraCallerNamedBySub` | The strategy or `id_token_principal_claim` names an Entra caller by `sub` |

@@ -67,8 +67,8 @@ changes:
         reached. Saving the setting checks the provider type, the strategy and its tenant, both
         endpoints, the client ID and secret, the confirmation redirect URI, the principal claim and the
         identity hash pepper. A setting that no longer confirms any caller, for example after
-        the pepper is lost on a redeploy, refuses consent links instead of minting unconfirmed
-        ones. Consent links of providers without the setting, of API key callers, and of Transit
+        the pepper is lost on a redeploy, refuses consent links to JWT callers instead of minting
+        unconfirmed ones. Consent links of providers without the setting, of API key callers, and of Transit
         Point and Fabric callers are minted as before, with a warning in the gateway log when the
         provider has the setting.
   breaking: []

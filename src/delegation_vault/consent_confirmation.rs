@@ -158,15 +158,15 @@ pub(crate) async fn decide(
     else {
         return Ok(No(Unconfirmed::PathNotCovered));
     };
+    let Some(caller @ AuthenticatedIdentity::JwtBearer { principal_claim, claims, .. }) = identity else {
+        return Ok(No(Unconfirmed::NotJwtCaller));
+    };
     if !provider.uses_legacy_consent() {
         return Ok(No(Unconfirmed::NotLegacyConsent));
     }
     if !crate::identity::credential_identity::pepper_is_configured() {
         return Ok(No(Unconfirmed::PepperUnset));
     }
-    let Some(caller @ AuthenticatedIdentity::JwtBearer { principal_claim, claims, .. }) = identity else {
-        return Ok(No(Unconfirmed::NotJwtCaller));
-    };
     let Some(strategies) = strategies else {
         return Ok(No(Unconfirmed::StrategyUnavailable));
     };
@@ -1121,6 +1121,21 @@ mod tests {
             decide_for(&provider(true), Some(&alice), Some(&stored(strategy(ISSUER, None)))).await,
             ConfirmDecision::Unconfirmed(Unconfirmed::PepperUnset)
         );
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_is_not_a_jwt_caller_is_told_apart_before_the_pepper() {
+        crate::identity::credential_identity::configure_pepper_for_tests(false);
+        let api_key = AuthenticatedIdentity::ApiKey {
+            key_name: "key".to_string(),
+            provider_agent_id: None,
+        };
+        for identity in [Some(&api_key), None] {
+            assert_eq!(
+                decide_for(&provider(true), identity, Some(&stored(strategy(ISSUER, None)))).await,
+                ConfirmDecision::Unconfirmed(Unconfirmed::NotJwtCaller)
+            );
+        }
     }
 
     #[tokio::test]

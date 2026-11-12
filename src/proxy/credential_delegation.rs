@@ -3786,7 +3786,7 @@ mod tests {
             ("another issuer", confirming(&strategy.id), Some(&other_issuer), hash(&other_issuer)),
             ("another principal claim", confirming(&strategy.id), Some(&other_claim), hash(&other_claim)),
             ("another vault key", confirming(&strategy.id), Some(&alice), "sha256:someone-else".to_string()),
-            ("an API key caller of a deleted strategy", confirming("gone"), Some(&api_key), api_key_hash),
+            ("an API key caller of a deleted strategy", confirming("gone"), Some(&api_key), api_key_hash.clone()),
         ];
         let as_minted_today = |state: OAuthState| OAuthState {
             nonce: String::new(),
@@ -3827,6 +3827,13 @@ mod tests {
         );
         let today = minted_start_state(&without_setting, Some(&alice), &alice_hash, Some(&store)).await;
         assert_eq!(today.stage, None, "a provider without the setting still mints without a pepper");
+        let minted = minted_start_state(&confirming(&strategy.id), Some(&api_key), &api_key_hash, Some(&store)).await;
+        let today = minted_start_state(&without_setting, Some(&api_key), &api_key_hash, Some(&store)).await;
+        assert_eq!(minted.stage, None, "an API key caller without a configured pepper");
+        assert!(
+            as_minted_today(minted) == as_minted_today(today),
+            "an API key caller is minted a link as before without a configured pepper"
+        );
     }
 
     /// A strategy store whose every read fails.
