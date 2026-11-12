@@ -161,8 +161,8 @@ spa_reserved_routes() {
 # missing. Nothing is rewritten: the developer renames the prefix.
 #
 # The comparison matches the runtime's: the first path segment of the prefix,
-# lowercased, against the reserved list — so /svc/payments is fine and
-# /Payments/v1 is not. The prefixes are the ones
+# lowercased, against the reserved list — so /svc/settings is fine and
+# /Settings/v1 is not. The prefixes are the ones
 # NetworkConfig::dashboard_shadowing_prefixes returns: every channel and MCP
 # proxy prefix, every route of type "proxy", and every route of type "redirect"
 # that has a target.

@@ -4,11 +4,11 @@ changes:
   changed: []
   fixed:
     - timestamp: '2026-11-11T12:00:00Z'
-      title: Fail env preparation when a prefix shadows a dashboard page
+      title: Stop env preparation when a prefix shadows a dashboard page
       description: >-
-        scripts/_prepare.sh exits with an error again when a channel, MCP proxy, proxy route or
-        redirect route prefix in gateway.json shadows a dashboard page, instead of only warning.
-        The gateway's own startup behaviour is unchanged.
+        scripts/_prepare.sh, and so make config-debug, run-debug and run-watch, stops with an error
+        naming each channel, MCP proxy, proxy route or redirect route prefix in gateway.json whose
+        first path segment is a dashboard page. The gateway's own startup behaviour is unchanged.
   removed: []
   security: []
   breaking: []
