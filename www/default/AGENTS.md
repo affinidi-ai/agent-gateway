@@ -292,12 +292,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   Access Point and Caller Context elements carry `public` and `caller_authentication.on_failure`
   through a load and rebuild unchanged; `withCallerAccessSettled`
   (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
-  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
-  legacy state under the switch: the gateway refuses its failed callers, and without a Caller
-  Context it admits every caller. A **Close Access Point** button
-  (`access-point-close-button`, hidden when read-only) sets `public: false`. Turning the
-  switch off there clears `public`, so turning it on and off again keeps the surface legacy. A
-  `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
+  (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), turning the switch off
+  clears `public`, so turning it on and off again keeps `public` unset. A `public: false`
+  set in the JSON editor shows `access-point-closing-notice` under the switch until the save,
+  and is sent, like one set with the switch on a surface that has `public`. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
   a new surface) with no caller authentication method and no `mcp_http.authorization` is not
@@ -331,9 +329,7 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   - Stored without `public` and no Caller Context: "This Access Point is neither closed nor
     public, and it admits callers without credentials. …".
   The dashboard shows none of these after a save (`shownSaveWarnings` in
-  `elements/saveWarnings.ts` drops them, a variant's prefix ignored): the canvas notice and the
-  Access Point panel already show the Access Point's state, and turning Public access on is the
-  operator's own choice. Every other `Warning` header is shown.
+  `elements/saveWarnings.ts` drops them, a variant's prefix ignored). Every other `Warning` header is shown.
   `showSurfaceSaveToast` (`elements/saveWarnings.ts`) shows a save in one toast, since a later
   toast replaces an earlier one: "<saved>" alone as `success`, or "<saved>, with warnings:"
   and one line per warning as a `warning` toast, the shown `Warning` headers first, then the
