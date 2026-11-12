@@ -3,7 +3,13 @@ import type { ConnectionRuntimeStatus } from './connectionHealth';
 /** What a remote gateway is for: a Fabric peer, or an agent-pay gateway that takes payments. */
 export type GatewayRole = 'peer' | 'payment';
 
-export type GatewayStatus = 'active' | 'pending' | 'awaiting-approval' | 'disabled' | 'failed';
+export type GatewayStatus =
+  | 'active'
+  | 'pending'
+  | 'awaiting-approval'
+  | 'awaiting-mediator-access'
+  | 'disabled'
+  | 'failed';
 
 /** Shape of a gateway record as returned by `GET /gateways` and `GET /payment-gateways`. */
 export interface GatewayRecord {
@@ -32,7 +38,11 @@ export interface GatewayListItem extends GatewayRecord {
 
 /** Whether a gateway is still waiting to be connected or approved. */
 export function isGatewayPending(gw: { status?: string }): boolean {
-  return gw.status === 'pending' || gw.status === 'awaiting-approval';
+  return (
+    gw.status === 'pending' ||
+    gw.status === 'awaiting-approval' ||
+    gw.status === 'awaiting-mediator-access'
+  );
 }
 
 /**

@@ -1,7 +1,27 @@
 branch: fix/mediator-acl-only-changed-flags
 changes:
-  added: []
-  changed: []
+  added:
+    - timestamp: '2026-11-12T20:00:00Z'
+      title: ⭐ Pause pairing until the mediator admits the new DIDs, and continue later
+      description: >-
+        A mediator in explicit_allow mode refuses every DID its administrator has not added.
+        Creating a Connection Point and adding a gateway can now stop after minting their DIDs
+        (the Connection Point DID and the permanent DID it reserves for the paired gateway, or
+        the handshake and permanent DIDs of an acceptance), show them, and continue when they are
+        allowed, now or days later from Connections, until the invitation expires. Continue
+        checks each DID on the mediator and answers 409 mediator_access_refused naming the one
+        still refused. The dashboard always pauses; the API pauses when a request sets
+        await_mediator_access. Approval uses the reserved permanent DID, so pings work as soon as
+        the pairing completes. The event hook announces every DID at the pause.
+  changed:
+    - timestamp: '2026-11-12T20:05:00Z'
+      title: Let an accepted invitation wait for approval until the invitation expires
+      description: >-
+        A gateway that accepted an invitation now waits for the inviting gateway's approval until
+        the invitation expires (its expires_time, else seven days) instead of one hour
+        (oob_connection.pending_expiry_hours), since the inviting administrator may approve days
+        later. pending_expiry_hours now applies only to acceptances stored before the expiry was
+        recorded.
   fixed:
     - timestamp: '2026-11-12T16:00:00Z'
       title: ⭐ Pair gateways on an explicit_allow mediator without admin-only ACL rights
