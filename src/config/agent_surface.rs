@@ -3318,7 +3318,9 @@ impl std::fmt::Display for SurfaceStatus {
 
 // ─── Surface-level validation ───────────────────────────────────────
 
-use crate::trust_registry_verification::trust_check_element::TrustCheckElementValidationError;
+use crate::trust_registry_verification::trust_check_element::{
+    TRUST_CHECK_AUTHORITIES_MAX, TrustCheckElementValidationError,
+};
 
 /// Maximum number of [`TrustCheckElement`]s allowed per leg
 /// (`AccessPoint.trust_check_list`, `Target.trust_check_list` and each
@@ -3338,6 +3340,8 @@ pub const TRUST_CHECK_LIST_MAX: usize = 10;
 pub enum TrustCheckValidationError {
     #[error("{leg} trust_check_list has {got} elements (max {max})")]
     TrustCheckListTooLong { leg: &'static str, got: usize, max: usize },
+    #[error("{leg} trust_check_list queries {got} authorities in total (max {max})")]
+    TrustCheckListTooManyAuthorities { leg: &'static str, got: usize, max: usize },
     #[error("{leg} trust_check_list contains duplicate element id '{id}'")]
     TrustCheckDuplicateId { leg: &'static str, id: String },
     #[error("{leg} trust_check_list[{index}] (id '{id}'): {source}")]
@@ -3378,8 +3382,11 @@ pub enum TrustCheckValidationError {
 }
 
 /// Walk a `trust_check_list` slice: enforce the `TRUST_CHECK_LIST_MAX`
-/// cap, ensure element ids are unique within the list, and delegate the
-/// per-element shape check to [`TrustCheckElement::validate`]. The `leg`
+/// cap, ensure element ids are unique within the list, delegate the
+/// per-element shape check to [`TrustCheckElement::validate`], and cap the
+/// authorities the list queries per request at
+/// [`TRUST_CHECK_AUTHORITIES_MAX`] (an element without
+/// `query.authority_ids` counts as one). The `leg`
 /// label rides into every error variant so the API surface can echo
 /// `caller` / `target` back to the operator.
 pub fn validate_trust_check_list(
@@ -3406,6 +3413,22 @@ pub fn validate_trust_check_list(
                 source,
             });
         }
+    }
+    let authorities: usize = list
+        .iter()
+        .map(|elem| {
+            elem.query
+                .authority_ids
+                .as_ref()
+                .map_or(1, Vec::len)
+        })
+        .sum();
+    if authorities > TRUST_CHECK_AUTHORITIES_MAX {
+        return Err(TrustCheckValidationError::TrustCheckListTooManyAuthorities {
+            leg,
+            got: authorities,
+            max: TRUST_CHECK_AUTHORITIES_MAX,
+        });
     }
     Ok(())
 }
@@ -7773,6 +7796,42 @@ mod tests {
             }
             other => panic!("expected TrustCheckListTooLong on caller, got {other:?}"),
         }
+    }
+
+    fn multi_authority_elem(id: &str, count: usize) -> TrustCheckElement {
+        let mut e = elem(id);
+        e.query.authority_id = String::new();
+        e.query.authority_ids = Some(
+            (0..count)
+                .map(|i| format!("did:web:{id}-{i}"))
+                .collect(),
+        );
+        e
+    }
+
+    #[test]
+    fn validate_passes_at_max_authorities_per_list() {
+        let list = vec![
+            multi_authority_elem("tc-a", TRUST_CHECK_AUTHORITIES_MAX - 1),
+            elem("tc-b"),
+        ];
+        assert_eq!(validate_trust_check_list("caller", &list), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_over_max_authorities_per_list() {
+        let list = vec![
+            multi_authority_elem("tc-a", TRUST_CHECK_AUTHORITIES_MAX),
+            multi_authority_elem("tc-b", 2),
+        ];
+        assert_eq!(
+            validate_trust_check_list("target", &list),
+            Err(TrustCheckValidationError::TrustCheckListTooManyAuthorities {
+                leg: "target",
+                got: TRUST_CHECK_AUTHORITIES_MAX + 2,
+                max: TRUST_CHECK_AUTHORITIES_MAX,
+            })
+        );
     }
 
     #[test]

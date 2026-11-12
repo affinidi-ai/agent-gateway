@@ -729,7 +729,7 @@ const AuthorityRows: React.FC<AuthorityRowsProps> = ({
                 onChange={(did, src) => onRowChange?.(r, did, src)}
               />
             </div>
-            {onRemoveRow && (
+            {onRemoveRow && rows.length > 1 && (
               <button
                 type="button"
                 className="btn btn-outline-danger btn-sm"

@@ -225,7 +225,8 @@ Authority and the surface has no Issuer or its Issuer no longer exists; see _Tru
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-recorder).
 
 Trust Checks and Trust Recorder entries keep `authority_source` through every save and the
-Authority pickers set it. One whose Authority was deleted from the Authorities register is drawn
+Authority pickers set it. One whose Authority, or any Authority a query lists, was deleted from
+the Authorities register is drawn
 unconfigured with a "Configuration required" warning and blocks Save, and a refused Authority
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).

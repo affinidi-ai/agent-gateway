@@ -234,9 +234,19 @@ async fn execute_one<C: TrqpClient + ?Sized>(
     client: &C,
 ) -> TrustCheckResult {
     let resolved = match resolve_params(&elem.query, ctx.input) {
-        Ok(params) => params,
-        Err(err) => {
-            let detail = err.to_string();
+        Ok(params)
+            if !params
+                .authority_id
+                .trim()
+                .is_empty() =>
+        {
+            params
+        }
+        resolution => {
+            let detail = match resolution {
+                Err(err) => err.to_string(),
+                Ok(_) => "query.authority_id resolved to an empty value".to_string(),
+            };
             let result = stage_failure(elem, TEMPLATE_RESOLUTION_FAILED, detail.clone());
             record_trust_check(TrustCheckAuditEvent {
                 surface_id: origin.surface_id,
@@ -968,6 +978,14 @@ mod tests {
                 .iter()
                 .all(|r| r.ok && r.id == "authority-recognised")
         );
+    }
+
+    #[tokio::test]
+    async fn multi_authority_empty_list_fails_closed() {
+        let client = AuthorityClient::new(&[("", Answer::Allow)]);
+        let results = run_multi(&[multi_elem(&[])], &client).await;
+        assert_eq!(summary(&results), [(String::new(), Some(TEMPLATE_RESOLUTION_FAILED.to_string()))]);
+        assert!(client.asked().is_empty(), "a blank authority must not reach the registry");
     }
 
     #[tokio::test]

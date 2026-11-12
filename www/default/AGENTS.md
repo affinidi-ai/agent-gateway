@@ -697,10 +697,14 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   (`authorityRows`, `addAuthorityRow`, `setAuthorityRow`, `removeAuthorityRow`). Removing rows
   down to one makes the query single again. Templates (the caller-leg defaults) are offered only
   while there is one row, and **Add Authority** stays disabled until every row holds a literal DID
-  (`canAddAuthorityRow`) and below `TRUST_CHECK_AUTHORITIES_MAX` (25, the gateway's limit); at the
-  limit the count line shows it. A DID picked in one row is not offered in another. A row whose
-  Authority was deleted shows the picker's "Deleted Authority" option and warning; it does not
-  block Save. An empty row is incomplete ("Select an Issuer or Authority for every Authority
+  (`canAddAuthorityRow`) and below `TRUST_CHECK_AUTHORITIES_MAX` (25 per query); at the limit the
+  count line shows it. The gateway also refuses on save a Trust Check list whose queries name more
+  than 25 authorities in total (a single-authority query counts one); the editor does not check
+  that total, so such a Save gets the gateway's `400`. A DID picked in one row is not offered in another. A row whose
+  Authority was deleted shows the picker's "Deleted Authority" option and warning, and like a
+  deleted single Authority it is listed in the panel's "Configuration required" warning, draws the
+  node unconfigured and blocks Save (`missingTrustCheckAuthorities` walks `authorityRows`). An
+  empty row is incomplete ("Select an Issuer or Authority for every Authority
   row"), is marked invalid, and blocks the editor's Save. The sidebar lists "N authorities:
   <names>" under such a query, reading names from the Issuers and Authorities registers (a DID
   when neither has it), and the fullscreen card header adds "N authorities". A node with one such

@@ -1169,13 +1169,14 @@ async fn caller_trust_check_reported_error_code_for_authority(
     expected_code: String,
     authority: String,
 ) {
+    let audited_authority = audit_display_did(&authority);
     let reports_code = |event: &serde_json::Value| {
         event
             .get("event")
             .and_then(|action| action.get("trust_check"))
             .is_some_and(|trust_check| {
                 trust_check["leg"] == "caller"
-                    && trust_check["authority_id"] == authority.as_str()
+                    && trust_check["authority_id"] == audited_authority.as_str()
                     && trust_check["error_code"] == expected_code.as_str()
             })
     };
@@ -1193,6 +1194,33 @@ async fn caller_trust_check_reported_error_code_for_authority(
             })
             .collect::<Vec<_>>()
     );
+}
+
+/// The form the Trust Check audit record gives `did`: `format_did(did, 8, 8)` in
+/// `src/observability/did_display.rs`, which this test binary cannot import.
+fn audit_display_did(did: &str) -> String {
+    const FIRST: usize = 8;
+    const LAST: usize = 8;
+    let parts: Vec<&str> = did.split(':').collect();
+    if !did.starts_with("did:") || parts.len() < 3 {
+        return did.to_string();
+    }
+    if parts[1] == "web" && parts.len() >= 5 && parts[parts.len() - 2] == "channel" {
+        let id = parts[parts.len() - 1];
+        if id.len() >= FIRST + LAST
+            && let (Some(head), Some(tail)) = (id.get(..FIRST), id.get(id.len() - LAST..))
+        {
+            return format!("did::channel:{head}...{tail}");
+        }
+    }
+    let identifier = parts[2..].join(":");
+    if identifier.len() <= FIRST + LAST + 3 {
+        return did.to_string();
+    }
+    match (identifier.get(..FIRST), identifier.get(identifier.len() - LAST..)) {
+        (Some(head), Some(tail)) => format!("did:{}:{head}...{tail}", parts[1]),
+        _ => did.to_string(),
+    }
 }
 
 async fn assert_trust_check_error_code(

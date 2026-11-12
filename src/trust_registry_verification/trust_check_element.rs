@@ -178,8 +178,8 @@ pub enum TrustCheckElementValidationError {
     AuthoritiesTooMany { got: usize, max: usize },
     #[error("query.authority_ids[{index}] must not be blank")]
     AuthoritiesEntryBlank { index: usize },
-    #[error("query.authority_ids lists '{authority}' more than once")]
-    AuthoritiesDuplicate { authority: String },
+    #[error("query.authority_ids[{index}] repeats an earlier entry")]
+    AuthoritiesDuplicate { index: usize },
     #[error("timeout_secs cannot be set when query.authority_ids is set")]
     AuthoritiesTimeoutSet,
     #[error("name exceeds {max} code points (got {got})")]
@@ -264,9 +264,7 @@ impl TrustCheckElement {
                 return Err(TrustCheckElementValidationError::AuthoritiesEntryBlank { index });
             }
             if !seen.insert(authority) {
-                return Err(TrustCheckElementValidationError::AuthoritiesDuplicate {
-                    authority: authority.to_string(),
-                });
+                return Err(TrustCheckElementValidationError::AuthoritiesDuplicate { index });
             }
         }
         Ok(())
@@ -276,27 +274,33 @@ impl TrustCheckElement {
     /// order, each keeping this element's `id`, taking its `authority_source`
     /// from `authority_sources` and waiting
     /// [`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`]. A single-authority
-    /// element is returned unchanged.
+    /// element is returned unchanged. An empty list, which validation
+    /// refuses, yields one element with a blank `authority_id` so the
+    /// executor fails it instead of the check producing no result.
     pub fn per_authority(&self) -> Vec<TrustCheckElement> {
         let Some(authorities) = &self.query.authority_ids else {
             return vec![self.clone()];
         };
+        let for_authority = |authority: &String| TrustCheckElement {
+            authority_source: self
+                .authority_sources
+                .get(authority)
+                .copied(),
+            authority_sources: BTreeMap::new(),
+            query: TrqpQueryParams {
+                authority_id: authority.clone(),
+                authority_ids: None,
+                ..self.query.clone()
+            },
+            timeout_secs: Some(TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS),
+            ..self.clone()
+        };
+        if authorities.is_empty() {
+            return vec![for_authority(&String::new())];
+        }
         authorities
             .iter()
-            .map(|authority| TrustCheckElement {
-                authority_source: self
-                    .authority_sources
-                    .get(authority)
-                    .copied(),
-                authority_sources: BTreeMap::new(),
-                query: TrqpQueryParams {
-                    authority_id: authority.clone(),
-                    authority_ids: None,
-                    ..self.query.clone()
-                },
-                timeout_secs: Some(TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS),
-                ..self.clone()
-            })
+            .map(for_authority)
             .collect()
     }
 }
@@ -871,9 +875,7 @@ mod tests {
     fn validate_rejects_duplicate_authority_entry() {
         assert_eq!(
             multi(&["did:web:authority-a", "did:web:authority-b", " did:web:authority-a"]).validate(),
-            Err(TrustCheckElementValidationError::AuthoritiesDuplicate {
-                authority: "did:web:authority-a".to_string(),
-            })
+            Err(TrustCheckElementValidationError::AuthoritiesDuplicate { index: 2 })
         );
     }
 

@@ -646,16 +646,21 @@ export function queriesFromWire(raw: unknown): TrustCheckQueryConfig[] {
   return raw.filter((e: any) => e && typeof e === 'object').map(queryFromElement);
 }
 
-/** The queries of a Trust Check node whose Authority the loaded register no longer has. */
+/**
+ * The queries of a Trust Check node whose Authority, or any listed Authority, the loaded
+ * register no longer has: one entry per such Authority row.
+ */
 export function missingTrustCheckAuthorities(
   config: any,
   authorityDids: AuthorityDids
 ): MissingAuthority[] {
   if (!authorityDids) return [];
-  return readQueries(config).flatMap((q, index) => {
-    const did = missingAuthorityDid(q.query?.authority_id, q.authority_source, authorityDids);
-    return did ? [{ index, did }] : [];
-  });
+  return readQueries(config).flatMap((q, index) =>
+    authorityRows(q).flatMap(row => {
+      const did = missingAuthorityDid(row.did, row.source, authorityDids);
+      return did ? [{ index, did }] : [];
+    })
+  );
 }
 
 /**

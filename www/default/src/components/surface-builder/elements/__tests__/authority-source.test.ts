@@ -433,6 +433,24 @@ describe('missing Authority — nodes and Save', () => {
     expect(firstMissingAuthorityNode(nodes, dids)?.node.id).toBe('tr');
   });
 
+  it('flags a deleted Authority in a listed query and blocks Save', () => {
+    const listed = trustCheck([
+      check('a', AUTHORITY, 'authority'),
+      {
+        id: 'b',
+        trust_registry_id: 'tr-1',
+        query_type: 'recognition',
+        authority_sources: { [AUTHORITY]: 'authority', [GONE]: 'authority' },
+        query: { authority_ids: [AUTHORITY, GONE], entity_id: '{{ input.agent.did }}' },
+      },
+    ]);
+    expect(missingTrustCheckAuthorities(listed.config, dids)).toEqual([{ index: 1, did: GONE }]);
+    expect(missingAuthorityCanvasReason(listed, dids)).toBe('Authority deleted');
+    expect(firstMissingAuthorityNode([listed], dids)?.warning).toMatch(
+      new RegExp(`^Query 2: The Authority this Trust Check uses \\(${GONE}\\)`)
+    );
+  });
+
   it('blocks nothing while the register is not loaded or nothing names a deleted Authority', () => {
     const gone = trustCheck([check('b', GONE, 'authority')]);
     expect(firstMissingAuthorityNode([gone], null)).toBeNull();

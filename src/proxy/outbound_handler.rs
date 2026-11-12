@@ -3702,7 +3702,7 @@ async fn step_trust_check(
             crate::trust_registry_verification::metadata_gate::synthesize_metadata_gate_failures(
                 origin,
                 crate::trust_registry_verification::TrustCheckLeg::Target,
-                &target_elements,
+                &crate::trust_registry_verification::trust_check_element::expand_authorities(&target_elements),
                 &wrapped_input,
             );
         if synthesized_by_index

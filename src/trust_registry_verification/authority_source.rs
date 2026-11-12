@@ -233,7 +233,7 @@ fn visit_legs(
 
 /// Calls `visit` with the authority DID of `element` and its `authority_source`, or with each
 /// DID of `query.authority_ids` and its entry in `authority_sources`, in list order. Entries
-/// for DIDs the element does not list are dropped.
+/// for DIDs the element does not list are dropped, and so is `authority_source` on a list.
 fn visit_trust_check(
     element: &mut TrustCheckElement,
     used_by: AuthorityUse,
@@ -246,6 +246,7 @@ fn visit_trust_check(
         visit(&element.query.authority_id, &mut element.authority_source, used_by);
         return;
     };
+    element.authority_source = None;
     let mut sources = BTreeMap::new();
     for did in authorities {
         let mut source = element
@@ -1027,6 +1028,17 @@ mod tests {
         assert!(registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None));
 
         assert_eq!(listed_sources(&surface), json!({ ACME: "authority", BILLING: "issuer" }));
+    }
+
+    #[test]
+    fn classify_drops_a_single_authority_source_sent_beside_a_list() {
+        let mut sent = listed("authority-recognised", &[ACME], json!({}));
+        sent["authority_source"] = json!("authority");
+        let mut surface = surface(vec![sent], BILLING);
+
+        registers(vec![authority(ACME, None)]).classify_surface(&mut surface, None);
+
+        assert_eq!(surface.access_point.trust_check_list[0].authority_source, None);
     }
 
     #[test]

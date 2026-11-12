@@ -157,7 +157,10 @@ only that Transit Point's results, at `input.trust_check_results.target`, in all
 outbound OPA scopes (gateway, surface, Transit Point).
 
 A list holds at most `TRUST_CHECK_LIST_MAX` (10) elements
-([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)). A surface variant
+([`src/config/agent_surface.rs`](../src/config/agent_surface.rs)) and queries at most
+`TRUST_CHECK_AUTHORITIES_MAX` (25) authorities in total, counting each entry of a
+`query.authority_ids` list and one for every other element; a longer list is rejected with
+`400`. A surface variant
 override replaces the whole list verbatim, never element by element; a variant gives its
 Transit Points their own lists through its `transit.points` override.
 
@@ -289,12 +292,18 @@ A query that must accept an entity any of several organisations recognises lists
 ```
 
 The gateway sends one TRQP query per listed authority, all at once, and waits until each one
-answers or reaches its built-in 5-second timeout (`QUERY_TIMEOUT`); it never stops early and
-never combines the answers. Such an element cannot set `timeout_secs`. Each
+answers or reaches its built-in 5-second timeout (`TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS`),
+which fails that authority's result with `QUERY_TIMEOUT`; it never stops early and never
+combines the answers. Such an element cannot set `timeout_secs`. Each
 authority gets its own result, in list order, all carrying the element's `id` and each its own
-`authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A
+`authority_id`, and its own audit record and `agent_gateway_trust_check_total` sample. A result
+failed with `AGENT_CARD_UNAVAILABLE`, `TRUST_REGISTRY_METADATA_UNAVAILABLE`,
+`IDENTITY_VP_VERIFICATION_FAILED` or `TARGET_AGENT_IDENTITY_UNAVAILABLE` omits `authority_id`
+and `entity_id`, so the authorities of one element tell such results apart only by order. A
 template that fails to resolve, a missing metadata field or an unreachable registry fails only
-that authority's result. When the target cannot be checked at all (for example its agent card
+that authority's result. An authority that resolves to a blank value, in a list or in
+`query.authority_id`, fails with `TEMPLATE_RESOLUTION_FAILED` without querying its registry.
+When the target cannot be checked at all (for example its agent card
 is unavailable), every listed authority gets a result with that error code.
 
 Because several results share an `id`, an any-of rule iterates them:
@@ -313,7 +322,8 @@ A rule that addresses one result by `id` alone matches every authority of the el
 [_The authority of a Trust Check_](#the-authority-of-a-trust-check)); a template or a DID in
 neither register has no entry. A listed Authority that no longer exists fails only its own
 result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usual. The Surface
-Builder keeps a stored list when it saves the surface but cannot edit it.
+Builder's fullscreen editor builds the list row by row; see _Authority lists_ in
+[`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
 ### The authority of a Trust Check
 
