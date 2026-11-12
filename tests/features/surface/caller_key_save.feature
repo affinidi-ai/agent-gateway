@@ -21,6 +21,7 @@ Feature: Caller key rules when saving a surface
 
   Scenario: Saving a caller key for a plain http Target warns that its keys go out in clear
     Given a surface draft for route "/checked" whose Target receives secret "target-key" in header "X-Target-Key"
+    And the draft's Target is a plain http URL
     And the draft's Access Point checks callers by the API key in secret "target-key"
     And the draft derives caller keys in header "x-caller-key-memory" from secret "caller-keys"
     When the operator creates the surface from the draft
