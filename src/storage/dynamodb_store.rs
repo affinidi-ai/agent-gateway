@@ -440,6 +440,55 @@ mod tests {
     use aws_sdk_dynamodb::types::AttributeValue;
     use std::collections::HashMap;
 
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(
+            &mut self,
+            buf: &[u8],
+        ) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_warning_raised_before_logging_starts_is_logged_once_when_it_starts() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            super::warn_when_logging("held-until-logging-starts-marker".to_string());
+            let before = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert!(!before.contains("held-until-logging-starts-marker"), "nothing is logged before the start");
+
+            super::start_logging_warnings();
+            super::start_logging_warnings();
+        });
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged
+                .matches("held-until-logging-starts-marker")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("WARN"), "{logged}");
+    }
+
     #[test]
     fn parse_channel_protocol_defaults_to_a2a_when_missing() {
         let item = HashMap::new();

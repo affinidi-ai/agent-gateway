@@ -1023,12 +1023,17 @@ async fn a_public_surface_issues_a_fabric_token_without_a_principal_for_a_key_it
     public.access_point.public = Some(true);
     let (peer, _issuer_dir) = receiver(root.path(), &public).await;
 
-    let response = forward_response(&forward_request(
+    let (response, events) = crate::audit::producer::capture(forward_response(&forward_request(
         root.path(),
         json!({ "content-type": "application/json", "x-api-key": "a-key-the-surface-refuses" }),
         a2a_body(),
-    ))
+    )))
     .await;
+    let auth_failures = events
+        .iter()
+        .filter(|event| matches!(event.event, DelegationAuditAction::AuthFailed { blocking: false, .. }))
+        .count();
+    assert_eq!(auth_failures, 1, "the public surface checked the peer's key and refused it");
     assert_eq!(response["status"], 200, "a public surface forwards the unverified request: {response}");
     let forwarded = target
         .received()
