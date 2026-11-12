@@ -105,6 +105,7 @@ pub fn get_default_temp_dir() -> TempDir {
 
 #[derive(Debug, World)]
 #[world(init = Self::new)]
+#[allow(dead_code)]
 pub struct SurfaceWorld {
     pub actors: ActorRegistry,
     pub collaborators: HashMap<String, MockCollaborator>,
@@ -531,6 +532,7 @@ impl SurfaceWorld {
 
     /// Helper method for transit point discovery BDD tests.
     /// Records a request to a transit point and stores the response.
+    #[allow(dead_code)]
     pub async fn record_request(
         &mut self,
         method: &str,
