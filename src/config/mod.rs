@@ -5,6 +5,7 @@ mod agent_surface_accessors;
 pub(crate) mod agent_surface_compat;
 pub mod agent_surface_variants;
 mod bootstrap;
+pub mod caller_key;
 pub mod credential_policy;
 pub mod encryption_config;
 pub mod header_metadata_mapping;

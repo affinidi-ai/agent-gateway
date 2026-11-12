@@ -12,7 +12,9 @@
 pub mod audit;
 pub mod connect_api;
 pub mod connects;
+pub(crate) mod consent_confirmation;
 pub mod consent_cookie;
+pub(crate) mod consent_id_token;
 pub mod grants;
 pub mod handlers;
 pub mod jwt_assertion;
@@ -162,6 +164,7 @@ impl DelegationToken {
 /// OAuth state parameter — encrypted and passed through the OAuth flow
 /// to bind the callback to the original request context.
 #[derive(Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct OAuthState {
     /// Agent DID that needs the delegation
     pub agent_did: String,
@@ -187,6 +190,65 @@ pub struct OAuthState {
     /// start POST. A start state has none; a callback state must have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_binding: Option<String>,
+    /// The consent stage, sealed only on a state that confirms the caller at
+    /// their identity provider. A state without one is a legacy start or
+    /// vendor callback state, told apart by its fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ConsentStage>,
+}
+
+/// The step of a consent flow a sealed [`OAuthState`] is good for. Every
+/// stage carries the binding the caller is confirmed against, so a state can
+/// carry one only under the confirm seal; a start state that confirms no
+/// caller has no stage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentStage {
+    /// The consent start page and its POST, for a caller confirmed at their
+    /// identity provider before the vendor.
+    ConfirmStart(ConsentConfirmBinding),
+    /// The identity provider's redirect back to the gateway.
+    Confirmation(ConfirmationSignIn),
+    /// The vendor's redirect back to the gateway, for a confirmed caller.
+    Vendor(ConsentConfirmBinding),
+}
+
+/// What a caller is confirmed against at their identity provider: the
+/// `consent_confirmation` strategy, the
+/// [`verification_digest`](crate::jwt_bearer::models::JwtVerificationStrategy::verification_digest)
+/// it had at mint, and the surface tenant the caller's `user_identity_hash`
+/// was computed under.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsentConfirmBinding {
+    pub strategy_id: String,
+    pub strategy_digest: String,
+    pub tenant_id: Option<String>,
+}
+
+/// The sign-in at the caller's identity provider a
+/// [`ConsentStage::Confirmation`] state answers: the binding it confirms
+/// against, the `nonce` the ID token must carry and when the sign-in began,
+/// the lower bound of the ID token's `iat`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationSignIn {
+    pub binding: ConsentConfirmBinding,
+    pub nonce: String,
+    pub issued_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for ConfirmationSignIn {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        f.debug_struct("ConfirmationSignIn")
+            .field("binding", &self.binding)
+            .field("nonce", &loggable::REDACTED)
+            .field("issued_at", &self.issued_at)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for OAuthState {
@@ -217,6 +279,7 @@ impl std::fmt::Debug for OAuthState {
                     .as_ref()
                     .map(|_| loggable::REDACTED),
             )
+            .field("stage", &self.stage)
             .finish()
     }
 }
@@ -391,6 +454,7 @@ mod tests {
                 code_verifier: Some("pkce-code-verifier".to_string()),
                 scopes: vec!["repo".to_string()],
                 browser_binding: Some("browser-binding-hash".to_string()),
+                stage: None,
             }
         );
         assert!(state.contains(r#"surface_id: "surface-1""#), "{state}");
@@ -398,6 +462,22 @@ mod tests {
         assert!(!state.contains("csrf-nonce-value"), "{state}");
         assert!(!state.contains("pkce-code-verifier"), "{state}");
         assert!(!state.contains("browser-binding-hash"), "{state}");
+
+        let sign_in = format!(
+            "{:?}",
+            ConsentStage::Confirmation(ConfirmationSignIn {
+                binding: ConsentConfirmBinding {
+                    strategy_id: "strategy-1".to_string(),
+                    strategy_digest: "ab".repeat(32),
+                    tenant_id: None,
+                },
+                nonce: "id-token-nonce-value".to_string(),
+                issued_at: Utc::now(),
+            })
+        );
+        assert!(sign_in.contains(r#"strategy_id: "strategy-1""#), "{sign_in}");
+        assert!(sign_in.contains(r#"nonce: "<redacted>""#), "{sign_in}");
+        assert!(!sign_in.contains("id-token-nonce-value"), "{sign_in}");
     }
 
     #[test]
@@ -498,11 +578,63 @@ mod tests {
             code_verifier: None,
             scopes: Vec::new(),
             browser_binding: None,
+            stage: None,
         };
         let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("stage"), "a legacy state serializes as before: {json}");
         let deserialized: OAuthState = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.agent_did, "did:web:agent.example.com");
         assert_eq!(deserialized.nonce, "nonce-123");
+        assert_eq!(deserialized.stage, None);
+
+        let binding = ConsentConfirmBinding {
+            strategy_id: "strategy-1".to_string(),
+            strategy_digest: "ab".repeat(32),
+            tenant_id: Some("tenant-a".to_string()),
+        };
+        let staged = OAuthState {
+            stage: Some(ConsentStage::ConfirmStart(binding.clone())),
+            ..state
+        };
+        let json = serde_json::to_value(&staged).unwrap();
+        assert_eq!(
+            json["stage"],
+            serde_json::json!({"confirm_start": {
+                "strategy_id": "strategy-1", "strategy_digest": "ab".repeat(32), "tenant_id": "tenant-a"
+            }})
+        );
+        assert_eq!(serde_json::from_value::<OAuthState>(json.clone()).unwrap(), staged);
+
+        let mut extra = json;
+        extra["stage"]["confirm_start"]["confirmed"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<OAuthState>(extra).is_err(),
+            "a confirm binding with a field it does not have is refused"
+        );
+        assert!(
+            serde_json::from_value::<ConsentStage>(serde_json::json!("start")).is_err(),
+            "a start state that confirms no caller has no stage"
+        );
+
+        let issued_at = Utc::now();
+        let confirmation = serde_json::to_value(ConsentStage::Confirmation(ConfirmationSignIn {
+            binding: binding.clone(),
+            nonce: "n".to_string(),
+            issued_at,
+        }))
+        .unwrap();
+        assert_eq!(
+            confirmation,
+            serde_json::json!({"confirmation": {
+                "binding": serde_json::to_value(&binding).unwrap(), "nonce": "n", "issued_at": issued_at
+            }})
+        );
+        let mut extra = confirmation;
+        extra["confirmation"]["confirmed"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<ConsentStage>(extra).is_err(),
+            "a sign-in with a field it does not have is refused"
+        );
     }
 
     #[test]

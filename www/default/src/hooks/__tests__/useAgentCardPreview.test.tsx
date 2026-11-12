@@ -53,6 +53,28 @@ describe('useAgentCardPreview', () => {
     expect(result.current.lastServed).toBeNull();
   });
 
+  const fetchWith = (status: string, cause: string) => ({
+    fetch: { status, cause, http_status: null, duration_ms: 5 },
+  });
+
+  it('remembers a card served without a managed identity', async () => {
+    mockFetch.mockResolvedValue(
+      reply(200, previewBody(fetchWith('served_without_identity', 'identity_missing')))
+    );
+    const { result } = renderHook(() => useAgentCardPreview('s-123'));
+    await waitFor(() => expect(result.current.state.status).toBe('ready'));
+    expect(result.current.lastServed?.card).toEqual(AFTER_CARD);
+  });
+
+  it('remembers no card the gateway refused to serve for its identity', async () => {
+    mockFetch.mockResolvedValue(
+      reply(200, previewBody(fetchWith('not_served', 'identity_failed')))
+    );
+    const { result } = renderHook(() => useAgentCardPreview('s-123'));
+    await waitFor(() => expect(result.current.state.status).toBe('ready'));
+    expect(result.current.lastServed).toBeNull();
+  });
+
   it('reports unavailable when the read fails, and retries on reload', async () => {
     mockFetch.mockResolvedValueOnce(reply(500, {}));
     const { result } = renderHook(() => useAgentCardPreview('s-123'));

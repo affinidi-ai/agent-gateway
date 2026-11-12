@@ -1,0 +1,28 @@
+branch: fix/neutral-route-errors
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-09T12:00:00Z'
+      title: Answer route misses with a protocol-neutral 404
+      description: >-
+        A request on a surface route that no active surface serves now gets a 404
+        application/problem+json body with type about:blank and code: no_route, whose detail
+        names the path and says to check the entry point URL and that the surface is saved and
+        enabled. The body is the same for disabled, deleted and unknown surfaces.
+    - timestamp: '2026-11-11T09:00:00Z'
+      title: Answer Transit Point and MCP Proxy misses with a neutral 404
+      description: >-
+        A Transit Point path that no enabled Transit Point serves, and an entry point whose MCP
+        Proxy is missing, now get a 404 application/problem+json body with type about:blank and
+        code: no_route instead of an A2A error type. The body is the same whether Outbound is
+        off, the alias is missing or the alias is unknown.
+    - timestamp: '2026-11-09T12:30:00Z'
+      title: Drop the A2A error type from the MCP batch refusal
+      description: >-
+        A JSON-RPC batch sent to an MCP surface still gets a 422 application/problem+json
+        answer, but its type is now about:blank instead of an A2A protocol URL, and it carries
+        code: batch_not_supported so callers can tell it from other 422 answers.
+  removed: []
+  security: []
+  breaking: []

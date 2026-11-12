@@ -611,6 +611,25 @@ mod tests {
                 TokenFailure::InvalidResponse,
             ),
             (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": -1})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(
+                    200,
+                    json!({"access_token": "a", "token_type": "Bearer", "expires_in": MAX_EXPIRES_IN_SECS + 1}),
+                ),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": 3600.5})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
+                Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "expires_in": "3600.5"})),
+                TokenFailure::InvalidResponse,
+            ),
+            (
                 Answer::json(200, json!({"access_token": "a", "token_type": "Bearer", "refresh_token": ""})),
                 TokenFailure::InvalidResponse,
             ),
@@ -643,6 +662,19 @@ mod tests {
                 .expires_in,
             Some(3600),
             "a lifetime given as a string is read"
+        );
+        let server = RecordingServer::start_answering(vec![Answer::json(
+            200,
+            json!({"access_token": "a", "token_type": "Bearer", "expires_in": MAX_EXPIRES_IN_SECS}),
+        )])
+        .await;
+        assert_eq!(
+            request_token(&provider(&server, "none", None), None, Some(&server.origin()), code())
+                .await
+                .unwrap()
+                .expires_in,
+            Some(MAX_EXPIRES_IN_SECS),
+            "the longest lifetime is accepted"
         );
     }
 

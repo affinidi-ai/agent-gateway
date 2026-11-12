@@ -20,7 +20,7 @@ fn static_secret(
     }}})
 }
 
-fn draft(world: &mut SurfaceWorld) -> &mut Value {
+pub(crate) fn draft(world: &mut SurfaceWorld) -> &mut Value {
     world
         .surface_draft
         .as_mut()

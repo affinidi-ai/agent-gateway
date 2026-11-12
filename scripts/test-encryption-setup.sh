@@ -94,6 +94,7 @@ checkout="${TEMP_DIR}/usr/local/src/agent-gateway"
 stub_bin="${TEMP_DIR}/bin"
 mkdir -p "${checkout}/envs/certs" "${checkout}/target/debug" "${stub_bin}"
 ln -s "${REPO_DIR}/config" "${checkout}/config"
+ln -s "${REPO_DIR}/src" "${checkout}/src"
 touch "${checkout}/envs/certs/cert.pem" "${checkout}/envs/certs/key.pem"
 printf '#!/bin/bash\n' > "${stub_bin}/cargo"
 cat > "${checkout}/target/debug/agent-gateway" <<'EOF'
@@ -207,6 +208,39 @@ expect_stays_unencrypted() {
 }
 expect_stays_unencrypted local-2 ""
 expect_stays_unencrypted local-3 $'[encryption]\nenabled = false'
+
+# --- _prepare.sh: reserved dashboard routes ------------------------------------
+
+gateway_json="${checkout}/envs/local/config/gateway.json"
+cp "${gateway_json}" "${gateway_json}.orig"
+
+if output="$(prepare debug envs/local 2>&1)"; then
+  [[ "${output}" == *"✅ No prefix in gateway.json shadows a reserved dashboard route"* ]] \
+    || fail "_prepare.sh: the shipped example reports no shadowed dashboard route"
+else
+  fail "_prepare.sh: the shipped example is not refused"
+fi
+
+jq '.channels = ((.channels // []) + [{"prefix": "/Settings/v1"}])' "${gateway_json}.orig" > "${gateway_json}"
+if output="$(prepare debug envs/local 2>&1)"; then
+  fail "_prepare.sh: a channel prefix on a dashboard page is refused"
+else
+  [[ "${output}" == *"❌ Reserved dashboard routes are shadowed by"* ]] || fail "_prepare.sh: the refusal says routes are shadowed"
+  [[ "${output}" == *"prefix '/Settings/v1' shadows the dashboard page '/settings'"* ]] || fail "_prepare.sh: the refusal names the prefix and the page"
+  [[ "${output}" != *"preparation completed"* ]] || fail "_prepare.sh: a refused environment is not reported as prepared"
+fi
+
+jq '.mcp_proxies = [{"prefix": "/surfaces"}]
+    | .routes = {"r": {"type": "redirect", "prefix": "/users", "target": "http://example.test"},
+                 "n": {"type": "redirect", "prefix": "/logs"}}' "${gateway_json}.orig" > "${gateway_json}"
+if output="$(prepare debug envs/local 2>&1)"; then
+  fail "_prepare.sh: an MCP proxy or redirect prefix on a dashboard page is refused"
+else
+  [[ "${output}" == *"prefix '/surfaces' shadows the dashboard page '/surfaces'"* ]] || fail "_prepare.sh: an MCP proxy prefix is refused"
+  [[ "${output}" == *"prefix '/users' shadows the dashboard page '/users'"* ]] || fail "_prepare.sh: a redirect prefix with a target is refused"
+  [[ "${output}" != *"prefix '/logs'"* ]] || fail "_prepare.sh: a redirect without a target is not refused"
+fi
+mv "${gateway_json}.orig" "${gateway_json}"
 
 # --- _certs.sh with encrypted storage and no key ---------------------------------
 

@@ -131,4 +131,32 @@ describe('EditJwtVerificationStrategyPage caller identity claim', () => {
     await screen.findByTestId('settings-page');
     expect(sentBody('PUT')).not.toHaveProperty('principal_claim');
   });
+
+  it('names the providers that refuse an issuer change, and where to change them', async () => {
+    const refused = {
+      message: 'The new expected_issuer is refused by credential providers that use the strategy',
+      references: [{ id: 'p1', name: 'Calendar' }],
+      hidden_references: 1,
+    };
+    (apiClient.fetch as jest.Mock).mockImplementation((_url: string, init?: RequestInit) =>
+      init?.method === 'PUT'
+        ? Promise.resolve({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            text: () => Promise.resolve(JSON.stringify(refused)),
+          })
+        : response(storedStrategy)
+    );
+    renderPage('/jwt-verification-strategies/strategy-1');
+    await waitFor(() =>
+      expect(screen.getByTestId('jwt-strategy-editor-principal-claim-input')).toHaveValue('oid')
+    );
+
+    fireEvent.click(screen.getByTestId('jwt-strategy-editor-save-button'));
+
+    const error = await screen.findByText(/providers Calendar and 1 you can't view/);
+    expect(error).toHaveTextContent("Change a provider's consent confirmation in its editor");
+    expect(screen.queryByTestId('settings-page')).not.toBeInTheDocument();
+  });
 });

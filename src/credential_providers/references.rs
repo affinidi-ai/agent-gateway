@@ -1,5 +1,6 @@
-//! What still uses a credential provider, a secret or an Authority, so deleting it, or
-//! retyping a provider, can be refused while something would break.
+//! What still uses a credential provider, a secret, a JWT verification strategy or an
+//! Authority, so deleting it, or retyping a provider, can be refused while something would
+//! break.
 
 use std::sync::Arc;
 
@@ -126,6 +127,16 @@ impl Referrer {
             id: client.id.clone(),
             name: client.name.clone(),
             tenant_id: client.tenant_id.clone(),
+            uses: Vec::new(),
+        }
+    }
+
+    pub fn credential_provider(provider: &super::CredentialProvider) -> Self {
+        Self {
+            kind: ResourceKind::CredentialProviders,
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            tenant_id: provider.tenant_id.clone(),
             uses: Vec::new(),
         }
     }
@@ -268,6 +279,45 @@ impl ReferenceStores {
             }
         }
         Ok(referrers)
+    }
+
+    /// The credential providers whose `consent_confirmation` or
+    /// `consent_identity_strategy_id` names JWT verification strategy `strategy_id`.
+    pub async fn referrers_of_jwt_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> anyhow::Result<Vec<Referrer>> {
+        Ok(self
+            .providers_of_jwt_strategy(strategy_id)
+            .await?
+            .iter()
+            .map(Referrer::credential_provider)
+            .collect())
+    }
+
+    /// The credential providers [`Self::referrers_of_jwt_strategy`] names.
+    pub async fn providers_of_jwt_strategy(
+        &self,
+        strategy_id: &str,
+    ) -> anyhow::Result<Vec<super::CredentialProvider>> {
+        let Some(store) = &self.credential_providers else {
+            return Ok(Vec::new());
+        };
+        Ok(store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|provider| {
+                provider
+                    .consent_confirmation
+                    .as_ref()
+                    .is_some_and(|confirmation| confirmation.jwt_verification_strategy_id == strategy_id)
+                    || provider
+                        .consent_identity_strategy_id
+                        .as_deref()
+                        == Some(strategy_id)
+            })
+            .collect())
     }
 
     async fn surfaces_where(
@@ -472,6 +522,7 @@ mod tests {
                 }]}
             },
             "target": {"endpoint": "https://api.example.com"},
+            "caller_key": {"secret_id": "memory-keys"},
             "outbound_credentials": [{"credential_provider_id": "bound-provider"}],
             "transit": {"points": [{
                 "id": "partner-id", "alias": "partner", "target_endpoint": "https://partner.example.com",
@@ -501,14 +552,18 @@ mod tests {
             sorted(surface_reference_ids(&surface(), ResourceKind::CredentialProviders)),
             ["bound-provider", "transit-provider", "variant-provider"]
         );
-        assert_eq!(sorted(surface_reference_ids(&surface(), ResourceKind::Secrets)), ["caller-key", "partner-key"]);
+        assert_eq!(
+            sorted(surface_reference_ids(&surface(), ResourceKind::Secrets)),
+            ["caller-key", "memory-keys", "partner-key"]
+        );
         assert_eq!(sorted(target_auth_provider_ids(&surface())), ["variant-provider"]);
     }
 
     #[test]
     fn the_fallback_for_an_unresolvable_surface_holds_every_id_it_stores() {
         let values = string_values(&surface());
-        for id in ["caller-key", "partner-key", "bound-provider", "transit-provider", "variant-provider"] {
+        for id in ["caller-key", "memory-keys", "partner-key", "bound-provider", "transit-provider", "variant-provider"]
+        {
             assert!(values.contains(&id.to_string()), "{id}");
         }
     }
@@ -677,6 +732,71 @@ mod tests {
 
         assert_eq!(ids(tenant_owned), ["own"], "another tenant's or an appliance-wide record does not hold it");
         assert_eq!(ids(appliance_wide), ["appliance", "other", "own"]);
+    }
+
+    #[tokio::test]
+    async fn a_consent_confirmation_client_id_and_secret_make_their_provider_a_referrer_of_the_secrets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                directory.path().to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let provider =
+            |id: &str, consent_confirmation: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+                serde_json::from_value(json!({
+                    "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                    "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                    "consent_confirmation": consent_confirmation,
+                    "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                }))
+                .unwrap()
+            };
+        let confirmation = json!({
+            "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
+            "jwt_verification_strategy_id": "strategy"
+        });
+        for stored in [provider("confirming", confirmation), provider("plain", serde_json::Value::Null)] {
+            store
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let stores = ReferenceStores {
+            credential_providers: Some(store),
+            ..Default::default()
+        };
+        let ids = |referrers: Vec<Referrer>| {
+            sorted(
+                referrers
+                    .into_iter()
+                    .map(|referrer| referrer.id)
+                    .collect(),
+            )
+        };
+        for (case, login_secret) in ["LOGIN_CLIENT_ID", "LOGIN_SECRET"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                ids(stores
+                    .referrers_of_secret(login_secret)
+                    .await
+                    .unwrap()),
+                ["confirming"],
+                "login client secret {case}"
+            );
+        }
+        assert_eq!(
+            ids(stores
+                .referrers_of_secret("CLIENT_SECRET")
+                .await
+                .unwrap()),
+            ["confirming", "plain"]
+        );
     }
 
     async fn body(response: Response) -> serde_json::Value {

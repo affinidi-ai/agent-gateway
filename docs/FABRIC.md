@@ -480,8 +480,11 @@ does not recheck the caller's browser Origin against its own `mcp_http.allowed_o
 the paired sending gateway's check, as it trusts that peer for every other forwarded header. The
 exception is the caller-info and `did:webvh` identity headers (`x-caller-did`,
 `x-caller-identity-source`, `x-caller-dna-uai`, `x-gateway-did`, `x-did-identity`,
-`x-did-signed-identity`): the receiving gateway drops every copy the peer sent, so the agent behind
-it never takes a peer's value for one.
+`x-did-signed-identity`) and the caller key family (`x-caller-key` and every name starting
+`x-caller-key-`): the receiving gateway drops every copy the peer sent, so the agent
+behind it never takes a peer's value for one. A receiving surface with `caller_key` derives its
+own key for a JWT it verified on the request; see
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ### Which variant serves a request over Fabric
 

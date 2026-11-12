@@ -1384,6 +1384,7 @@ export interface AgentSurface {
   issuer_id?: string;
   mcp_legacy_metadata_output?: 'compatibility' | 'canonical';
   mcp_http?: McpHttpConfig;
+  browser_origins?: string[];
   tags: string[];
   access_point: {
     name?: string;

@@ -1,6 +1,6 @@
-//! Credential providers of two tenants, their VP Audit Log, and the callers
-//! that read them, shared by the delegation vault's read scope, router and
-//! VP Audit Log tests.
+//! Credential providers of two tenants, their VP Audit Log, the callers that
+//! read them, and a surface store that cannot be read, shared by the
+//! delegation vault's tests.
 
 use std::sync::Arc;
 
@@ -203,4 +203,42 @@ pub(crate) fn reader(
     delegation: Option<PatDelegationContext>,
 ) -> VaultReader {
     VaultReader::from_extensions(&extensions(tenant, resource_scope, delegation))
+}
+
+/// A surface store every read and write of which fails.
+pub(crate) struct UnreadableSurfaces;
+
+#[async_trait::async_trait]
+impl crate::surfaces::AgentSurfaceStore for UnreadableSurfaces {
+    async fn get_checked(
+        &self,
+        surface_id: &str,
+    ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+        self.get(surface_id).await
+    }
+
+    async fn save(
+        &self,
+        _surface: &crate::config::agent_surface::AgentSurface,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("disk unavailable")
+    }
+
+    async fn get(
+        &self,
+        _surface_id: &str,
+    ) -> anyhow::Result<Option<crate::config::agent_surface::AgentSurface>> {
+        anyhow::bail!("disk unavailable")
+    }
+
+    async fn list_all(&self) -> anyhow::Result<Vec<crate::config::agent_surface::AgentSurface>> {
+        anyhow::bail!("disk unavailable")
+    }
+
+    async fn delete(
+        &self,
+        _surface_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("disk unavailable")
+    }
 }

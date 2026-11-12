@@ -318,6 +318,102 @@ export function isHttpsAddress(host: string): boolean {
   }
 }
 
+/** The consent confirmation inputs, prefixed so they never share a name with the provider's own. */
+export interface ConsentConfirmationFormFields {
+  consent_confirmation_enabled: boolean;
+  /** Whether the loaded provider has the setting; false for a new one. */
+  consent_confirmation_stored: boolean;
+  cc_client_id_secret_ref: string;
+  cc_client_secret_secret_ref: string;
+  cc_authorization_endpoint: string;
+  cc_token_endpoint: string;
+  cc_jwt_verification_strategy_id: string;
+  cc_id_token_principal_claim: string;
+  cc_require: boolean;
+}
+
+export const EMPTY_CONSENT_CONFIRMATION_FIELDS: ConsentConfirmationFormFields = {
+  consent_confirmation_enabled: false,
+  consent_confirmation_stored: false,
+  cc_client_id_secret_ref: '',
+  cc_client_secret_secret_ref: '',
+  cc_authorization_endpoint: '',
+  cc_token_endpoint: '',
+  cc_jwt_verification_strategy_id: '',
+  cc_id_token_principal_claim: '',
+  cc_require: false,
+};
+
+/** The consent confirmation inputs of a loaded provider record. */
+export function consentConfirmationFieldsOf(
+  data: Record<string, unknown>
+): ConsentConfirmationFormFields {
+  const setting = data.consent_confirmation;
+  if (!setting || typeof setting !== 'object') return EMPTY_CONSENT_CONFIRMATION_FIELDS;
+  const stored = setting as Record<string, unknown>;
+  const text = (key: string) => (typeof stored[key] === 'string' ? (stored[key] as string) : '');
+  return {
+    consent_confirmation_enabled: true,
+    consent_confirmation_stored: true,
+    cc_client_id_secret_ref: text('client_id_secret_ref'),
+    cc_client_secret_secret_ref: text('client_secret_secret_ref'),
+    cc_authorization_endpoint: text('authorization_endpoint'),
+    cc_token_endpoint: text('token_endpoint'),
+    cc_jwt_verification_strategy_id: text('jwt_verification_strategy_id'),
+    cc_id_token_principal_claim: text('id_token_principal_claim'),
+    cc_require: stored.require === true,
+  };
+}
+
+/** The first missing required consent confirmation field, as the message to show, or null. */
+export function missingConsentConfirmationField(
+  form: ConsentConfirmationFormFields
+): string | null {
+  if (!form.cc_client_id_secret_ref) return 'Login Client ID is required for consent confirmation.';
+  if (!form.cc_client_secret_secret_ref) {
+    return 'Login Client Secret is required for consent confirmation.';
+  }
+  if (!form.cc_authorization_endpoint.trim()) {
+    return 'Login Authorization Endpoint is required for consent confirmation.';
+  }
+  if (!form.cc_token_endpoint.trim()) {
+    return 'Login Token Endpoint is required for consent confirmation.';
+  }
+  if (!form.cc_jwt_verification_strategy_id) {
+    return 'JWT verification strategy is required for consent confirmation.';
+  }
+  return null;
+}
+
+/**
+ * The `consent_confirmation` to send: the setting while the switch is on for a legacy consent
+ * provider, `null` to clear a stored one that is switched off or no longer applies, and
+ * `undefined` (left out of the request, so the gateway keeps what it has) otherwise.
+ */
+export function consentConfirmationField(
+  form: ConsentConfirmationFormFields,
+  usesConsentFlow: boolean
+): Record<string, string | boolean> | null | undefined {
+  if (usesConsentFlow && form.consent_confirmation_enabled) {
+    const claim = form.cc_id_token_principal_claim.trim();
+    return {
+      client_id_secret_ref: form.cc_client_id_secret_ref,
+      client_secret_secret_ref: form.cc_client_secret_secret_ref,
+      authorization_endpoint: form.cc_authorization_endpoint.trim(),
+      token_endpoint: form.cc_token_endpoint.trim(),
+      jwt_verification_strategy_id: form.cc_jwt_verification_strategy_id,
+      ...(claim ? { id_token_principal_claim: claim } : {}),
+      ...(form.cc_require ? { require: true } : {}),
+    };
+  }
+  return form.consent_confirmation_stored ? null : undefined;
+}
+
+/** The consent confirmation sign-in's redirect URI: the provider's Callback URL plus `/confirm`. */
+export function consentConfirmationRedirectUri(callbackUrl: string): string {
+  return callbackUrl ? `${callbackUrl}/confirm` : '';
+}
+
 /**
  * The callback URL of an authorization code provider: `host` followed by the path the
  * gateway stored for it (`storedPath`). A provider not yet created has none: the gateway

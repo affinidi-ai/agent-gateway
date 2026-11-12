@@ -712,6 +712,46 @@ async fn collect_connection_point_references(
     Ok(())
 }
 
+/// What a credential provider names, as (kind, id, context, same tenant): its
+/// secrets, which must be of its own tenant, and the strategies of its consent
+/// identity and its consent confirmation.
+fn credential_provider_references(
+    provider: &crate::credential_providers::CredentialProvider
+) -> Vec<(ResourceKind, &str, &'static str, bool)> {
+    let secrets = provider
+        .secret_refs()
+        .into_iter()
+        .map(|id| (ResourceKind::Secrets, id, "credential provider secret", true));
+    let strategies = [
+        provider
+            .consent_identity_strategy_id
+            .as_deref()
+            .map(|id| {
+                (ResourceKind::JwtVerificationStrategies, id, "credential provider consent identity strategy", false)
+            }),
+        provider
+            .consent_confirmation
+            .as_ref()
+            .map(|confirmation| {
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    confirmation
+                        .jwt_verification_strategy_id
+                        .as_str(),
+                    "credential provider consent confirmation strategy",
+                    false,
+                )
+            }),
+    ];
+    secrets
+        .chain(
+            strategies
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
 async fn collect_credential_references(
     state: &IdentityApiState,
     references: &mut Vec<OwnershipReference>,
@@ -726,52 +766,8 @@ async fn collect_credential_references(
             .map_err(internal)?
         {
             let source = endpoint(ResourceKind::CredentialProviders, &provider.id, provider.tenant_id.clone(), true);
-            for id in [
-                provider
-                    .client_id_secret_ref
-                    .as_deref(),
-                provider
-                    .client_secret_secret_ref
-                    .as_deref(),
-                provider
-                    .api_key_secret_ref
-                    .as_deref(),
-                provider
-                    .jwt
-                    .jwt_signing_key_secret_ref
-                    .as_deref(),
-                provider
-                    .jwt
-                    .jwt_certificate_secret_ref
-                    .as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                add_reference_with_rule(
-                    state,
-                    references,
-                    source.clone(),
-                    ResourceKind::Secrets,
-                    id,
-                    "credential provider secret",
-                    true,
-                )
-                .await?;
-            }
-            if let Some(id) = provider
-                .consent_identity_strategy_id
-                .as_deref()
-            {
-                add_reference(
-                    state,
-                    references,
-                    source,
-                    ResourceKind::JwtVerificationStrategies,
-                    id,
-                    "credential provider consent identity strategy",
-                )
-                .await?;
+            for (kind, id, context, same_tenant) in credential_provider_references(&provider) {
+                add_reference_with_rule(state, references, source.clone(), kind, id, context, same_tenant).await?;
             }
         }
     }
@@ -1836,6 +1832,55 @@ mod tests {
         }
         assert!(refuse_moving_a_bound_provider(&[surface("tenant-a", other)], "provider").is_ok());
         assert!(refuse_moving_a_bound_provider(&[], "provider").is_ok());
+    }
+
+    #[test]
+    fn a_provider_with_consent_confirmation_references_its_login_secrets_and_strategy() {
+        let provider = |consent_confirmation: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+            serde_json::from_value(serde_json::json!({
+                "id": "provider", "tenant_id": "tenant-a", "name": "GitHub", "provider_id": "github",
+                "provider_type": "oauth2_authorization_code",
+                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
+                "consent_identity_strategy_id": "identity-strategy",
+                "consent_confirmation": consent_confirmation,
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let confirming = provider(serde_json::json!({
+            "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+            "authorization_endpoint": "https://idp.example/authorize", "token_endpoint": "https://idp.example/token",
+            "jwt_verification_strategy_id": "confirmation-strategy"
+        }));
+        assert_eq!(
+            credential_provider_references(&confirming),
+            [
+                (ResourceKind::Secrets, "CLIENT_ID", "credential provider secret", true),
+                (ResourceKind::Secrets, "CLIENT_SECRET", "credential provider secret", true),
+                (ResourceKind::Secrets, "LOGIN_CLIENT_ID", "credential provider secret", true),
+                (ResourceKind::Secrets, "LOGIN_SECRET", "credential provider secret", true),
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    "identity-strategy",
+                    "credential provider consent identity strategy",
+                    false
+                ),
+                (
+                    ResourceKind::JwtVerificationStrategies,
+                    "confirmation-strategy",
+                    "credential provider consent confirmation strategy",
+                    false
+                ),
+            ]
+        );
+        let plain = provider(serde_json::Value::Null);
+        assert_eq!(
+            credential_provider_references(&plain)
+                .into_iter()
+                .map(|(_, id, _, _)| id)
+                .collect::<Vec<_>>(),
+            ["CLIENT_ID", "CLIENT_SECRET", "identity-strategy"]
+        );
     }
 
     /// Slugs are unique per tenant, so a provider moves only into a tenant

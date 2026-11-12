@@ -102,7 +102,10 @@ standard DID tooling such as the Universal Resolver. Its own DID is served at
 `/.well-known/did.jsonl`, each managed agent's under `/dids/{path}/did.jsonl`, and surfaces,
 issuers, trust registries, and Connection Points each at their own path. Each document
 carries the verification methods and service endpoints another system needs to check a
-signature.
+signature. The gateway's DID and newly created managed agent DIDs list the Multikey that signs
+their credentials and presentations (`#key-2`) under `assertionMethod`, so strict Data
+Integrity verifiers accept them. The gateway writes its DID log when it first starts, so a gateway that
+already has one keeps publishing the document it was created with.
 
 ## Federation across organisations
 

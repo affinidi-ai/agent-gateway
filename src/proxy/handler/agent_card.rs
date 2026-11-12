@@ -46,6 +46,9 @@ pub(crate) struct BuiltCard {
     pub generated: bool,
     /// Whether the fetch carried the Target credential.
     pub credential_sent: bool,
+    /// Whether the agent's card carried no identity, so the card is served without
+    /// an identity credential although the surface reads the managed identity from it.
+    pub served_without_identity: bool,
 }
 
 /// Why the card was not built, and exactly what the card route answers.
@@ -81,11 +84,17 @@ pub(crate) enum FetchFault {
     BlockedByEgress,
     Unreachable,
     TimedOut,
-    Status { status: u16, credential_sent: bool },
+    Status {
+        status: u16,
+        credential_sent: bool,
+    },
     TooLarge,
     InvalidCard,
     Compressed,
-    IdentityFailed,
+    IdentityFailed {
+        slot: crate::proxy::card_preview::CardIdentitySlot,
+        error: crate::proxy::card_preview::CardIdentityError,
+    },
     RewriteFailed,
 }
 
@@ -186,11 +195,18 @@ pub(crate) async fn build_public_card(
     if mode.serves() {
         record_served_effects(state, source_addr, &resolved_identity);
     }
+    let served_without_identity = !generated
+        && matches!(resolved_identity, ProtectedAgentIdentity::Anonymous)
+        && crate::proxy::backend_identity::slot_reads_response_body(
+            &state.surface,
+            crate::proxy::backend_identity::IdentitySlot::Protected,
+        );
     Ok(BuiltCard {
         upstream,
         served: agent_card,
         generated,
         credential_sent,
+        served_without_identity,
     })
 }
 
@@ -253,7 +269,10 @@ async fn resolve_card_identity(
             "Protected agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -301,7 +320,10 @@ async fn resolve_external_card_identity(
             "External agent identity resolution failed for agent card intercept"
         );
         CardFailure::new(
-            FetchFault::IdentityFailed,
+            FetchFault::IdentityFailed {
+                slot: crate::proxy::card_preview::CardIdentitySlot::ExternalIdentity,
+                error: crate::proxy::card_preview::CardIdentityError::of(&e),
+            },
             crate::a2a::create_identity_error_response(
                 e.http_status(),
                 e.code(),
@@ -365,7 +387,10 @@ async fn inject_identity_credential(
         .map_err(|e| {
             error!(channel = channel_name, error = %e, "Failed to inject identity credential into agent card");
             CardFailure::new(
-                FetchFault::IdentityFailed,
+                FetchFault::IdentityFailed {
+                    slot: crate::proxy::card_preview::CardIdentitySlot::ProtectedIdentity,
+                    error: crate::proxy::card_preview::CardIdentityError::CredentialInjectionFailed,
+                },
                 create_error_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("Agent card identity credential injection failed: {}", e),
@@ -1094,7 +1119,14 @@ mod tests {
         target: JsonValue,
         metrics: &Arc<crate::metrics::MetricsStore>,
     ) -> ProxyState {
-        let state = super::super::variant_routing_tests::router(surface(target))
+        state_of(surface(target), metrics).await
+    }
+
+    async fn state_of(
+        surface: crate::config::agent_surface::AgentSurface,
+        metrics: &Arc<crate::metrics::MetricsStore>,
+    ) -> ProxyState {
+        let state = super::super::variant_routing_tests::router(surface)
             .base_proxy_state("orders")
             .await
             .unwrap();
@@ -1168,8 +1200,48 @@ mod tests {
         assert_eq!(served.upstream, Some(card));
         assert!(!preview.generated && !served.generated);
         assert_eq!(preview.served, served.served);
+        assert!(
+            !preview.served_without_identity && !served.served_without_identity,
+            "a surface without managed identity has nothing missing"
+        );
         assert_ne!(served.served["url"], "http://agent.internal/a2a", "the card points at the Access Point");
         assert_eq!(recorded(&metrics, 1).await, vec![crate::metrics::ConnectionStatus::Success]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_card_without_an_identity_extension_is_served_without_an_identity_credential() {
+        let card = json!({"name": "Orders agent", "url": "http://agent.internal/a2a", "skills": []});
+        let target = MockServer::start_with_response(card.to_string()).await;
+        let metrics = Arc::new(crate::metrics::MetricsStore::new(10));
+        let mut managed = surface(json!({"endpoint": target.url()}));
+        managed
+            .identity_slots
+            .protected = Some(crate::source_auth::ManagedIdentityConfig::PayloadExtraction(
+            crate::source_auth::models::PayloadExtractionConfig {
+                meta_field: "agentIdentity".to_string(),
+                ..Default::default()
+            },
+        ));
+        let state = state_of(managed, &metrics).await;
+
+        for mode in [CardMode::Preview, CardMode::Serve] {
+            let built = build(&state, mode)
+                .await
+                .unwrap_or_else(|failure| panic!("{mode:?}: {:?}", failure.fault));
+            assert_eq!(built.upstream, Some(card.clone()), "{mode:?}");
+            assert_ne!(
+                built.served["url"], "http://agent.internal/a2a",
+                "{mode:?}: the card points at the Access Point"
+            );
+            assert_eq!(
+                built
+                    .served
+                    .pointer("/capabilities/extensions"),
+                None,
+                "{mode:?}: no identity credential"
+            );
+            assert!(built.served_without_identity, "{mode:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

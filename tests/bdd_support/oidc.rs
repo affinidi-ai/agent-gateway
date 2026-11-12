@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axum::extract::{Form, Query, State};
 use axum::http::{StatusCode, header};
@@ -40,8 +40,10 @@ struct ProviderState {
     grants: Mutex<HashMap<String, Grant>>,
     token_requests: AtomicU64,
     next_code: AtomicU64,
+    omits_nonce: AtomicBool,
     access_token: String,
     refresh_token: String,
+    issuer: String,
 }
 
 pub struct OidcProvider {
@@ -69,6 +71,12 @@ impl Drop for OidcProvider {
 
 impl OidcProvider {
     pub async fn start() -> Self {
+        Self::start_with_issuer(OIDC_ISSUER).await
+    }
+
+    /// A provider that signs its ID tokens, and names itself in its
+    /// authorization responses, as `issuer`.
+    pub async fn start_with_issuer(issuer: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap();
@@ -76,6 +84,7 @@ impl OidcProvider {
         let state = Arc::new(ProviderState {
             access_token: format!("bdd-delegated-access-{}", uuid::Uuid::new_v4()),
             refresh_token: format!("bdd-delegated-refresh-{}", uuid::Uuid::new_v4()),
+            issuer: issuer.to_string(),
             ..ProviderState::default()
         });
         let app = Router::new()
@@ -137,7 +146,7 @@ impl OidcProvider {
     ) -> String {
         let now = now_secs();
         sign_jwt(serde_json::json!({
-            "iss": OIDC_ISSUER,
+            "iss": self.state.issuer,
             "sub": subject,
             "aud": OIDC_CLIENT_ID,
             "iat": now,
@@ -154,6 +163,13 @@ impl OidcProvider {
             .signed_in
             .lock()
             .await = Some(subject.to_string());
+    }
+
+    /// Issue ID tokens without the nonce of the authorization request.
+    pub fn omit_nonce(&self) {
+        self.state
+            .omits_nonce
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn access_token(&self) -> &str {
@@ -226,7 +242,7 @@ async fn authorize(
         .query_pairs_mut()
         .append_pair("code", &code)
         .append_pair("state", &request_state)
-        .append_pair("iss", OIDC_ISSUER);
+        .append_pair("iss", &state.issuer);
     (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
 }
 
@@ -267,14 +283,24 @@ async fn token(
         return invalid_grant();
     }
     let now = now_secs();
-    let id_token = sign_jwt(serde_json::json!({
-        "iss": OIDC_ISSUER,
+    let mut claims = serde_json::json!({
+        "iss": state.issuer,
         "sub": grant.subject,
         "aud": OIDC_CLIENT_ID,
         "nonce": grant.nonce,
         "iat": now,
         "exp": now + 300,
-    }));
+    });
+    if state
+        .omits_nonce
+        .load(Ordering::SeqCst)
+    {
+        claims
+            .as_object_mut()
+            .expect("ID token claims are an object")
+            .remove("nonce");
+    }
+    let id_token = sign_jwt(claims);
     Json(serde_json::json!({
         "access_token": state.access_token,
         "refresh_token": state.refresh_token,

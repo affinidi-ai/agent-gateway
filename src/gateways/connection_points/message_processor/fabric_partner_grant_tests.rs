@@ -411,9 +411,11 @@ impl Receiver {
         tenant: Option<&str>,
     ) -> String {
         crate::source_auth::AuthenticatedIdentity::JwtBearer {
+            strategy_id: None,
             subject: subject.to_string(),
             claims: json!({ "iss": self.idp.issuer, "sub": subject }),
             principal_claim: "sub".to_string(),
+            verification: Default::default(),
         }
         .principal_hash(tenant)
         .unwrap()
@@ -513,6 +515,13 @@ impl Receiver {
             resource_origins: Arc::new(HashMap::new()),
             issuers: Default::default(),
             mcp_proxy_store: None,
+            identity_strategies: self.strategies.clone(),
+            verifier: Arc::new(crate::jwt_bearer::JwtBearerVerifier::new(Arc::new(
+                crate::jwt_bearer::JwksClient::new(),
+            ))),
+            provider_egress: self.egress(),
+            gateway_mcp_issuer: None,
+            config_surfaces: None,
         };
         let app = crate::delegation_vault::router::create_delegation_vault_oauth_router(callback)
             .layer(axum::middleware::from_fn(crate::delegation_vault::consent_cookie::guard));

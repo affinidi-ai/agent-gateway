@@ -202,8 +202,10 @@ impl GatewayConfig {
                 mcp_legacy_metadata_output: None,
                 _retired_protocol_mode: Default::default(),
                 mcp_http: None,
+                caller_key: None,
                 trust_check_split: false,
                 transit_point_source_auth: false,
+                browser_origins: Vec::new(),
             }],
             tls: TlsConfig {
                 cert_path: PathBuf::from("cert.pem"),

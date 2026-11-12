@@ -751,10 +751,12 @@ fn a_fabric_tokens_principal_is_only_the_caller_the_receiving_surface_verified()
     );
 
     let alice = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        strategy_id: None,
         principal_claim: "sub".to_string(),
         subject: "alice".to_string(),
         claims: json!({ "iss": "https://idp.example", "sub": "alice", "email": "alice@example.com",
             "name": "Alice", "phone": "+15550100" }),
+        verification: Default::default(),
     };
     let mut verified = caller(Some("did:web:agent.example"), IdentityVerification::Vp);
     verified.verified_identity = Some(&alice);
@@ -1231,9 +1233,11 @@ async fn a_jwt_the_receiving_surface_verified_is_the_fabric_tokens_principal_wit
         .validate(header_values(&received, "x-transit-token")[0], 300)
         .unwrap();
     let verified = crate::source_auth::AuthenticatedIdentity::JwtBearer {
+        strategy_id: None,
         principal_claim: "sub".to_string(),
         subject: "user-123".to_string(),
         claims,
+        verification: Default::default(),
     };
     assert_eq!(token.user_identity_hash, None);
     assert_eq!(

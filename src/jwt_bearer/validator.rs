@@ -147,7 +147,7 @@ impl JwtBearerVerifier {
                 ErrorKind::ExpiredSignature => JwtBearerError::ExpiredToken,
                 ErrorKind::ImmatureSignature => JwtBearerError::InvalidToken("JWT is not valid yet (nbf)".to_string()),
                 ErrorKind::InvalidIssuer => JwtBearerError::InvalidIssuer,
-                ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => JwtBearerError::InvalidAudience,
+                ErrorKind::MissingRequiredClaim(claim) if claim == "iss" => JwtBearerError::InvalidIssuer,
                 ErrorKind::InvalidAudience => JwtBearerError::InvalidAudience,
                 ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => JwtBearerError::InvalidAudience,
                 _ => JwtBearerError::InvalidToken(format!("JWT verification failed: {}", e)),

@@ -169,11 +169,13 @@ pub enum DelegationFailureReason {
     BrowserBindingMismatch,
     /// A consent callback without `iss` from a provider whose issuer is recorded.
     IssMissing,
-    /// A consent callback whose `iss` is not the provider's recorded issuer.
+    /// A consent callback whose `iss` is not the provider's recorded issuer,
+    /// or a consent confirmation whose `iss` is not its strategy's issuer.
     IssMismatch,
     /// A consent callback that is malformed or carries no code.
     ConsentResponseInvalid,
-    /// The vendor answered the consent with an error.
+    /// The vendor, or the identity provider of a consent confirmation,
+    /// answered with an error.
     ConsentDenied,
     /// The provider's redirect URI breaks the consent rules or is another
     /// provider's.
@@ -182,8 +184,11 @@ pub enum DelegationFailureReason {
     AuthorizationUrlInvalid,
     /// A consent start POST that did not come from the gateway's start page.
     CrossSiteConsentStart,
-    /// The vendor's token endpoint refused or failed the code exchange.
+    /// The vendor's token endpoint, or the consent confirmation login
+    /// client's, refused or failed the code exchange.
     TokenExchangeFailed,
+    /// A consent confirmation sign-in gave no ID token that names a caller.
+    ConsentIdentityMissing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

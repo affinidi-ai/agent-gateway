@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::identity::ssi::vc_issuer::{AgentIdentity, IssueVcPayload, LocalVcIssuer, LocalVcSigner, VcIssuer};
+use crate::identity::ssi::vc_issuer::{
+    AgentIdentity, DEFAULT_SIGNING_KEY_ID, IssueVcPayload, LocalVcIssuer, LocalVcSigner, VcIssuer,
+};
 use crate::identity::ssi::verifier::{LocalVerifier, Verifier};
 use crate::identity::ssi::vp_issuer::{Credentials, LocalVpIssuer, LocalVpSigner, VpIssuer, VpIssuerPayload};
 
@@ -24,6 +26,85 @@ const IS_VP_CHALLENGE_REQUIRED_DEFAULT: bool = false;
 
 fn extract_domain_from_proxy_did(proxy_did: &str) -> String {
     crate::identity::utils::extract_domain_from_did(proxy_did)
+}
+
+/// The public JWK of a DIDComm key-agreement secret, without its private `d` parameter.
+fn public_key_agreement_jwk(
+    secret: &affinidi_tdk_common::secrets_resolver::secrets::Secret,
+    label: &str,
+) -> Result<serde_json::Value> {
+    let affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::JWK(jwk) = &secret.secret_material else {
+        return Err(anyhow::anyhow!("{} secret is not a JWK", label));
+    };
+    let mut public_jwk = serde_json::to_value(jwk)?;
+    if let Some(obj) = public_jwk.as_object_mut() {
+        obj.remove("d");
+    }
+    Ok(public_jwk)
+}
+
+/// The gateway's DID document. The Ed25519 signing key is published twice: as `#key-1`
+/// (JsonWebKey2020) and as the Multikey the `eddsa-rdfc-2022` signer references. Both are
+/// listed under `assertionMethod`, so verifiers accept the credentials the gateway signs.
+fn gateway_did_document(
+    proxy_did: &str,
+    signing_key: &JWK,
+    x25519_key_id: &str,
+    x25519_public_jwk: serde_json::Value,
+    p256_key_id: &str,
+    p256_public_jwk: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let public_key_multibase = crate::identity::ssi::did_utils::jwk_to_multibase_ed25519(signing_key)?;
+    let jwk_key_id = format!("{}#key-1", proxy_did);
+    let multikey_id = format!("{}#{}", proxy_did, DEFAULT_SIGNING_KEY_ID);
+    let domain = extract_domain_from_proxy_did(proxy_did);
+
+    Ok(json!({
+        "@context": [
+            "https://www.w3.org/ns/did/v1",
+            "https://w3id.org/security/suites/jws-2020/v1",
+            "https://w3id.org/security/multikey/v1"
+        ],
+        "id": proxy_did,
+        "verificationMethod": [
+            {
+                "id": &jwk_key_id,
+                "type": "JsonWebKey2020",
+                "controller": proxy_did,
+                "publicKeyJwk": signing_key.to_public()
+            },
+            {
+                "id": &multikey_id,
+                "type": "Multikey",
+                "controller": proxy_did,
+                "publicKeyMultibase": public_key_multibase
+            },
+            {
+                "id": x25519_key_id,
+                "type": "JsonWebKey2020",
+                "controller": proxy_did,
+                "publicKeyJwk": x25519_public_jwk
+            },
+            {
+                "id": p256_key_id,
+                "type": "JsonWebKey2020",
+                "controller": proxy_did,
+                "publicKeyJwk": p256_public_jwk
+            }
+        ],
+        "authentication": [&jwk_key_id],
+        "assertionMethod": [&jwk_key_id, &multikey_id],
+        "keyAgreement": [x25519_key_id, p256_key_id],
+        "service": [{
+            "id": format!("{}#didcomm", proxy_did),
+            "type": "DIDCommMessaging",
+            "serviceEndpoint": [{
+                "uri": format!("https://{}/didcomm", domain),
+                "accept": ["didcomm/v2"],
+                "routingKeys": []
+            }]
+        }]
+    }))
 }
 
 /// Read an issuer key file, transparently decrypting the whole-file `.enc`
@@ -354,12 +435,6 @@ impl VCIssuer {
         if let Some(content) = crate::storage::did_artifacts::read_did_document(&config.storage_path).await? {
             Ok(serde_json::from_str(&content)?)
         } else {
-            use crate::identity::ssi::did_utils::jwk_to_multibase_ed25519;
-
-            let domain = extract_domain_from_proxy_did(&config.proxy_did);
-
-            let public_key_multibase = jwk_to_multibase_ed25519(&config.signing_key)?;
-
             let x25519_key_path = config
                 .storage_path
                 .join("x25519_key.json");
@@ -369,95 +444,26 @@ impl VCIssuer {
 
             let (x25519_key_id, x25519_public_jwk) = if let Some(content) = read_issuer_file(&x25519_key_path).await? {
                 let secret: affinidi_tdk_common::secrets_resolver::secrets::Secret = serde_json::from_str(&content)?;
-                let key_id = secret.id.clone();
-                let public_jwk = if let affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::JWK(jwk) =
-                    &secret.secret_material
-                {
-                    let mut public_jwk = serde_json::to_value(jwk)?;
-                    if let Some(obj) = public_jwk.as_object_mut() {
-                        obj.remove("d");
-                    }
-                    public_jwk
-                } else {
-                    return Err(anyhow::anyhow!("X25519 secret is not a JWK"));
-                };
-                (key_id, public_jwk)
+                (secret.id.clone(), public_key_agreement_jwk(&secret, "X25519")?)
             } else {
-                let key_id = format!("{}#key-x25519-1", config.proxy_did);
-                (key_id, serde_json::json!({}))
+                (format!("{}#key-x25519-1", config.proxy_did), serde_json::json!({}))
             };
 
             let (p256_key_id, p256_public_jwk) = if let Some(content) = read_issuer_file(&p256_key_path).await? {
                 let secret: affinidi_tdk_common::secrets_resolver::secrets::Secret = serde_json::from_str(&content)?;
-                let key_id = secret.id.clone();
-                let public_jwk = if let affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::JWK(jwk) =
-                    &secret.secret_material
-                {
-                    let mut public_jwk = serde_json::to_value(jwk)?;
-                    if let Some(obj) = public_jwk.as_object_mut() {
-                        obj.remove("d");
-                    }
-                    public_jwk
-                } else {
-                    return Err(anyhow::anyhow!("P-256 secret is not a JWK"));
-                };
-                (key_id, public_jwk)
+                (secret.id.clone(), public_key_agreement_jwk(&secret, "P-256")?)
             } else {
-                let key_id = format!("{}#key-p256-1", config.proxy_did);
-                (key_id, serde_json::json!({}))
+                (format!("{}#key-p256-1", config.proxy_did), serde_json::json!({}))
             };
 
-            // Include both JsonWebKey2020 (#key-1) and Multikey (#key-2) formats
-            // VP signatures use EdDsaRdfc2022 cryptosuite which expects Multikey format
-            Ok(serde_json::json!({
-                "@context": [
-                    "https://www.w3.org/ns/did/v1",
-                    "https://w3id.org/security/suites/jws-2020/v1",
-                    "https://w3id.org/security/multikey/v1"
-                ],
-                "id": config.proxy_did,
-                "verificationMethod": [
-                    {
-                        "id": format!("{}#key-1", config.proxy_did),
-                        "type": "JsonWebKey2020",
-                        "controller": config.proxy_did,
-                        "publicKeyJwk": config.signing_key.to_public()
-                    },
-                    {
-                        "id": format!("{}#key-2", config.proxy_did),
-                        "type": "Multikey",
-                        "controller": config.proxy_did,
-                        "publicKeyMultibase": public_key_multibase
-                    },
-                    {
-                        "id": &x25519_key_id,
-                        "type": "JsonWebKey2020",
-                        "controller": config.proxy_did,
-                        "publicKeyJwk": x25519_public_jwk
-                    },
-                    {
-                        "id": &p256_key_id,
-                        "type": "JsonWebKey2020",
-                        "controller": config.proxy_did,
-                        "publicKeyJwk": p256_public_jwk
-                    }
-                ],
-                "authentication": [format!("{}#key-1", config.proxy_did)],
-                "assertionMethod": [
-                    format!("{}#key-1", config.proxy_did),
-                    format!("{}#key-2", config.proxy_did)
-                ],
-                "keyAgreement": [&x25519_key_id, &p256_key_id],
-                "service": [{
-                    "id": format!("{}#didcomm", config.proxy_did),
-                    "type": "DIDCommMessaging",
-                    "serviceEndpoint": [{
-                        "uri": format!("https://{}/didcomm", domain),
-                        "accept": ["didcomm/v2"],
-                        "routingKeys": []
-                    }]
-                }]
-            }))
+            gateway_did_document(
+                &config.proxy_did,
+                &config.signing_key,
+                &x25519_key_id,
+                x25519_public_jwk,
+                &p256_key_id,
+                p256_public_jwk,
+            )
         }
     }
 
@@ -631,35 +637,6 @@ impl VCIssuer {
             secret
         };
 
-        // Extract public keys from the secrets for the DID document
-        let x25519_key_id = x25519_secret.id.clone();
-        let x25519_public_jwk = if let affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::JWK(jwk) =
-            &x25519_secret.secret_material
-        {
-            // Create public-only version (without 'd' parameter)
-            let mut public_jwk = serde_json::to_value(jwk)?;
-            if let Some(obj) = public_jwk.as_object_mut() {
-                obj.remove("d");
-            }
-            public_jwk
-        } else {
-            return Err(anyhow::anyhow!("X25519 secret is not a JWK"));
-        };
-
-        let p256_key_id = p256_secret.id.clone();
-        let p256_public_jwk = if let affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::JWK(jwk) =
-            &p256_secret.secret_material
-        {
-            // Create public-only version (without 'd' parameter)
-            let mut public_jwk = serde_json::to_value(jwk)?;
-            if let Some(obj) = public_jwk.as_object_mut() {
-                obj.remove("d");
-            }
-            public_jwk
-        } else {
-            return Err(anyhow::anyhow!("P-256 secret is not a JWK"));
-        };
-
         // Generate or update the DID document
         let did_doc_path = storage_path.join("did.json");
 
@@ -667,58 +644,14 @@ impl VCIssuer {
         let should_update_did_doc = !did_doc_path.exists() || is_new_config || !x25519_existed || !p256_existed;
 
         if should_update_did_doc {
-            use crate::identity::ssi::did_utils::jwk_to_multibase_ed25519;
-
-            let domain = extract_domain_from_proxy_did(&proxy_did);
-
-            let public_key_multibase = jwk_to_multibase_ed25519(&key)?;
-
-            let did_doc = json!({
-                "@context": [
-                    "https://www.w3.org/ns/did/v1",
-                    "https://w3id.org/security/suites/jws-2020/v1",
-                    "https://w3id.org/security/multikey/v1"
-                ],
-                "id": proxy_did,
-                "verificationMethod": [
-                    {
-                        "id": format!("{}#key-1", proxy_did),
-                        "type": "JsonWebKey2020",
-                        "controller": proxy_did,
-                        "publicKeyJwk": key.to_public()
-                    },
-                    {
-                        "id": format!("{}#key-2", proxy_did),
-                        "type": "Multikey",
-                        "controller": proxy_did,
-                        "publicKeyMultibase": public_key_multibase
-                    },
-                    {
-                        "id": &x25519_key_id,
-                        "type": "JsonWebKey2020",
-                        "controller": proxy_did,
-                        "publicKeyJwk": x25519_public_jwk
-                    },
-                    {
-                        "id": &p256_key_id,
-                        "type": "JsonWebKey2020",
-                        "controller": proxy_did,
-                        "publicKeyJwk": p256_public_jwk
-                    }
-                ],
-                "authentication": [format!("{}#key-1", proxy_did)],
-                "assertionMethod": [format!("{}#key-1", proxy_did)],
-                "keyAgreement": [&x25519_key_id, &p256_key_id],
-                "service": [{
-                    "id": format!("{}#didcomm", proxy_did),
-                    "type": "DIDCommMessaging",
-                    "serviceEndpoint": [{
-                        "uri": format!("https://{}/didcomm", domain),
-                        "accept": ["didcomm/v2"],
-                        "routingKeys": []
-                    }]
-                }]
-            });
+            let did_doc = gateway_did_document(
+                &proxy_did,
+                &key,
+                &x25519_secret.id,
+                public_key_agreement_jwk(&x25519_secret, "X25519")?,
+                &p256_secret.id,
+                public_key_agreement_jwk(&p256_secret, "P-256")?,
+            )?;
 
             let did_doc_json = serde_json::to_string_pretty(&did_doc)?;
             crate::storage::did_artifacts::write_did_document(&storage_path, &did_doc_json).await?;
@@ -1918,6 +1851,130 @@ mod tests {
             "DID document missing 'keyAgreement'"
         );
         assert!(doc.get("id").is_some(), "DID document missing 'id'");
+    }
+
+    fn key_ids(
+        doc: &serde_json::Value,
+        relationship: &str,
+    ) -> Vec<String> {
+        doc[relationship]
+            .as_array()
+            .unwrap_or_else(|| panic!("DID document missing '{relationship}'"))
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_signing_key_authorized_for_assertions(
+        doc: &serde_json::Value,
+        did: &str,
+    ) {
+        let multikey_id = format!("{did}#{DEFAULT_SIGNING_KEY_ID}");
+        assert_eq!(key_ids(doc, "assertionMethod"), vec![format!("{did}#key-1"), multikey_id.clone()]);
+        assert_eq!(key_ids(doc, "authentication"), vec![format!("{did}#key-1")]);
+        let signing_method = doc["verificationMethod"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|vm| vm["id"] == multikey_id.as_str())
+            .unwrap_or_else(|| panic!("verificationMethod must list {multikey_id}"));
+        assert_eq!(signing_method["type"], "Multikey");
+    }
+
+    /// The gateway signs its credentials with the Multikey, so the DID log it publishes must
+    /// list that key under assertionMethod for strict Data Integrity verifiers to accept them.
+    #[tokio::test]
+    async fn published_did_log_authorizes_signing_key_for_assertions() {
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let identity_store = Arc::new(MockIdentityStore::new()) as Arc<dyn IdentityStore>;
+        let vp_challenge_store = Arc::new(MockVpChallengeStore::new()) as Arc<dyn VpChallengeStore>;
+
+        let issuer = VCIssuer::new(temp_dir.path(), "example.com", identity_store, vp_challenge_store, None, None)
+            .await
+            .unwrap();
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+
+        let log = crate::storage::did_artifacts::read_did_log_raw(temp_dir.path())
+            .await
+            .unwrap()
+            .expect("the gateway must publish a did.jsonl log");
+        let latest: serde_json::Value = serde_json::from_str(log.lines().last().unwrap()).unwrap();
+
+        assert_signing_key_authorized_for_assertions(&latest["state"], &did);
+    }
+
+    /// Without a stored did.json the gateway builds its document on demand, and that document
+    /// authorizes the signing Multikey the same way.
+    #[tokio::test]
+    async fn generated_did_document_authorizes_signing_key_for_assertions() {
+        crate::gateways::did_cache::init_shared_resolver()
+            .await
+            .unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let identity_store = Arc::new(MockIdentityStore::new()) as Arc<dyn IdentityStore>;
+        let vp_challenge_store = Arc::new(MockVpChallengeStore::new()) as Arc<dyn VpChallengeStore>;
+
+        let issuer = VCIssuer::new(temp_dir.path(), "example.com", identity_store, vp_challenge_store, None, None)
+            .await
+            .unwrap();
+        let did = issuer
+            .get_issuer_did()
+            .await
+            .unwrap();
+        std::fs::remove_file(
+            temp_dir
+                .path()
+                .join("did.json"),
+        )
+        .unwrap();
+
+        let doc = issuer
+            .get_did_document()
+            .await
+            .unwrap();
+
+        assert_eq!(doc["id"], did.as_str());
+        assert_signing_key_authorized_for_assertions(&doc, &did);
+    }
+
+    #[test]
+    fn public_key_agreement_jwk_drops_private_key() {
+        let secret = affinidi_tdk_common::secrets_resolver::secrets::Secret::generate_x25519(
+            Some("did:web:example.com#key-x25519-1"),
+            None,
+        )
+        .unwrap();
+
+        let public_jwk = public_key_agreement_jwk(&secret, "X25519").unwrap();
+
+        assert!(public_jwk.get("d").is_none(), "public JWK must not carry the private key");
+        assert_eq!(public_jwk["crv"], "X25519");
+        assert!(public_jwk["x"].is_string(), "public JWK must carry the public key");
+    }
+
+    #[test]
+    fn public_key_agreement_jwk_rejects_non_jwk_secret() {
+        let mut secret = affinidi_tdk_common::secrets_resolver::secrets::Secret::generate_x25519(
+            Some("did:web:example.com#key-x25519-1"),
+            None,
+        )
+        .unwrap();
+        secret.secret_material =
+            affinidi_tdk_common::secrets_resolver::secrets::SecretMaterial::PrivateKeyMultibase("z6LS".to_string());
+
+        let err = public_key_agreement_jwk(&secret, "X25519").unwrap_err();
+
+        assert_eq!(err.to_string(), "X25519 secret is not a JWK");
     }
 
     /// The issued VC's issuer field must match the proxy_did.

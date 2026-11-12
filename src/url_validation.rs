@@ -379,6 +379,23 @@ pub fn validate_oauth_endpoint_url(raw: &str) -> Result<Url, String> {
     validate_oauth_endpoint_url_inner(raw, bdd_oauth_endpoint_allowlist().as_deref())
 }
 
+/// [`validate_oauth_endpoint_url`] without resolving the host:
+/// [`validate_url_not_cloud_metadata`], with the same BDD exact endpoint
+/// allowlist fallback, for a check on a request path that must not wait on DNS.
+pub fn validate_oauth_endpoint_url_unresolved(raw: &str) -> Result<Url, String> {
+    validate_url_not_cloud_metadata(raw).or_else(|production_error| {
+        let Some(allowlist_raw) = bdd_oauth_endpoint_allowlist() else {
+            return Err(production_error);
+        };
+        let candidate = validate_url_not_cloud_metadata_host(raw)?;
+        if parse_oauth_endpoint_allowlist(&allowlist_raw)?.contains(&candidate) {
+            Ok(candidate)
+        } else {
+            Err(format!("{production_error}; the OAuth endpoint is not in the BDD exact endpoint allowlist"))
+        }
+    })
+}
+
 /// Defense-in-depth check for the forwarding layer. Only blocks cloud metadata
 /// endpoints — does NOT block loopback (channels may legitimately target
 /// localhost in dev/test environments).

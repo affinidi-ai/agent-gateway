@@ -216,7 +216,7 @@
         },
         {
           "name": "Quoted credential fields",
-          "pattern": "(?i)(\"[A-Za-z0-9_.-]*(?:authorization|cookie|api[_-]?key|secret(?:[_-]?key)?|private[_-]?key|token|passw(?:or)?d|session[_-]?id|credentials?)\\\\?\"\\s*:\\s*\\\\?\")[^\"\\\\]*",
+          "pattern": "(?i)(\"[A-Za-z0-9_.-]*(?:authorization|cookie|api[_-]?key|caller[_-]?key|secret(?:[_-]?key)?|private[_-]?key|token|passw(?:or)?d|session[_-]?id|credentials?)\\\\?\"\\s*:\\s*\\\\?\")[^\"\\\\]*",
           "replacement": "${1}[REDACTED]"
         },
         {

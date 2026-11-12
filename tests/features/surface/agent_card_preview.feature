@@ -14,9 +14,29 @@ Feature: Agent card preview
     And the agent card preview field "supported" is true
     And the agent card preview field "fetch.status" is "ok"
     And the agent card preview field "fetch.cause" is empty
+    And the agent card preview field "fetch.identity_error" is empty
     And the agent card preview shows the card of managed agent "bravo" as the agent publishes it
     And the agent card preview shows the card the gateway serves, pointing at the gateway
     And managed agent "bravo" received a request for its agent card without the operator's credentials
+
+  Scenario: The preview reports a card served without a managed identity
+    Given the surface has managed identity enabled
+    And managed agent "bravo" serves an Agent Card that names its own address
+    When the operator reads the agent card preview of the surface
+    Then the agent card preview answers 200
+    And the agent card preview field "fetch.status" is "served_without_identity"
+    And the agent card preview field "fetch.cause" is "identity_missing"
+    And the agent card preview field "fetch.identity_error" is empty
+    And the agent card preview shows the card the gateway serves, pointing at the gateway
+
+  Scenario: The preview names the cause of a real identity failure
+    Given the surface has managed identity enabled
+    And managed agent "bravo" serves an Agent Card that declares the identity extension without its payload
+    When the operator reads the agent card preview of the surface
+    Then the agent card preview answers 200
+    And the agent card preview field "fetch.status" is "not_served"
+    And the agent card preview field "fetch.cause" is "identity_failed"
+    And the agent card preview field "fetch.identity_error" is "identity_validation_failed"
 
   Scenario: A target token the provider refuses is reported while the preview still answers
     Given the gateway authenticates to the managed agent with a client credentials provider

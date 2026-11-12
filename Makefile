@@ -239,11 +239,11 @@ run-debug: config-certs ## Run in debug mode; x=name for named instance; o=1 for
 	@[ -n "$(o)" ] && rm -f "envs/local$(if $(x),-$(x),)/.browser_opened" || true
 	@if [ -n "$(x)" ]; then \
 		echo "$(BLUE)🔧 Configuring debug instance $(x)...$(NC)"; \
-		./scripts/_prepare.sh debug envs/local-$(x); \
+		./scripts/_prepare.sh debug envs/local-$(x) || exit 1; \
 		echo "$(GREEN)✅ Debug instance $(x) ready!$(NC)"; \
 	else \
 		echo "$(BLUE)🔧 Configuring debug environment (dev mode)...$(NC)"; \
-		./scripts/_prepare.sh debug envs/local; \
+		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Debug dev environment ready!$(NC)"; \
 	fi
 	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true
@@ -260,11 +260,11 @@ run-watch: config-certs ## Run with cargo watch (auto-rebuild/restart on Rust ch
 	@[ -n "$(o)" ] && rm -f "envs/local$(if $(x),-$(x),)/.browser_opened" || true
 	@if [ -n "$(x)" ]; then \
 		echo "$(BLUE)🔧 Configuring watch instance $(x)...$(NC)"; \
-		./scripts/_prepare.sh debug envs/local-$(x); \
+		./scripts/_prepare.sh debug envs/local-$(x) || exit 1; \
 		echo "$(GREEN)✅ Watch instance $(x) ready!$(NC)"; \
 	else \
 		echo "$(BLUE)🔧 Configuring watch environment (dev mode)...$(NC)"; \
-		./scripts/_prepare.sh debug envs/local; \
+		./scripts/_prepare.sh debug envs/local || exit 1; \
 		echo "$(GREEN)✅ Watch dev environment ready!$(NC)"; \
 	fi
 	@[ "$(auth)" = "saml" ] && ./scripts/_saml-setup.sh "envs/local$(if $(x),-$(x),)" "$(AZURE_TENANT)" || true

@@ -15,6 +15,8 @@ pub struct AgentSurfaceFixture {
     pub identity_slots: HashMap<String, Value>,
     pub transit_points: HashMap<String, TransitPointFixture>,
     pub mcp_http: Option<Value>,
+    pub caller_key: Option<Value>,
+    pub browser_origins: Vec<String>,
     pub a2a_settings: Option<Value>,
     pub tenant_id: Option<String>,
 }
@@ -166,6 +168,8 @@ impl AgentSurfaceFixture {
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
             mcp_http: None,
+            caller_key: None,
+            browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
         }
@@ -321,6 +325,22 @@ impl AgentSurfaceFixture {
         mcp_http: Value,
     ) -> Self {
         self.mcp_http = Some(mcp_http);
+        self
+    }
+
+    pub fn with_caller_key(
+        mut self,
+        caller_key: Value,
+    ) -> Self {
+        self.caller_key = Some(caller_key);
+        self
+    }
+
+    pub fn with_browser_origins(
+        mut self,
+        origins: &[String],
+    ) -> Self {
+        self.browser_origins = origins.to_vec();
         self
     }
 
@@ -525,6 +545,15 @@ impl AgentSurfaceFixture {
         if let Some(mcp_http) = &self.mcp_http {
             surface["mcp_http"] = mcp_http.clone();
         }
+        if let Some(caller_key) = &self.caller_key {
+            surface["caller_key"] = caller_key.clone();
+        }
+        if !self
+            .browser_origins
+            .is_empty()
+        {
+            surface["browser_origins"] = json!(self.browser_origins);
+        }
         if let Some(a2a) = &self.a2a_settings {
             surface["access_point"]["a2a"] = a2a.clone();
         }
@@ -632,6 +661,8 @@ impl Default for AgentSurfaceFixture {
             identity_slots: HashMap::new(),
             transit_points: HashMap::new(),
             mcp_http: None,
+            caller_key: None,
+            browser_origins: Vec::new(),
             a2a_settings: None,
             tenant_id: None,
         }

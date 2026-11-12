@@ -336,13 +336,23 @@ pub async fn get_strategy(
     }
 }
 
+/// gateway.json's `sts.mcp_issuer`: the issuer of this gateway's own STS
+/// tokens, which no consent confirmation may confirm callers of.
+#[derive(Clone, Debug, Default)]
+pub struct GatewayMcpIssuer(pub Option<String>);
+
 /// `PUT /v1/jwt-verification-strategies/{id}`  — update a strategy.  The `id` cannot change.
+/// A new `expected_issuer` is refused (`409`) while a credential provider names the
+/// strategy and would no longer pass its own save rules with it.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_strategy(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    references: Option<Extension<crate::credential_providers::references::ReferenceStores>>,
+    gateway_issuer: Option<Extension<GatewayMcpIssuer>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -419,6 +429,7 @@ pub async fn update_strategy(
         }
     }
 
+    let issuer_changed = body.expected_issuer != existing.expected_issuer;
     let updated = JwtVerificationStrategy {
         id: existing.id.clone(),
         tenant_id: existing.tenant_id,
@@ -429,6 +440,39 @@ pub async fn update_strategy(
         created_at: existing.created_at,
         updated_at: chrono::Utc::now(),
     };
+    if issuer_changed && let Some(Extension(references)) = &references {
+        let providers = match references
+            .providers_of_jwt_strategy(&updated.id)
+            .await
+        {
+            Ok(providers) => providers,
+            Err(error) => {
+                error!(%error, "Failed to find the credential providers using JWT strategy {}", id);
+                return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to update strategy"))
+                    .into_response();
+            }
+        };
+        let gateway_issuer = gateway_issuer
+            .as_ref()
+            .and_then(|Extension(GatewayMcpIssuer(issuer))| issuer.as_deref());
+        let refused: Vec<_> = providers
+            .iter()
+            .filter(|provider| !still_accepts(provider, &updated, gateway_issuer))
+            .map(crate::credential_providers::references::Referrer::credential_provider)
+            .collect();
+        if !refused.is_empty() {
+            let pat = pat
+                .as_ref()
+                .map(|Extension(pat)| pat);
+            return crate::credential_providers::references::conflict_response(
+                STRATEGY_ISSUER_IN_USE,
+                &refused,
+                &viewable_kinds(&passkey_storage, &rbac_config, &user_id, pat).await,
+                tenant_context(&context),
+                resource_scope(&scope),
+            );
+        }
+    }
 
     match store.update(updated).await {
         Ok(strategy) => {
@@ -443,13 +487,64 @@ pub async fn update_strategy(
     }
 }
 
-/// `DELETE /v1/jwt-verification-strategies/{id}`  — delete a strategy.
+const STRATEGY_IN_USE: &str = "The strategy is used by credential providers; remove their references to it first";
+const STRATEGY_ISSUER_IN_USE: &str = "The new expected_issuer is refused by credential providers that use the strategy; point them at another strategy first";
+
+/// Whether `provider`, which names `strategy`, still passes its save rules with it:
+/// a `consent_confirmation` through it still names its callers
+/// ([`ConsentConfirmation::claims_through`](crate::credential_providers::ConsentConfirmation::claims_through)),
+/// and a `consent_identity_strategy_id` naming it still has an https issuer.
+fn still_accepts(
+    provider: &crate::credential_providers::CredentialProvider,
+    strategy: &JwtVerificationStrategy,
+    gateway_issuer: Option<&str>,
+) -> bool {
+    let confirms = provider
+        .consent_confirmation
+        .as_ref()
+        .filter(|confirmation| confirmation.jwt_verification_strategy_id == strategy.id)
+        .is_none_or(|confirmation| {
+            confirmation
+                .claims_through(strategy, gateway_issuer)
+                .is_ok()
+        });
+    let identifies = provider
+        .consent_identity_strategy_id
+        .as_deref()
+        .filter(|id| *id == strategy.id)
+        .is_none_or(|_| crate::sts::mcp_profile::canonical_https_url(&strategy.expected_issuer).is_ok());
+    confirms && identifies
+}
+
+/// The referrer kinds the caller may view, or none when the caller cannot be loaded.
+async fn viewable_kinds(
+    passkey_storage: &PasskeyStorage,
+    rbac_config: &RbacConfig,
+    user_id: &str,
+    pat: Option<&PatContext>,
+) -> crate::credential_providers::references::ViewableKinds {
+    match passkey_storage
+        .load_user_by_id(user_id)
+        .await
+    {
+        Ok(Some(user)) => {
+            crate::credential_providers::references::ViewableKinds::for_role(rbac_config, &user.role, pat)
+        }
+        _ => Default::default(),
+    }
+}
+
+/// `DELETE /v1/jwt-verification-strategies/{id}`  — delete a strategy, unless a
+/// credential provider's `consent_confirmation` or `consent_identity_strategy_id`
+/// names it (`409`).
+#[allow(clippy::too_many_arguments)]
 pub async fn delete_strategy(
     Extension(user_id): Extension<String>,
     Extension(passkey_storage): Extension<Arc<PasskeyStorage>>,
     Extension(rbac_config): Extension<Arc<RbacConfig>>,
     axum::extract::State(store): axum::extract::State<JwtVerificationStrategyState>,
     Path(id): Path<String>,
+    references: Option<Extension<crate::credential_providers::references::ReferenceStores>>,
     pat: Option<Extension<PatContext>>,
     context: Option<Extension<PatTenantContext>>,
     scope: Option<Extension<PatResourceScope>>,
@@ -490,6 +585,31 @@ pub async fn delete_strategy(
     if !can_mutate(existing.tenant_id.as_deref(), tenant_context(&context)) {
         return (StatusCode::FORBIDDEN, ErrorBody::json("strategy is outside this token's permitted scope"))
             .into_response();
+    }
+    if let Some(Extension(references)) = &references {
+        let referrers = match references
+            .referrers_of_jwt_strategy(&existing.id)
+            .await
+        {
+            Ok(referrers) => referrers,
+            Err(error) => {
+                error!(%error, "Failed to find the credential providers using JWT strategy {}", id);
+                return (StatusCode::INTERNAL_SERVER_ERROR, ErrorBody::json("Failed to delete strategy"))
+                    .into_response();
+            }
+        };
+        if !referrers.is_empty() {
+            let pat = pat
+                .as_ref()
+                .map(|Extension(pat)| pat);
+            return crate::credential_providers::references::conflict_response(
+                STRATEGY_IN_USE,
+                &referrers,
+                &viewable_kinds(&passkey_storage, &rbac_config, &user_id, pat).await,
+                tenant_context(&context),
+                resource_scope(&scope),
+            );
+        }
     }
 
     match store.delete(&id).await {
@@ -1264,6 +1384,278 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// A strategy a credential provider's `consent_confirmation` or
+    /// `consent_identity_strategy_id` names is not deleted: 409 naming the
+    /// provider. An unreferenced one is.
+    #[tokio::test]
+    async fn a_strategy_a_credential_provider_names_is_not_deleted() {
+        use crate::credential_providers::storage::CredentialProviderStorage as _;
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let providers_dir = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                providers_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(crate::credential_providers::references::ReferenceStores {
+            credential_providers: Some(providers.clone()),
+            ..Default::default()
+        }));
+        let mut ids = Vec::new();
+        for name in ["Confirming", "Modern consent", "Unused"] {
+            let (_, created) = create_via_api(&router, name).await;
+            ids.push(
+                created["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let provider = |id: &str, extra: serde_json::Value| -> crate::credential_providers::CredentialProvider {
+            let mut value = serde_json::json!({
+                "id": id, "name": id, "provider_id": id, "provider_type": "oauth2_authorization_code",
+                "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(
+                    extra
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+            serde_json::from_value(value).unwrap()
+        };
+        for stored in [
+            provider(
+                "confirming-provider",
+                serde_json::json!({"consent_confirmation": {
+                    "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+                    "authorization_endpoint": "https://idp.example/authorize",
+                    "token_endpoint": "https://idp.example/token", "jwt_verification_strategy_id": ids[0]
+                }}),
+            ),
+            provider("modern-provider", serde_json::json!({"consent_identity_strategy_id": ids[1]})),
+        ] {
+            providers
+                .create(stored)
+                .await
+                .unwrap();
+        }
+        let delete = |id: &str| {
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/jwt-verification-strategies/{id}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (id, provider_id) in [(&ids[0], "confirming-provider"), (&ids[1], "modern-provider")] {
+            let resp = router
+                .clone()
+                .oneshot(delete(id))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = response_body(resp).await;
+            assert_eq!(body["message"], STRATEGY_IN_USE);
+            assert_eq!(
+                body["references"],
+                serde_json::json!([{"kind": "credential_provider", "id": provider_id, "name": provider_id}])
+            );
+            assert!(
+                store
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{provider_id}"
+            );
+        }
+        let resp = router
+            .oneshot(delete(&ids[2]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            store
+                .get(&ids[2])
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A new `expected_issuer` that a confirming provider's save rules refuse,
+    /// an Entra one while callers are named by `sub` or this gateway's own MCP
+    /// issuer, is refused with 409 naming the provider and changes nothing;
+    /// one they accept, or an edit that keeps the issuer, is saved.
+    #[tokio::test]
+    async fn an_issuer_a_confirming_provider_would_refuse_is_not_saved() {
+        use crate::credential_providers::storage::CredentialProviderStorage as _;
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let providers_dir = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                providers_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(crate::credential_providers::references::ReferenceStores {
+            credential_providers: Some(providers.clone()),
+            ..Default::default()
+        }))
+        .layer(Extension(GatewayMcpIssuer(Some("https://gateway.example/oauth2/mcp".to_string()))));
+        let (_, created) = create_via_api(&router, "Confirming").await;
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "confirming-provider", "name": "Confirming provider", "provider_id": "confirming-provider",
+                    "provider_type": "oauth2_authorization_code",
+                    "consent_confirmation": {
+                        "client_id_secret_ref": "LOGIN_CLIENT_ID", "client_secret_secret_ref": "LOGIN_SECRET",
+                        "authorization_endpoint": "https://idp.example/authorize",
+                        "token_endpoint": "https://idp.example/token", "jwt_verification_strategy_id": id
+                    },
+                    "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let put = |name: &str, issuer: &str| {
+            serde_json::json!({
+                "name": name, "expected_issuer": issuer,
+                "jwks_source": { "type": "remote", "jwks_uri": "https://issuer.example.com/.well-known/jwks.json" }
+            })
+        };
+        let path = format!("/v1/jwt-verification-strategies/{id}");
+        for issuer in ["https://login.microsoftonline.com/tenant/v2.0", "https://gateway.example/oauth2/mcp"] {
+            let (status, body) = send_strategy(&router, "PUT", &path, put("Confirming", issuer)).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{issuer}: {body}");
+            assert_eq!(body["message"], STRATEGY_ISSUER_IN_USE);
+            assert_eq!(
+                body["references"],
+                serde_json::json!([{"kind": "credential_provider", "id": "confirming-provider", "name": "Confirming provider"}])
+            );
+            assert_eq!(
+                store
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expected_issuer,
+                "https://issuer.example.com",
+                "{issuer}"
+            );
+        }
+        let (status, body) = send_strategy(&router, "PUT", &path, put("Renamed", "https://issuer.example.com")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send_strategy(&router, "PUT", &path, put("Renamed", "https://other.example.com")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["expected_issuer"], "https://other.example.com");
+    }
+
+    /// A strategy a provider names only by `consent_identity_strategy_id` keeps
+    /// a canonical https issuer: an `http://` one is refused with 409 naming the
+    /// provider and changes nothing; another canonical https one is saved.
+    #[tokio::test]
+    async fn an_issuer_a_modern_consent_provider_would_refuse_is_not_saved() {
+        use crate::credential_providers::storage::CredentialProviderStorage as _;
+        let store = Arc::new(MemStore::default());
+        let (ps, _dir, uid) = make_passkey_storage(UserRole::Administrator).await;
+        let providers_dir = tempfile::tempdir().unwrap();
+        let providers = Arc::new(
+            crate::credential_providers::storage::FileSystemCredentialProviderStore::new(
+                providers_dir
+                    .path()
+                    .to_path_buf(),
+            )
+            .await
+            .unwrap(),
+        );
+        let router = build_test_router(
+            store.clone(),
+            Arc::new(ps),
+            Arc::new(RbacConfig::default()),
+            uid,
+            Arc::new(crate::jwt_bearer::JwksClient::new()),
+        )
+        .layer(Extension(crate::credential_providers::references::ReferenceStores {
+            credential_providers: Some(providers.clone()),
+            ..Default::default()
+        }));
+        let (_, created) = create_via_api(&router, "Modern consent").await;
+        let id = created["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        providers
+            .create(
+                serde_json::from_value(serde_json::json!({
+                    "id": "modern-provider", "name": "Modern provider", "provider_id": "modern-provider",
+                    "provider_type": "oauth2_authorization_code", "consent_identity_strategy_id": id,
+                    "created_at": "2026-11-01T00:00:00Z", "updated_at": "2026-11-01T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let put = |issuer: &str| {
+            serde_json::json!({
+                "name": "Modern consent", "expected_issuer": issuer,
+                "jwks_source": { "type": "remote", "jwks_uri": "https://issuer.example.com/.well-known/jwks.json" }
+            })
+        };
+        let path = format!("/v1/jwt-verification-strategies/{id}");
+        let (status, body) = send_strategy(&router, "PUT", &path, put("http://issuer.example.com")).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["message"], STRATEGY_ISSUER_IN_USE);
+        assert_eq!(
+            body["references"],
+            serde_json::json!([{"kind": "credential_provider", "id": "modern-provider", "name": "Modern provider"}])
+        );
+        assert_eq!(
+            store
+                .get(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expected_issuer,
+            "https://issuer.example.com"
+        );
+        let (status, body) = send_strategy(&router, "PUT", &path, put("https://other.example.com/")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["expected_issuer"], "https://other.example.com/");
     }
 
     #[tokio::test]
