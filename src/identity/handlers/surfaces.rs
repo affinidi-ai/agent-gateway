@@ -424,8 +424,30 @@ fn validate_resolved_variants(surface: &AgentSurface) -> Result<(), SurfaceApiEr
         {
             return Err(SurfaceApiError::BadRequest(format!("{}: {}", label, e)));
         }
+        validate_mirror_endpoint(&resolved, &label)?;
     }
     Ok(())
+}
+
+/// Refuse a traffic mirror endpoint that is not an http(s) URL or that names a
+/// cloud-provider metadata host. Static only: resolves no DNS. Loopback and
+/// private addresses are allowed, as for the Target. The reason never repeats
+/// the URL.
+fn validate_mirror_endpoint(
+    surface: &AgentSurface,
+    label: &str,
+) -> Result<(), SurfaceApiError> {
+    let Some(mirror) = surface.mirror() else {
+        return Ok(());
+    };
+    let prefix = if label.is_empty() {
+        String::new()
+    } else {
+        format!("{label}: ")
+    };
+    crate::url_validation::validate_url_not_cloud_metadata_host(&mirror.endpoint)
+        .map(|_| ())
+        .map_err(|reason| SurfaceApiError::BadRequest(format!("{prefix}target.networking.mirror.endpoint: {reason}")))
 }
 
 /// Validate Trust Check list invariants (caller + target legs, plus
@@ -3209,6 +3231,7 @@ pub async fn create_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
     }
+    validate_mirror_endpoint(&surface, "")?;
 
     // Validate variant alias uniqueness
     validate_variant_aliases(&surface)?;
@@ -4219,6 +4242,7 @@ async fn validate_and_save_surface(
     {
         return Err(SurfaceApiError::BadRequest(format!("target.endpoint: {}", e)));
     }
+    validate_mirror_endpoint(&surface, "")?;
 
     validate_variant_aliases(&surface)?;
     validate_transit_points(
@@ -8625,6 +8649,109 @@ mod validation_tests {
                 },
             });
         validate_resolved_variants(&s).expect("disabled variant is skipped");
+    }
+
+    fn mirror_networking(endpoint: &str) -> crate::config::agent_surface::NetworkingConfig {
+        serde_json::from_value(serde_json::json!({ "mirror": { "endpoint": endpoint } })).expect("networking")
+    }
+
+    fn mirrored_surface(endpoint: &str) -> AgentSurface {
+        let mut s = base_surface();
+        s.target.networking = Some(mirror_networking(endpoint));
+        s
+    }
+
+    fn surface_with_variant_mirror(
+        endpoint: &str,
+        enabled: bool,
+    ) -> AgentSurface {
+        let mut s = base_surface();
+        s.variants
+            .push(SurfaceVariant {
+                id: "v-shadow".to_string(),
+                alias: "shadow".to_string(),
+                name: "shadow".to_string(),
+                description: String::new(),
+                enabled,
+                overrides: SurfaceOverrides {
+                    target: Some(TargetOverrides {
+                        networking: Some(mirror_networking(endpoint)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+        s
+    }
+
+    fn bad_request(result: Result<(), SurfaceApiError>) -> String {
+        match result {
+            Err(SurfaceApiError::BadRequest(msg)) => msg,
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_accepts_a_surface_without_a_mirror() {
+        validate_mirror_endpoint(&base_surface(), "").expect("no mirror is valid");
+    }
+
+    #[test]
+    fn mirror_endpoint_accepts_public_loopback_and_private_http_urls() {
+        for endpoint in [
+            "https://mirror.example.com/copy",
+            "http://127.0.0.1:9000/copy",
+            "http://localhost:9000/copy",
+            "http://10.1.2.3/copy",
+            "http://192.168.1.5:8080/copy",
+        ] {
+            validate_mirror_endpoint(&mirrored_surface(endpoint), "")
+                .unwrap_or_else(|e| panic!("{endpoint} must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_refuses_cloud_metadata_without_repeating_the_path() {
+        for endpoint in [
+            "http://169.254.169.254/latest/meta-data/secret-path",
+            "http://169.254.170.2/v2/secret-path",
+            "http://metadata.google.internal/computeMetadata/secret-path",
+            "http://[::ffff:169.254.169.254]/secret-path",
+            "http://[fd00:ec2::254]/secret-path",
+        ] {
+            let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
+            assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{msg}");
+            assert!(!msg.contains("secret-path"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn mirror_endpoint_refuses_non_http_relative_and_credentialed_urls() {
+        for endpoint in ["ftp://mirror.example.com/copy", "/relative/copy", "http://user:pw@mirror.example.com/copy"] {
+            let msg = bad_request(validate_mirror_endpoint(&mirrored_surface(endpoint), ""));
+            assert!(msg.starts_with("target.networking.mirror.endpoint: "), "{endpoint}: {msg}");
+            assert!(!msg.contains("pw@"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn resolved_variants_refuse_an_enabled_variant_mirror_on_cloud_metadata() {
+        let s = surface_with_variant_mirror("http://169.254.169.254/latest/secret-path", true);
+        let msg = bad_request(validate_resolved_variants(&s));
+        assert!(msg.starts_with("Variant 'shadow': target.networking.mirror.endpoint: "), "{msg}");
+        assert!(!msg.contains("secret-path"), "{msg}");
+    }
+
+    #[test]
+    fn resolved_variants_skip_a_disabled_variant_with_a_metadata_mirror() {
+        let s = surface_with_variant_mirror("http://169.254.169.254/latest/", false);
+        validate_resolved_variants(&s).expect("a disabled variant is not resolved");
+    }
+
+    #[test]
+    fn resolved_variants_accept_a_variant_mirror_on_a_private_address() {
+        let s = surface_with_variant_mirror("http://10.0.0.7/copy", true);
+        validate_resolved_variants(&s).expect("a private mirror is allowed");
     }
 
     fn api_key_caller(secret_id: &str) -> serde_json::Value {

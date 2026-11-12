@@ -12,6 +12,7 @@ pub mod fabric_identity;
 pub(crate) mod fabric_response_waiter;
 pub(crate) mod fabric_stream;
 pub mod handler;
+pub(crate) mod mirror;
 pub mod outbound_handler;
 pub mod paths;
 pub mod port_listener;

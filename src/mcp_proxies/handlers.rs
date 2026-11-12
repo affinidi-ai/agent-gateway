@@ -13,6 +13,7 @@ use super::types::{CreateMcpProxyRequest, McpProxy, McpProxyAnswer, McpProxyWrit
 use crate::auth_manager::pat::{PatContext, PatResourceScope};
 use crate::mcp::sse_server::SseSessionManager;
 use crate::observability::loggable;
+use crate::proxy::mirror;
 use crate::tenancy::{
     PatTenantContext, ResourceKind, can_access, can_mutate, scope_allows_resource, tenant_for_create,
 };
@@ -3016,7 +3017,6 @@ pub async fn execute_mcp_request(
     prepared: PreparedMcpRequest,
     surface: &crate::config::agent_surface::AgentSurface,
     policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
-    client: &reqwest::Client,
     channel_name: &str,
     sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
 ) -> Result<serde_json::Value, McpProxyCallError> {
@@ -3157,58 +3157,46 @@ pub async fn execute_mcp_request(
             };
 
             // Traffic mirroring for MCP tool calls (if configured)
-            if let Some(mirror_config) = surface.mirror() {
-                let should_mirror = if mirror_config.percentage >= 100 {
-                    true
-                } else if mirror_config.percentage == 0 {
-                    false
-                } else {
-                    use rand::Rng;
-                    let mut rng = rand::rng();
-                    rng.random_range(0..100) < mirror_config.percentage
-                };
-
-                if should_mirror {
-                    let mirror_endpoint = mirror_config.endpoint.clone();
-                    let mirror_timeout = std::time::Duration::from_secs(mirror_config.timeout_secs);
-                    let wait_for_response = mirror_config.wait_for_response;
-                    let client_clone = client.clone();
-                    let request_clone = request.clone();
-                    let channel_name_clone = channel_name.to_string();
-
-                    // Send mirror request to mirror endpoint
-                    let mirror_task = async move {
-                        let mirror_req = client_clone
-                            .post(&mirror_endpoint)
-                            .json(&request_clone)
-                            .timeout(mirror_timeout)
+            if let Some(mirror_config) = surface.mirror()
+                && mirror::selected(mirror_config.percentage)
+            {
+                match serde_json::to_vec(&request) {
+                    Ok(payload) => {
+                        let mirror_request = mirror::MirrorRequest::new(mirror_config, reqwest::Method::POST, payload)
                             .header("Content-Type", "application/json")
                             .header("X-Mirrored-Request", "true");
+                        let mirror_endpoint = loggable::url(&mirror_config.endpoint);
+                        let channel_name_clone = channel_name.to_string();
 
-                        match mirror_req.send().await {
-                            Ok(resp) => {
-                                info!(
-                                    channel = channel_name_clone,
-                                    mirror_endpoint = %loggable::url(&mirror_endpoint),
-                                    status = resp.status().as_u16(),
-                                    "MCP mirror request completed"
-                                );
+                        let mirror_task = async move {
+                            match mirror::send(mirror_request).await {
+                                Ok(status) => {
+                                    info!(
+                                        channel = channel_name_clone,
+                                        mirror_endpoint = %mirror_endpoint,
+                                        status = status.as_u16(),
+                                        "MCP mirror request completed"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        channel = channel_name_clone,
+                                        mirror_endpoint = %mirror_endpoint,
+                                        error = %e,
+                                        "MCP mirror request failed"
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                warn!(
-                                    channel = channel_name_clone,
-                                    mirror_endpoint = %loggable::url(&mirror_endpoint),
-                                    error = %e.without_url(),
-                                    "MCP mirror request failed"
-                                );
-                            }
+                        };
+
+                        if mirror_config.wait_for_response {
+                            mirror_task.await;
+                        } else {
+                            tokio::spawn(mirror_task);
                         }
-                    };
-
-                    if wait_for_response {
-                        mirror_task.await;
-                    } else {
-                        tokio::spawn(mirror_task);
+                    }
+                    Err(e) => {
+                        warn!(channel = channel_name, error = %e, "MCP mirror request could not be serialized");
                     }
                 }
             }
@@ -3445,13 +3433,12 @@ mod tests {
         request: serde_json::Value,
         surface: &crate::config::agent_surface::AgentSurface,
         policy_manager: Option<&std::sync::Arc<crate::policies::SurfacePolicyManager>>,
-        client: &reqwest::Client,
         channel_name: &str,
         target_auth_header: Option<(String, String)>,
         sent_token: Option<&crate::proxy::handler::SentServiceToken<'_>>,
     ) -> Result<serde_json::Value, super::McpProxyCallError> {
         let prepared = super::prepare_mcp_request(proxy, request, target_auth_header, channel_name)?;
-        super::execute_mcp_request(proxy, prepared, surface, policy_manager, client, channel_name, sent_token).await
+        super::execute_mcp_request(proxy, prepared, surface, policy_manager, channel_name, sent_token).await
     }
 
     #[test]
@@ -3545,7 +3532,6 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "listItems", "arguments": {"key": "argument-marker-42"}}
         });
-        let client = reqwest::Client::new();
         let policy_manager = Arc::new(crate::policies::SurfacePolicyManager::new());
 
         for (path, networking) in [
@@ -3577,7 +3563,6 @@ mod tests {
                 request.clone(),
                 &surface,
                 Some(&policy_manager),
-                &client,
                 "tool-errors",
                 None,
                 None,
@@ -3662,17 +3647,7 @@ mod tests {
             "params": {"name": "getItem", "arguments": {"id": id}}
         });
         let credential = credential.then(|| ("X-Api-Key".to_string(), "gateway-value".to_string()));
-        handle_mcp_request_with_policies(
-            proxy,
-            request,
-            &surface,
-            None,
-            &reqwest::Client::new(),
-            "base-path",
-            credential,
-            None,
-        )
-        .await
+        handle_mcp_request_with_policies(proxy, request, &surface, None, "base-path", credential, None).await
     }
 
     #[test]
@@ -3897,14 +3872,12 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "listItems", "arguments": {}}
         });
-        let client = reqwest::Client::new();
 
         let refused = handle_mcp_request_with_policies(
             &proxy,
             request.clone(),
             &surface,
             None,
-            &client,
             "redirect",
             Some(("X-Api-Key".to_string(), "gateway-value".to_string())),
             None,
@@ -3919,7 +3892,7 @@ mod tests {
         );
         assert_eq!(followed.load(Ordering::SeqCst), 0);
 
-        handle_mcp_request_with_policies(&proxy, request, &surface, None, &client, "redirect", None, None)
+        handle_mcp_request_with_policies(&proxy, request, &surface, None, "redirect", None, None)
             .await
             .expect("without a credential the redirect is followed");
         assert_eq!(followed.load(Ordering::SeqCst), 1);
