@@ -1537,6 +1537,7 @@ mod tests {
             mcp_http: None,
             trust_check_split: false,
             transit_point_source_auth: false,
+            browser_origins: Vec::new(),
         }
     }
 
