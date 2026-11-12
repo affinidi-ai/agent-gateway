@@ -289,6 +289,9 @@ async fn load_base_gateway_config(state: &IdentityApiState) -> anyhow::Result<Ar
                         }
                     }
                 }
+                for surface in &channels {
+                    crate::proxy::caller_key::record_surface(surface);
+                }
                 for surface in channels
                     .iter()
                     .filter(|surface| given.contains(&surface.surface_id))

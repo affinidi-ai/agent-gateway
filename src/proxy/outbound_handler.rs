@@ -2791,7 +2791,7 @@ const PROXY_FORWARDING_HEADERS: &[&str] = &[
 /// connected to it, for which host and path and over what: [`PROXY_FORWARDING_HEADERS`]
 /// and every `X-Forwarded-*` header, also spelled with `_` for `-`, which
 /// CGI-style servers read as the same header.
-fn is_proxy_forwarding_header(name: &str) -> bool {
+pub(crate) fn is_proxy_forwarding_header(name: &str) -> bool {
     const X_FORWARDED: &str = "x-forwarded-";
     let name = name.replace('_', "-");
     PROXY_FORWARDING_HEADERS
@@ -12672,6 +12672,8 @@ mod tests {
             "x-gateway-did",
             "X-DID-Identity",
             "x-did-signed-identity",
+            "x-caller-key",
+            "x_caller_key",
         ] {
             assert!(!should_forward_outbound_request_header(withheld, None), "{withheld}");
         }

@@ -191,14 +191,16 @@ impl CallerHeaders {
         Self::DID_SIGNED_IDENTITY,
     ];
 
-    /// Whether `name` is one of [`Self::NAMES`], in any case. The Access Point,
-    /// Fabric receive and Transit Point request filters drop these from what a
-    /// caller or a peer gateway sent, so an agent or a Transit Point's target
-    /// sees only the values the gateway sets.
+    /// Whether `name` is one of [`Self::NAMES`], in any case, or a caller key
+    /// header ([`crate::proxy::caller_key::is_caller_key_header`]). The Access
+    /// Point, Fabric receive and Transit Point request filters drop these from
+    /// what a caller or a peer gateway sent, so an agent or a Transit Point's
+    /// target sees only the values the gateway sets.
     pub fn is_caller_info_header(name: &str) -> bool {
         Self::NAMES
             .iter()
             .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            || crate::proxy::caller_key::is_caller_key_header(name)
     }
 
     /// Build the caller-info header set from a [`CallerIdentity`].
@@ -570,7 +572,8 @@ mod tests {
     }
 
     /// Every header the gateway builds, and each DID identity header it sets,
-    /// is a caller-info header, in any case, and no other header is.
+    /// is a caller-info header, in any case, and so is the default caller key
+    /// header, also spelled with `_`; no other header is.
     #[test]
     fn every_header_the_gateway_builds_is_a_caller_info_header() {
         let identity = make_identity(IdentitySource::SelfPresented);
@@ -578,7 +581,13 @@ mod tests {
         for name in built
             .iter()
             .map(|(name, _)| name.as_str())
-            .chain([CallerHeaders::CALLER_DNA_UAI, "X-DID-Identity", "X-DID-Signed-Identity"])
+            .chain([
+                CallerHeaders::CALLER_DNA_UAI,
+                "X-DID-Identity",
+                "X-DID-Signed-Identity",
+                "x-caller-key",
+                "x_caller_key",
+            ])
         {
             assert!(CallerHeaders::is_caller_info_header(name), "{name}");
             assert!(CallerHeaders::is_caller_info_header(&name.to_uppercase()), "{name}");

@@ -118,6 +118,12 @@ pub struct AgentSurface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_http: Option<super::types::McpHttpConfig>,
 
+    /// The per-caller key the Target receives on each request whose caller presented a JWT
+    /// verified on that request, derived from a secret in the secrets store. See
+    /// [`crate::proxy::caller_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_key: Option<super::caller_key::CallerKeyConfig>,
+
     /// Web origins whose pages may call this surface from a browser, beyond
     /// `network.cors`. Each is an exact `https` origin in the form the URL
     /// parser normalises to; see [`normalize_browser_origins`].
@@ -6626,6 +6632,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
             browser_origins: Vec::new(),
@@ -6777,6 +6784,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
             browser_origins: Vec::new(),
@@ -8335,6 +8343,7 @@ mod tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
             browser_origins: Vec::new(),

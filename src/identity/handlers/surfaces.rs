@@ -3252,6 +3252,7 @@ pub async fn create_surface(
     // Re-run the shape check against every resolved variant so a
     // variant override can't blank out a required field unnoticed.
     validate_resolved_variants(&surface)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
 
     surface
         .validate()
@@ -3400,6 +3401,7 @@ pub async fn update_surface(
     retain_a2a_settings(&mut surface, &existing);
     retain_transit_token_lifetime(&mut surface, &existing);
     retain_transit_caller_authentication(&mut surface, &existing, &sent);
+    super::surface_caller_key::retain_caller_key(&mut surface, &existing, &sent);
 
     let (saved, warnings) = validate_and_save_surface(
         &state,
@@ -4243,6 +4245,7 @@ async fn validate_and_save_surface(
     reject_target_trust_checks_unless_target_runs_them(&surface)?;
     validate_workload_binding_config(&surface)?;
     validate_source_auth(&surface, existing)?;
+    super::surface_caller_key::validate_caller_key(&surface)?;
     surface
         .validate_mcp_metadata()
         .map_err(SurfaceApiError::BadRequest)?;
@@ -4766,6 +4769,11 @@ async fn apply_surface_change_while_locked(
     // re-fetch).
     crate::proxy::agent_card_cache::invalidate_all();
     crate::proxy::backend_identity::forget_card_identity_warning(surface_id);
+
+    match change {
+        SurfaceChange::Upsert(surface) => crate::proxy::caller_key::record_surface(surface),
+        SurfaceChange::Delete(id) => crate::proxy::caller_key::forget_surface(id),
+    }
 
     let provider_key_gate = crate::identity::provider_key_gate::gate();
     let changed_id = match change {
@@ -8515,6 +8523,7 @@ mod validation_tests {
             mcp_legacy_metadata_output: None,
             _retired_protocol_mode: Default::default(),
             mcp_http: None,
+            caller_key: None,
             trust_check_split: false,
             transit_point_source_auth: false,
             browser_origins: Vec::new(),

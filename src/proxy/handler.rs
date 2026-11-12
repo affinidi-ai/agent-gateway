@@ -6744,6 +6744,17 @@ async fn proxy_charged_request(
         }
     }
 
+    if !bound_target
+        && let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+            &state.surface,
+            authenticated_identity.as_ref(),
+            state.secrets_store.as_ref(),
+        )
+        .await
+    {
+        upstream_req = replace_request_header(upstream_req, &header_name, &header_value);
+    }
+
     // ── The Target's grant by binding, in place of the caller's credentials ──
     let released_target_grant = match target_grant.as_ref() {
         Some(route) => match route
@@ -22185,6 +22196,37 @@ allow if {
             Some("kept")
         );
         assert!(!should_forward_ap_request_header_with_mapping("X-Gateway-Fabric-Hops", &[], None, None));
+    }
+
+    /// A caller key the caller sends never reaches the Target or a Fabric peer: the default
+    /// header and one a stored surface's `caller_key` names, in any spelling, on a surface
+    /// without the setting too.
+    #[test]
+    fn a_caller_key_the_caller_sends_is_stripped() {
+        let mut configured: crate::config::agent_surface::AgentSurface = serde_json::from_value(serde_json::json!({
+            "surface_id": "ap-strip-caller-key", "name": "keyed",
+            "access_point": { "listen_address": "0.0.0.0:9000", "route": "/keyed", "protocol": "a2a" },
+            "target": { "endpoint": "https://agent.example" },
+            "caller_key": { "secret_id": "caller-keys", "header": "x-ap-strip-vault-key" },
+        }))
+        .unwrap();
+        crate::proxy::caller_key::record_surface(&configured);
+        for name in ["x-caller-key", "X-Caller-Key", "x_caller_key", "x-ap-strip-vault-key", "X_AP_Strip_Vault_Key"] {
+            assert!(!should_forward_ap_request_header_with_mapping(name, &[], None, None), "{name}");
+            assert!(!forwards_ap_caller_header(name, &[], None, None, &[]), "{name}");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("forged"),
+            );
+            let (buffered, streamed) = access_point_fabric_headers(&headers, &[], None, &[]);
+            assert!(!buffered.contains_key(&name.to_uppercase()), "{name}");
+            assert!(streamed.get(name).is_none(), "{name}");
+        }
+        assert!(should_forward_ap_request_header_with_mapping("x-ap-strip-vault", &[], None, None));
+        configured.caller_key = None;
+        crate::proxy::caller_key::record_surface(&configured);
+        assert!(should_forward_ap_request_header_with_mapping("x-ap-strip-vault-key", &[], None, None));
     }
 
     #[test]

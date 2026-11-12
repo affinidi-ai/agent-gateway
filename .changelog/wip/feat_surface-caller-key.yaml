@@ -1,0 +1,26 @@
+branch: feat/surface-caller-key
+changes:
+  added:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: Give a surface's Target a stable per-caller key for each verified JWT caller
+      description: >-
+        A surface takes an optional `caller_key` naming a secret in the secrets store by
+        `secret_id`, with a `header` (`x-caller-key` by default) and ordered `identity_claims`
+        (`["sub"]` by default). On each request whose caller presented a JWT the gateway verified
+        on that request, the Target receives HKDF-SHA256 of the secret, salted with
+        `agent-gateway-caller-key-v1`, over the surface id, the token's `iss` and the first
+        identity claim the token carries as a string, as 32 bytes of base64url without padding,
+        so a Target that keeps data per caller can encrypt it with a key its own operator cannot
+        derive. API key, DID Auth, mTLS and anonymous callers, and callers whose credential
+        failed, get none. A caller's own `x-caller-key`, or a header any stored surface's
+        `caller_key` names, is never forwarded, on any surface. When the secret cannot be read
+        the request is forwarded without the header and a warning names the surface. A save
+        refuses a header that is not a lower-case header name, one the gateway reserves, reads
+        or sets, or one the surface already uses, invalid claims, and a secret of fewer than 32
+        bytes; a PUT that leaves the setting out, as a Surface Builder save does, keeps it. Log
+        redaction treats `caller_key` fields and attributes as credentials.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []
