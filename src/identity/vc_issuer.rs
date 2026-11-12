@@ -1407,71 +1407,29 @@ impl VCIssuer {
                     .sign_token(&payload)
                     .await?
             }
-            None => Self::sign_jwt(&payload, &local_signing_key).await?,
+            None => Self::sign_jwt(&payload, &local_signing_key)?,
         };
 
         Ok(jwt)
     }
 
-    /// Open the local signing library and prove it holds the gateway's own
-    /// key: the public half it signs under must be the one this gateway
-    /// publishes, or it would sign as an identity nobody can verify.
-    pub async fn verify_local_signing(&self) -> Result<()> {
-        use base64::Engine;
-
-        let key = self
-            .config
-            .read()
-            .await
-            .signing_key
-            .clone();
-        let secret = crate::vta::local::secret_of(&key)?;
-        let published = serde_json::to_value(key.to_public())?["x"]
-            .as_str()
-            .context("The gateway's signing key publishes no public half")?
-            .to_string();
-        let probe = crate::vta::local::shared()
-            .await?
-            .sign_raw(&secret, b"local signing self-check")
-            .await?;
-        let public: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(published)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("The gateway's published key is not 32 bytes"))?;
-        ed25519_dalek::VerifyingKey::from_bytes(&public)?
-            .verify_strict(b"local signing self-check", &ed25519_dalek::Signature::from_bytes(&probe))
-            .context("Local signing does not sign under the gateway's published key")
-    }
-
     /// Sign a payload as JWT (JOSE `typ` = `JWT`).
-    async fn sign_jwt(
+    fn sign_jwt(
         payload: &serde_json::Value,
         key: &JWK,
     ) -> Result<String> {
-        Self::sign_jwt_with_typ(payload, key, "JWT").await
+        Self::sign_jwt_with_typ(payload, key, "JWT")
     }
 
     /// Sign a payload as a JWS with an explicit JOSE `typ` header. Explicit
     /// typing (RFC 8725) lets a verifier reject a token presented in the wrong
     /// context — e.g. requiring `oauth-id-jag+jwt` when redeeming an ID-JAG.
-    pub(crate) async fn sign_jwt_with_typ(
+    pub(crate) fn sign_jwt_with_typ(
         payload: &serde_json::Value,
         key: &JWK,
         typ: &str,
     ) -> Result<String> {
-        use base64::Engine;
-
-        let secret = crate::vta::local::secret_of(key)?;
-        let kid = key
-            .key_id
-            .as_deref()
-            .unwrap_or("key-1");
-        let payload_b64 =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload)?.as_bytes());
-        Ok(crate::vta::local::shared()
-            .await?
-            .sign_jws(&secret, typ, kid, &payload_b64)
-            .await?)
+        Ok(crate::vta::local::sign_jwt(key, typ, payload)?)
     }
 
     pub async fn get_agent_key_by_did(
@@ -1502,7 +1460,7 @@ impl VCIssuer {
         let key = self
             .get_agent_key_by_did(did)
             .await?;
-        let jwt = Self::sign_jwt(payload, &key).await?;
+        let jwt = Self::sign_jwt(payload, &key)?;
         info!(did = did, "✍️ Signed JWT with agent key");
         Ok(jwt)
     }
@@ -1569,7 +1527,7 @@ impl VCIssuer {
     ) -> Result<String> {
         let config = self.config.read().await;
         let gateway_did = config.proxy_did.clone();
-        let jwt = Self::sign_jwt(payload, &config.signing_key).await?;
+        let jwt = Self::sign_jwt(payload, &config.signing_key)?;
         drop(config);
         info!(did = %gateway_did, "✍️ Signed JWT with gateway key");
         Ok(jwt)
@@ -1585,7 +1543,7 @@ impl VCIssuer {
     ) -> Result<String> {
         let config = self.config.read().await;
         let gateway_did = config.proxy_did.clone();
-        let jwt = Self::sign_jwt_with_typ(payload, &config.signing_key, typ).await?;
+        let jwt = Self::sign_jwt_with_typ(payload, &config.signing_key, typ)?;
         drop(config);
         info!(did = %gateway_did, typ = typ, "✍️ Signed typed JWT with gateway key");
         Ok(jwt)
@@ -2288,15 +2246,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_signing_proves_it_signs_under_the_gateways_published_key_at_startup() {
-        let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
-        issuer
-            .verify_local_signing()
-            .await
-            .expect("the library signs as the published key");
-    }
-
-    #[tokio::test]
     async fn a_gateway_token_is_signed_by_the_vta_library_under_the_gateways_own_key() {
         let (issuer, _dir) = crate::identity::test_helpers::test_vc_issuer().await;
         let key = issuer
@@ -2312,15 +2261,6 @@ mod tests {
             .expect("signed");
 
         assert!(verifies_under(&jwt, &key), "the token verifies under the gateway's published key");
-        let secret = crate::vta::local::secret_of(&key).expect("secret");
-        assert!(
-            crate::vta::local::shared()
-                .await
-                .expect("shared")
-                .holds(&secret)
-                .await,
-            "the gateway's key was imported into the VTA that signed"
-        );
     }
 
     #[tokio::test]

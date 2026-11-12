@@ -8,17 +8,16 @@ use async_trait::async_trait;
 use ssi::crypto::algorithm::{Algorithm, AlgorithmInstance, SignatureAlgorithmType};
 use ssi::verification_methods::{MessageSigner, Signer, VerificationMethod};
 use ssi_claims_core::{MessageSignatureError, SignatureError};
-use zeroize::Zeroizing;
+use vta_signing::SigningSecret;
 
-/// An `ssi` signer whose Ed25519 signatures are made by the in-process VTA
-/// library instead of by the key material directly. Wrap it in
-/// `ssi::verification_methods::LocalSigner` where the suite wants one.
+/// An `ssi` signer whose Ed25519 signatures are made by `vta-signing`. Wrap it
+/// in `ssi::verification_methods::LocalSigner` where the suite wants one.
 pub struct VtaSsiSigner {
-    secret: Arc<Zeroizing<[u8; 32]>>,
+    secret: Arc<SigningSecret>,
 }
 
 impl VtaSsiSigner {
-    pub fn new(secret: Zeroizing<[u8; 32]>) -> Self {
+    pub fn new(secret: SigningSecret) -> Self {
         Self { secret: Arc::new(secret) }
     }
 }
@@ -36,27 +35,48 @@ impl<M: VerificationMethod> Signer<M> for VtaSsiSigner {
     }
 }
 
-/// A `did:webvh` log signer whose Ed25519 signatures are made by the in-process
-/// VTA library. Its verification method is the key's own `did:key`, which is
+pub struct VtaMessageSigner {
+    secret: Arc<SigningSecret>,
+}
+
+impl<A: SignatureAlgorithmType> MessageSigner<A> for VtaMessageSigner
+where
+    A::Instance: Into<AlgorithmInstance>,
+{
+    async fn sign(
+        self,
+        algorithm: A::Instance,
+        message: &[u8],
+    ) -> Result<Vec<u8>, MessageSignatureError> {
+        let algorithm = algorithm.into().algorithm();
+        if algorithm != Algorithm::EdDSA {
+            return Err(MessageSignatureError::UnsupportedAlgorithm(algorithm.to_string()));
+        }
+        Ok(self
+            .secret
+            .sign_message(message))
+    }
+}
+
+/// A `did:webvh` log signer whose Ed25519 signatures are made by
+/// `vta-signing`. Its verification method is the key's own `did:key`, which is
 /// what the log's `update_keys` name.
 pub struct VtaDiSigner {
-    secret: Zeroizing<[u8; 32]>,
+    secret: SigningSecret,
     verification_method: String,
     public_multibase: String,
 }
 
 impl VtaDiSigner {
-    pub fn from_seed(secret: Zeroizing<[u8; 32]>) -> Self {
-        let public = ed25519_dalek::SigningKey::from_bytes(&secret)
-            .verifying_key()
-            .to_bytes();
-        let mut prefixed = vec![0xed, 0x01];
-        prefixed.extend_from_slice(&public);
-        let public_multibase = multibase::encode(multibase::Base::Base58Btc, prefixed);
+    pub fn from_secret(secret: SigningSecret) -> Self {
+        use vta_signing::Signer as _;
+        let public_multibase = secret
+            .public_key()
+            .to_multibase();
         Self {
-            secret,
             verification_method: format!("did:key:{public_multibase}#{public_multibase}"),
             public_multibase,
+            secret,
         }
     }
 
@@ -64,7 +84,7 @@ impl VtaDiSigner {
     pub fn from_jwk(jwk: &serde_json::Value) -> Result<Self, super::VtaError> {
         let key: ssi::jwk::JWK = serde_json::from_value(jwk.clone())
             .map_err(|e| super::VtaError::Signing(format!("local signing: not a JWK: {e}")))?;
-        Ok(Self::from_seed(super::secret_of(&key)?))
+        Ok(Self::from_secret(super::secret_of(&key)?))
     }
 
     /// The key's public half as a multibase string (`z6Mk…`).
@@ -87,40 +107,7 @@ impl DiSigner for VtaDiSigner {
         &self,
         data: &[u8],
     ) -> Result<Vec<u8>, DataIntegrityError> {
-        let signature = super::shared()
-            .await
-            .map_err(DataIntegrityError::signing)?
-            .sign_raw(&self.secret, data)
-            .await
-            .map_err(DataIntegrityError::signing)?;
-        Ok(signature.to_vec())
-    }
-}
-
-pub struct VtaMessageSigner {
-    secret: Arc<Zeroizing<[u8; 32]>>,
-}
-
-impl<A: SignatureAlgorithmType> MessageSigner<A> for VtaMessageSigner
-where
-    A::Instance: Into<AlgorithmInstance>,
-{
-    async fn sign(
-        self,
-        algorithm: A::Instance,
-        message: &[u8],
-    ) -> Result<Vec<u8>, MessageSignatureError> {
-        let algorithm = algorithm.into().algorithm();
-        if algorithm != Algorithm::EdDSA {
-            return Err(MessageSignatureError::UnsupportedAlgorithm(algorithm.to_string()));
-        }
-        let signature = super::shared()
-            .await
-            .map_err(MessageSignatureError::signature_failed)?
-            .sign_raw(&self.secret, message)
-            .await
-            .map_err(MessageSignatureError::signature_failed)?;
-        Ok(signature.to_vec())
+        Ok(self.secret.sign_message(data))
     }
 }
 
@@ -130,26 +117,27 @@ mod tests {
 
     use super::*;
 
-    fn signer_for(key: &JWK) -> VtaMessageSigner {
-        VtaMessageSigner {
-            secret: Arc::new(super::super::secret_of(key).expect("secret")),
-        }
+    fn secret_for(key: &JWK) -> SigningSecret {
+        super::super::secret_of(key).expect("secret")
     }
 
     #[tokio::test]
-    async fn the_vta_signs_exactly_the_bytes_the_key_signed_before() {
+    async fn the_library_signs_exactly_the_bytes_the_key_signed_before() {
         let key = JWK::generate_ed25519().expect("key");
         let message = b"canonical hash data the suite produced";
+        let through_the_library = VtaMessageSigner {
+            secret: Arc::new(secret_for(&key)),
+        };
 
-        let through_the_vta = MessageSigner::<Algorithm>::sign(signer_for(&key), AlgorithmInstance::EdDSA, message)
+        let signed = MessageSigner::<Algorithm>::sign(through_the_library, AlgorithmInstance::EdDSA, message)
             .await
-            .expect("signed by the vta");
+            .expect("signed by the library");
         let directly = MessageSigner::<Algorithm>::sign(key.clone(), AlgorithmInstance::EdDSA, message)
             .await
             .expect("signed by the key");
 
-        assert_eq!(through_the_vta, directly);
-        assert_eq!(through_the_vta.len(), 64);
+        assert_eq!(signed, directly);
+        assert_eq!(signed.len(), 64);
     }
 
     #[tokio::test]
@@ -158,7 +146,7 @@ mod tests {
 
         let jwk = serde_json::to_value(JWK::generate_ed25519().expect("key")).expect("jwk");
         let signer = VtaDiSigner::from_jwk(&jwk).expect("signer");
-        let secret = Secret::from_jwk_value("did:key:temp#temp", &jwk).expect("secret");
+        let secret = Secret::from_str("did:key:temp#temp", &jwk).expect("secret");
 
         let expected_multibase = secret
             .get_public_keymultibase()
@@ -169,12 +157,11 @@ mod tests {
             format!("did:key:{expected_multibase}#{expected_multibase}")
         );
         assert_eq!(DiSigner::key_type(&signer), KeyType::Ed25519);
-
         let data = b"entry hash and update keys";
         assert_eq!(
             DiSigner::sign(&signer, data)
                 .await
-                .expect("by the vta"),
+                .expect("by the library"),
             DiSigner::sign(&secret, data)
                 .await
                 .expect("by the key")
@@ -190,8 +177,11 @@ mod tests {
     #[tokio::test]
     async fn an_algorithm_other_than_eddsa_is_refused_not_signed() {
         let key = JWK::generate_ed25519().expect("key");
+        let signer = VtaMessageSigner {
+            secret: Arc::new(secret_for(&key)),
+        };
 
-        let refused = MessageSigner::<Algorithm>::sign(signer_for(&key), AlgorithmInstance::ES256, b"m").await;
+        let refused = MessageSigner::<Algorithm>::sign(signer, AlgorithmInstance::ES256, b"m").await;
 
         assert!(matches!(refused, Err(MessageSignatureError::UnsupportedAlgorithm(_))), "{refused:?}");
     }

@@ -39,31 +39,23 @@ about. The behaviour that exists is in [`VTA_INTEGRATION_POC.md`](VTA_INTEGRATIO
 
 ## Local signing
 
-- **The gateway's own keys still live in its files.** The VTA library signs with them from an
-  in-process working store, but the private keys are generated and kept by the gateway, so local
-  signing is a single code path, not a custody improvement. Generating keys inside the library
-  needs a storage design for a store shared by an Active and a Standby node.
+- **The gateway's own keys still live in its files.** `vta-signing` signs with them in memory,
+  but the private keys are generated and kept by the gateway, so local signing is a single code
+  path, not a custody improvement. Key storage, or a KMS or HSM, would plug in behind the
+  library's `Signer` trait.
 - **Credential proofs are `eddsa-rdfc-2022`.** The library signs `eddsa-jcs-2022` documents
   itself; the gateway keeps building the RDFC hash data and has the library sign it, because
   gateways that predate `eddsa-jcs-2022` verification would refuse JCS proofs. Moving to JCS
   waits until every peer runs a release that verifies it.
 - **AP2 gateway presentations always sign locally.** They build their own local authority
   instead of using the one selected for the surface, so a connected trust agent never signs them.
-- **The library's signing path decrypts the imported key and writes an audit row per
-  signature.** If that shows up in signing latency, a per-key cache belongs inside the library.
-- **`vta-service` needs `rest` and `didcomm` enabled to build.** Its default-features-off build
-  does not compile, and its HTTP dependency selects the aws-lc backend of the JWT library.
-
-- **The two-gateway suite (`make gw-e2e`) fails intermittently under parallelism.** Linking the
-  VTA crates moves the DID resolver libraries to newer versions, and with them the suite fails
-  in roughly half of its full runs, in scenarios that depend on DID resolution between the
-  gateways (the restart backfill of a peer's issuer DID, 50 concurrent MCP calls over the
-  fabric). Each of those scenarios passes when run alone, and the commit before the VTA crates
-  were linked passed every full run. The failures also appear on the commit that only adds the
-  dependencies, so they do not come from the signing change. Until it is traced, run the suite more than once and read a single failing scenario as
-  suspect, not as proof. Pinning the resolver to 0.8.43 with `vta-service` 0.78 lowered the
-  failure rate (one failing full run in four) without removing it, so the resolver version alone
-  does not explain it.
+- **The two-gateway suite (`make gw-e2e`) fails intermittently under parallelism.** On a
+  development laptop a full run fails in roughly a third to a half of its runs (4 of 8 with the
+  signing library, 2 of 6 on the release before it), in scenarios that depend on DID resolution
+  or timing between the gateways (the restart backfill of a peer's issuer DID, concurrent MCP
+  calls over the fabric). Each scenario passes when run alone, and the signing change does not
+  cause it. Until it is traced, run the suite more than once and read a single failing scenario
+  as suspect, not as proof.
 
 ## Tenancy and publication
 

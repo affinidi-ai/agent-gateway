@@ -26,21 +26,17 @@ signature: every signature is made by the VTA library running inside the gateway
 signing bug is fixed in one place for local and for remote signing alike.
 
 - The key files stay the source of truth (`issuer_config.json`, agent identity records,
-  `did:webvh` key pairs). Nothing new is persisted: the gateway imports each private key once
-  into an in-process VTA store the first time it signs with it, and the VTA signs from there.
-- The store is a working copy, in a directory this process alone owns (the system temporary
-  directory, or `[local_signing] store_dir`), encrypted with a key that only exists in memory.
-  It is rebuilt on every start, needs no backup, and is never inside `_storage`: the VTA's
-  embedded database locks its directory, and an Active and a Standby node share `_storage`. A
-  store left behind by a process that crashed is removed the next time any gateway starts in
-  the same directory.
-- Startup proves the library signs under the gateway's published key; the gateway refuses to
-  start otherwise.
+  `did:webvh` key pairs). Nothing new is persisted: the gateway holds each private key in
+  memory only while it signs, and `vta-signing` makes the signature. There is no key store,
+  database or working directory, and no setting for one.
+- `vta-signing` is the small library the VTA's own signing operations are built on. The gateway
+  links it alone, not the VTA service, so none of the VTA's storage, access control or audit
+  code runs in the gateway process.
 - Tokens (`sign-jws`) are signed over the exact payload bytes the gateway builds, so claims are
   not reserialised. The only difference a verifier can see is the order of the header members,
-  which the VTA sorts.
+  which the library sorts.
 - Credential and presentation proofs stay `eddsa-rdfc-2022`: the gateway builds the canonical
-  hash data and the VTA signs those bytes, so gateways that predate `eddsa-jcs-2022`
+  hash data and the library signs those bytes, so gateways that predate `eddsa-jcs-2022`
   verification still accept them. `did:webvh` log entries are signed the same way.
 - Not covered: DIDComm (the messaging library needs the key material for key agreement), the
   HMAC transit token, third-party client assertion keys, x402 chain keys, and the control key

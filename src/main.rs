@@ -588,7 +588,6 @@ async fn async_main() -> Result<()> {
             Ok(())
         }
     };
-    vta::local::remove_working_store();
     if tokio::time::timeout(SHUTDOWN_STEP_TIMEOUT, payments_ledger::flush_global())
         .await
         .is_err()
@@ -1474,7 +1473,6 @@ fn render_default_bootstrap_toml(
         trust_registry: Default::default(),
         tenancy: Default::default(),
         vta: Default::default(),
-        local_signing: Default::default(),
         credential_policy: Default::default(),
         config_dir: None,
         server_mode: crate::server::mode::ServerMode::default(),
