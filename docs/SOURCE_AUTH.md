@@ -383,8 +383,8 @@ To find the affected surfaces and callers:
   whose base or enabled variant now refuses such a caller (one that authenticates callers without protected
   resource metadata, `on_failure: reject` or an inbound `from_jwt_claim` identity, which refused
   already), naming the surface:
-  `This Access Point has caller authentication but no Public access setting. A caller whose
-  credential is missing or invalid is refused with 401, as on a closed Access Point …`;
+  `This Access Point is neither closed nor public, and it refuses callers whose credential is
+  missing or invalid with 401, as a closed one does …`;
 - the dashboard's Access Point panel shows such a surface as legacy, with a **Close Access
   Point** button.
 
