@@ -27,9 +27,9 @@ export interface JwtVerificationStrategy {
 const nonEmpty = (value: unknown): value is string => typeof value === 'string' && value !== '';
 
 /**
- * Why a strategy delete failed: the API's message, the credential providers a `409` names as
- * still using the strategy (by name, else id) and how many more the caller can't view, where
- * to change them, and the status.
+ * Why a strategy delete or an editor save failed: the API's message, the credential providers a
+ * `409` names as still using the strategy (by name, else id) and how many more the caller can't
+ * view, where to change them, and the status.
  */
 export function strategyDeleteError(status: number, body: string, statusText: string): string {
   let names: string[] = [];

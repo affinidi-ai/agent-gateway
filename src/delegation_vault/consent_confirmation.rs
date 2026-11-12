@@ -581,7 +581,7 @@ pub(crate) fn note(
                     provider_id = %provider.provider_id,
                     surface_id = %surface_id,
                     reason = ?reason,
-                    "Consent confirmation confirms no caller of this provider: consent links are refused"
+                    "Consent confirmation confirms no caller of this provider: consent links to JWT callers are refused"
                 );
             } else if refused {
                 warn!(

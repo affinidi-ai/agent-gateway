@@ -1058,7 +1058,9 @@ its alert with the gateway's message, the credential providers a `409` lists as 
 strategy by name (else id), "and N you can't view" for its `hidden_references`, that a
 provider's consent confirmation is changed in its editor and its `consent_identity_strategy_id`
 through the API, and the status (`strategyDeleteError`). The delete's confirm dialog says
-credential providers that use the strategy block the delete.
+credential providers that use the strategy block the delete. The strategy editor shows a `409`
+on save (an issuer change a provider using the strategy would refuse) with the same
+`strategyDeleteError` text, so it names those providers and where to change them.
 
 ## Credentials audit tab
 
@@ -1166,7 +1168,10 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (`credential-provider-consent-confirmation-strategies-failed`). Then an optional ID-token principal claim
   (`…-principal-claim-input`) and a **Refuse callers that can't be confirmed** switch
 (`credential-provider-consent-confirmation-require-switch`, writes `require`, off by default,
-sent only while on). The labels say "Login" so they never share a name with the
+sent only while on; its `FieldHelp` says it acts on new links only, so a stored grant is still
+used, and that JWT callers get no link while the setting confirms nobody, whether it is on or not).
+The Login Client ID and Login Client Secret pickers offer the same tenant's secrets as the
+strategy picker: on a new provider, appliance-wide ones only. The labels say "Login" so they never share a name with the
   provider's own client and endpoints. Explanations sit behind each field's `FieldHelp`. A
   read-only **Confirmation redirect URI**
   (`credential-provider-consent-confirmation-redirect-uri`, copy button

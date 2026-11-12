@@ -13,12 +13,11 @@ interface ConsentConfirmationSectionProps {
   /** The confirmation redirect URI, empty until the provider's Callback URL is known. */
   redirectUri: string;
   secrets: SecretOption[];
-  ownerTenant: OwnerTenant;
   /**
-   * The tenant the provider's strategy must be usable by: the stored provider's, or `null` for a
-   * new one, which the dashboard creates appliance-wide.
+   * The tenant the login client's secrets and the strategy must be usable by: the stored
+   * provider's, or `null` for a new one, which the dashboard creates appliance-wide.
    */
-  strategyOwnerTenant: OwnerTenant;
+  ownerTenant: OwnerTenant;
   loadingSecrets: boolean;
   onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
 }
@@ -32,13 +31,12 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
   redirectUri,
   secrets,
   ownerTenant,
-  strategyOwnerTenant,
   loadingSecrets,
   onChange,
 }) => {
   const { strategies, status } = useJwtStrategyList(form.consent_confirmation_enabled);
   // A tenant provider may name its own tenant's strategies or appliance-wide ones, as the gateway allows.
-  const { offered, outside } = splitByTenant(strategies, strategyOwnerTenant, () => true);
+  const { offered, outside } = splitByTenant(strategies, ownerTenant, () => true);
   const storedId = form.cc_jwt_verification_strategy_id;
   const storedOffered = offered.some(strategy => strategy.id === storedId);
   const storedOutside = outside.find(strategy => strategy.id === storedId);
@@ -268,7 +266,10 @@ const ConsentConfirmationSection: React.FC<ConsentConfirmationSectionProps> = ({
                 Off: a caller the setting can&apos;t confirm, such as an API key, mTLS or DID
                 caller, a Transit Point or Fabric request, or a caller of another issuer, gets a
                 consent link that goes straight to the vendor. On: that caller gets no link and the
-                request is refused.
+                request is refused. It acts on new links only: a grant already stored for such a
+                caller is still used, so delete the provider&apos;s vault entries to have those
+                callers consent again. Either way, JWT callers get no link while the setting
+                confirms nobody, for example when the gateway has lost its identity hash pepper.
               </FieldHelp>
             </div>
           </div>

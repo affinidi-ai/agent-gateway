@@ -951,6 +951,16 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     ...extra,
   });
 
+  const LOGIN_SECRETS = [
+    { id: 's1', secret_id: 'LOGIN_SECRET', name: 'Login secret', tenant_id: null },
+    {
+      id: 's2',
+      secret_id: 'LOGIN_CLIENT_ID',
+      name: 'Login client ID',
+      tenant_id: null,
+    },
+  ];
+
   const setup = (
     record: Record<string, unknown>,
     strategies: () => Promise<unknown> = () =>
@@ -958,7 +968,8 @@ describe('EditCredentialProviderPage consent confirmation', () => {
         ok: true,
         json: () => Promise.resolve([{ id: 'strategy-1', name: 'Entra callers' }]),
       }),
-    path = '/credential-providers/p1'
+    path = '/credential-providers/p1',
+    secrets: Record<string, unknown>[] = LOGIN_SECRETS
   ) => {
     mockFetch.mockImplementation((url: string, init?: { method?: string }) => {
       if (init?.method === 'PUT') return Promise.resolve({ ok: true });
@@ -968,16 +979,7 @@ describe('EditCredentialProviderPage consent confirmation', () => {
       if (url.startsWith('/api/v1/secrets/')) {
         return Promise.resolve({
           ok: true,
-          json: () =>
-            Promise.resolve([
-              { id: 's1', secret_id: 'LOGIN_SECRET', name: 'Login secret', tenant_id: null },
-              {
-                id: 's2',
-                secret_id: 'LOGIN_CLIENT_ID',
-                name: 'Login client ID',
-                tenant_id: null,
-              },
-            ]),
+          json: () => Promise.resolve(secrets),
         });
       }
       if (url === '/api/v1/jwt-verification-strategies') return strategies();
@@ -1103,6 +1105,26 @@ describe('EditCredentialProviderPage consent confirmation', () => {
     expect(await screen.findByRole('option', { name: 'Shared callers' })).toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /Own callers/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('option', { name: /Other callers/ })).not.toBeInTheDocument();
+  });
+
+  it('offers a new provider, which the dashboard creates appliance-wide, only appliance-wide login secrets', async () => {
+    setup(legacy(), undefined, '/credential-providers/new', [
+      ...LOGIN_SECRETS,
+      { id: 's3', secret_id: 'ACME_LOGIN_ID', name: 'Acme login id', tenant_id: 'acme' },
+    ]);
+    fireEvent.change(await screen.findByTestId('credential-provider-type-select'), {
+      target: { value: 'oauth2_authorization_code' },
+    });
+    fireEvent.click(await screen.findByTestId(SWITCH));
+    const clientId = await screen.findByTestId(
+      'credential-provider-cc_client_id_secret_ref-select'
+    );
+    await waitFor(() =>
+      expect(within(clientId).getByRole('option', { name: /LOGIN_CLIENT_ID/ })).toBeInTheDocument()
+    );
+    expect(
+      within(clientId).queryByRole('option', { name: /ACME_LOGIN_ID/ })
+    ).not.toBeInTheDocument();
   });
 
   it('says where the redirect URI will show on a stored provider without a Callback URL', async () => {

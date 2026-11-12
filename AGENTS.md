@@ -197,8 +197,9 @@ setting while on, `null` when a stored one is switched off or the provider is no
 consent, and nothing otherwise; see _Credential provider editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#credential-provider-editor).
 
-The strategies tab shows a refused JWT verification strategy delete with the credential providers
-that still use the strategy, by name, and a count of those the user can't view; see _JWT verification strategy editor_ in
+The strategies tab shows a refused JWT verification strategy delete, and the strategy editor a
+refused issuer change, with the credential providers that still use the strategy, by name, and a
+count of those the user can't view; see _JWT verification strategy editor_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#jwt-verification-strategy-editor).
 
 The JWT verification strategy editor's Caller identity claim is editable only on a new strategy;

@@ -182,8 +182,8 @@ No label carries a URL, provider id, secret or tenant.
 
 `agent_gateway_consent_confirmation_links_total{provider_id,surface_id,outcome,reason}` is a
 Prometheus counter incremented once for each consent link a provider with
-[consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation) is asked for, whether it
-is minted or refused. Unlike the log line, which is written once per provider, surface and
+[consent confirmation](CREDENTIAL_DELEGATION.md#consent-confirmation) is asked for once its redirect URI, client ID and authorization endpoint pass, whether it is
+then minted or refused. Unlike the log line, which is written once per provider, surface and
 reason, it counts every link. A provider without the setting is not counted.
 
 | Label | Value |
@@ -191,10 +191,10 @@ reason, it counts every link. A provider without the setting is not counted.
 | `provider_id` | The credential provider's `provider_id` |
 | `surface_id` | The surface the link is for |
 | `outcome` | `confirmed` (the link signs the caller in at their identity provider first); `unconfirmed` (the link goes straight to the vendor); `refused` (no link: the setting confirms no caller, or it sets `require`) |
-| `reason` | `none` for `confirmed`; otherwise why the caller is not confirmed: `path_not_covered`, `not_legacy_consent`, `pepper_unset`, `not_jwt_caller`, `strategy_unavailable`, `gateway_issuer`, `entra_caller_named_by_sub`, `id_token_claim_invalid`, `editable_claim`, `other_issuer`, `other_principal_claim` or `other_identity_hash` |
+| `reason` | `none` for `confirmed`; otherwise why the caller is not confirmed: `path_not_covered`, `not_jwt_caller`, `not_legacy_consent`, `pepper_unset`, `strategy_unavailable`, `gateway_issuer`, `entra_caller_named_by_sub`, `id_token_claim_invalid`, `editable_claim`, `other_issuer`, `other_principal_claim` or `other_identity_hash` |
 
 `reason` is the first that holds, in the order of the [reason
-table](CREDENTIAL_DELEGATION.md#who-is-confirmed): a caller that is not a JWT caller is counted as
+table](CREDENTIAL_DELEGATION.md#who-is-confirmed) and with the exception it notes: a caller that is not a JWT caller is counted as
 `not_jwt_caller` even while the pepper is unset, so `pepper_unset` and the other reasons that
 confirm no caller are counted only once a JWT caller asks for a link.
 

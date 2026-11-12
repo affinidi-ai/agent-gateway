@@ -44,7 +44,8 @@ changes:
         refuse at its own save: an issuer of this gateway's own STS or an Entra issuer while
         callers are named by sub for consent_confirmation, or an issuer that is not a canonical
         https URL for consent_identity_strategy_id. Before, such an edit stopped modern consent
-        from finding the strategy.
+        from finding the strategy. The strategy editor shows the refusal with those providers
+        and where to change them.
   fixed:
     - timestamp: '2026-11-11T21:00:00Z'
       title: Report a caller JWT without an iss claim as an invalid issuer
