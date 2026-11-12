@@ -82,11 +82,25 @@ inside that folder, except `backup_restore`. Put `backup_restore` on persistent,
 storage next to `_storage`, never inside it: a restore empties `_storage`. A full backup
 covers `_storage` except `logs/` and `system_metrics/`. Back up `config.toml`,
 `gateway.json`, the other configuration files and the TLS certificates separately. See
-[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). The volume must
-support hard links where `[storage_paths] vc_keys` points: the gateway creates its transit
-token key there on its first start by linking a complete copy into place, and stops with an
-error saying so on a filesystem without them, such as an object-store mount. Local disks,
-EFS and NFS support them.
+[Locating the files](CONFIGURATION_REFERENCE.md#locating-the-files). Where
+`[storage_paths] vc_keys` points, the gateway creates its transit token key on its first
+start by linking a complete copy into place, so that instances starting together create one
+key between them. Local disks, EFS and NFS support hard links. Where the link fails, as it
+does on a volume without them such as an Azure Files SMB share, the gateway logs a warning
+and creates the key file exclusively instead, filling it in place; instances still share one
+key, and one reading the file while another fills it waits up to 5 seconds for it to be
+complete. An instance that still cannot read a key file with content in it by then stops
+with an error and reads the complete file when it is restarted, so a stalled share costs one
+restart; a key file that holds no content, which a first start killed while filling it
+leaves behind, is removed and created again instead, but only by an instance that found it
+unchanged across those 5 seconds, so a file another instance is filling is left alone. See
+[Transit token](SOURCE_AUTH.md#transit-token) for the whole
+rule and the error. No configuration beyond the mount
+is needed: the gateway reacts to what the volume does. Mount an SMB share with options that
+keep the key file readable by its owner only (`file_mode=0600`, `dir_mode=0700`, and `uid`
+and `gid` matching the user the gateway runs as, or your platform's equivalent for the
+share). A mount that applies its own mode instead leaves the key readable by others on the
+host; the gateway warns about it and starts.
 
 Back up with full `.agbak` archives from the dashboard or the management API; see
 [Storage export and backup](development/DEVELOPMENT.md#storage-export-and-backup). Treat

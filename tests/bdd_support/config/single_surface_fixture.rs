@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use crate::bdd_support::config::config_tree::PolicyDefinitionFixture;
 
+/// The id the single-surface fixture stores its surface under.
+pub const SEEDED_SURFACE_ID: &str = "bdd-surface";
+
 /// The public https origin a surface's protected resource is published under.
 pub const PROTECTED_RESOURCE_PUBLIC_ORIGIN: &str = "https://gateway.bdd.example";
 
@@ -74,6 +77,7 @@ pub struct SurfaceConfigBuilder {
     pub trust_recorder_entries: Vec<serde_json::Value>,
     pub transit_shared_policy: Option<RequestPolicyFixture>,
     pub mcp_http: Option<serde_json::Value>,
+    pub browser_origins: Vec<String>,
     pub protected_resource: Option<ProtectedResourceFixture>,
     /// The outbound listener is also published at [`PROTECTED_RESOURCE_PUBLIC_ORIGIN`], the
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
@@ -123,6 +127,17 @@ pub struct SurfaceConfigBuilder {
     pub streams_sign_in_records: bool,
     /// Console users sign in with SAML rather than passkeys.
     pub signs_in_with_saml: bool,
+    /// The surface's `caller_key`, and the secret it names when that is stored.
+    pub caller_key: Option<CallerKeyFixture>,
+}
+
+/// A surface's `caller_key`: the secret its keys are derived from, stored with `secret_value`
+/// unless that is `None`, and the header they are sent in, the default when `None`.
+#[derive(Debug, Clone)]
+pub struct CallerKeyFixture {
+    pub secret_id: String,
+    pub secret_value: Option<String>,
+    pub header: Option<String>,
 }
 
 /// A prefix the operator adds to `gateway.json`.
@@ -230,6 +245,7 @@ impl Default for SurfaceConfigBuilder {
             trust_recorder_entries: Vec::new(),
             transit_shared_policy: None,
             mcp_http: None,
+            browser_origins: Vec::new(),
             a2a_settings: None,
             rate_limit_per_minute: None,
             audit_log_keeps_every_event: false,
@@ -250,6 +266,7 @@ impl Default for SurfaceConfigBuilder {
             sign_in_event_stream: None,
             streams_sign_in_records: false,
             signs_in_with_saml: false,
+            caller_key: None,
         }
     }
 }

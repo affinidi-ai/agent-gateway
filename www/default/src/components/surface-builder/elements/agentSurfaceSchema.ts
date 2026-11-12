@@ -33,6 +33,7 @@ export const AGENT_SURFACE_PATHS: ReadonlySet<string> = new Set([
   'issuer_id',
   'mcp_legacy_metadata_output',
   'mcp_http',
+  'browser_origins',
   'tags',
   'trust_check_split',
   'access_point',

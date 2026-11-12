@@ -1107,10 +1107,28 @@ The signing key is 32 random bytes the gateway creates on its first start, in
 encrypted like the gateway's other keys when encryption at rest is on. A key file that is
 not owner-only, such as one a restore wrote, is restricted to its owner when the gateway
 loads it, and the file written when encryption at rest is turned on later is owner-only
-too. The file is created by linking a complete copy into place, so the directory must be on
-a filesystem that supports hard links; one that does not stops the first start with an error
-saying so. A key file that cannot be read stops the gateway from starting. Every token names
-the key in its `kid` header, and a token that names another key, or none, is refused.
+too. A volume that applies its own mode, such as an SMB share mounted without
+`file_mode=0600`, keeps the key readable beyond its owner; the gateway warns about it and
+starts, so mount such a share with the options under
+[Storage](DEPLOYMENT_REQUIREMENTS.md#storage). The file is created by linking a complete
+copy into place. When that link fails for any reason other than the file already existing,
+as every link does on a filesystem without hard links such as an Azure Files SMB share, the
+gateway logs a warning and creates the file exclusively instead, filling it in place; one
+instance still wins the creation, and an instance reading the file while another fills it
+waits up to 5 seconds for it to be complete. Filling it takes milliseconds, so the wait
+covers a storage backend that stalls; an instance that still cannot read a file with content
+in it by then stops with an error and reads the complete file when it is restarted, so such
+a stall costs one restart. A directory the file cannot be made in at all still stops the
+start. A key file that cannot be read stops the gateway from starting and is never replaced,
+with one exception: a key file that holds no content at all, which a first start killed
+between creating the file and filling it leaves behind, is removed and a new key created in
+its place, so an interrupted first start does not stop every later one. Only an instance
+that read the file empty and found it unchanged 5 seconds later removes it, and an instance
+creating the key removes nothing, so a file another instance is filling is left alone. A
+file with any content in it, even damaged, is kept and named in the error instead. Instances
+that recover the same empty file together still end on one key, and one that finds the key
+gone while it is creating it reads it again rather than stopping. Every token names the key
+in its `kid` header, and a token that names another key, or none, is refused.
 Instances that share the storage directory share the key, so a Standby that takes over
 accepts the tokens the Active instance issued; instances that do not share it refuse each
 other's tokens, so every instance that serves a managed agent's Transit Point calls must share
@@ -1256,7 +1274,9 @@ except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `X-Gateway-Fabric-Hops` (a Fabric send sets its own), the caller's
 `Authorization` and its `Cookie`, its proxy forwarding headers, the caller-info and
 `did:webvh` identity headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`,
-`x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the header its `source_auth`
+`x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the caller key headers
+(`x-caller-key` and every name starting `x-caller-key-`, also spelled with `_` for `-`; see
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys)), the header its `source_auth`
 reads, a header named like the Transit Point's `target_auth` header or like the
 `custom_header` of a credential binding that can apply on it, and any header a Header
 Metadata Mapping is set to strip. Other headers, such as an API key header the agent sends for
@@ -1301,6 +1321,20 @@ request-bound but still `unverified`, because every holder of the secret shares 
 identity presentation reports `vp` or `vp_unanchored` regardless of the configured mode, except
 on a direct request to an inbound `from_api_key` surface, where the key's DID replaces it; see
 [`POLICY.md`](POLICY.md#caller-identity-verification-in-policy-input).
+
+### A missing identity on the public agent card
+
+On the protected slot, `payload_extraction` refuses a response that carries no identity with
+`422 identity_extension_missing`, and one whose identity is present but invalid with `422
+identity_validation_failed`, except on a public card this gateway serves to a peer over Fabric,
+which is served without an identity credential on any identity error. The public agent card of
+an A2A or AP2 surface is the exception for a missing identity: a named card with neither
+`agent-identity/v1` nor `agent-identity-credential/v1` is served as anonymous, with no identity
+credential and no Trust Recorder write. The gateway logs a `WARN` once per surface, and again
+only after that card carried an identity, after the surface changes, or after a configuration
+reload or restart. An agent that publishes no identity, such as a Microsoft Foundry agent, stays
+discoverable. Its messages are still refused while the slot reads the identity from the response.
+See [`PROTOCOLS.md`](PROTOCOLS.md#generated-agent-cards) for which cards qualify and the codes.
 
 ### `from_api_key` on the inbound slot
 

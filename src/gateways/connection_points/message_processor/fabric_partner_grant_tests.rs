@@ -414,6 +414,7 @@ impl Receiver {
             subject: subject.to_string(),
             claims: json!({ "iss": self.idp.issuer, "sub": subject }),
             principal_claim: "sub".to_string(),
+            verification: Default::default(),
         }
         .principal_hash(tenant)
         .unwrap()

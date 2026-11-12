@@ -1286,6 +1286,7 @@ mod tests {
                 principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                verification: Default::default(),
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(
@@ -1648,6 +1649,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            verification: Default::default(),
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -1843,6 +1845,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            verification: Default::default(),
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -1956,6 +1959,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            verification: Default::default(),
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -2037,6 +2041,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            verification: Default::default(),
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -2148,6 +2153,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user".into(),
             claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+            verification: Default::default(),
         };
         let service = ContinuationService::new(
             ContinuationCipher::new(
@@ -2536,6 +2542,7 @@ mod tests {
                 principal_claim: "sub".to_string(),
                 subject: "user".into(),
                 claims: json!({"iss": profile.issuer, "sub": "user", "scope": "read"}),
+                verification: Default::default(),
             };
             let now = now_secs().unwrap();
             let service = ContinuationService::new(

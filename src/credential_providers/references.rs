@@ -472,6 +472,7 @@ mod tests {
                 }]}
             },
             "target": {"endpoint": "https://api.example.com"},
+            "caller_key": {"secret_id": "memory-keys"},
             "outbound_credentials": [{"credential_provider_id": "bound-provider"}],
             "transit": {"points": [{
                 "id": "partner-id", "alias": "partner", "target_endpoint": "https://partner.example.com",
@@ -501,14 +502,18 @@ mod tests {
             sorted(surface_reference_ids(&surface(), ResourceKind::CredentialProviders)),
             ["bound-provider", "transit-provider", "variant-provider"]
         );
-        assert_eq!(sorted(surface_reference_ids(&surface(), ResourceKind::Secrets)), ["caller-key", "partner-key"]);
+        assert_eq!(
+            sorted(surface_reference_ids(&surface(), ResourceKind::Secrets)),
+            ["caller-key", "memory-keys", "partner-key"]
+        );
         assert_eq!(sorted(target_auth_provider_ids(&surface())), ["variant-provider"]);
     }
 
     #[test]
     fn the_fallback_for_an_unresolvable_surface_holds_every_id_it_stores() {
         let values = string_values(&surface());
-        for id in ["caller-key", "partner-key", "bound-provider", "transit-provider", "variant-provider"] {
+        for id in ["caller-key", "memory-keys", "partner-key", "bound-provider", "transit-provider", "variant-provider"]
+        {
             assert!(values.contains(&id.to_string()), "{id}");
         }
     }

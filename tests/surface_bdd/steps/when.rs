@@ -1802,6 +1802,68 @@ async fn mcp_surface_with_a2a_settings_create_request_submitted(
     create_surface(world, payload).await;
 }
 
+#[when(expr = "the operator attempts to create a surface for route {string} that allows browser origins {string}")]
+async fn surface_with_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    origins: String,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        origins
+            .split(", ")
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "the operator attempts to create a surface for route {string} that allows {int} browser origins")]
+async fn surface_with_many_browser_origins_create_request_submitted(
+    world: &mut SurfaceWorld,
+    route: String,
+    count: usize,
+) {
+    configure_unseeded_route(world, &route);
+    let mut payload = build_primary_target_surface_payload(world, &route).await;
+    payload["browser_origins"] = serde_json::json!(
+        (0..count)
+            .map(|index| format!("https://page{index}.example.com"))
+            .collect::<Vec<_>>()
+    );
+    create_surface(world, payload).await;
+}
+
+#[when(expr = "a web page at origin {string} sends a preflight for a POST to the surface")]
+async fn web_page_sends_preflight_to_surface(
+    world: &mut SurfaceWorld,
+    origin: String,
+) {
+    ensure_gateway_running(world).await;
+    let url = format!(
+        "http://127.0.0.1:{}{}/foo",
+        world
+            .infra
+            .as_ref()
+            .unwrap()
+            .gateway_port,
+        world.surface_config.route
+    );
+    let response = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await
+        .expect("send preflight to gateway");
+    world.caller_response = Some(RecordedResponse {
+        status: response.status().as_u16(),
+        headers: collect_headers(response.headers()),
+        body: serde_json::Value::Null,
+    });
+}
+
 #[when(expr = "the operator attempts to create a surface for route {string} with invalid configuration")]
 async fn invalid_surface_create_request_submitted(
     world: &mut SurfaceWorld,
@@ -2184,6 +2246,7 @@ async fn request_with_tampered_token(world: &mut SurfaceWorld) {
     send_request_with_bearer_token(world, token).await;
 }
 
+#[given("the caller has sent a request to the surface with a valid token")]
 #[when("the caller sends a request to the surface with a valid token")]
 async fn request_with_valid_token(world: &mut SurfaceWorld) {
     ensure_gateway_running(world).await;
@@ -2191,6 +2254,29 @@ async fn request_with_valid_token(world: &mut SurfaceWorld) {
     let audience = caller_token_audience(world);
     let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
     send_request_with_bearer_token(world, token).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid token and header {string} set to {string}")]
+async fn request_with_valid_token_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    ensure_gateway_running(world).await;
+    let issuer = get_jwt_source_auth_issuer(world);
+    let audience = caller_token_audience(world);
+    let token = create_valid_jwt_for_issuer_with_audience(issuer, audience);
+    send_request_and_record(world, vec![("authorization".to_string(), format!("Bearer {token}")), (name, value)]).await;
+}
+
+#[when(expr = "the caller sends a request to the surface with a valid API key and header {string} set to {string}")]
+async fn request_with_valid_api_key_and_header(
+    world: &mut SurfaceWorld,
+    name: String,
+    value: String,
+) {
+    let api_key = build_valid_api_key_source_auth_header(world);
+    send_request_and_record(world, vec![api_key, (name, value)]).await;
 }
 
 #[when(expr = "the caller sends a request to the surface with a token for audience {string}")]
@@ -2999,6 +3085,21 @@ async fn managed_agent_sends_a2a_request_through_transit_point_with_header(
     value: String,
 ) {
     send_a2a_request_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)]).await;
+}
+
+#[when(
+    regex = r#"^managed agent \"([^\"]+)\" sends an A2A message/send request with the agent-identity extension through Transit Point \"([^\"]+)\" with header \"([^\"]+)\" set to \"([^\"]+)\"$"#
+)]
+async fn managed_agent_sends_identity_request_through_transit_point_with_header(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    transit_point: String,
+    header: String,
+    value: String,
+) {
+    let mut body = build_a2a_message_send_body("hello");
+    crate::bdd_support::json_rpc::attach_agent_identity_payload(&mut body);
+    send_a2a_body_through_transit_point(world, &agent_name, &transit_point, vec![(header, value)], body).await;
 }
 
 #[when(
@@ -4198,6 +4299,15 @@ async fn mcp_modern_batch_sent(world: &mut SurfaceWorld) {
         build_modern_mcp_list_tools_body(serde_json::json!("modern-mcp-batch-second"), &McpVersion::Modern, true),
     ]);
     send_json_request_and_record(world, batch, modern_mcp_request_headers(&McpVersion::Modern, "tools/list")).await;
+}
+
+#[when("the caller sends a legacy batch of MCP tool catalog requests")]
+async fn mcp_legacy_batch_sent(world: &mut SurfaceWorld) {
+    let batch = serde_json::Value::Array(vec![
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-first")),
+        build_mcp_list_tools_body_with_id(serde_json::json!("mcp-batch-second")),
+    ]);
+    send_json_request_and_record(world, batch, vec![]).await;
 }
 
 #[when(expr = "the caller asks the MCP surface for available tools with header {string} set to {string}")]

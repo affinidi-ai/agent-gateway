@@ -5975,6 +5975,16 @@ async fn process_charged_forward_request(
         }
     }
 
+    if let Some((header_name, header_value)) = crate::proxy::caller_key::caller_key_header(
+        &surface,
+        authenticated_identity.as_ref(),
+        get_secrets_store().as_ref(),
+    )
+    .await
+    {
+        req = crate::proxy::handler::replace_request_header(req, &header_name, &header_value);
+    }
+
     // Inject custom metadata for MCP protocol
     if surface_protocol == crate::config::ChannelProtocol::Mcp
         && let Some(custom_metadata) = surface.custom_metadata()
@@ -6348,9 +6358,7 @@ async fn process_charged_forward_request(
             };
             match store.get(proxy_id).await {
                 Ok(Some(proxy)) => Some(proxy),
-                Ok(None) => return axum_response_to_forward_result(crate::a2a::create_error_response(
-                    axum::http::StatusCode::NOT_FOUND, "MCP proxy was not found",
-                )).await,
+                Ok(None) => return axum_response_to_forward_result(crate::protocols::no_mcp_proxy_response()).await,
                 Err(_) => return axum_response_to_forward_result(crate::a2a::create_error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE, "MCP proxy storage is unavailable",
                 )).await,
@@ -11544,6 +11552,9 @@ mod tests {
                 "x-gateway-did": "did:web:peer-sent-gateway.example",
                 "X-DID-Identity": "did:web:peer-sent-surface.example",
                 "X-Did-Signed-Identity": "{\"id\":\"did:web:peer-sent-surface.example\"}",
+                "X-Caller-Key": "peer-sent",
+                "x_caller_key": "peer-sent",
+                "X-Caller-Key-Memory": "peer-sent",
                 "Cookie": "__Host-session_token=peer-dashboard-session",
                 "Accept-Encoding": "gzip, br",
                 "x-peer-context": "kept"
@@ -11562,6 +11573,9 @@ mod tests {
             "x-gateway-did",
             "x-did-identity",
             "x-did-signed-identity",
+            "x-caller-key",
+            "x_caller_key",
+            "x-caller-key-memory",
             "cookie",
         ] {
             assert!(

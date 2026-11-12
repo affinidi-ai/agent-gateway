@@ -53,7 +53,14 @@ export function previewBody(overrides: Json = {}): Json {
     source_url_query_hidden: false,
     fetched_at: '2026-10-23T10:00:00Z',
     cached: false,
-    fetch: { status: 'ok', cause: null, http_status: null, duration_ms: 182 },
+    fetch: {
+      status: 'ok',
+      cause: null,
+      http_status: null,
+      duration_ms: 182,
+      identity_error: null,
+      identity_slot: null,
+    },
     auth: {
       kind: 'credential_provider',
       result: 'sent',

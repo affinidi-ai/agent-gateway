@@ -48,7 +48,7 @@ const BUILT_IN_RULES: &[(&str, &str, &str)] = &[
     ),
     (
         "Quoted credential fields",
-        r#"(?i)("[A-Za-z0-9_.-]*(?:authorization|cookie|api[_-]?key|secret(?:[_-]?key)?|private[_-]?key|token|passw(?:or)?d|session[_-]?id|credentials?)\\?"\s*:\s*\\?")[^"\\]*"#,
+        r#"(?i)("[A-Za-z0-9_.-]*(?:authorization|cookie|api[_-]?key|caller[_-]?key|secret(?:[_-]?key)?|private[_-]?key|token|passw(?:or)?d|session[_-]?id|credentials?)\\?"\s*:\s*\\?")[^"\\]*"#,
         "${1}[REDACTED]",
     ),
     ("Personal access tokens", r"agpat_[A-Za-z0-9_-]+", "[REDACTED-PAT]"),
@@ -87,6 +87,7 @@ const CREDENTIAL_ATTRIBUTE_NAMES: &[&str] = &[
     "secret_key",
     "api_key",
     "apikey",
+    "caller_key",
     "private_key",
     "credential",
     "credentials",
@@ -1124,6 +1125,14 @@ mod tests {
     }
 
     #[test]
+    fn test_built_in_rules_redact_json_quoted_caller_key() {
+        let result = built_in_redactor()
+            .redact(r#"{"x-caller-key": "abc", "x_caller_key": "def", "accept": "*/*"}"#)
+            .into_owned();
+        assert_eq!(result, r#"{"x-caller-key": "[REDACTED]", "x_caller_key": "[REDACTED]", "accept": "*/*"}"#);
+    }
+
+    #[test]
     fn test_built_in_rules_redact_json_escaped_quoted_values() {
         let result = built_in_redactor()
             .redact(r#"{"message":"headers {\"Authorization\": \"Bearer abc123\", \"cookie\": \"sid-value\"}"}"#)
@@ -1240,6 +1249,8 @@ mod tests {
             "stripe_secret_key",
             "api_key",
             "x-api-key",
+            "x-caller-key",
+            "http.request.header.x-caller-key",
             "private_key",
             "credentials",
         ] {

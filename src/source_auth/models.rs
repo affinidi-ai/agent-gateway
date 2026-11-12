@@ -400,6 +400,9 @@ pub enum AuthenticatedIdentity {
         principal_claim: String,
         /// All decoded claims.
         claims: Value,
+        /// Where the keys that verified the token come from, and the audiences it was
+        /// accepted against.
+        verification: JwtVerification,
     },
 
     /// API Key authentication succeeded.
@@ -445,7 +448,60 @@ pub enum AuthenticatedIdentity {
     },
 }
 
+/// How a JWT was verified: where the keys that verified it come from and the audiences it was
+/// accepted against. Its issuer claim is only what the token says; this is what the gateway
+/// trusted, so binding to it keeps a token verified under another key set, or accepted for an
+/// added audience, from standing for a caller the real issuer names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JwtVerification {
+    /// `jwks_uri:` and the strategy's JWKS URI as configured, so the issuer's own key rotation
+    /// keeps it; or `inline_jwks:sha256:` and the lowercase hex SHA-256 of the RFC 8785
+    /// canonical JSON of the key set configured inline. Empty when it is not known.
+    pub key_source: String,
+    /// The claim the audiences are matched against: `aud`, `azp` or `client_id`.
+    pub audience_claim: String,
+    /// The audiences the token was accepted against, sorted and without duplicates.
+    pub audiences: Vec<String>,
+}
+
+impl JwtVerification {
+    /// The verification of a token checked against `strategy`'s keys for `audiences` in
+    /// `audience_claim`. A key set that cannot be put in canonical form leaves the key source
+    /// empty.
+    pub fn of(
+        strategy: &crate::jwt_bearer::models::JwtVerificationStrategy,
+        audiences: &[String],
+        audience_claim: crate::jwt_bearer::models::AudienceClaim,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        let key_source = match &strategy.jwks_source {
+            crate::jwt_bearer::models::JwksSource::Remote { jwks_uri } => format!("jwks_uri:{jwks_uri}"),
+            crate::jwt_bearer::models::JwksSource::Static { jwks } => serde_json_canonicalizer::to_vec(jwks)
+                .map(|canonical| format!("inline_jwks:sha256:{}", hex::encode(Sha256::digest(canonical))))
+                .unwrap_or_default(),
+        };
+        let mut audiences = audiences.to_vec();
+        audiences.sort();
+        audiences.dedup();
+        Self {
+            key_source,
+            audience_claim: audience_claim
+                .as_str()
+                .to_string(),
+            audiences,
+        }
+    }
+}
+
 impl AuthenticatedIdentity {
+    /// How a JWT caller's token was verified; `None` for any other mode.
+    pub fn jwt_verification(&self) -> Option<&JwtVerification> {
+        match self {
+            AuthenticatedIdentity::JwtBearer { verification, .. } => Some(verification),
+            _ => None,
+        }
+    }
+
     /// The decoded JWT claim set, when this identity was produced by JWT
     /// Bearer source authentication. Returns `None` for every other auth
     /// mode. Used by `ManagedIdentityConfig::FromJwtClaim` to derive the
@@ -496,6 +552,7 @@ impl AuthenticatedIdentity {
                 subject,
                 principal_claim,
                 claims,
+                ..
             } => {
                 let issuer = claims
                     .get("iss")
@@ -935,6 +992,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "agent-1".to_string(),
             claims: serde_json::json!({"oid": "abc", "tid": "tenant-1"}),
+            verification: Default::default(),
         };
         let claims = id
             .jwt_claims()
@@ -964,6 +1022,7 @@ mod tests {
                 .to_string(),
             principal_claim: principal_claim.to_string(),
             claims,
+            verification: Default::default(),
         }
     }
 
@@ -1080,6 +1139,7 @@ mod tests {
             subject: "alice".to_string(),
             principal_claim: "oid".to_string(),
             claims,
+            verification: Default::default(),
         };
         assert_eq!(forged.principal_hash(None), None);
     }
@@ -1101,6 +1161,7 @@ mod tests {
             subject: subject.to_string(),
             principal_claim: "sub".to_string(),
             claims: serde_json::json!({"iss": "https://login.example.com", "sub": subject}),
+            verification: Default::default(),
         };
         assert_eq!(
             jwt_subject("alice")
@@ -1157,6 +1218,7 @@ mod tests {
                 .unwrap_or("<none>")
                 .to_string(),
             claims,
+            verification: Default::default(),
         };
         let api_key = |name: &str, provider: Option<&str>| AuthenticatedIdentity::ApiKey {
             key_name: name.to_string(),
@@ -1205,6 +1267,7 @@ mod tests {
                     principal_claim: "sub".to_string(),
                     subject: "alice".into(),
                     claims: serde_json::json!({"iss": "https://idp.example", "sub": "bob"}),
+                    verification: Default::default(),
                 },
             ),
             ("an empty key name", api_key("", None)),

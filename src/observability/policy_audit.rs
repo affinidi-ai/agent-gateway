@@ -939,6 +939,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "sub-123".to_string(),
             claims: serde_json::json!({}),
+            verification: Default::default(),
         };
         let (method, principal, did) = caller_fields(&jwt);
         assert_eq!(method, "jwt_bearer");
@@ -969,6 +970,7 @@ mod tests {
             principal_claim: "sub".to_string(),
             subject: "user-123".to_string(),
             claims: serde_json::json!({"email": "ada@example.com"}),
+            verification: Default::default(),
         };
         let carried = crate::delegation_vault::audit::AuditCallerContext {
             principal: None,

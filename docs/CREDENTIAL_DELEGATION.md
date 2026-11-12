@@ -55,7 +55,7 @@ not fail on its next request.
 | --- | --- | --- |
 | `DELETE /api/v1/credential-providers/{id}` | A surface binds the provider or uses it for Target authentication; the answer is the `provider_in_use` one described in [Deleting a provider](#deleting-a-provider), not the body below | None: remove the references first |
 | `PUT /api/v1/credential-providers/{id}` that changes the type from one that sends the gateway's own credential to one that needs a user's consent (`oauth2_authorization_code`) | A surface uses the provider for Target authentication, which refuses such a provider | None. A provider used only in bindings may change type |
-| `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
+| `DELETE /api/v1/secrets/{id}` | A surface names the secret (Target authentication, caller authentication, managed identity, caller key), a credential provider references it, an A2A proxy's Direct Line backend uses it, or an STS client's `client_secret_ref` names it; tenant and appliance-wide secrets alike | `?force=true` deletes it anyway, logs a warning with the secret id and the referrers' ids, and records a `secret_force_deleted` event in the VP Audit Log (see [Auditing a forced secret delete](#auditing-a-forced-secret-delete)). It does not override an integration endpoint that references the secret, which still answers `409` with its own message (see [`INTEGRATIONS.md`](INTEGRATIONS.md)) |
 
 The other refusals answer a `409` body that keeps the `message` field current clients show:
 
@@ -1535,6 +1535,73 @@ returned, never followed. A request whose path climbs out, such as `{route}/%2e%
 tool calls; the rules and each path's answer are in
 [Target Credential Scope](PROTOCOLS.md#target-credential-scope).
 
+## Caller keys
+
+A Target that keeps data for each caller, such as an agent's memory of each signed-in user,
+can encrypt each caller's data with a key the gateway derives and its own operator cannot. A
+surface's `caller_key` names a secret in the secrets store; on each request whose caller
+presented a JWT the gateway verified on that request, by JWT Bearer source authentication or
+by the Resource Server token of `mcp_http.authorization`, the Target receives
+HKDF-SHA256(secret, salt `agent-gateway-caller-key-v2`, info) in the surface's header,
+`x-caller-key` by default, as 32 bytes of base64url without padding. The info is the surface
+id, the key source, the audience claim, the accepted audiences, the token's `iss`, the claim's
+name and its value, each field preceded by its 4-byte big-endian length and each audience by
+its own, so no field can be read as part of another. The claim is the first of
+`identity_claims` (`["sub"]` by default) the token carries as a non-empty string; a token
+without a string `iss`, or without any of the claims as such a string, gets no key. The same
+caller on the same surface gets the same key on every request, every variant of the surface
+included; another caller, another issuer, another surface, another secret, another key source
+or another audience set gives another key. The setting and its rules
+are in [`CONFIGURATION_REFERENCE.md`](CONFIGURATION_REFERENCE.md#surface-caller-keys), and the
+derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
+
+- **Bound to how the token was verified.** The token's `iss` is only what the token says, and
+  whoever can edit a JWT verification strategy can point it at a key set of their own and sign
+  a token with the real `iss` and any caller's subject. So the key is also bound to the key
+  source that verified the token: `jwks_uri:` and the strategy's JWKS URI as configured, which
+  the issuer's own key rotation behind that URI does not change, or `inline_jwks:sha256:` and
+  the SHA-256 of the RFC 8785 canonical JSON of a key set configured inline; an MCP Resource
+  Server token is verified against the gateway's own signing keys, an inline key set by the
+  same rule. It is bound as well to the audience claim and the audiences the token was accepted
+  against, sorted and without duplicates, so adding an audience to accept another
+  application's tokens changes every key. A forged token under a substituted key set, or one
+  accepted only through an added audience, gets a key no caller had.
+- **Who gets a key.** Only a caller with a JWT verified on the request. A caller identified by an
+  API key, an API Key Provider key, DID Auth or mTLS gets none, nor does a caller without a
+  credential or whose credential failed on a public Access Point. A Target bound by external
+  consent is a third party and never gets one, nor does a mirror endpoint.
+- **Where it is sent.** On the request to an HTTP(S) Target, from the Access Point and on Fabric
+  receive, where the receiving gateway derives it for the JWT it verified. A `fabric://` Target
+  is not sent the sending gateway's key; a `proxy://` MCP proxy's backend and an `a2a-proxy://`
+  backend are sent none.
+- **A caller cannot supply one.** A surface's caller key header is always of the caller key
+  family: `x-caller-key`, or `x-caller-key-` followed by lower-case words, such as
+  `x-caller-key-memory`. The Access Point, mirror, Fabric send and receive, Transit Point, agent
+  card and MCP proxy request filters drop every header of the family, any header whose name,
+  lower-cased with `_` read as `-`, is `x-caller-key` or starts with `x-caller-key-`, from what a
+  caller, an agent or a peer sent, on every surface, whether or not it sets `caller_key`. So no
+  surface's choice of header changes what another surface, of the same tenant or another,
+  forwards. Every other header, such as `x-api-key` or `x-caller-keys`, passes as before. A
+  managed agent that passes on the headers it received does not leak its callers' keys through a
+  Transit Point.
+- **Behaviour change.** A caller, an agent or a peer gateway can no longer send any header of
+  the caller key family through the gateway, even to a surface without `caller_key`. A Target
+  that read such a header from its callers must take it under another name.
+- **When the secret cannot be read.** A missing secret, one outside the surface's tenant, one of
+  fewer than 32 bytes, or a secrets store that fails, leaves the header out and logs a warning
+  naming the surface and the reason, never the secret. The request is forwarded.
+- **The secret stays in the store.** The surface holds only its `secret_id`; the value is read
+  from the secrets store for each derivation, and is never logged or returned by the admin API. Deleting a secret a
+  surface's `caller_key` names is refused with `409` unless forced, as for any other secret a
+  surface names (see [Records that are still in use](#records-that-are-still-in-use)). The derived key is
+  not logged; the log redaction rules treat a `caller_key` field or attribute as a credential.
+- **Changing the setting.** By design, replacing the secret's value, the claims or the surface,
+  and changing the key source (the strategy's JWKS URI, or its inline keys, an inline key
+  rotation included) or the audience claim or audiences the token is accepted against, changes
+  every caller's key, so the Target can no longer read what it encrypted with the old keys. For
+  a Resource Server token that includes a change of the gateway's own signing keys. Keep these
+  fixed for the surface's life, and prefer a JWKS URI over inline keys.
+
 ## Tenant isolation on a surface's upstream legs
 
 A surface owned by a tenant sends only credentials of its own tenant. The check covers
@@ -2184,7 +2251,11 @@ revoked; when the person connected again while it ran, the call uses the new gra
   refresh token may be spent: the grant is never refreshed again, and once its access token
   expires the call answers `connect_required`.
 - A provider with `token_refresh_enabled: false`, or a grant without a refresh token, is never
-  refreshed: once its access token expires, `connect_required`.
+  refreshed: once its access token expires, `connect_required`. A connect for a provider with
+  `token_refresh_enabled` keeps no grant whose access token expires without a refresh token
+  (`no_refresh_token`, [The connect API](#the-connect-api)), so a grant without one is one whose
+  token never expires, or one connected while its provider's `token_refresh_enabled` was
+  `false`.
 
 Each refresh is audited, `token_refreshed` or `refresh_failed` with the cause in `detail`.
 
@@ -2222,7 +2293,14 @@ server to server only, under a management session or access token, and never ret
 The gateway keeps a pending connect in the vault, encrypted at rest and under the vault's lock,
 holding a fresh verifier (32 random bytes) for ten minutes, and answers `201` with only its
 challenge: `{connect_id, code_challenge, code_challenge_method: "S256", expires_at}`. The other
-system builds the authorization request with that challenge and its own `state`.
+system builds the authorization request with that challenge and its own `state`. It names the
+provider's `resource` there (RFC 8707) unless the provider's `send_resource` is `false`, whose
+token endpoint refuses the parameter, as Entra v2.0's authorization endpoint does too. For a
+provider with `token_refresh_enabled` it also asks for a refresh token the way the vendor wants
+it, such as the `offline_access` scope at Entra and other OpenID Connect servers or
+`access_type=offline` at Google; otherwise the vendor issues none and the connect is refused
+`no_refresh_token`. An `offline_access` the vendor reports back is not taken for a wider grant
+under `scope_comparison` `oidc` or `microsoft` ([Granted scopes](#granted-scopes)).
 
 `POST /api/v1/delegation-vault/connects/{connect_id}/complete` with `{code, iss}` completes it.
 The code's shape, the provider (still an external consent provider of the connect's tenant, and
@@ -2241,12 +2319,22 @@ only decides, by the file names, which claim came first. Then:
    `false`), as a refresh is sent.
 3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
    for, as the provider compares them ([Granted scopes](#granted-scopes)).
-4. The grant is kept only while the surface still serves its binding, and the scopes asked for
+4. For a provider with `token_refresh_enabled` (the default), an answer whose access token
+   expires (`expires_in`) must carry a refresh token: without one the grant could never be
+   refreshed, and the person would be asked to connect again once its token expired. An answer
+   without `expires_in` is kept without one: its grant is never refreshed on a schedule, only
+   when the vendor refuses its token ([External consent on a Transit
+   Point](#external-consent-on-a-transit-point)), which a grant with a refresh token survives
+   and one without answers with `connect_required`. A provider with `token_refresh_enabled:
+   false` keeps an answer without a refresh token too. An empty refresh token makes the whole
+   answer unusable (`invalid_token_response`).
+5. The grant is kept only while the surface still serves its binding, and the scopes asked for
    still lie within the binding's (or the provider's default scopes when it names none), checked
    under the surface's lock; a grant it replaces for the same key is revoked.
 
-Tokens obtained but not kept, because the scopes were wider, or the binding was removed or
-narrowed while the person consented, are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
+Tokens obtained but not kept, because the scopes were wider, no refresh token came with an
+access token that expires, or the binding was removed or narrowed while the person consented,
+are revoked. The answer is `{"status": "connected", "grant_id", "scopes",
 "expires_at"}`, or `{"status": "failed", "reason"}` with a fixed reason; the authorization
 server's words are never echoed or logged, with one exception. A `scope_widened` answer adds
 `widened_scopes`, the scopes granted beyond those asked for (as the provider compares them), so
@@ -2260,7 +2348,7 @@ out. The connect's log line names the same, and a refresh refused for a wider gr
 | `409` | `already_used` | The connect was completed, or tried, before |
 | `410` | `expired` | Ten minutes passed |
 | `400` | `iss_mismatch`, `iss_missing` | `iss` is not the provider's, or is missing for an issuer that sends it; the connect is not claimed, and stays open |
-| `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, or more scopes were granted than asked for |
+| `502` | `invalid_client`, `invalid_grant`, `token_endpoint_refused`, `token_endpoint_unreachable`, `invalid_token_response`, `client_unavailable`, `scope_widened`, `no_refresh_token` | The token endpoint refused the client (re-register it) or the code, refused otherwise, could not be reached or failed, answered something that is not a `Bearer` token, the client's secret cannot be resolved, more scopes were granted than asked for, or an access token that expires came without a refresh token for a provider with `token_refresh_enabled` (ask the vendor for offline access, or turn the provider's refresh off) |
 | `409` | `binding_removed`, `binding_changed`, `provider_unavailable` | The binding or the provider went away, or the binding was narrowed below the scopes asked for, while the person consented |
 | `403` | `issuer_not_permitted`, `resource_not_permitted` | The operator's rules no longer permit the provider |
 

@@ -82,7 +82,38 @@ fn cors_request_method(request_parts: &RequestParts) -> String {
 }
 
 fn proxy_cors_layer(cors_origins: &[String]) -> CorsLayer {
-    cors_layer(cors_origins, false)
+    cors_layer(cors_origins, false, None)
+}
+
+/// CORS for the routes of surfaces: `network.cors` plus, for a path that
+/// belongs to a surface, that surface's `browser_origins`, read from `surfaces`
+/// on every request so a saved change applies at once.
+fn surface_cors_layer(
+    cors_origins: &[String],
+    surfaces: &Arc<RwLock<Vec<SurfaceInfo>>>,
+) -> CorsLayer {
+    cors_layer(cors_origins, false, Some(Arc::clone(surfaces)))
+}
+
+/// Whether `origin` is one of the `browser_origins` of the active surface that
+/// `path` belongs to.
+async fn is_surface_browser_origin(
+    surfaces: &RwLock<Vec<SurfaceInfo>>,
+    origin: &HeaderValue,
+    path: &str,
+) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let surfaces = surfaces.read().await;
+    super::handler::match_surface_route(&surfaces, path).is_some_and(|(info, ..)| {
+        info.surface.status == crate::config::agent_surface::SurfaceStatus::Active
+            && info
+                .surface
+                .browser_origins
+                .iter()
+                .any(|allowed| allowed == origin)
+    })
 }
 
 /// Removes every `Set-Cookie` and `Set-Cookie2` from an Access Point's answer.
@@ -102,12 +133,13 @@ async fn withhold_target_cookies(mut response: axum::response::Response) -> axum
 /// channel or proxy route also receives these paths, so a proxied Target's
 /// responses are never opened to every origin.
 fn metadata_cors_layer(cors_origins: &[String]) -> CorsLayer {
-    cors_layer(cors_origins, true)
+    cors_layer(cors_origins, true, None)
 }
 
 fn cors_layer(
     cors_origins: &[String],
     any_origin_reads: bool,
+    surfaces: Option<Arc<RwLock<Vec<SurfaceInfo>>>>,
 ) -> CorsLayer {
     let origins = parse_cors_origins(cors_origins);
 
@@ -115,13 +147,22 @@ fn cors_layer(
         .allow_methods(Any)
         .allow_origin(AllowOrigin::async_predicate(move |origin: HeaderValue, request_parts: &RequestParts| {
             let origins = Arc::clone(&origins);
+            let surfaces = surfaces.clone();
             let path = request_parts
                 .uri
                 .path()
                 .to_string();
             let method = cors_request_method(request_parts);
             let reads = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
-            async move { any_origin_reads && reads || is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) }
+            async move {
+                if any_origin_reads && reads || is_proxy_cors_origin_allowed(&origin, &method, &path, &origins) {
+                    return true;
+                }
+                match surfaces {
+                    Some(surfaces) => is_surface_browser_origin(&surfaces, &origin, &path).await,
+                    None => false,
+                }
+            }
         }))
         .allow_headers(Any)
         // A browser MCP client reads the 401 challenge to find the metadata.
@@ -1254,7 +1295,7 @@ pub async fn build_port_router(
         let proxy_router = proxy_router
             .layer(axum::middleware::map_response(withhold_target_cookies))
             .layer(axum::middleware::from_fn(crate::observability::trace_http_request))
-            .layer(proxy_cors_layer(&network_config.cors))
+            .layer(surface_cors_layer(&network_config.cors, &state.channels))
             .with_state(state.as_ref().clone());
 
         app = app.merge(proxy_router);
@@ -2055,6 +2096,202 @@ mod tests {
             }];
             assert_eq!(metadata_path_owner(&network), Some(prefix));
         }
+    }
+
+    fn browser_origin_surface(
+        route: &str,
+        origins: &[&str],
+    ) -> SurfaceInfo {
+        let mut surface = crate::config::agent_surface::AgentSurface {
+            name: route
+                .trim_start_matches('/')
+                .to_string(),
+            browser_origins: origins
+                .iter()
+                .map(|origin| origin.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        surface.access_point.route = route.to_string();
+        SurfaceInfo {
+            surface: Arc::new(surface),
+            identity_rules_engine: None,
+            identity_selector: None,
+            protected_rules_engine: None,
+            protected_selector: None,
+            external_rules_engine: None,
+            external_selector: None,
+            task_id: route.to_string(),
+            variant_engines: Default::default(),
+        }
+    }
+
+    async fn browser_origin_response(
+        surfaces: &Arc<RwLock<Vec<SurfaceInfo>>>,
+        cors: &[&str],
+        origin: &str,
+        method: &str,
+        path: &str,
+        preflight_for: Option<&str>,
+    ) -> axum::response::Response {
+        use axum::http::{Request, header};
+        use tower::ServiceExt;
+        let cors: Vec<String> = cors
+            .iter()
+            .map(|origin| origin.to_string())
+            .collect();
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::ORIGIN, origin);
+        if let Some(requested) = preflight_for {
+            request = request
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, requested)
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type");
+        }
+        let event_stream = path.ends_with("/stream");
+        Router::new()
+            .route(
+                "/{*path}",
+                axum::routing::any(move || async move {
+                    let content_type = if event_stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    ([(header::CONTENT_TYPE, content_type)], "{}")
+                }),
+            )
+            .layer(surface_cors_layer(&cors, surfaces))
+            .oneshot(
+                request
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn allow_origin(response: &axum::response::Response) -> Option<String> {
+        response
+            .headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .map(|value| {
+                value
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+    }
+
+    #[tokio::test]
+    async fn a_surface_browser_origin_may_call_its_own_surface_only() {
+        let page = "https://chat.example.com";
+        let surfaces = Arc::new(RwLock::new(vec![
+            browser_origin_surface("/agents/alpha", &[page]),
+            browser_origin_surface("/agents/beta", &[]),
+        ]));
+        for (path, event_stream) in [("/agents/alpha/rpc", false), ("/agents/alpha/stream", true)] {
+            let preflight = browser_origin_response(&surfaces, &[], page, "OPTIONS", path, Some("POST")).await;
+            assert_eq!(allow_origin(&preflight).as_deref(), Some(page), "preflight {path}");
+            let call = browser_origin_response(&surfaces, &[], page, "POST", path, None).await;
+            assert_eq!(allow_origin(&call).as_deref(), Some(page), "request {path}");
+            assert_eq!(
+                call.headers()[axum::http::header::CONTENT_TYPE],
+                if event_stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }
+            );
+            assert!(
+                !call
+                    .headers()
+                    .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            );
+            assert!(
+                !preflight
+                    .headers()
+                    .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            );
+            assert_eq!(call.headers()[axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS], "www-authenticate");
+        }
+        for path in ["/agents/beta/rpc", "/agents/beta/stream", "/agents/other/rpc", "/elsewhere"] {
+            let preflight = browser_origin_response(&surfaces, &[], page, "OPTIONS", path, Some("POST")).await;
+            assert_eq!(allow_origin(&preflight), None, "preflight {path}");
+            let call = browser_origin_response(&surfaces, &[], page, "POST", path, None).await;
+            assert_eq!(allow_origin(&call), None, "request {path}");
+        }
+        let stranger =
+            browser_origin_response(&surfaces, &[], "https://evil.example", "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&stranger), None);
+        let near_miss =
+            browser_origin_response(&surfaces, &[], "https://chat.example.com:8443", "POST", "/agents/alpha/rpc", None)
+                .await;
+        assert_eq!(allow_origin(&near_miss), None);
+    }
+
+    #[tokio::test]
+    async fn the_network_cors_list_still_applies_to_surface_paths() {
+        let dashboard = "https://dashboard.example.com";
+        let surfaces = Arc::new(RwLock::new(vec![browser_origin_surface("/agents/alpha", &[])]));
+        for path in ["/agents/alpha/rpc", "/agents/unknown"] {
+            let call = browser_origin_response(&surfaces, &[dashboard], dashboard, "POST", path, None).await;
+            assert_eq!(allow_origin(&call).as_deref(), Some(dashboard), "{path}");
+            let stranger =
+                browser_origin_response(&surfaces, &[dashboard], "https://chat.example.com", "POST", path, None).await;
+            assert_eq!(allow_origin(&stranger), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_discovery_reads_keep_their_any_origin_rule() {
+        let surfaces = Arc::new(RwLock::new(vec![browser_origin_surface("/agents/alpha", &[])]));
+        let read =
+            browser_origin_response(&surfaces, &[], "https://anywhere.example", "GET", "/agents/alpha/discovery", None)
+                .await;
+        assert_eq!(allow_origin(&read).as_deref(), Some("https://anywhere.example"));
+    }
+
+    #[tokio::test]
+    async fn a_saved_browser_origin_applies_to_the_next_request() {
+        let page = "https://chat.example.com";
+        let surfaces = Arc::new(RwLock::new(vec![browser_origin_surface("/agents/alpha", &[])]));
+        let call = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call), None);
+
+        *surfaces.write().await = vec![browser_origin_surface("/agents/alpha", &[page])];
+        let call = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call).as_deref(), Some(page));
+
+        *surfaces.write().await = vec![browser_origin_surface("/agents/alpha", &[])];
+        let call = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call), None);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_surface_opens_no_browser_origin() {
+        let page = "https://chat.example.com";
+        let mut disabled = browser_origin_surface("/agents/alpha", &[page]);
+        let mut surface = (*disabled.surface).clone();
+        surface.status = crate::config::agent_surface::SurfaceStatus::Disabled;
+        disabled.surface = Arc::new(surface);
+        let surfaces = Arc::new(RwLock::new(vec![disabled]));
+        let call = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&call), None);
+    }
+
+    #[tokio::test]
+    async fn the_most_specific_surface_route_decides_the_browser_origin() {
+        let page = "https://chat.example.com";
+        let surfaces = Arc::new(RwLock::new(vec![
+            browser_origin_surface("/agents", &[page]),
+            browser_origin_surface("/agents/beta", &[]),
+        ]));
+        let outer = browser_origin_response(&surfaces, &[], page, "POST", "/agents/alpha/rpc", None).await;
+        assert_eq!(allow_origin(&outer).as_deref(), Some(page));
+        let inner = browser_origin_response(&surfaces, &[], page, "POST", "/agents/beta/rpc", None).await;
+        assert_eq!(allow_origin(&inner), None);
     }
 
     #[test]
