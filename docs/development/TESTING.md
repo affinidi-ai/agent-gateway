@@ -122,8 +122,9 @@ file is deleted without lowering or removing its pin. New helpers are caught in 
 by the tests.
 
 Pins only go down. A change that deletes tests lowers the pin in the same change. Raising a
-pin needs a stated reason in the pull request; the usual one is a rebase that brings in a
-test main already added.
+pin needs a stated reason in the pull request; the usual one is matching tests main already
+has, after a merge conflict in `FROZEN_FILES` or when main itself fails the guard. A test a
+branch writes belongs outside the folder, never behind a raised pin.
 
 They compile into the binary's test target, so they still run with the unit tests:
 

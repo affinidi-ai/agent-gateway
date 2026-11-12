@@ -269,7 +269,7 @@ make lint         # fmt-check + clippy + eslint + shellcheck
 
 ```mermaid
 flowchart LR
-    U["Unit<br/>one function"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
+    U["Unit<br/>one function or seam"] --> B["Behaviour<br/>end to end, in Gherkin"] --> D["Dashboard<br/>in a real browser"]
 ```
 
 [`TESTING.md`](TESTING.md) explains what belongs in each layer.
