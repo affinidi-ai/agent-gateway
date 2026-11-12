@@ -2300,6 +2300,88 @@ fn response_is_consent_required_error(
     );
 }
 
+#[then(expr = "the consent required error for OAuth provider {string} gives the reason {string}")]
+fn consent_required_error_gives_the_reason(
+    world: &mut SurfaceWorld,
+    provider: String,
+    reason: String,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert_eq!(entry["reason"], serde_json::json!(reason), "{entry}");
+}
+
+#[then(expr = "the consent required error for OAuth provider {string} gives no reason")]
+fn consent_required_error_gives_no_reason(
+    world: &mut SurfaceWorld,
+    provider: String,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert!(entry.get("reason").is_none(), "{entry}");
+}
+
+#[then(expr = "the consent required error says a new consent to OAuth provider {string} may be used for {int} seconds")]
+fn consent_required_error_says_how_long_a_new_consent_lasts(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    let body = get_response_body_value(world);
+    let entry =
+        consent_entry(body, &provider).unwrap_or_else(|| panic!("missing consent entry for '{provider}', got {body}"));
+    assert_eq!(entry["max_consent_age_secs"], serde_json::json!(seconds), "{entry}");
+}
+
+#[then("the delegation vault holds no delegated credential")]
+async fn delegation_vault_holds_no_delegated_credential(world: &mut SurfaceWorld) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert!(held.is_empty(), "expected an empty delegation vault, got {held:?}");
+}
+
+#[then(expr = "the delegated credential in the delegation vault ends its consent {int} seconds after it was given")]
+async fn delegated_credential_ends_its_consent_after(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    let held = crate::steps::when::list_delegation_vault(world).await;
+    assert_eq!(held.len(), 1, "expected one delegated credential, got {held:?}");
+    let time = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(
+            held[0][field]
+                .as_str()
+                .unwrap_or_else(|| panic!("the delegated credential has no {field}: {}", held[0])),
+        )
+        .expect("a listed time is RFC 3339")
+    };
+    assert_eq!(
+        time("consent_expires_at") - time("consent_granted_at"),
+        chrono::Duration::seconds(seconds),
+        "{}",
+        held[0]
+    );
+}
+
+#[then(expr = "OAuth provider {string} was not asked to refresh delegated credentials")]
+fn oauth_provider_was_not_asked_to_refresh(
+    world: &mut SurfaceWorld,
+    _provider: String,
+) {
+    let refreshes: Vec<_> = oauth_provider_requests(world)
+        .into_iter()
+        .filter(|request| {
+            request
+                .path_and_query
+                .starts_with("/token")
+                && url::form_urlencoded::parse(request.raw_body.as_bytes())
+                    .any(|(name, value)| name == "grant_type" && value == "refresh_token")
+        })
+        .collect();
+    assert!(refreshes.is_empty(), "expected no token refresh request, got {refreshes:?}");
+}
+
 #[then("the consent required error names neither the caller's identity hash nor the managed agent's DID")]
 fn consent_required_error_names_no_caller_or_agent(world: &mut SurfaceWorld) {
     let body = get_response_body_value(world);

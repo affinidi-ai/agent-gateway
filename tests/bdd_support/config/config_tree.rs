@@ -115,6 +115,7 @@ pub struct CredentialProviderFixture {
     pub token_refresh_enabled: bool,
     pub api_key_secret_ref: Option<String>,
     pub authorization_response_issuer: Option<String>,
+    pub max_consent_age_secs: Option<u64>,
     /// The `jwt_*` settings of a provider that signs a JWT, merged into the record.
     pub jwt_settings: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -513,6 +514,9 @@ fn write_credential_provider_fixture(
     }
     if let Some(issuer) = &provider.authorization_response_issuer {
         value["authorization_response_issuer"] = serde_json::json!(issuer);
+    }
+    if let Some(secs) = provider.max_consent_age_secs {
+        value["max_consent_age_secs"] = serde_json::json!(secs);
     }
     if let Some(serde_json::Value::Object(settings)) = &provider.jwt_settings {
         for (name, setting) in settings {

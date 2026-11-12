@@ -821,6 +821,18 @@ Trust); see [`POLICY.md`](POLICY.md#the-authority-of-a-trust-check).
   `sts_client`). `actor` names the management caller as on policy change events. The record
   carries no record name and sets no `surface_id`.
 
+**Consent expiry events.** Raised when a consent reaches its time limit (group Delegation); see
+[`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#consent-time-limit).
+
+- `consent_expired`: the stored credential of an ended consent was removed, and the person is
+  asked to consent again. It is never a `token_revoked` or `user_tokens_revoked`, which record
+  a revocation. The record names the agent (`agent_did`, absent for a grant by binding), the
+  caller's identity hash or `owner` (`user_identity_hash`), the provider, the surface, the
+  scopes and the token or grant id (`token_id`). Its `detail` is
+  `consent_granted_at:<time>,consent_expired_at:<time>,source:release`, the times in RFC 3339
+  UTC and `source` what found the consent ended: `release` is a request that needed the
+  credential. One removal writes one record, whichever request finds the consent ended first.
+
 **MCP Proxy pin change events.** Raised by management API writes to a surface (group
 Delegation); see [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#through-an-mcp-proxy)
 for when a save changes a pin.

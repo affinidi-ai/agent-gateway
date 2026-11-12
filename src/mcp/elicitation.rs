@@ -172,6 +172,7 @@ pub fn build_oauth_consent_elicitation(
     tool_name: Option<&str>,
     scopes: &[String],
     authorization_url: &str,
+    notice: Option<&str>,
 ) -> ElicitationCreateRequest {
     // Strip control characters from provider_name to prevent message
     // manipulation. Allow printable chars (punctuation, unicode letters).
@@ -194,8 +195,11 @@ pub fn build_oauth_consent_elicitation(
         .map(|t| format!(" to run `{}`", t))
         .unwrap_or_default();
 
+    let notice = notice
+        .map(|notice| format!(" {notice}"))
+        .unwrap_or_default();
     let message = format!(
-        "{safe_provider_name} access is required{tool_blurb}{scope_blurb}.\n\nOpen this URL in your \
+        "{safe_provider_name} access is required{tool_blurb}{scope_blurb}.{notice}\n\nOpen this URL in your \
          browser, sign in with {safe_provider_name}, then return here and click Accept:\n\n{authorization_url}",
     );
 
@@ -570,6 +574,7 @@ mod tests {
             Some("create_issue"),
             &["repo".to_string(), "read:user".to_string()],
             "https://github.com/login/oauth/authorize?state=xyz",
+            None,
         );
         assert_eq!(req.jsonrpc, "2.0");
         assert_eq!(req.method, "elicitation/create");
@@ -610,7 +615,7 @@ mod tests {
 
     #[test]
     fn builder_omits_tool_when_none() {
-        let req = build_oauth_consent_elicitation(json!(1), "Slack", None, &[], "https://slack/auth");
+        let req = build_oauth_consent_elicitation(json!(1), "Slack", None, &[], "https://slack/auth", None);
         assert!(
             !req.params
                 .message
@@ -637,13 +642,45 @@ mod tests {
 
     #[test]
     fn schema_validation_accepts_oauth_consent_builder_output() {
-        let req = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x");
+        let req = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x", None);
         assert!(validate_requested_schema(&req.params.requested_schema).is_ok());
     }
 
     #[test]
+    fn the_message_carries_the_notice_before_the_instructions() {
+        let asked_again = build_oauth_consent_elicitation(
+            json!(1),
+            "GitHub",
+            None,
+            &[],
+            "https://x",
+            Some("Your earlier access ended at its time limit. The agent may use this access for 6 hours."),
+        );
+        assert!(
+            asked_again
+                .params
+                .message
+                .starts_with(
+                    "GitHub access is required. Your earlier access ended at its time limit. The agent may use \
+                     this access for 6 hours.\n\nOpen this URL"
+                ),
+            "{}",
+            asked_again.params.message
+        );
+        let first_time = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x", None);
+        assert!(
+            first_time
+                .params
+                .message
+                .starts_with("GitHub access is required.\n\nOpen this URL"),
+            "{}",
+            first_time.params.message
+        );
+    }
+
+    #[test]
     fn round_trip_request_serialization_matches_spec_shape() {
-        let req = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x");
+        let req = build_oauth_consent_elicitation(json!(1), "GitHub", None, &[], "https://x", None);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["method"], "elicitation/create");

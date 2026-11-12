@@ -34,6 +34,7 @@ use tracing::{info, warn};
 
 use super::audit::AuditCallerContext;
 use super::connects::{ConnectClaim, PendingConnect, TooManyPendingConnects};
+use super::consent_age::ConsentLimits;
 use super::grants::{DelegatedGrant, GrantBinding, GrantKey, OWNER_PRINCIPAL, ObtainedTokens, UnreadableGrant};
 use super::handlers::DelegationVaultState;
 use super::token_endpoint::{TokenFailure, TokenRequest};
@@ -467,12 +468,15 @@ pub async fn start_connect(
         return error(StatusCode::BAD_REQUEST, "scope_not_permitted", "scopes must lie within the binding's scopes");
     }
     let (connect, code_challenge) = PendingConnect::start(&key, scopes, request.redirect_uri, Utc::now());
-    let answer = serde_json::json!({
+    let mut answer = serde_json::json!({
         "connect_id": connect.id,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
         "expires_at": connect.expires_at,
     });
+    if let Some(secs) = ConsentLimits::of(binding.max_consent_age_secs, provider.max_consent_age_secs).lifetime_secs() {
+        answer["max_consent_age_secs"] = serde_json::json!(secs);
+    }
     match state
         .vault_store
         .start_connect(connect)
@@ -589,16 +593,18 @@ pub async fn complete_connect(
         "External consent connect completed"
     );
     match outcome {
-        Ok(grant) => (
-            status,
-            Json(serde_json::json!({
+        Ok(grant) => {
+            let mut answer = serde_json::json!({
                 "status": "connected",
                 "grant_id": grant.id,
                 "scopes": grant.scopes,
                 "expires_at": grant.expires_at,
-            })),
-        )
-            .into_response(),
+            });
+            if let Some(end) = grant.consent_expires_at {
+                answer["consent_expires_at"] = serde_json::json!(end);
+            }
+            (status, Json(answer)).into_response()
+        }
         Err(unkept) => unkept.response(),
     }
 }
@@ -707,6 +713,21 @@ async fn redeem(
         revoke_unkept(state, &provider, grant, &manager.actor);
         return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
     };
+    // The binding as saved now sets the end the person is told. One changed
+    // before the grant is stored is still checked at every release.
+    let binding_secs = match surfaces
+        .get(&grant.surface_id)
+        .await
+    {
+        Ok(Some(surface)) => crate::identity::handlers::surface_grants::binding_max_consent_age(&surface, &grant),
+        Ok(None) => None,
+        Err(error) => {
+            warn!(target: "credential_delegation", error = %error, "Failed to read a surface to end a grant's consent");
+            revoke_unkept(state, &provider, grant, &manager.actor);
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "grants_unavailable").into());
+        }
+    };
+    grant.consent_expires_at = ConsentLimits::of(binding_secs, provider.max_consent_age_secs).expires_at(now);
     let stored = match crate::identity::handlers::surface_grants::store_grant_while_bound(
         &state.vault_store,
         surfaces.as_ref(),
@@ -1624,6 +1645,102 @@ mod tests {
                 .contains("access-1"),
             "no token is listed"
         );
+    }
+
+    /// Under a consent time limit a connect says how long the grant will last
+    /// before the person consents, and the grant it keeps ends then: at the
+    /// shorter of its binding's limit and its provider's. Without a limit
+    /// neither answer mentions one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_under_a_time_limit_says_how_long_the_grant_lasts_and_stores_its_end() {
+        let fixture = Fixture::new(vec![token_answer("access-1"), token_answer("access-2")]).await;
+        let (status, started) = fixture
+            .start(Some("tenant-a"), owner_start())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        assert!(
+            started
+                .get("max_consent_age_secs")
+                .is_none(),
+            "{started}"
+        );
+
+        let mut provider = fixture
+            .state
+            .provider_store
+            .get("vendor")
+            .await
+            .unwrap()
+            .unwrap();
+        provider.max_consent_age_secs = Some(21_600);
+        fixture
+            .state
+            .provider_store
+            .update(provider)
+            .await
+            .unwrap();
+        async fn connect(fixture: &Fixture) -> (serde_json::Value, serde_json::Value) {
+            let (status, started) = fixture
+                .start(Some("tenant-a"), owner_start())
+                .await;
+            assert_eq!(status, StatusCode::CREATED, "{started}");
+            let (status, completed) = fixture
+                .complete(
+                    started["connect_id"]
+                        .as_str()
+                        .unwrap(),
+                    json!({"code": "the-code", "iss": fixture.issuer()}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{completed}");
+            (started, completed)
+        }
+        async fn stored(fixture: &Fixture) -> DelegatedGrant {
+            fixture
+                .state
+                .vault_store
+                .grant(&GrantKey::owner(Some("tenant-a"), "surface", "owner-hop", "vendor"))
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        let (started, completed) = connect(&fixture).await;
+        assert_eq!(started["max_consent_age_secs"], 21_600, "the provider's limit");
+        let grant = stored(&fixture).await;
+        assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(21_600)));
+        assert_eq!(completed["consent_expires_at"], json!(grant.consent_expires_at));
+
+        let surfaces = fixture
+            .state
+            .agent_surface_store
+            .clone()
+            .unwrap();
+        let mut surface = surfaces
+            .get("surface")
+            .await
+            .unwrap()
+            .unwrap();
+        surface
+            .transit
+            .as_mut()
+            .unwrap()
+            .points
+            .iter_mut()
+            .find(|point| point.id == "owner-hop")
+            .unwrap()
+            .transit_credentials
+            .as_mut()
+            .unwrap()
+            .max_consent_age_secs = Some(3_600);
+        surfaces
+            .save(&surface)
+            .await
+            .unwrap();
+        let (started, _) = connect(&fixture).await;
+        assert_eq!(started["max_consent_age_secs"], 3_600, "the binding's shorter limit");
+        let grant = stored(&fixture).await;
+        assert_eq!(grant.consent_expires_at, Some(grant.created_at + chrono::Duration::seconds(3_600)));
     }
 
     /// A Transit Point whose target is an MCP Proxy starts a connect only while

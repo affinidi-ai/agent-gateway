@@ -52,6 +52,8 @@ pub struct SurfaceConfigBuilder {
     pub oauth_callback_base_url: Option<String>,
     /// The RFC 9207 `iss` the surface's OAuth provider records as its authorization server's.
     pub oauth_authorization_response_issuer: Option<String>,
+    /// The seconds the surface's OAuth provider lets a consent be used.
+    pub oauth_max_consent_age_secs: Option<u64>,
     /// OAuth providers the gateway has besides the surface's own, by provider id.
     pub additional_oauth_providers: Vec<String>,
     /// The surface's OAuth provider is stored as the admin API now creates one: with a
@@ -213,6 +215,7 @@ impl Default for SurfaceConfigBuilder {
             oauth_provider_base_url: None,
             oauth_callback_base_url: None,
             oauth_authorization_response_issuer: None,
+            oauth_max_consent_age_secs: None,
             additional_oauth_providers: Vec::new(),
             oauth_callback_path_ends_in_record_id: false,
             mcp_identity_payload_schema: None,

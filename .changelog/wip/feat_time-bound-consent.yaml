@@ -1,0 +1,27 @@
+branch: feat/time-bound-consent
+changes:
+  added:
+    - timestamp: '2026-11-12T12:00:00Z'
+      title: ⭐ End a delegated consent at a configurable time limit
+      description: >-
+        A person's consent to a credential provider can now have an end. `max_consent_age_secs`
+        on an `oauth2_authorization_code` credential provider limits every consent given to it,
+        the same field on a binding (`outbound_credentials[]`, a Transit Point's
+        `transit_credentials`) limits the consents used through that binding, and
+        `[credential_policy]` in config.toml takes `default_max_consent_age_secs`, for providers
+        that set none, and `max_consent_age_ceiling_secs`, which no limit reaches past. Each is
+        from 60 seconds to 365 days. The end is fixed when the person consents and stored with
+        the credential, so a shortened limit also ends older consents and a lengthened one never
+        extends a consent already given. From its end a credential is never injected and never
+        refreshed, even when the vendor would still refresh it: the gateway removes it, records
+        `consent_expired`, which is not a revocation, and answers the existing `consent_required`
+        or `connect_required` with the reason, so the person is asked again. A binding with a
+        shorter limit than the consent it finds asks again with `consent_too_old` and leaves the
+        credential for other bindings. The consent start page, the elicitation message and the
+        `consent_required` entries say how long the new consent lasts. Without a limit nothing
+        changes, and revocation works as before.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

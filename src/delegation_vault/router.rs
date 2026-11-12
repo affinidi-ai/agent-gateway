@@ -256,6 +256,7 @@ mod tests {
     fn seed_token(id: &str) -> DelegationToken {
         let now = Utc::now();
         DelegationToken {
+            consent_expires_at: None,
             id: id.to_string(),
             agent_did: "did:web:agent.example".to_string(),
             user_identity_hash: "sha256:user-1".to_string(),
@@ -823,6 +824,7 @@ mod tests {
             "surface",
             &["repo".to_string()],
             "https://198.51.100.7",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -896,6 +898,86 @@ mod tests {
             .await;
         assert_eq!(accepted.status, StatusCode::OK, "{}", accepted.body);
         assert_eq!(fixture.vault_records(), 1);
+    }
+
+    /// Under a consent time limit the start page says how long the agent may
+    /// use the consent, the callback stores its end with the credential, and
+    /// the page after it says until when. Without one, none of them mentions it.
+    #[tokio::test]
+    async fn a_time_limit_is_shown_on_the_consent_pages_and_ends_the_stored_consent() {
+        let fixture = consent::Fixture::new().await;
+        let unlimited = fixture
+            .get(&consent::local(&fixture.start_url()), &[])
+            .await;
+        assert_eq!(unlimited.status, StatusCode::OK, "{}", unlimited.body);
+        assert!(
+            !unlimited
+                .body
+                .contains("Time limit"),
+            "{}",
+            unlimited.body
+        );
+
+        let start_url = fixture.start_url_under(Some(21_600));
+        let page = fixture
+            .get(&consent::local(&start_url), &[])
+            .await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        assert!(
+            page.body.contains(
+                "<dt>Time limit</dt><dd>The agent may use it for 6 hours after you approve. Then it asks you \
+                 again.</dd>"
+            ),
+            "{}",
+            page.body
+        );
+
+        let (callback_state, cookie) = fixture
+            .begin_at(&start_url)
+            .await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        let end = stored[0].consent_granted_at + chrono::Duration::seconds(21_600);
+        assert_eq!(stored[0].consent_expires_at, Some(end));
+        assert!(
+            done.body
+                .contains(&format!("on your behalf until {}.", end.format("%-d %B %Y, %H:%M UTC"))),
+            "{}",
+            done.body
+        );
+
+        let (callback_state, cookie) = fixture.begin().await;
+        let done = fixture
+            .callback("github", &format!("code=vendor-code&state={callback_state}"), Some(&cookie))
+            .await;
+        assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+        assert!(
+            done.body
+                .contains("on your behalf.</p>"),
+            "{}",
+            done.body
+        );
+        let stored = fixture
+            .vault
+            .list_all()
+            .await
+            .unwrap();
+        assert!(
+            stored
+                .iter()
+                .any(|token| token
+                    .consent_expires_at
+                    .is_none()),
+            "a consent given under no limit has no end"
+        );
     }
 
     /// The start page claims nothing and sets no cookie, so it may be fetched
@@ -1178,6 +1260,7 @@ mod tests {
             "surface",
             &[],
             "https://198.51.100.7",
+            None,
         )
         .unwrap();
         let started = fixture
@@ -1535,6 +1618,15 @@ mod tests {
             }
 
             pub fn start_url(&self) -> String {
+                self.start_url_under(None)
+            }
+
+            /// The start page of a consent that may be used for
+            /// `max_consent_age_secs` once given.
+            pub fn start_url_under(
+                &self,
+                max_consent_age_secs: Option<u64>,
+            ) -> String {
                 crate::delegation_vault::oauth::build_authorization_url(
                     &self.provider(),
                     "did:web:agent.example",
@@ -1542,6 +1634,7 @@ mod tests {
                     "surface",
                     &["repo".to_string(), "read:user".to_string()],
                     "https://198.51.100.7",
+                    max_consent_age_secs,
                 )
                 .unwrap()
             }
@@ -1549,8 +1642,17 @@ mod tests {
             /// A callback state and the binding cookie of the browser that
             /// posted its start page.
             pub async fn begin(&self) -> (String, String) {
+                self.begin_at(&self.start_url())
+                    .await
+            }
+
+            /// [`Self::begin`] from the start page at `start_url`.
+            pub async fn begin_at(
+                &self,
+                start_url: &str,
+            ) -> (String, String) {
                 let started = self
-                    .start_post(&start_state(&self.start_url()), &[("origin", "https://198.51.100.7")])
+                    .start_post(&start_state(start_url), &[("origin", "https://198.51.100.7")])
                     .await;
                 assert_eq!(started.status, StatusCode::FOUND, "{}", started.body);
                 let vendor = url::Url::parse(

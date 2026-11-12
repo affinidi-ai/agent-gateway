@@ -613,6 +613,19 @@ fn missing_type_fields(provider: &CredentialProvider) -> Option<Response> {
         .map(|message| (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response())
 }
 
+/// Refuses a consent time limit outside one minute to 365 days, and one on a
+/// provider of a type nobody consents to.
+fn consent_limit_error(provider: &CredentialProvider) -> Option<Response> {
+    let secs = provider.max_consent_age_secs?;
+    let refusal = if provider.provider_type == CredentialProviderType::OAuth2AuthorizationCode {
+        crate::config::credential_policy::validate_max_consent_age("max_consent_age_secs", secs).err()?
+    } else {
+        "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+            .to_string()
+    };
+    Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": refusal }))).into_response())
+}
+
 /// The consent-flow rules a provider passes before it is stored: an
 /// `authorization_response_issuer` only where allowed, and for an authorization
 /// code provider without an `issuer`, an authorization endpoint, when it has
@@ -778,6 +791,9 @@ pub async fn create_provider(
         scope_comparison: req.scope_comparison,
         revocation_ends_authorization: req.revocation_ends_authorization,
         send_resource: req.send_resource,
+        max_consent_age_secs: req
+            .max_consent_age_secs
+            .filter(|secs| *secs != 0),
         created_at: now,
         updated_at: now,
     };
@@ -786,6 +802,9 @@ pub async fn create_provider(
         return error.into_response();
     }
     if let Some(response) = missing_type_fields(&provider) {
+        return response;
+    }
+    if let Some(response) = consent_limit_error(&provider) {
         return response;
     }
 
@@ -1149,11 +1168,20 @@ pub async fn update_provider(
         scope_comparison: existing.scope_comparison,
         revocation_ends_authorization: existing.revocation_ends_authorization,
         send_resource: existing.send_resource,
+        // A `0` in the request removes the stored limit.
+        max_consent_age_secs: match req.max_consent_age_secs {
+            Some(0) => None,
+            Some(secs) => Some(secs),
+            None => existing.max_consent_age_secs,
+        },
         created_at: existing.created_at,
         updated_at: Utc::now(),
     };
 
     if let Some(response) = missing_type_fields(&updated) {
+        return response;
+    }
+    if let Some(response) = consent_limit_error(&updated) {
         return response;
     }
 
@@ -1992,6 +2020,66 @@ mod jwt_provider_tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "the rule holds on the merged provider: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_consent_provider_takes_a_time_limit_that_an_update_keeps_changes_or_removes() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let (status, body) =
+            create(&state, with(authorization_code("github"), json!({"max_consent_age_secs": 21_600}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 21_600);
+        let id = body["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, body) = update(&state, &id, json!({"description": "kept"})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 21_600, "left out, the limit is kept");
+        let (status, body) = update(&state, &id, json!({"max_consent_age_secs": 3_600})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["max_consent_age_secs"], 3_600);
+        for refused in [59, 31_536_001] {
+            let (status, body) = update(&state, &id, json!({"max_consent_age_secs": refused})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}: {body}");
+            assert_eq!(
+                body["error"],
+                format!("max_consent_age_secs must be from 60 to 31536000, got {refused}"),
+                "{refused}"
+            );
+        }
+        let (status, body) = update(&state, &id, json!({"max_consent_age_secs": 0})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            body.get("max_consent_age_secs")
+                .is_none(),
+            "0 removes the limit: {body}"
+        );
+
+        let (status, body) =
+            create(&state, with(authorization_code("unlimited"), json!({"max_consent_age_secs": 0}))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            body.get("max_consent_age_secs")
+                .is_none(),
+            "{body}"
+        );
+        let (status, body) =
+            create(&state, with(authorization_code("too-short"), json!({"max_consent_age_secs": 30}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "max_consent_age_secs must be from 60 to 31536000, got 30");
+
+        let mut service = authorization_code("svc");
+        service["provider_type"] = json!("oauth2_client_credentials");
+        service["max_consent_age_secs"] = json!(3_600);
+        let (status, body) = create(&state, service).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error"],
+            "max_consent_age_secs is set only on an oauth2_authorization_code provider, the type a person consents to"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

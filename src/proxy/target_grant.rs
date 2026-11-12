@@ -893,6 +893,9 @@ impl TargetGrantRoute {
                     .network_config
                     .external_consent_refresh_refusals,
             ),
+            max_consent_age_secs: self
+                .binding
+                .max_consent_age_secs,
         })
     }
 

@@ -1047,6 +1047,7 @@ fn target_auth_provider_fixture(provider: &SurfaceTargetAuthProviderConfig) -> C
         token_refresh_enabled: false,
         api_key_secret_ref: None,
         authorization_response_issuer: None,
+        max_consent_age_secs: None,
         jwt_settings: (!client_credentials).then(|| {
             serde_json::json!({
                 "jwt_issuer": TARGET_AUTH_JWT_ISSUER,
@@ -1079,12 +1080,13 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
                 surface_config
                     .oauth_authorization_response_issuer
                     .clone(),
+                surface_config.oauth_max_consent_age_secs,
             )];
             providers.extend(
                 surface_config
                     .additional_oauth_providers
                     .iter()
-                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None)),
+                    .map(|provider_id| oauth_provider_fixture(surface_config, provider_id, Vec::new(), None, None)),
             );
             providers
         }
@@ -1104,6 +1106,7 @@ fn delegation_provider_fixture(surface_config: &SurfaceConfigBuilder) -> Vec<Cre
             token_refresh_enabled: false,
             api_key_secret_ref: Some(secret_id.clone()),
             authorization_response_issuer: None,
+            max_consent_age_secs: None,
             jwt_settings: None,
             created_at: now,
             updated_at: now,
@@ -1116,6 +1119,7 @@ fn oauth_provider_fixture(
     provider_id: &str,
     default_scopes: Vec<String>,
     authorization_response_issuer: Option<String>,
+    max_consent_age_secs: Option<u64>,
 ) -> CredentialProviderFixture {
     let now = chrono::Utc::now();
     let base_url = surface_config
@@ -1147,6 +1151,7 @@ fn oauth_provider_fixture(
         token_refresh_enabled: true,
         api_key_secret_ref: None,
         authorization_response_issuer,
+        max_consent_age_secs,
         jwt_settings: None,
         created_at: now,
         updated_at: now,

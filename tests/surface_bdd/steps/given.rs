@@ -4106,6 +4106,71 @@ fn caller_delegated_credentials_have_expired(world: &mut SurfaceWorld) {
     expire_delegation_tokens(world);
 }
 
+#[given(expr = "OAuth provider {string} limits a consent to {int} seconds")]
+fn oauth_provider_limits_a_consent(
+    world: &mut SurfaceWorld,
+    provider: String,
+    seconds: u64,
+) {
+    assert_eq!(
+        delegation_config_mut(world).provider_id,
+        provider,
+        "a consent time limit is set only on the surface's own OAuth provider"
+    );
+    world
+        .surface_config
+        .oauth_max_consent_age_secs = Some(seconds);
+}
+
+/// Moves the consent of every delegated credential the gateway holds back by
+/// `seconds`: the time it was given, and its end when it has one. The vault is
+/// read from disk on every request, so the gateway sees the older consent
+/// without a restart.
+#[given(expr = "the caller's consent was given {int} seconds ago")]
+fn callers_consent_was_given_seconds_ago(
+    world: &mut SurfaceWorld,
+    seconds: i64,
+) {
+    let vault_dir = world
+        .infra
+        .as_ref()
+        .expect("the gateway must hold a delegated credential before its consent can age")
+        ._temp_dir
+        .path()
+        .join("_storage/delegation_vault");
+    let earlier = |token: &serde_json::Value, field: &str| {
+        token[field]
+            .as_str()
+            .map(|time| {
+                let time = chrono::DateTime::parse_from_rfc3339(time).expect("a stored time is RFC 3339");
+                serde_json::json!((time - chrono::Duration::seconds(seconds)).to_rfc3339())
+            })
+    };
+    let mut aged = 0;
+    for entry in std::fs::read_dir(&vault_dir).expect("read the delegation vault directory") {
+        let path = entry
+            .expect("delegation vault entry")
+            .path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let mut token: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read a stored delegated credential"))
+                .expect("a stored delegated credential is JSON");
+        token["consent_granted_at"] = earlier(&token, "consent_granted_at").expect("a stored consent time");
+        if let Some(end) = earlier(&token, "consent_expires_at") {
+            token["consent_expires_at"] = end;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&token).unwrap()).expect("write the aged consent");
+        aged += 1;
+    }
+    assert_eq!(aged, 1, "the gateway must hold exactly one delegated credential");
+}
+
 #[given(expr = "OAuth provider {string} is ready to refresh delegated credentials")]
 async fn oauth_provider_ready_to_refresh(
     world: &mut SurfaceWorld,

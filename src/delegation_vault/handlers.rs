@@ -621,6 +621,15 @@ pub async fn consent_start_page(
     } else {
         start.scopes.join(", ")
     };
+    let time_limit = start
+        .max_consent_age_secs
+        .map(|secs| {
+            format!(
+                "<dt>Time limit</dt><dd>The agent may use it for {} after you approve. Then it asks you again.</dd>\n",
+                super::consent_age::describe(secs)
+            )
+        })
+        .unwrap_or_default();
     let page = format!(
         r#"<!DOCTYPE html>
 <html><head><title>Authorize {provider}</title></head>
@@ -632,7 +641,7 @@ pub async fn consent_start_page(
 <dt>Surface</dt><dd>{surface}</dd>
 <dt>Provider</dt><dd>{provider}</dd>
 <dt>Scopes</dt><dd><code>{scopes}</code></dd>
-</dl>
+{time_limit}</dl>
 <p>Continue only if you started this from your own application.</p>
 <form method="post" action="start">
 <input type="hidden" name="state" value="{state}">
@@ -978,6 +987,7 @@ pub async fn oauth_callback(
         .map(|secs| Utc::now() + Duration::seconds(secs));
 
     let now = Utc::now();
+    let consent_expires_at = super::consent_age::end_of(now, oauth_state.max_consent_age_secs);
     let delegation_token = DelegationToken {
         id: Uuid::new_v4().to_string(),
         agent_did: oauth_state.agent_did.clone(),
@@ -998,6 +1008,7 @@ pub async fn oauth_callback(
         delegation_vc: delegation_vc_json,
         consent_identity: None,
         consent_granted_at: now,
+        consent_expires_at,
         last_used_at: None,
         created_at: now,
         updated_at: now,
@@ -1156,7 +1167,7 @@ pub async fn oauth_callback(
 <h2 style="color: #22c55e;">Authorization Successful</h2>
 <p>{} access has been granted for scopes: <code>{}</code></p>
 <p>You may close this window and return to your application.</p>
-<p style="color: #666; font-size: 0.9em;">The agent can now access {} on your behalf.</p>
+<p style="color: #666; font-size: 0.9em;">The agent can now access {} on your behalf{}.</p>
 <script>
 // Attempt to close the window after a short delay
 setTimeout(function() {{ window.close(); }}, 3000);
@@ -1164,7 +1175,10 @@ setTimeout(function() {{ window.close(); }}, 3000);
 </body></html>"#,
         html_escape(&provider.name),
         html_escape(&granted_scopes.join(", ")),
-        html_escape(&provider.name)
+        html_escape(&provider.name),
+        consent_expires_at
+            .map(|end| format!(" until {}", end.format("%-d %B %Y, %H:%M UTC")))
+            .unwrap_or_default()
     ))
     .into_response();
     consent_page_headers(&mut response, "no-referrer");

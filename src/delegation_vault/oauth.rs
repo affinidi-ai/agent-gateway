@@ -42,7 +42,9 @@ pub fn binding_cookie_name(state: &OAuthState) -> Option<String> {
 
 /// The gateway's consent start page for `provider`: `{redirect URI}/start`
 /// with a sealed start state. The person opens it and confirms; only then does
-/// the gateway build the vendor's authorization URL.
+/// the gateway build the vendor's authorization URL. `max_consent_age_secs` is
+/// how long the consent may be used once given, which the page says and the
+/// callback stores as the consent's end.
 pub fn build_authorization_url(
     provider: &CredentialProvider,
     agent_did: &str,
@@ -50,6 +52,7 @@ pub fn build_authorization_url(
     surface_id: &str,
     scopes: &[String],
     gateway_base_url: &str,
+    max_consent_age_secs: Option<u64>,
 ) -> Result<String> {
     let mut url = provider
         .consent_redirect_uri(gateway_base_url)
@@ -65,6 +68,7 @@ pub fn build_authorization_url(
         surface_id: surface_id.to_string(),
         credential_provider_id: provider.id.clone(),
         provider_id: provider.provider_id.clone(),
+        max_consent_age_secs,
         nonce: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(CONSENT_STATE_LIFETIME_MINUTES),
         code_verifier: None,
@@ -102,6 +106,7 @@ pub async fn mint_consent_link(
     gateway_base_url: &str,
     secrets_store: &Arc<dyn SecretsStore>,
     provider_store: &dyn crate::credential_providers::storage::CredentialProviderStorage,
+    max_consent_age_secs: Option<u64>,
 ) -> Result<String> {
     provider
         .consent_redirect_uri(gateway_base_url)
@@ -122,7 +127,15 @@ pub async fn mint_consent_link(
     provider
         .consent_authorization_endpoint()
         .map_err(|rule| anyhow!("Provider '{}': {rule}", provider.provider_id))?;
-    build_authorization_url(provider, agent_did, user_identity_hash, surface_id, scopes, gateway_base_url)
+    build_authorization_url(
+        provider,
+        agent_did,
+        user_identity_hash,
+        surface_id,
+        scopes,
+        gateway_base_url,
+        max_consent_age_secs,
+    )
 }
 
 /// What the consent start POST answers with: the vendor's authorization URL,
@@ -1675,6 +1688,7 @@ mod tests {
     fn test_encode_decode_oauth_state_roundtrip_encrypted() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
             surface_id: "ch-test-1".to_string(),
@@ -1703,6 +1717,7 @@ mod tests {
     fn test_decode_oauth_state_rejects_expired() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -1828,6 +1843,7 @@ mod tests {
                 "surface",
                 &[],
                 "https://ignored.example",
+                None,
             )
             .unwrap(),
         )
@@ -1849,8 +1865,16 @@ mod tests {
 
         provider.callback_url = Some("http://gw.example/prefix/v1/identity/oauth/callback/github".to_string());
         assert!(
-            build_authorization_url(&provider, "did:web:agent", "sha256:user", "surface", &[], "https://gw.example")
-                .is_err()
+            build_authorization_url(
+                &provider,
+                "did:web:agent",
+                "sha256:user",
+                "surface",
+                &[],
+                "https://gw.example",
+                None
+            )
+            .is_err()
         );
     }
 
@@ -1914,6 +1938,7 @@ mod tests {
 
     fn sample_state() -> OAuthState {
         OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent.example.com".to_string(),
             user_identity_hash: "sha256:abc123".to_string(),
             surface_id: "ch-test-1".to_string(),
@@ -3217,6 +3242,7 @@ mod tests {
     #[test]
     fn test_build_consent_required_format() {
         let provider = CredentialProvider {
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
@@ -3270,6 +3296,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_delegation_vc_structure() {
         let provider = CredentialProvider {
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
@@ -3396,6 +3423,7 @@ mod tests {
     fn test_oauth_state_with_code_verifier_roundtrip() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -3416,6 +3444,7 @@ mod tests {
     fn test_oauth_state_without_code_verifier_roundtrip() {
         init_test_encryption();
         let state = OAuthState {
+            max_consent_age_secs: None,
             agent_did: "did:web:agent".to_string(),
             user_identity_hash: "sha256:user".to_string(),
             surface_id: "ch-1".to_string(),
@@ -3451,6 +3480,7 @@ mod tests {
         let signer: Arc<dyn VcSigner> = Arc::new(LocalVcSigner::new(config));
 
         let provider = CredentialProvider {
+            max_consent_age_secs: None,
             id: "cp-1".to_string(),
             tenant_id: None,
             name: "GitHub".to_string(),
