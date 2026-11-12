@@ -80,7 +80,7 @@
 }
 
 .logs-audit-banner__cta:hover {
-  background: #b45309;
+  background: var(--warning-solid);
   color: #fff;
 }
 
