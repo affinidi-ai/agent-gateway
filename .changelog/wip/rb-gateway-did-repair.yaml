@@ -1,0 +1,18 @@
+branch: rb-gateway-did-repair
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-12T06:07:40Z'
+      title: Repair a published gateway DID document that leaves out the signing key
+      description: >-
+        A gateway that already published its DID document without the signing key under
+        assertionMethod now adds it when it starts Active. A did:webvh DID gets one new log
+        version signed with the gateway key, so the DID and its earlier versions do not change
+        and verifiers that read the latest version accept credentials the gateway signed
+        before. A did:web DID gets its document rewritten. Only the Active node writes the
+        shared log, the repair runs once, a log that does not verify is left as it is, and the
+        /v1/resolve index now picks up new versions of the gateway DID log.
+  removed: []
+  security: []
+  breaking: []
