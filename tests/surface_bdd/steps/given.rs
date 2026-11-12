@@ -989,16 +989,6 @@ fn transit_point_requires_a_transit_token(
     transit_point_config_mut(world, &transit_point).require_transit_token = true;
 }
 
-#[given(expr = "Transit Point {string} injects delegated credentials from OAuth provider {string}")]
-fn transit_point_injects_oauth_delegated_credentials(
-    world: &mut SurfaceWorld,
-    transit_point: String,
-    provider: String,
-) {
-    transit_point_config_mut(world, &transit_point).delegated_credentials = true;
-    surface_requires_oauth_delegated_credentials(world, provider);
-}
-
 /// The audience a Transit Point's JWT callers' tokens are issued for.
 pub(crate) const TRANSIT_AUDIENCE: &str = "bdd-transit-audience";
 

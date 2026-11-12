@@ -439,6 +439,7 @@ fn confirmed_identity_hash(
         principal_claim: strategy_claim.to_string(),
         claims,
         strategy_id: Some(strategy_id.to_string()),
+        verification: Default::default(),
     }
     .principal_hash(tenant_id)
 }
@@ -1155,6 +1156,7 @@ mod tests {
                 principal_claim: claim.to_string(),
                 claims: json!({"iss": ISSUER, claim: value, "scp": "read"}),
                 strategy_id: Some("confirming".to_string()),
+                verification: Default::default(),
             }
             .principal_hash(TENANT)
         };

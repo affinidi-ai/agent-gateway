@@ -2878,6 +2878,7 @@ mod tests {
                 principal_claim: claim.to_string(),
                 claims: serde_json::json!({"iss": IDP_ISSUER, claim: value}),
                 strategy_id: None,
+                verification: Default::default(),
             }
             .principal_hash(None)
             .unwrap()
