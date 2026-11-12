@@ -24010,7 +24010,7 @@ mod fabric_send_tests {
 
     const TARGET_URL: &str = "https://backend.internal/a2a";
 
-    fn run_on_large_stack<F>(test: F)
+    pub(super) fn run_on_large_stack<F>(test: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {

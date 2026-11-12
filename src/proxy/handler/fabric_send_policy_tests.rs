@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use super::fabric_send_tests::run_on_large_stack;
 use crate::config::agent_surface::AgentSurface;
 
 /// A surface on a `fabric://` Target, connected to a peer gateway that never answers, whose
@@ -81,26 +82,30 @@ async fn denying_router() -> (crate::state::MultiSurfaceProxyState, [tempfile::T
     (router, [directory, issuer_dir])
 }
 
-#[tokio::test]
-async fn a_post_to_a_card_like_path_is_evaluated_by_the_surface_policy() {
-    for path in ["/a2a/x/agent-card.json", "/a2a/x/agent.json", "/a2a/x/.well-known/agent-card"] {
-        let (router, _policies) = denying_router().await;
-        let (status, _) = super::variant_routing_tests::send(router, path).await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{path}");
-    }
+#[test]
+fn a_post_to_a_card_like_path_is_evaluated_by_the_surface_policy() {
+    run_on_large_stack(async {
+        for path in ["/a2a/x/agent-card.json", "/a2a/x/agent.json", "/a2a/x/.well-known/agent-card"] {
+            let (router, _policies) = denying_router().await;
+            let (status, _) = super::variant_routing_tests::send(router, path).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{path}");
+        }
+    });
 }
 
-#[tokio::test]
-async fn a_discovery_read_is_not_refused_by_the_sending_gateways_surface_policy() {
-    for (method, path) in [
-        (axum::http::Method::GET, "/a2a/x/agent.json"),
-        (axum::http::Method::HEAD, "/a2a/x/agent-card.json"),
-        (axum::http::Method::HEAD, "/a2a/x/agent.json"),
-        (axum::http::Method::GET, "/a2a/x/discovery"),
-        (axum::http::Method::GET, "/a2a/.well-known/ucp"),
-    ] {
-        let (router, _policies) = denying_router().await;
-        let (status, _) = super::variant_routing_tests::send_method(router, method.clone(), path).await;
-        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{method} {path}");
-    }
+#[test]
+fn a_discovery_read_is_not_refused_by_the_sending_gateways_surface_policy() {
+    run_on_large_stack(async {
+        for (method, path) in [
+            (axum::http::Method::GET, "/a2a/x/agent.json"),
+            (axum::http::Method::HEAD, "/a2a/x/agent-card.json"),
+            (axum::http::Method::HEAD, "/a2a/x/agent.json"),
+            (axum::http::Method::GET, "/a2a/x/discovery"),
+            (axum::http::Method::GET, "/a2a/.well-known/ucp"),
+        ] {
+            let (router, _policies) = denying_router().await;
+            let (status, _) = super::variant_routing_tests::send_method(router, method.clone(), path).await;
+            assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY, "{method} {path}");
+        }
+    });
 }
