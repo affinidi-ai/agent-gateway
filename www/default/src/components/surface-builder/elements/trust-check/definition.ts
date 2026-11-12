@@ -10,7 +10,6 @@ import * as Cap from '../capabilities';
 import type { DependencyNode, NodeDefinition, PayloadSlice, SurfaceContext } from '../types';
 import TrustCheckPanel from './TrustCheckPanel';
 import TrustCheckFullscreenPanel from './TrustCheckFullscreenPanel';
-import { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE } from './templates';
 import { DOCS_URL } from '../../../../config/docs';
 import {
   authoritySourceFor,
@@ -18,40 +17,19 @@ import {
   type AuthorityDids,
   type MissingAuthority,
 } from '../_shared/authorityReference';
+import {
+  AUTHORITY_ID_TEMPLATE,
+  AGENT_DID_TEMPLATE,
+  AGENT_AUTHORITY_DID_TEMPLATE,
+  EXTENSION_IDENTITY_DID_TEMPLATE,
+  AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
+  INPUT_GATEWAY_SOURCE_ID_TEMPLATE,
+} from './templates';
 
 export type { PredefinedQueryOrigin, PredefinedTrustCheckQuery } from '../../../../types';
+export * from './templates';
 
 export type TrustCheckRecordType = 'authorization' | 'recognition';
-
-/**
- * The `{{ input.agent.provider_did }}` template — the caller's **provider**
- * DID (e.g. the department / issuing org) resolved at runtime from the
- * caller's `https://fabric.affinidi.io/extensions/trust-registry`
- * extension.
- *
- * This is **no longer** the caller-leg Authority default: both legs now
- * require the operator to pick an explicit Issuer / Authority literal DID
- * from the gateway's own registers (see `classifyTargetAuthoritySelection`),
- * because deriving the authority from a payload / agent-card trust-registry
- * extension trips the runtime `TRUST_REGISTRY_METADATA_UNAVAILABLE` gate
- * whenever that extension is absent. The constant survives only as the
- * template for the Entity ID picker's `provider` subject (a JSON-API /
- * power-user option), mapped via `templateForSubject` / `subjectForTemplate`.
- */
-export const AUTHORITY_ID_TEMPLATE = '{{ input.agent.provider_did }}';
-
-/**
- * Other OPA `PolicyInput` template tokens used across the Trust Check UI.
- * Kept as named constants so the panel copy, the Advanced Entity ID help,
- * and the fullscreen editor banners all reference one canonical string —
- * avoiding subtle whitespace typos (`{{input.agent.did}}` vs
- * `{{ input.agent.did }}`) that would silently fail at runtime as
- * `TEMPLATE_RESOLUTION_FAILED`.
- */
-export const AGENT_DID_TEMPLATE = '{{ input.agent.did }}';
-export const AGENT_AUTHORITY_DID_TEMPLATE = '{{ input.agent.authority_did }}';
-export const EXTENSION_IDENTITY_DID_TEMPLATE = '{{ input.extension_identity.did }}';
-export { AGENT_IDENTITY_ISSUER_DID_TEMPLATE, INPUT_GATEWAY_SOURCE_ID_TEMPLATE };
 
 /**
  * Auto-injected `entity_id` template. Both legs default to the single

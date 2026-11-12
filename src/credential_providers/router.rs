@@ -20,7 +20,7 @@ pub fn create_credential_providers_router(
     surfaces: Option<Arc<dyn crate::surfaces::AgentSurfaceStore>>,
     vault: Option<Arc<dyn crate::delegation_vault::storage::DelegationVaultStorage>>,
     resource_origins: std::collections::HashMap<String, Vec<String>>,
-    issuers: Option<std::collections::HashMap<String, Vec<String>>>,
+    issuers: super::external::PermittedIssuers,
     references: super::references::ReferenceStores,
 ) -> Router {
     let state = handlers::CredentialProviderState {

@@ -22,7 +22,7 @@ const PUBLIC_ACCESS_HELP =
   'Let anyone call this Access Point without credentials. Leave this off unless your agent is meant to be public.';
 
 export const LEGACY_ACCESS_POINT_TEXT =
-  'Not enforced (legacy): this Access Point is neither closed nor public, so a caller whose credential is missing or invalid reaches your policies.';
+  'Legacy: this Access Point is neither closed nor public. A caller whose credential is missing or invalid is refused, and without caller authentication every caller is admitted.';
 export const CLOSE_ACCESS_POINT_LABEL = 'Close Access Point';
 export const CLOSING_ACCESS_POINT_TEXT =
   'Closed when you save: a caller whose credential is missing or invalid is refused, and without a Caller Context every caller is refused.';
@@ -44,9 +44,9 @@ const AccessPointPanel: React.FC<ConfigPanelProps> = ({
   const a2aValidation = a2aView.envelopeOnly
     ? A2A_PROXY_SETTINGS.validation
     : selectedA2aValidation(config);
-  // A surface stored without `public` keeps its rules until the operator
-  // closes it, or turns Public access on; turning the switch off again
-  // returns it to the stored, legacy state.
+  // A surface stored without `public` stays legacy until the operator closes
+  // it, or turns Public access on; turning the switch off again returns it to
+  // the stored, legacy state.
   const meta = useOptionalSurfaceMeta();
   const legacy = meta?.legacyAccessPoint === true;
 

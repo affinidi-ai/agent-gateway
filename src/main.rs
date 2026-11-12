@@ -463,8 +463,9 @@ async fn async_main() -> Result<()> {
     x402::init_gateway_facilitator_service().await;
     info!("Gateway facilitator service initialized - ready for ATM infrastructure");
 
-    // NOW load surfaces (after logging is initialized so errors are logged)
-    // Only for "local" configuration source
+    // Load local surfaces after logging is initialized so errors are logged;
+    // other sources loaded theirs with the configuration, before logging, so
+    // their legacy Access Point notices are logged here.
     if bootstrap_config.channel_config_source == "local" {
         info!("Loading surfaces from local storage (after logging initialized)");
         match load_surfaces(&bootstrap_config).await {
@@ -477,6 +478,8 @@ async fn async_main() -> Result<()> {
                 return Err(e.context("Failed to load surfaces from local storage"));
             }
         }
+    } else {
+        config::log_legacy_access_point_notices(&config.surfaces);
     }
 
     // Print ASCII art banner (always to terminal and logs)
@@ -972,6 +975,7 @@ async fn load_surfaces(bootstrap: &BootstrapConfig) -> Result<Vec<crate::config:
     surfaces::fall_back_to_first_source_auth_methods(&store, &mut channels, !crate::server::mode::is_standby()).await?;
     config::log_additional_source_auth_method_notices(&channels);
     config::log_unchecked_audience_warnings(&channels);
+    config::log_legacy_access_point_notices(&channels);
     surfaces::clear_dangling_default_variants(&store, &mut channels).await?;
     surfaces::carry_over_a2a_settings(&store, &mut channels, !crate::server::mode::is_standby(), || {
         surfaces::RetiredA2aSwitches::read(bootstrap)
@@ -1515,6 +1519,7 @@ fn render_default_bootstrap_toml(
         pinned_transit_token_max_lifetime_secs: None,
         pinned_external_consent_resource_origins: None,
         pinned_external_consent_issuers: None,
+        pinned_external_consent_issuer_patterns: None,
         audit: config::AuditConfig::default(),
     };
     let toml_str = toml::to_string_pretty(&config)?;

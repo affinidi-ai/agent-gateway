@@ -376,8 +376,14 @@ tenant](#provider-secrets-belong-to-the-providers-tenant)).
   refuses the token.
 - `resource` is sent only when the provider sets it, on every path including legacy bindings.
   The Microsoft identity platform v2.0 token endpoint rejects it (AADSTS901002): put the audience
-  in the scopes as `<resource>/.default` instead. The dashboard warns on the provider form and
-  list when an Entra v2.0 provider sets `resource`.
+  in the scopes as `<resource>/.default` instead. An [external consent
+  provider](#external-consent-providers) must set `resource`, which binds where its grants go,
+  and cannot change it: for such an issuer, create it with `send_resource: false`, so its code
+  exchange and refresh leave the parameter out. The dashboard warns on the provider form and
+  list when a provider's token requests send `resource` to an Entra v2.0 token endpoint: a
+  provider without an issuer is told to move the audience into its scopes and clear `resource`,
+  and an external consent provider to be re-created with `send_resource: false`. An external
+  consent provider with `send_resource: false` is not warned.
 
 Each replica sends one token request per cache key at a time. Requests that miss the cache
 meanwhile wait for it, then read the vault again, so they reuse the token it stored, or one
@@ -470,6 +476,7 @@ authorization server, whose grants another system obtains through the browser wi
 | `allow_unadvertised_pkce` | Optional, `false` by default. `true` admits an issuer whose metadata does not list `code_challenge_methods_supported`; see below |
 | `scope_comparison` | Optional, `exact` by default: how the scopes the token endpoint grants are compared with those asked for ([Granted scopes](#granted-scopes)) |
 | `revocation_ends_authorization` | Optional, `false` by default. `true` for a vendor whose revocation of any one token ends the person's whole authorization of the client, as Google's does ([Revoking grants at the vendor](#revoking-grants-at-the-vendor)) |
+| `send_resource` | Optional, `true` by default: the code exchange and every refresh send `resource` to the token endpoint, which binds the token's audience to it (RFC 8707). `false` sends it on neither, so the token carries no such binding and its audience follows the scopes alone (Entra: `<resource>/.default`); use it only for a token endpoint that refuses the parameter, such as the Microsoft identity platform v2.0 one (AADSTS901002). It never loosens where the grants may be sent: `resource` is still required and is still the only origin they go to. The API names it only when `false` |
 | `additional_params`, `consent_identity_strategy_id`, `api_key_secret_ref` | Refused |
 
 An external consent provider uses its own tenant's secrets only, for its client secret, its
@@ -486,8 +493,8 @@ posture's static check). At create only the issuer's metadata fetch resolves a n
 name that resolves to a blocked address is refused when the gateway calls it, since every call
 to a vendor endpoint goes through pinned Strict egress. A provider without an `issuer` cannot
 set `revocation_endpoint`, `token_endpoint_auth_method`, `client_id`, `allow_unadvertised_pkce`,
-`scope_comparison` or `revocation_ends_authorization`, the last three of which are fixed for the
-provider's life.
+`scope_comparison`, `revocation_ends_authorization` or `send_resource: false`, the last four of
+which are fixed for the provider's life.
 
 A provider's resource must be permitted for its issuer. By default its host must be the
 issuer's host or one of its subdomains: for the issuer `https://mcp.notion.com`, a resource on
@@ -509,7 +516,9 @@ List each host on its own: `https://*.googleapis.com` is not a wildcard. An entr
 such an origin permits nothing, not even the literal origin it spells, and is named in an `ERROR`
 at startup. The value is read once, when the gateway starts: provider create, surface save and
 every request use it, and a configuration reload keeps it, with a `WARN` when the file says
-otherwise, so a change takes a restart.
+otherwise, so a change takes a restart. A pattern of `external_consent_issuer_patterns`
+([Permitted issuers](#permitted-issuers)) lists resource origins the same way, for each issuer
+it matches.
 The rule is checked when the provider is created (`400`, `provider_resource_not_permitted`),
 when a surface binds the provider (`400`), and again whenever a grant is released: a provider
 whose resource is no longer permitted, because its entry was removed, releases nothing, and the
@@ -604,6 +613,50 @@ gateway starts: provider create, surface save, the connect API and every request
 configuration reload keeps it, with a `WARN` when the file says otherwise, so a change takes a
 restart.
 
+A vendor whose issuer carries the customer's tenant, such as Microsoft Entra ID
+(`https://login.microsoftonline.com/<tenant id>/v2.0`), cannot be listed issuer by issuer. The
+operator names it once in `external_consent_issuer_patterns`, also set only by the operator's
+file and read once at startup in the same way:
+
+```json
+"external_consent_issuer_patterns": [
+  {"issuer": "https://login.microsoftonline.com/{tenant}/v2.0", "tenant": "uuid",
+   "resource_origins": ["https://graph.microsoft.com"]},
+  {"issuer": "https://{tenant}.my.salesforce.com", "tenant": "label"}
+]
+```
+
+- `issuer` is an `https` issuer written as the URL parser writes it (lower-case host, no default
+  port, no `.` segments), with no credentials, query, fragment or `%`, and exactly one
+  `{tenant}`: either a whole path segment after a fixed host, or the whole leftmost label of a
+  fixed host that has at least two labels besides it, so `https://{tenant}.com` is refused. A
+  wildcard host is refused. The two-label rule does not make every such host safe: the gateway
+  carries no public suffix list, so it cannot tell a vendor's own host from a public suffix such
+  as `co.uk` or a shared hosting suffix such as `github.io` or `herokuapp.com`, under which
+  anyone can create a label and serve metadata naming itself. Use a host label pattern only for
+  a fixed host under which the vendor alone creates labels, such as `my.salesforce.com`.
+- `tenant` says what may stand for `{tenant}`: `uuid`, a UUID in its canonical 8-4-4-4-12 hex
+  form in either case, or `label`, 1 to 63 lower-case letters, digits and `-`, not starting or
+  ending with `-`. Neither can hold `/`, `.`, `:`, `@`, `?`, `#` or `%`, so the value is always
+  one segment or one label: `https://login.microsoftonline.com/<id>/extra/v2.0`,
+  `https://login.microsoftonline.com//v2.0` and `https://evil.acme.my.salesforce.com` match
+  nothing.
+- `endpoint_origins` (empty by default) count, for an issuer the pattern matches, as the origins
+  `external_consent_issuers` lists for an issuer, and `resource_origins` (empty by default) as
+  those `external_consent_resource_origins` lists for it. Both are exact origins.
+
+An issuer is matched byte for byte, apart from the value standing for `{tenant}`, as an exact
+entry is compared. With either setting, a provider is permitted when its issuer is listed or
+matches a pattern and each endpoint is on the issuer's host or has an origin listed for it by
+either; a pattern list that is set, even empty, counts as a list, so a tenant's token may then
+create a provider whose issuer matches a pattern. Without both, nothing changes from the rules
+above. A pattern that breaks these rules, or an origin it lists that is not a plain `https`
+origin, permits nothing and is named in an `ERROR` at startup. While patterns are set, the
+credential policy report at startup and on a configuration reload names, in a `WARN` with its
+record id, slug and the field refused, each stored external consent provider that neither list
+permits, so a pattern written too narrowly, or an exact entry removed in its favour, shows before
+its grants stop being released.
+
 The rule is checked when a provider is created, before its issuer's metadata is fetched, so an
 unlisted issuer is never called (`400`, `provider_issuer_not_permitted`, `field` naming the
 issuer or the endpoint); when a surface binds the provider (`400`); when a connect starts and
@@ -620,12 +673,12 @@ cannot help an issuer whose own host serves content its users control.
 | The provider differs from the metadata | `provider_metadata_mismatch` | `field` names the field |
 | An update changes a fixed field | `provider_field_immutable` | `field` names the field |
 | The resource is not permitted for the issuer | `provider_resource_not_permitted` | |
-| `external_consent_issuers` does not permit the issuer or an endpoint | `provider_issuer_not_permitted` | `field`: `issuer`, `authorization_endpoint`, `token_endpoint`, `revocation_endpoint` or `jwks_uri` |
-| A tenant's token creates a provider with an issuer while `external_consent_issuers` is unset | `external_consent_issuers_required` | |
+| `external_consent_issuers` and `external_consent_issuer_patterns` do not permit the issuer or an endpoint | `provider_issuer_not_permitted` | `field`: `issuer`, `authorization_endpoint`, `token_endpoint`, `revocation_endpoint` or `jwks_uri` |
+| A tenant's token creates a provider with an issuer while `external_consent_issuers` and `external_consent_issuer_patterns` are unset | `external_consent_issuers_required` | |
 
 `issuer`, the endpoints, `client_id`, `token_endpoint_auth_method`, the secret references, the
-signed-JWT settings, `callback_url`, `resource`, `allow_unadvertised_pkce`, `provider_type` and
-the refused fields never change: an update that
+signed-JWT settings, `callback_url`, `resource`, `send_resource`, `allow_unadvertised_pkce`,
+`provider_type` and the refused fields never change: an update that
 sends another value is refused, and one that sends the stored value, such as a round trip of
 the whole record, is accepted. The name, description, default scopes and
 `token_refresh_enabled` stay editable. A change to the client or its server is a new
@@ -2090,8 +2143,8 @@ the provider's `token_endpoint` with the refresh token, the scopes the connect a
 spelling the person consented to, not the vendor's) that the grant still holds, as its provider
 compares them ([Granted scopes](#granted-scopes)), so a grant the person consented to more
 narrowly is never refreshed for a scope it was not granted (RFC 6749 section 6), and the
-provider's `resource`, through pinned Strict egress, the client authenticating as at revocation
-(a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
+provider's `resource` unless its `send_resource` is `false`, through pinned Strict egress, the
+client authenticating as at revocation (a `private_key_jwt` client with a new signed assertion). An answer that names no scope keeps
 the scopes the grant held. The request is sent and read by `post_token_request`, with a fixed
 30-second timeout and a 64 KiB cap on the answer, which must be a `Bearer` token. The service
 token requests use the same routine, but within `credential_policy.token_request_timeout_secs`. The rotated tokens are written
@@ -2184,7 +2237,8 @@ only decides, by the file names, which claim came first. Then:
    when it is sent, and must be sent unless the issuer's metadata said its responses do not
    carry it (a provider created before that was recorded needs it too).
 2. The code is redeemed at the provider's pinned token endpoint with the verifier, the
-   connect's `redirect_uri` and the provider's `resource`, as a refresh is sent.
+   connect's `redirect_uri` and the provider's `resource` (left out when its `send_resource` is
+   `false`), as a refresh is sent.
 3. The scopes granted, the answer's `scope` or else those asked for, must lie within those asked
    for, as the provider compares them ([Granted scopes](#granted-scopes)).
 4. The grant is kept only while the surface still serves its binding, and the scopes asked for

@@ -79,6 +79,22 @@ describe('getIdentityRotations', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('stops paging back once the signal aborts', async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      if (init.signal?.aborted) {
+        return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+      }
+      controller.abort();
+      return Promise.resolve(json({ rotations: [rotation(3)], total: 3, start: 2 }));
+    });
+
+    await expect(apiClient.getIdentityRotations('a/b', controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects an unknown identity with its status', async () => {
     fetchMock.mockResolvedValue(json({ error: 'not_found', message: 'Identity not found' }, 404));
 

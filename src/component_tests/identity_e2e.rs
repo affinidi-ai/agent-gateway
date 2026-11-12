@@ -2656,13 +2656,13 @@ async fn inbound_static_identity_keeps_a_body_asserted_agent_did() {
     assert_eq!(forwarded, 1);
 }
 
+/// A public Access Point hands a caller whose key fails to policy, which sees
+/// no `input.agent.did`, not the DID the body asserts.
 #[tokio::test(flavor = "multi_thread")]
-async fn inbound_from_api_key_failed_auth_leaves_no_agent_did() {
-    let (status, forwarded) = send_asserted_caller_did(
-        inbound_api_key_identity_surface(AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID),
-        "not-the-caller-key",
-    )
-    .await;
+async fn a_public_access_point_hands_a_failed_key_to_policy_with_no_agent_did() {
+    let mut surface = inbound_api_key_identity_surface(AGENT_DID_ABSENT_ON_FAILED_AUTH_POLICY_ID);
+    surface.access_point.public = Some(true);
+    let (status, forwarded) = send_asserted_caller_did(surface, "not-the-caller-key").await;
     assert_eq!(status, 200, "a failed key must leave input.agent.did absent, not the body-asserted DID");
     assert_eq!(forwarded, 1);
 }

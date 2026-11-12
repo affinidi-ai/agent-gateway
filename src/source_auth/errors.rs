@@ -73,8 +73,9 @@ impl From<JwtBearerError> for SourceAuthError {
 impl SourceAuthError {
     /// Whether this failure is attributable to the caller's credential (missing
     /// or invalid) rather than a server-side problem (config resolution, JWKS
-    /// fetch, storage). Caller-attributable failures are handed to the policy
-    /// layer instead of being blocked at the source-auth stage.
+    /// fetch, storage). A public Access Point hands caller-attributable
+    /// failures to the policy layer; every other Access Point refuses them
+    /// (see [`caller_refusal`]).
     pub fn is_caller_attributable(&self) -> bool {
         matches!(
             self,
@@ -112,9 +113,9 @@ pub type SourceAuthResult<T> = Result<T, SourceAuthError>;
 /// **401 Unauthorized**; server-side failures (config not found, internal) map
 /// to **500 Internal Server Error** — a 401 would misrepresent a server-side
 /// problem as the caller's fault. Note: caller-attributable failures are
-/// handed to the policy layer unless the Access Point rejects failed callers
-/// (see [`caller_refusal`]), so in practice this builder is reached for
-/// server-side (500) failures.
+/// refused through [`caller_refusal`], or handed to the policy layer on a public
+/// Access Point, so in practice this builder is reached for server-side (500)
+/// failures.
 ///
 /// A caller-attributable failure reports [`CALLER_CREDENTIAL_REFUSED`] and a
 /// server-side failure reports [`INTERNAL_ERROR_DETAIL`], so no reason or

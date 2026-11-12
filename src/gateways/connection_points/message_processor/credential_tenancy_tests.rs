@@ -132,6 +132,7 @@ impl Receiver {
                 let surface: crate::config::agent_surface::AgentSurface = serde_json::from_value(json!({
                     "surface_id": surface_id, "name": surface_id, "tenant_id": "tenant-a",
                     "access_point": {"listen_address": "127.0.0.1:8080", "route": format!("/{surface_id}"), "protocol": "a2a",
+                        "public": false,
                         "caller_authentication": {"methods": [{"type": "api_key", "secret_id": "callers",
                             "extraction": {"source": "http_header", "field": "x-api-key"}}]}},
                     "target": {"endpoint": target.url, "auth": target_auth},
@@ -334,14 +335,14 @@ fn fabric_receive_sends_a_tenant_surface_only_credentials_the_isolation_mode_all
                 receiver
                     .receive_from("delegated-own", mode, None)
                     .await,
-                (403, None, none.clone()),
+                (401, None, none.clone()),
                 "{mode:?}: no verified caller"
             );
             assert_eq!(
                 receiver
                     .receive_from("delegated-own", mode, Some("a-key-the-surface-refuses"))
                     .await,
-                (403, None, none.clone()),
+                (401, None, none.clone()),
                 "{mode:?}: a caller the surface did not verify"
             );
         }

@@ -9,13 +9,12 @@ Feature: Tenant ownership of Security Token Service tokens at JWT Bearer surface
     And the surface belongs to tenant "alpha"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT audience "/reports"
-    And the surface has a policy denying callers whose source authentication failed
     And the surface trusts tokens issued by the gateway's Security Token Service
     And tenant "charlie" has a managed connection for agent "delta" allowing audience "/reports"
     And agent "delta" holds an identity assertion for subject "did:example:user"
     And agent "delta" has exchanged the identity assertion for a token scoped to audience "/reports"
     When the caller sends a request to the surface with the token issued to agent "delta"
-    Then the response status is 403
+    Then the response status is 401
     And managed agent "bravo" was not called
 
   Scenario: A token issued to the surface's own tenant's managed connection is accepted
@@ -23,7 +22,6 @@ Feature: Tenant ownership of Security Token Service tokens at JWT Bearer surface
     And the surface belongs to tenant "alpha"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT audience "/reports"
-    And the surface has a policy denying callers whose source authentication failed
     And the surface trusts tokens issued by the gateway's Security Token Service
     And tenant "alpha" has a managed connection for agent "delta" allowing audience "/reports"
     And agent "delta" holds an identity assertion for subject "did:example:user"
@@ -37,7 +35,6 @@ Feature: Tenant ownership of Security Token Service tokens at JWT Bearer surface
     And the surface belongs to tenant "alpha"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT audience "/reports"
-    And the surface has a policy denying callers whose source authentication failed
     And the surface trusts tokens issued by the gateway's Security Token Service
     And the operator has a managed connection for agent "delta" allowing audience "/reports"
     And agent "delta" holds an identity assertion for subject "did:example:user"
@@ -51,14 +48,13 @@ Feature: Tenant ownership of Security Token Service tokens at JWT Bearer surface
     And the surface belongs to tenant "alpha"
     And the surface requires "JWT Bearer" source authentication
     And the surface accepts JWT audience "/reports"
-    And the surface has a policy denying callers whose source authentication failed
     And the surface trusts tokens issued by the gateway's Security Token Service
     And tenant "alpha" has a managed connection for agent "delta" allowing audience "/reports"
     And agent "delta" holds an identity assertion for subject "did:example:user"
     And agent "delta" has exchanged the identity assertion for a token scoped to audience "/reports"
     And the operator has deleted the managed connection for agent "delta"
     When the caller sends a request to the surface with the token issued to agent "delta"
-    Then the response status is 403
+    Then the response status is 401
     And managed agent "bravo" was not called
 
   Scenario: A Transit Point refuses a token issued to another tenant's managed connection

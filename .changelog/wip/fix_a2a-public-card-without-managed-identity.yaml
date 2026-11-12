@@ -33,13 +33,6 @@ changes:
         the slot that failed (protected_identity or external_identity). The Agent Cards view names
         that cause and what to do, pointing at the external Identity element when the external slot
         failed, instead of only asking the operator to check the gateway logs.
-    - timestamp: '2026-11-11T14:30:00Z'
-      title: Load surface pages again instead of a blank page in the production dashboard
-      description: >-
-        The Trust Check query form read two template constants from the Trust Check element's
-        definition while that definition was still loading, through a circular import, so the
-        production bundle stopped with "Cannot access before initialization" and every surface
-        page rendered blank. The constants now live in their own module with no imports.
   removed: []
   security: []
   breaking:

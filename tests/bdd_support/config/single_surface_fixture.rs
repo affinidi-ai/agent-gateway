@@ -79,6 +79,11 @@ pub struct SurfaceConfigBuilder {
     /// https origin a Transit Point's `mcp_http.authorization` resource must use.
     pub outbound_public_origin: bool,
     pub a2a_settings: Option<serde_json::Value>,
+    /// The stored `access_point.public`; `None` stores what the admin API
+    /// writes (see [`AccessPointFixture::public`](crate::bdd_support::config::agent_surface::AccessPointFixture)).
+    pub access_point_public: Option<bool>,
+    /// Store no `access_point.public`, as a legacy surface does.
+    pub legacy_access_point: bool,
     /// Requests the Access Point admits per minute.
     pub rate_limit_per_minute: Option<u32>,
     /// The gateway starts with the VP Audit Log keeping every audit event.
@@ -214,6 +219,8 @@ impl Default for SurfaceConfigBuilder {
             required_mcp_identity_field: None,
             constrained_mcp_identity_field: None,
             agent_card_path: None,
+            access_point_public: None,
+            legacy_access_point: false,
             transit_points: Vec::new(),
             transit_source_auth: false,
             transit_token_lifetime_secs: None,

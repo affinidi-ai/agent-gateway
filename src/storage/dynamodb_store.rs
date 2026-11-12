@@ -16,7 +16,8 @@ use crate::storage::ConfigurationStore;
 /// - Sort Key: `config_id` (String) - e.g., channel name, or "default" for singleton configs
 ///
 /// Attributes depend on config_type:
-/// - For channels: name, description, listen_address, target_endpoint, managed_identity (with extension_rules for identity schema)
+/// - For channels: name, description, listen_address, target_endpoint, managed_identity (with extension_rules for identity schema),
+///   and an optional boolean `public` (`access_point.public`)
 /// - For tls: cert_path, key_path, verify_upstream
 /// - For a2a: default_version, max_body_size, timeout_seconds
 /// - For logging: level, json
@@ -150,6 +151,30 @@ impl DynamoDbConfigStore {
         }
     }
 
+    /// The item's `public` attribute, the surface's `access_point.public`: a
+    /// boolean, or the string `"true"` or `"false"`. `None` when it has none,
+    /// a legacy surface; any other value is logged and ignored.
+    fn parse_public(item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>) -> Option<bool> {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let public = match item.get("public")? {
+            AttributeValue::Bool(public) => Some(*public),
+            AttributeValue::S(text) if text == "true" => Some(true),
+            AttributeValue::S(text) if text == "false" => Some(false),
+            _ => None,
+        };
+        if public.is_none() {
+            let config_id = item
+                .get("config_id")
+                .and_then(|v| v.as_s().ok())
+                .map_or("", String::as_str);
+            warn!(
+                config_id,
+                "Ignoring the DynamoDB channel attribute 'public': it must be a boolean, or 'true' or 'false'"
+            );
+        }
+        public
+    }
+
     /// Parse a DynamoDB item into an AgentSurface
     fn parse_channel_item(
         &self,
@@ -259,6 +284,7 @@ impl DynamoDbConfigStore {
                         protected_resource: None,
                         on_failure: crate::config::agent_surface::OnFailure::Continue,
                     }),
+                public: Self::parse_public(&item),
                 ..Default::default()
             },
             target: Target {
@@ -336,6 +362,21 @@ mod tests {
         let item = HashMap::new();
         let protocol = DynamoDbConfigStore::parse_channel_protocol(&item).expect("protocol should parse");
         assert_eq!(protocol, crate::config::ChannelProtocol::A2a);
+    }
+
+    #[test]
+    fn parse_public_reads_the_optional_boolean_attribute() {
+        assert_eq!(DynamoDbConfigStore::parse_public(&HashMap::new()), None, "missing: a legacy surface");
+        for public in [true, false] {
+            let item = HashMap::from([("public".to_string(), AttributeValue::Bool(public))]);
+            assert_eq!(DynamoDbConfigStore::parse_public(&item), Some(public));
+        }
+        for (text, public) in [("true", Some(true)), ("false", Some(false)), ("yes", None)] {
+            let item = HashMap::from([("public".to_string(), AttributeValue::S(text.to_string()))]);
+            assert_eq!(DynamoDbConfigStore::parse_public(&item), public, "string {text:?}");
+        }
+        let number = HashMap::from([("public".to_string(), AttributeValue::N("1".to_string()))]);
+        assert_eq!(DynamoDbConfigStore::parse_public(&number), None, "a number is not a boolean");
     }
 
     #[test]

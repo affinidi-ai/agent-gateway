@@ -566,6 +566,24 @@ pub(crate) fn build_surface_payload(
         .surface_name
         .as_deref()
         .unwrap_or("bdd-created-surface");
+    let public = world
+        .surface_config
+        .access_point_public
+        .unwrap_or_else(|| {
+            world
+                .surface_config
+                .source_auth
+                .is_none()
+                && world
+                    .surface_config
+                    .additional_source_auth
+                    .is_empty()
+                && world
+                    .surface_config
+                    .mcp_http
+                    .as_ref()
+                    .is_none_or(|mcp_http| mcp_http["authorization"].is_null())
+        });
 
     serde_json::json!({
         "name": surface_name,
@@ -575,7 +593,7 @@ pub(crate) fn build_surface_payload(
             "listen_address": format!("http://localhost:{}", infra.gateway_port),
             "route": route,
             "protocol": world.surface_config.protocol,
-            "public": true,
+            "public": public,
         },
         "target": {
             "endpoint": target_url,

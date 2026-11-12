@@ -1,0 +1,15 @@
+branch: fix/blank-surface-page
+changes:
+  added: []
+  changed: []
+  fixed:
+    - timestamp: '2026-11-11T16:00:00Z'
+      title: Show a surface's page again instead of a blank page
+      description: >-
+        Opening a surface in the dashboard showed a blank page, because the Trust Check
+        element's code read two of its own values before they were defined in the built
+        dashboard. They are now defined before anything reads them, and the surface page
+        loads again.
+  removed: []
+  security: []
+  breaking: []

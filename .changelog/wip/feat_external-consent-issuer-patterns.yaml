@@ -1,0 +1,27 @@
+branch: feat/external-consent-issuer-patterns
+changes:
+  added:
+    - timestamp: '2026-11-11T12:00:00Z'
+      title: Let the operator permit tenant-specific issuers by pattern
+      description: >-
+        The new `external_consent_issuer_patterns` of gateway.json, set only by the operator's
+        file, permits issuers that differ only by the customer's tenant, such as
+        `https://login.microsoftonline.com/{tenant}/v2.0`, without listing each one in
+        `external_consent_issuers`. Each pattern has exactly one `{tenant}`, a whole path segment
+        after a fixed host or the leftmost label of a fixed host, and says whether a UUID or a
+        DNS label may stand for it, so the value can never reach into another segment, label or
+        host. A pattern can also list the endpoint and resource origins a matching issuer may
+        use. Provider create, surface save, the connect API and every grant release and refresh
+        check patterns beside the exact list, and a pattern list that is set, even empty, counts
+        as the operator's list for a tenant's provider. A pattern that is not valid permits
+        nothing and is named at startup, and while patterns are set the credential policy
+        report, at startup and on every reload, warns about each stored external consent provider
+        neither list permits.
+        A host label pattern's fixed host must be one under which only the vendor creates
+        labels, never a shared hosting or public suffix. It is read once, at startup, and a
+        configuration reload keeps it. Without the setting nothing changes.
+  changed: []
+  fixed: []
+  removed: []
+  security: []
+  breaking: []

@@ -6,6 +6,7 @@ import { apiClient } from '../../../../../api';
 import CallerAuthFullscreen from '../CallerAuthFullscreen';
 import CallerAuthPanel from '../CallerAuthPanel';
 import { SurfaceMetaProvider, type SurfaceMetaValue } from '../../../SurfaceMetaContext';
+import { useSaveShortcut } from '../../../hooks/useSaveShortcut';
 import type { CanvasNode, ConfigPanelProps, Protocol } from '../../types';
 
 jest.mock('../../../../../api', () => ({ apiClient: { fetch: jest.fn(), get: jest.fn() } }));
@@ -50,6 +51,18 @@ interface HarnessProps {
   protocol?: Protocol;
   meta?: Partial<SurfaceMetaValue>;
   hasAttemptedSave?: boolean;
+  onSave?: (config: Record<string, unknown>) => void;
+}
+
+function readAudiences(config: Record<string, unknown> | undefined): unknown {
+  const methods = config?.methods;
+  if (Array.isArray(methods)) {
+    const firstMethod = methods[0];
+    return firstMethod && typeof firstMethod === 'object'
+      ? (firstMethod as Record<string, unknown>).audiences
+      : undefined;
+  }
+  return config?.audiences;
 }
 
 /** Renders a caller-auth panel over config it keeps in state, as the builder does. */
@@ -60,8 +73,10 @@ const Harness: React.FC<HarnessProps> = ({
   protocol = 'mcp',
   meta,
   hasAttemptedSave = false,
+  onSave,
 }) => {
   const [config, setConfig] = useState(initial);
+  useSaveShortcut(() => onSave?.(config));
   latest.config = config;
   const updateFields = (fields: Record<string, unknown>) =>
     setConfig(prev => ({ ...prev, ...fields }));
@@ -324,6 +339,102 @@ describe('Caller Context editor: authorization server discovery', () => {
   it('offers no discovery outside an MCP surface', async () => {
     await openEditor({ initial: jwtConfig(), protocol: 'a2a' });
     expect(screen.queryByTestId('caller-auth-discovery-switch')).toBeNull();
+  });
+});
+
+describe('Caller Context accepted audiences', () => {
+  let hasFocus: jest.SpyInstance;
+
+  beforeEach(() => {
+    hasFocus = jest.spyOn(document, 'hasFocus').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    hasFocus.mockRestore();
+  });
+
+  it('keeps a half-typed audience in the field when the window loses focus', async () => {
+    hasFocus.mockReturnValue(false);
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: 'https://api.exa' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual([]);
+    expect(input).toHaveValue('https://api.exa');
+  });
+
+  it('adds a typed audience when the field loses focus', async () => {
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual(['https://api.example.com']);
+    expect(input).toHaveValue('');
+  });
+
+  it('commits a pending audience before the save handler reads the config on Cmd+S', async () => {
+    const savedAudiences: unknown[] = [];
+    await openEditor({
+      initial: jwtConfig(),
+      onSave: config => savedAudiences.push(readAudiences(config)),
+    });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.keyDown(input, { key: 's', metaKey: true });
+
+    expect(savedAudiences).toEqual([['https://api.example.com']]);
+    expect(screen.queryByText(/No audience configured/)).toBeNull();
+  });
+
+  it('leaves Shift+Cmd+S alone: no save, no commit, browser shortcut not blocked', async () => {
+    const save = jest.fn();
+    const latest = await openEditor({ initial: jwtConfig(), onSave: save });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: 'https://api.example.com' } });
+    const notPrevented = fireEvent.keyDown(input, { key: 'S', metaKey: true, shiftKey: true });
+
+    expect(notPrevented).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+    expect(readAudiences(latest.config)).toEqual([]);
+  });
+
+  it('does not add an empty or whitespace-only audience on blur', async () => {
+    const latest = await openEditor({ initial: jwtConfig() });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: '   ' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual([]);
+    expect(screen.getByText(/No audience configured/)).toBeInTheDocument();
+  });
+
+  it('does not add a duplicate audience on blur', async () => {
+    const latest = await openEditor({
+      initial: jwtConfig({ audiences: ['https://api.example.com'] }),
+    });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: ' https://api.example.com ' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual(['https://api.example.com']);
+  });
+
+  it('does not add an audience while authorization server discovery is on', async () => {
+    const latest = await openEditor({ initial: jwtConfig({ protected_resource: SETTING }) });
+    const input = screen.getByPlaceholderText('e.g. https://api.example.com');
+
+    fireEvent.change(input, { target: { value: 'https://api.example.com' } });
+    fireEvent.blur(input);
+
+    expect(readAudiences(latest.config)).toEqual([]);
   });
 });
 

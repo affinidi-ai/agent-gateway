@@ -1219,9 +1219,7 @@ async fn start_a2a_proxy_harness_with_caller_auth(
     GatewayHarness::start(move |temp_dir, gw_config, _| {
         let mut surface = helpers::build_minimal_channel();
         surface.target.endpoint = format!("a2a-proxy://{PROXY_ID}");
-        if on_failure == crate::config::agent_surface::OnFailure::Reject {
-            surface.access_point.public = Some(false);
-        }
+        surface.access_point.public = Some(on_failure == crate::config::agent_surface::OnFailure::Continue);
         surface
             .access_point
             .caller_authentication = Some(crate::config::agent_surface::CallerAuthentication {
@@ -1282,7 +1280,7 @@ async fn send_a2a_text(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a2a_proxy_withholds_the_direct_line_credential_from_a_caller_whose_source_auth_failed() {
+async fn a_public_a2a_proxy_access_point_withholds_the_direct_line_credential_from_a_failed_caller() {
     let fake_direct_line = FakeDirectLine::start("Hello from Copilot").await;
     let h = start_a2a_proxy_harness_requiring_caller_auth(&fake_direct_line).await;
 

@@ -293,9 +293,10 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   through a load and rebuild unchanged; `withCallerAccessSettled`
   (`access-point/publicAccess.ts`) settles the write. On a surface stored without `public`
   (`legacyAccessPoint` in `SurfaceMetaContext`, set by the edit page), the panel shows the
-  legacy state, "Not enforced (legacy)", under the switch with a **Close Access Point** button
-  (`access-point-close-button`, hidden when read-only) that sets `public: false`. Turning the
-  switch off there clears `public`, so turning it on and off again keeps the stored rules. A
+  legacy state under the switch: the gateway refuses its failed callers, and without a Caller
+  Context it admits every caller. A **Close Access Point** button
+  (`access-point-close-button`, hidden when read-only) sets `public: false`. Turning the
+  switch off there clears `public`, so turning it on and off again keeps the surface legacy. A
   `public: false` the operator sets, in the panel or the JSON editor, is sent. Once `public` is
   sent, `on_failure` is left out of the surface and its variants, because the gateway derives it.
 - **Access Point readiness.** A closed Access Point (`public: false`, which the gateway stamps on
@@ -504,6 +505,9 @@ login. `App.tsx` renders it in place of `AuthenticatedApp`, so it has no sidebar
   the resource it advertises, `<resource>$<alias>`, and keeps its own setting. A failed save whose
   message names the setting shows in the section and in the sidebar, which also shows whether
   discovery is on.
+- **Accepted Audiences** adds a value left in the field when the field loses focus or on
+  Cmd/Ctrl+S, so a typed audience is saved without pressing Enter, comma, or Add. It adds
+  nothing while discovery is on, and skips empty and duplicate values.
 - A PUT that leaves out a stored `protected_resource` keeps it, so Save sends a setting the
   operator switched off as `protected_resource: null` in the same PUT
   (`withDroppedProtectedResourcesRemoved`), for the surface and each variant. A save that fails
@@ -1093,10 +1097,14 @@ show the inputs of the chosen Provider Type (`credential-provider-type-select`).
   (JWT Bearer sends it empty then, so a stored one is cleared and no longer blocks deleting its
   secret), and `client_authentication`, which is always sent, empty for every type but JWT Bearer.
 - `resource` has no input (it is set through the API or YAML) and is never sent on save. When
-  `entraRejectsResource` finds it set on a Microsoft identity platform v2.0 token endpoint, which
-  rejects it (AADSTS901002), the form warns under Token Endpoint
-  (`credential-provider-entra-resource-warning`) and the list row shows a warning icon
-  (`credential-provider-entra-resource-badge`).
+  `entraRejectsResource` finds the provider's token requests send it to a Microsoft identity
+  platform v2.0 token endpoint, which rejects it (AADSTS901002), the form warns
+  (`credential-provider-entra-resource-warning`: under Token Endpoint, or under the external
+  consent notice for a provider with an `issuer`) and the list row shows a warning icon
+  (`credential-provider-entra-resource-badge`). An external consent provider with
+  `send_resource: false` sends no `resource` and is not warned; one that sends it is told to be
+  re-created with `send_resource: false` (`entraResourceMessage`), since its resource is required
+  and fixed. `send_resource` is never sent on save.
 - The secret pickers offer only secrets of the provider's own tenant (`SecretOptions` in
   `SecretSelect.tsx`; the tenant is the loaded provider's `tenant_id`, unknown while creating). A
   stored secret outside that tenant stays selectable with the same labels: "appliance-wide, stops
@@ -1349,8 +1357,9 @@ parts `IdentityNameCell`, `IdentitySurfaceCell`, `IdentityOriginBadge`,
   of each member DID's rotations with a count above 0 (`getIdentityRotations` in `api.ts`,
   through the `useEntryVersions` hook), showing `identities-version-history-loading` while it
   loads and `identities-version-history-error` with `identities-version-history-retry-button`
-  when it fails. It refetches only when a member's `rotation_count` changes, and an entry
-  with no rotations builds its DID versions without a request; see
+  when it fails. It refetches only when a member's `rotation_count` changes, showing the
+  loading state until the new list arrives, and closing Version History aborts the fetch. An
+  entry with no rotations builds its DID versions without a request; see
   `docs/SOURCE_AUTH.md#identity-versions`.
 - `/identities/<did>` expands the entry holding that DID once the dashboard identities have
   loaded; an earlier DID also opens Version History and marks its versions, including when

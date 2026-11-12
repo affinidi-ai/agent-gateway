@@ -279,6 +279,10 @@ pub(crate) async fn report_credential_policy(
     );
     crate::credential_providers::log_redirect_uri_conflicts(&providers, &gateway_base_url);
     crate::credential_providers::log_consent_rule_breaches(&providers, &gateway_base_url);
+    crate::credential_providers::external::warn_unpermitted_providers(
+        &providers,
+        crate::credential_providers::external::IssuerRules::of(&state.network_config),
+    );
     let secrets = match &state.secrets_store {
         Some(store) => match store.list_all().await {
             Ok(secrets) => secrets,

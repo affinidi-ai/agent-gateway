@@ -148,6 +148,12 @@ fn build_surface_fixture(
         let SourceAuthSpec::ApiKey { header_name, secret_id, .. } = source_auth;
         fixture = fixture.with_caller_auth_method(api_key_source_auth_method_json(header_name, secret_id));
     }
+    if surface.legacy_access_point {
+        fixture = fixture.with_legacy_access_point();
+    }
+    if let Some(public) = surface.access_point_public {
+        fixture = fixture.with_public(public);
+    }
 
     if surface
         .inbound_policy_rego
