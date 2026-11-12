@@ -1275,8 +1275,8 @@ except hop-by-hop headers, `Host`, `Content-Length`, `X-Transit-Token`,
 `Authorization` and its `Cookie`, its proxy forwarding headers, the caller-info and
 `did:webvh` identity headers (`x-caller-did`, `x-caller-identity-source`, `x-caller-dna-uai`,
 `x-gateway-did`, `x-did-identity`, `x-did-signed-identity`), the caller key headers
-(`x-caller-key` and the header any stored surface's `caller_key` names, also spelled with `_`
-for `-`; see [Caller keys](CREDENTIAL_DELEGATION.md#caller-keys)), the header its `source_auth`
+(`x-caller-key` and every name starting `x-caller-key-`, also spelled with `_` for `-`; see
+[Caller keys](CREDENTIAL_DELEGATION.md#caller-keys)), the header its `source_auth`
 reads, a header named like the Transit Point's `target_auth` header or like the
 `custom_header` of a credential binding that can apply on it, and any header a Header
 Metadata Mapping is set to strip. Other headers, such as an API key header the agent sends for

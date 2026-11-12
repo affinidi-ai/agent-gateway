@@ -1560,12 +1560,19 @@ derivation in [`proxy/caller_key.rs`](../src/proxy/caller_key.rs).
   receive, where the receiving gateway derives it for the JWT it verified. A `fabric://` Target
   is not sent the sending gateway's key; a `proxy://` MCP proxy's backend and an `a2a-proxy://`
   backend are sent none.
-- **A caller cannot supply one.** The Access Point, Fabric send and receive, Transit Point and
-  MCP proxy request filters drop every copy of `x-caller-key`, and of the header any stored
-  surface's `caller_key` names, from what a caller, an agent or a peer sent, on every surface,
-  ignoring case and `_` against `-`. On a surface with `caller_key` the gateway's value replaces
-  any such header. A managed agent that passes on the headers it received does not leak its
-  callers' keys through a Transit Point.
+- **A caller cannot supply one.** A surface's caller key header is always of the caller key
+  family: `x-caller-key`, or `x-caller-key-` followed by lower-case words, such as
+  `x-caller-key-memory`. The Access Point, mirror, Fabric send and receive, Transit Point, agent
+  card and MCP proxy request filters drop every header of the family, any header whose name,
+  lower-cased with `_` read as `-`, is `x-caller-key` or starts with `x-caller-key-`, from what a
+  caller, an agent or a peer sent, on every surface, whether or not it sets `caller_key`. So no
+  surface's choice of header changes what another surface, of the same tenant or another,
+  forwards. Every other header, such as `x-api-key` or `x-caller-keys`, passes as before. A
+  managed agent that passes on the headers it received does not leak its callers' keys through a
+  Transit Point.
+- **Behaviour change.** A caller, an agent or a peer gateway can no longer send any header of
+  the caller key family through the gateway, even to a surface without `caller_key`. A Target
+  that read such a header from its callers must take it under another name.
 - **When the secret cannot be read.** A missing secret, one outside the surface's tenant, one of
   fewer than 32 bytes, or a secrets store that fails, leaves the header out and logs a warning
   naming the surface and the reason, never the secret. The request is forwarded.

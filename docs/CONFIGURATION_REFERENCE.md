@@ -1022,7 +1022,7 @@ admin API; a variant cannot override it.
 | Field | Default | Behaviour |
 | --- | --- | --- |
 | `secret_id` | Required | The `secret_id` of a secret in the secrets store, as `target.auth` `static_secret` names one. The value never appears in the surface, its API responses or the logs. A save refuses a secret that does not exist, one the surface's tenant may not use, and one of fewer than 32 bytes. |
-| `header` | `x-caller-key` | The header the Target receives the key in. A lower-case HTTP header name. A save refuses a hop-by-hop header, `host`, `content-length`, `authorization`, `cookie`, a proxy forwarding header, a content or protocol header the gateway reads or sets (`accept`, `accept-encoding`, `content-type`, `content-encoding`, `mcp-protocol-version`, `mcp-session-id`, `last-event-id`, `a2a-version`, `a2a-extensions`, `x-a2a-extensions`), any other header reserved for the gateway (`x-transit-token`, `x-gateway-fabric-hops`, the caller-info and `did:webvh` identity headers, `x-gateway-trace-id`, `x-mirrored-request`), and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header. Names are compared ignoring case and `_` against `-`. |
+| `header` | `x-caller-key` | The header the Target receives the key in: `x-caller-key`, or `x-caller-key-` followed by words of lower-case letters and digits joined by single hyphens, such as `x-caller-key-memory`, at most 64 characters. A save refuses any other name, and a header the surface or one of its variants already reads or sends: a source authentication credential header, a Target or delegated credential header, or a header metadata mapping header, compared ignoring case and `_` against `-`. |
 | `identity_claims` | `["sub"]` | The JWT claims that name the caller, in order: the first the token carries as a non-empty string without NUL is used. Each is 1 to 128 printable ASCII characters without spaces, named once, and not a claim that names the token, issuer, audience, client, tenant, session or lifetime (`iss`, `aud`, `tid`, `azp` and the others `principal_claim` refuses). |
 
 The key is HKDF-SHA256 with the secret's bytes as the input key, `agent-gateway-caller-key-v1`
@@ -1031,9 +1031,11 @@ and the claim's value as the info, 32 bytes, base64url without padding. Changing
 the claims or the surface changes every caller's key. Only a caller whose JWT was verified on
 that request gets a key: no caller with an API key, DID Auth or mTLS, no caller without a
 credential or whose credential failed on a public Access Point, and no token without a string
-`iss` or any of the claims. A caller's own copy of `x-caller-key`, or of the header any stored
-surface's `caller_key` names, is never forwarded, on any surface. A PUT that leaves `caller_key`
-out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
+`iss` or any of the claims. No header of the caller key family, `x-caller-key` or a name
+starting `x-caller-key-` once lower-cased with `_` read as `-`, that a caller, an agent or a peer
+gateway sends is forwarded, on any surface, whether or not it sets `caller_key`; a caller that
+used such a header for its own purposes can no longer send it through. A PUT that leaves
+`caller_key` out keeps the stored one, so a Surface Builder save keeps it; `null` removes it. See
 [`CREDENTIAL_DELEGATION.md`](CREDENTIAL_DELEGATION.md#caller-keys).
 
 ## Remote gateway records
