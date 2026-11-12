@@ -25,10 +25,11 @@ use crate::bdd_support::policies::{
     build_transit_point_request_path_policy,
 };
 use crate::world::{
-    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CredentialProviderKind, DelegatedCredentialInjection,
-    JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig, SurfaceSourceAuthConfig,
-    SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld, TransitPointHeaderMetadataMappingRow,
-    TransitPointManagedIdentityConfig, mcp_identity_schema_with_field, select_identity_schema_field,
+    ApiKeyProviderSourceAuthConfig, ApiKeySourceAuthConfig, CallerKeyFixture, CredentialProviderKind,
+    DelegatedCredentialInjection, JwtSourceAuthConfig, RequestPolicyFixture, SurfaceCredentialDelegationConfig,
+    SurfaceSourceAuthConfig, SurfaceTargetAuthConfig, SurfaceTransitPointConfig, SurfaceWorld,
+    TransitPointHeaderMetadataMappingRow, TransitPointManagedIdentityConfig, mcp_identity_schema_with_field,
+    select_identity_schema_field,
 };
 use tracing::log::Level;
 
@@ -2514,6 +2515,50 @@ fn surface_is_stored_with_a_public_access_point(world: &mut SurfaceWorld) {
     world
         .surface_config
         .access_point_public = Some(true);
+}
+
+/// The value of the secret a caller key fixture stores: 32 bytes, the fewest a caller key
+/// secret may hold.
+pub(crate) const CALLER_KEY_SECRET_VALUE: &str = "bdd-caller-key-secret-0123456789";
+
+fn derive_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+    secret_value: Option<&str>,
+    header: Option<String>,
+) {
+    world
+        .surface_config
+        .caller_key = Some(CallerKeyFixture {
+        secret_id,
+        secret_value: secret_value.map(str::to_string),
+        header,
+    });
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}")]
+fn surface_derives_caller_keys(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), None);
+}
+
+#[given(expr = "the surface derives caller keys in header {string} from secret {string}")]
+fn surface_derives_caller_keys_in_header(
+    world: &mut SurfaceWorld,
+    header: String,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, Some(CALLER_KEY_SECRET_VALUE), Some(header));
+}
+
+#[given(expr = "the surface derives caller keys from secret {string}, which is not stored")]
+fn surface_derives_caller_keys_from_a_missing_secret(
+    world: &mut SurfaceWorld,
+    secret_id: String,
+) {
+    derive_caller_keys(world, secret_id, None, None);
 }
 
 #[given(expr = "the surface accepts {string} and {string} source authentication")]

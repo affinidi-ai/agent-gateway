@@ -257,7 +257,7 @@ fn write_single_surface_config_inner(
         .unwrap_or("bdd-surface");
     let effective_target_url = effective_target_url(mock_url, surface_config);
     let mut surface_fixture = AgentSurfaceFixture::new(
-        "bdd-surface",
+        crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID,
         surface_name,
         "BDD test surface",
         format!("http://localhost:{gateway_port}"),
@@ -328,6 +328,13 @@ fn write_single_surface_config_inner(
     }
     if let Some(mcp_http) = &surface_config.mcp_http {
         surface_fixture = surface_fixture.with_mcp_http(mcp_http.clone());
+    }
+    if let Some(caller_key) = &surface_config.caller_key {
+        let mut setting = serde_json::json!({ "secret_id": caller_key.secret_id });
+        if let Some(header) = &caller_key.header {
+            setting["header"] = serde_json::json!(header);
+        }
+        surface_fixture = surface_fixture.with_caller_key(setting);
     }
     if !surface_config
         .browser_origins
@@ -948,6 +955,11 @@ fn secret_fixtures(surface_config: &SurfaceConfigBuilder) -> Vec<SecretFixture> 
     }
     if let Some(proxy) = &surface_config.a2a_proxy_target {
         secrets.push(SecretFixture::new(&proxy.secret_id, &proxy.secret_value));
+    }
+    if let Some(caller_key) = &surface_config.caller_key
+        && let Some(secret_value) = &caller_key.secret_value
+    {
+        secrets.push(SecretFixture::new(&caller_key.secret_id, secret_value));
     }
     if let Some(provider) = &surface_config.target_auth_provider {
         if provider.grant == TargetAuthProviderGrant::JwtBearer {

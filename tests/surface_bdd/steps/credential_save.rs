@@ -33,7 +33,7 @@ pub(crate) async fn create_secret(
     create_secret_with_value(world, secret_id, tenant, SECRET_VALUE).await;
 }
 
-async fn create_secret_with_value(
+pub(crate) async fn create_secret_with_value(
     world: &mut SurfaceWorld,
     secret_id: &str,
     tenant: Option<&str>,
@@ -331,8 +331,6 @@ async fn create_surface_with_secret(
     );
 }
 
-const SEEDED_SURFACE_ID: &str = "bdd-surface";
-
 pub(crate) fn surface_id(world: &SurfaceWorld) -> String {
     world
         .surface_under_test_id
@@ -341,7 +339,7 @@ pub(crate) fn surface_id(world: &SurfaceWorld) -> String {
             world
                 .surface_config
                 .seed_surface
-                .then(|| SEEDED_SURFACE_ID.to_string())
+                .then(|| crate::bdd_support::config::single_surface_fixture::SEEDED_SURFACE_ID.to_string())
         })
         .expect("the surface under test must exist")
 }

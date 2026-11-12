@@ -656,6 +656,64 @@ fn named_managed_agent_did_not_receive_header(
     assert_collaborator_header_absent(&request.headers, &header_name, &format!("managed agent '{}'", agent_name));
 }
 
+/// The caller key the gateway derives for the caller whose token's `sub` is `subject` on the
+/// surface under test: HKDF-SHA256 over the fixture's secret, with salt
+/// `agent-gateway-caller-key-v1` and info `surface id, 0x00, iss, 0x00, "sub", 0x00, subject`,
+/// 32 bytes, base64url without padding.
+fn expected_caller_key(
+    world: &SurfaceWorld,
+    subject: &str,
+) -> String {
+    let secret = world
+        .surface_config
+        .caller_key
+        .as_ref()
+        .and_then(|caller_key| {
+            caller_key
+                .secret_value
+                .as_deref()
+        })
+        .expect("the surface derives caller keys from a stored secret");
+    let issuer = match &world
+        .surface_config
+        .source_auth
+    {
+        Some(crate::world::SurfaceSourceAuthConfig::JwtBearer(config)) => config.issuer.as_str(),
+        other => panic!("the surface must require JWT Bearer source authentication, got {other:?}"),
+    };
+    let surface_id = crate::steps::credential_save::surface_id(world);
+    let info = format!("{surface_id}\0{issuer}\0sub\0{subject}");
+    let mut key = [0u8; 32];
+    hkdf::Hkdf::<sha2::Sha256>::new(Some(b"agent-gateway-caller-key-v1"), secret.as_bytes())
+        .expand(info.as_bytes(), &mut key)
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+}
+
+#[then(expr = "managed agent {string} received the caller key of {string} in header {string} on every request")]
+fn managed_agent_received_caller_key_on_every_request(
+    world: &mut SurfaceWorld,
+    agent_name: String,
+    subject: String,
+    header: String,
+) {
+    let target = get_observed_target_for_actor(world, &agent_name, TargetActorKind::ManagedAgent);
+    let forwarded: Vec<_> = get_observed_target_requests(target, &agent_name)
+        .iter()
+        .filter(|request| !is_agent_card_discovery(request))
+        .collect();
+    assert!(!forwarded.is_empty(), "managed agent '{agent_name}' received no request");
+    let expected = expected_caller_key(world, &subject);
+    for request in forwarded {
+        assert_collaborator_header_value(
+            &request.headers,
+            &header,
+            &expected,
+            &format!("managed agent '{agent_name}'"),
+        );
+    }
+}
+
 #[then("the admin API response includes a surface id")]
 fn admin_api_response_includes_surface_id(world: &mut SurfaceWorld) {
     let body = &get_admin_response(world).body;
