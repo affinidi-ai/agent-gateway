@@ -44,7 +44,9 @@ same message in both (for example
 `client_id_secret_ref and client_secret_secret_ref are required for OAuth providers`). An update
 therefore cannot clear one of these references with an empty string, and a retype to one of
 these types must send the references the provider does not store yet. A stored provider that
-already lacks one is refused every update until the update names it.
+already lacks one is refused every update until the update names it. On a token endpoint that
+is still http and not listed in `insecure_token_endpoints`, naming a missing client secret
+reference is refused as well (see [https token endpoints](#https-token-endpoints)).
 
 ### Records that are still in use
 
@@ -164,7 +166,7 @@ sets how the rule is applied (see [Credential policy](CONFIGURATION_RELOAD.md#cr
 | --- | --- | --- |
 | Create, or an update that sets a new token endpoint or changes the provider type (an `api_key` provider turning into an OAuth type, or one OAuth type into another) | 400 `token_endpoint must be an https URL` | The same |
 | Update that keeps a stored http endpoint and the provider type | Saved | 400 |
-| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent no client secret before | 400 `token_endpoint must be an https URL` | The same |
+| Update that keeps a stored http endpoint not listed in `insecure_token_endpoints` and starts sending a client secret: it sets `client_authentication` to `client_secret_basic` or `client_secret_post` on an `oauth2_jwt_bearer` provider that sent none before, or sets a `client_secret_secret_ref` on an `oauth2_client_credentials` or `oauth2_authorization_code` provider that held none | 400 `token_endpoint must be an https URL` | The same |
 | `POST /api/v1/credential-providers/validate` | 400, before the endpoint is contacted | The same |
 | Token request, refresh or code exchange of a stored http provider | Sent, with a warning log | Refused before any secret is read |
 
@@ -177,19 +179,30 @@ already cached, the legacy code exchange and refresh fail with `token_endpoint m
 URL`, and the `2026-07-28` consent exchange answers an invalid record. Move such providers to
 https, or list a deliberate http endpoint, before switching to `enforce`.
 
-In `warn` mode a stored http provider therefore cannot start sending a client secret by turning on
-a `client_authentication` that sends one, and cannot change its type to an OAuth type: a retype
-must meet the rule like a new provider. Setting `client_authentication` to `none`, clearing it,
-or switching between `client_secret_basic` and `client_secret_post` is still saved. Listing the
-endpoint in `insecure_token_endpoints` allows the change on purpose.
+In `warn` mode a stored http provider therefore cannot start sending a client secret, either by
+turning on a `client_authentication` that sends one or, on an `oauth2_client_credentials` or
+`oauth2_authorization_code` provider, by being given a `client_secret_secret_ref` it did not
+hold, and cannot change its type to an OAuth type: a retype must meet the rule like a new
+provider. Setting `client_authentication` to `none`, clearing it, or switching between
+`client_secret_basic` and `client_secret_post` is still saved. Listing the endpoint in
+`insecure_token_endpoints` allows the change on purpose.
 
-The rule does not compare `client_secret_secret_ref`. A stored http provider may point it at
-another secret of its tenant, which is a rotation and is saved, and a secret's value can already
-change through the secrets API without any check by a provider, so pinning the reference would
-not pin what the endpoint receives. What a stored provider cannot do is lose the reference:
-`oauth2_client_credentials` and `oauth2_authorization_code` providers need it, so an update that
-clears it is refused (see [Credential providers](#credential-providers)), and a provider cannot
-be emptied of its client secret and given one again later on an endpoint that is still http.
+A provider sends a client secret when it holds a `client_secret_secret_ref` and its type sends
+it: an `oauth2_client_credentials` or `oauth2_authorization_code` provider always does, an
+`oauth2_jwt_bearer` provider only while its `client_authentication` is `client_secret_basic` or
+`client_secret_post`, and the other types never do. The rule compares that for the stored and
+the saved provider, not which secret the reference names. A stored http provider may point the
+reference at another secret of its tenant, which is a rotation and is saved, and a secret's
+value can already change through the secrets API without any check by a provider, so pinning the
+reference would not pin what the endpoint receives.
+
+`oauth2_client_credentials` and `oauth2_authorization_code` providers without an `issuer` need
+the reference, so an update that clears it is refused on any endpoint (see
+[Credential providers](#credential-providers)). A provider of these types stored without it,
+which a gateway before 1.0.8 let an update leave behind, cannot be given one while its endpoint
+is still http: move the endpoint to https in the same update, or first list it in
+`insecure_token_endpoints` and restart the gateway (see
+[Credential policy](CONFIGURATION_RELOAD.md#credential-policy)).
 
 ### Provider secrets belong to the provider's tenant
 

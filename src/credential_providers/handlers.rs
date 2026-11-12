@@ -3,7 +3,7 @@
 use super::{
     CreateCredentialProviderRequest, CredentialProvider, CredentialProviderListItem, CredentialProviderType,
     JwtAssertionSettings, JwtSigningAlgorithm, UpdateCredentialProviderRequest, ValidateCredentialProviderRequest,
-    storage::CredentialProviderStorage,
+    is_blank, storage::CredentialProviderStorage,
 };
 use axum::{
     Extension, Json,
@@ -329,7 +329,7 @@ fn validate_jwt_provider(provider: &CredentialProvider) -> Result<(), ProviderVa
     };
     if let Some((field, _)) = required
         .into_iter()
-        .find(|(_, value)| value.is_none_or(|value| value.trim().is_empty()))
+        .find(|(_, value)| is_blank(*value))
     {
         return Err(ProviderValidationError::Missing(field));
     }
@@ -374,15 +374,14 @@ fn validate_client_authentication(provider: &CredentialProvider) -> Result<(), P
     else {
         return Ok(());
     };
-    let blank = |value: Option<&str>| value.is_none_or(|value| value.trim().is_empty());
-    if blank(
+    if is_blank(
         provider
             .client_id_secret_ref
             .as_deref(),
     ) {
         return Err(ProviderValidationError::MissingForClientAuthentication("client_id_secret_ref"));
     }
-    let secret_missing = blank(
+    let secret_missing = is_blank(
         provider
             .client_secret_secret_ref
             .as_deref(),
@@ -469,7 +468,7 @@ fn validate_token_endpoint_scheme(
                 .token_endpoint
                 .as_deref()
                 == Some(endpoint)
-            && (sends_grant_client_secret(previous) || !sends_grant_client_secret(provider))
+            && (previous.sends_client_secret() || !provider.sends_client_secret())
     });
     if unchanged && egress.admits_token_endpoint(endpoint) {
         return Ok(());
@@ -494,14 +493,6 @@ fn updated_jwt_settings(
         settings.client_authentication = None;
     }
     settings.normalized()
-}
-
-/// Whether the provider's client authentication sends a client secret with its grant.
-fn sends_grant_client_secret(provider: &CredentialProvider) -> bool {
-    provider
-        .jwt
-        .client_authentication_method()
-        .is_some_and(|method| method.uses_secret())
 }
 
 /// The checks a provider passes before it is stored, `previous` being the stored record an
@@ -570,21 +561,20 @@ fn validate_url_fields(fields: &[(&str, Option<&str>)]) -> Option<Response> {
 
 /// The type-specific fields a provider without an issuer needs, if one is missing.
 fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
-    let blank = |value: Option<&str>| value.is_none_or(|value| value.trim().is_empty());
     match provider.provider_type {
         CredentialProviderType::OAuth2AuthorizationCode | CredentialProviderType::OAuth2ClientCredentials => {
-            if blank(
+            if is_blank(
                 provider
                     .token_endpoint
                     .as_deref(),
             ) {
                 return Some("token_endpoint is required for OAuth providers");
             }
-            if blank(
+            if is_blank(
                 provider
                     .client_id_secret_ref
                     .as_deref(),
-            ) || blank(
+            ) || is_blank(
                 provider
                     .client_secret_secret_ref
                     .as_deref(),
@@ -593,7 +583,7 @@ fn legacy_type_error(provider: &CredentialProvider) -> Option<&'static str> {
             }
             None
         }
-        CredentialProviderType::ApiKey => blank(
+        CredentialProviderType::ApiKey => is_blank(
             provider
                 .api_key_secret_ref
                 .as_deref(),
@@ -3628,9 +3618,6 @@ mod jwt_provider_tests {
         let http = provider(CredentialProviderType::OAuth2ClientCredentials, "http://idp.internal/token");
         let https = provider(CredentialProviderType::OAuth2ClientCredentials, "https://idp.internal/token");
         let was_api_key = provider(CredentialProviderType::ApiKey, "http://idp.internal/token");
-        let refused = |result: Result<(), ProviderValidationError>| {
-            matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
-        };
 
         let warn = egress(RuleMode::Warn, vec![]);
         assert!(refused(validate_token_endpoint_scheme(&warn, None, &http)));
@@ -3662,6 +3649,10 @@ mod jwt_provider_tests {
         }
     }
 
+    fn refused(result: Result<(), ProviderValidationError>) -> bool {
+        matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
+    }
+
     #[test]
     fn the_save_check_refuses_a_client_secret_newly_sent_to_a_stored_http_endpoint() {
         let provider = |client_authentication: Value| -> CredentialProvider {
@@ -3673,9 +3664,6 @@ mod jwt_provider_tests {
                 "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
             }))
             .unwrap()
-        };
-        let refused = |result: Result<(), ProviderValidationError>| {
-            matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps))
         };
         let stored = provider(Value::Null);
 
@@ -3711,6 +3699,156 @@ mod jwt_provider_tests {
         );
     }
 
+    const STORED_HTTP_TOKEN_ENDPOINT: &str = "http://192.0.2.1/token";
+
+    fn http_oauth_provider(
+        provider_type: &str,
+        client_secret_secret_ref: Value,
+    ) -> CredentialProvider {
+        serde_json::from_value(json!({
+            "id": provider_type, "name": "Provider", "provider_id": provider_type, "provider_type": provider_type,
+            "token_endpoint": STORED_HTTP_TOKEN_ENDPOINT, "client_id_secret_ref": "CLIENT_ID",
+            "client_secret_secret_ref": client_secret_secret_ref,
+            "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_save_check_refuses_a_client_secret_newly_given_to_a_stored_http_oauth_provider() {
+        let warn = warn_egress(vec![]);
+        let listed = warn_egress(vec![STORED_HTTP_TOKEN_ENDPOINT.into()]);
+
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let without_secret = http_oauth_provider(provider_type, Value::Null);
+            let with_secret = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            assert!(
+                validate_token_endpoint_scheme(&warn, Some(&without_secret), &without_secret).is_ok(),
+                "{provider_type}: the stored provider still saves"
+            );
+            assert!(
+                refused(validate_token_endpoint_scheme(&warn, Some(&without_secret), &with_secret)),
+                "{provider_type}: the client secret would be sent over http"
+            );
+            assert!(
+                validate_token_endpoint_scheme(&listed, Some(&without_secret), &with_secret).is_ok(),
+                "{provider_type}: an endpoint insecure_token_endpoints lists is allowed on purpose"
+            );
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&with_secret),
+                    &http_oauth_provider(provider_type, json!("NEW_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the client secret was already sent there"
+            );
+            assert!(
+                validate_token_endpoint_scheme(&warn, Some(&with_secret), &without_secret).is_ok(),
+                "{provider_type}: dropping the client secret stops sending it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_reads_a_blank_client_secret_reference_as_none() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let without_secret = http_oauth_provider(provider_type, Value::Null);
+            let with_secret = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            for blank in ["", "  "] {
+                let blank_secret = http_oauth_provider(provider_type, json!(blank));
+                assert!(
+                    refused(validate_token_endpoint_scheme(&warn, Some(&blank_secret), &with_secret)),
+                    "{provider_type}: a stored reference {blank:?} sent no client secret"
+                );
+                assert!(
+                    validate_token_endpoint_scheme(&warn, Some(&without_secret), &blank_secret).is_ok(),
+                    "{provider_type}: a requested reference {blank:?} sends no client secret"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_save_check_ignores_a_client_secret_reference_that_other_provider_types_never_send() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_jwt_bearer", "oauth2_client_credentials_jwt_auth"] {
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&http_oauth_provider(provider_type, Value::Null)),
+                    &http_oauth_provider(provider_type, json!("CLIENT_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the reference alone sends nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_ignores_a_client_authentication_on_a_provider_type_that_never_reads_it() {
+        let warn = warn_egress(vec![]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            let mut stored = http_oauth_provider(provider_type, Value::Null);
+            stored
+                .jwt
+                .client_authentication = Some(crate::credential_providers::GrantClientAuthentication::ClientSecretPost);
+            assert!(
+                refused(validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&stored),
+                    &http_oauth_provider(provider_type, json!("CLIENT_SECRET"))
+                )),
+                "{provider_type}: the stored record sent no client secret"
+            );
+
+            let mut public = http_oauth_provider(provider_type, json!("CLIENT_SECRET"));
+            public
+                .jwt
+                .client_authentication = Some(crate::credential_providers::GrantClientAuthentication::PublicClient);
+            assert!(
+                validate_token_endpoint_scheme(
+                    &warn,
+                    Some(&public),
+                    &http_oauth_provider(provider_type, json!("NEW_SECRET"))
+                )
+                .is_ok(),
+                "{provider_type}: the client secret was already sent there"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_check_counts_a_jwt_bearer_client_secret_only_once_the_provider_holds_one() {
+        let warn = warn_egress(vec![]);
+        let jwt_bearer = |client_secret_secret_ref: Value| {
+            let mut provider = http_oauth_provider("oauth2_jwt_bearer", client_secret_secret_ref);
+            provider
+                .jwt
+                .client_authentication =
+                Some(crate::credential_providers::GrantClientAuthentication::ClientSecretBasic);
+            provider
+        };
+        assert!(
+            refused(validate_token_endpoint_scheme(
+                &warn,
+                Some(&jwt_bearer(Value::Null)),
+                &jwt_bearer(json!("CLIENT_SECRET"))
+            )),
+            "a stored client authentication without a client secret sent none"
+        );
+        assert!(
+            validate_token_endpoint_scheme(
+                &warn,
+                Some(&jwt_bearer(json!("OLD_SECRET"))),
+                &jwt_bearer(json!("NEW_SECRET"))
+            )
+            .is_ok(),
+            "the client secret was already sent there"
+        );
+    }
+
     #[test]
     fn the_save_check_refuses_a_retype_of_a_stored_http_provider() {
         let provider = |provider_type: &str| -> CredentialProvider {
@@ -3736,7 +3874,7 @@ mod jwt_provider_tests {
                     assert!(result.is_ok(), "{stored} saved again keeps its stored http endpoint");
                 } else {
                     assert!(
-                        matches!(result, Err(ProviderValidationError::TokenEndpointNotHttps)),
+                        refused(result),
                         "{stored} retyped to {requested} would use its stored http endpoint in a new way"
                     );
                 }
@@ -3852,20 +3990,77 @@ mod jwt_provider_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_a_client_secret_to_a_stored_http_provider_that_holds_none_is_refused_in_warn_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            state
+                .store
+                .create(http_oauth_provider(provider_type, Value::Null))
+                .await
+                .unwrap();
+
+            let (status, response) =
+                update(&state, provider_type, json!({"client_secret_secret_ref": "CLIENT_SECRET"})).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{provider_type}: the client secret would be sent over http: {response}"
+            );
+            assert_eq!(response["error"], "token_endpoint must be an https URL", "{provider_type}");
+            let kept = state
+                .store
+                .get(provider_type)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept.client_secret_secret_ref, None, "{provider_type}");
+
+            let (status, response) = update(
+                &state,
+                provider_type,
+                json!({"token_endpoint": "https://192.0.2.1/token", "client_secret_secret_ref": "CLIENT_SECRET"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{provider_type}: https carries the client secret: {response}");
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_http_provider_that_holds_no_client_secret_is_given_one_on_a_listed_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = with_key_material(&directory).await;
+        let listed = warn_egress(vec![STORED_HTTP_TOKEN_ENDPOINT.into()]);
+        for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
+            state
+                .store
+                .create(http_oauth_provider(provider_type, Value::Null))
+                .await
+                .unwrap();
+
+            let (status, response) = listed
+                .clone()
+                .scope(update(&state, provider_type, json!({"client_secret_secret_ref": "CLIENT_SECRET"})))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{provider_type}: an endpoint insecure_token_endpoints lists is allowed on purpose: {response}"
+            );
+            assert_eq!(response["client_secret_secret_ref"], "CLIENT_SECRET", "{provider_type}");
+            assert_eq!(response["token_endpoint"], STORED_HTTP_TOKEN_ENDPOINT, "{provider_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stored_http_provider_keeps_a_client_secret_it_may_replace_but_not_clear() {
         let directory = tempfile::tempdir().unwrap();
         let state = with_key_material(&directory).await;
         for provider_type in ["oauth2_client_credentials", "oauth2_authorization_code"] {
-            let stored: CredentialProvider = serde_json::from_value(json!({
-                "id": provider_type, "name": "Hydra", "provider_id": provider_type, "provider_type": provider_type,
-                "token_endpoint": "http://192.0.2.1/token",
-                "client_id_secret_ref": "CLIENT_ID", "client_secret_secret_ref": "CLIENT_SECRET",
-                "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"
-            }))
-            .unwrap();
             state
                 .store
-                .create(stored)
+                .create(http_oauth_provider(provider_type, json!("CLIENT_SECRET")))
                 .await
                 .unwrap();
 

@@ -2846,6 +2846,15 @@ fn surface_authenticates_target_with_client_credentials(world: &mut SurfaceWorld
         .target_auth_provider = Some(SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::ClientCredentials));
 }
 
+#[given("the appliance stores an authorization code provider that no surface uses")]
+fn appliance_stores_unused_authorization_code_provider(world: &mut SurfaceWorld) {
+    let mut provider = SurfaceTargetAuthProviderConfig::new(TargetAuthProviderGrant::AuthorizationCode);
+    provider.authenticates_surface_target = false;
+    world
+        .surface_config
+        .target_auth_provider = Some(provider);
+}
+
 /// Serves a client credentials provider that the surface's own Target does not use, for a
 /// Transit Point or a delegated credential binding to use instead.
 fn serve_client_credentials_provider_off_the_surface_target(world: &mut SurfaceWorld) {
@@ -2923,6 +2932,17 @@ fn target_credential_provider_stores_unused_client_references(world: &mut Surfac
     jwt_bearer_target_auth_provider(world).stores_unused_client_references = true;
 }
 
+#[given("the credential provider stores no client secret")]
+fn target_credential_provider_stores_no_client_secret(world: &mut SurfaceWorld) {
+    let provider = target_auth_provider(world);
+    assert_ne!(
+        provider.grant,
+        TargetAuthProviderGrant::JwtBearer,
+        "this step applies only to a provider type that needs a client secret"
+    );
+    provider.omits_client_secret_reference = true;
+}
+
 #[given(expr = "the credential provider authenticates its client with {string}")]
 fn target_credential_provider_authenticates_its_client(
     world: &mut SurfaceWorld,
@@ -2964,6 +2984,11 @@ fn target_credential_provider_token_lifetime(
 #[given("the credential provider has a plain http token endpoint")]
 fn target_credential_provider_has_http_token_endpoint(world: &mut SurfaceWorld) {
     target_auth_provider(world).insecure_token_endpoint = true;
+}
+
+#[given("the gateway's insecure token endpoints list names the credential provider's token endpoint")]
+fn gateway_lists_target_credential_provider_token_endpoint(world: &mut SurfaceWorld) {
+    target_auth_provider(world).token_endpoint_listed_as_insecure = true;
 }
 
 #[given("the gateway keeps its log of warnings")]
