@@ -1,6 +1,6 @@
 import React from 'react';
 import { Form } from 'react-bootstrap';
-import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import { topAndTail } from '../../../../utils/stringUtils';
 import { deepLinks } from '../../../../utils/deepLinks';
 import AddResourceLink from '../../../shared/AddResourceLink';
@@ -103,13 +103,8 @@ interface TrustCheckQueryFormProps {
   loadError: string | null;
   updateQueryAt: (index: number, patch: Partial<TrustCheckQueryConfig>) => void;
   updateQuerySubField: (index: number, field: string, value: string) => void;
-  /** `source` is where a literal DID was picked from; absent for a template, which removes it. */
-  updateAuthorityAt: (index: number, value: string, source?: AuthoritySource) => void;
-  /**
-   * Set the query's Authorities to the multi-select's picks, in order. Omit to allow one
-   * Authority only, written through `updateAuthorityAt`.
-   */
-  setAuthoritiesAt?: (index: number, picks: AuthorityRow[]) => void;
+  /** Set the query's Authorities to the multi-select's picks, in order. */
+  setAuthoritiesAt: (index: number, picks: AuthorityRow[]) => void;
   updateEntityAt: (index: number, value: string) => void;
   handleQueryTypeChangeAt: (index: number, next: TrustCheckRecordType) => void;
   /**
@@ -132,7 +127,6 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
   loadError,
   updateQueryAt,
   updateQuerySubField,
-  updateAuthorityAt,
   setAuthoritiesAt,
   updateEntityAt,
   handleQueryTypeChangeAt,
@@ -206,12 +200,7 @@ const TrustCheckQueryForm: React.FC<TrustCheckQueryFormProps> = ({
             authorities={authorities}
             authoritiesLoaded={authoritiesLoaded}
             saveAttempted={saveAttempted}
-            multiple={!!setAuthoritiesAt}
-            onChange={picks =>
-              setAuthoritiesAt
-                ? setAuthoritiesAt(index, picks)
-                : updateAuthorityAt(index, picks[0]?.did ?? '', picks[0]?.source)
-            }
+            onChange={picks => setAuthoritiesAt(index, picks)}
           />
         </div>
 
@@ -397,8 +386,6 @@ interface IssuerAuthorityPickerProps {
   authorities: Authority[];
   authoritiesLoaded: boolean;
   saveAttempted: boolean;
-  /** False to allow one Authority only: picking one replaces the selection. */
-  multiple: boolean;
   /** The query's Authorities after a pick, in the order picked. */
   onChange: (picks: AuthorityRow[]) => void;
 }
@@ -447,21 +434,18 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   authorities,
   authoritiesLoaded,
   saveAttempted,
-  multiple,
   onChange,
 }) => {
   const rows = authorityRows(queryConfig).filter(r => r.did.trim() !== '');
   const issuerDids = new Set(issuers.map(i => i.did));
-  const shownIssuers = issuers;
   const authorityList = authorities
     .filter(a => !issuerDids.has(a.did))
     .map(a => ({ did: a.did, name: a.name, description: a.description }));
-  const templates = isApMa;
   const selected =
-    templates && rows.length === 0 ? [AGENT_IDENTITY_ISSUER_DID_TEMPLATE] : rows.map(r => r.did);
+    isApMa && rows.length === 0 ? [AGENT_IDENTITY_ISSUER_DID_TEMPLATE] : rows.map(r => r.did);
   // Stored values neither register nor the templates offer.
   const extras = rows.flatMap(row => {
-    if (templates && CALLER_TEMPLATES.has(row.did.trim())) return [];
+    if (isApMa && CALLER_TEMPLATES.has(row.did.trim())) return [];
     const selection = classifyTargetAuthoritySelection(
       row.did,
       issuers,
@@ -479,12 +463,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
     .filter(e => e.kind === 'missing-authority')
     .map((e, index) => ({ index, did: e.did }));
 
-  if (
-    !templates &&
-    shownIssuers.length === 0 &&
-    authorityList.length === 0 &&
-    extras.length === 0
-  ) {
+  if (!isApMa && issuers.length === 0 && authorityList.length === 0 && extras.length === 0) {
     return (
       <>
         <Form.Control
@@ -515,7 +494,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
 
   const options: Array<FormSelectOption<string>> = [];
 
-  if (templates) {
+  if (isApMa) {
     options.push({
       value: AGENT_IDENTITY_ISSUER_DID_TEMPLATE,
       label: 'Agent identity credential issuer (default)',
@@ -532,12 +511,12 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
   // a lone "Issuers" (or "Authorities") label above a single flat list
   // adds no information, so with one category we drop the header and the
   // per-item indent entirely.
-  const showGroupHeaders = shownIssuers.length > 0 && authorityList.length > 0;
-  if (shownIssuers.length > 0) {
+  const showGroupHeaders = issuers.length > 0 && authorityList.length > 0;
+  if (issuers.length > 0) {
     if (showGroupHeaders) {
       options.push({ value: GRP_ISSUERS, label: 'Issuers', disabled: true });
     }
-    for (const issuer of shownIssuers) {
+    for (const issuer of issuers) {
       options.push({
         value: issuer.did,
         label: issuer.name,
@@ -584,7 +563,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
     const pick: AuthorityRow = CALLER_TEMPLATES.has(value)
       ? { did: value }
       : { did: value, source: issuerDids.has(value) ? 'issuer' : 'authority' };
-    onChange(multiple ? [...current, pick] : [pick]);
+    onChange([...current, pick]);
   };
 
   return (
@@ -596,7 +575,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
         isInvalid={
           (saveAttempted && queryAuthorityMissing(queryConfig, isApMa)) || missing.length > 0
         }
-        placeholder={multiple ? 'Select Issuers or Authorities…' : 'Select an Issuer or Authority…'}
+        placeholder="Select Issuers or Authorities…"
         testid={testid}
       />
       {missing.length > 0 && (
@@ -609,7 +588,7 @@ const IssuerAuthorityPicker: React.FC<IssuerAuthorityPickerProps> = ({
       <Form.Text className="text-muted d-block mt-1" style={{ fontSize: '11px' }}>
         {isApMa
           ? 'Choose the trust anchors the caller is checked against. By default, this is the cryptographically verified issuer of the caller’s agent identity credential.'
-          : 'Choose the trust anchors the target is checked against. By default, this is the cryptographically verified issuer of the target’s agent identity credential.'}
+          : 'Choose the trust anchors the target is checked against. Their DIDs are stored directly, so the gateway never derives the authority from the target’s own agent card. If a picked Authority is deleted later, its check fails until you pick another.'}
       </Form.Text>
       {rows.length > 1 && (
         <Form.Text

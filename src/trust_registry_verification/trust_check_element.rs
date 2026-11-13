@@ -155,7 +155,7 @@ pub struct TrustCheckElement {
 }
 
 /// Element-level validation errors raised by [`TrustCheckElement::validate`].
-/// List-level errors (duplicate `id`, list too long) live on
+/// List-level errors (duplicate `id`) live on
 /// [`crate::config::agent_surface::TrustCheckValidationError`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TrustCheckElementValidationError {
@@ -179,6 +179,8 @@ pub enum TrustCheckElementValidationError {
     AuthoritySourcesWithoutList,
     #[error("authority_source cannot be set when query.authority_ids is set; use authority_sources")]
     AuthoritySourceWithList,
+    #[error("authority_sources holds a DID that query.authority_ids does not list")]
+    AuthoritySourcesUnlisted,
     #[error("timeout_secs cannot be set when query.authority_ids is set")]
     AuthoritiesTimeoutSet,
     #[error("name exceeds {max} code points (got {got})")]
@@ -270,6 +272,13 @@ impl TrustCheckElement {
             if !seen.insert(authority) {
                 return Err(TrustCheckElementValidationError::AuthoritiesDuplicate { index });
             }
+        }
+        if self
+            .authority_sources
+            .keys()
+            .any(|did| !authorities.contains(did))
+        {
+            return Err(TrustCheckElementValidationError::AuthoritySourcesUnlisted);
         }
         Ok(())
     }
@@ -862,6 +871,19 @@ mod tests {
         let mut elem = multi(&["did:web:authority-a"]);
         elem.authority_source = Some(AuthoritySource::Authority);
         assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritySourceWithList));
+    }
+
+    #[test]
+    fn validate_rejects_authority_sources_entry_not_in_authority_list() {
+        use crate::trust_registry_verification::authority_source::AuthoritySource;
+
+        let mut elem = multi(&["did:web:authority-a"]);
+        elem.authority_sources
+            .insert("did:web:authority-a".to_string(), AuthoritySource::Authority);
+        assert_eq!(elem.validate(), Ok(()));
+        elem.authority_sources
+            .insert("did:web:authority-b".to_string(), AuthoritySource::Authority);
+        assert_eq!(elem.validate(), Err(TrustCheckElementValidationError::AuthoritySourcesUnlisted));
     }
 
     #[test]

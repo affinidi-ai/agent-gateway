@@ -231,8 +231,8 @@ unconfigured with a "Configuration required" warning and blocks Save, and a refu
 delete lists what uses the Authority in a dialog with no way to delete it anyway; see _Trust
 Check_ and _Authority delete_ in [`www/default/AGENTS.md`](www/default/AGENTS.md#authority-delete).
 A Trust Check query that lists several authorities (`query.authority_ids`) keeps its list and
-`authority_sources` through every dashboard save, and the fullscreen editor builds that list row
-by row from the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
+`authority_sources` through every dashboard save, and the fullscreen editor picks that list in one
+multi-select of the Issuers and Authorities registers; see _Authority lists_ under _Trust Check_ in
 [`www/default/AGENTS.md`](www/default/AGENTS.md#trust-check).
 
 The Audit Log names the surface variant of each request record and describes `request_rejected`

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { apiClient } from '../../../../api';
 import { getAuthorities } from '../../../../utils/authoritiesCache';
 import { getIssuers } from '../../../../utils/issuersCache';
-import type { Authority, AuthoritySource, Issuer, TrustRegistry } from '../../../../types';
+import type { Authority, Issuer, TrustRegistry } from '../../../../types';
 import type { ConfigPanelProps } from '../types';
 import {
   authorityCountLabel,
@@ -114,21 +114,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
           return { ...q, query: rest };
         }
         return { ...q, query: { ...cur, [field]: value } };
-      })
-    );
-  };
-
-  const updateAuthorityAt = (idx: number, value: string, source?: AuthoritySource) => {
-    setDraft(prev =>
-      prev.map((q, i) => {
-        if (i !== idx) return q;
-        const { authority_source: _previous, ...rest } = q;
-        void _previous;
-        return {
-          ...rest,
-          ...(source ? { authority_source: source } : {}),
-          query: { ...(q.query || {}), authority_id: value },
-        };
       })
     );
   };
@@ -257,7 +242,6 @@ const TrustCheckFullscreenPanel: React.FC<ConfigPanelProps> = ({
             loadError={loadError}
             updateQueryAt={updateQueryAt}
             updateQuerySubField={updateQuerySubField}
-            updateAuthorityAt={updateAuthorityAt}
             setAuthoritiesAt={setAuthoritiesAt}
             updateEntityAt={updateEntityAt}
             handleQueryTypeChangeAt={handleQueryTypeChangeAt}

@@ -235,8 +235,9 @@ fn visit_legs(
 }
 
 /// Calls `visit` with the authority DID of `element` and its `authority_source`, or with each
-/// DID of `query.authority_ids` and its entry in `authority_sources`, in list order. Entries
-/// for DIDs the element does not list are dropped.
+/// DID of `query.authority_ids` and its entry in `authority_sources`, in list order. Validation
+/// refuses `authority_sources` keys the element does not list; this drops any that reach it
+/// anyway.
 fn visit_trust_check(
     element: &mut TrustCheckElement,
     used_by: AuthorityUse,

@@ -262,7 +262,7 @@ Element validation is in
 | `id` | Required, unique within the leg, at most `TRUST_CHECK_ID_MAX_CODE_POINTS` (64) code points. Rego-addressable and audit-visible. |
 | `name` | Optional display label, at most `TRUST_CHECK_NAME_MAX_CODE_POINTS` (64) code points. |
 | `id` and `name` | Control, DEL, C1, and bidi-override codepoints are rejected. |
-| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids`, and `authority_source` is refused with it. |
+| `query.authority_id` / `query.authority_ids` | Exactly one is set. `authority_ids` holds one or more distinct, non-blank DIDs or templates. `authority_sources` is refused without `authority_ids` or with a key `authority_ids` does not list, and `authority_source` is refused with `authority_ids`. |
 | `timeout_secs` | Optional on a single-authority element; without it the element waits for the trust registry transport's own timeout. Refused on a multi-authority element, where each authority always waits `TRUST_CHECK_MULTI_AUTHORITY_TIMEOUT_SECS` (5). |
 
 The two caps are separate constants that happen to share a value today, because `id` is
@@ -321,7 +321,8 @@ A rule that addresses one result by `id` alone matches every authority of the el
 [_The authority of a Trust Check_](#the-authority-of-a-trust-check)); a template or a DID in
 neither register has no entry. A listed Authority that no longer exists fails only its own
 result with `AUTHORITY_NOT_FOUND`, and the other authorities are queried as usual. The Surface
-Builder's fullscreen editor builds the list row by row; see _Authority lists_ in
+Builder's fullscreen editor picks that list in one multi-select of the Issuers and Authorities
+registers; see _Authority lists_ in
 [`www/default/AGENTS.md`](../www/default/AGENTS.md).
 
 Accepted risk: nothing bounds how many authorities a leg queries. Every request sends one TRQP

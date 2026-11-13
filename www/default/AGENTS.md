@@ -703,8 +703,11 @@ Caller Context method lists use `<area>` `caller-auth-panel` (sidebar) or `calle
   was deleted shows as a checked "Deleted Authority" option with the warning, and like a deleted
   single Authority it is listed in the panel's "Configuration required" warning, draws the node
   unconfigured and blocks Save (`missingTrustCheckAuthorities` walks `authorityRows`). A stored
-  list with an empty entry is incomplete ("Select an Issuer or Authority for every Authority
-  row"), is marked invalid, and blocks the editor's Save. The side panel lists each query as "Query N" and its record type
+  list is incomplete, is marked invalid, and blocks the editor's Save when it has an empty entry
+  or a template its leg refuses: any template on the target leg ("Select an Issuer or Authority
+  for every Authority row"), or on the caller leg a template other than the verified-issuer
+  default and the sending-gateway DID ("Replace the caller-leg Authority template …"); an empty
+  entry gives the first message on either leg. The side panel lists each query as "Query N" and its record type
   only, with no Authorities or name; the fullscreen card header adds "N authorities". A node with one such
   query has the canvas summary `<type> · N authorities`; a node with several queries keeps "N
   queries".

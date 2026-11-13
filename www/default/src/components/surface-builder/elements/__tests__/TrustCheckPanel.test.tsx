@@ -396,7 +396,6 @@ describe('TrustCheckFullscreenPanel — Authority source', () => {
       stored('did:web:authority-a', 'authority'),
     ]);
     fireEvent.click(screen.getByTestId('trust-check-query-2-remove'));
-    expect(screen.queryByTestId('trust-check-authority-total-limit')).toBeNull();
     expect(screen.getByTestId('trust-check-add-query')).toBeEnabled();
     fireEvent.click(screen.getByTestId('trust-check-save'));
     expect(updateFields).toHaveBeenCalled();

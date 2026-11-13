@@ -592,13 +592,17 @@ export function pickAuthorities(
 }
 
 /**
- * True when the query's Authority is not usable: a row of several left empty, or a single
- * Authority `authorityNeedsSelection` rejects on this leg.
+ * True when the query's Authority is not usable: a row of several left empty, or any Authority
+ * `authorityNeedsSelection` rejects on this leg.
  */
 export function queryAuthorityMissing(q: TrustCheckQueryConfig, isApMa: boolean): boolean {
-  return isMultiAuthorityQuery(q)
-    ? authorityRows(q).length === 0 || authorityRows(q).some(r => r.did.trim() === '')
-    : authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa);
+  if (!isMultiAuthorityQuery(q))
+    return authorityNeedsSelection(q.query?.authority_id as string | undefined, isApMa);
+  const rows = authorityRows(q);
+  return (
+    rows.length === 0 ||
+    rows.some(r => r.did.trim() === '' || authorityNeedsSelection(r.did, isApMa))
+  );
 }
 
 /** "1 authority", "3 authorities". */
@@ -941,8 +945,13 @@ export const trustCheckDefinition: NodeDefinition = {
       const prefix = queries.length > 1 ? `Query ${i + 1}: ` : '';
       if (!q.trust_registry_id) return `${prefix}Trust registry must be selected`;
       if (isMultiAuthorityQuery(q)) {
-        if (queryAuthorityMissing(q, !isTargetLeg))
-          return `${prefix}Select an Issuer or Authority for every Authority row`;
+        if (queryAuthorityMissing(q, !isTargetLeg)) {
+          const rows = authorityRows(q);
+          const hasEmptyRow = rows.length === 0 || rows.some(r => r.did.trim() === '');
+          return hasEmptyRow || isTargetLeg
+            ? `${prefix}Select an Issuer or Authority for every Authority row`
+            : `${prefix}Replace the caller-leg Authority template with the agent identity credential issuer default or an explicit Issuer / Authority`;
+        }
       } else if (authorityNeedsSelection(q.query?.authority_id as string, !isTargetLeg)) {
         return isTargetLeg
           ? `${prefix}Select an Issuer or Authority for the target-leg Authority`

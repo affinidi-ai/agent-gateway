@@ -128,8 +128,10 @@ async fn handle_message(
                 debug!("TR reader: delivered problem-report to waiter (thid {})", thid);
             } else if is_request_thread(&thid) {
                 warn!(
-                    "TR reader: problem-report for '{}' answers a request no longer awaited (thid {}), ignoring",
-                    connection.trust_registry_id, thid
+                    // Peer-chosen: capped at 64 chars and Debug-escaped.
+                    thid = ?thid.chars().take(64).collect::<String>(),
+                    "TR reader: problem-report for '{}' answers a request no longer awaited, ignoring",
+                    connection.trust_registry_id
                 );
             } else {
                 // Not a reply to a request → the registry rejected the gateway.

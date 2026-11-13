@@ -21,7 +21,7 @@ function baseProps(overrides: Partial<Parameters<typeof TrustCheckQueryForm>[0]>
     loadError: null,
     updateQueryAt: jest.fn(),
     updateQuerySubField: jest.fn(),
-    updateAuthorityAt: jest.fn(),
+    setAuthoritiesAt: jest.fn(),
     updateEntityAt: jest.fn(),
     handleQueryTypeChangeAt: jest.fn(),
     ...overrides,
@@ -65,18 +65,19 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
   });
 
   it('writes the literal Issuer DID verbatim when an Issuer is selected on the caller leg', () => {
-    const updateAuthorityAt = jest.fn();
+    const setAuthoritiesAt = jest.fn();
     renderForm(
       baseProps({
         isApMa: true,
-        updateAuthorityAt,
+        setAuthoritiesAt,
         issuers: [{ id: 'd-1', name: 'Acme Inc', did: 'did:web:acme.example' }] as any,
         authorities: [],
       })
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Acme Inc'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example', 'issuer');
+    const picks = setAuthoritiesAt.mock.calls[0][1];
+    expect(picks[picks.length - 1]).toEqual({ did: 'did:web:acme.example', source: 'issuer' });
   });
 
   it('renders the verified-issuer default picker on the caller leg even when no Issuers or Authorities are configured (no degenerate locked textbox on the caller leg)', () => {
@@ -175,18 +176,20 @@ describe('TrustCheckQueryForm — Authority rendering', () => {
   });
 
   it('writes the literal Issuer DID verbatim when an Issuer is selected on the target leg', () => {
-    const updateAuthorityAt = jest.fn();
+    const setAuthoritiesAt = jest.fn();
     renderForm(
       baseProps({
         isApMa: false,
-        updateAuthorityAt,
+        setAuthoritiesAt,
         issuers: [{ id: 'd-1', name: 'Acme Dept', did: 'did:web:acme.example' }] as any,
         authorities: [],
       })
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Acme Dept'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(0, 'did:web:acme.example', 'issuer');
+    expect(setAuthoritiesAt).toHaveBeenCalledWith(0, [
+      { did: 'did:web:acme.example', source: 'issuer' },
+    ]);
   });
 
   it('surfaces a stored legacy template as a locked "from JSON API" option on the target leg', () => {
@@ -304,7 +307,7 @@ describe('TrustCheckQueryForm — several Authorities', () => {
   const ISSUER = { id: 'd-1', name: 'issuer-A', did: 'did:web:issuer-a' };
   const option = (did: string) => screen.getByTestId(`trust-check-query-0-authority-option-${did}`);
 
-  it('offers the templates, Issuers and Authorities in one multi-select, with no Add Authority button', () => {
+  it('offers the templates, Issuers and Authorities in one multi-select', () => {
     renderForm(
       baseProps({
         setAuthoritiesAt: jest.fn(),
@@ -312,7 +315,6 @@ describe('TrustCheckQueryForm — several Authorities', () => {
         authorities: AUTHORITIES as any,
       })
     );
-    expect(screen.queryByTestId('trust-check-query-0-add-authority')).toBeNull();
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     expect(screen.getByRole('listbox')).toHaveAttribute('aria-multiselectable', 'true');
     expect(screen.getByText('issuer-A')).toBeInTheDocument();
@@ -407,7 +409,6 @@ describe('TrustCheckQueryForm — several Authorities', () => {
     expect(screen.getByTestId('trust-check-query-0-authority-count')).toHaveTextContent(
       '30 Authorities'
     );
-    expect(screen.queryByTestId('trust-check-query-0-authority-limit')).toBeNull();
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     expect(option('did:web:authority-a')).toBeEnabled();
   });
@@ -461,37 +462,34 @@ describe('TrustCheckQueryForm — Authority source', () => {
     }) as TrustCheckQueryConfig;
 
   it('writes authority_source "authority" when an Authority is picked', () => {
-    const updateAuthorityAt = jest.fn();
+    const setAuthoritiesAt = jest.fn();
     renderForm(
       baseProps({
         isApMa: false,
-        updateAuthorityAt,
+        setAuthoritiesAt,
         issuers: [ISSUER] as any,
         authorities: [AUTHORITY] as any,
       })
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Payments Authority'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(0, AUTHORITY.did, 'authority');
+    expect(setAuthoritiesAt).toHaveBeenCalledWith(0, [{ did: AUTHORITY.did, source: 'authority' }]);
   });
 
   it('writes no authority_source when the caller-leg template default is picked', () => {
-    const updateAuthorityAt = jest.fn();
+    const setAuthoritiesAt = jest.fn();
     renderForm(
       baseProps({
         isApMa: true,
-        updateAuthorityAt,
+        setAuthoritiesAt,
         authorities: [AUTHORITY] as any,
         queryConfig: storedQuery(AUTHORITY.did, 'authority'),
       })
     );
     fireEvent.click(screen.getByTestId('trust-check-query-0-authority'));
     fireEvent.click(screen.getByText('Agent identity credential issuer (default)'));
-    expect(updateAuthorityAt).toHaveBeenCalledWith(
-      0,
-      '{{ input.agent.identity_issuer_did }}',
-      undefined
-    );
+    const picks = setAuthoritiesAt.mock.calls[0][1];
+    expect(picks[picks.length - 1]).toEqual({ did: '{{ input.agent.identity_issuer_did }}' });
   });
 
   it('shows a deleted Authority as locked and invalid, with the Configuration required warning', () => {
